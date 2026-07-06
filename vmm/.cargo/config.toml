@@ -1,0 +1,12 @@
+# Cross-compile target for type-checking the KVM (Linux-only) code paths
+# from macOS. Full builds require a Linux toolchain (run on a real Linux+KVM
+# host or inside the Colima VM); this config lets `cargo check` resolve
+# target_os = "linux" deps so the cfg-gated code is at least type-checked.
+#
+# Only apply the placeholder linker when building *from* macOS (where there
+# is no real x86_64-linux-gnu-gcc). On a native Linux host, the default
+# linker works and this config is a no-op.
+[target.x86_64-unknown-linux-gnu]
+# No `linker =` line here: on macOS, ci/check.sh sets
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=true for `cargo check` (which
+# doesn't link). On native Linux, the default cc is used.

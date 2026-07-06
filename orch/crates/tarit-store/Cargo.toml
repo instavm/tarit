@@ -1,0 +1,12 @@
+[package]
+name = "tarit-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+tarit-types = { path = "../tarit-types" }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }

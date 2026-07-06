@@ -1,0 +1,20 @@
+[package]
+name = "vmm-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+linux-loader = { workspace = true, features = ["elf", "bzimage"] }
+vm-memory.workspace = true
+vmm-sys-util.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+[lints]
+workspace = true

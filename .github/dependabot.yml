@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/proto"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: cargo
+    directory: "/vmm"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      rust-vmm:
+        patterns:
+          - "kvm-*"
+          - "vm-*"
+          - "virtio-*"
+          - "linux-loader"
+          - "event-manager"
+          - "seccompiler"
+          - "vmm-sys-util"
+
+  - package-ecosystem: cargo
+    directory: "/orch"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

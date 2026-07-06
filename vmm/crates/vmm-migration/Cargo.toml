@@ -1,0 +1,17 @@
+[package]
+name = "vmm-migration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+vmm-snapshot = { path = "../vmm-snapshot" }
+vmm-memory-backend = { path = "../vmm-memory-backend" }
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a functional bug (not a security issue)
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security vulnerabilities, do not file a public issue. See SECURITY.md.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of Tarit is affected?
+      options:
+        - vmm (microVM monitor)
+        - orch (taritd orchestrator)
+        - proto (shared wire types)
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Exact commands, the kernel and rootfs used, and the invocation.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Host OS, kernel version, CPU, and whether KVM is available.
+    validations:
+      required: false

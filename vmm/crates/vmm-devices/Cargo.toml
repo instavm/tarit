@@ -1,0 +1,31 @@
+[package]
+name = "vmm-devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+vmm-jailer = { path = "../vmm-jailer" }
+virtio-queue.workspace = true
+virtio-devices.workspace = true
+virtio-bindings.workspace = true
+vm-device.workspace = true
+vm-superio.workspace = true
+vm-memory.workspace = true
+vmm-memory-backend = { path = "../vmm-memory-backend" }
+vmm-sys-util.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+libc.workspace = true
+
+# Linux-only: the epoll I/O loop (event-manager) and KVM transport.
+[target.'cfg(target_os = "linux")'.dependencies]
+event-manager.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

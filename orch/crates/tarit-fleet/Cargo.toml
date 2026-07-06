@@ -1,0 +1,22 @@
+[package]
+name = "tarit-fleet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Global fleet store sync via Postgres (tokio-postgres, MIT/Apache-2.0)"
+
+[dependencies]
+chrono.workspace = true
+deadpool-postgres = { workspace = true }
+tarit-store = { path = "../tarit-store" }
+tarit-types = { path = "../tarit-types" }
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio-postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+webpki-roots = { workspace = true }
+tracing.workspace = true
+uuid.workspace = true

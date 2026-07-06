@@ -1,0 +1,75 @@
+[package]
+name = "vmm-integration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+vm-memory = { workspace = true }
+vmm-net = { path = "../vmm-net" }
+vmm-jailer = { path = "../vmm-jailer" }
+vmm-migration = { path = "../vmm-migration", optional = true }
+kvm-ioctls = { workspace = true, optional = true }
+kvm-bindings = { workspace = true, optional = true }
+vmm-core = { path = "../vmm-core", optional = true }
+vmm-snapshot = { path = "../vmm-snapshot", optional = true }
+vmm-devices = { path = "../vmm-devices" }
+vmm-loader = { path = "../vmm-loader" }
+vmm-memory-backend = { path = "../vmm-memory-backend" }
+vmm-sys-util.workspace = true
+postcard = { workspace = true, optional = true }
+libc.workspace = true
+tempfile = "3"
+env_logger = "0.10"
+
+[features]
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vmm-core", "dep:vmm-snapshot", "dep:postcard", "dep:vmm-migration", "vmm-core/kvm", "vmm-core/boot"]
+
+[[test]]
+name = "boot_smoke"
+path = "boot_smoke.rs"
+
+[[test]]
+name = "snapshot_roundtrip"
+path = "snapshot_roundtrip.rs"
+
+[[test]]
+name = "egress_denial"
+path = "egress_denial.rs"
+
+[[test]]
+name = "lifecycle_e2e"
+path = "lifecycle_e2e.rs"
+required-features = ["kvm"]
+
+[[test]]
+name = "egress_live_test"
+path = "egress_live_test.rs"
+
+[[test]]
+name = "comprehensive_e2e"
+path = "comprehensive_e2e.rs"
+required-features = ["kvm"]
+
+[[test]]
+name = "virtio_blk_e2e"
+path = "virtio_blk_e2e.rs"
+
+[[test]]
+name = "comprehensive_tests"
+path = "comprehensive_tests.rs"
+required-features = ["kvm"]
+
+[[test]]
+name = "oci_boot_e2e"
+path = "oci_boot_e2e.rs"
+required-features = ["kvm"]
+
+[[test]]
+name = "virtio_net_e2e"
+path = "virtio_net_e2e.rs"
+
+[lints]
+workspace = true

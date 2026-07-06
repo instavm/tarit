@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check / test / clippy / fmt (${{ matrix.workspace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [proto, vmm, orch]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.workspace }}
+
+      - name: Format
+        working-directory: ${{ matrix.workspace }}
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: ${{ matrix.workspace }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check
+        working-directory: ${{ matrix.workspace }}
+        run: cargo check --workspace --all-targets
+
+      - name: Test (non-KVM unit tests)
+        working-directory: ${{ matrix.workspace }}
+        run: cargo test --workspace
+
+      - name: Type-check KVM/Linux code paths
+        if: matrix.workspace == 'vmm'
+        working-directory: ${{ matrix.workspace }}
+        run: >-
+          cargo check --workspace --all-targets
+          --features vmm-core/kvm
+          --features vmm-memory-backend/kvm
+          --features vmm-integration/kvm
+
+# The full KVM integration suite
+# (cargo test --workspace --features kvm -- --include-ignored) requires a Linux
+# host with /dev/kvm, which GitHub-hosted runners do not provide. Run it on a
+# Linux+KVM host.

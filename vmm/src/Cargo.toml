@@ -1,0 +1,39 @@
+[package]
+name = "vmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "vmm"
+path = "main.rs"
+
+[features]
+default = []
+# Enable the full boot path (KVM VM creation + vCPU run loop). Only compiles
+# on Linux+x86_64; off-Linux the `run` subcommand loads the kernel but does
+# not boot (the integration test that actually boots needs a real Linux+KVM
+# host — see crates/vmm-integration/boot_smoke.rs).
+boot = ["vmm-core/kvm", "vmm-api/boot"]
+[dependencies]
+vmm-core = { path = "../crates/vmm-core" }
+vmm-loader = { path = "../crates/vmm-loader" }
+vmm-memory-backend = { path = "../crates/vmm-memory-backend" }
+vmm-devices = { path = "../crates/vmm-devices" }
+vmm-snapshot = { path = "../crates/vmm-snapshot" }
+vmm-net = { path = "../crates/vmm-net" }
+vmm-jailer = { path = "../crates/vmm-jailer" }
+vmm-api = { path = "../crates/vmm-api" }
+vm-memory.workspace = true
+vmm-sys-util.workspace = true
+libc.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
