@@ -9,7 +9,7 @@ dependencies = [
  "displaydoc",
  "thiserror 1.0.69",
  "vm-memory 0.18.0",
- "zerocopy 0.8.52",
+ "zerocopy",
 ]
 
 [[package]]
@@ -303,7 +303,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13bdac971eb2efaceffca0976058ab80c715945cc565c8a4aa1ed3bb0dc8d0e4"
 dependencies = [
  "libc",
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -414,25 +414,25 @@ dependencies = [
 
 [[package]]
 name = "kvm-bindings"
-version = "0.10.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa4933174d0cc4b77b958578cd45784071cc5ae212c2d78fbd755aaaa6dfa71a"
+checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
 dependencies = [
  "serde",
- "vmm-sys-util 0.12.1",
- "zerocopy 0.7.35",
+ "vmm-sys-util",
+ "zerocopy",
 ]
 
 [[package]]
 name = "kvm-ioctls"
-version = "0.19.1"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e013ae7fcd2c6a8f384104d16afe7ea02969301ea2bb2a56e44b011ebc907cab"
+checksum = "06ac372c120eb893b086d1a12027669cf2b478d1f71204021ffa7adf57948d63"
 dependencies = [
  "bitflags 2.13.0",
  "kvm-bindings",
  "libc",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -640,9 +640,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seccompiler"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "345a3e4dddf721a478089d4697b83c6c0a8f5bf16086f6c13397e4534eb6e2e5"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
 dependencies = [
  "libc",
 ]
@@ -832,7 +832,7 @@ dependencies = [
  "log",
  "virtio-bindings",
  "vm-memory 0.17.2",
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -887,7 +887,7 @@ dependencies = [
  "vmm-memory-backend",
  "vmm-net",
  "vmm-snapshot",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -927,8 +927,8 @@ dependencies = [
  "vmm-memory-backend",
  "vmm-net",
  "vmm-snapshot",
- "vmm-sys-util 0.12.1",
- "zerocopy 0.8.52",
+ "vmm-sys-util",
+ "zerocopy",
 ]
 
 [[package]]
@@ -949,7 +949,7 @@ dependencies = [
  "vm-superio",
  "vmm-jailer",
  "vmm-memory-backend",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -971,7 +971,7 @@ dependencies = [
  "vmm-migration",
  "vmm-net",
  "vmm-snapshot",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -996,7 +996,7 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "vm-memory 0.18.0",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -1010,7 +1010,7 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "vm-memory 0.18.0",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -1050,17 +1050,7 @@ dependencies = [
  "vm-memory 0.18.0",
  "vmm-devices",
  "vmm-memory-backend",
- "vmm-sys-util 0.12.1",
-]
-
-[[package]]
-name = "vmm-sys-util"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1435039746e20da4f8d507a72ee1b916f7b4b05af7a91c093d2c6561934ede"
-dependencies = [
- "bitflags 1.3.2",
- "libc",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -1121,32 +1111,11 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
-dependencies = [
- "byteorder",
- "zerocopy-derive 0.7.35",
-]
-
-[[package]]
-name = "zerocopy"
 version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
 dependencies = [
- "zerocopy-derive 0.8.52",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa4f8080344d4671fb4e831a13ad1e68092748387dfc4f55e356242fae12ce3e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "zerocopy-derive",
 ]
 
 [[package]]
