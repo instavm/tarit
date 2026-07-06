@@ -598,7 +598,7 @@ paths:
   /v1/vms/{id}/pty/{pty_id}/connect:
     get:
       summary: Attach to PTY session (WebSocket)
-      description: Upgrades to a WebSocket bridged to the guest PTY. Authenticates with the `token` query parameter carrying the one-time `connect_token` from the create-session response, not the X-API-Key header. Tokens expire after 60 seconds or on first successful connect. Binary messages carry raw PTY bytes; text messages are JSON controls (client-to-server `{"type":"resize","cols":N,"rows":N}`, server-to-client `{"type":"exit","exit_code":N}`). A bad, missing, expired, reused, or unknown token closes the socket with code 4401.
+      description: Upgrades to a WebSocket bridged to the guest PTY. Authenticates with the `token` query parameter carrying the one-time `connect_token` from the create-session response, not the X-API-Key header. Tokens expire after 5 minutes or on first successful connect. Binary messages carry raw PTY bytes; text messages are JSON controls (client-to-server `{"type":"resize","cols":N,"rows":N}`, server-to-client `{"type":"exit","exit_code":N}`). A bad, missing, expired, reused, or unknown token closes the socket with code 4401.
       security: []
       parameters:
         - name: id

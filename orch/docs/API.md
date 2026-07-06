@@ -7,7 +7,7 @@ This document reflects the Rust handlers in `crates/taritd/src/api.rs` and `crat
 | Surface | Header | Applies to |
 | --- | --- | --- |
 | Public API | `X-API-Key: <api key>` | All `/v1/*` routes. Keys resolve to a tenant and role. |
-| PTY WebSocket | `?token=<connect_token>` | `/v1/vms/{id}/pty/{pty_id}/connect`. The one-time token comes from the create-session response and expires after 60 seconds. |
+| PTY WebSocket | `?token=<connect_token>` | `/v1/vms/{id}/pty/{pty_id}/connect`. The one-time token comes from the create-session response and expires after 5 minutes. |
 | Peer API | `X-Peer-Secret: <TARIT_PEER_SECRET>` | All `/internal/v1/*` routes. |
 | Unauthenticated | none | `/health`, `/metrics`, `/openapi.yaml`, `/docs`. |
 
@@ -265,7 +265,7 @@ Response `201`:
 { "pty_id": "uuid", "cols": 80, "rows": 24, "connect_token": "..." }
 ```
 
-`connect_token` is a one-time per-session secret. Pass it as the `token` query parameter when attaching over the WebSocket route below. It expires after 60 seconds or on first successful connect.
+`connect_token` is a one-time per-session secret. Pass it as the `token` query parameter when attaching over the WebSocket route below. It expires after 5 minutes or on first successful connect.
 
 Additional REST routes:
 

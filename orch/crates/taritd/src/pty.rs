@@ -33,7 +33,7 @@ pub(crate) struct PtyRegistry {
     sessions: Mutex<HashMap<Uuid, PtySession>>,
 }
 
-const CONNECT_TOKEN_TTL_SECS: i64 = 60;
+const CONNECT_TOKEN_TTL_SECS: i64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PtySession {
@@ -680,6 +680,20 @@ mod tests {
             registry.consume_connect_token(vm_id, session.pty_id, &session.connect_token),
             Err(OrchError::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn connect_token_expires_five_minutes_after_creation() {
+        let registry = PtyRegistry::default();
+        let vm_id = Uuid::new_v4();
+        let before = Utc::now();
+        let session = registry
+            .create(vm_id, 80, 24, None, test_identity())
+            .unwrap();
+        let after = Utc::now();
+
+        assert!(session.connect_token_expires_at >= before + chrono::Duration::minutes(5));
+        assert!(session.connect_token_expires_at <= after + chrono::Duration::minutes(5));
     }
 
     #[test]
