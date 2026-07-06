@@ -7,7 +7,7 @@ name = "acpi_tables"
 version = "0.1.0"
 dependencies = [
  "displaydoc",
- "thiserror 1.0.69",
+ "thiserror",
  "vm-memory 0.18.0",
  "zerocopy 0.8.52",
 ]
@@ -171,7 +171,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror",
 ]
 
 [[package]]
@@ -224,7 +224,7 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror",
 ]
 
 [[package]]
@@ -760,31 +760,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl 2.0.18",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -858,7 +838,7 @@ checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
 dependencies = [
  "arc-swap",
  "libc",
- "thiserror 2.0.18",
+ "thiserror",
  "winapi",
 ]
 
@@ -899,7 +879,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tarit-proto",
- "thiserror 1.0.69",
+ "thiserror",
  "vmm-core",
  "vmm-net",
 ]
@@ -919,7 +899,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tarit-proto",
- "thiserror 1.0.69",
+ "thiserror",
  "vm-memory 0.18.0",
  "vmm-devices",
  "vmm-jailer",
@@ -940,7 +920,7 @@ dependencies = [
  "log",
  "serde",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror",
  "virtio-bindings",
  "virtio-devices",
  "virtio-queue",
@@ -984,7 +964,7 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror",
 ]
 
 [[package]]
@@ -994,7 +974,7 @@ dependencies = [
  "linux-loader",
  "log",
  "serde",
- "thiserror 1.0.69",
+ "thiserror",
  "vm-memory 0.18.0",
  "vmm-sys-util 0.12.1",
 ]
@@ -1008,7 +988,7 @@ dependencies = [
  "libc",
  "log",
  "serde",
- "thiserror 1.0.69",
+ "thiserror",
  "vm-memory 0.18.0",
  "vmm-sys-util 0.12.1",
 ]
@@ -1020,7 +1000,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror",
  "vmm-memory-backend",
  "vmm-snapshot",
 ]
@@ -1034,7 +1014,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror",
 ]
 
 [[package]]
@@ -1046,7 +1026,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror",
  "vm-memory 0.18.0",
  "vmm-devices",
  "vmm-memory-backend",

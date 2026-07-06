@@ -18,7 +18,7 @@ bench = false
 
 [dependencies]
 displaydoc = "0.2.5"
-thiserror = "1"
+thiserror = "2"
 vm-memory = { workspace = true }
 zerocopy = { version = "0.8.48", features = ["derive"] }
 
