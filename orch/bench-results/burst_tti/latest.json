@@ -1,0 +1,335 @@
+{
+  "version": "1.1",
+  "timestamp": "2026-07-01T17:56:23.915Z",
+  "environment": {
+    "node": "n/a",
+    "platform": "linux",
+    "arch": "x86_64"
+  },
+  "config": {
+    "concurrency": 100,
+    "timeoutMs": 200000
+  },
+  "results": [
+    {
+      "provider": "instavm",
+      "mode": "burst",
+      "iterations": [
+        {
+          "ttiMs": 12343
+        },
+        {
+          "ttiMs": 6079
+        },
+        {
+          "ttiMs": 36177
+        },
+        {
+          "ttiMs": 42581
+        },
+        {
+          "ttiMs": 1499
+        },
+        {
+          "ttiMs": 12374
+        },
+        {
+          "ttiMs": 42773
+        },
+        {
+          "ttiMs": 12375
+        },
+        {
+          "ttiMs": 12374
+        },
+        {
+          "ttiMs": 12196
+        },
+        {
+          "ttiMs": 36360
+        },
+        {
+          "ttiMs": 12124
+        },
+        {
+          "ttiMs": 42811
+        },
+        {
+          "ttiMs": 73458
+        },
+        {
+          "ttiMs": 12374
+        },
+        {
+          "ttiMs": 42425
+        },
+        {
+          "ttiMs": 1160
+        },
+        {
+          "ttiMs": 1747
+        },
+        {
+          "ttiMs": 2035
+        },
+        {
+          "ttiMs": 42456
+        },
+        {
+          "ttiMs": 12374
+        },
+        {
+          "ttiMs": 12374
+        },
+        {
+          "ttiMs": 42773
+        },
+        {
+          "ttiMs": 67415
+        },
+        {
+          "ttiMs": 73458
+        },
+        {
+          "ttiMs": 35177
+        },
+        {
+          "ttiMs": 12374
+        },
+        {
+          "ttiMs": 368
+        },
+        {
+          "ttiMs": 1342
+        },
+        {
+          "ttiMs": 1050
+        },
+        {
+          "ttiMs": 1746
+        },
+        {
+          "ttiMs": 1468
+        },
+        {
+          "ttiMs": 1463
+        },
+        {
+          "ttiMs": 1741
+        },
+        {
+          "ttiMs": 1462
+        },
+        {
+          "ttiMs": 66535
+        },
+        {
+          "ttiMs": 12337
+        },
+        {
+          "ttiMs": 12369
+        },
+        {
+          "ttiMs": 66816
+        },
+        {
+          "ttiMs": 12369
+        },
+        {
+          "ttiMs": 42767
+        },
+        {
+          "ttiMs": 12369
+        },
+        {
+          "ttiMs": 66833
+        },
+        {
+          "ttiMs": 12368
+        },
+        {
+          "ttiMs": 12369
+        },
+        {
+          "ttiMs": 66910
+        },
+        {
+          "ttiMs": 42766
+        },
+        {
+          "ttiMs": 12337
+        },
+        {
+          "ttiMs": 12368
+        },
+        {
+          "ttiMs": 12367
+        },
+        {
+          "ttiMs": 12368
+        },
+        {
+          "ttiMs": 42469
+        },
+        {
+          "ttiMs": 42766
+        },
+        {
+          "ttiMs": 42772
+        },
+        {
+          "ttiMs": 12343
+        },
+        {
+          "ttiMs": 42773
+        },
+        {
+          "ttiMs": 42811
+        },
+        {
+          "ttiMs": 12375
+        },
+        {
+          "ttiMs": 12375
+        },
+        {
+          "ttiMs": 73458
+        },
+        {
+          "ttiMs": 42489
+        },
+        {
+          "ttiMs": 1747
+        },
+        {
+          "ttiMs": 1746
+        },
+        {
+          "ttiMs": 1747
+        },
+        {
+          "ttiMs": 2035
+        },
+        {
+          "ttiMs": 1160
+        },
+        {
+          "ttiMs": 42615
+        },
+        {
+          "ttiMs": 12374
+        },
+        {
+          "ttiMs": 42810
+        },
+        {
+          "ttiMs": 42772
+        },
+        {
+          "ttiMs": 12171
+        },
+        {
+          "ttiMs": 42810
+        },
+        {
+          "ttiMs": 42810
+        },
+        {
+          "ttiMs": 73458
+        },
+        {
+          "ttiMs": 1342
+        },
+        {
+          "ttiMs": 1355
+        },
+        {
+          "ttiMs": 1747
+        },
+        {
+          "ttiMs": 1746
+        },
+        {
+          "ttiMs": 1463
+        },
+        {
+          "ttiMs": 42805
+        },
+        {
+          "ttiMs": 12370
+        },
+        {
+          "ttiMs": 42804
+        },
+        {
+          "ttiMs": 42588
+        },
+        {
+          "ttiMs": 42767
+        },
+        {
+          "ttiMs": 12369
+        },
+        {
+          "ttiMs": 42805
+        },
+        {
+          "ttiMs": 36199
+        },
+        {
+          "ttiMs": 12369
+        },
+        {
+          "ttiMs": 12368
+        },
+        {
+          "ttiMs": 42804
+        },
+        {
+          "ttiMs": 66833
+        },
+        {
+          "ttiMs": 12368
+        },
+        {
+          "ttiMs": 67237
+        },
+        {
+          "ttiMs": 67114
+        },
+        {
+          "ttiMs": 42766
+        },
+        {
+          "ttiMs": 67343
+        },
+        {
+          "ttiMs": 12368
+        },
+        {
+          "ttiMs": 1026
+        },
+        {
+          "ttiMs": 42804
+        },
+        {
+          "ttiMs": 1461
+        }
+      ],
+      "summary": {
+        "ttiMs": {
+          "median": 12374,
+          "p95": 66833,
+          "p99": 67343,
+          "min": 368,
+          "max": 73458
+        }
+      },
+      "compositeScore": 0.0,
+      "successRate": 1.0,
+      "concurrency": 100,
+      "wallClockMs": 94300,
+      "timeToFirstReadyMs": 368
+    }
+  ]
+}

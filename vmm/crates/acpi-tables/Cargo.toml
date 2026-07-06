@@ -1,0 +1,26 @@
+[package]
+name = "acpi_tables"
+version.workspace = true
+authors = [
+    "The Cloud Hypervisor Authors",
+    "Amazon Firecracker team <firecracker-devel@amazon.com>",
+]
+edition.workspace = true
+# This crate is vendored/adapted from the Cloud Hypervisor and Firecracker
+# acpi-tables code, which is Apache-2.0. Apache-2.0 code can be distributed as
+# part of the AGPL-3.0-or-later project, but its own license and notices must be
+# preserved, so this crate stays Apache-2.0 rather than inheriting the workspace
+# AGPL license. See LICENSE in this directory and the root NOTICE file.
+license = "Apache-2.0"
+
+[lib]
+bench = false
+
+[dependencies]
+displaydoc = "0.2.5"
+thiserror = "1"
+vm-memory = { workspace = true }
+zerocopy = { version = "0.8.48", features = ["derive"] }
+
+[lints]
+workspace = true

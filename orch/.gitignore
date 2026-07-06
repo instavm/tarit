@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+/target-wp
+**/*.rs.bk
+
+# OS / editor
+.DS_Store
+
+# Local runtime logs
+*.log
+
+# Local-only c8i deploy helper (holds real host IP; kept on disk, not published)
+deploy/c8i-deploy.sh

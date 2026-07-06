@@ -1,0 +1,40 @@
+# Rust / Cargo
+/target
+**/target
+**/*.rs.bk
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# VM artifacts
+*.img
+*.qcow2
+*.raw
+vmlinux
+bzImage
+initramfs.*
+
+# Snapshot artifacts
+*.snap
+*.mem
+*.state
+
+# Local env
+.env
+.env.local
+
+
+# Local-only c8i run logs
+docs/c8i-run-*.log
+
+# Local-only dev tooling (kept on disk, not published): c8i sync loop + personal editor config
+ci/sync-and-test.sh
+opencode.json
+
+# Transient benchmark result dumps (raw scratch; curated results live in docs/)
+membench/results-*.txt

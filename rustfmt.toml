@@ -1,0 +1,6 @@
+# Tarit uses stock stable rustfmt defaults across proto/, vmm/, and orch/.
+# This file exists so editors and CI agree on that choice. Do not add
+# non-default or unstable options here without reformatting all three
+# workspaces in the same commit (CI runs `cargo fmt --all -- --check`).
+
+edition = "2021"

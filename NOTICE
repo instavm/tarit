@@ -1,0 +1,32 @@
+Tarit
+Copyright 2026 The Tarit Authors
+
+Licensed under the GNU Affero General Public License v3.0 or later
+(AGPL-3.0-or-later); see the LICENSE file.
+
+This product includes software developed at InstaVM.
+
+Portions are built on rust-vmm crates (https://github.com/rust-vmm),
+licensed under Apache-2.0 or MIT.
+
+--- Vendored and adapted components (Apache-2.0) ---
+
+The AGPL-3.0-or-later license of Tarit as a whole does not relicense the
+following components: they remain under Apache-2.0, and their own license and
+attribution notices are preserved here as required by that license.
+
+vmm/crates/acpi-tables/ is derived from the Cloud Hypervisor and Firecracker
+acpi-tables code and is licensed under Apache-2.0. Its license text is in
+vmm/crates/acpi-tables/LICENSE. It carries the copyright notices:
+    Copyright (c) 2019 Intel Corporation
+    Copyright (c) 2023 Rivos, Inc.
+    Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+    The Cloud Hypervisor Authors
+    Amazon Firecracker team <firecracker-devel@amazon.com>
+
+vmm/crates/vmm-core/src/vcpu_setup.rs contains x86_64 boot-setup code (GDT
+layout, DSDT AML, and boot MSR sequences) adapted to match Firecracker's boot
+protocol. Firecracker is Copyright Amazon.com, Inc. or its affiliates, licensed
+under Apache-2.0; some of the adapted snippets derive in turn from the Chromium
+OS project under a BSD-style license. The adapted code has been modified for
+Tarit.

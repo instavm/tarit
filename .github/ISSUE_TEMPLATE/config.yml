@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/instavm/tarit/security/advisories/new
+    about: >-
+      Report security issues privately through GitHub Security Advisories.
+      Do not open a public issue for a vulnerability. See SECURITY.md.

@@ -1,0 +1,23 @@
+# Code owners are automatically requested for review on pull requests.
+# See MAINTAINERS.md for the list of maintainers and their areas.
+
+# Default owner for everything in the repository.
+*               @abhishek-anand
+
+# Shared wire protocol crate (tarit-proto). Changes here move both sides.
+/proto/         @abhishek-anand
+
+# The Tarit VMM (microVM monitor) workspace.
+/vmm/           @abhishek-anand
+
+# taritd, the orchestrator and control plane workspace.
+/orch/          @abhishek-anand
+
+# CI, security workflows, issue templates, and repo automation.
+/.github/       @abhishek-anand
+
+# Licensing, dependency policy, and release notes.
+/LICENSE        @abhishek-anand
+/NOTICE         @abhishek-anand
+/deny.toml      @abhishek-anand
+/CHANGELOG.md   @abhishek-anand

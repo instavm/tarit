@@ -1,0 +1,931 @@
+openapi: 3.1.0
+info:
+  title: Tarit Orchestrator API
+  version: 0.1.0
+  description: Host orchestrator HTTP API (identical on every node behind external LB).
+servers:
+  - url: http://localhost:8080
+    description: Current host (rewritten from Host header when served)
+security:
+  - ApiKeyAuth: []
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key mapped by taritd to a tenant and role (admin or user).
+  schemas:
+    VmRecord:
+      type: object
+      description: Stored orchestrator record for a VM.
+      required: [id, host_id, status, memory_mib, vcpus, kernel_path, cmdline, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        host_id:
+          type: string
+        status:
+          type: string
+          enum: [creating, running, paused, stopped, error]
+        memory_mib:
+          type: integer
+        vcpus:
+          type: integer
+        kernel_path:
+          type: string
+        rootfs_path:
+          type: ["string", "null"]
+        cmdline:
+          type: string
+        socket_path:
+          type: ["string", "null"]
+        pid:
+          type: ["integer", "null"]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateVmRequest:
+      type: object
+      description: All fields optional; defaults come from node configuration. `image` (JSON alias `image_ref`) resolves through the node-local image registry and cannot be combined with `rootfs_path`.
+      properties:
+        id:
+          type: string
+          format: uuid
+        memory_mib:
+          type: integer
+          default: 256
+        vcpus:
+          type: integer
+          default: 1
+        kernel_path:
+          type: string
+        image:
+          type: string
+        rootfs_path:
+          type: string
+        cmdline:
+          type: string
+    RestoreRequest:
+      type: object
+      required: [snapshot_path]
+      properties:
+        snapshot_path:
+          type: string
+          description: Snapshot file path on the node that took it.
+        host_id:
+          type: string
+          description: Node that holds the snapshot file, as returned by the snapshot call. The restore routes there; omit to restore on the receiving node.
+        id:
+          type: string
+          format: uuid
+          description: Optional id for the restored VM; generated when omitted.
+    ExecuteRequest:
+      type: object
+      required: [vm_id, command]
+      properties:
+        vm_id:
+          type: string
+          format: uuid
+        command:
+          type: string
+        timeout_ms:
+          type: integer
+          default: 30000
+    ExecutionRecord:
+      type: object
+      required: [id, vm_id, command, timeout_ms, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        vm_id:
+          type: string
+          format: uuid
+        command:
+          type: string
+        timeout_ms:
+          type: integer
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        exit_code:
+          type: ["integer", "null"]
+        stdout:
+          type: ["string", "null"]
+        stderr:
+          type: ["string", "null"]
+        duration_ms:
+          type: ["integer", "null"]
+        error:
+          type: ["string", "null"]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PtySessionResponse:
+      type: object
+      required: [pty_id, vm_id, cols, rows, created_at]
+      properties:
+        pty_id:
+          type: string
+          format: uuid
+        vm_id:
+          type: string
+          format: uuid
+        cols:
+          type: integer
+        rows:
+          type: integer
+        shell:
+          type: ["string", "null"]
+        created_at:
+          type: string
+          format: date-time
+    SshKeyResponse:
+      type: object
+      required: [id, fingerprint, key_type, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        fingerprint:
+          type: string
+          description: OpenSSH SHA256 fingerprint (`SHA256:` plus unpadded base64).
+        key_type:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    UsageSummary:
+      type: object
+      required: [api_key_id, owner_key, vm_runtime_seconds, exec_count, exec_duration_ms]
+      properties:
+        api_key_id:
+          type: string
+        owner_key:
+          type: string
+        vm_runtime_seconds:
+          type: number
+        exec_count:
+          type: integer
+        exec_duration_ms:
+          type: integer
+    AuditEvent:
+      type: object
+      required: [id, api_key_id, owner_key, host_id, action, outcome, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        api_key_id:
+          type: string
+        owner_key:
+          type: string
+        host_id:
+          type: string
+        vm_id:
+          type: ["string", "null"]
+          format: uuid
+        action:
+          type: string
+          enum: [create, delete, pause, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress]
+        outcome:
+          type: string
+          enum: [ok, denied, error]
+        detail:
+          type: ["string", "null"]
+        created_at:
+          type: string
+          format: date-time
+paths:
+  /openapi.yaml:
+    get:
+      summary: OpenAPI specification (YAML)
+      security: []
+      responses:
+        "200":
+          description: OpenAPI 3.1 document
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /docs:
+    get:
+      summary: Interactive API documentation (Swagger UI)
+      security: []
+      responses:
+        "200":
+          description: HTML API explorer
+          content:
+            text/html:
+              schema:
+                type: string
+  /health:
+    get:
+      summary: Health check for external load balancer
+      security: []
+      responses:
+        "200":
+          description: OK
+  /metrics:
+    get:
+      summary: Prometheus operational metrics
+      description: Includes taritd_tenant_vms{tenant="..."} active local VM usage by tenant.
+      security: []
+      responses:
+        "200":
+          description: Metrics in Prometheus text exposition format
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+  /v1/vms:
+    get:
+      summary: List sandboxes
+      description: User keys only list their tenant's VMs; admin keys list all visible local VM records.
+      responses:
+        "200":
+          description: VM list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VmRecord"
+        "401":
+          description: Missing or invalid API key
+    post:
+      summary: Create sandbox
+      description: Creates a VM owned by the caller's tenant. The JSON body may set `image` (`name[:tag]`) instead of `rootfs_path`; the owner node resolves it through the local image registry. Per-tenant max_vms quotas return 403 when reached.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVmRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRecord"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: Tenant VM quota reached
+        "409":
+          description: Conflict, such as a duplicate requested VM id
+        "429":
+          description: Capacity exhausted or admission timed out
+          headers:
+            Retry-After:
+              description: Seconds the client should wait before retrying admission
+              schema:
+                type: integer
+                minimum: 1
+  /v1/vms/{id}:
+    get:
+      summary: Get sandbox
+      description: Returns the stored orchestrator VM record if visible to the caller's tenant, or to an admin key.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: VM record
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+    delete:
+      summary: Stop and remove sandbox
+      description: User keys can delete only their tenant's VMs; admin keys can delete any VM.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Stopped
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+  /v1/vms/{id}/status:
+    get:
+      summary: Get live sandbox status
+      description: Queries the owning VMM over its Unix socket for live runtime status; unlike GET /v1/vms/{id}, this is not the stored orchestrator record. User keys can access only their tenant's VMs.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Live VMM status
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - state
+                  - uptime_ms
+                  - vcpus
+                  - mem_mib
+                  - volumes
+                  - nets
+                  - kernel
+                  - vcpu_alive
+                properties:
+                  state:
+                    type: string
+                    enum: [created, running, paused, suspended, stopped]
+                  uptime_ms:
+                    type: integer
+                    format: uint64
+                  vcpus:
+                    type: integer
+                    minimum: 1
+                  mem_mib:
+                    type: integer
+                    format: uint64
+                  volumes:
+                    type: integer
+                    minimum: 0
+                  nets:
+                    type: integer
+                    minimum: 0
+                  kernel:
+                    type: string
+                  vcpu_alive:
+                    type: boolean
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+  /v1/vms/{id}/pty/sessions:
+    post:
+      summary: Create PTY session
+      description: Registers an interactive PTY session for the VM. PTY routes operate on the VM's owning node only; on a non-owner node they return 409. Attach to the session over the WebSocket connect route.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cols, rows]
+              properties:
+                cols:
+                  type: integer
+                  minimum: 1
+                rows:
+                  type: integer
+                  minimum: 1
+                shell:
+                  type: string
+                  description: Shell to launch in the guest; the guest agent default is used when omitted.
+      responses:
+        "201":
+          description: PTY session created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pty_id, cols, rows]
+                properties:
+                  pty_id:
+                    type: string
+                    format: uuid
+                  cols:
+                    type: integer
+                  rows:
+                    type: integer
+        "400":
+          description: cols or rows is zero
+        "403":
+          description: VM belongs to a different tenant
+        "409":
+          description: VM is owned by another node; connect to the owner
+    get:
+      summary: List PTY sessions
+      description: Lists PTY sessions registered for the VM on this node.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: PTY session list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PtySessionResponse"
+        "403":
+          description: VM belongs to a different tenant
+        "409":
+          description: VM is owned by another node; connect to the owner
+  /v1/vms/{id}/pty/sessions/{pty_id}:
+    get:
+      summary: Get PTY session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: pty_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: PTY session record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PtySessionResponse"
+        "404":
+          description: PTY session not found
+    delete:
+      summary: Delete PTY session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: pty_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: PTY session not found
+  /v1/vms/{id}/pty/sessions/{pty_id}/resize:
+    post:
+      summary: Resize PTY session
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: pty_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cols, rows]
+              properties:
+                cols:
+                  type: integer
+                  minimum: 1
+                rows:
+                  type: integer
+                  minimum: 1
+      responses:
+        "200":
+          description: Updated PTY dimensions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pty_id, cols, rows]
+                properties:
+                  pty_id:
+                    type: string
+                    format: uuid
+                  cols:
+                    type: integer
+                  rows:
+                    type: integer
+        "400":
+          description: cols or rows is zero
+        "404":
+          description: PTY session not found
+  /v1/vms/{id}/pty/{pty_id}/connect:
+    get:
+      summary: Attach to PTY session (WebSocket)
+      description: Upgrades to a WebSocket bridged to the guest PTY. Authenticates with the `api_key` query parameter, not the X-API-Key header. Binary messages carry raw PTY bytes; text messages are JSON controls (client-to-server `{"type":"resize","cols":N,"rows":N}`, server-to-client `{"type":"exit","exit_code":N}`). Auth failures close the socket with code 4401.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: pty_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: api_key
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "101":
+          description: Switching protocols to WebSocket
+  /v1/vms/{id}/pause:
+    post:
+      summary: Pause sandbox
+      description: User keys can pause only their tenant's VMs; admin keys can pause any VM.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Paused VM record
+        "403":
+          description: VM belongs to a different tenant
+  /v1/vms/{id}/resume:
+    post:
+      summary: Resume sandbox
+      description: User keys can resume only their tenant's VMs; admin keys can resume any VM.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Resumed VM record
+        "403":
+          description: VM belongs to a different tenant
+  /v1/vms/{id}/snapshot:
+    post:
+      summary: Snapshot sandbox
+      description: User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. Snapshot files are node-local; keep the returned `host_id` and pass it to `POST /v1/restore`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                diff:
+                  type: boolean
+                  default: false
+                  description: Write a diff (dirty pages only) snapshot instead of a full one.
+      responses:
+        "200":
+          description: Snapshot path and host_id
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, host_id]
+                properties:
+                  path:
+                    type: string
+                  host_id:
+                    type: string
+        "403":
+          description: VM belongs to a different tenant
+  /v1/restore:
+    post:
+      summary: Restore sandbox from a snapshot
+      description: Restores a VM from a snapshot file. When `host_id` names another node, the request routes to it; no snapshot bytes are copied between nodes. Tenant VM quotas apply.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreRequest"
+      responses:
+        "201":
+          description: Restored VM record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRecord"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: Tenant VM quota reached
+        "404":
+          description: host_id not found in the fleet
+        "429":
+          description: Selected node is at capacity
+          headers:
+            Retry-After:
+              description: Seconds the client should wait before retrying
+              schema:
+                type: integer
+                minimum: 1
+  /v1/execute:
+    post:
+      summary: Execute command in sandbox (synchronous)
+      description: Runs the command and returns the finished execution record in one request, no polling. The record is `completed` or `failed`; an exec that could not run at all is still a 200 with `status:"failed"` and `error` set. User keys can execute only in their tenant's VMs.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecuteRequest"
+      responses:
+        "200":
+          description: Finished execution record (completed or failed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionRecord"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+        "404":
+          description: VM not found
+  /v1/execute_async:
+    post:
+      summary: Execute command in sandbox (async)
+      description: User keys can execute only in their tenant's VMs; admin keys can execute in any VM. Poll the record with GET /v1/executions/{id} on the same node.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecuteRequest"
+      responses:
+        "202":
+          description: Execution accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionRecord"
+        "403":
+          description: VM belongs to a different tenant
+  /v1/executions/{id}:
+    get:
+      summary: Get execution status
+      description: Returns execution status only if the caller can access the VM associated with the execution.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Execution record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionRecord"
+        "403":
+          description: Execution belongs to a different tenant's VM
+  /v1/egress/vm/{id}:
+    patch:
+      summary: Update egress allowlist
+      description: User keys can update egress only for their tenant's VMs; admin keys can update any VM.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [allowlist]
+              properties:
+                allowlist:
+                  type: array
+                  items:
+                    type: string
+                  description: Egress allow rules, for example "10.0.0.0/8:443/tcp".
+                allow_existing:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Applied rule count
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rules_applied]
+                properties:
+                  rules_applied:
+                    type: integer
+        "403":
+          description: VM belongs to a different tenant
+  /v1/ssh-keys:
+    post:
+      summary: Register SSH public key
+      description: Registers an OpenSSH public key for the caller's tenant, for use with the SSH gateway.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [public_key]
+              properties:
+                public_key:
+                  type: string
+                  description: OpenSSH public key line, for example "ssh-ed25519 AAAA... comment".
+      responses:
+        "201":
+          description: SSH key registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SshKeyResponse"
+        "400":
+          description: Invalid or unsupported SSH public key
+        "401":
+          description: Missing or invalid API key
+    get:
+      summary: List SSH keys
+      description: Lists SSH keys registered for the caller's tenant.
+      responses:
+        "200":
+          description: SSH key list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [keys]
+                properties:
+                  keys:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SshKeyResponse"
+        "401":
+          description: Missing or invalid API key
+  /v1/ssh-keys/{key_id}:
+    delete:
+      summary: Delete SSH key
+      description: Deletes an SSH key belonging to the caller's tenant.
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Deleted
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: SSH key not found
+  /v1/cluster:
+    get:
+      summary: Cluster capacity and health
+      description: Admin-only cluster status and capacity summary.
+      responses:
+        "200":
+          description: Cluster status
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: Admin role required
+  /v1/usage:
+    get:
+      summary: Aggregated usage stats per API key
+      description: Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Window start (RFC3339). Defaults to 30 days before `to`.
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: Window end (RFC3339). Defaults to now.
+        - name: api_key_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Admin only; filter to one API key id.
+      responses:
+        "200":
+          description: Usage summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UsageSummary"
+        "401":
+          description: Missing or invalid API key
+        "500":
+          description: No fleet database configured, or store failure
+  /v1/audit:
+    get:
+      summary: Recent audit trail
+      description: Audited actions from the primary store, newest first; requires a fleet database (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+      parameters:
+        - name: api_key_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Admin only; filter to one API key id.
+        - name: vm_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+      responses:
+        "200":
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuditEvent"
+        "401":
+          description: Missing or invalid API key
+        "500":
+          description: No fleet database configured, or store failure

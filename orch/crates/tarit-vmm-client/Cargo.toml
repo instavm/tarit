@@ -1,0 +1,11 @@
+[package]
+name = "tarit-vmm-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tarit-proto = { path = "../../../proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

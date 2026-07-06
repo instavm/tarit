@@ -1,0 +1,24 @@
+[package]
+name = "vmm-memory-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings"]
+
+[dependencies]
+vm-memory.workspace = true
+vmm-sys-util.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+serde.workspace = true
+
+kvm-ioctls = { workspace = true, optional = true }
+kvm-bindings = { workspace = true, optional = true }
+
+[lints]
+workspace = true

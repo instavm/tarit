@@ -1,0 +1,42 @@
+[package]
+name = "vmm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "vmm-memory-backend/kvm"]
+boot = ["kvm"]
+
+[dependencies]
+tarit-proto = { path = "../../../proto" }
+acpi_tables = { path = "../acpi-tables" }
+vmm-memory-backend = { path = "../vmm-memory-backend" }
+vmm-loader = { path = "../vmm-loader" }
+vmm-devices = { path = "../vmm-devices" }
+vmm-net = { path = "../vmm-net" }
+vmm-snapshot = { path = "../vmm-snapshot" }
+vmm-jailer = { path = "../vmm-jailer" }
+vm-memory.workspace = true
+vmm-sys-util.workspace = true
+thiserror.workspace = true
+log.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+crc32fast.workspace = true
+zerocopy.workspace = true
+
+kvm-ioctls = { workspace = true, optional = true }
+kvm-bindings = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+postcard.workspace = true
+
+[lints]
+workspace = true

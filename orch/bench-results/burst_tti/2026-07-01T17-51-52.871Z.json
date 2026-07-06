@@ -1,0 +1,339 @@
+{
+  "version": "1.1",
+  "timestamp": "2026-07-01T17:51:52.871Z",
+  "environment": {
+    "node": "n/a",
+    "platform": "linux",
+    "arch": "x86_64"
+  },
+  "config": {
+    "concurrency": 100,
+    "timeoutMs": 120000
+  },
+  "results": [
+    {
+      "provider": "instavm",
+      "mode": "burst",
+      "iterations": [
+        {
+          "ttiMs": 1029
+        },
+        {
+          "ttiMs": 1575
+        },
+        {
+          "ttiMs": 1576
+        },
+        {
+          "ttiMs": 1779
+        },
+        {
+          "ttiMs": 1848
+        },
+        {
+          "ttiMs": 1944
+        },
+        {
+          "ttiMs": 1944
+        },
+        {
+          "ttiMs": 2133
+        },
+        {
+          "ttiMs": 17791
+        },
+        {
+          "ttiMs": 17883
+        },
+        {
+          "ttiMs": 41626
+        },
+        {
+          "ttiMs": 41622
+        },
+        {
+          "ttiMs": 42084
+        },
+        {
+          "ttiMs": 41938
+        },
+        {
+          "ttiMs": 41622
+        },
+        {
+          "ttiMs": 1028
+        },
+        {
+          "ttiMs": 1847
+        },
+        {
+          "ttiMs": 1847
+        },
+        {
+          "ttiMs": 1575
+        },
+        {
+          "ttiMs": 1847
+        },
+        {
+          "ttiMs": 1795
+        },
+        {
+          "ttiMs": 1575
+        },
+        {
+          "ttiMs": 1511
+        },
+        {
+          "ttiMs": 1575
+        },
+        {
+          "ttiMs": 12441
+        },
+        {
+          "ttiMs": 6693
+        },
+        {
+          "ttiMs": 6700
+        },
+        {
+          "ttiMs": 17762
+        },
+        {
+          "ttiMs": 36386
+        },
+        {
+          "ttiMs": 66232
+        },
+        {
+          "ttiMs": 0,
+          "error": "HTTP 409 Conflict: {\"error\":\"conflict: host at capacity (32 slots) — no VM became available within 60000ms\"}"
+        },
+        {
+          "ttiMs": 17847
+        },
+        {
+          "ttiMs": 0,
+          "error": "HTTP 409 Conflict: {\"error\":\"conflict: host at capacity (32 slots) — no VM became available within 60000ms\"}"
+        },
+        {
+          "ttiMs": 67819
+        },
+        {
+          "ttiMs": 0,
+          "error": "HTTP 409 Conflict: {\"error\":\"conflict: host at capacity (32 slots) — no VM became available within 60000ms\"}"
+        },
+        {
+          "ttiMs": 41623
+        },
+        {
+          "ttiMs": 41623
+        },
+        {
+          "ttiMs": 17830
+        },
+        {
+          "ttiMs": 36330
+        },
+        {
+          "ttiMs": 42081
+        },
+        {
+          "ttiMs": 42082
+        },
+        {
+          "ttiMs": 17900
+        },
+        {
+          "ttiMs": 42082
+        },
+        {
+          "ttiMs": 36383
+        },
+        {
+          "ttiMs": 41607
+        },
+        {
+          "ttiMs": 42081
+        },
+        {
+          "ttiMs": 41618
+        },
+        {
+          "ttiMs": 17767
+        },
+        {
+          "ttiMs": 67819
+        },
+        {
+          "ttiMs": 17999
+        },
+        {
+          "ttiMs": 17696
+        },
+        {
+          "ttiMs": 42080
+        },
+        {
+          "ttiMs": 17879
+        },
+        {
+          "ttiMs": 31713
+        },
+        {
+          "ttiMs": 12441
+        },
+        {
+          "ttiMs": 41622
+        },
+        {
+          "ttiMs": 41638
+        },
+        {
+          "ttiMs": 42088
+        },
+        {
+          "ttiMs": 17638
+        },
+        {
+          "ttiMs": 17779
+        },
+        {
+          "ttiMs": 66916
+        },
+        {
+          "ttiMs": 0,
+          "error": "HTTP 409 Conflict: {\"error\":\"conflict: host at capacity (32 slots) — no VM became available within 60000ms\"}"
+        },
+        {
+          "ttiMs": 1575
+        },
+        {
+          "ttiMs": 1847
+        },
+        {
+          "ttiMs": 1847
+        },
+        {
+          "ttiMs": 1847
+        },
+        {
+          "ttiMs": 1778
+        },
+        {
+          "ttiMs": 1944
+        },
+        {
+          "ttiMs": 42085
+        },
+        {
+          "ttiMs": 1575
+        },
+        {
+          "ttiMs": 12441
+        },
+        {
+          "ttiMs": 12440
+        },
+        {
+          "ttiMs": 12440
+        },
+        {
+          "ttiMs": 17847
+        },
+        {
+          "ttiMs": 17847
+        },
+        {
+          "ttiMs": 42084
+        },
+        {
+          "ttiMs": 41626
+        },
+        {
+          "ttiMs": 17741
+        },
+        {
+          "ttiMs": 12441
+        },
+        {
+          "ttiMs": 17726
+        },
+        {
+          "ttiMs": 17845
+        },
+        {
+          "ttiMs": 41623
+        },
+        {
+          "ttiMs": 41623
+        },
+        {
+          "ttiMs": 17674
+        },
+        {
+          "ttiMs": 17726
+        },
+        {
+          "ttiMs": 17798
+        },
+        {
+          "ttiMs": 42082
+        },
+        {
+          "ttiMs": 17844
+        },
+        {
+          "ttiMs": 41623
+        },
+        {
+          "ttiMs": 67792
+        },
+        {
+          "ttiMs": 36670
+        },
+        {
+          "ttiMs": 66229
+        },
+        {
+          "ttiMs": 66229
+        },
+        {
+          "ttiMs": 17749
+        },
+        {
+          "ttiMs": 42082
+        },
+        {
+          "ttiMs": 42082
+        },
+        {
+          "ttiMs": 41618
+        },
+        {
+          "ttiMs": 17844
+        },
+        {
+          "ttiMs": 17844
+        },
+        {
+          "ttiMs": 41618
+        }
+      ],
+      "summary": {
+        "ttiMs": {
+          "median": 17844,
+          "p95": 42084,
+          "p99": 66229,
+          "min": 1028,
+          "max": 67819
+        }
+      },
+      "compositeScore": 0.0,
+      "successRate": 0.96,
+      "concurrency": 100,
+      "wallClockMs": 68010,
+      "timeToFirstReadyMs": 1028
+    }
+  ]
+}

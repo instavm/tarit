@@ -1,0 +1,113 @@
+# cargo-deny configuration for the Tarit repository.
+#
+# The repo holds three independent cargo workspaces (proto/, vmm/, orch/).
+# CI runs `cargo deny check --config deny.toml` once per workspace from the
+# repo root; see .github/workflows/security.yml. Run it locally the same way:
+#
+#   cargo deny --manifest-path orch/Cargo.toml check --config deny.toml
+#
+# This file uses the cargo-deny v2 config schema.
+
+[graph]
+# Hosts Tarit builds for: x86_64 Linux (the only platform that runs microVMs)
+# and macOS as a development host for building and cross-checking.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+# https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
+[advisories]
+version = 2
+# RustSec vulnerabilities, unmaintained crates, and unsound crates are errors
+# by default under the v2 schema.
+# A yanked crate in a lockfile is worth noticing but should not block
+# unrelated work; Dependabot picks up the replacement.
+yanked = "warn"
+# Advisories that do not apply to Tarit. Keep each entry commented with a
+# reason and revisit on every toolchain or dependency bump.
+ignore = [
+    # RUSTSEC-2023-0071: "Marvin Attack" timing sidechannel in the `rsa` crate,
+    # pulled in transitively by `russh` (the optional SSH gateway) through
+    # `ssh-key`. There is no fixed release of `rsa` yet (the advisory states no
+    # safe upgrade is available). Tarit's SSH gateway is disabled by default and
+    # uses Ed25519 host keys, so the vulnerable RSA path is not exercised in the
+    # default configuration. Revisit when `rsa` ships a constant-time release or
+    # `russh` drops the dependency.
+    "RUSTSEC-2023-0071",
+]
+
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+[licenses]
+version = 2
+# Permissive licenses used by third-party dependencies of the three
+# workspaces. Everything a dependency offers under an OR must resolve to one
+# of these. Additions need maintainer review (see CODEOWNERS).
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+# Some entries above are kept for dependency churn (Dependabot bumps swap
+# license expressions, e.g. Unicode-DFS-2016 <-> Unicode-3.0), so do not warn
+# when an allowed license is currently unused.
+unused-allowed-license = "allow"
+# First-party workspace crates are AGPL-3.0-or-later (see LICENSE and NOTICE).
+# They are exceptions rather than a global allow so that a copyleft license
+# showing up in a third-party dependency still fails the check.
+exceptions = [
+    # proto/
+    { name = "tarit-proto", allow = ["AGPL-3.0-or-later"] },
+    # vmm/ (acpi_tables is Apache-2.0 and covered by the allow list)
+    { name = "vmm", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-api", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-core", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-devices", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-integration", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-jailer", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-loader", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-memory-backend", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-migration", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-net", allow = ["AGPL-3.0-or-later"] },
+    { name = "vmm-snapshot", allow = ["AGPL-3.0-or-later"] },
+    # orch/
+    { name = "tarit-bench", allow = ["AGPL-3.0-or-later"] },
+    { name = "tarit-fleet", allow = ["AGPL-3.0-or-later"] },
+    { name = "tarit-store", allow = ["AGPL-3.0-or-later"] },
+    { name = "tarit-types", allow = ["AGPL-3.0-or-later"] },
+    { name = "tarit-vmm-client", allow = ["AGPL-3.0-or-later"] },
+    { name = "taritd", allow = ["AGPL-3.0-or-later"] },
+]
+
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
+[bans]
+# Duplicate versions of a crate are common across a tree this size; surface
+# them without failing the build.
+multiple-versions = "warn"
+highlight = "all"
+# First-party path dependencies (e.g. tarit-proto) carry no version
+# requirement, so wildcard bans stay off.
+wildcards = "allow"
+# Crates that must not enter the dependency tree, with a reason.
+deny = [
+    # example: { name = "openssl", reason = "TLS is provided by rustls" },
+]
+
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
+[sources]
+# Every dependency must come from crates.io; no git or alternate-registry
+# dependencies without a deliberate decision here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
