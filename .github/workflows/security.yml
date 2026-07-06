@@ -27,7 +27,7 @@ jobs:
       matrix:
         workspace: [proto, vmm, orch]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Checks advisories, licenses, bans, and sources against the root
       # deny.toml for each cargo workspace.
@@ -51,7 +51,7 @@ jobs:
       # Needed by scorecard-action to publish results.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
