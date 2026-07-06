@@ -22,7 +22,7 @@ vmm-sys-util.workspace = true
 postcard = { workspace = true, optional = true }
 libc.workspace = true
 tempfile = "3"
-env_logger = "0.10"
+env_logger = "0.11"
 
 [features]
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vmm-core", "dep:vmm-snapshot", "dep:postcard", "dep:vmm-migration", "vmm-core/kvm", "vmm-core/boot"]
