@@ -38,29 +38,6 @@ jobs:
           manifest-path: ${{ matrix.workspace }}/Cargo.toml
           command-arguments: --config deny.toml
 
-  cargo-audit:
-    name: cargo-audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-
-      - name: Audit proto
-        run: cargo audit --file proto/Cargo.lock
-
-      - name: Audit vmm
-        run: cargo audit --file vmm/Cargo.lock
-
-      - name: Audit orch
-        run: cargo audit --file orch/Cargo.lock
-
   scorecard:
     name: openssf scorecard
     runs-on: ubuntu-latest
