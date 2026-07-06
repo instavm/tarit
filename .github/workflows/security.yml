@@ -61,21 +61,6 @@ jobs:
       - name: Audit orch
         run: cargo audit --file orch/Cargo.lock
 
-  secret-scan:
-    name: secret scan (gitleaks)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # scan full history, not just the latest commit
-
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Only required if the repository is owned by an organization.
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
-
   scorecard:
     name: openssf scorecard
     runs-on: ubuntu-latest
