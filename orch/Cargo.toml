@@ -26,7 +26,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # MIT OR Apache-2.0 licensed — peer HTTP + Postgres fleet sync
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 webpki-roots = "0.26"
