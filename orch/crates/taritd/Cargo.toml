@@ -21,7 +21,7 @@ tarit-store = { path = "../tarit-store" }
 tarit-types = { path = "../tarit-types" }
 tarit-vmm-client = { path = "../tarit-vmm-client" }
 reqwest = { workspace = true }
-russh = "0.61"
+russh = "0.62"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
