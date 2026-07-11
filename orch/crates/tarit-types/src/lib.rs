@@ -62,7 +62,7 @@ pub struct VmRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Whether a shared VM port is reachable publicly or only by its owner.
+/// Whether a shared VM port is public or requires a valid private-share token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShareVisibility {
@@ -121,6 +121,17 @@ pub struct UpdateShareRequest {
     pub vm_id: Option<Uuid>,
     pub guest_port: Option<u16>,
     pub visibility: Option<ShareVisibility>,
+}
+
+impl UpdateShareRequest {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.guest_port == Some(0) {
+            return Err(OrchError::BadRequest(
+                "guest_port must be in 1..=65535".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A temporary bearer token for accessing a private share.
@@ -480,6 +491,19 @@ mod tests {
             visibility: ShareVisibility::Private,
         };
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn update_share_rejects_zero_port() {
+        let req = UpdateShareRequest {
+            guest_port: Some(0),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            req.validate(),
+            Err(OrchError::BadRequest(message)) if message == "guest_port must be in 1..=65535"
+        ));
     }
 
     #[test]
