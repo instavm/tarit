@@ -51,8 +51,11 @@ mod auth {
 
 use auth::require_api_key;
 use axum::{
-    extract::{Extension, Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    extract::{
+        rejection::{JsonRejection, PathRejection},
+        Extension, FromRequest, FromRequestParts, Path, Query, Request, State,
+    },
+    http::{header, request::Parts, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -147,6 +150,120 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// JSON extraction used only by share mutations so malformed ports are client
+/// errors without changing request rejection behavior for unrelated APIs.
+struct ShareJson<T>(T);
+
+impl<S, T> FromRequest<S> for ShareJson<T>
+where
+    S: Send + Sync,
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+{
+    type Rejection = ShareApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(req, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(ShareApiError::invalid_request)
+    }
+}
+
+struct SharePath(Uuid);
+
+impl<S> FromRequestParts<S> for SharePath
+where
+    S: Send + Sync,
+{
+    type Rejection = ShareApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<Uuid>::from_request_parts(parts, state)
+            .await
+            .map(|Path(id)| Self(id))
+            .map_err(ShareApiError::invalid_path)
+    }
+}
+
+enum ShareApiError {
+    InvalidRequest,
+    BadRequest,
+    NotFound,
+    Conflict,
+    Unauthorized,
+    Forbidden,
+    ServiceUnavailable,
+    AuditUnavailable,
+}
+
+impl ShareApiError {
+    fn invalid_request(error: JsonRejection) -> Self {
+        tracing::debug!(error = %error, "invalid share request");
+        Self::InvalidRequest
+    }
+
+    fn invalid_path(error: PathRejection) -> Self {
+        tracing::debug!(error = %error, "invalid share path");
+        Self::InvalidRequest
+    }
+
+    fn from_service(error: OrchError) -> Self {
+        match error {
+            OrchError::BadRequest(error) => {
+                tracing::debug!(%error, "share request rejected");
+                Self::BadRequest
+            }
+            OrchError::NotFound(error) => {
+                tracing::debug!(%error, "share resource not found");
+                Self::NotFound
+            }
+            OrchError::Conflict(error) => {
+                tracing::debug!(%error, "share request conflicted");
+                Self::Conflict
+            }
+            OrchError::Unauthorized => Self::Unauthorized,
+            OrchError::Forbidden(error) => {
+                tracing::debug!(%error, "share request forbidden");
+                Self::Forbidden
+            }
+            error @ (OrchError::Internal(_) | OrchError::Vmm(_) | OrchError::Overloaded { .. }) => {
+                tracing::warn!(error = %error, "share service unavailable");
+                Self::ServiceUnavailable
+            }
+        }
+    }
+
+    fn audit_unavailable(action: &str) -> Self {
+        tracing::error!(action, "share audit pipeline unavailable");
+        Self::AuditUnavailable
+    }
+}
+
+impl IntoResponse for ShareApiError {
+    fn into_response(self) -> Response {
+        let (status, error) = match self {
+            Self::InvalidRequest | Self::BadRequest => {
+                (StatusCode::BAD_REQUEST, "invalid share request")
+            }
+            Self::NotFound => (StatusCode::NOT_FOUND, "share not found"),
+            Self::Conflict => (StatusCode::CONFLICT, "share conflict"),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::ServiceUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "share service unavailable")
+            }
+            Self::AuditUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "share audit unavailable"),
+        };
+        (
+            status,
+            Json(ErrorBody {
+                error: error.into(),
+            }),
+        )
+            .into_response()
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/v1/vms", post(create_vm).get(list_vms))
@@ -216,8 +333,8 @@ async fn health() -> Json<HealthResponse> {
 async fn create_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    Json(request): Json<CreateShareRequest>,
-) -> Result<(StatusCode, Json<ShareRecord>), ApiError> {
+    ShareJson(request): ShareJson<CreateShareRequest>,
+) -> Result<(StatusCode, Json<ShareRecord>), ShareApiError> {
     let attempted = ShareAuditFields {
         share_id: None,
         vm_id: Some(request.vm_id),
@@ -232,7 +349,7 @@ async fn create_share(
                 audit_action::CREATE_SHARE,
                 ShareAuditFields::from(&share),
                 audit_outcome::OK,
-            );
+            )?;
             Ok((StatusCode::CREATED, Json(share)))
         }
         Err(error) => {
@@ -242,8 +359,8 @@ async fn create_share(
                 audit_action::CREATE_SHARE,
                 attempted,
                 audit_outcome::ERROR,
-            );
-            Err(error.into())
+            )?;
+            Err(ShareApiError::from_service(error))
         }
     }
 }
@@ -251,24 +368,32 @@ async fn create_share(
 async fn list_shares(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-) -> Result<Json<Vec<ShareRecord>>, ApiError> {
-    Ok(Json(crate::shares::list(&state, &identity).await?))
+) -> Result<Json<Vec<ShareRecord>>, ShareApiError> {
+    Ok(Json(
+        crate::shares::list(&state, &identity)
+            .await
+            .map_err(ShareApiError::from_service)?,
+    ))
 }
 
 async fn get_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<ShareRecord>, ApiError> {
-    Ok(Json(crate::shares::get(&state, &identity, id).await?))
+    SharePath(id): SharePath,
+) -> Result<Json<ShareRecord>, ShareApiError> {
+    Ok(Json(
+        crate::shares::get(&state, &identity, id)
+            .await
+            .map_err(ShareApiError::from_service)?,
+    ))
 }
 
 async fn update_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    Path(id): Path<Uuid>,
-    Json(request): Json<UpdateShareRequest>,
-) -> Result<Json<ShareRecord>, ApiError> {
+    SharePath(id): SharePath,
+    ShareJson(request): ShareJson<UpdateShareRequest>,
+) -> Result<Json<ShareRecord>, ShareApiError> {
     let attempted = ShareAuditFields {
         share_id: Some(id),
         vm_id: request.vm_id,
@@ -283,7 +408,7 @@ async fn update_share(
                 audit_action::UPDATE_SHARE,
                 ShareAuditFields::from(&share),
                 audit_outcome::OK,
-            );
+            )?;
             Ok(Json(share))
         }
         Err(error) => {
@@ -293,8 +418,8 @@ async fn update_share(
                 audit_action::UPDATE_SHARE,
                 attempted,
                 audit_outcome::ERROR,
-            );
-            Err(error.into())
+            )?;
+            Err(ShareApiError::from_service(error))
         }
     }
 }
@@ -302,8 +427,8 @@ async fn update_share(
 async fn revoke_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    Path(id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
+    SharePath(id): SharePath,
+) -> Result<StatusCode, ShareApiError> {
     match crate::shares::revoke(&state, &identity, id).await {
         Ok(share) => {
             record_share_audit(
@@ -312,7 +437,7 @@ async fn revoke_share(
                 audit_action::REVOKE_SHARE,
                 ShareAuditFields::from(&share),
                 audit_outcome::OK,
-            );
+            )?;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(error) => {
@@ -325,8 +450,8 @@ async fn revoke_share(
                     ..Default::default()
                 },
                 audit_outcome::ERROR,
-            );
-            Err(error.into())
+            )?;
+            Err(ShareApiError::from_service(error))
         }
     }
 }
@@ -334,8 +459,8 @@ async fn revoke_share(
 async fn issue_share_token(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<ShareTokenResponse>, ApiError> {
+    SharePath(id): SharePath,
+) -> Result<Json<ShareTokenResponse>, ShareApiError> {
     let share = match crate::shares::get(&state, &identity, id).await {
         Ok(share) => share,
         Err(error) => {
@@ -348,8 +473,8 @@ async fn issue_share_token(
                     ..Default::default()
                 },
                 audit_outcome::ERROR,
-            );
-            return Err(error.into());
+            )?;
+            return Err(ShareApiError::from_service(error));
         }
     };
     match crate::shares::issue_token(&state, &identity, id, Utc::now()).await {
@@ -360,7 +485,7 @@ async fn issue_share_token(
                 audit_action::ISSUE_SHARE_TOKEN,
                 ShareAuditFields::from(&share),
                 audit_outcome::OK,
-            );
+            )?;
             Ok(Json(token))
         }
         Err(error) => {
@@ -370,8 +495,8 @@ async fn issue_share_token(
                 audit_action::ISSUE_SHARE_TOKEN,
                 ShareAuditFields::from(&share),
                 audit_outcome::ERROR,
-            );
-            Err(error.into())
+            )?;
+            Err(ShareApiError::from_service(error))
         }
     }
 }
@@ -401,7 +526,7 @@ fn record_share_audit(
     action: &str,
     fields: ShareAuditFields,
     outcome: &str,
-) {
+) -> Result<(), ShareApiError> {
     let visibility = match fields.visibility {
         Some(ShareVisibility::Public) => "public",
         Some(ShareVisibility::Private) => "private",
@@ -422,7 +547,8 @@ fn record_share_audit(
             .map(|port| port.to_string())
             .unwrap_or_else(|| "unknown".into()),
     );
-    audit::record(state, identity, action, fields.vm_id, outcome, Some(detail));
+    audit::record_required(state, identity, action, fields.vm_id, outcome, Some(detail))
+        .map_err(|_| ShareApiError::audit_unavailable(action))
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> Response {
@@ -1806,7 +1932,7 @@ mod tests {
 
     #[test]
     fn share_routes_reject_owner_override_and_admin_uses_service_ownership() {
-        let state = test_state();
+        let (state, _audits) = test_state_with_audit();
         let tenant_a_vm = Uuid::new_v4();
         let tenant_b_vm = Uuid::new_v4();
         insert_vm(&state, tenant_a_vm, "tenant-a", VmStatus::Running);
@@ -1824,7 +1950,7 @@ mod tests {
                 "owner_key": "tenant-b",
             }),
         ));
-        assert_eq!(owner_override.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(owner_override.status(), StatusCode::BAD_REQUEST);
 
         let created = rt.block_on(request_json(
             router(state.clone()),
@@ -1906,6 +2032,248 @@ mod tests {
             serde_json::json!({}),
         ));
         assert_eq!(admin_revoke.status(), StatusCode::NO_CONTENT);
+        drop(rt);
+    }
+
+    #[test]
+    fn share_create_rejects_invalid_guest_port_json_as_bad_request() {
+        let (state, _audits) = test_state_with_audit();
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        let rt = test_runtime();
+
+        for body in [
+            format!(r#"{{"vm_id":"{vm_id}","guest_port":65536}}"#),
+            format!(r#"{{"vm_id":"{vm_id}","guest_port":-1}}"#),
+            format!(r#"{{"vm_id":"{vm_id}","guest_port":"8080"}}"#),
+            r#"{"vm_id":"not-a-uuid","guest_port":8080}"#.into(),
+            r#"{"vm_id":"not-a-uuid","guest_port":8080"#.into(),
+        ] {
+            let response = rt.block_on(request_raw(
+                router(state.clone()),
+                "POST",
+                "/v1/shares",
+                Some("tenant-a-key"),
+                &body,
+            ));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        drop(rt);
+    }
+
+    #[test]
+    fn share_update_rejects_invalid_guest_port_json_as_bad_request() {
+        let (state, _audits) = test_state_with_audit();
+        let share_id = Uuid::new_v4();
+        let rt = test_runtime();
+        rt.block_on(insert_share(&state, share_id, "tenant-a"));
+
+        for body in [
+            r#"{"guest_port":0}"#,
+            r#"{"guest_port":65536}"#,
+            r#"{"guest_port":-1}"#,
+            r#"{"guest_port":false}"#,
+            r#"{"guest_port":8080"#,
+        ] {
+            let response = rt.block_on(request_raw(
+                router(state.clone()),
+                "PATCH",
+                &format!("/v1/shares/{share_id}"),
+                Some("tenant-a-key"),
+                body,
+            ));
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        drop(rt);
+    }
+
+    #[test]
+    fn share_routes_require_an_api_key() {
+        let response = test_runtime().block_on(request_raw(
+            router(test_state()),
+            "GET",
+            "/v1/shares",
+            None,
+            "",
+        ));
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn foreign_tenant_cannot_update_share() {
+        let (state, _audits) = test_state_with_audit();
+        let share_id = Uuid::new_v4();
+        let rt = test_runtime();
+        rt.block_on(insert_share(&state, share_id, "tenant-b"));
+
+        let response = rt.block_on(request_json(
+            router(state),
+            "PATCH",
+            &format!("/v1/shares/{share_id}"),
+            "tenant-a-key",
+            serde_json::json!({"guest_port": 9090}),
+        ));
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        drop(rt);
+    }
+
+    #[test]
+    fn foreign_tenant_cannot_revoke_share() {
+        let (state, _audits) = test_state_with_audit();
+        let share_id = Uuid::new_v4();
+        let rt = test_runtime();
+        rt.block_on(insert_share(&state, share_id, "tenant-b"));
+
+        let response = rt.block_on(request_json(
+            router(state),
+            "DELETE",
+            &format!("/v1/shares/{share_id}"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        drop(rt);
+    }
+
+    #[test]
+    fn foreign_tenant_cannot_issue_share_token() {
+        let (mut state, _audits) = test_state_with_audit();
+        state.config.share_token_key = Some([7; 32]);
+        let share_id = Uuid::new_v4();
+        let rt = test_runtime();
+        rt.block_on(insert_share(&state, share_id, "tenant-b"));
+
+        let response = rt.block_on(request_json(
+            router(state),
+            "POST",
+            &format!("/v1/shares/{share_id}/tokens"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        drop(rt);
+    }
+
+    #[test]
+    fn share_route_rejects_malformed_uuid_paths() {
+        let rt = test_runtime();
+        for (method, path) in [
+            ("GET", "/v1/shares/not-a-uuid"),
+            ("PATCH", "/v1/shares/not-a-uuid"),
+            ("DELETE", "/v1/shares/not-a-uuid"),
+            ("POST", "/v1/shares/not-a-uuid/tokens"),
+        ] {
+            let response = rt.block_on(request_json(
+                router(test_state()),
+                method,
+                path,
+                "tenant-a-key",
+                serde_json::json!({}),
+            ));
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {path}"
+            );
+            assert_eq!(
+                rt.block_on(response_json(response))["error"],
+                "invalid share request"
+            );
+        }
+        drop(rt);
+    }
+
+    #[test]
+    fn stale_share_update_returns_conflict() {
+        let (state, _audits) = test_state_with_audit();
+        let share_id = Uuid::new_v4();
+        let rt = test_runtime();
+        rt.block_on(insert_share(&state, share_id, "tenant-a"));
+
+        let revoke = rt.block_on(request_json(
+            router(state.clone()),
+            "DELETE",
+            &format!("/v1/shares/{share_id}"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+
+        let update = rt.block_on(request_json(
+            router(state),
+            "PATCH",
+            &format!("/v1/shares/{share_id}"),
+            "tenant-a-key",
+            serde_json::json!({"guest_port": 9090}),
+        ));
+        assert_eq!(update.status(), StatusCode::CONFLICT);
+        drop(rt);
+    }
+
+    #[test]
+    fn share_create_requires_audit_pipeline_acceptance() {
+        let (state, audits) = test_state_with_audit();
+        drop(audits);
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        let rt = test_runtime();
+
+        let response = rt.block_on(request_json(
+            router(state),
+            "POST",
+            "/v1/shares",
+            "tenant-a-key",
+            serde_json::json!({"vm_id": vm_id, "guest_port": 8080}),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error = rt.block_on(response_json(response));
+        assert_eq!(error["error"], "share audit unavailable");
+        drop(rt);
+    }
+
+    #[test]
+    fn share_internal_errors_are_unavailable_without_source_details() {
+        let (mut state, _audits) = test_state_with_audit();
+        state.config.share_token_key = Some([7; 32]);
+        state.config.share_token_ttl_secs = 0;
+        let share_id = Uuid::new_v4();
+        let rt = test_runtime();
+        rt.block_on(insert_share(&state, share_id, "tenant-a"));
+
+        let response = rt.block_on(request_json(
+            router(state),
+            "POST",
+            &format!("/v1/shares/{share_id}/tokens"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error = rt.block_on(response_json(response));
+        assert_eq!(error["error"], "share service unavailable");
+        assert!(!error["error"]
+            .as_str()
+            .unwrap()
+            .contains("share token TTL must be positive"));
+
+        let peer_response = ShareApiError::from_service(OrchError::Internal(
+            "peer http://10.0.0.2:8443/internal/v1/vms upstream body: connection refused".into(),
+        ))
+        .into_response();
+        assert_eq!(peer_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let peer_error = rt.block_on(response_json(peer_response));
+        assert_eq!(peer_error["error"], "share service unavailable");
+        assert!(!peer_error["error"].as_str().unwrap().contains("10.0.0.2"));
+        assert!(!peer_error["error"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused"));
         drop(rt);
     }
 
@@ -2028,6 +2396,45 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn request_raw(
+        app: Router,
+        method: &str,
+        uri: &str,
+        api_key: Option<&str>,
+        body: &str,
+    ) -> Response {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(api_key) = api_key {
+            request = request.header("X-API-Key", api_key);
+        }
+        app.oneshot(request.body(Body::from(body.to_owned())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn insert_share(state: &AppState, id: Uuid, owner_key: &str) {
+        let now = Utc::now();
+        state
+            .shares
+            .insert(&ShareRecord {
+                id,
+                slug: id.simple().to_string(),
+                owner_key: owner_key.into(),
+                vm_id: Uuid::new_v4(),
+                guest_port: 8080,
+                visibility: ShareVisibility::Private,
+                token_version: 0,
+                revoked_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
     }
 
     async fn response_json(response: Response) -> serde_json::Value {

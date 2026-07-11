@@ -36,6 +36,33 @@ pub fn record(
     let _ = state.store_tx.send(StoreWrite::Audit(event));
 }
 
+/// Record an audit event when the caller must not report success until the
+/// write-behind pipeline has accepted it.
+pub(crate) fn record_required(
+    state: &AppState,
+    identity: &ApiIdentity,
+    action: &str,
+    vm_id: Option<Uuid>,
+    outcome: &str,
+    detail: Option<String>,
+) -> Result<(), ()> {
+    let event = AuditEvent {
+        id: Uuid::new_v4(),
+        api_key_id: identity.api_key_id.clone(),
+        owner_key: identity.tenant.clone(),
+        host_id: state.config.host_id.clone(),
+        vm_id,
+        action: action.to_string(),
+        outcome: outcome.to_string(),
+        detail,
+        created_at: chrono::Utc::now(),
+    };
+    state
+        .store_tx
+        .send(StoreWrite::Audit(event))
+        .map_err(|_| ())
+}
+
 /// Record an audit event from raw identity parts (used by the SSH gateway,
 /// which authenticates a key before it has a full `ApiIdentity`).
 pub fn record_parts(
