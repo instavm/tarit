@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -809,11 +810,15 @@ fn parse_share_config(
         bail!("TARIT_SHARE_TOKEN_KEY must decode to exactly 32 bytes when TARIT_SHARE_LISTEN is enabled");
     }
 
+    let share_token_ttl_secs =
+        parse_positive_share_setting("TARIT_SHARE_TOKEN_TTL_SECS", token_ttl_secs_raw, 300)?;
+    validate_share_token_ttl(share_token_ttl_secs)?;
+
     Ok((
         share_listen,
         share_domain,
         share_token_key,
-        parse_positive_share_setting("TARIT_SHARE_TOKEN_TTL_SECS", token_ttl_secs_raw, 300)?,
+        share_token_ttl_secs,
         parse_positive_share_setting(
             "TARIT_SHARE_CONNECT_TIMEOUT_MS",
             connect_timeout_ms_raw,
@@ -871,6 +876,19 @@ fn parse_positive_share_setting(name: &str, raw: Option<&str>, default: u64) -> 
         bail!("{name} must be a positive integer");
     }
     Ok(value)
+}
+
+fn validate_share_token_ttl(ttl_secs: u64) -> Result<()> {
+    let ttl = i64::try_from(ttl_secs)
+        .context("TARIT_SHARE_TOKEN_TTL_SECS must fit token timestamp arithmetic")?;
+    let expiry = Utc::now()
+        .timestamp()
+        .checked_add(ttl)
+        .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0));
+    if expiry.is_none() {
+        bail!("TARIT_SHARE_TOKEN_TTL_SECS must fit token timestamp arithmetic");
+    }
+    Ok(())
 }
 
 fn load_peer_secret_for_mode(raw: Option<String>, cluster_mode: bool) -> Result<String> {
@@ -932,6 +950,15 @@ mod security_tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn share_token_ttl_must_fit_token_timestamp_arithmetic() {
+        for ttl in [i64::MAX as u64, i64::MAX as u64 + 1] {
+            assert!(
+                parse_share_config(None, None, None, Some(&ttl.to_string()), None, None,).is_err()
+            );
+        }
     }
 
     #[test]

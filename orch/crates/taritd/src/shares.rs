@@ -298,9 +298,10 @@ async fn create_for_vm(
 ) -> Result<ShareRecord, OrchError> {
     request.validate()?;
     ensure_share_vm_access(identity, vm)?;
+    let owner_key = share_vm_owner(vm)?;
     insert_with_generated_slug(
         repository,
-        &identity.tenant,
+        owner_key,
         vm.id,
         request.guest_port,
         request.visibility,
@@ -329,6 +330,11 @@ async fn update_for_share(
             ));
         }
         ensure_share_vm_access(identity, vm)?;
+        if vm.owner_key.as_deref() != Some(share.owner_key.as_str()) {
+            return Err(OrchError::Forbidden(
+                "replacement VM does not belong to the share owner".into(),
+            ));
+        }
     }
     let updated = apply_update(&share, &request, now)?;
     if updated.token_version != share.token_version {
@@ -429,6 +435,12 @@ fn ensure_share_vm_access(identity: &ApiIdentity, vm: &VmRecord) -> Result<(), O
         ));
     }
     Ok(())
+}
+
+fn share_vm_owner(vm: &VmRecord) -> Result<&str, OrchError> {
+    vm.owner_key.as_deref().ok_or_else(|| {
+        OrchError::BadRequest("VM must have a tenant owner before it can be shared".into())
+    })
 }
 
 async fn resolve_authorized_running_vm(
@@ -804,6 +816,65 @@ mod tests {
             Err(tarit_types::OrchError::Conflict(_))
         ));
         assert_eq!(exhausted_attempts, MAX_SLUG_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn admin_create_uses_the_target_vm_tenant_as_share_owner() {
+        let repository =
+            ShareRepository::new(Arc::new(Mutex::new(Store::open(":memory:").unwrap())), None);
+        let admin = ApiIdentity {
+            tenant: "admin-tenant".into(),
+            role: ApiRole::Admin,
+            max_vms: None,
+            api_key_id: "admin-key".into(),
+        };
+        let vm = test_vm("tenant-a", VmStatus::Running);
+
+        let share = create_for_vm(
+            &repository,
+            &admin,
+            &vm,
+            CreateShareRequest {
+                vm_id: vm.id,
+                guest_port: 8080,
+                visibility: ShareVisibility::Private,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(share.owner_key, "tenant-a");
+    }
+
+    #[tokio::test]
+    async fn admin_cannot_retarget_a_share_to_another_tenant_vm() {
+        let repository =
+            ShareRepository::new(Arc::new(Mutex::new(Store::open(":memory:").unwrap())), None);
+        let admin = ApiIdentity {
+            tenant: "admin-tenant".into(),
+            role: ApiRole::Admin,
+            max_vms: None,
+            api_key_id: "admin-key".into(),
+        };
+        let share = test_private_share(0);
+        repository.insert(&share).await.unwrap();
+        let replacement = test_vm("tenant-b", VmStatus::Running);
+
+        assert!(matches!(
+            update_for_share(
+                &repository,
+                &admin,
+                share.id,
+                Some(&replacement),
+                UpdateShareRequest {
+                    vm_id: Some(replacement.id),
+                    ..Default::default()
+                },
+                Utc::now(),
+            )
+            .await,
+            Err(OrchError::Forbidden(_))
+        ));
     }
 
     #[test]

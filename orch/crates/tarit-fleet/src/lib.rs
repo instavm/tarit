@@ -757,6 +757,70 @@ mod tests {
         let _ = fleet.get_share_by_slug(&share.slug);
         let _ = fleet.list_shares(&share.owner_key);
         let _ = fleet.update_share(share);
+        let _ = fleet.update_share_if_current(share, share.token_version);
+    }
+
+    #[tokio::test]
+    async fn share_compare_and_swap_uses_postgres_when_database_is_configured(
+    ) -> Result<(), FleetError> {
+        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+            eprintln!(
+                "skipping PostgreSQL share compare-and-swap test: TARIT_TEST_DATABASE_URL is absent"
+            );
+            return Ok(());
+        };
+        if database_url.is_empty() {
+            eprintln!(
+                "skipping PostgreSQL share compare-and-swap test: TARIT_TEST_DATABASE_URL is empty"
+            );
+            return Ok(());
+        }
+
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let suffix = Uuid::new_v4();
+        let mut share = test_share(format!("share-{suffix}-cas"), &format!("tenant-{suffix}"));
+        share.revoked_at = None;
+        let result = async {
+            fleet.insert_share(&share).await?;
+
+            let updated = ShareRecord {
+                guest_port: 9090,
+                token_version: share.token_version + 1,
+                updated_at: share.updated_at + chrono::Duration::seconds(1),
+                ..share.clone()
+            };
+            fleet
+                .update_share_if_current(&updated, share.token_version)
+                .await?;
+            assert_share_eq(
+                &fleet
+                    .get_share(share.id)
+                    .await?
+                    .ok_or_else(|| FleetError::Config("updated share is missing".into()))?,
+                &updated,
+            )?;
+
+            let stale = ShareRecord {
+                visibility: ShareVisibility::Public,
+                token_version: share.token_version + 1,
+                ..share.clone()
+            };
+            if !matches!(
+                fleet
+                    .update_share_if_current(&stale, share.token_version)
+                    .await,
+                Err(FleetError::Conflict(_))
+            ) {
+                return Err(FleetError::Config(
+                    "stale compare-and-swap share update did not conflict".into(),
+                ));
+            }
+
+            Ok::<(), FleetError>(())
+        }
+        .await;
+
+        result.and(cleanup_test_shares(&fleet, &[share.id]).await)
     }
 
     #[tokio::test]
