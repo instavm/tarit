@@ -1134,6 +1134,7 @@ async fn audit_log(
 pub(crate) fn store_err(e: tarit_store::StoreError) -> OrchError {
     match e {
         tarit_store::StoreError::NotFound => OrchError::NotFound("record not found".into()),
+        tarit_store::StoreError::Conflict(message) => OrchError::Conflict(message),
         tarit_store::StoreError::Sqlite(e) => OrchError::Internal(e.to_string()),
     }
 }
@@ -1208,6 +1209,16 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("7")
         );
+    }
+
+    #[test]
+    fn store_conflict_maps_to_http_conflict() {
+        let response = ApiError(store_err(tarit_store::StoreError::Conflict(
+            "share slug already exists".into(),
+        )))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

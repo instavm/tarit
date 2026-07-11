@@ -625,7 +625,7 @@ mod tests {
     use tarit_types::ShareRecord;
 
     fn test_share(slug: String, owner_key: &str) -> ShareRecord {
-        let now = Utc::now();
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_000).unwrap();
         ShareRecord {
             id: Uuid::new_v4(),
             slug,
