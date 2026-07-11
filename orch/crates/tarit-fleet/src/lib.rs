@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use rustls::{ClientConfig, RootCertStore};
 use tarit_store::HostRecord;
-use tarit_types::{AuditEvent, UsageEvent, UsageSummary, VmRecord};
+use tarit_types::{AuditEvent, ShareRecord, ShareVisibility, UsageEvent, UsageSummary, VmRecord};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
@@ -18,6 +18,8 @@ pub enum FleetError {
     Pool(#[from] deadpool_postgres::PoolError),
     #[error("config: {0}")]
     Config(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 pub struct PostgresFleet {
@@ -177,6 +179,96 @@ impl PostgresFleet {
         client
             .execute("DELETE FROM fleet_vms WHERE id = $1", &[&id])
             .await?;
+        Ok(())
+    }
+
+    pub async fn insert_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "INSERT INTO fleet_shares (
+                   id, slug, owner_key, vm_id, guest_port, visibility, token_version, revoked_at,
+                   created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                &[
+                    &share.id,
+                    &share.slug,
+                    &share.owner_key,
+                    &share.vm_id,
+                    &(i32::from(share.guest_port)),
+                    &share_visibility_as_str(share.visibility),
+                    &u64_to_sql_i64(share.token_version)?,
+                    &share.revoked_at,
+                    &share.created_at,
+                    &share.updated_at,
+                ],
+            )
+            .await
+            .map_err(fleet_error_from_postgres)?;
+        Ok(())
+    }
+
+    pub async fn get_share(&self, id: Uuid) -> Result<Option<ShareRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM fleet_shares WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        row.map(|row| row_to_share(&row)).transpose()
+    }
+
+    pub async fn get_share_by_slug(&self, slug: &str) -> Result<Option<ShareRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM fleet_shares WHERE slug = $1",
+                &[&slug],
+            )
+            .await?;
+        row.map(|row| row_to_share(&row)).transpose()
+    }
+
+    pub async fn list_shares(&self, owner_key: &str) -> Result<Vec<ShareRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM fleet_shares WHERE owner_key = $1 ORDER BY created_at DESC",
+                &[&owner_key],
+            )
+            .await?;
+        rows.iter().map(row_to_share).collect()
+    }
+
+    pub async fn update_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE fleet_shares SET
+                   slug = $2, owner_key = $3, vm_id = $4, guest_port = $5, visibility = $6,
+                   token_version = $7, revoked_at = $8, updated_at = $9
+                 WHERE id = $1",
+                &[
+                    &share.id,
+                    &share.slug,
+                    &share.owner_key,
+                    &share.vm_id,
+                    &(i32::from(share.guest_port)),
+                    &share_visibility_as_str(share.visibility),
+                    &u64_to_sql_i64(share.token_version)?,
+                    &share.revoked_at,
+                    &share.updated_at,
+                ],
+            )
+            .await
+            .map_err(fleet_error_from_postgres)?;
         Ok(())
     }
 
@@ -369,6 +461,20 @@ CREATE TABLE IF NOT EXISTS fleet_leader (
   leader_id TEXT NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fleet_shares (
+  id UUID PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  owner_key TEXT NOT NULL,
+  vm_id UUID NOT NULL,
+  guest_port INTEGER NOT NULL CHECK (guest_port BETWEEN 1 AND 65535),
+  visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
+  token_version BIGINT NOT NULL DEFAULT 0,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fleet_shares_owner ON fleet_shares (owner_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS fleet_shares_vm ON fleet_shares (vm_id);
 CREATE TABLE IF NOT EXISTS usage_events (
   id UUID PRIMARY KEY,
   api_key_id TEXT NOT NULL,
@@ -398,6 +504,49 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS audit_events_key_time ON audit_events (api_key_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_vm ON audit_events (vm_id);
 ";
+
+fn share_visibility_as_str(visibility: ShareVisibility) -> &'static str {
+    match visibility {
+        ShareVisibility::Public => "public",
+        ShareVisibility::Private => "private",
+    }
+}
+
+fn row_to_share(row: &tokio_postgres::Row) -> Result<ShareRecord, FleetError> {
+    let visibility: String = row.get(5);
+    let guest_port: i32 = row.get(4);
+    let token_version: i64 = row.get(6);
+    Ok(ShareRecord {
+        id: row.get(0),
+        slug: row.get(1),
+        owner_key: row.get(2),
+        vm_id: row.get(3),
+        guest_port: u16::try_from(guest_port)
+            .map_err(|_| FleetError::Config("invalid share guest port".into()))?,
+        visibility: match visibility.as_str() {
+            "public" => ShareVisibility::Public,
+            "private" => ShareVisibility::Private,
+            _ => return Err(FleetError::Config("invalid share visibility".into())),
+        },
+        token_version: u64::try_from(token_version)
+            .map_err(|_| FleetError::Config("invalid share token version".into()))?,
+        revoked_at: row.get(7),
+        created_at: row.get(8),
+        updated_at: row.get(9),
+    })
+}
+
+fn u64_to_sql_i64(value: u64) -> Result<i64, FleetError> {
+    i64::try_from(value).map_err(|_| FleetError::Config("share token version is too large".into()))
+}
+
+fn fleet_error_from_postgres(error: tokio_postgres::Error) -> FleetError {
+    if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+        FleetError::Conflict(error.to_string())
+    } else {
+        FleetError::Postgres(error)
+    }
+}
 
 fn make_rustls_connector() -> Result<MakeRustlsConnect, FleetError> {
     let mut roots = RootCertStore::empty();
@@ -463,5 +612,28 @@ pub fn host_record_from_capacity(
         free_memory_mib,
         healthy: true,
         last_heartbeat: Utc::now(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tarit_types::ShareRecord;
+
+    #[test]
+    fn fleet_schema_defines_share_constraints() {
+        assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_shares"));
+        assert!(FLEET_SCHEMA.contains("slug TEXT NOT NULL UNIQUE"));
+        assert!(FLEET_SCHEMA.contains("guest_port BETWEEN 1 AND 65535"));
+        assert!(FLEET_SCHEMA.contains("visibility IN ('public', 'private')"));
+    }
+
+    #[allow(dead_code)]
+    fn share_persistence_api_is_available(fleet: &PostgresFleet, share: &ShareRecord) {
+        let _ = fleet.insert_share(share);
+        let _ = fleet.get_share(share.id);
+        let _ = fleet.get_share_by_slug(&share.slug);
+        let _ = fleet.list_shares(&share.owner_key);
+        let _ = fleet.update_share(share);
     }
 }
