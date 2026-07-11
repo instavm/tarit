@@ -658,7 +658,7 @@ async fn share_audit_fields(state: &AppState, id: Uuid) -> ShareAuditFields {
 
 fn audit_outcome_for(error: &OrchError) -> &'static str {
     match error {
-        OrchError::Unauthorized | OrchError::Forbidden(_) => audit_outcome::DENIED,
+        OrchError::Forbidden(_) => audit_outcome::DENIED,
         _ => audit_outcome::ERROR,
     }
 }
@@ -2583,7 +2583,10 @@ mod tests {
     #[test]
     fn share_create_returns_503_when_durable_outcome_persistence_fails() {
         let (mut state, _audits) = test_state_with_audit();
-        state.audit_outbox = Arc::new(FailAfterFirstAuditOutbox::default());
+        state.audit_outbox = Arc::new(PersistFirstThenFailAuditOutbox {
+            store: Arc::clone(&state.store),
+            calls: AtomicUsize::default(),
+        });
         let vm_id = Uuid::new_v4();
         insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
         let rt = test_runtime();
@@ -2601,15 +2604,25 @@ mod tests {
             rt.block_on(response_json(response))["error"],
             "share audit unavailable"
         );
-        assert_eq!(
-            rt.block_on(crate::shares::list(
-                &state,
-                &state.config.api_keys.resolve("tenant-a-key").unwrap()
-            ))
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, audit_action::CREATE_SHARE);
+        assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
+        assert_eq!(audits[0].vm_id, Some(vm_id));
+        assert!(audits[0]
+            .detail
+            .as_deref()
             .unwrap()
-            .len(),
-            1
-        );
+            .contains("guest_port=8080"));
+        let shares = rt
+            .block_on(crate::shares::list(
+                &state,
+                &state.config.api_keys.resolve("tenant-a-key").unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].vm_id, vm_id);
+        assert_eq!(shares[0].guest_port, 8080);
         drop(rt);
     }
 
@@ -2679,7 +2692,8 @@ mod tests {
     }
 
     #[test]
-    fn share_peer_unauthorized_is_owner_unavailable() {
+    fn share_peer_unauthorized_is_owner_unavailable_and_audited_as_error() {
+        let (state, _audits) = test_state_with_audit();
         let response = ShareApiError::from_service(OrchError::Unauthorized).into_response();
         let rt = test_runtime();
 
@@ -2688,6 +2702,17 @@ mod tests {
             rt.block_on(response_json(response))["error"],
             "owner_unavailable"
         );
+        assert!(record_share_audit(
+            &state,
+            &state.config.api_keys.resolve("tenant-a-key").unwrap(),
+            audit_action::CREATE_SHARE,
+            ShareAuditFields::default(),
+            audit_outcome_for(&OrchError::Unauthorized),
+        )
+        .is_ok());
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].outcome, audit_outcome::ERROR);
         drop(rt);
     }
 
@@ -2739,13 +2764,16 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct FailAfterFirstAuditOutbox(AtomicUsize);
+    struct PersistFirstThenFailAuditOutbox {
+        store: Arc<Mutex<Store>>,
+        calls: AtomicUsize,
+    }
 
-    impl audit::DurableAuditOutbox for FailAfterFirstAuditOutbox {
-        fn enqueue(&self, _: &AuditEvent) -> Result<(), ()> {
-            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
-                Ok(())
+    impl audit::DurableAuditOutbox for PersistFirstThenFailAuditOutbox {
+        fn enqueue(&self, event: &AuditEvent) -> Result<(), ()> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let store = self.store.lock().map_err(|_| ())?;
+                store.enqueue_audit(event).map_err(|_| ())
             } else {
                 Err(())
             }
