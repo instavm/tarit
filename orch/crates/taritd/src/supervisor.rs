@@ -849,6 +849,20 @@ impl VmmSupervisor {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_test_network_allocation(&self, id: Uuid, allocation: NetAlloc) {
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        self.running.lock().unwrap().insert(
+            id,
+            RunningVm {
+                pid: process.pid,
+                socket_path: PathBuf::new(),
+                process,
+                net: Some(allocation),
+            },
+        );
+    }
+
     /// Live VMM status (state/uptime/vcpus/mem/config/vcpu_alive) for a running VM.
     pub fn status_vm(&self, id: Uuid) -> Result<tarit_vmm_client::VmStatus, OrchError> {
         let client = self.client_for(id)?;

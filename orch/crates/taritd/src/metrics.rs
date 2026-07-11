@@ -1,7 +1,10 @@
 use crate::api::AppState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use tarit_types::VmStatus;
 
 #[derive(Debug, Default)]
@@ -9,6 +12,19 @@ pub struct Metrics {
     vm_create_total: AtomicU64,
     vm_create_errors_total: AtomicU64,
     exec_total: AtomicU64,
+    active_share_websockets: AtomicU64,
+}
+
+pub(crate) struct ActiveShareWebSocket {
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for ActiveShareWebSocket {
+    fn drop(&mut self) {
+        self.metrics
+            .active_share_websockets
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Metrics {
@@ -22,6 +38,17 @@ impl Metrics {
 
     pub fn inc_exec_total(&self) {
         self.exec_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn track_share_websocket(self: &Arc<Self>) -> ActiveShareWebSocket {
+        self.active_share_websockets.fetch_add(1, Ordering::Relaxed);
+        ActiveShareWebSocket {
+            metrics: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn active_share_websockets(&self) -> u64 {
+        self.active_share_websockets.load(Ordering::Relaxed)
     }
 
     fn vm_create_total(&self) -> u64 {

@@ -8,8 +8,8 @@ use axum::{
     },
     http::{
         header::{
-            HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, FORWARDED, HOST,
-            PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+            HeaderName, HeaderValue, CONNECTION, FORWARDED, HOST, PROXY_AUTHENTICATE,
+            PROXY_AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
         },
         Request, StatusCode, Uri,
     },
@@ -51,6 +51,7 @@ use crate::{api::AppState, net::NetAlloc, shares, supervisor::NetworkLease};
 
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
+const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
 
 #[derive(Default)]
 struct PendingPings {
@@ -182,7 +183,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(peer)| *peer);
         let slug = share_slug_from_headers(request.headers(), domain)?;
-        let token = bearer_token(request.headers())?;
+        let token = share_token(request.headers())?;
         let share = shares::authorize_gateway(&state, &slug, token.as_deref()).await?;
         let forwarding = TrustedForwarding {
             peer,
@@ -274,8 +275,8 @@ fn share_slug(host: &str, domain: &str) -> Result<String, ()> {
     Ok(slug.into())
 }
 
-fn bearer_token(headers: &axum::http::HeaderMap) -> Result<Option<String>, GatewayError> {
-    let values = headers.get_all(AUTHORIZATION);
+fn share_token(headers: &axum::http::HeaderMap) -> Result<Option<String>, GatewayError> {
+    let values = headers.get_all(SHARE_TOKEN_HEADER);
     if values.iter().count() > 1 {
         return Err(GatewayError::Unauthorized);
     }
@@ -283,9 +284,8 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Result<Option<String>, Gatew
         return Ok(None);
     };
     let value = value.to_str().map_err(|_| GatewayError::Unauthorized)?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .filter(|token| !token.is_empty() && !token.bytes().any(|byte| byte.is_ascii_whitespace()))
+    let token = (!value.is_empty() && !value.bytes().any(|byte| byte.is_ascii_whitespace()))
+        .then_some(value)
         .ok_or(GatewayError::Unauthorized)?;
     Ok(Some(token.into()))
 }
@@ -399,7 +399,10 @@ async fn proxy_http_to_target(
             response = &mut request => break response.map_err(|_| GatewayError::Unavailable)?,
             changed = upload_done_rx.changed() => {
                 if changed.is_err() {
-                    return Err(GatewayError::Unavailable);
+                    break time::timeout(idle_timeout, &mut request)
+                        .await
+                        .map_err(|_| GatewayError::Unavailable)?
+                        .map_err(|_| GatewayError::Unavailable)?;
                 }
             }
         }
@@ -530,7 +533,7 @@ fn should_strip_request_header(
 ) -> bool {
     is_hop_by_hop(name, connection_headers)
         || name == HOST
-        || name == AUTHORIZATION
+        || name.as_str() == SHARE_TOKEN_HEADER
         || name == PROXY_AUTHORIZATION
         || name == PROXY_AUTHENTICATE
         || name == FORWARDED
@@ -588,6 +591,7 @@ async fn proxy_local_websocket(
         connect_timeout,
         idle_timeout,
         Some(lease),
+        Arc::clone(&state.metrics),
     )
     .await
 }
@@ -602,6 +606,7 @@ async fn proxy_websocket_to_target(
     connect_timeout: Duration,
     idle_timeout: Duration,
     lease: Option<NetworkLease>,
+    metrics: Arc<crate::metrics::Metrics>,
 ) -> Result<Response, GatewayError> {
     let request_uri = path_and_query
         .parse::<Uri>()
@@ -650,6 +655,7 @@ async fn proxy_websocket_to_target(
     };
     Ok(websocket.on_upgrade(move |client| async move {
         let _lease = lease;
+        let _active_websocket = metrics.track_share_websocket();
         bridge_websocket(client, upstream, idle_timeout).await;
     }))
 }
@@ -875,8 +881,8 @@ fn upstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
 #[cfg(test)]
 mod tests {
     use super::{
-        proxy_http_to_target, proxy_websocket_to_target, share_slug, TrustedForwarding,
-        UpstreamTarget,
+        proxy_http_to_target, proxy_websocket_to_target, router as gateway_router, share_slug,
+        TrustedForwarding, UpstreamTarget,
     };
     use axum::{
         body::{Body, Bytes},
@@ -886,19 +892,23 @@ mod tests {
                 AUTHORIZATION, CONNECTION, COOKIE, FORWARDED, HOST, ORIGIN, PROXY_AUTHORIZATION,
                 SEC_WEBSOCKET_PROTOCOL,
             },
-            HeaderMap, HeaderValue, Method, Request, StatusCode,
+            HeaderMap, HeaderValue, Method, Request, StatusCode, Uri,
         },
         response::Response,
         routing::{get, post},
         Router,
     };
+    use chrono::Utc;
     use futures_util::{SinkExt, StreamExt};
     use std::{
+        collections::HashMap,
         convert::Infallible,
         net::SocketAddr,
+        path::PathBuf,
         sync::{Arc, Mutex},
         time::Duration,
     };
+    use tarit_types::{ShareRecord, ShareVisibility};
     use tokio::{
         net::TcpListener,
         sync::{mpsc, oneshot},
@@ -906,6 +916,21 @@ mod tests {
     use tokio_tungstenite::{
         accept_hdr_async, connect_async,
         tungstenite::{client::IntoClientRequest, protocol::Message as TungsteniteMessage},
+    };
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::{
+        api::AppState,
+        audit::LocalAuditOutbox,
+        config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig},
+        metrics::Metrics,
+        net::NetAlloc,
+        peer::PeerClient,
+        pty::PtyRegistry,
+        scheduler::Scheduler,
+        shares::{ShareRepository, ShareTokenSigner},
+        supervisor::VmmSupervisor,
     };
 
     const SHARE_HOST: &str = "calm-red-fox.shares.example.com";
@@ -939,6 +964,136 @@ mod tests {
         assert!(pings.consume(&Bytes::from_static(&[super::MAX_PENDING_PINGS as u8])));
     }
 
+    #[test]
+    fn header_sanitation_preserves_basic_and_bearer_application_credentials() {
+        let forwarding = TrustedForwarding {
+            peer: Some("203.0.113.9:443".parse().unwrap()),
+            host: SHARE_HOST.into(),
+        };
+
+        for authorization in ["Basic YXBwbGljYXRpb246c2VjcmV0", "Bearer application-token"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_str(authorization).unwrap());
+            headers.insert(
+                "x-tarit-share-token",
+                HeaderValue::from_static("share-token"),
+            );
+
+            let sanitized = super::sanitized_request_headers(&headers, &forwarding).unwrap();
+
+            assert_eq!(sanitized.get(AUTHORIZATION).unwrap(), authorization);
+            assert!(sanitized.get("x-tarit-share-token").is_none());
+        }
+    }
+
+    #[test]
+    fn share_token_rejects_multiple_credential_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-tarit-share-token",
+            HeaderValue::from_static("first-token"),
+        );
+        headers.append(
+            "x-tarit-share-token",
+            HeaderValue::from_static("second-token"),
+        );
+
+        assert!(super::share_token(&headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn gateway_router_rejects_ambiguous_hosts_before_target_resolution() {
+        let state = gateway_test_state();
+        let mut request = Request::builder()
+            .uri("/")
+            .header(HOST, SHARE_HOST)
+            .body(Body::empty())
+            .unwrap();
+        request
+            .headers_mut()
+            .append(HOST, HeaderValue::from_static("other.shares.example.com"));
+
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn gateway_router_requires_the_dedicated_private_share_token_header() {
+        let state = gateway_test_state();
+        let share = gateway_share(Uuid::new_v4(), 8080, ShareVisibility::Private);
+        state.shares.insert(&share).await.unwrap();
+        let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
+            .issue(&share, Utc::now())
+            .unwrap();
+        assert!(
+            crate::shares::authorize_gateway(&state, &share.slug, Some(&token))
+                .await
+                .is_ok()
+        );
+        let request = Request::builder()
+            .uri("/")
+            .header(HOST, SHARE_HOST)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gateway_router_uses_supervisor_target_and_sanitizes_share_credentials() {
+        let (upstream, received) = spawn_inspecting_http_upstream().await;
+        let state = gateway_test_state();
+        let share = install_gateway_share(&state, upstream, ShareVisibility::Private).await;
+        assert_eq!(
+            state
+                .supervisor
+                .network_allocation(share.vm_id)
+                .unwrap()
+                .guest_ip,
+            upstream.ip().to_string()
+        );
+        let (target, _lease) = super::local_target(&state, &share).unwrap();
+        assert_eq!(
+            target.uri("http", &"/inspect".parse().unwrap()).unwrap(),
+            format!("http://{upstream}/inspect")
+        );
+        let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
+            .issue(&share, Utc::now())
+            .unwrap();
+        assert!(
+            crate::shares::authorize_gateway(&state, &share.slug, Some(&token))
+                .await
+                .is_ok()
+        );
+        let request = Request::builder()
+            .uri("/inspect?unrelated=keep")
+            .header(HOST, SHARE_HOST)
+            .header(AUTHORIZATION, "Bearer application-credential")
+            .header("x-tarit-share-token", token)
+            .header(COOKIE, "session=application")
+            .header(CONNECTION, "keep-alive, x-smuggled")
+            .header("x-smuggled", "remove-me")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, uri) = received.await.unwrap();
+        assert_eq!(uri, "/inspect?unrelated=keep");
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer application-credential"
+        );
+        assert_eq!(headers.get(COOKIE).unwrap(), "session=application");
+        assert!(headers.get("x-tarit-share-token").is_none());
+        assert!(headers.get("x-smuggled").is_none());
+    }
+
     #[tokio::test]
     async fn streams_bodies_and_rebuilds_trusted_headers() {
         let (addr, received_headers) = spawn_streaming_http_upstream().await;
@@ -956,6 +1111,7 @@ mod tests {
             .header("proxy-connection", "keep-alive")
             .header(PROXY_AUTHORIZATION, "Basic c2VjcmV0")
             .header(AUTHORIZATION, "Bearer private-share-token")
+            .header("x-tarit-share-token", "share-secret")
             .header(FORWARDED, "for=untrusted")
             .header("x-forwarded-for", "198.51.100.7")
             .header("x-forwarded-host", "untrusted.example")
@@ -992,7 +1148,8 @@ mod tests {
 
         let headers = received_headers.await.unwrap();
         assert!(headers.get(PROXY_AUTHORIZATION).is_none());
-        assert!(headers.get(AUTHORIZATION).is_none());
+        assert!(headers.get(AUTHORIZATION).is_some());
+        assert!(headers.get("x-tarit-share-token").is_none());
         assert!(headers.get("x-smuggled").is_none());
         assert!(headers.get("proxy-connection").is_none());
         assert!(headers.get(FORWARDED).is_some());
@@ -1035,7 +1192,7 @@ mod tests {
             target,
             request,
             Duration::from_secs(1),
-            Duration::from_millis(25),
+            Duration::from_millis(100),
             None,
         )
         .await
@@ -1045,9 +1202,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_router_exposes_the_first_response_chunk_before_upstream_completes() {
+        let (upstream, release_second_chunk, mut upstream_complete) =
+            spawn_delayed_streaming_http_upstream().await;
+        let state = gateway_test_state();
+        let share = install_gateway_share(&state, upstream, ShareVisibility::Public).await;
+        assert_eq!(
+            state
+                .supervisor
+                .network_allocation(share.vm_id)
+                .unwrap()
+                .guest_ip,
+            upstream.ip().to_string()
+        );
+        let request = Request::builder()
+            .uri("/stream")
+            .header(HOST, SHARE_HOST)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(500),
+            gateway_router(state).oneshot(request),
+        )
+        .await
+        .expect("gateway should return response headers before upstream completes")
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("first chunk should be observable")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, Bytes::from_static(b"first"));
+        assert!(
+            upstream_complete.try_recv().is_err(),
+            "upstream must still be waiting to produce its delayed second chunk"
+        );
+
+        release_second_chunk.send(()).unwrap();
+        let second = tokio::time::timeout(Duration::from_millis(500), body.next())
+            .await
+            .expect("second chunk should arrive after release")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, Bytes::from_static(b"second"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut upstream_complete)
+                .await
+                .expect("upstream should complete after its second chunk")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn bridges_websocket_frames_and_negotiates_the_upstream_protocol() {
         let (upstream, observed) = spawn_websocket_echo_upstream().await;
-        let gateway = start_gateway_router(upstream, Duration::from_secs(1)).await;
+        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_secs(1)).await;
         let mut request = format!("ws://{gateway}/socket?keep=this")
             .into_client_request()
             .unwrap();
@@ -1067,8 +1278,17 @@ mod tests {
         request
             .headers_mut()
             .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer application-credential"),
+        );
+        request.headers_mut().insert(
+            "x-tarit-share-token",
+            HeaderValue::from_static("share-token"),
+        );
 
         let (mut client, response) = connect_async(request).await.unwrap();
+        wait_for_websocket_gauge(&metrics, 1).await;
         assert_eq!(
             response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
             "chat"
@@ -1117,12 +1337,13 @@ mod tests {
         assert!(observed.contains(&"ping"));
         assert!(observed.contains(&"pong"));
         assert!(observed.contains(&"close"));
+        wait_for_websocket_gauge(&metrics, 0).await;
     }
 
     #[tokio::test]
     async fn websocket_idle_timeout_closes_an_inactive_bridge() {
         let (upstream, _observed) = spawn_websocket_echo_upstream().await;
-        let gateway = start_gateway_router(upstream, Duration::from_millis(25)).await;
+        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_millis(100)).await;
         let mut request = format!("ws://{gateway}/socket")
             .into_client_request()
             .unwrap();
@@ -1138,7 +1359,16 @@ mod tests {
         request
             .headers_mut()
             .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer application-credential"),
+        );
+        request.headers_mut().insert(
+            "x-tarit-share-token",
+            HeaderValue::from_static("share-token"),
+        );
         let (mut client, _) = connect_async(request).await.unwrap();
+        wait_for_websocket_gauge(&metrics, 1).await;
 
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), client.next())
@@ -1146,21 +1376,245 @@ mod tests {
                 .unwrap(),
             Some(Ok(TungsteniteMessage::Close(_))) | None
         ));
+        wait_for_websocket_gauge(&metrics, 0).await;
     }
 
     #[tokio::test]
     async fn upstream_eof_closes_client_without_waiting_for_idle_timeout() {
-        let upstream = spawn_websocket_drop_upstream().await;
-        let gateway = start_gateway_router(upstream, Duration::from_secs(1)).await;
+        let (upstream, drop_upstream) = spawn_websocket_drop_upstream().await;
+        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_millis(100)).await;
         let (mut client, _) = connect_async(format!("ws://{gateway}/socket"))
             .await
             .unwrap();
+        wait_for_websocket_gauge(&metrics, 1).await;
+        drop_upstream.send(()).unwrap();
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), client.next())
-                .await
-                .is_ok()
+        let close = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .expect("client should observe upstream EOF");
+        assert!(matches!(
+            close,
+            Some(Ok(TungsteniteMessage::Close(_))) | None
+        ));
+        wait_for_websocket_gauge(&metrics, 0).await;
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_releases_the_active_websocket_gauge() {
+        let (upstream, _observed) = spawn_websocket_echo_upstream().await;
+        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_secs(1)).await;
+        let mut request = format!("ws://{gateway}/socket")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("chat, alternate"),
         );
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+        request
+            .headers_mut()
+            .insert(COOKIE, HeaderValue::from_static("session=guest"));
+        request
+            .headers_mut()
+            .insert(FORWARDED, HeaderValue::from_static("for=untrusted"));
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer application-credential"),
+        );
+        request.headers_mut().insert(
+            "x-tarit-share-token",
+            HeaderValue::from_static("share-token"),
+        );
+        let (client, _) = connect_async(request).await.unwrap();
+        wait_for_websocket_gauge(&metrics, 1).await;
+
+        drop(client);
+
+        wait_for_websocket_gauge(&metrics, 0).await;
+    }
+
+    fn gateway_test_state() -> AppState {
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
+                "test-key".into(),
+                "tenant-a".into(),
+                ApiRole::Admin,
+                0,
+            )])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: PathBuf::from("target/taritd-gateway-test/vmm"),
+            kernel: PathBuf::from("target/taritd-gateway-test/kernel"),
+            rootfs: PathBuf::from("target/taritd-gateway-test/rootfs"),
+            socket_dir: PathBuf::from("target/taritd-gateway-test/sockets"),
+            db_path: PathBuf::from("target/taritd-gateway-test/fleet.db"),
+            net_state_path: PathBuf::from("target/taritd-gateway-test/net-state.json"),
+            images_dir: PathBuf::from("target/taritd-gateway-test/images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: None,
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: PathBuf::from("target/taritd-gateway-test/ssh_host"),
+            share_listen: None,
+            share_domain: Some("shares.example.com".into()),
+            share_token_key: Some([7; 32]),
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 1_000,
+            share_idle_timeout_secs: 1,
+        };
+        let store = Arc::new(Mutex::new(tarit_store::Store::open(":memory:").unwrap()));
+        let shares = ShareRepository::new(Arc::clone(&store), None);
+        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let peer = std::thread::spawn(|| PeerClient::new("peer-secret".into()))
+            .join()
+            .unwrap();
+        AppState {
+            config: config.clone(),
+            audit_outbox: Arc::new(LocalAuditOutbox::new(Arc::clone(&store))),
+            store,
+            exec_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            vm_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            store_tx,
+            pty_registry: Arc::new(PtyRegistry::default()),
+            supervisor: Arc::new(VmmSupervisor::new(config.clone())),
+            scheduler: Arc::new(Scheduler::new(config)),
+            peer: Arc::new(peer),
+            shares,
+            fleet: None,
+            metrics: Arc::new(Metrics::default()),
+        }
+    }
+
+    fn gateway_share(vm_id: Uuid, guest_port: u16, visibility: ShareVisibility) -> ShareRecord {
+        let now = Utc::now();
+        ShareRecord {
+            id: Uuid::new_v4(),
+            slug: "calm-red-fox".into(),
+            owner_key: "tenant-a".into(),
+            vm_id,
+            guest_port,
+            visibility,
+            token_version: 0,
+            revoked_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn install_gateway_share(
+        state: &AppState,
+        upstream: SocketAddr,
+        visibility: ShareVisibility,
+    ) -> ShareRecord {
+        let vm_id = Uuid::new_v4();
+        let share = gateway_share(vm_id, upstream.port(), visibility);
+        state.supervisor.install_test_network_allocation(
+            vm_id,
+            NetAlloc {
+                idx: 0,
+                vm_id,
+                tap: "test-tap".into(),
+                host_ip: "127.0.0.1".into(),
+                guest_ip: upstream.ip().to_string(),
+                prefix: 30,
+            },
+        );
+        state.shares.insert(&share).await.unwrap();
+        share
+    }
+
+    async fn wait_for_websocket_gauge(metrics: &Metrics, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while metrics.active_share_websockets() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "active share websocket gauge did not reach {expected}; got {}",
+                metrics.active_share_websockets()
+            )
+        });
+    }
+
+    async fn spawn_inspecting_http_upstream() -> (SocketAddr, oneshot::Receiver<(HeaderMap, Uri)>) {
+        let (received_tx, received_rx) = oneshot::channel();
+        let received_tx = Arc::new(Mutex::new(Some(received_tx)));
+        let app = Router::new()
+            .route(
+                "/inspect",
+                get(
+                    |State(tx): State<Arc<Mutex<Option<oneshot::Sender<(HeaderMap, Uri)>>>>>,
+                     headers: HeaderMap,
+                     uri: Uri| async move {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send((headers, uri));
+                        }
+                        Response::new(Body::from("ok"))
+                    },
+                ),
+            )
+            .with_state(received_tx);
+        (start_axum(app).await, received_rx)
+    }
+
+    async fn spawn_delayed_streaming_http_upstream(
+    ) -> (SocketAddr, oneshot::Sender<()>, oneshot::Receiver<()>) {
+        let (release_tx, release_rx) = oneshot::channel();
+        let (complete_tx, complete_rx) = oneshot::channel();
+        let controls = Arc::new(Mutex::new(Some((release_rx, complete_tx))));
+        let app = Router::new().route(
+            "/stream",
+            get({
+                let controls = Arc::clone(&controls);
+                move || {
+                    let controls = Arc::clone(&controls);
+                    async move {
+                        let (release_rx, complete_tx) = controls.lock().unwrap().take().unwrap();
+                        let (chunk_tx, chunk_rx) = mpsc::channel::<Bytes>(2);
+                        tokio::spawn(async move {
+                            let _ = chunk_tx.send(Bytes::from_static(b"first")).await;
+                            let _ = release_rx.await;
+                            let _ = chunk_tx.send(Bytes::from_static(b"second")).await;
+                            let _ = complete_tx.send(());
+                        });
+                        Response::new(Body::from_stream(futures_util::stream::unfold(
+                            chunk_rx,
+                            |mut chunk_rx| async move {
+                                chunk_rx
+                                    .recv()
+                                    .await
+                                    .map(|chunk| (Ok::<_, Infallible>(chunk), chunk_rx))
+                            },
+                        )))
+                    }
+                }
+            }),
+        );
+        (start_axum(app).await, release_tx, complete_rx)
     }
 
     async fn spawn_streaming_http_upstream() -> (SocketAddr, oneshot::Receiver<HeaderMap>) {
@@ -1216,29 +1670,40 @@ mod tests {
         start_axum(app).await
     }
 
-    async fn start_gateway_router(upstream: SocketAddr, idle: Duration) -> SocketAddr {
+    async fn start_gateway_router(
+        upstream: SocketAddr,
+        idle: Duration,
+    ) -> (SocketAddr, Arc<Metrics>) {
+        let metrics = Arc::new(Metrics::default());
         let app = Router::new().route(
             "/socket",
-            get(move |headers: HeaderMap, ws: WebSocketUpgrade| async move {
-                proxy_websocket_to_target(
-                    UpstreamTarget::new(upstream.ip(), upstream.port()),
-                    "/echo?keep=this",
-                    ws,
-                    vec!["chat".into(), "alternate".into()],
-                    &headers,
-                    &TrustedForwarding {
-                        peer: Some("203.0.113.9:443".parse().unwrap()),
-                        host: SHARE_HOST.into(),
-                    },
-                    Duration::from_secs(1),
-                    idle,
-                    None,
-                )
-                .await
-                .unwrap()
+            get({
+                let metrics = Arc::clone(&metrics);
+                move |headers: HeaderMap, ws: WebSocketUpgrade| {
+                    let metrics = Arc::clone(&metrics);
+                    async move {
+                        proxy_websocket_to_target(
+                            UpstreamTarget::new(upstream.ip(), upstream.port()),
+                            "/echo?keep=this",
+                            ws,
+                            vec!["chat".into(), "alternate".into()],
+                            &headers,
+                            &TrustedForwarding {
+                                peer: Some("203.0.113.9:443".parse().unwrap()),
+                                host: SHARE_HOST.into(),
+                            },
+                            Duration::from_secs(1),
+                            idle,
+                            None,
+                            metrics,
+                        )
+                        .await
+                        .unwrap()
+                    }
+                }
             }),
         );
-        start_axum(app).await
+        (start_axum(app).await, metrics)
     }
 
     async fn start_axum(app: Router) -> SocketAddr {
@@ -1272,6 +1737,11 @@ mod tests {
                     "https://client.example"
                 );
                 assert_eq!(request.headers().get(COOKIE).unwrap(), "session=guest");
+                assert_eq!(
+                    request.headers().get(AUTHORIZATION).unwrap(),
+                    "Bearer application-credential"
+                );
+                assert!(request.headers().get("x-tarit-share-token").is_none());
                 assert_eq!(
                     request.headers().get(FORWARDED).unwrap(),
                     "for=203.0.113.9;host=calm-red-fox.shares.example.com;proto=http"
@@ -1322,9 +1792,10 @@ mod tests {
         (addr, observed_rx)
     }
 
-    async fn spawn_websocket_drop_upstream() -> SocketAddr {
+    async fn spawn_websocket_drop_upstream() -> (SocketAddr, oneshot::Sender<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (drop_tx, drop_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let socket = accept_hdr_async(
@@ -1340,9 +1811,9 @@ mod tests {
             )
             .await
             .unwrap();
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = drop_rx.await;
             drop(socket);
         });
-        addr
+        (addr, drop_tx)
     }
 }
