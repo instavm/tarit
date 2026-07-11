@@ -340,6 +340,7 @@ pub mod audit_action {
 
 /// Stable audit outcome values.
 pub mod audit_outcome {
+    pub const ATTEMPT: &str = "attempt";
     pub const OK: &str = "ok";
     pub const DENIED: &str = "denied";
     pub const ERROR: &str = "error";

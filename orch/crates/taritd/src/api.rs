@@ -51,17 +51,16 @@ mod auth {
 
 use auth::require_api_key;
 use axum::{
-    extract::{
-        rejection::{JsonRejection, PathRejection},
-        Extension, FromRequest, FromRequestParts, Path, Query, Request, State,
-    },
-    http::{header, request::Parts, HeaderValue, StatusCode},
+    body::to_bytes,
+    extract::{Extension, Path, Query, Request, State},
+    http::{header, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::Utc;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use tarit_store::Store;
@@ -110,6 +109,9 @@ pub struct AppState {
     pub vm_cache: Arc<RwLock<HashMap<Uuid, VmRecord>>>,
     /// Channel to the background store writer (durability, write-behind).
     pub store_tx: tokio::sync::mpsc::UnboundedSender<StoreWrite>,
+    /// Durable audit outbox used by lifecycle operations that cannot rely on
+    /// the best-effort background writer.
+    pub(crate) audit_outbox: Arc<dyn audit::DurableAuditOutbox>,
     pub(crate) pty_registry: Arc<crate::pty::PtyRegistry>,
     pub supervisor: Arc<VmmSupervisor>,
     pub scheduler: Arc<Scheduler>,
@@ -150,63 +152,18 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// JSON extraction used only by share mutations so malformed ports are client
-/// errors without changing request rejection behavior for unrelated APIs.
-struct ShareJson<T>(T);
-
-impl<S, T> FromRequest<S> for ShareJson<T>
-where
-    S: Send + Sync,
-    Json<T>: FromRequest<S, Rejection = JsonRejection>,
-{
-    type Rejection = ShareApiError;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        Json::<T>::from_request(req, state)
-            .await
-            .map(|Json(value)| Self(value))
-            .map_err(ShareApiError::invalid_request)
-    }
-}
-
-struct SharePath(Uuid);
-
-impl<S> FromRequestParts<S> for SharePath
-where
-    S: Send + Sync,
-{
-    type Rejection = ShareApiError;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        Path::<Uuid>::from_request_parts(parts, state)
-            .await
-            .map(|Path(id)| Self(id))
-            .map_err(ShareApiError::invalid_path)
-    }
-}
-
 enum ShareApiError {
     InvalidRequest,
     BadRequest,
     NotFound,
     Conflict,
-    Unauthorized,
     Forbidden,
+    OwnerUnavailable,
     ServiceUnavailable,
     AuditUnavailable,
 }
 
 impl ShareApiError {
-    fn invalid_request(error: JsonRejection) -> Self {
-        tracing::debug!(error = %error, "invalid share request");
-        Self::InvalidRequest
-    }
-
-    fn invalid_path(error: PathRejection) -> Self {
-        tracing::debug!(error = %error, "invalid share path");
-        Self::InvalidRequest
-    }
-
     fn from_service(error: OrchError) -> Self {
         match error {
             OrchError::BadRequest(error) => {
@@ -221,7 +178,10 @@ impl ShareApiError {
                 tracing::debug!(%error, "share request conflicted");
                 Self::Conflict
             }
-            OrchError::Unauthorized => Self::Unauthorized,
+            // The public API key was already authenticated by middleware. A
+            // share-service 401 can only be an internal peer authentication
+            // failure, which must not be disclosed as a caller credential error.
+            OrchError::Unauthorized => Self::OwnerUnavailable,
             OrchError::Forbidden(error) => {
                 tracing::debug!(%error, "share request forbidden");
                 Self::Forbidden
@@ -247,8 +207,8 @@ impl IntoResponse for ShareApiError {
             }
             Self::NotFound => (StatusCode::NOT_FOUND, "share not found"),
             Self::Conflict => (StatusCode::CONFLICT, "share conflict"),
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
+            Self::OwnerUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"),
             Self::ServiceUnavailable => {
                 (StatusCode::SERVICE_UNAVAILABLE, "share service unavailable")
             }
@@ -333,13 +293,32 @@ async fn health() -> Json<HealthResponse> {
 async fn create_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    ShareJson(request): ShareJson<CreateShareRequest>,
+    request: Request,
 ) -> Result<(StatusCode, Json<ShareRecord>), ShareApiError> {
-    let attempted = ShareAuditFields {
-        share_id: None,
-        vm_id: Some(request.vm_id),
-        guest_port: Some(request.guest_port),
-        visibility: Some(request.visibility),
+    let request = parse_share_json::<CreateShareRequest>(request).await;
+    let attempted = match &request {
+        Ok(request) => ShareAuditFields::from_create_request(request),
+        Err(fields) => *fields,
+    };
+    record_share_audit(
+        &state,
+        &identity,
+        audit_action::CREATE_SHARE,
+        attempted,
+        audit_outcome::ATTEMPT,
+    )?;
+    let request = match request {
+        Ok(request) => request,
+        Err(_) => {
+            record_share_audit(
+                &state,
+                &identity,
+                audit_action::CREATE_SHARE,
+                attempted,
+                audit_outcome::ERROR,
+            )?;
+            return Err(ShareApiError::InvalidRequest);
+        }
     };
     match crate::shares::create(&state, &identity, request).await {
         Ok(share) => {
@@ -358,7 +337,7 @@ async fn create_share(
                 &identity,
                 audit_action::CREATE_SHARE,
                 attempted,
-                audit_outcome::ERROR,
+                audit_outcome_for(&error),
             )?;
             Err(ShareApiError::from_service(error))
         }
@@ -379,8 +358,9 @@ async fn list_shares(
 async fn get_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    SharePath(id): SharePath,
+    Path(id): Path<String>,
 ) -> Result<Json<ShareRecord>, ShareApiError> {
+    let id = parse_share_id(id)?;
     Ok(Json(
         crate::shares::get(&state, &identity, id)
             .await
@@ -391,14 +371,35 @@ async fn get_share(
 async fn update_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    SharePath(id): SharePath,
-    ShareJson(request): ShareJson<UpdateShareRequest>,
+    Path(id): Path<String>,
+    request: Request,
 ) -> Result<Json<ShareRecord>, ShareApiError> {
-    let attempted = ShareAuditFields {
-        share_id: Some(id),
-        vm_id: request.vm_id,
-        guest_port: request.guest_port,
-        visibility: request.visibility,
+    let id = parse_lifecycle_share_id(&state, &identity, audit_action::UPDATE_SHARE, id)?;
+    let pre_mutation = share_audit_fields(&state, id).await;
+    let request = parse_share_json::<UpdateShareRequest>(request).await;
+    let attempted = match &request {
+        Ok(request) => pre_mutation.merge(ShareAuditFields::from_update_request(request)),
+        Err(fields) => pre_mutation.merge(*fields),
+    };
+    record_share_audit(
+        &state,
+        &identity,
+        audit_action::UPDATE_SHARE,
+        attempted,
+        audit_outcome::ATTEMPT,
+    )?;
+    let request = match request {
+        Ok(request) => request,
+        Err(_) => {
+            record_share_audit(
+                &state,
+                &identity,
+                audit_action::UPDATE_SHARE,
+                attempted,
+                audit_outcome::ERROR,
+            )?;
+            return Err(ShareApiError::InvalidRequest);
+        }
     };
     match crate::shares::update(&state, &identity, id, request).await {
         Ok(share) => {
@@ -417,7 +418,7 @@ async fn update_share(
                 &identity,
                 audit_action::UPDATE_SHARE,
                 attempted,
-                audit_outcome::ERROR,
+                audit_outcome_for(&error),
             )?;
             Err(ShareApiError::from_service(error))
         }
@@ -427,8 +428,17 @@ async fn update_share(
 async fn revoke_share(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    SharePath(id): SharePath,
+    Path(id): Path<String>,
 ) -> Result<StatusCode, ShareApiError> {
+    let id = parse_lifecycle_share_id(&state, &identity, audit_action::REVOKE_SHARE, id)?;
+    let pre_mutation = share_audit_fields(&state, id).await;
+    record_share_audit(
+        &state,
+        &identity,
+        audit_action::REVOKE_SHARE,
+        pre_mutation,
+        audit_outcome::ATTEMPT,
+    )?;
     match crate::shares::revoke(&state, &identity, id).await {
         Ok(share) => {
             record_share_audit(
@@ -445,11 +455,8 @@ async fn revoke_share(
                 &state,
                 &identity,
                 audit_action::REVOKE_SHARE,
-                ShareAuditFields {
-                    share_id: Some(id),
-                    ..Default::default()
-                },
-                audit_outcome::ERROR,
+                pre_mutation,
+                audit_outcome_for(&error),
             )?;
             Err(ShareApiError::from_service(error))
         }
@@ -459,31 +466,24 @@ async fn revoke_share(
 async fn issue_share_token(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    SharePath(id): SharePath,
+    Path(id): Path<String>,
 ) -> Result<Json<ShareTokenResponse>, ShareApiError> {
-    let share = match crate::shares::get(&state, &identity, id).await {
-        Ok(share) => share,
-        Err(error) => {
-            record_share_audit(
-                &state,
-                &identity,
-                audit_action::ISSUE_SHARE_TOKEN,
-                ShareAuditFields {
-                    share_id: Some(id),
-                    ..Default::default()
-                },
-                audit_outcome::ERROR,
-            )?;
-            return Err(ShareApiError::from_service(error));
-        }
-    };
+    let id = parse_lifecycle_share_id(&state, &identity, audit_action::ISSUE_SHARE_TOKEN, id)?;
+    let pre_mutation = share_audit_fields(&state, id).await;
+    record_share_audit(
+        &state,
+        &identity,
+        audit_action::ISSUE_SHARE_TOKEN,
+        pre_mutation,
+        audit_outcome::ATTEMPT,
+    )?;
     match crate::shares::issue_token(&state, &identity, id, Utc::now()).await {
         Ok(token) => {
             record_share_audit(
                 &state,
                 &identity,
                 audit_action::ISSUE_SHARE_TOKEN,
-                ShareAuditFields::from(&share),
+                pre_mutation,
                 audit_outcome::OK,
             )?;
             Ok(Json(token))
@@ -493,19 +493,20 @@ async fn issue_share_token(
                 &state,
                 &identity,
                 audit_action::ISSUE_SHARE_TOKEN,
-                ShareAuditFields::from(&share),
-                audit_outcome::ERROR,
+                pre_mutation,
+                audit_outcome_for(&error),
             )?;
             Err(ShareApiError::from_service(error))
         }
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct ShareAuditFields {
     share_id: Option<Uuid>,
     vm_id: Option<Uuid>,
     guest_port: Option<u16>,
+    attempted_guest_port: Option<i64>,
     visibility: Option<ShareVisibility>,
 }
 
@@ -515,8 +516,150 @@ impl From<&ShareRecord> for ShareAuditFields {
             share_id: Some(share.id),
             vm_id: Some(share.vm_id),
             guest_port: Some(share.guest_port),
+            attempted_guest_port: None,
             visibility: Some(share.visibility),
         }
+    }
+}
+
+impl ShareAuditFields {
+    fn from_create_request(request: &CreateShareRequest) -> Self {
+        Self {
+            vm_id: Some(request.vm_id),
+            guest_port: Some(request.guest_port),
+            visibility: Some(request.visibility),
+            ..Default::default()
+        }
+    }
+
+    fn from_update_request(request: &UpdateShareRequest) -> Self {
+        Self {
+            vm_id: request.vm_id,
+            guest_port: request.guest_port,
+            visibility: request.visibility,
+            ..Default::default()
+        }
+    }
+
+    fn from_malformed_json(body: &[u8]) -> Self {
+        let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(body) else {
+            return Self::default();
+        };
+        let (guest_port, attempted_guest_port) = match object.get("guest_port") {
+            Some(serde_json::Value::Number(port)) => match port.as_i64() {
+                Some(port) => match u16::try_from(port).ok() {
+                    Some(port) => (Some(port), None),
+                    None => (None, Some(port)),
+                },
+                None => (None, None),
+            },
+            _ => (None, None),
+        };
+        Self {
+            vm_id: object
+                .get("vm_id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok()),
+            guest_port,
+            attempted_guest_port,
+            visibility: object
+                .get("visibility")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|visibility| match visibility {
+                    "public" => Some(ShareVisibility::Public),
+                    "private" => Some(ShareVisibility::Private),
+                    _ => None,
+                }),
+            ..Default::default()
+        }
+    }
+
+    fn merge(self, attempted: Self) -> Self {
+        Self {
+            share_id: attempted.share_id.or(self.share_id),
+            vm_id: attempted.vm_id.or(self.vm_id),
+            guest_port: attempted.guest_port.or(self.guest_port),
+            attempted_guest_port: attempted.attempted_guest_port.or(self.attempted_guest_port),
+            visibility: attempted.visibility.or(self.visibility),
+        }
+    }
+}
+
+const MAX_SHARE_REQUEST_BYTES: usize = 1024 * 1024;
+
+async fn parse_share_json<T: DeserializeOwned>(request: Request) -> Result<T, ShareAuditFields> {
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_SHARE_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!(%error, "invalid share request body");
+            return Err(ShareAuditFields::default());
+        }
+    };
+    let fields = ShareAuditFields::from_malformed_json(&body);
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if !content_type.is_some_and(|value| value.starts_with("application/json")) {
+        tracing::debug!("invalid share content type");
+        return Err(fields);
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        tracing::debug!(%error, "invalid share request");
+        fields
+    })
+}
+
+fn parse_share_id(id: String) -> Result<Uuid, ShareApiError> {
+    Uuid::parse_str(&id).map_err(|error| {
+        tracing::debug!(%error, "invalid share path");
+        ShareApiError::InvalidRequest
+    })
+}
+
+fn parse_lifecycle_share_id(
+    state: &AppState,
+    identity: &ApiIdentity,
+    action: &str,
+    id: String,
+) -> Result<Uuid, ShareApiError> {
+    match parse_share_id(id) {
+        Ok(id) => Ok(id),
+        Err(error) => {
+            record_share_audit(
+                state,
+                identity,
+                action,
+                ShareAuditFields::default(),
+                audit_outcome::ATTEMPT,
+            )?;
+            record_share_audit(
+                state,
+                identity,
+                action,
+                ShareAuditFields::default(),
+                audit_outcome::ERROR,
+            )?;
+            Err(error)
+        }
+    }
+}
+
+async fn share_audit_fields(state: &AppState, id: Uuid) -> ShareAuditFields {
+    match state.shares.get(id).await {
+        Ok(Some(share)) => ShareAuditFields::from(&share),
+        Ok(None) | Err(_) => ShareAuditFields {
+            share_id: Some(id),
+            ..Default::default()
+        },
+    }
+}
+
+fn audit_outcome_for(error: &OrchError) -> &'static str {
+    match error {
+        OrchError::Unauthorized | OrchError::Forbidden(_) => audit_outcome::DENIED,
+        _ => audit_outcome::ERROR,
     }
 }
 
@@ -527,27 +670,29 @@ fn record_share_audit(
     fields: ShareAuditFields,
     outcome: &str,
 ) -> Result<(), ShareApiError> {
-    let visibility = match fields.visibility {
-        Some(ShareVisibility::Public) => "public",
-        Some(ShareVisibility::Private) => "private",
-        None => "unknown",
-    };
-    let detail = format!(
-        "share_id={}; vm_id={}; guest_port={}; visibility={visibility}",
-        fields
-            .share_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        fields
-            .vm_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        fields
-            .guest_port
-            .map(|port| port.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-    );
-    audit::record_required(state, identity, action, fields.vm_id, outcome, Some(detail))
+    let vm_id = fields.vm_id;
+    let mut detail_fields = Vec::new();
+    if let Some(share_id) = fields.share_id {
+        detail_fields.push(format!("share_id={share_id}"));
+    }
+    if let Some(vm_id) = fields.vm_id {
+        detail_fields.push(format!("vm_id={vm_id}"));
+    }
+    if let Some(guest_port) = fields.guest_port {
+        detail_fields.push(format!("guest_port={guest_port}"));
+    }
+    if let Some(attempted_guest_port) = fields.attempted_guest_port {
+        detail_fields.push(format!("attempted_guest_port={attempted_guest_port}"));
+    }
+    if let Some(visibility) = fields.visibility {
+        let visibility = match visibility {
+            ShareVisibility::Public => "public",
+            ShareVisibility::Private => "private",
+        };
+        detail_fields.push(format!("visibility={visibility}"));
+    }
+    let detail = (!detail_fields.is_empty()).then(|| detail_fields.join("; "));
+    audit::record_required(state, identity, action, vm_id, outcome, detail)
         .map_err(|_| ShareApiError::audit_unavailable(action))
 }
 
@@ -1536,7 +1681,10 @@ mod tests {
     use axum::http::Request;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex, RwLock};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Condvar, Mutex, RwLock,
+    };
     use tarit_store::Store;
     use tower::ServiceExt;
 
@@ -1758,13 +1906,13 @@ mod tests {
 
     #[test]
     fn tenant_cannot_create_share_for_foreign_vm() {
-        let (state, mut audits) = test_state_with_audit();
+        let (state, _audits) = test_state_with_audit();
         let vm_id = Uuid::new_v4();
         insert_vm(&state, vm_id, "tenant-b", VmStatus::Running);
         let rt = test_runtime();
 
         let response = rt.block_on(request_json(
-            router(state),
+            router(state.clone()),
             "POST",
             "/v1/shares",
             "tenant-a-key",
@@ -1776,17 +1924,30 @@ mod tests {
         ));
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let audit = next_audit(&mut audits);
-        assert_eq!(audit.action, audit_action::CREATE_SHARE);
-        assert_eq!(audit.vm_id, Some(vm_id));
-        assert_eq!(audit.outcome, audit_outcome::ERROR);
-        assert!(audit.detail.unwrap().contains("guest_port=8080"));
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].action, audit_action::CREATE_SHARE);
+        assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
+        assert_eq!(audits[0].vm_id, Some(vm_id));
+        assert!(audits[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("guest_port=8080"));
+        assert_eq!(audits[1].action, audit_action::CREATE_SHARE);
+        assert_eq!(audits[1].outcome, audit_outcome::DENIED);
+        assert_eq!(audits[1].vm_id, Some(vm_id));
+        assert!(audits[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("guest_port=8080"));
         drop(rt);
     }
 
     #[test]
     fn share_routes_enforce_lifecycle_statuses_and_keep_tokens_out_of_audits() {
-        let (mut state, mut audits) = test_state_with_audit();
+        let (mut state, _audits) = test_state_with_audit();
         state.config.share_token_key = Some([7; 32]);
         let vm_id = Uuid::new_v4();
         insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
@@ -1805,7 +1966,17 @@ mod tests {
         assert_eq!(created["vm_id"], vm_id.to_string());
         assert_eq!(created["guest_port"], 8080);
         assert_eq!(created["visibility"], "private");
-        let create_audit = next_audit(&mut audits);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 2);
+        let create_attempt = &audits[0];
+        assert_eq!(create_attempt.action, audit_action::CREATE_SHARE);
+        assert_eq!(create_attempt.outcome, audit_outcome::ATTEMPT);
+        assert_eq!(create_attempt.vm_id, Some(vm_id));
+        let create_attempt_detail = create_attempt.detail.as_deref().unwrap();
+        assert!(create_attempt_detail.contains("guest_port=8080"));
+        assert!(create_attempt_detail.contains("visibility=private"));
+        assert!(!create_attempt_detail.contains("share_id="));
+        let create_audit = &audits[1];
         assert_eq!(create_audit.action, audit_action::CREATE_SHARE);
         assert_eq!(create_audit.vm_id, Some(vm_id));
         assert_eq!(create_audit.outcome, audit_outcome::OK);
@@ -1858,10 +2029,14 @@ mod tests {
             serde_json::json!({"guest_port": 0}),
         ));
         assert_eq!(invalid_update.status(), StatusCode::BAD_REQUEST);
-        let invalid_update_audit = next_audit(&mut audits);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 4);
+        assert_eq!(audits[2].action, audit_action::UPDATE_SHARE);
+        assert_eq!(audits[2].outcome, audit_outcome::ATTEMPT);
+        let invalid_update_audit = &audits[3];
         assert_eq!(invalid_update_audit.action, audit_action::UPDATE_SHARE);
         assert_eq!(invalid_update_audit.outcome, audit_outcome::ERROR);
-        let invalid_update_detail = invalid_update_audit.detail.unwrap();
+        let invalid_update_detail = invalid_update_audit.detail.as_deref().unwrap();
         assert!(invalid_update_detail.contains(&format!("share_id={share_id}")));
         assert!(invalid_update_detail.contains("guest_port=0"));
 
@@ -1879,11 +2054,15 @@ mod tests {
         assert_eq!(token_fields.len(), 2);
         assert!(token_fields.contains_key("token"));
         assert!(token_fields.contains_key("expires_at"));
-        let token_audit = next_audit(&mut audits);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 6);
+        assert_eq!(audits[4].action, audit_action::ISSUE_SHARE_TOKEN);
+        assert_eq!(audits[4].outcome, audit_outcome::ATTEMPT);
+        let token_audit = &audits[5];
         assert_eq!(token_audit.action, audit_action::ISSUE_SHARE_TOKEN);
         assert_eq!(token_audit.outcome, audit_outcome::OK);
         assert_share_audit_detail(&token_audit, &share_id, 8080, "private");
-        assert!(!token_audit.detail.unwrap().contains(token));
+        assert!(!token_audit.detail.as_deref().unwrap().contains(token));
 
         let update = rt.block_on(request_json(
             router(state.clone()),
@@ -1896,7 +2075,11 @@ mod tests {
         let updated = rt.block_on(response_json(update));
         assert_eq!(updated["guest_port"], 9090);
         assert_eq!(updated["visibility"], "public");
-        let update_audit = next_audit(&mut audits);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 8);
+        assert_eq!(audits[6].action, audit_action::UPDATE_SHARE);
+        assert_eq!(audits[6].outcome, audit_outcome::ATTEMPT);
+        let update_audit = &audits[7];
         assert_eq!(update_audit.action, audit_action::UPDATE_SHARE);
         assert_eq!(update_audit.outcome, audit_outcome::OK);
         assert_share_audit_detail(&update_audit, &share_id, 9090, "public");
@@ -1909,11 +2092,19 @@ mod tests {
             serde_json::json!({}),
         ));
         assert_eq!(public_token.status(), StatusCode::BAD_REQUEST);
-        let public_token_audit = next_audit(&mut audits);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 10);
+        assert_eq!(audits[8].action, audit_action::ISSUE_SHARE_TOKEN);
+        assert_eq!(audits[8].outcome, audit_outcome::ATTEMPT);
+        let public_token_audit = &audits[9];
         assert_eq!(public_token_audit.action, audit_action::ISSUE_SHARE_TOKEN);
         assert_eq!(public_token_audit.outcome, audit_outcome::ERROR);
         assert_share_audit_detail(&public_token_audit, &share_id, 9090, "public");
-        assert!(!public_token_audit.detail.unwrap().contains(token));
+        assert!(!public_token_audit
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains(token));
 
         let revoke = rt.block_on(request_json(
             router(state.clone()),
@@ -1923,10 +2114,17 @@ mod tests {
             serde_json::json!({}),
         ));
         assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
-        let revoke_audit = next_audit(&mut audits);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 12);
+        assert_eq!(audits[10].action, audit_action::REVOKE_SHARE);
+        assert_eq!(audits[10].outcome, audit_outcome::ATTEMPT);
+        let revoke_audit = &audits[11];
         assert_eq!(revoke_audit.action, audit_action::REVOKE_SHARE);
         assert_eq!(revoke_audit.outcome, audit_outcome::OK);
         assert_share_audit_detail(&revoke_audit, &share_id, 9090, "public");
+        assert!(audits
+            .iter()
+            .all(|audit| { !audit.detail.as_deref().unwrap_or_default().contains(token) }));
         drop(rt);
     }
 
@@ -2110,7 +2308,7 @@ mod tests {
         rt.block_on(insert_share(&state, share_id, "tenant-b"));
 
         let response = rt.block_on(request_json(
-            router(state),
+            router(state.clone()),
             "PATCH",
             &format!("/v1/shares/{share_id}"),
             "tenant-a-key",
@@ -2118,6 +2316,13 @@ mod tests {
         ));
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
+        assert_eq!(audits[1].action, audit_action::UPDATE_SHARE);
+        assert_eq!(audits[1].outcome, audit_outcome::DENIED);
+        assert_share_audit_detail(&audits[1], &share_id.to_string(), 9090, "private");
+        assert_eq!(audits[0].vm_id, audits[1].vm_id);
         drop(rt);
     }
 
@@ -2129,7 +2334,7 @@ mod tests {
         rt.block_on(insert_share(&state, share_id, "tenant-b"));
 
         let response = rt.block_on(request_json(
-            router(state),
+            router(state.clone()),
             "DELETE",
             &format!("/v1/shares/{share_id}"),
             "tenant-a-key",
@@ -2137,6 +2342,13 @@ mod tests {
         ));
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
+        assert_eq!(audits[1].action, audit_action::REVOKE_SHARE);
+        assert_eq!(audits[1].outcome, audit_outcome::DENIED);
+        assert_share_audit_detail(&audits[1], &share_id.to_string(), 8080, "private");
+        assert_eq!(audits[0].vm_id, audits[1].vm_id);
         drop(rt);
     }
 
@@ -2149,7 +2361,7 @@ mod tests {
         rt.block_on(insert_share(&state, share_id, "tenant-b"));
 
         let response = rt.block_on(request_json(
-            router(state),
+            router(state.clone()),
             "POST",
             &format!("/v1/shares/{share_id}/tokens"),
             "tenant-a-key",
@@ -2157,6 +2369,13 @@ mod tests {
         ));
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = durable_audits(&state);
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
+        assert_eq!(audits[1].action, audit_action::ISSUE_SHARE_TOKEN);
+        assert_eq!(audits[1].outcome, audit_outcome::DENIED);
+        assert_share_audit_detail(&audits[1], &share_id.to_string(), 8080, "private");
+        assert_eq!(audits[0].vm_id, audits[1].vm_id);
         drop(rt);
     }
 
@@ -2217,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn share_create_requires_audit_pipeline_acceptance() {
+    fn share_create_does_not_rely_on_background_audit_channel() {
         let (state, audits) = test_state_with_audit();
         drop(audits);
         let vm_id = Uuid::new_v4();
@@ -2225,15 +2444,250 @@ mod tests {
         let rt = test_runtime();
 
         let response = rt.block_on(request_json(
-            router(state),
+            router(state.clone()),
             "POST",
             "/v1/shares",
             "tenant-a-key",
             serde_json::json!({"vm_id": vm_id, "guest_port": 8080}),
         ));
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(durable_audits(&state).len(), 2);
+        drop(rt);
+    }
+
+    #[test]
+    fn share_create_persists_durable_intent_and_outcome() {
+        let (state, _audits) = test_state_with_audit();
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        let rt = test_runtime();
+
+        let response = rt.block_on(request_json(
+            router(state.clone()),
+            "POST",
+            "/v1/shares",
+            "tenant-a-key",
+            serde_json::json!({"vm_id": vm_id, "guest_port": 8080, "visibility": "public"}),
+        ));
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let share_id = rt.block_on(response_json(response))["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let audits = state.store.lock().unwrap().list_unsent_audit(10).unwrap();
+        assert_eq!(audits.len(), 2);
+        assert_eq!(audits[0].action, audit_action::CREATE_SHARE);
+        assert_eq!(audits[0].outcome, "attempt");
+        assert_eq!(audits[0].vm_id, Some(vm_id));
+        assert!(audits[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains(&format!("vm_id={vm_id}")));
+        assert!(!audits[0].detail.as_deref().unwrap().contains("unknown"));
+        assert_eq!(audits[1].action, audit_action::CREATE_SHARE);
+        assert_eq!(audits[1].outcome, audit_outcome::OK);
+        assert_eq!(audits[1].vm_id, Some(vm_id));
+        assert_share_audit_detail(&audits[1], &share_id, 8080, "public");
+        drop(rt);
+    }
+
+    #[test]
+    fn durable_share_intent_exists_before_create_mutates() {
+        let (mut state, _audits) = test_state_with_audit();
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        let (intent_tx, intent_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        state.audit_outbox = Arc::new(BlockingFirstAuditOutbox {
+            store: Arc::clone(&state.store),
+            intent_tx,
+            gate: Arc::clone(&gate),
+            calls: AtomicUsize::default(),
+        });
+        let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let response = rt.block_on(async {
+            let request_state = state.clone();
+            let request = tokio::spawn(async move {
+                request_json(
+                    router(request_state),
+                    "POST",
+                    "/v1/shares",
+                    "tenant-a-key",
+                    serde_json::json!({"vm_id": vm_id, "guest_port": 8080}),
+                )
+                .await
+            });
+
+            intent_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("durable intent should be written before the mutation");
+            let audits = durable_audits(&state);
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0].action, audit_action::CREATE_SHARE);
+            assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
+            assert!(crate::shares::list(&state, &identity)
+                .await
+                .unwrap()
+                .is_empty());
+
+            let (released, wake) = &*gate;
+            *released.lock().unwrap() = true;
+            wake.notify_one();
+            request.await.unwrap()
+        });
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(durable_audits(&state).len(), 2);
+        drop(rt);
+    }
+
+    #[test]
+    fn share_create_does_not_mutate_when_durable_intent_persistence_fails() {
+        let (mut state, _audits) = test_state_with_audit();
+        state.audit_outbox = Arc::new(AlwaysFailAuditOutbox);
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        let rt = test_runtime();
+
+        let response = rt.block_on(request_json(
+            router(state.clone()),
+            "POST",
+            "/v1/shares",
+            "tenant-a-key",
+            serde_json::json!({"vm_id": vm_id, "guest_port": 8080}),
+        ));
+
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let error = rt.block_on(response_json(response));
-        assert_eq!(error["error"], "share audit unavailable");
+        assert_eq!(
+            rt.block_on(response_json(response))["error"],
+            "share audit unavailable"
+        );
+        assert!(rt
+            .block_on(crate::shares::list(
+                &state,
+                &state.config.api_keys.resolve("tenant-a-key").unwrap()
+            ))
+            .unwrap()
+            .is_empty());
+        drop(rt);
+    }
+
+    #[test]
+    fn share_create_returns_503_when_durable_outcome_persistence_fails() {
+        let (mut state, _audits) = test_state_with_audit();
+        state.audit_outbox = Arc::new(FailAfterFirstAuditOutbox::default());
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        let rt = test_runtime();
+
+        let response = rt.block_on(request_json(
+            router(state.clone()),
+            "POST",
+            "/v1/shares",
+            "tenant-a-key",
+            serde_json::json!({"vm_id": vm_id, "guest_port": 8080}),
+        ));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rt.block_on(response_json(response))["error"],
+            "share audit unavailable"
+        );
+        assert_eq!(
+            rt.block_on(crate::shares::list(
+                &state,
+                &state.config.api_keys.resolve("tenant-a-key").unwrap()
+            ))
+            .unwrap()
+            .len(),
+            1
+        );
+        drop(rt);
+    }
+
+    #[test]
+    fn malformed_share_requests_are_durably_audited_without_unknown_fields() {
+        let (state, _audits) = test_state_with_audit();
+        let share_id = Uuid::new_v4();
+        let vm_id = Uuid::new_v4();
+        let rt = test_runtime();
+        rt.block_on(insert_share(&state, share_id, "tenant-a"));
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+
+        let malformed_create = rt.block_on(request_raw(
+            router(state.clone()),
+            "POST",
+            "/v1/shares",
+            Some("tenant-a-key"),
+            &format!(r#"{{"vm_id":"{vm_id}","guest_port":65536}}"#),
+        ));
+        assert_eq!(malformed_create.status(), StatusCode::BAD_REQUEST);
+
+        let malformed_body = rt.block_on(request_raw(
+            router(state.clone()),
+            "PATCH",
+            &format!("/v1/shares/{share_id}"),
+            Some("tenant-a-key"),
+            r#"{"guest_port":8080"#,
+        ));
+        assert_eq!(malformed_body.status(), StatusCode::BAD_REQUEST);
+
+        let malformed_id = rt.block_on(request_raw(
+            router(state.clone()),
+            "DELETE",
+            "/v1/shares/not-a-uuid",
+            Some("tenant-a-key"),
+            "",
+        ));
+        assert_eq!(malformed_id.status(), StatusCode::BAD_REQUEST);
+
+        let audits = state.store.lock().unwrap().list_unsent_audit(10).unwrap();
+        assert_eq!(audits.len(), 6);
+        assert_eq!(audits[0].action, audit_action::CREATE_SHARE);
+        assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
+        assert_eq!(audits[0].vm_id, Some(vm_id));
+        assert!(audits[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("attempted_guest_port=65536"));
+        assert_eq!(audits[1].outcome, audit_outcome::ERROR);
+        assert_eq!(audits[2].action, audit_action::UPDATE_SHARE);
+        assert_eq!(audits[2].outcome, audit_outcome::ATTEMPT);
+        assert_share_audit_detail(&audits[2], &share_id.to_string(), 8080, "private");
+        assert_eq!(audits[3].outcome, audit_outcome::ERROR);
+        assert_eq!(audits[4].action, audit_action::REVOKE_SHARE);
+        assert_eq!(audits[4].outcome, audit_outcome::ATTEMPT);
+        assert_eq!(audits[4].vm_id, None);
+        assert_eq!(audits[4].detail, None);
+        assert_eq!(audits[5].outcome, audit_outcome::ERROR);
+        assert_eq!(audits[5].detail, None);
+        assert!(audits.iter().all(|audit| !audit
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unknown")));
+        drop(rt);
+    }
+
+    #[test]
+    fn share_peer_unauthorized_is_owner_unavailable() {
+        let response = ShareApiError::from_service(OrchError::Unauthorized).into_response();
+        let rt = test_runtime();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rt.block_on(response_json(response))["error"],
+            "owner_unavailable"
+        );
         drop(rt);
     }
 
@@ -2275,6 +2729,52 @@ mod tests {
             .unwrap()
             .contains("connection refused"));
         drop(rt);
+    }
+
+    struct AlwaysFailAuditOutbox;
+
+    impl audit::DurableAuditOutbox for AlwaysFailAuditOutbox {
+        fn enqueue(&self, _: &AuditEvent) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailAfterFirstAuditOutbox(AtomicUsize);
+
+    impl audit::DurableAuditOutbox for FailAfterFirstAuditOutbox {
+        fn enqueue(&self, _: &AuditEvent) -> Result<(), ()> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    struct BlockingFirstAuditOutbox {
+        store: Arc<Mutex<Store>>,
+        intent_tx: mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        calls: AtomicUsize,
+    }
+
+    impl audit::DurableAuditOutbox for BlockingFirstAuditOutbox {
+        fn enqueue(&self, event: &AuditEvent) -> Result<(), ()> {
+            {
+                let store = self.store.lock().map_err(|_| ())?;
+                store.enqueue_audit(event).map_err(|_| ())?;
+            }
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.intent_tx.send(()).map_err(|_| ())?;
+                let (released, wake) = &*self.gate;
+                let mut released = released.lock().map_err(|_| ())?;
+                while !*released {
+                    released = wake.wait(released).map_err(|_| ())?;
+                }
+            }
+            Ok(())
+        }
     }
 
     fn test_state() -> AppState {
@@ -2332,6 +2832,7 @@ mod tests {
         (
             AppState {
                 config: config.clone(),
+                audit_outbox: Arc::new(audit::LocalAuditOutbox::new(Arc::clone(&store))),
                 store,
                 exec_cache: Arc::new(RwLock::new(HashMap::new())),
                 vm_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -2442,11 +2943,8 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
-    fn next_audit(audits: &mut tokio::sync::mpsc::UnboundedReceiver<StoreWrite>) -> AuditEvent {
-        match audits.try_recv().unwrap() {
-            StoreWrite::Audit(event) => event,
-            _ => panic!("expected audit event"),
-        }
+    fn durable_audits(state: &AppState) -> Vec<AuditEvent> {
+        state.store.lock().unwrap().list_unsent_audit(100).unwrap()
     }
 
     fn assert_share_audit_detail(

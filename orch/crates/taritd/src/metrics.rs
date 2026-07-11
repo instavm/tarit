@@ -512,6 +512,7 @@ mod tests {
         let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
         AppState {
             config: config.clone(),
+            audit_outbox: Arc::new(crate::audit::LocalAuditOutbox::new(Arc::clone(&store))),
             store,
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),

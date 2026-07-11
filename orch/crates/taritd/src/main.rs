@@ -196,6 +196,7 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let shares = shares::ShareRepository::new(Arc::clone(&store), fleet.clone());
     let state = AppState {
         config: config.clone(),
+        audit_outbox: Arc::new(audit::LocalAuditOutbox::new(Arc::clone(&store))),
         store,
         exec_cache: Arc::new(RwLock::new(HashMap::new())),
         vm_cache,
