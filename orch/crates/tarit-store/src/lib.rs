@@ -1039,6 +1039,7 @@ fn share_error_from_sqlite(error: rusqlite::Error) -> StoreError {
         &error,
         rusqlite::Error::SqliteFailure(db_error, _)
             if db_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || db_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
     ) {
         StoreError::Conflict("share slug already exists".into())
     } else {
@@ -1116,6 +1117,15 @@ mod tests {
         let share = test_share("conflicting-share", "tenant-a");
         store.insert_share(&share).unwrap();
 
+        let duplicate_id = ShareRecord {
+            slug: "different-share".into(),
+            ..share.clone()
+        };
+        assert!(matches!(
+            store.insert_share(&duplicate_id),
+            Err(StoreError::Conflict(_))
+        ));
+
         let duplicate_slug = ShareRecord {
             id: Uuid::new_v4(),
             ..share.clone()
@@ -1123,6 +1133,17 @@ mod tests {
         assert!(matches!(
             store.insert_share(&duplicate_slug),
             Err(StoreError::Conflict(_))
+        ));
+
+        let invalid_port = ShareRecord {
+            id: Uuid::new_v4(),
+            slug: "invalid-port-share".into(),
+            guest_port: 0,
+            ..share.clone()
+        };
+        assert!(matches!(
+            store.insert_share(&invalid_port),
+            Err(StoreError::Sqlite(_))
         ));
 
         let key = SshKeyRecord {

@@ -22,6 +22,8 @@ pub enum FleetError {
     NotFound,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("invalid fleet share row: {0}")]
+    InvalidShareRow(String),
 }
 
 pub struct PostgresFleet {
@@ -186,6 +188,9 @@ impl PostgresFleet {
 
     pub async fn insert_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
         let client = self.pool.get().await?;
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let created_at = share.created_at.to_rfc3339();
+        let updated_at = share.updated_at.to_rfc3339();
         client
             .execute(
                 "INSERT INTO fleet_shares (
@@ -200,9 +205,9 @@ impl PostgresFleet {
                     &(i32::from(share.guest_port)),
                     &share_visibility_as_str(share.visibility),
                     &u64_to_sql_i64(share.token_version)?,
-                    &share.revoked_at,
-                    &share.created_at,
-                    &share.updated_at,
+                    &revoked_at,
+                    &created_at,
+                    &updated_at,
                 ],
             )
             .await
@@ -251,6 +256,8 @@ impl PostgresFleet {
 
     pub async fn update_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
         let client = self.pool.get().await?;
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let updated_at = share.updated_at.to_rfc3339();
         let updated = client
             .execute(
                 "UPDATE fleet_shares SET
@@ -264,8 +271,8 @@ impl PostgresFleet {
                     &(i32::from(share.guest_port)),
                     &share_visibility_as_str(share.visibility),
                     &u64_to_sql_i64(share.token_version)?,
-                    &share.revoked_at,
-                    &share.updated_at,
+                    &revoked_at,
+                    &updated_at,
                 ],
             )
             .await
@@ -473,9 +480,9 @@ CREATE TABLE IF NOT EXISTS fleet_shares (
   guest_port INTEGER NOT NULL CHECK (guest_port BETWEEN 1 AND 65535),
   visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
   token_version BIGINT NOT NULL DEFAULT 0,
-  revoked_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL
+  revoked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS fleet_shares_owner ON fleet_shares (owner_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS fleet_shares_vm ON fleet_shares (vm_id);
@@ -517,27 +524,53 @@ fn share_visibility_as_str(visibility: ShareVisibility) -> &'static str {
 }
 
 fn row_to_share(row: &tokio_postgres::Row) -> Result<ShareRecord, FleetError> {
-    let visibility: String = row.get(5);
-    let guest_port: i32 = row.get(4);
-    let token_version: i64 = row.get(6);
+    let id: Uuid = share_column(row, 0, "id")?;
+    let slug: String = share_column(row, 1, "slug")?;
+    let owner_key: String = share_column(row, 2, "owner_key")?;
+    let vm_id: Uuid = share_column(row, 3, "vm_id")?;
+    let guest_port: i32 = share_column(row, 4, "guest_port")?;
+    let visibility: String = share_column(row, 5, "visibility")?;
+    let token_version: i64 = share_column(row, 6, "token_version")?;
+    let revoked_at: Option<String> = share_column(row, 7, "revoked_at")?;
+    let created_at: String = share_column(row, 8, "created_at")?;
+    let updated_at: String = share_column(row, 9, "updated_at")?;
     Ok(ShareRecord {
-        id: row.get(0),
-        slug: row.get(1),
-        owner_key: row.get(2),
-        vm_id: row.get(3),
+        id,
+        slug,
+        owner_key,
+        vm_id,
         guest_port: u16::try_from(guest_port)
-            .map_err(|_| FleetError::Config("invalid share guest port".into()))?,
+            .map_err(|_| FleetError::InvalidShareRow("invalid guest_port".into()))?,
         visibility: match visibility.as_str() {
             "public" => ShareVisibility::Public,
             "private" => ShareVisibility::Private,
-            _ => return Err(FleetError::Config("invalid share visibility".into())),
+            _ => return Err(FleetError::InvalidShareRow("invalid visibility".into())),
         },
         token_version: u64::try_from(token_version)
-            .map_err(|_| FleetError::Config("invalid share token version".into()))?,
-        revoked_at: row.get(7),
-        created_at: row.get(8),
-        updated_at: row.get(9),
+            .map_err(|_| FleetError::InvalidShareRow("invalid token_version".into()))?,
+        revoked_at: revoked_at
+            .as_deref()
+            .map(|value| parse_share_timestamp("revoked_at", value))
+            .transpose()?,
+        created_at: parse_share_timestamp("created_at", &created_at)?,
+        updated_at: parse_share_timestamp("updated_at", &updated_at)?,
     })
+}
+
+fn share_column<T>(row: &tokio_postgres::Row, index: usize, name: &str) -> Result<T, FleetError>
+where
+    for<'a> T: tokio_postgres::types::FromSql<'a>,
+{
+    row.try_get(index)
+        .map_err(|error| FleetError::InvalidShareRow(format!("{name}: {error}")))
+}
+
+fn parse_share_timestamp(column: &str, value: &str) -> Result<DateTime<Utc>, FleetError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            FleetError::InvalidShareRow(format!("invalid {column} timestamp: {error}"))
+        })
 }
 
 fn u64_to_sql_i64(value: u64) -> Result<i64, FleetError> {
@@ -625,7 +658,7 @@ mod tests {
     use tarit_types::ShareRecord;
 
     fn test_share(slug: String, owner_key: &str) -> ShareRecord {
-        let now = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_000).unwrap();
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
         ShareRecord {
             id: Uuid::new_v4(),
             slug,
@@ -634,7 +667,7 @@ mod tests {
             guest_port: 8080,
             visibility: ShareVisibility::Private,
             token_version: 2,
-            revoked_at: None,
+            revoked_at: Some(chrono::DateTime::from_timestamp(1_700_000_001, 987_654_321).unwrap()),
             created_at: now,
             updated_at: now,
         }
@@ -674,6 +707,8 @@ mod tests {
         assert!(FLEET_SCHEMA.contains("slug TEXT NOT NULL UNIQUE"));
         assert!(FLEET_SCHEMA.contains("guest_port BETWEEN 1 AND 65535"));
         assert!(FLEET_SCHEMA.contains("visibility IN ('public', 'private')"));
+        assert!(FLEET_SCHEMA
+            .contains("revoked_at TEXT,\n  created_at TEXT NOT NULL,\n  updated_at TEXT NOT NULL"));
     }
 
     #[allow(dead_code)]
