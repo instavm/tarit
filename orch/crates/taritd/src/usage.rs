@@ -27,14 +27,14 @@ type AliveVm = (Uuid, Option<String>, Option<String>, DateTime<Utc>);
 
 /// Spawn the VM-runtime meter. Every `interval_secs` it bills each alive local
 /// VM for the wall-clock seconds since its last billed watermark.
-pub fn spawn_usage_meter(state: AppState, interval_secs: u64) {
+pub fn spawn_usage_meter(state: AppState, interval_secs: u64) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
             tick.tick().await;
             meter_runtime_once(&state);
         }
-    });
+    })
 }
 
 /// Emit VM-runtime usage for every alive local VM in one pass.
@@ -169,17 +169,18 @@ fn runtime_event(
 /// Spawn the outbox flusher: push locally buffered usage and audit events to the
 /// primary store (Postgres). No-op in single-host mode (no fleet), where events
 /// stay in the local outbox until a fleet is configured.
-pub fn spawn_outbox_flusher(state: AppState, interval_secs: u64) {
-    let Some(fleet) = state.fleet.clone() else {
-        return;
-    };
-    tokio::spawn(async move {
+pub fn spawn_outbox_flusher(
+    state: AppState,
+    interval_secs: u64,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let fleet = state.fleet.clone()?;
+    Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
             tick.tick().await;
             flush_once(&state, &fleet).await;
         }
-    });
+    }))
 }
 
 async fn flush_once(state: &AppState, fleet: &PostgresFleet) {

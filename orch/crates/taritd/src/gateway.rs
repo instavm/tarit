@@ -23,7 +23,7 @@ use crate::cluster::{self, Owner};
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
-pub(crate) async fn run(state: AppState) -> Result<()> {
+pub(crate) async fn run(state: AppState, listener: TcpListener) -> Result<()> {
     let host_key = load_or_generate_host_key(&state.config.ssh_gateway_host_key_path)?;
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::PublicKey);
@@ -36,9 +36,6 @@ pub(crate) async fn run(state: AppState) -> Result<()> {
         ..Default::default()
     });
 
-    let listener = TcpListener::bind(state.config.ssh_gateway_addr)
-        .await
-        .with_context(|| format!("bind SSH gateway {}", state.config.ssh_gateway_addr))?;
     tracing::info!(
         addr = %state.config.ssh_gateway_addr,
         host_key = %state.config.ssh_gateway_host_key_path.display(),

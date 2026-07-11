@@ -27,11 +27,11 @@ const LEADER_TTL_SECS: i64 = 30;
 const HOST_FRESH: Duration = Duration::from_secs(15);
 const COOLDOWN: Duration = Duration::from_secs(60);
 
-pub fn spawn(fleet: Arc<PostgresFleet>, config: Config) {
+pub fn spawn(fleet: Arc<PostgresFleet>, config: Config) -> Option<tokio::task::JoinHandle<()>> {
     if !config.autoscale.enabled {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         tracing::info!(
             min = config.autoscale.min_nodes,
             max = config.autoscale.max_nodes,
@@ -101,7 +101,7 @@ pub fn spawn(fleet: Arc<PostgresFleet>, config: Config) {
                 }
             }
         }
-    });
+    }))
 }
 
 fn actuate(

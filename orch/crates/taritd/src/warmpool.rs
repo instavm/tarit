@@ -16,9 +16,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Spawn the background replenishment loop. No-op unless the pool is enabled.
-pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc<Scheduler>) {
+pub fn spawn_replenisher(
+    sup: Arc<VmmSupervisor>,
+    config: Config,
+    scheduler: Arc<Scheduler>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !config.warm_pool.enabled {
-        return;
+        return None;
     }
     let classes = config.warm_pool.classes.clone();
     let conc = config.warm_pool.replenish_concurrency.max(1);
@@ -34,7 +38,7 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
         HashMap::<VmSpawnConfig, String>::new(),
     ));
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             let mut did_work = false;
             for class in &classes {
@@ -163,5 +167,5 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
         }
-    });
+    }))
 }

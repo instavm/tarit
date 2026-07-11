@@ -278,7 +278,6 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             error.into_response()
         }
     };
-    active_request.finish(response.status().as_u16());
     meter_response_body(response, metrics, active_request)
 }
 
@@ -293,13 +292,26 @@ fn meter_response_body(
     active_request: ActiveShareHttp,
 ) -> Response {
     let (parts, body) = response.into_parts();
-    let stream = body.into_data_stream().map(move |item| {
-        let _active_request = &active_request;
-        if let Ok(bytes) = &item {
-            metrics.add_share_bytes_out(bytes.len() as u64);
-        }
-        item
-    });
+    let status = parts.status.as_u16();
+    let stream = stream::unfold(
+        (Box::pin(body.into_data_stream()), active_request),
+        move |(mut body, active_request)| {
+            let metrics = Arc::clone(&metrics);
+            async move {
+                match body.next().await {
+                    Some(Ok(bytes)) => {
+                        metrics.add_share_bytes_out(bytes.len() as u64);
+                        Some((Ok(bytes), (body, active_request)))
+                    }
+                    Some(Err(error)) => Some((Err(error), (body, active_request))),
+                    None => {
+                        active_request.finish(status);
+                        None
+                    }
+                }
+            }
+        },
+    );
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
@@ -1364,6 +1376,87 @@ mod tests {
         assert!(rendered.contains("taritd_share_bytes_out_total 11"));
         assert!(!rendered.contains(&share.slug));
         assert!(!rendered.contains(&share.owner_key));
+    }
+
+    #[tokio::test]
+    async fn gateway_router_records_cancelled_streams_when_the_client_drops_the_response() {
+        let (upstream, _release_second_chunk, _upstream_complete) =
+            spawn_delayed_streaming_http_upstream().await;
+        let state = gateway_test_state();
+        let metrics = Arc::clone(&state.metrics);
+        install_gateway_share(&state, upstream, ShareVisibility::Public).await;
+        let response = gateway_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .header(HOST, SHARE_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"first")
+        );
+        drop(body);
+
+        let rendered = metrics.render_share_metrics();
+        assert!(rendered.contains(
+            "taritd_share_requests_total{visibility=\"public\",status_class=\"cancelled\"} 1"
+        ));
+        assert!(rendered.contains("taritd_share_active_http 0"));
+    }
+
+    #[tokio::test]
+    async fn gateway_router_websocket_records_bytes_and_releases_its_gauge_on_disconnect() {
+        let (upstream, observed) = spawn_permissive_websocket_echo_upstream().await;
+        let state = gateway_test_state();
+        let metrics = Arc::clone(&state.metrics);
+        install_gateway_share(&state, upstream, ShareVisibility::Public).await;
+        let gateway = start_axum(gateway_router(state)).await;
+        let mut request = format!("ws://{gateway}/socket")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static(SHARE_HOST));
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("chat, alternate"),
+        );
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+        request
+            .headers_mut()
+            .insert(COOKIE, HeaderValue::from_static("session=guest"));
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer guest-token"),
+        );
+
+        let (mut client, _) = connect_async(request).await.unwrap();
+        wait_for_websocket_gauge(&metrics, 1).await;
+        client
+            .send(TungsteniteMessage::Binary(Bytes::from_static(b"bin")))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Binary(Bytes::from_static(b"bin"))
+        );
+        drop(client);
+
+        let observed = observed.await.unwrap();
+        assert!(observed.contains(&"binary"));
+        wait_for_websocket_gauge(&metrics, 0).await;
+        let rendered = metrics.render_share_metrics();
+        assert!(rendered.contains("taritd_share_bytes_in_total 3"));
+        assert!(rendered.contains("taritd_share_bytes_out_total 3"));
+        assert!(rendered.contains("taritd_share_active_websockets 0"));
     }
 
     #[tokio::test]
