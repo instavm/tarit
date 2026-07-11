@@ -6,19 +6,43 @@
 //! behavior is identical whether a request arrives from a client or a peer.
 
 use axum::{
+    body::Body,
     extract::{Extension, Path, State},
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{any, get, patch, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::Utc;
+use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 use tarit_types::{CreateVmRequest, EgressUpdateRequest, RestoreRequest, VmRecord};
 use uuid::Uuid;
 
-use crate::api::{enforce_create_path_policy, ensure_vm_access, ApiError, AppState};
+use crate::{
+    api::{enforce_create_path_policy, ensure_vm_access, ApiError, AppState},
+    cluster::Owner,
+    share_gateway::{self, resolve_share_owner, share_peer_identity_id, GatewayError},
+};
+
+const IDENTITY_SIGNATURE_VERSION: &str = "tarit-peer-identity-v1";
+const MAX_PEER_IDENTITY_AGE_SECS: u64 = 60;
+const MAX_TRACKED_PEER_IDENTITY_NONCES: usize = 65_536;
+static USED_PEER_IDENTITY_NONCES: OnceLock<Mutex<ReplayCache>> = OnceLock::new();
+
+#[derive(Default)]
+struct ReplayCache {
+    nonces: HashSet<Uuid>,
+    expirations: VecDeque<(Instant, Uuid)>,
+}
 use crate::config::{ApiIdentity, ApiRole};
 use crate::ops;
 
@@ -48,6 +72,11 @@ pub fn internal_router(state: AppState) -> Router {
         .route("/internal/v1/vms/{id}/resume", post(internal_resume))
         .route("/internal/v1/vms/{id}/snapshot", post(internal_snapshot))
         .route("/internal/v1/vms/{id}/egress", patch(internal_egress))
+        .route("/internal/v1/shares/{id}", any(internal_share_proxy_root))
+        .route(
+            "/internal/v1/shares/{id}/{*path}",
+            any(internal_share_proxy),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_peer_secret,
@@ -66,13 +95,108 @@ async fn require_peer_secret(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|s| peer_secret_matches(s, &state.config.peer_secret));
     if ok {
-        if let Some(identity) = peer_identity_from_headers(request.headers()) {
+        if let Some(identity) =
+            peer_identity_from_headers(request.headers(), &state.config.peer_secret)
+        {
             request.extensions_mut().insert(identity);
         }
         next.run(request).await
     } else {
-        StatusCode::UNAUTHORIZED.into_response()
+        if request.uri().path().starts_with("/internal/v1/shares/") {
+            GatewayError::Unavailable.into_response()
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
     }
+}
+
+async fn internal_share_proxy_root(
+    State(state): State<AppState>,
+    identity: Option<Extension<ApiIdentity>>,
+    Path(id): Path<Uuid>,
+    request: Request<Body>,
+) -> Response {
+    internal_share_proxy_impl(state, identity.map(|identity| identity.0), id, request).await
+}
+
+async fn internal_share_proxy(
+    State(state): State<AppState>,
+    identity: Option<Extension<ApiIdentity>>,
+    Path((id, _path)): Path<(Uuid, String)>,
+    request: Request<Body>,
+) -> Response {
+    internal_share_proxy_impl(state, identity.map(|identity| identity.0), id, request).await
+}
+
+async fn internal_share_proxy_impl(
+    state: AppState,
+    identity: Option<ApiIdentity>,
+    id: Uuid,
+    request: Request<Body>,
+) -> Response {
+    let result = async {
+        let identity = require_peer_identity(identity.as_ref())?;
+        let share = state
+            .shares
+            .get(id)
+            .await?
+            .filter(|share| share.revoked_at.is_none())
+            .ok_or_else(|| tarit_types::OrchError::NotFound("share not found".into()))?;
+        if !identity.is_admin()
+            && (identity.tenant != share.owner_key
+                || identity.api_key_id != share_peer_identity_id(&share))
+        {
+            return Err(tarit_types::OrchError::Forbidden(
+                "share does not belong to forwarded tenant".into(),
+            ));
+        }
+        if !state.supervisor.is_running(share.vm_id)
+            || !matches!(
+                resolve_share_owner(&state, share.vm_id).await?,
+                Owner::Local
+            )
+        {
+            return Err(tarit_types::OrchError::Internal(
+                "share VM is not owned locally".into(),
+            ));
+        }
+        let request = rewrite_share_request_uri(request, id)?;
+        share_gateway::proxy_authoritative_local_share(&state, &share, request)
+            .await
+            .map_err(|_| tarit_types::OrchError::Internal("share proxy unavailable".into()))
+    }
+    .await;
+
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(share_id = %id, %error, "internal share proxy rejected");
+            GatewayError::Unavailable.into_response()
+        }
+    }
+}
+
+fn rewrite_share_request_uri(
+    request: Request<Body>,
+    id: Uuid,
+) -> Result<Request<Body>, tarit_types::OrchError> {
+    let (mut parts, body) = request.into_parts();
+    let prefix = format!("/internal/v1/shares/{id}");
+    let path = parts
+        .uri
+        .path()
+        .strip_prefix(&prefix)
+        .filter(|path| path.is_empty() || path.starts_with('/'))
+        .ok_or_else(|| tarit_types::OrchError::BadRequest("invalid internal share path".into()))?;
+    let path = if path.is_empty() { "/" } else { path };
+    let target = match parts.uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    parts.uri = target
+        .parse::<Uri>()
+        .map_err(|_| tarit_types::OrchError::BadRequest("invalid share request URI".into()))?;
+    Ok(Request::from_parts(parts, body))
 }
 
 /// Constant-time comparison of the presented peer secret against the configured
@@ -88,26 +212,71 @@ fn peer_secret_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
-fn peer_identity_from_headers(headers: &HeaderMap) -> Option<ApiIdentity> {
-    let tenant = headers
-        .get("X-Tarit-Tenant")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty())?;
-    let role = headers
-        .get("X-Tarit-Role")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<ApiRole>().ok())?;
-    let api_key_id = headers
-        .get("X-Tarit-Api-Key-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+fn peer_identity_from_headers(headers: &HeaderMap, peer_secret: &str) -> Option<ApiIdentity> {
+    let tenant = single_header(headers, "X-Tarit-Tenant").filter(|value| !value.is_empty())?;
+    let role =
+        single_header(headers, "X-Tarit-Role").and_then(|value| value.parse::<ApiRole>().ok())?;
+    let api_key_id = single_header(headers, "X-Tarit-Api-Key-Id")?;
+    let issued_at = single_header(headers, "X-Tarit-Identity-Timestamp")
+        .and_then(|value| value.parse::<i64>().ok())?;
+    if Utc::now().timestamp().abs_diff(issued_at) > MAX_PEER_IDENTITY_AGE_SECS {
+        return None;
+    }
+    let nonce = single_header(headers, "X-Tarit-Identity-Nonce")
+        .and_then(|value| Uuid::parse_str(value).ok())?;
+    let signature = single_header(headers, "X-Tarit-Identity-Signature")
+        .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(peer_secret.as_bytes()).ok()?;
+    mac.update(IDENTITY_SIGNATURE_VERSION.as_bytes());
+    mac.update(b"\n");
+    mac.update(issued_at.to_string().as_bytes());
+    mac.update(b"\n");
+    mac.update(nonce.to_string().as_bytes());
+    mac.update(b"\n");
+    mac.update(tenant.as_bytes());
+    mac.update(b"\n");
+    mac.update(role.as_str().as_bytes());
+    mac.update(b"\n");
+    mac.update(api_key_id.as_bytes());
+    mac.verify_slice(&signature).ok()?;
+    consume_peer_identity_nonce(nonce)?;
     Some(ApiIdentity {
         tenant: tenant.to_string(),
         role,
         max_vms: None,
-        api_key_id,
+        api_key_id: api_key_id.to_string(),
     })
+}
+
+fn consume_peer_identity_nonce(nonce: Uuid) -> Option<()> {
+    let now = Instant::now();
+    let expires_at = now + Duration::from_secs(MAX_PEER_IDENTITY_AGE_SECS);
+    let mut cache = USED_PEER_IDENTITY_NONCES
+        .get_or_init(|| Mutex::new(ReplayCache::default()))
+        .lock()
+        .ok()?;
+    while cache
+        .expirations
+        .front()
+        .is_some_and(|(expires_at, _)| *expires_at <= now)
+    {
+        if let Some((_, expired_nonce)) = cache.expirations.pop_front() {
+            cache.nonces.remove(&expired_nonce);
+        }
+    }
+    if cache.nonces.len() >= MAX_TRACKED_PEER_IDENTITY_NONCES || !cache.nonces.insert(nonce) {
+        return None;
+    }
+    cache.expirations.push_back((expires_at, nonce));
+    Some(())
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let values = headers.get_all(name);
+    (values.iter().count() == 1)
+        .then(|| values.iter().next())
+        .flatten()
+        .and_then(|value| value.to_str().ok())
 }
 
 /// Resolve the peer-forwarded caller identity, failing closed if the signed

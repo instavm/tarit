@@ -47,7 +47,17 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::{api::AppState, net::NetAlloc, shares, supervisor::NetworkLease};
+use crate::{
+    api::AppState,
+    cluster::{self, Owner},
+    config::{ApiIdentity, ApiRole},
+    net::NetAlloc,
+    shares,
+    supervisor::NetworkLease,
+};
+
+#[cfg(test)]
+use std::{collections::HashMap, sync::OnceLock};
 
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
@@ -80,7 +90,7 @@ impl PendingPings {
 }
 
 #[derive(Clone)]
-struct TrustedForwarding {
+pub(crate) struct TrustedForwarding {
     peer: Option<SocketAddr>,
     host: String,
 }
@@ -126,7 +136,7 @@ impl UpstreamTarget {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum GatewayError {
+pub(crate) enum GatewayError {
     Unauthorized,
     NotFound,
     Unavailable,
@@ -166,9 +176,44 @@ impl IntoResponse for GatewayError {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/internal/v1", any(reject_internal_path))
+        .route("/internal/v1/{*path}", any(reject_internal_path))
         .route("/", any(handle_request))
         .route("/{*path}", any(handle_request))
         .with_state(state)
+}
+
+#[cfg(test)]
+static TEST_REMOTE_OWNERS: OnceLock<Mutex<HashMap<(String, uuid::Uuid), String>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_test_remote_owner(host_id: &str, id: uuid::Uuid, rpc_addr: String) {
+    TEST_REMOTE_OWNERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("test remote owner lock")
+        .insert((host_id.to_string(), id), rpc_addr);
+}
+
+pub(crate) async fn resolve_share_owner(
+    state: &AppState,
+    id: uuid::Uuid,
+) -> Result<Owner, OrchError> {
+    #[cfg(test)]
+    if let Some(rpc_addr) = TEST_REMOTE_OWNERS.get().and_then(|owners| {
+        owners
+            .lock()
+            .ok()?
+            .get(&(state.config.host_id.clone(), id))
+            .cloned()
+    }) {
+        return Ok(Owner::Remote(rpc_addr));
+    }
+    cluster::resolve_owner(state, id).await
+}
+
+async fn reject_internal_path() -> Response {
+    GatewayError::NotFound.into_response()
 }
 
 async fn handle_request(State(state): State<AppState>, request: Request<Body>) -> Response {
@@ -190,32 +235,172 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             host: format!("{slug}.{domain}"),
         };
         let (mut parts, body) = request.into_parts();
+        let owner = resolve_share_owner(&state, share.vm_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(share_id = %share.id, %error, "share owner resolution failed");
+                GatewayError::Unavailable
+            })?;
 
         if is_websocket_request(&parts) {
             let protocols = requested_subprotocols(&parts.headers)?;
             let websocket = WebSocketUpgrade::from_request_parts(&mut parts, &state)
                 .await
                 .map_err(|_| GatewayError::NotFound)?;
-            proxy_local_websocket(
-                &state,
-                &share,
-                &parts.uri,
-                websocket,
-                protocols,
-                &parts.headers,
-                &forwarding,
-                connect_timeout(&state),
-                idle_timeout(&state),
-            )
-            .await
+            match owner {
+                Owner::Local => {
+                    proxy_local_websocket(
+                        &state,
+                        &share,
+                        &parts.uri,
+                        websocket,
+                        protocols,
+                        &parts.headers,
+                        &forwarding,
+                        connect_timeout(&state),
+                        idle_timeout(&state),
+                    )
+                    .await
+                }
+                Owner::Remote(rpc_addr) => {
+                    proxy_remote_websocket(
+                        &state,
+                        &share,
+                        &rpc_addr,
+                        &parts.uri,
+                        websocket,
+                        protocols,
+                        &parts.headers,
+                    )
+                    .await
+                }
+            }
         } else {
             parts.extensions.insert(forwarding);
-            proxy_local_http(&state, &share, Request::from_parts(parts, body)).await
+            let request = Request::from_parts(parts, body);
+            match owner {
+                Owner::Local => proxy_local_http(&state, &share, request).await,
+                Owner::Remote(rpc_addr) => {
+                    proxy_remote_http(&state, &share, &rpc_addr, request).await
+                }
+            }
         }
     }
     .await;
 
     result.unwrap_or_else(IntoResponse::into_response)
+}
+
+fn share_identity(share: &ShareRecord) -> ApiIdentity {
+    ApiIdentity {
+        tenant: share.owner_key.clone(),
+        role: ApiRole::User,
+        max_vms: None,
+        api_key_id: share_peer_identity_id(share),
+    }
+}
+
+pub(crate) fn share_peer_identity_id(share: &ShareRecord) -> String {
+    format!("share:{}:{}", share.id, share.token_version)
+}
+
+async fn proxy_remote_http(
+    state: &AppState,
+    share: &ShareRecord,
+    rpc_addr: &str,
+    request: Request<Body>,
+) -> Result<Response, GatewayError> {
+    let identity = share_identity(share);
+    state
+        .peer
+        .proxy_share_http(rpc_addr, share.id, &identity, request)
+        .await
+        .map_err(|error| {
+            tracing::warn!(share_id = %share.id, %error, "owner share HTTP proxy failed");
+            GatewayError::Unavailable
+        })
+}
+
+async fn proxy_remote_websocket(
+    state: &AppState,
+    share: &ShareRecord,
+    rpc_addr: &str,
+    request_uri: &Uri,
+    websocket: WebSocketUpgrade,
+    protocols: Vec<String>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Response, GatewayError> {
+    let identity = share_identity(share);
+    let (upstream, response_protocol) = time::timeout(
+        connect_timeout(state),
+        state.peer.connect_share_websocket(
+            rpc_addr,
+            share.id,
+            &identity,
+            request_uri,
+            headers,
+            &protocols,
+        ),
+    )
+    .await
+    .map_err(|_| GatewayError::Unavailable)?
+    .map_err(|error| {
+        tracing::warn!(share_id = %share.id, %error, "owner share WebSocket proxy failed");
+        GatewayError::Unavailable
+    })?;
+    let protocol = negotiated_protocol(response_protocol.as_deref(), &protocols)?;
+    let websocket = if let Some(protocol) = protocol {
+        websocket.protocols([protocol])
+    } else {
+        websocket
+    };
+    let idle_timeout = idle_timeout(state);
+    let metrics = Arc::clone(&state.metrics);
+    Ok(websocket.on_upgrade(move |client| async move {
+        let _active_websocket = metrics.track_share_websocket();
+        bridge_websocket(client, upstream, idle_timeout).await;
+    }))
+}
+
+/// Handle the owner-side peer request after the internal router has loaded and
+/// authorized the authoritative share record. The peer URL is never exposed to
+/// this function; it only derives a guest target from the local supervisor.
+pub(crate) async fn proxy_authoritative_local_share(
+    state: &AppState,
+    share: &ShareRecord,
+    request: Request<Body>,
+) -> Result<Response, GatewayError> {
+    let domain = state
+        .config
+        .share_domain
+        .as_deref()
+        .ok_or(GatewayError::Unavailable)?;
+    let forwarding = TrustedForwarding {
+        peer: None,
+        host: format!("{}.{}", share.slug, domain),
+    };
+    let (mut parts, body) = request.into_parts();
+    if is_websocket_request(&parts) {
+        let protocols = requested_subprotocols(&parts.headers)?;
+        let websocket = WebSocketUpgrade::from_request_parts(&mut parts, state)
+            .await
+            .map_err(|_| GatewayError::Unavailable)?;
+        proxy_local_websocket(
+            state,
+            share,
+            &parts.uri,
+            websocket,
+            protocols,
+            &parts.headers,
+            &forwarding,
+            connect_timeout(state),
+            idle_timeout(state),
+        )
+        .await
+    } else {
+        parts.extensions.insert(forwarding);
+        proxy_local_http(state, share, Request::from_parts(parts, body)).await
+    }
 }
 
 fn is_websocket_request(parts: &axum::http::request::Parts) -> bool {
@@ -539,6 +724,8 @@ fn should_strip_request_header(
         || name == FORWARDED
         || name.as_str().starts_with("x-forwarded-")
         || name.as_str() == "x-real-ip"
+        || name.as_str() == "x-peer-secret"
+        || name.as_str().starts_with("x-tarit-")
 }
 
 fn should_strip_response_header(
@@ -548,6 +735,10 @@ fn should_strip_response_header(
     is_hop_by_hop(name, connection_headers)
         || name == PROXY_AUTHENTICATE
         || name == PROXY_AUTHORIZATION
+        || name == FORWARDED
+        || name.as_str().starts_with("x-forwarded-")
+        || name.as_str() == "x-real-ip"
+        || name.as_str().starts_with("x-tarit-")
 }
 
 fn is_hop_by_hop(name: &HeaderName, connection_headers: &HashSet<HeaderName>) -> bool {
@@ -647,7 +838,13 @@ async fn proxy_websocket_to_target(
         .await
         .map_err(|_| GatewayError::Unavailable)?
         .map_err(|_| GatewayError::Unavailable)?;
-    let protocol = negotiated_protocol(response.headers().get(SEC_WEBSOCKET_PROTOCOL), &protocols)?;
+    let protocol = negotiated_protocol(
+        response
+            .headers()
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok()),
+        &protocols,
+    )?;
     let websocket = if let Some(protocol) = protocol {
         websocket.protocols([protocol])
     } else {
@@ -661,16 +858,16 @@ async fn proxy_websocket_to_target(
 }
 
 fn negotiated_protocol(
-    response_protocol: Option<&HeaderValue>,
+    response_protocol: Option<&str>,
     requested: &[String],
 ) -> Result<Option<String>, GatewayError> {
     let Some(response_protocol) = response_protocol else {
         return Ok(None);
     };
     let protocol = response_protocol
-        .to_str()
-        .ok()
-        .filter(|protocol| protocol.bytes().all(is_websocket_token_byte))
+        .bytes()
+        .all(is_websocket_token_byte)
+        .then_some(response_protocol)
         .filter(|protocol| requested.iter().any(|requested| requested == protocol))
         .ok_or(GatewayError::Unavailable)?;
     Ok(Some(protocol.into()))
@@ -898,8 +1095,11 @@ mod tests {
         routing::{get, post},
         Router,
     };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use chrono::Utc;
     use futures_util::{SinkExt, StreamExt};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use std::{
         collections::HashMap,
         convert::Infallible,
@@ -1041,6 +1241,26 @@ mod tests {
         let response = gateway_router(state).oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gateway_router_does_not_expose_internal_paths() {
+        let upstream = start_axum(Router::new().route(
+            "/{*path}",
+            get(|| async { Response::new(Body::from("guest internal endpoint")) }),
+        ))
+        .await;
+        let state = gateway_test_state();
+        install_gateway_share(&state, upstream, ShareVisibility::Public).await;
+        let request = Request::builder()
+            .uri("/internal/v1/shares/not-a-tarit-route")
+            .header(HOST, SHARE_HOST)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1438,7 +1658,398 @@ mod tests {
         wait_for_websocket_gauge(&metrics, 0).await;
     }
 
+    #[tokio::test]
+    async fn remote_owner_preserves_stream_chunks_and_identity() {
+        let mut cluster = TestShareCluster::start().await;
+
+        let response = cluster
+            .request_through_non_owner_with_header(
+                "/stream?keep=this",
+                "x-tarit-tenant",
+                "attacker-tenant",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.bytes_stream();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), body.next())
+                .await
+                .expect("owner should stream the first chunk promptly")
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"first")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), cluster.owner_tenant())
+                .await
+                .expect("owner should receive the forwarding identity"),
+            "tenant-a"
+        );
+
+        cluster.release_second_chunk();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), body.next())
+                .await
+                .expect("owner should stream the delayed chunk")
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"second")
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_share_route_rejects_missing_or_forged_identity() {
+        let cluster = TestShareCluster::start().await;
+
+        let missing_secret = reqwest::Client::new()
+            .get(cluster.owner_share_url("/stream"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_secret.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let forged_admin = reqwest::Client::new()
+            .get(cluster.owner_share_url("/stream"))
+            .header("x-peer-secret", "peer-secret")
+            .header("x-tarit-tenant", "tenant-b")
+            .header("x-tarit-role", "admin")
+            .header("x-tarit-api-key-id", "forged")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forged_admin.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn peer_share_identity_cannot_be_replayed() {
+        let upstream = start_axum(
+            Router::new().route("/stream", get(|| async { Response::new(Body::from("ok")) })),
+        )
+        .await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+        let headers = signed_share_identity_headers(&cluster.share);
+
+        let first = reqwest::Client::new()
+            .get(cluster.owner_share_url("/stream"))
+            .headers(headers.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replay = reqwest::Client::new()
+            .get(cluster.owner_share_url("/stream"))
+            .headers(headers)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn remote_owner_enforces_private_share_auth_and_strips_share_tokens() {
+        let (upstream, received) = spawn_inspecting_http_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Private).await;
+        let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
+            .issue(&cluster.share, Utc::now())
+            .unwrap();
+
+        let missing_token = cluster.request_through_non_owner("/inspect").await;
+        assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
+
+        let response = cluster
+            .request_through_non_owner_with_header(
+                "/inspect?preserve=this",
+                "x-tarit-share-token",
+                &token,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, uri) = received.await.unwrap();
+        assert_eq!(uri, "/inspect?preserve=this");
+        assert!(headers.get("x-tarit-share-token").is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_owner_streams_large_uploads_and_query_strings() {
+        let (upstream, received) = spawn_large_echo_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/upload?large=yes", cluster.client_addr))
+            .header(HOST, SHARE_HOST)
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter([
+                Ok::<_, std::io::Error>(Bytes::copy_from_slice(&payload[..512 * 1024])),
+                Ok(Bytes::copy_from_slice(&payload[512 * 1024..])),
+            ])))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), payload.as_slice());
+        let (uri, received_len) = received.await.unwrap();
+        assert_eq!(uri, "/upload?large=yes");
+        assert_eq!(received_len, payload.len());
+    }
+
+    #[tokio::test]
+    async fn remote_owner_bridges_websocket_frames_and_releases_both_nodes() {
+        let (upstream, observed) = spawn_permissive_websocket_echo_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+        let mut request = format!("ws://{}/socket?keep=this", cluster.client_addr)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static(SHARE_HOST));
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("chat, alternate"),
+        );
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+        request
+            .headers_mut()
+            .insert(COOKIE, HeaderValue::from_static("session=guest"));
+        request
+            .headers_mut()
+            .insert(AUTHORIZATION, HeaderValue::from_static("******"));
+        request.headers_mut().insert(
+            "x-tarit-share-token",
+            HeaderValue::from_static("must-not-reach-guest"),
+        );
+
+        let (mut client, response) = connect_async(request).await.unwrap();
+        assert_eq!(
+            response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
+            "chat"
+        );
+        wait_for_websocket_gauge(&cluster.client_metrics, 1).await;
+        wait_for_websocket_gauge(&cluster.owner_metrics, 1).await;
+
+        client
+            .send(TungsteniteMessage::Binary(Bytes::from_static(
+                b"through-owner",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Binary(Bytes::from_static(b"through-owner"))
+        );
+        drop(client);
+
+        wait_for_websocket_gauge(&cluster.client_metrics, 0).await;
+        wait_for_websocket_gauge(&cluster.owner_metrics, 0).await;
+        assert!(observed.await.unwrap().contains(&"binary"));
+    }
+
+    #[tokio::test]
+    async fn remote_owner_rejects_a_node_that_no_longer_owns_the_vm() {
+        let cluster = TestShareCluster::start().await;
+        super::set_test_remote_owner("owner", cluster.share.vm_id, "http://127.0.0.1:9".into());
+
+        let response = cluster.request_through_non_owner("/stream").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn remote_owner_rechecks_the_authoritative_share_version() {
+        let cluster = TestShareCluster::start().await;
+        let mut updated = cluster.share.clone();
+        updated.token_version += 1;
+        cluster.owner_shares.update(&updated).await.unwrap();
+
+        let response = cluster.request_through_non_owner("/stream").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn remote_share_rejects_dot_segment_paths() {
+        let cluster = TestShareCluster::start().await;
+        for path in ["/../../vms", "/%2e%2e/%2E%2e/vms"] {
+            let response = gateway_router(cluster.client_state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(HOST, SHARE_HOST)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    struct TestShareCluster {
+        client_state: AppState,
+        client_addr: SocketAddr,
+        owner_addr: SocketAddr,
+        share_id: Uuid,
+        share: ShareRecord,
+        owner_shares: ShareRepository,
+        client_metrics: Arc<Metrics>,
+        owner_metrics: Arc<Metrics>,
+        owner_tenants: mpsc::UnboundedReceiver<String>,
+        release_second_chunk: Option<oneshot::Sender<()>>,
+    }
+
+    impl TestShareCluster {
+        async fn start() -> Self {
+            let (upstream, release_second_chunk, _upstream_complete) =
+                spawn_delayed_streaming_http_upstream().await;
+            Self::start_with(
+                upstream,
+                ShareVisibility::Public,
+                Some(release_second_chunk),
+            )
+            .await
+        }
+
+        async fn start_with_upstream(upstream: SocketAddr, visibility: ShareVisibility) -> Self {
+            Self::start_with(upstream, visibility, None).await
+        }
+
+        async fn start_with(
+            upstream: SocketAddr,
+            visibility: ShareVisibility,
+            release_second_chunk: Option<oneshot::Sender<()>>,
+        ) -> Self {
+            let owner = gateway_test_state_for_host("owner");
+            let owner_metrics = Arc::clone(&owner.metrics);
+            let owner_shares = owner.shares.clone();
+            let share = install_gateway_share(&owner, upstream, visibility).await;
+            let (owner_tenant_tx, owner_tenants) = mpsc::unbounded_channel();
+            let owner_addr = start_axum(crate::internal::internal_router(owner).layer(
+                axum::middleware::from_fn(
+                    move |request: Request<Body>, next: axum::middleware::Next| {
+                        let owner_tenant_tx = owner_tenant_tx.clone();
+                        async move {
+                            if let Some(tenant) = request
+                                .headers()
+                                .get("x-tarit-tenant")
+                                .and_then(|value| value.to_str().ok())
+                            {
+                                let _ = owner_tenant_tx.send(tenant.to_string());
+                            }
+                            next.run(request).await
+                        }
+                    },
+                ),
+            ))
+            .await;
+
+            let client = gateway_test_state_for_host("non-owner");
+            let client_metrics = Arc::clone(&client.metrics);
+            client.shares.insert(&share).await.unwrap();
+            let client_addr = start_axum(gateway_router(client.clone())).await;
+            super::set_test_remote_owner("non-owner", share.vm_id, format!("http://{owner_addr}"));
+
+            Self {
+                client_state: client,
+                client_addr,
+                owner_addr,
+                share_id: share.id,
+                share,
+                owner_shares,
+                client_metrics,
+                owner_metrics,
+                owner_tenants,
+                release_second_chunk,
+            }
+        }
+
+        async fn request_through_non_owner(&self, path: &str) -> reqwest::Response {
+            self.request_through_non_owner_with_header(path, "x-request-id", "test")
+                .await
+        }
+
+        async fn request_through_non_owner_with_header(
+            &self,
+            path: &str,
+            header: &str,
+            value: &str,
+        ) -> reqwest::Response {
+            reqwest::Client::new()
+                .get(format!("http://{}{}", self.client_addr, path))
+                .header(HOST, SHARE_HOST)
+                .header(header, value)
+                .send()
+                .await
+                .unwrap()
+        }
+
+        async fn owner_tenant(&mut self) -> String {
+            self.owner_tenants.recv().await.unwrap()
+        }
+
+        fn owner_share_url(&self, path: &str) -> String {
+            format!(
+                "http://{}/internal/v1/shares/{}{}",
+                self.owner_addr, self.share_id, path
+            )
+        }
+
+        fn release_second_chunk(&mut self) {
+            self.release_second_chunk.take().unwrap().send(()).unwrap();
+        }
+    }
+
     fn gateway_test_state() -> AppState {
+        gateway_test_state_for_host("test-host")
+    }
+
+    fn signed_share_identity_headers(share: &ShareRecord) -> HeaderMap {
+        let issued_at = Utc::now().timestamp();
+        let nonce = Uuid::new_v4().to_string();
+        let identity_id = super::share_peer_identity_id(share);
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
+        mac.update(b"tarit-peer-identity-v1\n");
+        mac.update(issued_at.to_string().as_bytes());
+        mac.update(b"\n");
+        mac.update(nonce.as_bytes());
+        mac.update(b"\n");
+        mac.update(share.owner_key.as_bytes());
+        mac.update(b"\nuser\n");
+        mac.update(identity_id.as_bytes());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-peer-secret", HeaderValue::from_static("peer-secret"));
+        headers.insert(
+            "x-tarit-tenant",
+            HeaderValue::from_str(&share.owner_key).unwrap(),
+        );
+        headers.insert("x-tarit-role", HeaderValue::from_static("user"));
+        headers.insert(
+            "x-tarit-api-key-id",
+            HeaderValue::from_str(&identity_id).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-identity-timestamp",
+            HeaderValue::from_str(&issued_at.to_string()).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-identity-nonce",
+            HeaderValue::from_str(&nonce).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-identity-signature",
+            HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())).unwrap(),
+        );
+        headers
+    }
+
+    fn gateway_test_state_for_host(host_id: &str) -> AppState {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
@@ -1448,7 +2059,7 @@ mod tests {
                 0,
             )])
             .unwrap(),
-            host_id: "test-host".into(),
+            host_id: host_id.into(),
             vmm_bin: PathBuf::from("target/taritd-gateway-test/vmm"),
             kernel: PathBuf::from("target/taritd-gateway-test/kernel"),
             rootfs: PathBuf::from("target/taritd-gateway-test/rootfs"),
@@ -1656,6 +2267,32 @@ mod tests {
         (start_axum(app).await, headers_rx)
     }
 
+    async fn spawn_large_echo_upstream() -> (SocketAddr, oneshot::Receiver<(Uri, usize)>) {
+        let (received_tx, received_rx) = oneshot::channel();
+        let received_tx = Arc::new(Mutex::new(Some(received_tx)));
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(
+                    |State(tx): State<Arc<Mutex<Option<oneshot::Sender<(Uri, usize)>>>>>,
+                     uri: Uri,
+                     body: Body| async move {
+                        let mut body = body.into_data_stream();
+                        let mut bytes = Vec::new();
+                        while let Some(chunk) = body.next().await {
+                            bytes.extend_from_slice(&chunk.unwrap());
+                        }
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send((uri, bytes.len()));
+                        }
+                        Response::new(Body::from(bytes))
+                    },
+                ),
+            )
+            .with_state(received_tx);
+        (start_axum(app).await, received_rx)
+    }
+
     async fn spawn_upload_draining_upstream() -> SocketAddr {
         let app = Router::new().route(
             "/upload",
@@ -1782,6 +2419,49 @@ mod tests {
                         observed.push("close");
                         let _ = frame;
                         socket.flush().await.unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = observed_tx.send(observed);
+        });
+        (addr, observed_rx)
+    }
+
+    async fn spawn_permissive_websocket_echo_upstream(
+    ) -> (SocketAddr, oneshot::Receiver<Vec<&'static str>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(
+                stream,
+                |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        "sec-websocket-protocol",
+                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let mut observed = Vec::new();
+            while let Some(message) = socket.next().await {
+                match message.unwrap() {
+                    TungsteniteMessage::Binary(bytes) => {
+                        observed.push("binary");
+                        socket
+                            .send(TungsteniteMessage::Binary(bytes))
+                            .await
+                            .unwrap();
+                    }
+                    TungsteniteMessage::Close(frame) => {
+                        observed.push("close");
+                        let _ = socket.send(TungsteniteMessage::Close(frame)).await;
                         break;
                     }
                     _ => {}
