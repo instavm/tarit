@@ -7,8 +7,10 @@
 //! the host uplink. Requires CAP_NET_ADMIN (run taritd as root); gated behind
 //! `TARIT_ENABLE_NET` so the default (no-net) path is unaffected.
 
+use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -744,9 +746,17 @@ fn egress_comment(alloc: &NetAlloc) -> String {
 
 /// Parse one `cidr[:port[/proto]]` allowlist entry, mirroring the VMM grammar.
 /// Returns `(cidr, port, proto)` where `proto` is `None` for "any port/proto".
+/// Port zero is rejected.
 fn parse_egress_entry(entry: &str) -> Result<(String, u16, Option<&'static str>), OrchError> {
     if entry.is_empty() {
         return Err(OrchError::BadRequest("empty egress rule".into()));
+    }
+    if matches!(entry.parse::<IpAddr>(), Ok(IpAddr::V6(_)))
+        || matches!(entry.parse::<IpNet>(), Ok(IpNet::V6(_)))
+    {
+        return Err(OrchError::BadRequest(format!(
+            "bad egress rule {entry:?}: IPv6 CIDRs are unsupported"
+        )));
     }
     let (cidr, port_proto) = match entry.split_once(':') {
         Some(("", _)) => {
@@ -757,8 +767,9 @@ fn parse_egress_entry(entry: &str) -> Result<(String, u16, Option<&'static str>)
         Some((cidr, rest)) => (cidr, Some(rest)),
         None => (entry, None),
     };
+    let cidr = parse_ipv4_egress_cidr(cidr, entry)?.to_string();
     let Some(port_proto) = port_proto else {
-        return Ok((cidr.to_string(), 0, None));
+        return Ok((cidr, 0, None));
     };
     let (port_str, proto) = match port_proto.split_once('/') {
         Some((port, "tcp")) => (port, "tcp"),
@@ -775,7 +786,36 @@ fn parse_egress_entry(entry: &str) -> Result<(String, u16, Option<&'static str>)
             "bad egress rule {entry:?}: invalid port {port_str:?}"
         ))
     })?;
-    Ok((cidr.to_string(), port, Some(proto)))
+    if port == 0 {
+        return Err(OrchError::BadRequest(format!(
+            "bad egress rule {entry:?}: invalid port {port_str:?}"
+        )));
+    }
+    Ok((cidr, port, Some(proto)))
+}
+
+fn parse_ipv4_egress_cidr(cidr: &str, entry: &str) -> Result<Ipv4Net, OrchError> {
+    match cidr.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => Ipv4Net::new(addr, 32)
+            .map(|cidr| cidr.trunc())
+            .map_err(|_| {
+                OrchError::BadRequest(format!(
+                    "bad egress rule {entry:?}: invalid IPv4 CIDR {cidr:?}"
+                ))
+            }),
+        Ok(IpAddr::V6(_)) => Err(OrchError::BadRequest(format!(
+            "bad egress rule {entry:?}: IPv6 CIDRs are unsupported"
+        ))),
+        Err(_) => match cidr.parse::<IpNet>() {
+            Ok(IpNet::V4(cidr)) => Ok(cidr.trunc()),
+            Ok(IpNet::V6(_)) => Err(OrchError::BadRequest(format!(
+                "bad egress rule {entry:?}: IPv6 CIDRs are unsupported"
+            ))),
+            Err(_) => Err(OrchError::BadRequest(format!(
+                "bad egress rule {entry:?}: invalid IPv4 CIDR {cidr:?}"
+            ))),
+        },
+    }
 }
 
 /// Build the nft `add rule` argv for one allowlist entry in the forward chain.
@@ -895,16 +935,39 @@ mod tests {
         );
         assert_eq!(
             parse_egress_entry("1.2.3.4:443").unwrap(),
-            ("1.2.3.4".to_string(), 443, Some("tcp"))
+            ("1.2.3.4/32".to_string(), 443, Some("tcp"))
         );
         assert_eq!(
             parse_egress_entry("8.8.8.8:53/udp").unwrap(),
-            ("8.8.8.8".to_string(), 53, Some("udp"))
+            ("8.8.8.8/32".to_string(), 53, Some("udp"))
         );
         assert!(parse_egress_entry("").is_err());
         assert!(parse_egress_entry(":443").is_err());
         assert!(parse_egress_entry("1.2.3.4:443/sctp").is_err());
         assert!(parse_egress_entry("1.2.3.4:notaport").is_err());
+    }
+
+    #[test]
+    fn egress_entry_rejects_injected_and_malformed_ipv4_cidrs() {
+        for entry in [
+            "192.0.2.0/24 accept; list chain ip taritd_nat vm_egress; #",
+            "192.0.2.0/24 accept; list chain ip taritd_nat vm_egress; #:443",
+            "192.0.2.0/33",
+            "192.0.2/24",
+            "192.0.2.0/not-a-prefix",
+            "egress.example",
+            "192.0.2.0/24 ",
+            "192.0.2.0/24:0",
+        ] {
+            assert!(
+                parse_egress_entry(entry).is_err(),
+                "invalid egress entry was accepted: {entry:?}"
+            );
+        }
+        assert!(matches!(
+            parse_egress_entry("2001:db8::/32").unwrap_err(),
+            OrchError::BadRequest(message) if message.contains("IPv6")
+        ));
     }
 
     #[test]
@@ -932,6 +995,17 @@ mod tests {
         let tcp = compile_host_egress_rule("172.16.0.2", "1.2.3.4:443", "\"c\"").unwrap();
         assert!(tcp.windows(3).any(|w| w == ["tcp", "dport", "443"]));
         assert_eq!(tcp.last().unwrap(), "\"c\"");
+
+        let canonical =
+            compile_host_egress_rule("172.16.0.2", "192.0.2.42/24:443", "\"c\"").unwrap();
+        assert!(canonical
+            .windows(3)
+            .any(|w| w == ["ip", "daddr", "192.0.2.0/24"]));
+
+        let host = compile_host_egress_rule("172.16.0.2", "192.0.2.42", "\"c\"").unwrap();
+        assert!(host
+            .windows(3)
+            .any(|w| w == ["ip", "daddr", "192.0.2.42/32"]));
     }
 
     #[test]

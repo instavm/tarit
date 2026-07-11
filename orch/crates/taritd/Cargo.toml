@@ -16,6 +16,7 @@ chrono = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 futures-util = { workspace = true }
+ipnet = { workspace = true }
 tarit-fleet = { path = "../tarit-fleet" }
 tarit-store = { path = "../tarit-store" }
 tarit-types = { path = "../tarit-types" }
