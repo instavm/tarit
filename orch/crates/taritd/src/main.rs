@@ -235,62 +235,30 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
     }
 
     let shutdown_state = state.clone();
-    let app = router(state.clone()).merge(internal::internal_router(state));
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("bind {}", config.listen))?;
+    let (listener, share_listener) =
+        bind_http_listeners(config.listen, config.share_listen).await?;
+    let (app, share_app) = server_routers(state);
 
-    tracing::info!("listening on http://{}", config.listen);
+    tracing::info!("control listener listening on http://{}", config.listen);
+    if let Some(share_addr) = config.share_listen {
+        tracing::info!("share listener listening on http://{}", share_addr);
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
     tokio::spawn(async move {
         let reason = shutdown_signal().await;
         let _ = shutdown_tx.send(Some(reason));
     });
 
-    let server_shutdown_rx = shutdown_rx.clone();
-    let mut serve_handle = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = wait_for_shutdown(server_shutdown_rx).await;
-            })
-            .await
-    });
-
-    let reason = tokio::select! {
-        result = &mut serve_handle => {
-            result
-                .map_err(|e| anyhow::anyhow!("server task panicked: {e}"))?
-                .context("serve")?;
-            let Some(reason) = *shutdown_rx.borrow() else {
-                return Ok(());
-            };
-            reason
-        }
-        reason = wait_for_shutdown(shutdown_rx.clone()) => {
-            tracing::info!(
-                reason = reason,
-                drain_timeout_secs = HTTP_DRAIN_TIMEOUT.as_secs(),
-                "shutdown signal received; draining HTTP"
-            );
-            match tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut serve_handle).await {
-                Ok(result) => {
-                    result
-                        .map_err(|e| anyhow::anyhow!("server task panicked: {e}"))?
-                        .context("serve")?;
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        reason = reason,
-                        drain_timeout_secs = HTTP_DRAIN_TIMEOUT.as_secs(),
-                        "HTTP drain timed out; aborting remaining connections"
-                    );
-                    serve_handle.abort();
-                    let _ = serve_handle.await;
-                }
-            }
-            reason
-        }
-    };
+    let control_server = spawn_http_server(listener, app, shutdown_rx.clone());
+    let share_server =
+        share_listener.map(|listener| spawn_http_server(listener, share_app, shutdown_rx.clone()));
+    let reason = supervise_http_servers(
+        control_server,
+        share_server,
+        shutdown_rx,
+        HTTP_DRAIN_TIMEOUT,
+    )
+    .await?;
 
     shutdown_sweep(&shutdown_state, reason).await?;
 
@@ -306,6 +274,150 @@ async fn wait_for_shutdown(mut rx: watch::Receiver<Option<&'static str>>) -> &'s
             return "shutdown";
         }
     }
+}
+
+type HttpServerHandle = tokio::task::JoinHandle<std::io::Result<()>>;
+
+fn server_routers(state: AppState) -> (axum::Router, axum::Router) {
+    (
+        router(state.clone()).merge(internal::internal_router(state.clone())),
+        share_gateway::router(state),
+    )
+}
+
+async fn bind_http_listeners(
+    control_addr: std::net::SocketAddr,
+    share_addr: Option<std::net::SocketAddr>,
+) -> anyhow::Result<(tokio::net::TcpListener, Option<tokio::net::TcpListener>)> {
+    let control = tokio::net::TcpListener::bind(control_addr)
+        .await
+        .with_context(|| format!("bind {control_addr}"))?;
+    let share = match share_addr {
+        Some(share_addr) => Some(
+            tokio::net::TcpListener::bind(share_addr)
+                .await
+                .with_context(|| format!("bind share {share_addr}"))?,
+        ),
+        None => None,
+    };
+    Ok((control, share))
+}
+
+fn spawn_http_server(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> HttpServerHandle {
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = wait_for_shutdown(shutdown_rx).await;
+            })
+            .await
+    })
+}
+
+async fn supervise_http_servers(
+    mut control: HttpServerHandle,
+    mut share: Option<HttpServerHandle>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+    drain_timeout: Duration,
+) -> anyhow::Result<&'static str> {
+    let (reason, control_exited, share_exited) = match share.as_mut() {
+        Some(share_server) => {
+            tokio::select! {
+                result = &mut control => {
+                    let Some(reason) = *shutdown_rx.borrow() else {
+                        abort_server(share_server).await;
+                        return Err(unexpected_server_exit("control", result));
+                    };
+                    server_result("control", result)?;
+                    (reason, true, false)
+                }
+                result = &mut *share_server => {
+                    let Some(reason) = *shutdown_rx.borrow() else {
+                        control.abort();
+                        let _ = control.await;
+                        return Err(unexpected_server_exit("share", result));
+                    };
+                    server_result("share", result)?;
+                    (reason, false, true)
+                }
+                reason = wait_for_shutdown(shutdown_rx.clone()) => (reason, false, false),
+            }
+        }
+        None => {
+            tokio::select! {
+                result = &mut control => {
+                    let Some(reason) = *shutdown_rx.borrow() else {
+                        return Err(unexpected_server_exit("control", result));
+                    };
+                    server_result("control", result)?;
+                    (reason, true, false)
+                }
+                reason = wait_for_shutdown(shutdown_rx.clone()) => (reason, false, false),
+            }
+        }
+    };
+
+    tracing::info!(
+        reason,
+        drain_timeout_secs = drain_timeout.as_secs(),
+        "shutdown signal received; draining HTTP listeners"
+    );
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    if !control_exited {
+        drain_server("control", &mut control, deadline).await?;
+    }
+    if !share_exited {
+        if let Some(share) = share.as_mut() {
+            drain_server("share", share, deadline).await?;
+        }
+    }
+    Ok(reason)
+}
+
+fn unexpected_server_exit(
+    name: &str,
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match server_result(name, result) {
+        Ok(()) => anyhow::anyhow!("{name} server exited unexpectedly"),
+        Err(error) => error.context(format!("{name} server exited unexpectedly")),
+    }
+}
+
+fn server_result(
+    name: &str,
+    result: Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    result
+        .map_err(|error| anyhow::anyhow!("{name} server task panicked: {error}"))?
+        .with_context(|| format!("{name} server serve"))
+}
+
+async fn drain_server(
+    name: &str,
+    server: &mut HttpServerHandle,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout_at(deadline, &mut *server).await {
+        Ok(result) => server_result(name, result),
+        Err(_) => {
+            tracing::warn!(
+                server = name,
+                "HTTP drain timed out; aborting remaining connections"
+            );
+            server.abort();
+            let _ = server.await;
+            Ok(())
+        }
+    }
+}
+
+async fn abort_server(server: &mut HttpServerHandle) {
+    server.abort();
+    let _ = server.await;
 }
 
 #[cfg(unix)]
@@ -351,6 +463,217 @@ async fn shutdown_sweep(state: &AppState, reason: &'static str) -> anyhow::Resul
         "shutdown drain summary: reaped local VMs"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{header::HOST, Request, StatusCode},
+    };
+    use std::{io, path::PathBuf};
+    use tokio::net::TcpListener;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn share_bind_failure_releases_the_unserved_control_listener() {
+        let occupied_share_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let share_addr = occupied_share_listener.local_addr().unwrap();
+        let reserved_control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = reserved_control_listener.local_addr().unwrap();
+        drop(reserved_control_listener);
+
+        let error = bind_http_listeners(control_addr, Some(share_addr))
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains(&format!("bind share {share_addr}")));
+        assert!(
+            TcpListener::bind(control_addr).await.is_ok(),
+            "a failed share bind must release the not-yet-served control listener"
+        );
+    }
+
+    #[test]
+    fn server_routers_keep_control_and_share_routes_separate() {
+        let (control, share) = server_routers(test_state());
+        let share_host = "calm-red-fox.shares.example.com";
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let control_test = control.clone();
+        let share_test = share.clone();
+
+        runtime.block_on(async move {
+            let control_response = control_test
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(HOST, share_host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(control_response.status(), StatusCode::UNAUTHORIZED);
+
+            let share_response = share_test
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header(HOST, share_host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(share_response.status(), StatusCode::NOT_FOUND);
+        });
+        drop(control);
+        drop(share);
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_both_servers_before_returning() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
+        let drained = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control_drained = Arc::clone(&drained);
+        let control_rx = shutdown_rx.clone();
+        let control = tokio::spawn(async move {
+            wait_for_shutdown(control_rx).await;
+            control_drained.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), io::Error>(())
+        });
+        let share_drained = Arc::clone(&drained);
+        let share_rx = shutdown_rx.clone();
+        let share = tokio::spawn(async move {
+            wait_for_shutdown(share_rx).await;
+            share_drained.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), io::Error>(())
+        });
+
+        shutdown_tx.send(Some("test")).unwrap();
+        let reason =
+            supervise_http_servers(control, Some(share), shutdown_rx, Duration::from_secs(1))
+                .await
+                .unwrap();
+
+        assert_eq!(reason, "test");
+        assert_eq!(
+            drained.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both listeners must drain before shutdown continues"
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_share_server_exit_is_fatal() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
+        let control = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), io::Error>(())
+        });
+        let share = tokio::spawn(async { Ok::<(), io::Error>(()) });
+
+        let error =
+            supervise_http_servers(control, Some(share), shutdown_rx, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("share server exited unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn unexpected_control_server_exit_is_fatal() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
+        let control = tokio::spawn(async { Ok::<(), io::Error>(()) });
+        let share = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok::<(), io::Error>(())
+        });
+
+        let error =
+            supervise_http_servers(control, Some(share), shutdown_rx, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("control server exited unexpectedly"));
+    }
+
+    fn test_state() -> AppState {
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: config::ApiKeyRegistry::from_plaintext_entries(vec![(
+                "test-key".into(),
+                "tenant-a".into(),
+                config::ApiRole::Admin,
+                0,
+            )])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: PathBuf::from("target/taritd-main-test/vmm"),
+            kernel: PathBuf::from("target/taritd-main-test/kernel"),
+            rootfs: PathBuf::from("target/taritd-main-test/rootfs"),
+            socket_dir: PathBuf::from("target/taritd-main-test/sockets"),
+            db_path: PathBuf::from("target/taritd-main-test/fleet.db"),
+            net_state_path: PathBuf::from("target/taritd-main-test/net-state.json"),
+            images_dir: PathBuf::from("target/taritd-main-test/images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: None,
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: config::WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: config::AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: PathBuf::from("target/taritd-main-test/ssh_host"),
+            share_listen: Some("127.0.0.1:0".parse().unwrap()),
+            share_domain: Some("shares.example.com".into()),
+            share_token_key: Some([7; 32]),
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 1_000,
+            share_idle_timeout_secs: 1,
+        };
+        let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let shares = shares::ShareRepository::new(Arc::clone(&store), None);
+        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        AppState {
+            config: config.clone(),
+            audit_outbox: Arc::new(audit::LocalAuditOutbox::new(Arc::clone(&store))),
+            store,
+            exec_cache: Arc::new(RwLock::new(HashMap::new())),
+            vm_cache: Arc::new(RwLock::new(HashMap::new())),
+            store_tx,
+            pty_registry: Arc::new(pty::PtyRegistry::default()),
+            supervisor: Arc::new(VmmSupervisor::new(config.clone())),
+            scheduler: Arc::new(Scheduler::new(config)),
+            peer: Arc::new(PeerClient::new("peer-secret".into())),
+            shares,
+            fleet: None,
+            metrics: Arc::new(metrics::Metrics::default()),
+        }
+    }
 }
 
 fn spawn_fleet_sync(

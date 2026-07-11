@@ -51,6 +51,7 @@ use crate::{
     api::AppState,
     cluster::{self, Owner},
     config::{ApiIdentity, ApiRole},
+    metrics::{ActiveShareHttp, Metrics, ShareMetricVisibility},
     net::NetAlloc,
     shares,
     supervisor::NetworkLease,
@@ -192,6 +193,9 @@ async fn reject_internal_path() -> Response {
 }
 
 async fn handle_request(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let active_request = state.metrics.track_share_http();
+    let metrics = Arc::clone(&state.metrics);
+    let request = meter_request_body(request, Arc::clone(&metrics));
     let result = async {
         let domain = state
             .config
@@ -205,6 +209,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
         let slug = share_slug_from_headers(request.headers(), domain)?;
         let token = share_token(request.headers())?;
         let share = shares::authorize_gateway(&state, &slug, token.as_deref()).await?;
+        active_request.set_visibility(ShareMetricVisibility::from(share.visibility));
         let forwarding = TrustedForwarding {
             peer,
             host: format!("{slug}.{domain}"),
@@ -214,6 +219,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             .await
             .map_err(|error| {
                 tracing::warn!(share_id = %share.id, %error, "share owner resolution failed");
+                state.metrics.inc_share_owner_failures();
                 GatewayError::Unavailable
             })?;
 
@@ -263,7 +269,48 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
     }
     .await;
 
-    result.unwrap_or_else(IntoResponse::into_response)
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            if matches!(error, GatewayError::Unauthorized) {
+                metrics.inc_share_auth_failures();
+            }
+            error.into_response()
+        }
+    };
+    active_request.finish(response.status().as_u16());
+    meter_response_body(response, metrics, active_request)
+}
+
+fn meter_request_body(request: Request<Body>, metrics: Arc<Metrics>) -> Request<Body> {
+    let (parts, body) = request.into_parts();
+    Request::from_parts(parts, metered_body(body, metrics))
+}
+
+fn meter_response_body(
+    response: Response,
+    metrics: Arc<Metrics>,
+    active_request: ActiveShareHttp,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream().map(move |item| {
+        let _active_request = &active_request;
+        if let Ok(bytes) = &item {
+            metrics.add_share_bytes_out(bytes.len() as u64);
+        }
+        item
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn metered_body(body: Body, metrics: Arc<Metrics>) -> Body {
+    let stream = body.into_data_stream().map(move |item| {
+        if let Ok(bytes) = &item {
+            metrics.add_share_bytes_in(bytes.len() as u64);
+        }
+        item
+    });
+    Body::from_stream(stream)
 }
 
 fn share_identity(share: &ShareRecord) -> ApiIdentity {
@@ -292,6 +339,7 @@ async fn proxy_remote_http(
         .await
         .map_err(|error| {
             tracing::warn!(share_id = %share.id, %error, "owner share HTTP proxy failed");
+            state.metrics.inc_share_target_failures();
             GatewayError::Unavailable
         })
 }
@@ -318,12 +366,20 @@ async fn proxy_remote_websocket(
         ),
     )
     .await
-    .map_err(|_| GatewayError::Unavailable)?
+    .map_err(|_| {
+        state.metrics.inc_share_target_failures();
+        GatewayError::Unavailable
+    })?
     .map_err(|error| {
         tracing::warn!(share_id = %share.id, %error, "owner share WebSocket proxy failed");
+        state.metrics.inc_share_target_failures();
         GatewayError::Unavailable
     })?;
-    let protocol = negotiated_protocol(response_protocol.as_deref(), &protocols)?;
+    let protocol =
+        negotiated_protocol(response_protocol.as_deref(), &protocols).map_err(|error| {
+            state.metrics.inc_share_target_failures();
+            error
+        })?;
     let websocket = if let Some(protocol) = protocol {
         websocket.protocols([protocol])
     } else {
@@ -333,7 +389,7 @@ async fn proxy_remote_websocket(
     let metrics = Arc::clone(&state.metrics);
     Ok(websocket.on_upgrade(move |client| async move {
         let _active_websocket = metrics.track_share_websocket();
-        bridge_websocket(client, upstream, idle_timeout).await;
+        bridge_websocket(client, upstream, idle_timeout, metrics).await;
     }))
 }
 
@@ -493,15 +549,22 @@ async fn proxy_local_http(
     share: &ShareRecord,
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
-    let (target, lease) = local_target(state, share)?;
-    proxy_http_to_target(
+    let (target, lease) = local_target(state, share).map_err(|error| {
+        state.metrics.inc_share_target_failures();
+        error
+    })?;
+    let result = proxy_http_to_target(
         target,
         request,
         connect_timeout(state),
         idle_timeout(state),
         Some(lease),
     )
-    .await
+    .await;
+    if result.is_err() {
+        state.metrics.inc_share_target_failures();
+    }
+    result
 }
 
 fn local_target(
@@ -743,8 +806,11 @@ async fn proxy_local_websocket(
     connect_timeout: Duration,
     idle_timeout: Duration,
 ) -> Result<Response, GatewayError> {
-    let (target, lease) = local_target(state, share)?;
-    proxy_websocket_to_target(
+    let (target, lease) = local_target(state, share).map_err(|error| {
+        state.metrics.inc_share_target_failures();
+        error
+    })?;
+    let result = proxy_websocket_to_target(
         target,
         request_uri
             .path_and_query()
@@ -759,7 +825,11 @@ async fn proxy_local_websocket(
         Some(lease),
         Arc::clone(&state.metrics),
     )
-    .await
+    .await;
+    if result.is_err() {
+        state.metrics.inc_share_target_failures();
+    }
+    result
 }
 
 async fn proxy_websocket_to_target(
@@ -828,7 +898,7 @@ async fn proxy_websocket_to_target(
     Ok(websocket.on_upgrade(move |client| async move {
         let _lease = lease;
         let _active_websocket = metrics.track_share_websocket();
-        bridge_websocket(client, upstream, idle_timeout).await;
+        bridge_websocket(client, upstream, idle_timeout, metrics).await;
     }))
 }
 
@@ -848,7 +918,12 @@ fn negotiated_protocol(
     Ok(Some(protocol.into()))
 }
 
-async fn bridge_websocket(client: WebSocket, upstream: UpstreamWebSocket, idle_timeout: Duration) {
+async fn bridge_websocket(
+    client: WebSocket,
+    upstream: UpstreamWebSocket,
+    idle_timeout: Duration,
+    metrics: Arc<Metrics>,
+) {
     let (client_tx, client_rx) = client.split();
     let (upstream_tx, upstream_rx) = upstream.split();
     let (activity_tx, activity_rx) = watch::channel(Instant::now());
@@ -866,6 +941,7 @@ async fn bridge_websocket(client: WebSocket, upstream: UpstreamWebSocket, idle_t
         Arc::clone(&upstream_closed),
         client_close_tx.clone(),
         Arc::clone(&client_pings),
+        Arc::clone(&metrics),
     ));
     let mut upstream_to_client = tokio::spawn(forward_upstream_to_client(
         upstream_rx,
@@ -877,6 +953,7 @@ async fn bridge_websocket(client: WebSocket, upstream: UpstreamWebSocket, idle_t
         upstream_closed,
         client_close_rx,
         client_pings,
+        metrics,
     ));
 
     tokio::select! {
@@ -901,6 +978,7 @@ async fn forward_client_to_upstream(
     upstream_closed: Arc<AtomicBool>,
     client_close_tx: watch::Sender<bool>,
     client_pings: Arc<Mutex<PendingPings>>,
+    metrics: Arc<Metrics>,
 ) {
     loop {
         let deadline = *activity_rx.borrow() + idle_timeout;
@@ -933,10 +1011,12 @@ async fn forward_client_to_upstream(
                         pending.track(payload.clone());
                     }
                 }
+                let bytes = axum_message_bytes(&message);
                 let message = client_message(message);
                 if !matches!(time::timeout(idle_timeout, sink.send(message)).await, Ok(Ok(()))) {
                     return;
                 }
+                metrics.add_share_bytes_in(bytes);
                 activity_tx.send_replace(Instant::now());
                 if close {
                     return;
@@ -956,6 +1036,7 @@ async fn forward_upstream_to_client(
     upstream_closed: Arc<AtomicBool>,
     mut client_close_rx: watch::Receiver<bool>,
     client_pings: Arc<Mutex<PendingPings>>,
+    metrics: Arc<Metrics>,
 ) {
     loop {
         let deadline = *activity_rx.borrow() + idle_timeout;
@@ -1000,15 +1081,27 @@ async fn forward_upstream_to_client(
                 let Some(message) = upstream_message(message) else {
                     continue;
                 };
+                let bytes = axum_message_bytes(&message);
                 if !matches!(time::timeout(idle_timeout, sink.send(message)).await, Ok(Ok(()))) {
                     return;
                 }
+                metrics.add_share_bytes_out(bytes);
                 activity_tx.send_replace(Instant::now());
                 if close {
                     return;
                 }
             }
         }
+    }
+}
+
+fn axum_message_bytes(message: &AxumMessage) -> u64 {
+    match message {
+        AxumMessage::Text(text) => text.len() as u64,
+        AxumMessage::Binary(bytes) | AxumMessage::Ping(bytes) | AxumMessage::Pong(bytes) => {
+            bytes.len() as u64
+        }
+        AxumMessage::Close(frame) => frame.as_ref().map_or(0, |frame| frame.reason.len() as u64),
     }
 }
 
@@ -1236,6 +1329,41 @@ mod tests {
         let response = gateway_router(state).oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn gateway_router_records_http_metrics_without_share_identifiers() {
+        let (upstream, _) = spawn_large_echo_upstream().await;
+        let state = gateway_test_state();
+        let metrics = Arc::clone(&state.metrics);
+        let share = install_gateway_share(&state, upstream, ShareVisibility::Public).await;
+        let response = gateway_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/upload")
+                    .header(HOST, SHARE_HOST)
+                    .body(Body::from("hello-share"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "hello-share"
+        );
+
+        let rendered = metrics.render_share_metrics();
+        assert!(rendered
+            .contains("taritd_share_requests_total{visibility=\"public\",status_class=\"2xx\"} 1"));
+        assert!(rendered.contains("taritd_share_bytes_in_total 11"));
+        assert!(rendered.contains("taritd_share_bytes_out_total 11"));
+        assert!(!rendered.contains(&share.slug));
+        assert!(!rendered.contains(&share.owner_key));
     }
 
     #[tokio::test]
