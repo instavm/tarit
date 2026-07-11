@@ -97,6 +97,7 @@ pub struct ShareRecord {
 
 /// Request body for creating a shared VM port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateShareRequest {
     pub vm_id: Uuid,
     pub guest_port: u16,
@@ -117,6 +118,7 @@ impl CreateShareRequest {
 
 /// Request body for updating a shared VM port.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateShareRequest {
     pub vm_id: Option<Uuid>,
     pub guest_port: Option<u16>,

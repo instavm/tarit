@@ -259,6 +259,14 @@ pub async fn list(state: &AppState, identity: &ApiIdentity) -> Result<Vec<ShareR
     state.shares.list(&identity.tenant).await
 }
 
+pub async fn get(
+    state: &AppState,
+    identity: &ApiIdentity,
+    share_id: Uuid,
+) -> Result<ShareRecord, OrchError> {
+    get_owned_share(&state.shares, identity, share_id).await
+}
+
 pub async fn get_visible(state: &AppState, slug: &str) -> Result<ShareRecord, OrchError> {
     get_visible_from_repository(&state.shares, slug).await
 }
