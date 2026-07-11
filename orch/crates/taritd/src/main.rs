@@ -14,6 +14,7 @@ mod ops;
 mod peer;
 mod pty;
 mod scheduler;
+mod share_gateway;
 mod shares;
 mod ssh_keys;
 mod supervisor;

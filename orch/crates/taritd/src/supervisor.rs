@@ -1,6 +1,6 @@
 use crate::config::{Config, WarmClass};
 use crate::net::{NetAlloc, NetProvisioner};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -87,6 +87,79 @@ struct RunningVm {
     net: Option<NetAlloc>,
 }
 
+#[derive(Default)]
+struct NetworkLeaseState {
+    active: usize,
+    pending_teardown: Option<NetAlloc>,
+    teardown_in_progress: bool,
+}
+
+#[derive(Default)]
+struct StopState {
+    stopping: HashSet<Uuid>,
+}
+
+impl StopState {
+    fn begin(&mut self, id: Uuid) -> bool {
+        self.stopping.insert(id)
+    }
+
+    fn complete(&mut self, id: Uuid) {
+        self.stopping.remove(&id);
+    }
+}
+
+impl NetworkLeaseState {
+    fn acquire(&mut self) {
+        self.active += 1;
+    }
+
+    fn defer_teardown(&mut self, allocation: NetAlloc) -> Option<NetAlloc> {
+        if self.active == 0 {
+            Some(allocation)
+        } else {
+            self.pending_teardown = Some(allocation);
+            None
+        }
+    }
+
+    fn release(&mut self) -> Option<NetAlloc> {
+        self.active = self.active.saturating_sub(1);
+        if self.active != 0 {
+            return None;
+        }
+        let teardown = self.pending_teardown.take();
+        self.teardown_in_progress = teardown.is_some();
+        teardown
+    }
+
+    fn teardown_in_progress(&self) -> bool {
+        self.teardown_in_progress
+    }
+
+    fn complete_teardown(&mut self) {
+        self.teardown_in_progress = false;
+    }
+}
+
+pub(crate) struct NetworkLease {
+    supervisor: Arc<VmmSupervisor>,
+    id: Uuid,
+    allocation: NetAlloc,
+}
+
+impl NetworkLease {
+    pub(crate) fn allocation(&self) -> &NetAlloc {
+        &self.allocation
+    }
+}
+
+impl Drop for NetworkLease {
+    fn drop(&mut self) {
+        self.supervisor.release_network_lease(self.id);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ManagedProcess {
     pid: u32,
@@ -133,6 +206,8 @@ enum SpawnPurpose {
 pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
+    stopping: Mutex<StopState>,
+    network_leases: Mutex<HashMap<Uuid, NetworkLeaseState>>,
     booting: Mutex<HashMap<Uuid, BootingVm>>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
@@ -179,6 +254,8 @@ impl VmmSupervisor {
         Self {
             config,
             running: Mutex::new(HashMap::new()),
+            stopping: Mutex::new(StopState::default()),
+            network_leases: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
             warm: Mutex::new(VecDeque::new()),
             net,
@@ -688,6 +765,20 @@ impl VmmSupervisor {
     }
 
     pub fn stop_vm(&self, id: Uuid) -> Result<(), OrchError> {
+        let should_stop = self
+            .stopping
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor stop lock poisoned".into()))?
+            .begin(id);
+        if !should_stop {
+            return Ok(());
+        }
+        let result = self.stop_vm_once(id);
+        self.complete_stop(id);
+        result
+    }
+
+    fn stop_vm_once(&self, id: Uuid) -> Result<(), OrchError> {
         // Remove from the running map under a brief lock, then do the slow
         // teardown (stop RPC + kill + wait) WITHOUT the lock held. Otherwise
         // every concurrent exec/create/delete serializes behind this VM's
@@ -700,6 +791,9 @@ impl VmmSupervisor {
             guard.remove(&id)
         };
         let Some(running) = running else {
+            if self.has_active_network_lease(id) {
+                return Ok(());
+            }
             if let Some(net) = &self.net {
                 net.teardown_vm_id(id);
             }
@@ -720,6 +814,39 @@ impl VmmSupervisor {
     pub fn resume_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let client = self.client_for(id)?;
         client.resume().map_err(|e| OrchError::Vmm(e.to_string()))
+    }
+
+    #[allow(dead_code)]
+    pub fn network_allocation(&self, id: Uuid) -> Result<NetAlloc, OrchError> {
+        self.running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
+            .get(&id)
+            .and_then(|vm| vm.net.clone())
+            .ok_or_else(|| OrchError::Conflict(format!("vm {id} has no active network")))
+    }
+
+    pub(crate) fn acquire_network_lease(
+        self: &Arc<Self>,
+        id: Uuid,
+    ) -> Result<NetworkLease, OrchError> {
+        let mut leases = self
+            .network_leases
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor network lease lock poisoned".into()))?;
+        let allocation = self
+            .running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
+            .get(&id)
+            .and_then(|vm| vm.net.clone())
+            .ok_or_else(|| OrchError::Conflict(format!("vm {id} has no active network")))?;
+        leases.entry(id).or_default().acquire();
+        Ok(NetworkLease {
+            supervisor: Arc::clone(self),
+            id,
+            allocation,
+        })
     }
 
     /// Live VMM status (state/uptime/vcpus/mem/config/vcpu_alive) for a running VM.
@@ -814,11 +941,19 @@ impl VmmSupervisor {
     pub fn stop_all(&self) -> Result<ShutdownSummary, OrchError> {
         self.shutting_down.store(true, Ordering::SeqCst);
         let running = {
+            let mut stopping = self
+                .stopping
+                .lock()
+                .map_err(|_| OrchError::Internal("supervisor stop lock poisoned".into()))?;
             let mut guard = self
                 .running
                 .lock()
                 .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
-            guard.drain().collect::<Vec<_>>()
+            let running = guard.drain().collect::<Vec<_>>();
+            for (id, _) in &running {
+                stopping.begin(*id);
+            }
+            running
         };
         let warm = {
             let mut guard = self
@@ -847,6 +982,7 @@ impl VmmSupervisor {
             let client = VmmClient::new(&vm.socket_path);
             let _ = client.stop();
             self.teardown_vm(id, vm);
+            self.complete_stop(id);
         }
         for warm_vm in warm {
             let client = VmmClient::new(&warm_vm.vm.socket_path);
@@ -867,7 +1003,75 @@ impl VmmSupervisor {
         let _ = std::fs::remove_file(&vm.socket_path);
         let _ = std::fs::remove_file(overlay_path_for(id));
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
-            p.teardown(a);
+            if let Some(allocation) = self.defer_network_teardown(id, a.clone()) {
+                p.teardown(&allocation);
+            }
+        }
+    }
+
+    fn has_active_network_lease(&self, id: Uuid) -> bool {
+        self.network_leases
+            .lock()
+            .map(|leases| {
+                leases
+                    .get(&id)
+                    .is_some_and(|lease| lease.active > 0 || lease.teardown_in_progress())
+            })
+            .unwrap_or(true)
+    }
+
+    fn complete_stop(&self, id: Uuid) {
+        if let Ok(mut stopping) = self.stopping.lock() {
+            stopping.complete(id);
+        }
+    }
+
+    fn defer_network_teardown(&self, id: Uuid, allocation: NetAlloc) -> Option<NetAlloc> {
+        let Ok(mut leases) = self.network_leases.lock() else {
+            return Some(allocation);
+        };
+        let Some(lease) = leases.get_mut(&id) else {
+            return Some(allocation);
+        };
+        let teardown = lease.defer_teardown(allocation);
+        if lease.active == 0 && !lease.teardown_in_progress() {
+            leases.remove(&id);
+        }
+        teardown
+    }
+
+    fn release_network_lease(&self, id: Uuid) {
+        let teardown = {
+            let Ok(mut leases) = self.network_leases.lock() else {
+                return;
+            };
+            let Some(lease) = leases.get_mut(&id) else {
+                return;
+            };
+            let teardown = lease.release();
+            if lease.active == 0 && !lease.teardown_in_progress() {
+                leases.remove(&id);
+            }
+            teardown
+        };
+        if let Some(allocation) = teardown {
+            if let Some(provisioner) = &self.net {
+                provisioner.teardown(&allocation);
+            }
+            self.complete_network_teardown(id);
+        }
+    }
+
+    fn complete_network_teardown(&self, id: Uuid) {
+        let Ok(mut leases) = self.network_leases.lock() else {
+            return;
+        };
+        let Some(lease) = leases.get_mut(&id) else {
+            return;
+        };
+        lease.complete_teardown();
+        if lease.active == 0 {
+            leases.remove(&id);
         }
     }
 }
@@ -1077,6 +1281,37 @@ mod tests {
             None
         );
         assert_eq!(overlay_path_for_config(id, &spawn_config(true, None)), None);
+    }
+
+    #[test]
+    fn network_lease_defers_teardown_until_final_release() {
+        let alloc = NetAlloc {
+            idx: 7,
+            vm_id: Uuid::nil(),
+            tap: "insta7".into(),
+            host_ip: "172.16.0.29".into(),
+            guest_ip: "172.16.0.30".into(),
+            prefix: 30,
+        };
+        let mut state = NetworkLeaseState::default();
+        state.acquire();
+
+        assert_eq!(state.defer_teardown(alloc.clone()), None);
+        assert_eq!(state.release(), Some(alloc));
+        assert!(state.teardown_in_progress());
+        state.complete_teardown();
+        assert!(!state.teardown_in_progress());
+    }
+
+    #[test]
+    fn stop_state_rejects_duplicate_teardown_until_completion() {
+        let id = Uuid::nil();
+        let mut state = StopState::default();
+
+        assert!(state.begin(id));
+        assert!(!state.begin(id));
+        state.complete(id);
+        assert!(state.begin(id));
     }
 
     #[cfg(target_os = "linux")]
