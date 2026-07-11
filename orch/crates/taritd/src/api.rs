@@ -75,6 +75,7 @@ use crate::config::{ApiIdentity, ApiRole, Config};
 use crate::openapi;
 use crate::peer::PeerClient;
 use crate::scheduler::Scheduler;
+use crate::shares::ShareRepository;
 use crate::supervisor::{VmSpawnConfig, VmmSupervisor};
 use crate::{audit, cluster, ops, usage};
 use std::time::{Duration, Instant};
@@ -109,6 +110,7 @@ pub struct AppState {
     pub supervisor: Arc<VmmSupervisor>,
     pub scheduler: Arc<Scheduler>,
     pub peer: Arc<PeerClient>,
+    pub shares: ShareRepository,
     /// Global fleet registry (Postgres). `None` in single-host mode; when set,
     /// enables cross-node placement, VM->owner routing, and membership.
     pub fleet: Option<Arc<tarit_fleet::PostgresFleet>>,
@@ -1447,12 +1449,19 @@ mod tests {
             ssh_gateway_enabled: false,
             ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
             ssh_gateway_host_key_path: PathBuf::from("target/taritd-api-test/ssh_host"),
+            share_listen: None,
+            share_domain: None,
+            share_token_key: None,
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 10_000,
+            share_idle_timeout_secs: 300,
         };
-        let store = Store::open(":memory:").unwrap();
+        let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let shares = ShareRepository::new(Arc::clone(&store), None);
         let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
         AppState {
             config: config.clone(),
-            store: Arc::new(Mutex::new(store)),
+            store,
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
@@ -1460,6 +1469,7 @@ mod tests {
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),
             peer: Arc::new(PeerClient::new("peer-secret".into())),
+            shares,
             fleet: None,
             metrics: Arc::new(Metrics::default()),
         }

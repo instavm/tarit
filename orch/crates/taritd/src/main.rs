@@ -14,6 +14,7 @@ mod ops;
 mod peer;
 mod pty;
 mod scheduler;
+mod shares;
 mod ssh_keys;
 mod supervisor;
 mod usage;
@@ -192,6 +193,7 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         Arc::clone(&scheduler),
     );
 
+    let shares = shares::ShareRepository::new(Arc::clone(&store), fleet.clone());
     let state = AppState {
         config: config.clone(),
         store,
@@ -202,6 +204,7 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         supervisor: Arc::clone(&supervisor),
         scheduler: scheduler.clone(),
         peer: Arc::new(peer),
+        shares,
         fleet,
         metrics: Arc::new(metrics::Metrics::default()),
     };

@@ -283,6 +283,45 @@ impl PostgresFleet {
         Ok(())
     }
 
+    /// Update an active share only when it still has the version read by the
+    /// caller. This protects token rotation and terminal revocation from
+    /// concurrent writers across taritd nodes.
+    pub async fn update_share_if_current(
+        &self,
+        share: &ShareRecord,
+        expected_token_version: u64,
+    ) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let updated_at = share.updated_at.to_rfc3339();
+        let updated = client
+            .execute(
+                "UPDATE fleet_shares SET
+                   slug = $2, vm_id = $3, guest_port = $4, visibility = $5, token_version = $6,
+                   revoked_at = $7, updated_at = $8
+                  WHERE id = $1 AND token_version = $9 AND revoked_at IS NULL",
+                &[
+                    &share.id,
+                    &share.slug,
+                    &share.vm_id,
+                    &(i32::from(share.guest_port)),
+                    &share_visibility_as_str(share.visibility),
+                    &u64_to_sql_i64(share.token_version)?,
+                    &revoked_at,
+                    &updated_at,
+                    &u64_to_sql_i64(expected_token_version)?,
+                ],
+            )
+            .await
+            .map_err(fleet_error_from_postgres)?;
+        if updated == 0 {
+            return Err(FleetError::Conflict(
+                "share was modified or revoked concurrently".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Try to become (or renew being) the single autoscaler leader via a lease
     /// row. Succeeds if we already hold the lease or the current lease expired.
     /// Lease-based election tolerates a connection pool (unlike session advisory

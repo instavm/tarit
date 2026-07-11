@@ -358,6 +358,42 @@ impl Store {
         Ok(())
     }
 
+    /// Update an active share only when it still has the version read by the
+    /// caller. This protects token rotation and terminal revocation from
+    /// concurrent writers.
+    pub fn update_share_if_current(
+        &self,
+        share: &ShareRecord,
+        expected_token_version: u64,
+    ) -> Result<(), StoreError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shares SET
+               slug = ?2, vm_id = ?3, guest_port = ?4, visibility = ?5, token_version = ?6,
+               revoked_at = ?7, updated_at = ?8
+             WHERE id = ?1 AND token_version = ?9 AND revoked_at IS NULL",
+                params![
+                    share.id.to_string(),
+                    share.slug,
+                    share.vm_id.to_string(),
+                    i64::from(share.guest_port),
+                    share_visibility_as_str(share.visibility),
+                    u64_to_sql_i64(share.token_version)?,
+                    share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
+                    share.updated_at.to_rfc3339(),
+                    u64_to_sql_i64(expected_token_version)?,
+                ],
+            )
+            .map_err(share_error_from_sqlite)?;
+        if updated == 0 {
+            return Err(StoreError::Conflict(
+                "share was modified or revoked concurrently".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn list_vms(&self) -> Result<Vec<VmRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, host_id, owner_key, api_key_id, status, memory_mib, vcpus, kernel_path, rootfs_path,
