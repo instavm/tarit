@@ -110,10 +110,17 @@ impl PeerClient {
                 "share request path contains a dot segment".into(),
             ));
         }
-        let url = Self::peer_url(
-            rpc_addr,
-            &format!("/internal/v1/shares/{share_id}{path_and_query}"),
-        );
+        let route = format!("/internal/v1/shares/{share_id}");
+        let peer_path = if request_uri.path() == "/" {
+            route
+        } else {
+            format!("{route}{path_and_query}")
+        };
+        let peer_path = match request_uri.query() {
+            Some(query) if request_uri.path() == "/" => format!("{peer_path}?{query}"),
+            _ => peer_path,
+        };
+        let url = Self::peer_url(rpc_addr, &peer_path);
         let base = reqwest::Url::parse(rpc_addr)
             .map_err(|error| OrchError::Internal(format!("invalid peer RPC address: {error}")))?;
         if base.query().is_some() || base.fragment().is_some() {
@@ -686,5 +693,34 @@ mod tests {
         let uri = r"/\..\..\vms".parse::<Uri>().unwrap();
 
         assert!(PeerClient::share_url("http://127.0.0.1:8080", Uuid::new_v4(), &uri).is_err());
+    }
+
+    #[test]
+    fn share_url_uses_the_exact_root_route_and_preserves_queries() {
+        let id = Uuid::nil();
+
+        assert_eq!(
+            PeerClient::share_url("http://owner.example/", id, &"/".parse::<Uri>().unwrap())
+                .unwrap(),
+            format!("http://owner.example/internal/v1/shares/{id}")
+        );
+        assert_eq!(
+            PeerClient::share_url(
+                "http://owner.example/",
+                id,
+                &"/?x=preserve".parse::<Uri>().unwrap(),
+            )
+            .unwrap(),
+            format!("http://owner.example/internal/v1/shares/{id}?x=preserve")
+        );
+        assert_eq!(
+            PeerClient::share_url(
+                "http://owner.example/",
+                id,
+                &"/nested/path?x=preserve".parse::<Uri>().unwrap(),
+            )
+            .unwrap(),
+            format!("http://owner.example/internal/v1/shares/{id}/nested/path?x=preserve")
+        );
     }
 }

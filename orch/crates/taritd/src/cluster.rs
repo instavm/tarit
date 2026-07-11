@@ -12,6 +12,12 @@ use uuid::Uuid;
 use crate::api::AppState;
 use tarit_types::{OrchError, VmRecord};
 
+#[cfg(test)]
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
 /// A host is a placement/routing candidate only if its heartbeat is fresher
 /// than this. 3x the 5s heartbeat interval tolerates a missed beat without
 /// flapping a node out of the cluster.
@@ -24,45 +30,60 @@ pub enum Owner {
     Remote(String),
 }
 
-/// Resolve the owner of `id`. The fleet ownership map is authoritative in
-/// cluster mode; single-host / fleet-miss / fleet-down falls back to the local
-/// store so the node still answers for VMs it owns.
+#[cfg(test)]
+static TEST_AUTHORITATIVE_OWNERS: OnceLock<Mutex<HashMap<(String, Uuid), String>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_test_authoritative_owner(host_id: &str, id: Uuid, rpc_addr: String) {
+    TEST_AUTHORITATIVE_OWNERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("test authoritative owner lock")
+        .insert((host_id.to_string(), id), rpc_addr);
+}
+
+/// Resolve the owner of `id`. In cluster mode the fleet ownership map is
+/// authoritative and unavailable authority fails closed. Single-host mode
+/// falls back to the local store so the node still answers for VMs it owns.
 pub async fn resolve_owner(state: &AppState, id: Uuid) -> Result<Owner, OrchError> {
-    // Fast path: if the VM is running (or paused) on THIS node it is ours, so
-    // skip the mutex-guarded SQLite read. Every live op (exec/pause/resume/
-    // snapshot/delete) resolves the owner first, and that single store read
-    // serializes a concurrent burst.
+    if let Some(fleet) = &state.fleet {
+        let host_id = fleet
+            .get_vm_host(id)
+            .await
+            .map_err(|error| OrchError::Internal(format!("fleet get_vm_host: {error}")))?
+            .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found in fleet")))?;
+        if host_id == state.config.host_id {
+            return Ok(Owner::Local);
+        }
+        let host = fleet
+            .get_host(&host_id)
+            .await
+            .map_err(|error| OrchError::Internal(format!("fleet get_host: {error}")))?
+            .ok_or_else(|| {
+                OrchError::Internal(format!("owner host {host_id} not registered in fleet"))
+            })?;
+        return host
+            .rpc_addr
+            .map(Owner::Remote)
+            .ok_or_else(|| OrchError::Internal(format!("owner host {host_id} has no rpc_addr")));
+    }
+    #[cfg(test)]
+    if let Some(rpc_addr) = TEST_AUTHORITATIVE_OWNERS.get().and_then(|owners| {
+        owners
+            .lock()
+            .ok()?
+            .get(&(state.config.host_id.clone(), id))
+            .cloned()
+    }) {
+        return Ok(Owner::Remote(rpc_addr));
+    }
+
+    // Single-node fast path: if the VM is running (or paused) on THIS node it
+    // is ours, so skip the mutex-guarded SQLite read.
     if state.supervisor.is_running(id) {
         return Ok(Owner::Local);
     }
-    if let Some(fleet) = &state.fleet {
-        match fleet.get_vm_host(id).await {
-            Ok(Some(host_id)) => {
-                if host_id == state.config.host_id {
-                    return Ok(Owner::Local);
-                }
-                match fleet.get_host(&host_id).await {
-                    Ok(Some(h)) => {
-                        return match h.rpc_addr {
-                            Some(rpc) => Ok(Owner::Remote(rpc)),
-                            None => Err(OrchError::Internal(format!(
-                                "owner host {host_id} has no rpc_addr"
-                            ))),
-                        };
-                    }
-                    Ok(None) => {
-                        return Err(OrchError::Internal(format!(
-                            "owner host {host_id} not registered in fleet"
-                        )));
-                    }
-                    Err(e) => tracing::warn!(%id, "fleet get_host failed: {e}; trying local"),
-                }
-            }
-            Ok(None) => { /* unknown to fleet; maybe a local single-host VM */ }
-            Err(e) => tracing::warn!(%id, "fleet get_vm_host failed: {e}; trying local"),
-        }
-    }
-
     let exists = state
         .vm_cache
         .read()

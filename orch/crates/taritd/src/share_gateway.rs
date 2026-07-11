@@ -56,9 +56,6 @@ use crate::{
     supervisor::NetworkLease,
 };
 
-#[cfg(test)]
-use std::{collections::HashMap, sync::OnceLock};
-
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
 const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
@@ -183,32 +180,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[cfg(test)]
-static TEST_REMOTE_OWNERS: OnceLock<Mutex<HashMap<(String, uuid::Uuid), String>>> = OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn set_test_remote_owner(host_id: &str, id: uuid::Uuid, rpc_addr: String) {
-    TEST_REMOTE_OWNERS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("test remote owner lock")
-        .insert((host_id.to_string(), id), rpc_addr);
-}
-
 pub(crate) async fn resolve_share_owner(
     state: &AppState,
     id: uuid::Uuid,
 ) -> Result<Owner, OrchError> {
-    #[cfg(test)]
-    if let Some(rpc_addr) = TEST_REMOTE_OWNERS.get().and_then(|owners| {
-        owners
-            .lock()
-            .ok()?
-            .get(&(state.config.host_id.clone(), id))
-            .cloned()
-    }) {
-        return Ok(Owner::Remote(rpc_addr));
-    }
     cluster::resolve_owner(state, id).await
 }
 
@@ -1699,6 +1674,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_owner_forwards_the_exact_root_path() {
+        let (upstream, received) = spawn_root_inspecting_http_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+
+        let response = cluster.request_through_non_owner("/").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(received.await.unwrap(), "/");
+    }
+
+    #[tokio::test]
+    async fn remote_owner_forwards_root_query_strings() {
+        let (upstream, received) = spawn_root_inspecting_http_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+
+        let response = cluster.request_through_non_owner("/?x=preserve").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(received.await.unwrap(), "/?x=preserve");
+    }
+
+    #[tokio::test]
+    async fn remote_owner_streams_upload_chunks_before_the_client_finishes() {
+        let (upstream, first_chunk) = spawn_first_chunk_observing_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+        let (release_second_chunk_tx, release_second_chunk_rx) = oneshot::channel();
+        let body = futures_util::stream::unfold(
+            (false, Some(release_second_chunk_rx)),
+            |(sent_first, release_second_chunk_rx)| async move {
+                if !sent_first {
+                    return Some((
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"first")),
+                        (true, release_second_chunk_rx),
+                    ));
+                }
+                let release_second_chunk_rx = release_second_chunk_rx?;
+                let _ = release_second_chunk_rx.await;
+                Some((Ok(Bytes::from_static(b"second")), (true, None)))
+            },
+        );
+        let request = reqwest::Client::new()
+            .post(format!("http://{}/upload", cluster.client_addr))
+            .header(HOST, SHARE_HOST)
+            .body(reqwest::Body::wrap_stream(body))
+            .send();
+        let request = tokio::spawn(request);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), first_chunk)
+                .await
+                .expect("owner upstream should receive the first delayed upload chunk")
+                .unwrap(),
+            Bytes::from_static(b"first")
+        );
+        assert!(
+            !request.is_finished(),
+            "the client must still be waiting to produce its second upload chunk"
+        );
+
+        release_second_chunk_tx.send(()).unwrap();
+        let response = request.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.bytes().await.unwrap(),
+            Bytes::from_static(b"firstsecond")
+        );
+    }
+
+    #[tokio::test]
     async fn peer_share_route_rejects_missing_or_forged_identity() {
         let cluster = TestShareCluster::start().await;
 
@@ -1798,8 +1845,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_owner_bridges_websocket_frames_and_releases_both_nodes() {
-        let (upstream, observed) = spawn_permissive_websocket_echo_upstream().await;
+    async fn remote_owner_bridges_text_binary_ping_pong_and_graceful_close() {
+        let (upstream, observed) = spawn_cross_node_websocket_upstream().await;
         let cluster =
             TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
         let mut request = format!("ws://{}/socket?keep=this", cluster.client_addr)
@@ -1835,6 +1882,14 @@ mod tests {
         wait_for_websocket_gauge(&cluster.owner_metrics, 1).await;
 
         client
+            .send(TungsteniteMessage::Text("through-owner".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Text("through-owner".into())
+        );
+        client
             .send(TungsteniteMessage::Binary(Bytes::from_static(
                 b"through-owner",
             )))
@@ -1844,17 +1899,79 @@ mod tests {
             client.next().await.unwrap().unwrap(),
             TungsteniteMessage::Binary(Bytes::from_static(b"through-owner"))
         );
+        client
+            .send(TungsteniteMessage::Ping(Bytes::from_static(b"ping")))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Pong(Bytes::from_static(b"ping"))
+        );
+        client
+            .send(TungsteniteMessage::Pong(Bytes::from_static(b"pong")))
+            .await
+            .unwrap();
+        client.send(TungsteniteMessage::Close(None)).await.unwrap();
+        assert!(matches!(
+            client.next().await.unwrap().unwrap(),
+            TungsteniteMessage::Close(_)
+        ));
+
+        wait_for_websocket_gauge(&cluster.client_metrics, 0).await;
+        wait_for_websocket_gauge(&cluster.owner_metrics, 0).await;
+        let observed = observed.await.unwrap();
+        for frame in ["text", "binary", "ping", "pong", "close"] {
+            assert!(
+                observed.contains(&frame),
+                "upstream did not receive {frame}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_owner_abrupt_disconnect_releases_both_node_gauges() {
+        let (upstream, observed) = spawn_permissive_websocket_echo_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+        let mut request = format!("ws://{}/socket", cluster.client_addr)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static(SHARE_HOST));
+        request
+            .headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat"));
+
+        let (client, _) = connect_async(request).await.unwrap();
+        wait_for_websocket_gauge(&cluster.client_metrics, 1).await;
+        wait_for_websocket_gauge(&cluster.owner_metrics, 1).await;
         drop(client);
 
         wait_for_websocket_gauge(&cluster.client_metrics, 0).await;
         wait_for_websocket_gauge(&cluster.owner_metrics, 0).await;
-        assert!(observed.await.unwrap().contains(&"binary"));
+        let observed = observed.await.unwrap();
+        assert!(
+            observed.contains(&"close") || observed.contains(&"disconnect"),
+            "upstream did not observe bridge termination: {observed:?}"
+        );
     }
 
     #[tokio::test]
-    async fn remote_owner_rejects_a_node_that_no_longer_owns_the_vm() {
+    async fn remote_owner_rejects_stale_local_state_after_authoritative_reassignment() {
         let cluster = TestShareCluster::start().await;
-        super::set_test_remote_owner("owner", cluster.share.vm_id, "http://127.0.0.1:9".into());
+        assert!(
+            cluster
+                .owner_state
+                .supervisor
+                .is_running(cluster.share.vm_id),
+            "the stale owner must still appear locally running"
+        );
+        crate::cluster::set_test_authoritative_owner(
+            "owner",
+            cluster.share.vm_id,
+            "http://127.0.0.1:9".into(),
+        );
 
         let response = cluster.request_through_non_owner("/stream").await;
 
@@ -1894,6 +2011,7 @@ mod tests {
 
     struct TestShareCluster {
         client_state: AppState,
+        owner_state: AppState,
         client_addr: SocketAddr,
         owner_addr: SocketAddr,
         share_id: Uuid,
@@ -1927,6 +2045,7 @@ mod tests {
             release_second_chunk: Option<oneshot::Sender<()>>,
         ) -> Self {
             let owner = gateway_test_state_for_host("owner");
+            let owner_state = owner.clone();
             let owner_metrics = Arc::clone(&owner.metrics);
             let owner_shares = owner.shares.clone();
             let share = install_gateway_share(&owner, upstream, visibility).await;
@@ -1954,10 +2073,15 @@ mod tests {
             let client_metrics = Arc::clone(&client.metrics);
             client.shares.insert(&share).await.unwrap();
             let client_addr = start_axum(gateway_router(client.clone())).await;
-            super::set_test_remote_owner("non-owner", share.vm_id, format!("http://{owner_addr}"));
+            crate::cluster::set_test_authoritative_owner(
+                "non-owner",
+                share.vm_id,
+                format!("http://{owner_addr}"),
+            );
 
             Self {
                 client_state: client,
+                owner_state,
                 client_addr,
                 owner_addr,
                 share_id: share.id,
@@ -2190,6 +2314,54 @@ mod tests {
             )
             .with_state(received_tx);
         (start_axum(app).await, received_rx)
+    }
+
+    async fn spawn_root_inspecting_http_upstream() -> (SocketAddr, oneshot::Receiver<String>) {
+        let (received_tx, received_rx) = oneshot::channel();
+        let received_tx = Arc::new(Mutex::new(Some(received_tx)));
+        let app =
+            Router::new()
+                .route(
+                    "/",
+                    get(
+                        |State(tx): State<Arc<Mutex<Option<oneshot::Sender<String>>>>>,
+                         uri: Uri| async move {
+                            if let Some(tx) = tx.lock().unwrap().take() {
+                                let _ = tx.send(uri.to_string());
+                            }
+                            Response::new(Body::from("ok"))
+                        },
+                    ),
+                )
+                .with_state(received_tx);
+        (start_axum(app).await, received_rx)
+    }
+
+    async fn spawn_first_chunk_observing_upstream() -> (SocketAddr, oneshot::Receiver<Bytes>) {
+        let (first_chunk_tx, first_chunk_rx) = oneshot::channel();
+        let first_chunk_tx = Arc::new(Mutex::new(Some(first_chunk_tx)));
+        let app =
+            Router::new()
+                .route(
+                    "/upload",
+                    post(
+                        |State(tx): State<Arc<Mutex<Option<oneshot::Sender<Bytes>>>>>,
+                         body: Body| async move {
+                            let mut body = body.into_data_stream();
+                            let first = body.next().await.unwrap().unwrap();
+                            if let Some(tx) = tx.lock().unwrap().take() {
+                                let _ = tx.send(first.clone());
+                            }
+                            let mut uploaded = first.to_vec();
+                            while let Some(chunk) = body.next().await {
+                                uploaded.extend_from_slice(&chunk.unwrap());
+                            }
+                            Response::new(Body::from(uploaded))
+                        },
+                    ),
+                )
+                .with_state(first_chunk_tx);
+        (start_axum(app).await, first_chunk_rx)
     }
 
     async fn spawn_delayed_streaming_http_upstream(
@@ -2429,7 +2601,7 @@ mod tests {
         (addr, observed_rx)
     }
 
-    async fn spawn_permissive_websocket_echo_upstream(
+    async fn spawn_cross_node_websocket_upstream(
     ) -> (SocketAddr, oneshot::Receiver<Vec<&'static str>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2452,6 +2624,66 @@ mod tests {
             let mut observed = Vec::new();
             while let Some(message) = socket.next().await {
                 match message.unwrap() {
+                    TungsteniteMessage::Text(text) => {
+                        observed.push("text");
+                        socket.send(TungsteniteMessage::Text(text)).await.unwrap();
+                    }
+                    TungsteniteMessage::Binary(bytes) => {
+                        observed.push("binary");
+                        socket
+                            .send(TungsteniteMessage::Binary(bytes))
+                            .await
+                            .unwrap();
+                    }
+                    TungsteniteMessage::Ping(bytes) => {
+                        observed.push("ping");
+                        socket.send(TungsteniteMessage::Pong(bytes)).await.unwrap();
+                    }
+                    TungsteniteMessage::Pong(_) => observed.push("pong"),
+                    TungsteniteMessage::Close(frame) => {
+                        observed.push("close");
+                        let _ = frame;
+                        socket.flush().await.unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = observed_tx.send(observed);
+        });
+        (addr, observed_rx)
+    }
+
+    async fn spawn_permissive_websocket_echo_upstream(
+    ) -> (SocketAddr, oneshot::Receiver<Vec<&'static str>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (observed_tx, observed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_hdr_async(
+                stream,
+                |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(
+                        "sec-websocket-protocol",
+                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
+                    );
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let mut observed = Vec::new();
+            while let Some(message) = socket.next().await {
+                let message = match message {
+                    Ok(message) => message,
+                    Err(_) => {
+                        observed.push("disconnect");
+                        break;
+                    }
+                };
+                match message {
                     TungsteniteMessage::Binary(bytes) => {
                         observed.push("binary");
                         socket
