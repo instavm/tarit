@@ -53,6 +53,9 @@ pub enum StoreError {
 
     #[error("not found")]
     NotFound,
+
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 pub struct Store {
@@ -269,24 +272,26 @@ impl Store {
     }
 
     pub fn insert_share(&self, share: &ShareRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO shares (
+        self.conn
+            .execute(
+                "INSERT INTO shares (
                id, slug, owner_key, vm_id, guest_port, visibility, token_version, revoked_at,
                created_at, updated_at
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![
-                share.id.to_string(),
-                share.slug,
-                share.owner_key,
-                share.vm_id.to_string(),
-                i64::from(share.guest_port),
-                share_visibility_as_str(share.visibility),
-                u64_to_sql_i64(share.token_version)?,
-                share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
-                share.created_at.to_rfc3339(),
-                share.updated_at.to_rfc3339(),
-            ],
-        )?;
+                params![
+                    share.id.to_string(),
+                    share.slug,
+                    share.owner_key,
+                    share.vm_id.to_string(),
+                    i64::from(share.guest_port),
+                    share_visibility_as_str(share.visibility),
+                    u64_to_sql_i64(share.token_version)?,
+                    share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
+                    share.created_at.to_rfc3339(),
+                    share.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(share_error_from_sqlite)?;
         Ok(())
     }
 
@@ -328,23 +333,25 @@ impl Store {
     }
 
     pub fn update_share(&self, share: &ShareRecord) -> Result<(), StoreError> {
-        let updated = self.conn.execute(
-            "UPDATE shares SET
-               slug = ?2, owner_key = ?3, vm_id = ?4, guest_port = ?5, visibility = ?6,
-               token_version = ?7, revoked_at = ?8, updated_at = ?9
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shares SET
+              slug = ?2, vm_id = ?3, guest_port = ?4, visibility = ?5, token_version = ?6,
+              revoked_at = ?7, updated_at = ?8
              WHERE id = ?1",
-            params![
-                share.id.to_string(),
-                share.slug,
-                share.owner_key,
-                share.vm_id.to_string(),
-                i64::from(share.guest_port),
-                share_visibility_as_str(share.visibility),
-                u64_to_sql_i64(share.token_version)?,
-                share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
-                share.updated_at.to_rfc3339(),
-            ],
-        )?;
+                params![
+                    share.id.to_string(),
+                    share.slug,
+                    share.vm_id.to_string(),
+                    i64::from(share.guest_port),
+                    share_visibility_as_str(share.visibility),
+                    u64_to_sql_i64(share.token_version)?,
+                    share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
+                    share.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(share_error_from_sqlite)?;
         if updated == 0 {
             return Err(StoreError::NotFound);
         }
@@ -1027,6 +1034,18 @@ fn u64_to_sql_i64(value: u64) -> Result<i64, StoreError> {
         .map_err(|e| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
 }
 
+fn share_error_from_sqlite(error: rusqlite::Error) -> StoreError {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(db_error, _)
+            if db_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    ) {
+        StoreError::Conflict("share slug already exists".into())
+    } else {
+        StoreError::Sqlite(error)
+    }
+}
+
 fn parse_ts(s: &str) -> Result<DateTime<Utc>, rusqlite::Error> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
@@ -1085,7 +1104,41 @@ mod tests {
             id: Uuid::new_v4(),
             ..share
         };
-        assert!(store.insert_share(&duplicate).is_err());
+        assert!(matches!(
+            store.insert_share(&duplicate),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn share_slug_conflicts_do_not_change_other_sqlite_errors() {
+        let store = Store::open(":memory:").unwrap();
+        let share = test_share("conflicting-share", "tenant-a");
+        store.insert_share(&share).unwrap();
+
+        let duplicate_slug = ShareRecord {
+            id: Uuid::new_v4(),
+            ..share.clone()
+        };
+        assert!(matches!(
+            store.insert_share(&duplicate_slug),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let key = SshKeyRecord {
+            id: Uuid::new_v4(),
+            owner_key: "tenant-a".into(),
+            fingerprint: "SHA256:conflict-test".into(),
+            public_key: "ssh-ed25519 AAAA conflict-test".into(),
+            key_type: "ssh-ed25519".into(),
+            created_at: Utc::now(),
+            is_active: true,
+        };
+        store.insert_ssh_key(&key).unwrap();
+        assert!(matches!(
+            store.insert_ssh_key(&key),
+            Err(StoreError::Sqlite(_))
+        ));
     }
 
     #[test]
@@ -1115,8 +1168,12 @@ mod tests {
         newer.visibility = ShareVisibility::Public;
         newer.token_version += 1;
         newer.updated_at = Utc::now();
+        newer.owner_key = "tenant-b".into();
         store.update_share(&newer).unwrap();
-        assert_share_eq(&store.get_share(newer.id).unwrap(), &newer);
+        let persisted = store.get_share(newer.id).unwrap();
+        assert_eq!(persisted.owner_key, "tenant-a");
+        newer.owner_key = "tenant-a".into();
+        assert_share_eq(&persisted, &newer);
 
         assert!(matches!(
             store.get_share(Uuid::new_v4()),

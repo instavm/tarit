@@ -20,3 +20,6 @@ rustls-native-certs = { workspace = true }
 webpki-roots = { workspace = true }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

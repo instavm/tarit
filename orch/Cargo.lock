@@ -2994,6 +2994,7 @@ dependencies = [
  "tarit-store",
  "tarit-types",
  "thiserror",
+ "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
  "tracing",
