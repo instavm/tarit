@@ -128,9 +128,11 @@ Response `200`: `text/html`.
 ### Port shares
 
 Port-share control routes use `X-API-Key` and are separate from the guest
-gateway. The gateway listens only when share configuration is enabled and
-accepts requests for `<slug>.<TARIT_SHARE_DOMAIN>`; it is not an API-key route.
-See [CONFIGURATION.md](CONFIGURATION.md) and
+gateway. The gateway listener requires `TARIT_SHARE_LISTEN`,
+`TARIT_SHARE_DOMAIN`, and `TARIT_SHARE_TOKEN_KEY`; it accepts requests for
+`<slug>.<TARIT_SHARE_DOMAIN>` and is not an API-key route. Disabling only
+`TARIT_SHARE_LISTEN` leaves the control routes below available on the normal
+API listener. See [CONFIGURATION.md](CONFIGURATION.md) and
 `deploy/Caddyfile.shares.example`.
 
 `ShareRecord`:
@@ -151,17 +153,22 @@ See [CONFIGURATION.md](CONFIGURATION.md) and
 ```
 
 Visibility is `private` or `public`; omitted create visibility defaults to
-`private`. `guest_port` must be in `1..=65535`. Create and update bodies reject
-unknown fields.
+`private`, while omitted update visibility preserves the existing value.
+`guest_port` must be in `1..=65535`. Create and update bodies reject unknown
+fields.
 
 | Method | Path | Success | Behavior |
 | --- | --- | --- | --- |
 | `POST` | `/v1/shares` | `201 ShareRecord` | Create a share for a running VM the caller can access. |
 | `GET` | `/v1/shares` | `200 ShareRecord[]` | List shares owned by the caller's tenant. |
-| `GET` | `/v1/shares/{id}` | `200 ShareRecord` | Get a share if the caller owns it or is an admin. |
+| `GET` | `/v1/shares/{id}` | `200 ShareRecord` | Get a share owned by the caller's tenant, or any share with an `admin` API key. |
 | `PATCH` | `/v1/shares/{id}` | `200 ShareRecord` | Update the VM, guest port, and/or visibility. |
 | `DELETE` | `/v1/shares/{id}` | `204` | Revoke a share. |
 | `POST` | `/v1/shares/{id}/tokens` | `200 ShareTokenResponse` | Issue a private-share gateway token. |
+
+User API keys can access only their tenant's existing shares. An `admin` API
+key can get, update, revoke, or issue a token for an existing share in any
+tenant; listing remains scoped to the caller's tenant.
 
 Create request:
 
@@ -208,9 +215,12 @@ The gateway rejects absent, malformed, duplicate, expired, revoked, or
 token-version-mismatched private tokens with `401`. Tokens expire at
 `expires_at`, which is issuance time plus `TARIT_SHARE_TOKEN_TTL_SECS`. Public
 shares do not need a token; share tokens are not accepted in query parameters.
+For `POST /v1/shares/{id}/tokens`, `400` means an invalid identifier or a
+request for a public or revoked share; an unknown share is `404`.
 
 Share control error bodies are JSON: `{ "error": "..." }`. Across the six
-control operations, `400` means an invalid identifier or request body, `401`
+control operations, `400` means an invalid identifier or request body (plus
+the public/revoked token cases above), `401`
 means a missing or invalid API key, `403` means another tenant's share or VM,
 `404` means an unknown share or VM, `409` means a revoked share, non-running VM,
 or mutation conflict, and `503` means the share owner, share service, or audit

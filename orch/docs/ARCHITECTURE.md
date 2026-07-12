@@ -76,8 +76,11 @@ The port-share data plane is opt-in and binds a separate listener configured by
 `TARIT_SHARE_LISTEN`; the control listener remains responsible for the
 API-key-protected `/v1/shares` lifecycle API. A trusted Caddy or Envoy edge
 terminates public TLS and proxies only wildcard share hosts to that listener.
-It must preserve the original `Host` and scheme, pass WebSocket upgrades, and
-reject `/internal/v1/*` rather than forwarding it.
+The share listener is private to that edge: direct public access is unsupported
+and must be firewalled. Disabling only the share listener does not remove the
+control routes from the normal API listener. The edge must preserve the original
+`Host`, overwrite rather than append forwarding headers, pass WebSocket
+upgrades, and reject `/internal/v1/*` rather than forwarding it.
 
 For a request to `<slug>.<TARIT_SHARE_DOMAIN>`, the gateway requires exactly
 one valid Host header, derives the slug from the configured domain, and loads
@@ -95,7 +98,7 @@ browser or client
   v
 trusted Caddy or Envoy edge
   |
-  | preserved Host and scheme
+  | preserved Host and one X-Forwarded-Proto value
   v
 Tarit share listener
   |
@@ -119,10 +122,14 @@ arbitrary upstream.
 HTTP request and response bodies stream without full buffering. WebSocket
 handshakes, subprotocol negotiation, frames, ping/pong messages, and close
 frames are bridged while connection and idle limits are applied. Before traffic
-reaches the guest, Tarit removes hop-by-hop, proxy-authentication, token,
-`X-Tarit-*`, and untrusted forwarding headers; it supplies its own forwarding
-metadata. Equivalent unsafe response headers are removed before they reach the
-client.
+reaches the guest, Tarit removes hop-by-hop, `X-API-Key`,
+proxy-authentication, the private-share token, `X-Tarit-*`, and untrusted
+forwarding headers; it supplies its own forwarding metadata. It accepts only
+one exact lowercase `http` or `https` `X-Forwarded-Proto` value from the
+trusted edge; missing, repeated, comma-separated, or invalid values become
+`http`. Equivalent unsafe response headers are removed before they reach the
+client. Guest applications that need application credentials should use
+`Authorization` or another non-reserved header, not `X-API-Key`.
 
 The normal Prometheus `/metrics` output includes bounded share-gateway metrics:
 request totals by visibility and status class, authorization, owner-resolution,

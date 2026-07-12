@@ -97,11 +97,22 @@ The `TARIT_CONFIG` TOML schema does not define an `[autoscale]` table. Configure
 
 ## Port shares
 
-Port shares are disabled unless `TARIT_SHARE_LISTEN` is set. The share listener
-is distinct from `TARIT_LISTEN`: expose only the share listener through a
-trusted Caddy or Envoy edge. That edge must terminate public TLS, preserve the
-incoming `Host` and scheme, support WebSocket upgrades, and never route
+Port-share guest traffic is disabled unless `TARIT_SHARE_LISTEN` is set. The
+share listener is distinct from `TARIT_LISTEN`: it is private to a trusted
+Caddy or Envoy edge, and direct public access is unsupported and must be
+firewalled. Disabling only this listener does not disable the `/v1/shares`
+control routes on `TARIT_LISTEN`. The edge must terminate public TLS, preserve
+the incoming `Host`, support WebSocket upgrades, and never route
 `/internal/v1/*` from the public edge.
+
+The edge must overwrite—not append—forwarding headers. Tarit accepts one
+`X-Forwarded-Proto` value only when it is exactly lowercase `http` or `https`;
+missing, repeated, comma-separated, or other values are treated as `http`.
+Tarit then rebuilds the forwarding headers sent to the guest. The checked-in
+Caddy example removes `X-API-Key` and `Proxy-Authorization`; Tarit removes
+those headers plus the private-share token after gateway authorization. Guest
+applications needing an application credential must use `Authorization` or a
+different non-reserved header, never `X-API-Key`.
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |

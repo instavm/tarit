@@ -504,6 +504,22 @@ impl PendingPings {
 pub(crate) struct TrustedForwarding {
     peer: Option<SocketAddr>,
     host: String,
+    scheme: ForwardedScheme,
+}
+
+#[derive(Clone, Copy)]
+enum ForwardedScheme {
+    Http,
+    Https,
+}
+
+impl ForwardedScheme {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -520,6 +536,15 @@ struct LocalWebSocketRequest<'a> {
     forwarding: &'a TrustedForwarding,
     connect_timeout: Duration,
     idle_timeout: Duration,
+}
+
+struct RemoteWebSocketRequest<'a> {
+    rpc_addr: &'a str,
+    request_uri: &'a Uri,
+    websocket: WebSocketUpgrade,
+    protocols: Vec<String>,
+    headers: &'a axum::http::HeaderMap,
+    forwarding: &'a TrustedForwarding,
 }
 
 struct WebSocketTargetRequest<'a> {
@@ -651,6 +676,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
         let forwarding = TrustedForwarding {
             peer,
             host: format!("{slug}.{domain}"),
+            scheme: trusted_forwarded_scheme(request.headers()),
         };
         let (mut parts, body) = request.into_parts();
         let owner = resolve_share_owner(&state, share.vm_id)
@@ -690,11 +716,14 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
                     proxy_remote_websocket(
                         &state,
                         &share,
-                        &rpc_addr,
-                        &parts.uri,
-                        websocket,
-                        protocols,
-                        &parts.headers,
+                        RemoteWebSocketRequest {
+                            rpc_addr: &rpc_addr,
+                            request_uri: &parts.uri,
+                            websocket,
+                            protocols,
+                            headers: &parts.headers,
+                            forwarding: &forwarding,
+                        },
                     )
                     .await
                 }
@@ -809,9 +838,14 @@ async fn proxy_remote_http(
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
     let identity = share_identity(share);
+    let scheme = request
+        .extensions()
+        .get::<TrustedForwarding>()
+        .map(|forwarding| forwarding.scheme.as_str())
+        .ok_or(GatewayError::Unavailable)?;
     state
         .peer
-        .proxy_share_http(rpc_addr, share.id, &identity, request)
+        .proxy_share_http(rpc_addr, share.id, &identity, request, scheme)
         .await
         .map_err(|error| {
             tracing::warn!(share_id = %share.id, %error, "owner share HTTP proxy failed");
@@ -823,12 +857,16 @@ async fn proxy_remote_http(
 async fn proxy_remote_websocket(
     state: &AppState,
     share: &ShareRecord,
-    rpc_addr: &str,
-    request_uri: &Uri,
-    websocket: WebSocketUpgrade,
-    protocols: Vec<String>,
-    headers: &axum::http::HeaderMap,
+    request: RemoteWebSocketRequest<'_>,
 ) -> Result<Response, GatewayError> {
+    let RemoteWebSocketRequest {
+        rpc_addr,
+        request_uri,
+        websocket,
+        protocols,
+        headers,
+        forwarding,
+    } = request;
     let identity = share_identity(share);
     let (upstream, response_protocol) = time::timeout(
         connect_timeout(state),
@@ -836,9 +874,12 @@ async fn proxy_remote_websocket(
             rpc_addr,
             share.id,
             &identity,
-            request_uri,
-            headers,
-            &protocols,
+            crate::peer::ShareWebSocketRequest {
+                request_uri,
+                headers,
+                protocols: &protocols,
+                trusted_proto: forwarding.scheme.as_str(),
+            },
         ),
     )
     .await
@@ -899,6 +940,7 @@ pub(crate) async fn proxy_authoritative_local_share(
     let forwarding = TrustedForwarding {
         peer: None,
         host: format!("{}.{}", share.slug, domain),
+        scheme: trusted_forwarded_scheme(request.headers()),
     };
     let (mut parts, body) = request.into_parts();
     if is_websocket_request(&parts) {
@@ -1198,17 +1240,30 @@ fn sanitized_request_headers(
         "x-forwarded-host",
         HeaderValue::from_str(&forwarding.host).map_err(|_| GatewayError::Unavailable)?,
     );
-    sanitized.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+    sanitized.insert(
+        "x-forwarded-proto",
+        HeaderValue::from_static(forwarding.scheme.as_str()),
+    );
     let forwarded = match forwarding.peer {
         Some(peer) if peer.ip().is_ipv4() => {
-            format!("for={};host={};proto=http", peer.ip(), forwarding.host)
+            format!(
+                "for={};host={};proto={}",
+                peer.ip(),
+                forwarding.host,
+                forwarding.scheme.as_str()
+            )
         }
         Some(peer) => format!(
-            "for=\"[{}]\";host={};proto=http",
+            "for=\"[{}]\";host={};proto={}",
             peer.ip(),
-            forwarding.host
+            forwarding.host,
+            forwarding.scheme.as_str()
         ),
-        None => format!("host={};proto=http", forwarding.host),
+        None => format!(
+            "host={};proto={}",
+            forwarding.host,
+            forwarding.scheme.as_str()
+        ),
     };
     sanitized.insert(
         FORWARDED,
@@ -1241,6 +1296,21 @@ fn connection_headers(headers: &axum::http::HeaderMap) -> HashSet<HeaderName> {
         .collect()
 }
 
+fn trusted_forwarded_scheme(headers: &axum::http::HeaderMap) -> ForwardedScheme {
+    let mut values = headers.get_all("x-forwarded-proto").iter();
+    let Some(value) = values.next() else {
+        return ForwardedScheme::Http;
+    };
+    if values.next().is_some() {
+        return ForwardedScheme::Http;
+    }
+    match value.as_bytes() {
+        b"http" => ForwardedScheme::Http,
+        b"https" => ForwardedScheme::Https,
+        _ => ForwardedScheme::Http,
+    }
+}
+
 fn should_strip_request_header(
     name: &HeaderName,
     connection_headers: &HashSet<HeaderName>,
@@ -1248,6 +1318,7 @@ fn should_strip_request_header(
     is_hop_by_hop(name, connection_headers)
         || name == HOST
         || name.as_str() == SHARE_TOKEN_HEADER
+        || name.as_str().eq_ignore_ascii_case("x-api-key")
         || name == PROXY_AUTHORIZATION
         || name == PROXY_AUTHENTICATE
         || name == FORWARDED
@@ -1737,8 +1808,9 @@ fn upstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
 mod tests {
     use super::{
         meter_response_body, proxy_http_to_target, proxy_websocket_to_target,
-        router as gateway_router, share_slug, ActiveBridgeTask, BridgeTaskTracker, ShareRuntime,
-        TrackedBridgeTasks, TrustedForwarding, UpstreamTarget, WebSocketTargetRequest,
+        router as gateway_router, share_slug, ActiveBridgeTask, BridgeTaskTracker, ForwardedScheme,
+        ShareRuntime, TrackedBridgeTasks, TrustedForwarding, UpstreamTarget,
+        WebSocketTargetRequest,
     };
     use axum::{
         body::{Body, Bytes},
@@ -1894,6 +1966,7 @@ mod tests {
         let forwarding = TrustedForwarding {
             peer: Some("203.0.113.9:443".parse().unwrap()),
             host: SHARE_HOST.into(),
+            scheme: ForwardedScheme::Http,
         };
 
         for authorization in ["Basic YXBwbGljYXRpb246c2VjcmV0", "Bearer application-token"] {
@@ -2344,7 +2417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_router_uses_supervisor_target_and_sanitizes_share_credentials() {
+    async fn gateway_router_uses_supervisor_target_and_keeps_control_credentials_from_guest() {
         let (upstream, received) = spawn_inspecting_http_upstream().await;
         let state = gateway_test_state();
         let share = install_gateway_share(&state, upstream, ShareVisibility::Private).await;
@@ -2372,11 +2445,13 @@ mod tests {
         let request = Request::builder()
             .uri("/inspect?unrelated=keep")
             .header(HOST, SHARE_HOST)
+            .header("X-aPi-KeY", "control-secret")
             .header(AUTHORIZATION, "Bearer application-credential")
             .header("x-tarit-share-token", token)
             .header(COOKIE, "session=application")
             .header(CONNECTION, "keep-alive, x-smuggled")
             .header("x-smuggled", "remove-me")
+            .header(PROXY_AUTHORIZATION, "Basic cHJveHktc2VjcmV0")
             .body(Body::empty())
             .unwrap();
 
@@ -2391,7 +2466,66 @@ mod tests {
         );
         assert_eq!(headers.get(COOKIE).unwrap(), "session=application");
         assert!(headers.get("x-tarit-share-token").is_none());
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get(PROXY_AUTHORIZATION).is_none());
         assert!(headers.get("x-smuggled").is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_router_preserves_single_strict_https_edge_scheme() {
+        let (upstream, received) = spawn_inspecting_http_upstream().await;
+        let state = gateway_test_state();
+        install_gateway_share(&state, upstream, ShareVisibility::Public).await;
+        let request = Request::builder()
+            .uri("/inspect")
+            .header(HOST, SHARE_HOST)
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, _) = received.await.unwrap();
+        assert_eq!(headers.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(
+            headers.get(FORWARDED).unwrap(),
+            "host=calm-red-fox.shares.example.com;proto=https"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_router_defaults_ambiguous_edge_schemes_to_http() {
+        for values in [
+            &["https,http"][..],
+            &["https", "http"][..],
+            &["HTTPS"][..],
+            &["gopher"][..],
+        ] {
+            let (upstream, received) = spawn_inspecting_http_upstream().await;
+            let state = gateway_test_state();
+            install_gateway_share(&state, upstream, ShareVisibility::Public).await;
+            let mut request = Request::builder()
+                .uri("/inspect")
+                .header(HOST, SHARE_HOST)
+                .body(Body::empty())
+                .unwrap();
+            for value in values {
+                request
+                    .headers_mut()
+                    .append("x-forwarded-proto", HeaderValue::from_static(value));
+            }
+
+            let response = gateway_router(state).oneshot(request).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let (headers, _) = received.await.unwrap();
+            assert_eq!(headers.get("x-forwarded-proto").unwrap(), "http");
+            assert_eq!(
+                headers.get(FORWARDED).unwrap(),
+                "host=calm-red-fox.shares.example.com;proto=http"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2421,6 +2555,7 @@ mod tests {
         request.extensions_mut().insert(TrustedForwarding {
             peer: Some("203.0.113.9:443".parse().unwrap()),
             host: SHARE_HOST.into(),
+            scheme: ForwardedScheme::Http,
         });
 
         let response = proxy_http_to_target(
@@ -2486,6 +2621,7 @@ mod tests {
         request.extensions_mut().insert(TrustedForwarding {
             peer: Some("203.0.113.9:443".parse().unwrap()),
             host: SHARE_HOST.into(),
+            scheme: ForwardedScheme::Http,
         });
 
         let response = proxy_http_to_target(
@@ -2905,7 +3041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_owner_enforces_private_share_auth_and_strips_share_tokens() {
+    async fn remote_owner_enforces_private_share_auth_and_keeps_control_credentials_from_guest() {
         let (upstream, received) = spawn_inspecting_http_upstream().await;
         let cluster =
             TestShareCluster::start_with_upstream(upstream, ShareVisibility::Private).await;
@@ -2917,16 +3053,70 @@ mod tests {
         assert_eq!(missing_token.status(), StatusCode::UNAUTHORIZED);
 
         let response = cluster
-            .request_through_non_owner_with_header(
+            .request_through_non_owner_with_headers(
                 "/inspect?preserve=this",
-                "x-tarit-share-token",
-                &token,
+                &[
+                    ("x-tarit-share-token", &token),
+                    ("X-aPi-KeY", "control-secret"),
+                    ("proxy-authorization", "Basic cHJveHktc2VjcmV0"),
+                ],
             )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         let (headers, uri) = received.await.unwrap();
         assert_eq!(uri, "/inspect?preserve=this");
+        assert!(headers.get("x-api-key").is_none());
         assert!(headers.get("x-tarit-share-token").is_none());
+        assert!(headers.get(PROXY_AUTHORIZATION).is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_owner_preserves_single_strict_https_edge_scheme() {
+        let (upstream, received) = spawn_inspecting_http_upstream().await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+
+        let response = cluster
+            .request_through_non_owner_with_header("/inspect", "x-forwarded-proto", "https")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, _) = received.await.unwrap();
+        assert_eq!(headers.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(
+            headers.get(FORWARDED).unwrap(),
+            "host=calm-red-fox.shares.example.com;proto=https"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_owner_defaults_ambiguous_edge_schemes_to_http() {
+        for values in [
+            &["https,http"][..],
+            &["https", "http"][..],
+            &["HTTPS"][..],
+            &["gopher"][..],
+        ] {
+            let (upstream, received) = spawn_inspecting_http_upstream().await;
+            let cluster =
+                TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+            let request_headers = values
+                .iter()
+                .map(|value| ("x-forwarded-proto", *value))
+                .collect::<Vec<_>>();
+
+            let response = cluster
+                .request_through_non_owner_with_headers("/inspect", &request_headers)
+                .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let (headers, _) = received.await.unwrap();
+            assert_eq!(headers.get("x-forwarded-proto").unwrap(), "http");
+            assert_eq!(
+                headers.get(FORWARDED).unwrap(),
+                "host=calm-red-fox.shares.example.com;proto=http"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3214,13 +3404,22 @@ mod tests {
             header: &str,
             value: &str,
         ) -> reqwest::Response {
-            reqwest::Client::new()
-                .get(format!("http://{}{}", self.client_addr, path))
-                .header(HOST, SHARE_HOST)
-                .header(header, value)
-                .send()
+            self.request_through_non_owner_with_headers(path, &[(header, value)])
                 .await
-                .unwrap()
+        }
+
+        async fn request_through_non_owner_with_headers(
+            &self,
+            path: &str,
+            headers: &[(&str, &str)],
+        ) -> reqwest::Response {
+            let mut request = reqwest::Client::new()
+                .get(format!("http://{}{}", self.client_addr, path))
+                .header(HOST, SHARE_HOST);
+            for (header, value) in headers {
+                request = request.header(*header, *value);
+            }
+            request.send().await.unwrap()
         }
 
         async fn owner_tenant(&mut self) -> String {
@@ -3603,6 +3802,7 @@ mod tests {
                         let forwarding = TrustedForwarding {
                             peer: Some("203.0.113.9:443".parse().unwrap()),
                             host: SHARE_HOST.into(),
+                            scheme: ForwardedScheme::Http,
                         };
                         proxy_websocket_to_target(WebSocketTargetRequest {
                             target: UpstreamTarget::new(upstream.ip(), upstream.port()),

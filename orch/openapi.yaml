@@ -195,10 +195,10 @@ components:
           format: uuid
         action:
           type: string
-          enum: [create, delete, pause, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress]
+          enum: [create, delete, pause, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token]
         outcome:
           type: string
-          enum: [ok, denied, error]
+          enum: [attempt, ok, denied, error]
         detail:
           type: ["string", "null"]
         created_at:
@@ -207,7 +207,6 @@ components:
     ShareVisibility:
       type: string
       enum: [public, private]
-      default: private
       description: "`private` requires a valid share token at the gateway; `public` does not."
     ShareRecord:
       type: object
@@ -272,6 +271,7 @@ components:
           maximum: 65535
         visibility:
           $ref: "#/components/schemas/ShareVisibility"
+          description: When omitted, the share keeps its current visibility.
     ShareTokenResponse:
       type: object
       required: [token, expires_at]
@@ -964,8 +964,16 @@ paths:
                   $ref: "#/components/schemas/ShareRecord"
         "401":
           description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "503":
           description: Share service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
     post:
       summary: Create port share
       description: Creates a share for a running VM owned by the caller. `visibility` defaults to `private`.
@@ -984,16 +992,40 @@ paths:
                 $ref: "#/components/schemas/ShareRecord"
         "400":
           description: Malformed, unknown-field, or invalid share request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "401":
           description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "403":
           description: VM belongs to another tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "404":
           description: VM not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "409":
           description: VM is not running or a share slug conflict could not be resolved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "503":
           description: Owner, share service, or share audit service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/shares/{id}:
     parameters:
       - name: id
@@ -1013,14 +1045,34 @@ paths:
                 $ref: "#/components/schemas/ShareRecord"
         "400":
           description: Invalid share identifier
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "401":
           description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "403":
           description: Share belongs to another tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "404":
           description: Share not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "503":
           description: Share service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
     patch:
       summary: Update port share
       description: Changes one or more share fields. Changing `vm_id`, `guest_port`, or `visibility` invalidates previously issued private-share tokens.
@@ -1039,16 +1091,40 @@ paths:
                 $ref: "#/components/schemas/ShareRecord"
         "400":
           description: Invalid share identifier or malformed, unknown-field, or invalid share request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "401":
           description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "403":
           description: Share or replacement VM belongs to another tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "404":
           description: Share or replacement VM not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "409":
           description: Share is revoked, replacement VM is not running, or the update conflicted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "503":
           description: Owner, share service, or share audit service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
     delete:
       summary: Revoke port share
       description: Revokes the share and invalidates issued private-share tokens. Repeating a successful revocation returns `204`.
@@ -1057,16 +1133,40 @@ paths:
           description: Revoked; no response body
         "400":
           description: Invalid share identifier
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "401":
           description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "403":
           description: Share belongs to another tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "404":
           description: Share not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "409":
           description: Revocation conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "503":
           description: Share or share audit service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/shares/{id}/tokens:
     post:
       summary: Issue private-share token
@@ -1087,14 +1187,34 @@ paths:
                 $ref: "#/components/schemas/ShareTokenResponse"
         "400":
           description: Invalid share identifier, public share, or revoked share
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "401":
           description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "403":
           description: Share belongs to another tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "404":
           description: Share not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
         "503":
           description: Share, signing, or share audit service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
   /v1/ssh-keys:
     post:
       summary: Register SSH public key

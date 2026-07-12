@@ -300,7 +300,7 @@ pub struct UsageSummary {
 
 /// An audited action taken through the orchestrator, attributed to an API key.
 /// `action` is a stable verb (see `audit_action` constants); `outcome` is
-/// `ok`, `denied`, or `error`.
+/// `attempt`, `ok`, `denied`, or `error`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub id: Uuid,

@@ -39,6 +39,13 @@ pub type PeerWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const IDENTITY_SIGNATURE_VERSION: &str = "tarit-peer-identity-v1";
 
+pub struct ShareWebSocketRequest<'a> {
+    pub request_uri: &'a Uri,
+    pub headers: &'a HeaderMap,
+    pub protocols: &'a [String],
+    pub trusted_proto: &'static str,
+}
+
 #[derive(Serialize)]
 struct RemoteExecRequest {
     command: String,
@@ -158,10 +165,11 @@ impl PeerClient {
         share_id: Uuid,
         identity: &ApiIdentity,
         request: Request<Body>,
+        trusted_proto: &'static str,
     ) -> Result<Response<Body>, OrchError> {
         let (parts, body) = request.into_parts();
         let url = Self::share_url(rpc_addr, share_id, &parts.uri)?;
-        let headers = self.share_headers(&parts.headers, identity)?;
+        let headers = self.share_headers(&parts.headers, identity, trusted_proto)?;
         let response = self
             .stream_http
             .request(parts.method, url)
@@ -192,10 +200,14 @@ impl PeerClient {
         rpc_addr: &str,
         share_id: Uuid,
         identity: &ApiIdentity,
-        request_uri: &Uri,
-        headers: &HeaderMap,
-        protocols: &[String],
+        request: ShareWebSocketRequest<'_>,
     ) -> Result<(PeerWebSocket, Option<String>), OrchError> {
+        let ShareWebSocketRequest {
+            request_uri,
+            headers,
+            protocols,
+            trusted_proto,
+        } = request;
         let url = Self::share_url(rpc_addr, share_id, request_uri)?;
         let mut url = reqwest::Url::parse(&url)
             .map_err(|error| OrchError::Internal(format!("invalid peer WebSocket URL: {error}")))?;
@@ -216,7 +228,7 @@ impl PeerClient {
             .as_str()
             .into_client_request()
             .map_err(|error| OrchError::Internal(format!("peer WebSocket request: {error}")))?;
-        let mut peer_headers = self.share_headers(headers, identity)?;
+        let mut peer_headers = self.share_headers(headers, identity, trusted_proto)?;
         let handshake_headers = peer_headers
             .keys()
             .filter(|name| name.as_str().starts_with("sec-websocket-"))
@@ -250,6 +262,7 @@ impl PeerClient {
         &self,
         headers: &HeaderMap,
         identity: &ApiIdentity,
+        trusted_proto: &'static str,
     ) -> Result<HeaderMap, OrchError> {
         let connection_headers = Self::connection_headers(headers);
         let mut sanitized = HeaderMap::new();
@@ -259,6 +272,7 @@ impl PeerClient {
             }
             sanitized.append(name.clone(), value.clone());
         }
+        sanitized.insert("x-forwarded-proto", HeaderValue::from_static(trusted_proto));
         sanitized.insert(
             "x-peer-secret",
             HeaderValue::from_str(&self.secret)
