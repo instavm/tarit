@@ -36,8 +36,8 @@ use std::{
 use tarit_types::{ErrorBody, OrchError, ShareRecord};
 use tokio::{
     net::TcpStream,
-    sync::{watch, Mutex as AsyncMutex},
-    task::JoinSet,
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex},
+    task::{JoinError, JoinHandle, JoinSet},
     time::{self, Instant},
 };
 use tokio_tungstenite::{
@@ -61,11 +61,34 @@ use crate::{
 
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
+const MAX_PENDING_BRIDGE_COMMANDS: usize = 256;
 const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
 
 struct PendingUpgradeState {
     accepting: bool,
     count: usize,
+}
+
+type BridgeFuture = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+enum BridgeCommand {
+    Spawn(BridgeFuture),
+    Stop {
+        timeout: Duration,
+        complete: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    Count(oneshot::Sender<usize>),
+}
+
+struct BridgeReaper {
+    commands: mpsc::Sender<BridgeCommand>,
+    handle: JoinHandle<()>,
+}
+
+struct BridgeState {
+    accepting: bool,
+    reaper: Option<BridgeReaper>,
 }
 
 pub(crate) struct ShareRuntime {
@@ -74,7 +97,8 @@ pub(crate) struct ShareRuntime {
     pending_upgrades: Mutex<PendingUpgradeState>,
     pending_upgrade_tx: watch::Sender<usize>,
     pending_upgrade_rx: watch::Receiver<usize>,
-    bridges: AsyncMutex<JoinSet<()>>,
+    bridges: Mutex<BridgeState>,
+    shutdown_lock: AsyncMutex<()>,
 }
 
 pub(crate) struct PendingUpgrade {
@@ -118,7 +142,11 @@ impl ShareRuntime {
             }),
             pending_upgrade_tx,
             pending_upgrade_rx,
-            bridges: AsyncMutex::new(JoinSet::new()),
+            bridges: Mutex::new(BridgeState {
+                accepting: true,
+                reaper: None,
+            }),
+            shutdown_lock: AsyncMutex::new(()),
         }
     }
 
@@ -155,15 +183,35 @@ impl ShareRuntime {
         Build: FnOnce(T) -> Bridge,
         Bridge: Future<Output = ()> + Send + 'static,
     {
-        let mut bridges = self.bridges.lock().await;
-        if self.is_shutting_down() {
+        let mut bridges = self
+            .bridges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_shutting_down() || !bridges.accepting {
             return Err(resource);
         }
-        bridges.spawn(build(resource));
+        let reaper = bridges.reaper.get_or_insert_with(|| {
+            let (commands, receiver) = mpsc::channel(MAX_PENDING_BRIDGE_COMMANDS);
+            BridgeReaper {
+                commands,
+                handle: tokio::spawn(run_bridge_reaper(receiver)),
+            }
+        });
+        match reaper.commands.clone().try_reserve_owned() {
+            Ok(permit) => {
+                permit.send(BridgeCommand::Spawn(Box::pin(build(resource))));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(resource),
+            Err(_) => {
+                tracing::error!("share WebSocket bridge reaper stopped unexpectedly");
+                return Err(resource);
+            }
+        }
         Ok(())
     }
 
     pub(crate) async fn stop(&self, timeout: Duration) {
+        let _shutdown = self.shutdown_lock.lock().await;
         self.shutdown_tx.send_if_modified(|reason| {
             if reason.is_none() {
                 *reason = Some("shutdown");
@@ -174,40 +222,59 @@ impl ShareRuntime {
         });
 
         {
-            let mut state = self
-                .pending_upgrades
+            let mut bridges = self
+                .bridges
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.accepting = false;
+            bridges.accepting = false;
         }
         self.wait_for_pending_upgrades(timeout).await;
 
-        let deadline = Instant::now() + timeout;
-        let mut bridges = self.bridges.lock().await;
-        while !bridges.is_empty() {
-            match time::timeout_at(deadline, bridges.join_next()).await {
-                Ok(Some(Ok(()))) => {}
-                Ok(Some(Err(error))) if error.is_cancelled() => {}
-                Ok(Some(Err(error))) => {
-                    tracing::warn!(%error, "share WebSocket bridge task failed");
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    tracing::warn!(
-                        "share WebSocket bridge drain timed out; aborting remaining bridges"
-                    );
-                    bridges.abort_all();
-                    while let Some(result) = bridges.join_next().await {
-                        if let Err(error) = result {
-                            if !error.is_cancelled() {
-                                tracing::warn!(%error, "share WebSocket bridge task failed while aborting");
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
+        let Some(reaper) = self
+            .bridges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reaper
+            .take()
+        else {
+            return;
+        };
+        let (complete_tx, complete_rx) = oneshot::channel();
+        if reaper
+            .commands
+            .send(BridgeCommand::Stop {
+                timeout,
+                complete: complete_tx,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("share WebSocket bridge reaper stopped before shutdown drain");
+        } else if complete_rx.await.is_err() {
+            tracing::warn!("share WebSocket bridge reaper ended before shutdown drain completed");
         }
+        if let Err(error) = reaper.handle.await {
+            tracing::warn!(%error, "share WebSocket bridge reaper task failed");
+        }
+    }
+
+    #[cfg(test)]
+    async fn tracked_bridge_count(&self) -> usize {
+        let Some(commands) = self
+            .bridges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reaper
+            .as_ref()
+            .map(|reaper| reaper.commands.clone())
+        else {
+            return 0;
+        };
+        let (count_tx, count_rx) = oneshot::channel();
+        if commands.send(BridgeCommand::Count(count_tx)).await.is_err() {
+            return 0;
+        }
+        count_rx.await.unwrap_or(0)
     }
 
     async fn wait_for_pending_upgrades(&self, warning_after: Duration) {
@@ -229,6 +296,7 @@ impl ShareRuntime {
                         return;
                     }
                 }
+
                 _ = time::sleep(warning_after) => {
                     warned = true;
                     tracing::warn!(
@@ -237,6 +305,80 @@ impl ShareRuntime {
                     );
                 }
             }
+        }
+    }
+}
+
+async fn run_bridge_reaper(mut commands: mpsc::Receiver<BridgeCommand>) {
+    let mut bridges = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            command = commands.recv() => match command {
+                Some(BridgeCommand::Spawn(bridge)) => {
+                    reap_completed_bridges(&mut bridges);
+                    bridges.spawn(bridge);
+                }
+                Some(BridgeCommand::Stop { timeout, complete }) => {
+                    drain_bridges(&mut bridges, timeout).await;
+                    let _ = complete.send(());
+                    return;
+                }
+                #[cfg(test)]
+                Some(BridgeCommand::Count(count)) => {
+                    reap_completed_bridges(&mut bridges);
+                    let _ = count.send(bridges.len());
+                }
+                None => {
+                    tracing::warn!("share WebSocket bridge reaper lost its runtime owner; aborting bridges");
+                    bridges.abort_all();
+                    while let Some(result) = bridges.join_next().await {
+                        observe_bridge_result(result, "while aborting after reaper ownership loss");
+                    }
+                    return;
+                }
+            },
+            result = bridges.join_next(), if !bridges.is_empty() => {
+                if let Some(result) = result {
+                    observe_bridge_result(result, "during normal operation");
+                }
+            }
+        }
+    }
+}
+
+fn reap_completed_bridges(bridges: &mut JoinSet<()>) {
+    while let Some(result) = bridges.try_join_next() {
+        observe_bridge_result(result, "while registering a bridge");
+    }
+}
+
+async fn drain_bridges(bridges: &mut JoinSet<()>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !bridges.is_empty() {
+        match time::timeout_at(deadline, bridges.join_next()).await {
+            Ok(Some(result)) => observe_bridge_result(result, "during shutdown"),
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(
+                    "share WebSocket bridge drain timed out; aborting remaining bridges"
+                );
+                bridges.abort_all();
+                while let Some(result) = bridges.join_next().await {
+                    observe_bridge_result(result, "while aborting");
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn observe_bridge_result(result: Result<(), JoinError>, phase: &'static str) {
+    if let Err(error) = result {
+        if error.is_cancelled() {
+            tracing::debug!(%error, phase, "share WebSocket bridge task cancelled");
+        } else {
+            tracing::warn!(%error, phase, "share WebSocket bridge task failed");
         }
     }
 }
@@ -277,6 +419,30 @@ pub(crate) struct TrustedForwarding {
 struct UpstreamTarget {
     ip: IpAddr,
     port: u16,
+}
+
+struct LocalWebSocketRequest<'a> {
+    request_uri: &'a Uri,
+    websocket: WebSocketUpgrade,
+    protocols: Vec<String>,
+    headers: &'a axum::http::HeaderMap,
+    forwarding: &'a TrustedForwarding,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+}
+
+struct WebSocketTargetRequest<'a> {
+    target: UpstreamTarget,
+    path_and_query: &'a str,
+    websocket: WebSocketUpgrade,
+    protocols: Vec<String>,
+    headers: &'a axum::http::HeaderMap,
+    forwarding: &'a TrustedForwarding,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+    lease: Option<NetworkLease>,
+    metrics: Arc<Metrics>,
+    runtime: Arc<ShareRuntime>,
 }
 
 impl UpstreamTarget {
@@ -417,13 +583,15 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
                     proxy_local_websocket(
                         &state,
                         &share,
-                        &parts.uri,
-                        websocket,
-                        protocols,
-                        &parts.headers,
-                        &forwarding,
-                        connect_timeout(&state),
-                        idle_timeout(&state),
+                        LocalWebSocketRequest {
+                            request_uri: &parts.uri,
+                            websocket,
+                            protocols,
+                            headers: &parts.headers,
+                            forwarding: &forwarding,
+                            connect_timeout: connect_timeout(&state),
+                            idle_timeout: idle_timeout(&state),
+                        },
                     )
                     .await
                 }
@@ -593,9 +761,8 @@ async fn proxy_remote_websocket(
         GatewayError::Unavailable
     })?;
     let protocol =
-        negotiated_protocol(response_protocol.as_deref(), &protocols).map_err(|error| {
+        negotiated_protocol(response_protocol.as_deref(), &protocols).inspect_err(|_| {
             state.metrics.inc_share_target_failures();
-            error
         })?;
     let websocket = if let Some(protocol) = protocol {
         websocket.protocols([protocol])
@@ -651,13 +818,15 @@ pub(crate) async fn proxy_authoritative_local_share(
         proxy_local_websocket(
             state,
             share,
-            &parts.uri,
-            websocket,
-            protocols,
-            &parts.headers,
-            &forwarding,
-            connect_timeout(state),
-            idle_timeout(state),
+            LocalWebSocketRequest {
+                request_uri: &parts.uri,
+                websocket,
+                protocols,
+                headers: &parts.headers,
+                forwarding: &forwarding,
+                connect_timeout: connect_timeout(state),
+                idle_timeout: idle_timeout(state),
+            },
         )
         .await
     } else {
@@ -781,9 +950,8 @@ async fn proxy_local_http(
     share: &ShareRecord,
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
-    let (target, lease) = local_target(state, share).map_err(|error| {
+    let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
-        error
     })?;
     let result = proxy_http_to_target(
         target,
@@ -1030,37 +1198,31 @@ fn is_hop_by_hop(name: &HeaderName, connection_headers: &HashSet<HeaderName>) ->
 async fn proxy_local_websocket(
     state: &AppState,
     share: &ShareRecord,
-    request_uri: &Uri,
-    websocket: WebSocketUpgrade,
-    protocols: Vec<String>,
-    headers: &axum::http::HeaderMap,
-    forwarding: &TrustedForwarding,
-    connect_timeout: Duration,
-    idle_timeout: Duration,
+    request: LocalWebSocketRequest<'_>,
 ) -> Result<Response, GatewayError> {
     if state.share_runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
-    let (target, lease) = local_target(state, share).map_err(|error| {
+    let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
-        error
     })?;
-    let result = proxy_websocket_to_target(
+    let result = proxy_websocket_to_target(WebSocketTargetRequest {
         target,
-        request_uri
+        path_and_query: request
+            .request_uri
             .path_and_query()
             .map(|value| value.as_str())
             .unwrap_or("/"),
-        websocket,
-        protocols,
-        headers,
-        forwarding,
-        connect_timeout,
-        idle_timeout,
-        Some(lease),
-        Arc::clone(&state.metrics),
-        Arc::clone(&state.share_runtime),
-    )
+        websocket: request.websocket,
+        protocols: request.protocols,
+        headers: request.headers,
+        forwarding: request.forwarding,
+        connect_timeout: request.connect_timeout,
+        idle_timeout: request.idle_timeout,
+        lease: Some(lease),
+        metrics: Arc::clone(&state.metrics),
+        runtime: Arc::clone(&state.share_runtime),
+    })
     .await;
     if result.is_err() {
         state.metrics.inc_share_target_failures();
@@ -1069,35 +1231,27 @@ async fn proxy_local_websocket(
 }
 
 async fn proxy_websocket_to_target(
-    target: UpstreamTarget,
-    path_and_query: &str,
-    websocket: WebSocketUpgrade,
-    protocols: Vec<String>,
-    headers: &axum::http::HeaderMap,
-    forwarding: &TrustedForwarding,
-    connect_timeout: Duration,
-    idle_timeout: Duration,
-    lease: Option<NetworkLease>,
-    metrics: Arc<crate::metrics::Metrics>,
-    runtime: Arc<ShareRuntime>,
+    request: WebSocketTargetRequest<'_>,
 ) -> Result<Response, GatewayError> {
-    let request_uri = path_and_query
+    let request_uri = request
+        .path_and_query
         .parse::<Uri>()
         .map_err(|_| GatewayError::NotFound)?;
-    let upstream = target.uri("ws", &request_uri)?;
+    let upstream = request.target.uri("ws", &request_uri)?;
     let mut upstream_request = upstream
         .into_client_request()
         .map_err(|_| GatewayError::Unavailable)?;
-    let headers = sanitized_websocket_headers(headers, forwarding)?;
+    let headers = sanitized_websocket_headers(request.headers, request.forwarding)?;
     for (name, value) in &headers {
         upstream_request
             .headers_mut()
             .append(name.clone(), value.clone());
     }
-    if !protocols.is_empty() {
+    if !request.protocols.is_empty() {
         upstream_request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_str(&protocols.join(", ")).map_err(|_| GatewayError::NotFound)?,
+            HeaderValue::from_str(&request.protocols.join(", "))
+                .map_err(|_| GatewayError::NotFound)?,
         );
     }
 
@@ -1116,36 +1270,38 @@ async fn proxy_websocket_to_target(
         }
         Ok(headers)
     }
-    let (upstream, response) = time::timeout(connect_timeout, connect_async(upstream_request))
-        .await
-        .map_err(|_| GatewayError::Unavailable)?
-        .map_err(|_| GatewayError::Unavailable)?;
+    let (upstream, response) =
+        time::timeout(request.connect_timeout, connect_async(upstream_request))
+            .await
+            .map_err(|_| GatewayError::Unavailable)?
+            .map_err(|_| GatewayError::Unavailable)?;
     let protocol = negotiated_protocol(
         response
             .headers()
             .get(SEC_WEBSOCKET_PROTOCOL)
             .and_then(|value| value.to_str().ok()),
-        &protocols,
+        &request.protocols,
     )?;
     let websocket = if let Some(protocol) = protocol {
-        websocket.protocols([protocol])
+        request.websocket.protocols([protocol])
     } else {
-        websocket
+        request.websocket
     };
-    if runtime.is_shutting_down() {
+    if request.runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
-    let pending_upgrade = runtime
+    let pending_upgrade = request
+        .runtime
         .register_upgrade()
         .ok_or(GatewayError::Unavailable)?;
     Ok(websocket.on_upgrade(move |client| async move {
         run_pending_websocket_upgrade(
             client,
             upstream,
-            lease,
-            idle_timeout,
-            metrics,
-            runtime,
+            request.lease,
+            request.idle_timeout,
+            request.metrics,
+            request.runtime,
             pending_upgrade,
         )
         .await;
@@ -1216,6 +1372,17 @@ async fn close_client_websocket(mut client: WebSocket, idle_timeout: Duration) {
     let _ = time::timeout(idle_timeout, client.send(AxumMessage::Close(None))).await;
 }
 
+struct BridgeForwarding {
+    activity_tx: watch::Sender<Instant>,
+    activity_rx: watch::Receiver<Instant>,
+    idle_timeout: Duration,
+    client_closed: Arc<AtomicBool>,
+    upstream_closed: Arc<AtomicBool>,
+    client_pings: Arc<Mutex<PendingPings>>,
+    metrics: Arc<Metrics>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+}
+
 async fn bridge_websocket(
     client: WebSocket,
     upstream: UpstreamWebSocket,
@@ -1233,28 +1400,32 @@ async fn bridge_websocket(
     let mut client_to_upstream = Box::pin(forward_client_to_upstream(
         client_rx,
         upstream_tx,
-        activity_tx.clone(),
-        activity_rx.clone(),
-        idle_timeout,
-        Arc::clone(&client_closed),
-        Arc::clone(&upstream_closed),
-        client_close_tx.clone(),
-        Arc::clone(&client_pings),
-        Arc::clone(&metrics),
-        shutdown_rx.clone(),
+        BridgeForwarding {
+            activity_tx: activity_tx.clone(),
+            activity_rx: activity_rx.clone(),
+            idle_timeout,
+            client_closed: Arc::clone(&client_closed),
+            upstream_closed: Arc::clone(&upstream_closed),
+            client_pings: Arc::clone(&client_pings),
+            metrics: Arc::clone(&metrics),
+            shutdown_rx: shutdown_rx.clone(),
+        },
+        client_close_tx,
     ));
     let mut upstream_to_client = Box::pin(forward_upstream_to_client(
         upstream_rx,
         client_tx,
-        activity_tx,
-        activity_rx,
-        idle_timeout,
-        client_closed,
-        upstream_closed,
+        BridgeForwarding {
+            activity_tx,
+            activity_rx,
+            idle_timeout,
+            client_closed,
+            upstream_closed,
+            client_pings,
+            metrics,
+            shutdown_rx,
+        },
         client_close_rx,
-        client_pings,
-        metrics,
-        shutdown_rx,
     ));
 
     tokio::select! {
@@ -1270,16 +1441,19 @@ async fn bridge_websocket(
 async fn forward_client_to_upstream(
     mut source: SplitStream<WebSocket>,
     mut sink: SplitSink<UpstreamWebSocket, TungsteniteMessage>,
-    activity_tx: watch::Sender<Instant>,
-    mut activity_rx: watch::Receiver<Instant>,
-    idle_timeout: Duration,
-    client_closed: Arc<AtomicBool>,
-    upstream_closed: Arc<AtomicBool>,
+    forwarding: BridgeForwarding,
     client_close_tx: watch::Sender<bool>,
-    client_pings: Arc<Mutex<PendingPings>>,
-    metrics: Arc<Metrics>,
-    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) {
+    let BridgeForwarding {
+        activity_tx,
+        mut activity_rx,
+        idle_timeout,
+        client_closed,
+        upstream_closed,
+        client_pings,
+        metrics,
+        mut shutdown_rx,
+    } = forwarding;
     loop {
         let deadline = *activity_rx.borrow() + idle_timeout;
         tokio::select! {
@@ -1333,16 +1507,19 @@ async fn forward_client_to_upstream(
 async fn forward_upstream_to_client(
     mut source: SplitStream<UpstreamWebSocket>,
     mut sink: SplitSink<WebSocket, AxumMessage>,
-    activity_tx: watch::Sender<Instant>,
-    mut activity_rx: watch::Receiver<Instant>,
-    idle_timeout: Duration,
-    client_closed: Arc<AtomicBool>,
-    upstream_closed: Arc<AtomicBool>,
+    forwarding: BridgeForwarding,
     mut client_close_rx: watch::Receiver<bool>,
-    client_pings: Arc<Mutex<PendingPings>>,
-    metrics: Arc<Metrics>,
-    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) {
+    let BridgeForwarding {
+        activity_tx,
+        mut activity_rx,
+        idle_timeout,
+        client_closed,
+        upstream_closed,
+        client_pings,
+        metrics,
+        mut shutdown_rx,
+    } = forwarding;
     loop {
         let deadline = *activity_rx.borrow() + idle_timeout;
         tokio::select! {
@@ -1470,6 +1647,7 @@ mod tests {
     use super::{
         meter_response_body, proxy_http_to_target, proxy_websocket_to_target,
         router as gateway_router, share_slug, ShareRuntime, TrustedForwarding, UpstreamTarget,
+        WebSocketTargetRequest,
     };
     use axum::{
         body::{Body, Bytes},
@@ -1505,7 +1683,13 @@ mod tests {
     };
     use tokio_tungstenite::{
         accept_hdr_async, connect_async,
-        tungstenite::{client::IntoClientRequest, protocol::Message as TungsteniteMessage},
+        tungstenite::{
+            client::IntoClientRequest,
+            handshake::server::{
+                Callback, ErrorResponse, Request as WebSocketRequest, Response as WebSocketResponse,
+            },
+            protocol::Message as TungsteniteMessage,
+        },
     };
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -1524,6 +1708,59 @@ mod tests {
     };
 
     const SHARE_HOST: &str = "calm-red-fox.shares.example.com";
+    type HeaderCapture = Arc<Mutex<Option<oneshot::Sender<(HeaderMap, Uri)>>>>;
+    type UploadCapture = Arc<Mutex<Option<oneshot::Sender<(Uri, usize)>>>>;
+
+    struct ChatProtocol;
+
+    impl Callback for ChatProtocol {
+        fn on_request(
+            self,
+            _request: &WebSocketRequest,
+            mut response: WebSocketResponse,
+        ) -> Result<WebSocketResponse, ErrorResponse> {
+            response.headers_mut().insert(
+                "sec-websocket-protocol",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
+            );
+            Ok(response)
+        }
+    }
+
+    struct InspectingChatProtocol;
+
+    impl Callback for InspectingChatProtocol {
+        fn on_request(
+            self,
+            request: &WebSocketRequest,
+            mut response: WebSocketResponse,
+        ) -> Result<WebSocketResponse, ErrorResponse> {
+            assert_eq!(
+                request.headers().get("sec-websocket-protocol").unwrap(),
+                "chat, alternate"
+            );
+            assert_eq!(
+                request.headers().get(ORIGIN).unwrap(),
+                "https://client.example"
+            );
+            assert_eq!(request.headers().get(COOKIE).unwrap(), "session=guest");
+            assert!(request.headers().contains_key(AUTHORIZATION));
+            assert!(request.headers().get("x-tarit-share-token").is_none());
+            assert_eq!(
+                request.headers().get(FORWARDED).unwrap(),
+                "for=203.0.113.9;host=calm-red-fox.shares.example.com;proto=http"
+            );
+            assert_eq!(
+                request.headers().get("x-forwarded-for").unwrap(),
+                "203.0.113.9"
+            );
+            response.headers_mut().insert(
+                "sec-websocket-protocol",
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
+            );
+            Ok(response)
+        }
+    }
 
     #[test]
     fn extracts_only_one_slug_label() {
@@ -1806,6 +2043,27 @@ mod tests {
         runtime.stop(Duration::from_millis(5)).await;
 
         dropped_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn share_runtime_reaps_short_lived_bridges_before_shutdown() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        let runtime = ShareRuntime::new(shutdown_tx, shutdown_rx);
+
+        for _ in 0..128 {
+            runtime.spawn_bridge((), |_| async {}).await.unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.tracked_bridge_count().await == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed bridges must be reaped before shutdown");
     }
 
     #[test]
@@ -2235,12 +2493,13 @@ mod tests {
         let (mut client, _) = connect_async(request).await.unwrap();
         wait_for_websocket_gauge(&metrics, 1).await;
 
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), client.next())
-                .await
-                .unwrap(),
-            Some(Ok(TungsteniteMessage::Close(_))) | None
-        ));
+        let close = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap();
+        assert!(
+            matches!(close, Some(Ok(TungsteniteMessage::Close(_))) | None),
+            "unexpected idle-timeout result: {close:?}"
+        );
         wait_for_websocket_gauge(&metrics, 0).await;
     }
 
@@ -2973,9 +3232,7 @@ mod tests {
             .route(
                 "/inspect",
                 get(
-                    |State(tx): State<Arc<Mutex<Option<oneshot::Sender<(HeaderMap, Uri)>>>>>,
-                     headers: HeaderMap,
-                     uri: Uri| async move {
+                    |State(tx): State<HeaderCapture>, headers: HeaderMap, uri: Uri| async move {
                         if let Some(tx) = tx.lock().unwrap().take() {
                             let _ = tx.send((headers, uri));
                         }
@@ -3117,9 +3374,7 @@ mod tests {
             .route(
                 "/upload",
                 post(
-                    |State(tx): State<Arc<Mutex<Option<oneshot::Sender<(Uri, usize)>>>>>,
-                     uri: Uri,
-                     body: Body| async move {
+                    |State(tx): State<UploadCapture>, uri: Uri, body: Body| async move {
                         let mut body = body.into_data_stream();
                         let mut bytes = Vec::new();
                         while let Some(chunk) = body.next().await {
@@ -3165,22 +3420,23 @@ mod tests {
                     let metrics = Arc::clone(&metrics);
                     let runtime = Arc::clone(&runtime);
                     async move {
-                        proxy_websocket_to_target(
-                            UpstreamTarget::new(upstream.ip(), upstream.port()),
-                            "/echo?keep=this",
-                            ws,
-                            vec!["chat".into(), "alternate".into()],
-                            &headers,
-                            &TrustedForwarding {
-                                peer: Some("203.0.113.9:443".parse().unwrap()),
-                                host: SHARE_HOST.into(),
-                            },
-                            Duration::from_secs(1),
-                            idle,
-                            None,
+                        let forwarding = TrustedForwarding {
+                            peer: Some("203.0.113.9:443".parse().unwrap()),
+                            host: SHARE_HOST.into(),
+                        };
+                        proxy_websocket_to_target(WebSocketTargetRequest {
+                            target: UpstreamTarget::new(upstream.ip(), upstream.port()),
+                            path_and_query: "/echo?keep=this",
+                            websocket: ws,
+                            protocols: vec!["chat".into(), "alternate".into()],
+                            headers: &headers,
+                            forwarding: &forwarding,
+                            connect_timeout: Duration::from_secs(1),
+                            idle_timeout: idle,
+                            lease: None,
                             metrics,
                             runtime,
-                        )
+                        })
                         .await
                         .unwrap()
                     }
@@ -3251,44 +3507,9 @@ mod tests {
         let (observed_tx, observed_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_hdr_async(
-                stream,
-                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                assert_eq!(
-                    request
-                        .headers()
-                        .get("sec-websocket-protocol")
-                        .unwrap(),
-                    "chat, alternate"
-                );
-                assert_eq!(
-                    request.headers().get(ORIGIN).unwrap(),
-                    "https://client.example"
-                );
-                assert_eq!(request.headers().get(COOKIE).unwrap(), "session=guest");
-                assert_eq!(
-                    request.headers().get(AUTHORIZATION).unwrap(),
-                    "Bearer application-credential"
-                );
-                assert!(request.headers().get("x-tarit-share-token").is_none());
-                assert_eq!(
-                    request.headers().get(FORWARDED).unwrap(),
-                    "for=203.0.113.9;host=calm-red-fox.shares.example.com;proto=http"
-                );
-                assert_eq!(
-                    request.headers().get("x-forwarded-for").unwrap(),
-                    "203.0.113.9"
-                );
-                response.headers_mut().insert(
-                    "sec-websocket-protocol",
-                    tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
-                );
-                Ok(response)
-            },
-            )
-            .await
-            .unwrap();
+            let mut socket = accept_hdr_async(stream, InspectingChatProtocol)
+                .await
+                .unwrap();
             let mut observed = Vec::new();
             while let Some(message) = socket.next().await {
                 match message.unwrap() {
@@ -3311,7 +3532,7 @@ mod tests {
                     TungsteniteMessage::Close(frame) => {
                         observed.push("close");
                         let _ = frame;
-                        socket.flush().await.unwrap();
+                        let _ = socket.flush().await;
                         break;
                     }
                     _ => {}
@@ -3329,19 +3550,7 @@ mod tests {
         let (observed_tx, observed_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_hdr_async(
-                stream,
-                |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                    response.headers_mut().insert(
-                        "sec-websocket-protocol",
-                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
-                    );
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let mut socket = accept_hdr_async(stream, ChatProtocol).await.unwrap();
             let mut observed = Vec::new();
             while let Some(message) = socket.next().await {
                 match message.unwrap() {
@@ -3364,7 +3573,7 @@ mod tests {
                     TungsteniteMessage::Close(frame) => {
                         observed.push("close");
                         let _ = frame;
-                        socket.flush().await.unwrap();
+                        let _ = socket.flush().await;
                         break;
                     }
                     _ => {}
@@ -3382,19 +3591,7 @@ mod tests {
         let (observed_tx, observed_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_hdr_async(
-                stream,
-                |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                    response.headers_mut().insert(
-                        "sec-websocket-protocol",
-                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
-                    );
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let mut socket = accept_hdr_async(stream, ChatProtocol).await.unwrap();
             let mut observed = Vec::new();
             while let Some(message) = socket.next().await {
                 let message = match message {
@@ -3431,19 +3628,7 @@ mod tests {
         let (drop_tx, drop_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let socket = accept_hdr_async(
-                stream,
-                |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                    response.headers_mut().insert(
-                        "sec-websocket-protocol",
-                        tokio_tungstenite::tungstenite::http::HeaderValue::from_static("chat"),
-                    );
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let socket = accept_hdr_async(stream, ChatProtocol).await.unwrap();
             let _ = drop_rx.await;
             drop(socket);
         });

@@ -802,6 +802,47 @@ async fn shutdown_sweep(state: &AppState, reason: &'static str) -> anyhow::Resul
     Ok(())
 }
 
+fn spawn_fleet_sync(
+    fleet: Arc<PostgresFleet>,
+    store: Arc<Mutex<Store>>,
+    config: Config,
+    scheduler: Arc<Scheduler>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
+            let cap = scheduler.local_capacity(1, 256);
+            let host = tarit_fleet::host_record_from_capacity(
+                &config.host_id,
+                Some(config.rpc_addr.clone()),
+                cap.sandbox_count,
+                cap.free_vcpus,
+                cap.free_memory_mib,
+            );
+            if fleet.upsert_host(&host).await.is_err() {
+                tracing::warn!("fleet heartbeat failed");
+                continue;
+            }
+            match fleet.list_hosts().await {
+                Ok(hosts) => {
+                    if let Ok(guard) = store.lock() {
+                        for host in hosts {
+                            let _ = guard.upsert_host(&host);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("fleet peer sync failed: {e}"),
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1389,45 +1430,4 @@ mod tests {
             share_runtime: Arc::new(share_gateway::ShareRuntime::default()),
         }
     }
-}
-
-fn spawn_fleet_sync(
-    fleet: Arc<PostgresFleet>,
-    store: Arc<Mutex<Store>>,
-    config: Config,
-    scheduler: Arc<Scheduler>,
-    shutdown_rx: watch::Receiver<Option<&'static str>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        loop {
-            tokio::select! {
-                biased;
-                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
-                _ = interval.tick() => {}
-            }
-            let cap = scheduler.local_capacity(1, 256);
-            let host = tarit_fleet::host_record_from_capacity(
-                &config.host_id,
-                Some(config.rpc_addr.clone()),
-                cap.sandbox_count,
-                cap.free_vcpus,
-                cap.free_memory_mib,
-            );
-            if fleet.upsert_host(&host).await.is_err() {
-                tracing::warn!("fleet heartbeat failed");
-                continue;
-            }
-            match fleet.list_hosts().await {
-                Ok(hosts) => {
-                    if let Ok(guard) = store.lock() {
-                        for host in hosts {
-                            let _ = guard.upsert_host(&host);
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("fleet peer sync failed: {e}"),
-            }
-        }
-    })
 }

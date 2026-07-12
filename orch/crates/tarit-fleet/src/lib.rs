@@ -752,12 +752,12 @@ mod tests {
 
     #[allow(dead_code)]
     fn share_persistence_api_is_available(fleet: &PostgresFleet, share: &ShareRecord) {
-        let _ = fleet.insert_share(share);
-        let _ = fleet.get_share(share.id);
-        let _ = fleet.get_share_by_slug(&share.slug);
-        let _ = fleet.list_shares(&share.owner_key);
-        let _ = fleet.update_share(share);
-        let _ = fleet.update_share_if_current(share, share.token_version);
+        std::mem::drop(fleet.insert_share(share));
+        std::mem::drop(fleet.get_share(share.id));
+        std::mem::drop(fleet.get_share_by_slug(&share.slug));
+        std::mem::drop(fleet.list_shares(&share.owner_key));
+        std::mem::drop(fleet.update_share(share));
+        std::mem::drop(fleet.update_share_if_current(share, share.token_version));
     }
 
     #[tokio::test]

@@ -1981,7 +1981,7 @@ mod tests {
         assert_eq!(create_audit.action, audit_action::CREATE_SHARE);
         assert_eq!(create_audit.vm_id, Some(vm_id));
         assert_eq!(create_audit.outcome, audit_outcome::OK);
-        assert_share_audit_detail(&create_audit, &share_id, 8080, "private");
+        assert_share_audit_detail(create_audit, &share_id, 8080, "private");
 
         let list = rt.block_on(request_json(
             router(state.clone()),
@@ -2062,7 +2062,7 @@ mod tests {
         let token_audit = &audits[5];
         assert_eq!(token_audit.action, audit_action::ISSUE_SHARE_TOKEN);
         assert_eq!(token_audit.outcome, audit_outcome::OK);
-        assert_share_audit_detail(&token_audit, &share_id, 8080, "private");
+        assert_share_audit_detail(token_audit, &share_id, 8080, "private");
         assert!(!token_audit.detail.as_deref().unwrap().contains(token));
 
         let update = rt.block_on(request_json(
@@ -2083,7 +2083,7 @@ mod tests {
         let update_audit = &audits[7];
         assert_eq!(update_audit.action, audit_action::UPDATE_SHARE);
         assert_eq!(update_audit.outcome, audit_outcome::OK);
-        assert_share_audit_detail(&update_audit, &share_id, 9090, "public");
+        assert_share_audit_detail(update_audit, &share_id, 9090, "public");
 
         let public_token = rt.block_on(request_json(
             router(state.clone()),
@@ -2100,7 +2100,7 @@ mod tests {
         let public_token_audit = &audits[9];
         assert_eq!(public_token_audit.action, audit_action::ISSUE_SHARE_TOKEN);
         assert_eq!(public_token_audit.outcome, audit_outcome::ERROR);
-        assert_share_audit_detail(&public_token_audit, &share_id, 9090, "public");
+        assert_share_audit_detail(public_token_audit, &share_id, 9090, "public");
         assert!(!public_token_audit
             .detail
             .as_deref()
@@ -2122,7 +2122,7 @@ mod tests {
         let revoke_audit = &audits[11];
         assert_eq!(revoke_audit.action, audit_action::REVOKE_SHARE);
         assert_eq!(revoke_audit.outcome, audit_outcome::OK);
-        assert_share_audit_detail(&revoke_audit, &share_id, 9090, "public");
+        assert_share_audit_detail(revoke_audit, &share_id, 9090, "public");
         assert!(audits
             .iter()
             .all(|audit| { !audit.detail.as_deref().unwrap_or_default().contains(token) }));

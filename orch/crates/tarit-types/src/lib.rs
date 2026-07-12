@@ -63,17 +63,12 @@ pub struct VmRecord {
 }
 
 /// Whether a shared VM port is public or requires a valid private-share token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShareVisibility {
     Public,
+    #[default]
     Private,
-}
-
-impl Default for ShareVisibility {
-    fn default() -> Self {
-        Self::Private
-    }
 }
 
 fn default_share_visibility() -> ShareVisibility {

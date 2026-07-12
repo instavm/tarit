@@ -202,6 +202,7 @@ impl Metrics {
         increment_counter(&self.share_bytes_out_total, bytes);
     }
 
+    #[cfg(test)]
     pub(crate) fn active_share_websockets(&self) -> u64 {
         self.active_share_websockets.load(Ordering::Relaxed)
     }
