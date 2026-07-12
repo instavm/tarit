@@ -204,13 +204,16 @@ When enabled, `taritd`:
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
 On startup, `taritd` reconciles the persisted map with live local VM records.
-Before per-TAP isolation, it atomically inserts top-of-chain forward and input
-drop quarantines for every recovered TAP. It then takes all recovered TAPs
-down, removes every Tarit-owned rule and ingress table for their slots,
-replaces the netdev IPv4/ARP guard and source, VM-pool lateral, uplink,
-host-input, and masquerade rules, removes each quarantine, and only then brings
-that TAP back up. A quarantine remains if containment, isolation, cleanup, or
-reconciliation fails, so startup fails closed. It then runs an age-gated sweep
+It validates the required nft base-chain hooks before atomically inserting
+top-of-chain forward and input drop quarantines for every recovered TAP. It
+then takes every recovered TAP down, removes Tarit-owned stale policy for all
+their slots, and programs and verifies every netdev IPv4/ARP, source,
+VM-pool lateral, uplink, host-input, and masquerade guard while all TAPs remain
+contained. Only after the entire set is ready does it raise the links and
+atomically remove every quarantine. A containment or reconciliation failure
+cleans partial policy and keeps every TAP down; if a link cannot be lowered,
+`taritd` attempts to delete it as a last-resort kernel isolation step. Startup
+therefore fails closed rather than exposing a partial recovered set. It then runs an age-gated sweep
 for stale `insta<N>` taps and orphaned `taritd` nftables rules. Stop/delete
 teardown is idempotent and best-effort for tap deletion, nft cleanup, and slot
 freeing.

@@ -147,6 +147,21 @@ expect_guest_denial() {
     fail "guest command unexpectedly succeeded: $2"
 }
 
+wait_for_guest_listener() {
+  local vm_id=$1 protocol=$2 port=$3 pid_file=$4 socket_check
+  case "$protocol" in
+    tcp) socket_check='ss -ltn' ;;
+    udp) socket_check='ss -lun' ;;
+    *) fail "unsupported listener protocol: $protocol" ;;
+  esac
+  for _ in $(seq 1 20); do
+    run_guest "$vm_id" "pid=\$(cat $pid_file 2>/dev/null) && [ -n \"\$pid\" ] && kill -0 \"\$pid\" && $socket_check | grep -Eq ':$port([[:space:]]|$)'"
+    [ "$GUEST_STATUS" = 0 ] && return
+    sleep 1
+  done
+  fail "$protocol listener on guest $vm_id port $port was not ready"
+}
+
 require_rule() {
   local text=$1 expected=$2
   grep -F -- "$expected" <<<"$text" >/dev/null ||
@@ -163,17 +178,34 @@ assert_recovered_policy() {
   require_rule "$netdev" "ether type arp accept"
   require_rule "$netdev" "ether type ip accept"
   forward=$(nft list chain ip taritd_nat vm_egress)
-  require_rule "$forward" "iifname \"$tap\" ip saddr != $guest drop"
+  require_rule "$forward" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$forward" "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop"
   require_rule "$forward" "iifname \"$tap\" ip saddr $guest oifname != \"$uplink\" drop"
   input=$(nft list chain ip taritd_nat vm_input)
-  require_rule "$input" "iifname \"$tap\" ip saddr != $guest drop"
+  require_rule "$input" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$input" "iifname \"$tap\" ct state established,related accept"
   require_rule "$input" "iifname \"$tap\" ip drop"
   nat=$(nft list chain ip taritd_nat post)
   require_rule "$nat" "iifname \"$tap\" ip saddr $guest oifname \"$uplink\" masquerade"
   nft -a list table ip taritd_nat | grep -F "vm=$vm_id tap=$tap" >/dev/null ||
     fail "recovered allocation tags are absent for $vm_id"
+}
+
+forged_source_drop_packets() {
+  local tap=$1 guest=$2 packets
+  packets=$(nft -a list chain ip taritd_nat vm_egress |
+    awk -v tap="$tap" -v guest="$guest" '
+      $0 ~ ("iifname \"" tap "\"") && $0 ~ ("ip saddr != " guest) {
+        for (i = 1; i <= NF; i++) {
+          if ($(i - 1) == "counter" && $i == "packets") {
+            print $(i + 1)
+            exit
+          }
+        }
+      }')
+  [ -n "$packets" ] && [ "$packets" -ge 0 ] 2>/dev/null ||
+    fail "source-guard counter is unavailable for $tap"
+  printf '%s\n' "$packets"
 }
 
 mkdir -p "$TARIT_SOCKET_DIR"
@@ -198,29 +230,42 @@ UPLINK_IP=$(ip route get "$EGRESS_TEST_IP" |
 # These guest utilities are required for the behavioral checks; do not treat a
 # missing tool as a pass because that would skip the actual isolation gate.
 for vm_id in "$VM_A" "$VM_B"; do
-  expect_guest_success "$vm_id" 'command -v sh ip ping nc timeout'
+  expect_guest_success "$vm_id" 'command -v sh ip ping nc ss sysctl timeout'
 done
 
 # Keep listeners on guest B alive while guest A attempts lateral TCP and UDP.
-expect_guest_success "$VM_B" 'rm -f /run/tarit-udp; nc -l -p 31337 >/dev/null 2>&1 &'
-expect_guest_success "$VM_B" 'nc -u -l -p 31338 >/run/tarit-udp 2>&1 &'
-sleep 1
+expect_guest_success "$VM_B" 'rm -f /run/tarit-tcp.pid /run/tarit-udp.pid /run/tarit-udp; (while :; do nc -l -p 31337 >/dev/null 2>&1; done) & tcp_pid=$!; echo "$tcp_pid" >/run/tarit-tcp.pid; nc -u -l -p 31338 >/run/tarit-udp 2>&1 & udp_pid=$!; echo "$udp_pid" >/run/tarit-udp.pid; kill -0 "$tcp_pid" && kill -0 "$udp_pid"'
+wait_for_guest_listener "$VM_B" tcp 31337 /run/tarit-tcp.pid
+wait_for_guest_listener "$VM_B" udp 31338 /run/tarit-udp.pid
 expect_guest_denial "$VM_A" "timeout 3 nc -z -w 2 $GUEST_B 31337"
 expect_guest_success "$VM_A" "printf denied | timeout 3 nc -u -w 2 $GUEST_B 31338 || true"
-sleep 1
+wait_for_guest_listener "$VM_B" tcp 31337 /run/tarit-tcp.pid
+wait_for_guest_listener "$VM_B" udp 31338 /run/tarit-udp.pid
 expect_guest_success "$VM_B" '[ ! -s /run/tarit-udp ]'
 expect_guest_denial "$VM_A" "ping -c 1 -W 2 $GUEST_B"
 
-# The source guard must reject a forged address before forwarding it.
+# The source guard counter proves a forged packet is dropped in the host
+# forwarding path even though the forged source cannot have a return route.
 expect_guest_success "$VM_A" 'ip addr add 172.16.255.250/32 dev eth0'
+FORGED_DROPS_BEFORE=$(forged_source_drop_packets "$TAP_A" "$GUEST_A")
 expect_guest_denial "$VM_A" "ping -I 172.16.255.250 -c 1 -W 2 $EGRESS_TEST_IP"
+FORGED_DROPS_AFTER=$(forged_source_drop_packets "$TAP_A" "$GUEST_A")
+[ "$FORGED_DROPS_AFTER" -gt "$FORGED_DROPS_BEFORE" ] ||
+  fail "forged-source packet did not increment the host source-guard counter"
 expect_guest_success "$VM_A" 'ip addr del 172.16.255.250/32 dev eth0'
 
-# IPv6 remains disabled even if the host is explicitly configured to forward it.
+# Configure a routable IPv6 subnet at both ends while host forwarding is on.
+# Without the netdev ingress guard, the guest would have a real host path.
 IPV6_FORWARDING=$(sysctl -n net.ipv6.conf.all.forwarding)
 IPV6_FORWARDING_CHANGED=1
 sysctl -qw net.ipv6.conf.all.forwarding=1
-expect_guest_denial "$VM_A" 'ip -6 addr add 2001:db8::7/64 dev eth0'
+IPV6_HOST_A=2001:db8:7::1
+IPV6_GUEST_A=2001:db8:7::2
+sysctl -qw "net.ipv6.conf.$TAP_A.disable_ipv6=0"
+sysctl -qw "net.ipv6.conf.$TAP_A.forwarding=1"
+ip -6 addr replace "$IPV6_HOST_A/64" dev "$TAP_A"
+expect_guest_success "$VM_A" "sysctl -qw net.ipv6.conf.all.disable_ipv6=0; sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0; ip -6 addr replace $IPV6_GUEST_A/64 dev eth0; ip -6 route replace default via $IPV6_HOST_A dev eth0"
+expect_guest_denial "$VM_A" "ping -6 -I eth0 -c 1 -W 2 $IPV6_HOST_A"
 
 # A guest cannot initiate host-local traffic through its TAP.
 expect_guest_denial "$VM_A" "ping -c 1 -W 2 $UPLINK_IP"
@@ -236,14 +281,23 @@ for vm_id in "$VM_A" "$VM_B"; do
   expect_guest_success "$vm_id" "timeout 8 nc -z -w 5 $EGRESS_TEST_IP $EGRESS_TEST_PORT"
 done
 
+RESTART_SENTINEL=198.18.0.1
+nft add rule ip taritd_nat vm_egress \
+  iifname "$TAP_A" ip saddr "$GUEST_A" ip daddr "$RESTART_SENTINEL" drop \
+  comment "taritd-egress slot=${TAP_A#insta} vm=$VM_A tap=$TAP_A"
+
 stop_taritd
 start_taritd
 assert_recovered_policy "$VM_A" "$TAP_A" "$GUEST_A" "$UPLINK"
 assert_recovered_policy "$VM_B" "$TAP_B" "$GUEST_B" "$UPLINK"
+! nft -a list chain ip taritd_nat vm_egress |
+  grep -F "ip daddr $RESTART_SENTINEL" >/dev/null ||
+  fail "restart left the prior-owner sentinel policy installed"
 expect_guest_success "$VM_A" "timeout 8 nc -z -w 5 $EGRESS_TEST_IP $EGRESS_TEST_PORT"
 expect_guest_success "$VM_B" "timeout 8 nc -z -w 5 $EGRESS_TEST_IP $EGRESS_TEST_PORT"
 
 delete_vm "$VM_A"
+OLD_VM_A=$VM_A
 VM_A=
 ! ip link show "$TAP_A" >/dev/null 2>&1 || fail "deleted TAP leaked: $TAP_A"
 ! nft list table netdev "taritd_ingress_${TAP_A#insta}" >/dev/null 2>&1 ||
@@ -254,5 +308,9 @@ VM_A=
 VM_C=$(create_vm)
 TAP_C=$(tap_for_vm "$VM_C")
 [ "$TAP_C" = "$TAP_A" ] || fail "slot was not reused: expected $TAP_A, got $TAP_C"
+GUEST_C=$(guest_ip_for_tap "$TAP_C")
+assert_recovered_policy "$VM_C" "$TAP_C" "$GUEST_C" "$UPLINK"
+! nft -a list table ip taritd_nat | grep -F "vm=$OLD_VM_A tap=$TAP_C" >/dev/null ||
+  fail "slot reuse retained prior-owner policy for $OLD_VM_A"
 
 echo "RESULT: EGRESS_RECOVERY_PASS"
