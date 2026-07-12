@@ -200,7 +200,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_DATABASE_URL` | No | unset | PostgreSQL fleet registry URL. Set to enable distributed cluster mode. |
 | `TARIT_RDS_CA_FILE` | No | unset | Extra CA bundle loaded for PostgreSQL TLS, used by RDS deployments. |
 | `TARIT_RPC_ADDR` | Cluster: yes | `http://<listen-ip>:<listen-port>` | Base URL advertised to peers in the fleet registry. Must be reachable by other nodes. |
-| `TARIT_ENABLE_NET` | No | `false` | Enable per-VM tap plus `/30` addressing plus nftables NAT. Requires `CAP_NET_ADMIN`. |
+| `TARIT_ENABLE_NET` | No | `false` | Enable per-VM TAP, IPv4 `/30` addressing, nftables NAT, and fail-closed TAP ingress filtering. Requires `CAP_NET_ADMIN`. |
 | `TARIT_ROOTFS_READONLY` | No | `false` | Attach rootfs read-only and rewrite `root=/dev/vda rw` to `ro`. Use for shared immutable images. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | No | `60000` | How long create waits and retries when the cluster is full before returning 429. |
 | `TARIT_REAP_ON_SHUTDOWN` | No | `true` | On SIGTERM/SIGINT, stop all local `vmm serve` children and remove their sockets/overlays after HTTP drain. Set `false` only for debugging. |

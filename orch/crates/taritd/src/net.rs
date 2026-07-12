@@ -25,6 +25,13 @@ const NFT_CHAIN: &str = "post";
 /// rather than only validated inside the VMM. Named to avoid the reserved nft
 /// keyword `fwd`.
 const NFT_FWD_CHAIN: &str = "vm_egress";
+/// Filter/input chain that rejects guest-initiated traffic to the host while
+/// preserving only stateful replies to host-initiated flows.
+const NFT_INPUT_CHAIN: &str = "vm_input";
+/// Each TAP gets its own netdev table so teardown can atomically remove its
+/// ingress base chain without touching another VM's filter.
+const NFT_INGRESS_TABLE_PREFIX: &str = "taritd_ingress_";
+const NFT_INGRESS_CHAIN: &str = "ingress";
 const TAP_PREFIX: &str = "insta";
 const NET_POOL_SLOTS: u32 = 1 << 14;
 const NET_STATE_VERSION: u32 = 1;
@@ -111,14 +118,14 @@ impl NetProvisioner {
             state_path,
             uplink,
         };
-        match provisioner.sweep_orphans() {
-            Ok(report) if report.has_work() => tracing::info!(
+        let report = provisioner.sweep_orphans()?;
+        if report.has_work() {
+            tracing::info!(
                 taps_removed = report.taps_removed,
                 nft_rules_removed = report.nft_rules_removed,
+                ingress_tables_removed = report.ingress_tables_removed,
                 "net: startup stale sweep completed"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("net: startup stale sweep failed: {e}"),
+            );
         }
         Ok(provisioner)
     }
@@ -168,60 +175,14 @@ impl NetProvisioner {
         allowlist: &[String],
         allow_existing: bool,
     ) -> Result<usize, OrchError> {
-        // Validate every rule before touching nft, so a bad rule cannot leave a
+        // Build every rule before touching nft, so a bad rule cannot leave a
         // half-applied policy (default-open) on the host.
-        for entry in allowlist {
-            parse_egress_entry(entry)?;
-        }
+        let rules = egress_policy_argv(alloc, allowlist, allow_existing)?;
         self.delete_egress_rules_for_alloc(alloc)?;
-        let guest = alloc.guest_ip.as_str();
-        let comment = format!("\"{}\"", egress_comment(alloc));
-        if allow_existing {
-            run(
-                "nft",
-                &[
-                    "add",
-                    "rule",
-                    "ip",
-                    NFT_TABLE,
-                    NFT_FWD_CHAIN,
-                    "ip",
-                    "saddr",
-                    guest,
-                    "ct",
-                    "state",
-                    "established,related",
-                    "accept",
-                    "comment",
-                    &comment,
-                ],
-            )?;
+        for argv in rules {
+            run_argv(&argv)?;
         }
-        let mut applied = 0usize;
-        for entry in allowlist {
-            let args = compile_host_egress_rule(guest, entry, &comment)?;
-            let argv = args.iter().map(String::as_str).collect::<Vec<_>>();
-            run("nft", &argv)?;
-            applied += 1;
-        }
-        // Default-deny the rest of this guest's forwarded traffic.
-        run(
-            "nft",
-            &[
-                "add",
-                "rule",
-                "ip",
-                NFT_TABLE,
-                NFT_FWD_CHAIN,
-                "ip",
-                "saddr",
-                guest,
-                "drop",
-                "comment",
-                &comment,
-            ],
-        )?;
-        Ok(applied)
+        Ok(allowlist.len())
     }
 
     fn delete_egress_rules_for_alloc(&self, alloc: &NetAlloc) -> Result<usize, OrchError> {
@@ -249,55 +210,23 @@ impl NetProvisioner {
     }
 
     fn provision_host(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
-        let _ = run("ip", &["link", "del", &alloc.tap]);
+        let tap = tap_name(alloc.idx);
+        let _ = run("ip", &["link", "del", &tap]);
         self.delete_nft_rules_for_slot(alloc.idx)?;
-        run("ip", &["tuntap", "add", "dev", &alloc.tap, "mode", "tap"])?;
-        run(
-            "ip",
-            &[
-                "addr",
-                "add",
-                &format!("{}/{}", alloc.host_ip, alloc.prefix),
-                "dev",
-                &alloc.tap,
-            ],
-        )?;
-        run("ip", &["link", "set", &alloc.tap, "up"])?;
+        for argv in tap_provision_argv(alloc) {
+            run_argv(&argv)?;
+        }
         self.add_nft_rule(alloc)
     }
 
     fn add_nft_rule(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
-        // nft joins argv into one buffer and re-lexes it, so a comment with
-        // spaces must arrive already double-quoted or nft rejects the rule with
-        // a syntax error. `nft list` prints the comment quoted, which the sweep
-        // parser already handles.
-        let comment = format!("\"{}\"", nft_comment(alloc));
-        run(
-            "nft",
-            &[
-                "add",
-                "rule",
-                "ip",
-                NFT_TABLE,
-                NFT_CHAIN,
-                "ip",
-                "saddr",
-                &alloc.guest_ip,
-                "oif",
-                &self.uplink,
-                "masquerade",
-                "comment",
-                &comment,
-            ],
-        )
+        run_argv(&masquerade_nft_argv(alloc, &self.uplink))
     }
 
     fn best_effort_delete(&self, alloc: &NetAlloc) {
-        if let Err(e) = run("ip", &["link", "del", &alloc.tap]) {
+        let tap = tap_name(alloc.idx);
+        if let Err(e) = run("ip", &["link", "del", &tap]) {
             tracing::warn!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: tap delete skipped/failed: {e}");
-        }
-        if let Err(e) = self.delete_egress_rules_for_alloc(alloc) {
-            tracing::warn!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: egress rule cleanup failed: {e}");
         }
         match self.delete_nft_rules_for_alloc(alloc) {
             Ok(deleted) if deleted > 0 => tracing::debug!(
@@ -355,19 +284,52 @@ impl NetProvisioner {
         }
 
         report.nft_rules_removed += self.delete_orphan_nft_rules(&active)?;
+        report.ingress_tables_removed += self.delete_orphan_ingress_tables(&active)?;
         Ok(report)
     }
 
     fn delete_nft_rules_for_alloc(&self, alloc: &NetAlloc) -> Result<usize, OrchError> {
-        delete_nft_rules_matching(|line| is_taritd_nft_rule_for_alloc(line, alloc))
+        let mut removed = 0;
+        for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
+            removed +=
+                delete_nft_rules_in_chain(chain, |line| is_taritd_nft_rule_for_alloc(line, alloc))?;
+        }
+        removed += delete_ingress_table_for_slot(alloc.idx)?;
+        Ok(removed)
     }
 
     fn delete_nft_rules_for_slot(&self, slot: u32) -> Result<usize, OrchError> {
-        delete_nft_rules_matching(|line| is_taritd_nft_rule_for_slot(line, slot))
+        let mut removed = 0;
+        for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
+            removed +=
+                delete_nft_rules_in_chain(chain, |line| is_taritd_nft_rule_for_slot(line, slot))?;
+        }
+        removed += delete_ingress_table_for_slot(slot)?;
+        Ok(removed)
     }
 
     fn delete_orphan_nft_rules(&self, active: &BTreeMap<u32, Uuid>) -> Result<usize, OrchError> {
-        delete_nft_rules_matching(|line| is_orphan_taritd_nft_rule(line, active))
+        let mut removed = 0;
+        for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
+            removed +=
+                delete_nft_rules_in_chain(chain, |line| is_orphan_taritd_nft_rule(line, active))?;
+        }
+        Ok(removed)
+    }
+
+    fn delete_orphan_ingress_tables(
+        &self,
+        active: &BTreeMap<u32, Uuid>,
+    ) -> Result<usize, OrchError> {
+        let active_slots = active.keys().copied().collect::<HashSet<_>>();
+        let tables = ingress_table_names()?;
+        let stale = stale_ingress_tables_to_sweep(&tables, &active_slots);
+        for table in &stale {
+            let slot = ingress_slot_from_table_name(table)
+                .expect("stale ingress table names are parsed from the fixed prefix");
+            run_argv(&delete_ingress_table_argv(slot))?;
+        }
+        Ok(stale.len())
     }
 }
 
@@ -375,11 +337,12 @@ impl NetProvisioner {
 struct SweepReport {
     taps_removed: usize,
     nft_rules_removed: usize,
+    ingress_tables_removed: usize,
 }
 
 impl SweepReport {
     fn has_work(self) -> bool {
-        self.taps_removed > 0 || self.nft_rules_removed > 0
+        self.taps_removed > 0 || self.nft_rules_removed > 0 || self.ingress_tables_removed > 0
     }
 }
 
@@ -551,33 +514,13 @@ fn state_write_path(path: &Path) -> PathBuf {
 }
 
 fn ensure_host_networking() -> Result<(), OrchError> {
-    run("sysctl", &["-qw", "net.ipv4.ip_forward=1"])?;
-    let _ = run("nft", &["add", "table", "ip", NFT_TABLE]);
-    let _ = run(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "ip",
-            NFT_TABLE,
-            NFT_CHAIN,
-            "{ type nat hook postrouting priority 100 ; }",
-        ],
-    );
-    // Egress allowlist chain (R-005). Default policy accept, so VMs without an
-    // egress policy and all non-VM forwarding are unaffected; a VM that sets a
-    // policy gets explicit per-guest accept rules plus a trailing drop.
-    let _ = run(
-        "nft",
-        &[
-            "add",
-            "chain",
-            "ip",
-            NFT_TABLE,
-            NFT_FWD_CHAIN,
-            "{ type filter hook forward priority 0 ; policy accept ; }",
-        ],
-    );
+    for argv in host_nft_base_argv() {
+        if argv.first().is_some_and(|command| command == "nft") {
+            run_nft_allowing_existing(&argv)?;
+        } else {
+            run_argv(&argv)?;
+        }
+    }
     match delete_nft_rules_matching(is_legacy_masquerade_rule) {
         Ok(deleted) if deleted > 0 => {
             tracing::info!(deleted, "net: removed legacy broad masquerade rule(s)")
@@ -586,6 +529,238 @@ fn ensure_host_networking() -> Result<(), OrchError> {
         Err(e) => tracing::warn!("net: failed to remove legacy broad masquerade rule(s): {e}"),
     }
     Ok(())
+}
+
+fn host_nft_base_argv() -> Vec<Vec<String>> {
+    vec![
+        command_argv(&["sysctl", "-qw", "net.ipv4.ip_forward=1"]),
+        command_argv(&["nft", "add", "table", "ip", NFT_TABLE]),
+        command_argv(&[
+            "nft",
+            "add",
+            "chain",
+            "ip",
+            NFT_TABLE,
+            NFT_CHAIN,
+            "{ type nat hook postrouting priority 100 ; }",
+        ]),
+        command_argv(&[
+            "nft",
+            "add",
+            "chain",
+            "ip",
+            NFT_TABLE,
+            NFT_FWD_CHAIN,
+            "{ type filter hook forward priority 0 ; policy accept ; }",
+        ]),
+        command_argv(&[
+            "nft",
+            "add",
+            "chain",
+            "ip",
+            NFT_TABLE,
+            NFT_INPUT_CHAIN,
+            "{ type filter hook input priority 0 ; policy accept ; }",
+        ]),
+    ]
+}
+
+fn tap_provision_argv(alloc: &NetAlloc) -> Vec<Vec<String>> {
+    let tap = tap_name(alloc.idx);
+    let ingress_table = ingress_table_name(alloc.idx);
+    let ingress_comment = nft_quote(&ingress_comment(alloc));
+    let guard_comment = nft_quote(&guard_comment(alloc));
+    let input_comment = nft_quote(&input_comment(alloc));
+    let interface = nft_quote(&tap);
+    let mut argv = vec![vec![
+        "ip".into(),
+        "tuntap".into(),
+        "add".into(),
+        "dev".into(),
+        tap.clone(),
+        "mode".into(),
+        "tap".into(),
+    ]];
+    argv.extend(tap_sysctl_argv(&tap));
+    argv.extend([
+        vec![
+            "nft".into(),
+            "add".into(),
+            "table".into(),
+            "netdev".into(),
+            ingress_table.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "chain".into(),
+            "netdev".into(),
+            ingress_table.clone(),
+            NFT_INGRESS_CHAIN.into(),
+            format!("{{ type filter hook ingress device {tap} priority filter ; policy drop ; }}"),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "netdev".into(),
+            ingress_table.clone(),
+            NFT_INGRESS_CHAIN.into(),
+            "ether".into(),
+            "type".into(),
+            "arp".into(),
+            "accept".into(),
+            "comment".into(),
+            ingress_comment.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "netdev".into(),
+            ingress_table,
+            NFT_INGRESS_CHAIN.into(),
+            "ether".into(),
+            "type".into(),
+            "ip".into(),
+            "accept".into(),
+            "comment".into(),
+            ingress_comment,
+        ],
+        vec![
+            "ip".into(),
+            "addr".into(),
+            "add".into(),
+            format!("{}/{}", alloc.host_ip, alloc.prefix),
+            "dev".into(),
+            tap.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_FWD_CHAIN.into(),
+            "iifname".into(),
+            interface.clone(),
+            "ip".into(),
+            "saddr".into(),
+            "!=".into(),
+            alloc.guest_ip.clone(),
+            "drop".into(),
+            "comment".into(),
+            guard_comment,
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_INPUT_CHAIN.into(),
+            "iifname".into(),
+            interface.clone(),
+            "ip".into(),
+            "saddr".into(),
+            "!=".into(),
+            alloc.guest_ip.clone(),
+            "drop".into(),
+            "comment".into(),
+            input_comment.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_INPUT_CHAIN.into(),
+            "iifname".into(),
+            interface.clone(),
+            "ct".into(),
+            "state".into(),
+            "established,related".into(),
+            "accept".into(),
+            "comment".into(),
+            input_comment.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_INPUT_CHAIN.into(),
+            "iifname".into(),
+            interface,
+            "ip".into(),
+            "drop".into(),
+            "comment".into(),
+            input_comment,
+        ],
+        command_argv(&["ip", "link", "set", &tap, "up"]),
+    ]);
+    argv
+}
+
+fn tap_sysctl_argv(tap: &str) -> Vec<Vec<String>> {
+    [
+        format!("net.ipv6.conf.{tap}.disable_ipv6=1"),
+        format!("net.ipv6.conf.{tap}.forwarding=0"),
+        format!("net.ipv6.conf.{tap}.accept_ra=0"),
+        format!("net.ipv6.conf.{tap}.autoconf=0"),
+        format!("net.ipv6.conf.{tap}.accept_redirects=0"),
+        format!("net.ipv4.conf.{tap}.rp_filter=1"),
+    ]
+    .into_iter()
+    .map(|setting| vec!["sysctl".into(), "-qw".into(), setting])
+    .collect()
+}
+
+fn masquerade_nft_argv(alloc: &NetAlloc, uplink: &str) -> Vec<String> {
+    vec![
+        "nft".into(),
+        "add".into(),
+        "rule".into(),
+        "ip".into(),
+        NFT_TABLE.into(),
+        NFT_CHAIN.into(),
+        "iifname".into(),
+        nft_quote(&tap_name(alloc.idx)),
+        "ip".into(),
+        "saddr".into(),
+        alloc.guest_ip.clone(),
+        "oifname".into(),
+        nft_quote(uplink),
+        "masquerade".into(),
+        "comment".into(),
+        nft_quote(&nft_comment(alloc)),
+    ]
+}
+
+fn command_argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+fn nft_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn run_argv(argv: &[String]) -> Result<(), OrchError> {
+    let (command, args) = argv
+        .split_first()
+        .ok_or_else(|| OrchError::Internal("empty network command".into()))?;
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run(command, &args)
+}
+
+fn run_nft_allowing_existing(argv: &[String]) -> Result<(), OrchError> {
+    match run_argv(argv) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("File exists") => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn default_uplink() -> Result<String, OrchError> {
@@ -704,10 +879,96 @@ fn slot_from_tap(name: &str) -> Option<u32> {
     (slot < NET_POOL_SLOTS).then_some(slot)
 }
 
+fn ingress_table_name(slot: u32) -> String {
+    format!("{NFT_INGRESS_TABLE_PREFIX}{slot}")
+}
+
+fn ingress_slot_from_table_name(table: &str) -> Option<u32> {
+    let raw = table.strip_prefix(NFT_INGRESS_TABLE_PREFIX)?;
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let slot = raw.parse::<u32>().ok()?;
+    (slot < NET_POOL_SLOTS).then_some(slot)
+}
+
+fn ingress_table_names() -> Result<Vec<String>, OrchError> {
+    let listing = command_stdout("nft", &["list", "tables", "netdev"])?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next(), words.next(), words.next()) {
+                (Some("table"), Some("netdev"), Some(table), None) => Some(table.to_string()),
+                _ => None,
+            }
+        })
+        .filter(|table| ingress_slot_from_table_name(table).is_some())
+        .collect())
+}
+
+fn stale_ingress_tables_to_sweep(tables: &[String], active_slots: &HashSet<u32>) -> Vec<String> {
+    tables
+        .iter()
+        .filter(|table| {
+            ingress_slot_from_table_name(table).is_some_and(|slot| !active_slots.contains(&slot))
+        })
+        .cloned()
+        .collect()
+}
+
+fn delete_ingress_table_argv(slot: u32) -> Vec<String> {
+    vec![
+        "nft".into(),
+        "delete".into(),
+        "table".into(),
+        "netdev".into(),
+        ingress_table_name(slot),
+    ]
+}
+
+fn delete_ingress_table_for_slot(slot: u32) -> Result<usize, OrchError> {
+    let table = ingress_table_name(slot);
+    if !ingress_table_names()?.iter().any(|name| name == &table) {
+        return Ok(0);
+    }
+    run_argv(&delete_ingress_table_argv(slot))?;
+    Ok(1)
+}
+
 fn nft_comment(alloc: &NetAlloc) -> String {
     format!(
         "taritd slot={} vm={} tap={}",
-        alloc.idx, alloc.vm_id, alloc.tap
+        alloc.idx,
+        alloc.vm_id,
+        tap_name(alloc.idx)
+    )
+}
+
+fn ingress_comment(alloc: &NetAlloc) -> String {
+    format!(
+        "taritd-ingress slot={} vm={} tap={}",
+        alloc.idx,
+        alloc.vm_id,
+        tap_name(alloc.idx)
+    )
+}
+
+fn guard_comment(alloc: &NetAlloc) -> String {
+    format!(
+        "taritd-guard slot={} vm={} tap={}",
+        alloc.idx,
+        alloc.vm_id,
+        tap_name(alloc.idx)
+    )
+}
+
+fn input_comment(alloc: &NetAlloc) -> String {
+    format!(
+        "taritd-input slot={} vm={} tap={}",
+        alloc.idx,
+        alloc.vm_id,
+        tap_name(alloc.idx)
     )
 }
 
@@ -740,7 +1001,9 @@ fn delete_nft_rules_in_chain(
 fn egress_comment(alloc: &NetAlloc) -> String {
     format!(
         "taritd-egress slot={} vm={} tap={}",
-        alloc.idx, alloc.vm_id, alloc.tap
+        alloc.idx,
+        alloc.vm_id,
+        tap_name(alloc.idx)
     )
 }
 
@@ -820,20 +1083,23 @@ fn parse_ipv4_egress_cidr(cidr: &str, entry: &str) -> Result<Ipv4Net, OrchError>
 
 /// Build the nft `add rule` argv for one allowlist entry in the forward chain.
 fn compile_host_egress_rule(
-    guest: &str,
+    alloc: &NetAlloc,
     entry: &str,
     comment: &str,
 ) -> Result<Vec<String>, OrchError> {
     let (cidr, port, proto) = parse_egress_entry(entry)?;
+    let tap = nft_quote(&tap_name(alloc.idx));
     let mut args: Vec<String> = vec![
         "add".into(),
         "rule".into(),
         "ip".into(),
         NFT_TABLE.into(),
         NFT_FWD_CHAIN.into(),
+        "iifname".into(),
+        tap,
         "ip".into(),
         "saddr".into(),
-        guest.into(),
+        alloc.guest_ip.clone(),
         "ip".into(),
         "daddr".into(),
         cidr,
@@ -847,6 +1113,59 @@ fn compile_host_egress_rule(
     args.push("comment".into());
     args.push(comment.into());
     Ok(args)
+}
+
+fn egress_policy_argv(
+    alloc: &NetAlloc,
+    allowlist: &[String],
+    allow_existing: bool,
+) -> Result<Vec<Vec<String>>, OrchError> {
+    let comment = nft_quote(&egress_comment(alloc));
+    let tap = nft_quote(&tap_name(alloc.idx));
+    let mut rules = Vec::with_capacity(allowlist.len() + usize::from(allow_existing) + 1);
+    if allow_existing {
+        rules.push(vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_FWD_CHAIN.into(),
+            "iifname".into(),
+            tap.clone(),
+            "ip".into(),
+            "saddr".into(),
+            alloc.guest_ip.clone(),
+            "ct".into(),
+            "state".into(),
+            "established,related".into(),
+            "accept".into(),
+            "comment".into(),
+            comment.clone(),
+        ]);
+    }
+    for entry in allowlist {
+        let mut rule = compile_host_egress_rule(alloc, entry, &comment)?;
+        rule.insert(0, "nft".into());
+        rules.push(rule);
+    }
+    rules.push(vec![
+        "nft".into(),
+        "add".into(),
+        "rule".into(),
+        "ip".into(),
+        NFT_TABLE.into(),
+        NFT_FWD_CHAIN.into(),
+        "iifname".into(),
+        tap,
+        "ip".into(),
+        "saddr".into(),
+        alloc.guest_ip.clone(),
+        "drop".into(),
+        "comment".into(),
+        comment,
+    ]);
+    Ok(rules)
 }
 
 fn nft_handle(line: &str) -> Option<String> {
@@ -864,18 +1183,19 @@ fn is_legacy_masquerade_rule(line: &str) -> bool {
 }
 
 fn is_taritd_nft_rule_for_alloc(line: &str, alloc: &NetAlloc) -> bool {
-    is_taritd_nft_rule_for_slot(line, alloc.idx)
-        || line.contains(&format!("vm={}", alloc.vm_id))
-        || line.contains(&format!("tap={}", alloc.tap))
+    is_taritd_nft_rule(line)
+        && (is_taritd_nft_rule_for_slot(line, alloc.idx)
+            || line.contains(&format!("vm={}", alloc.vm_id))
+            || line.contains(&format!("tap={}", tap_name(alloc.idx))))
 }
 
 fn is_taritd_nft_rule_for_slot(line: &str, slot: u32) -> bool {
-    line.contains("taritd slot=")
+    is_taritd_nft_rule(line)
         && parse_nft_comment_value(line, "slot=").and_then(|s| s.parse::<u32>().ok()) == Some(slot)
 }
 
 fn is_orphan_taritd_nft_rule(line: &str, active: &BTreeMap<u32, Uuid>) -> bool {
-    if !line.contains("taritd slot=") {
+    if !is_taritd_nft_rule(line) {
         return false;
     }
     let Some(slot) = parse_nft_comment_value(line, "slot=").and_then(|s| s.parse::<u32>().ok())
@@ -887,6 +1207,17 @@ fn is_orphan_taritd_nft_rule(line: &str, active: &BTreeMap<u32, Uuid>) -> bool {
         return !active.contains_key(&slot);
     };
     active.get(&slot).copied() != Some(vm_id)
+}
+
+fn is_taritd_nft_rule(line: &str) -> bool {
+    [
+        "taritd slot=",
+        "taritd-egress slot=",
+        "taritd-guard slot=",
+        "taritd-input slot=",
+    ]
+    .iter()
+    .any(|prefix| line.contains(prefix))
 }
 
 fn parse_nft_comment_value(line: &str, key: &str) -> Option<String> {
@@ -925,6 +1256,291 @@ mod tests {
         let c = a.ip_cmdline();
         assert!(c.starts_with("ip=172.16.0.10::172.16.0.9:255.255.255.252"));
         assert!(c.ends_with("eth0:off"));
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn nft_string_quotes_are_escaped() {
+        assert_eq!(
+            nft_quote("uplink\"; flush ruleset"),
+            "\"uplink\\\"; flush ruleset\""
+        );
+        assert_eq!(nft_quote(r"uplink\name"), r#""uplink\\name""#);
+    }
+
+    #[test]
+    fn host_base_policy_creates_forward_and_input_chains() {
+        assert_eq!(
+            host_nft_base_argv(),
+            vec![
+                argv(&["sysctl", "-qw", "net.ipv4.ip_forward=1"]),
+                argv(&["nft", "add", "table", "ip", "taritd_nat"]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "chain",
+                    "ip",
+                    "taritd_nat",
+                    "post",
+                    "{ type nat hook postrouting priority 100 ; }",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "chain",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "{ type filter hook forward priority 0 ; policy accept ; }",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "chain",
+                    "ip",
+                    "taritd_nat",
+                    "vm_input",
+                    "{ type filter hook input priority 0 ; policy accept ; }",
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn tap_provision_plan_hardens_before_link_is_up() {
+        let alloc = NetAlloc::for_idx(0);
+        let plan = tap_provision_argv(&alloc);
+        assert_eq!(
+            plan,
+            vec![
+                argv(&["ip", "tuntap", "add", "dev", "insta0", "mode", "tap"]),
+                argv(&["sysctl", "-qw", "net.ipv6.conf.insta0.disable_ipv6=1",]),
+                argv(&["sysctl", "-qw", "net.ipv6.conf.insta0.forwarding=0"]),
+                argv(&["sysctl", "-qw", "net.ipv6.conf.insta0.accept_ra=0"]),
+                argv(&["sysctl", "-qw", "net.ipv6.conf.insta0.autoconf=0"]),
+                argv(&["sysctl", "-qw", "net.ipv6.conf.insta0.accept_redirects=0",]),
+                argv(&["sysctl", "-qw", "net.ipv4.conf.insta0.rp_filter=1"]),
+                argv(&["nft", "add", "table", "netdev", "taritd_ingress_0"]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "chain",
+                    "netdev",
+                    "taritd_ingress_0",
+                    "ingress",
+                    "{ type filter hook ingress device insta0 priority filter ; policy drop ; }",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "netdev",
+                    "taritd_ingress_0",
+                    "ingress",
+                    "ether",
+                    "type",
+                    "arp",
+                    "accept",
+                    "comment",
+                    "\"taritd-ingress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "netdev",
+                    "taritd_ingress_0",
+                    "ingress",
+                    "ether",
+                    "type",
+                    "ip",
+                    "accept",
+                    "comment",
+                    "\"taritd-ingress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&["ip", "addr", "add", "172.16.0.1/30", "dev", "insta0",]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "!=",
+                    "172.16.0.2",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_input",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "!=",
+                    "172.16.0.2",
+                    "drop",
+                    "comment",
+                    "\"taritd-input slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_input",
+                    "iifname",
+                    "\"insta0\"",
+                    "ct",
+                    "state",
+                    "established,related",
+                    "accept",
+                    "comment",
+                    "\"taritd-input slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_input",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "drop",
+                    "comment",
+                    "\"taritd-input slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&["ip", "link", "set", "insta0", "up"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn ingress_recovery_and_teardown_only_target_owned_slot_tables() {
+        let active_slots = HashSet::from([1]);
+        let tables = vec![
+            "taritd_ingress_0".to_string(),
+            "taritd_ingress_1".to_string(),
+            "taritd_ingress_16384".to_string(),
+            "foreign_ingress_0".to_string(),
+        ];
+        assert_eq!(
+            stale_ingress_tables_to_sweep(&tables, &active_slots),
+            vec!["taritd_ingress_0".to_string()]
+        );
+        assert_eq!(
+            delete_ingress_table_argv(0),
+            argv(&["nft", "delete", "table", "netdev", "taritd_ingress_0"])
+        );
+    }
+
+    #[test]
+    fn masquerade_rule_is_bound_to_its_tap_and_guest_source() {
+        let alloc = NetAlloc::for_idx(0);
+        assert_eq!(
+            masquerade_nft_argv(&alloc, "eth0"),
+            argv(&[
+                "nft",
+                "add",
+                "rule",
+                "ip",
+                "taritd_nat",
+                "post",
+                "iifname",
+                "\"insta0\"",
+                "ip",
+                "saddr",
+                "172.16.0.2",
+                "oifname",
+                "\"eth0\"",
+                "masquerade",
+                "comment",
+                "\"taritd slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+            ])
+        );
+    }
+
+    #[test]
+    fn egress_policy_binds_state_allow_and_drop_rules_to_the_tap() {
+        let alloc = NetAlloc::for_idx(0);
+        assert_eq!(
+            egress_policy_argv(&alloc, &["198.51.100.10:443".to_string()], true).unwrap(),
+            vec![
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ct",
+                    "state",
+                    "established,related",
+                    "accept",
+                    "comment",
+                    "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ip",
+                    "daddr",
+                    "198.51.100.10/32",
+                    "tcp",
+                    "dport",
+                    "443",
+                    "accept",
+                    "comment",
+                    "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "drop",
+                    "comment",
+                    "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+            ]
+        );
     }
 
     #[test]
@@ -972,7 +1588,8 @@ mod tests {
 
     #[test]
     fn compile_host_egress_rule_builds_forward_accept() {
-        let any = compile_host_egress_rule("172.16.0.2", "10.0.0.0/8", "\"c\"").unwrap();
+        let alloc = NetAlloc::for_idx(0);
+        let any = compile_host_egress_rule(&alloc, "10.0.0.0/8", "\"c\"").unwrap();
         assert_eq!(
             any,
             vec![
@@ -981,6 +1598,8 @@ mod tests {
                 "ip",
                 NFT_TABLE,
                 NFT_FWD_CHAIN,
+                "iifname",
+                "\"insta0\"",
                 "ip",
                 "saddr",
                 "172.16.0.2",
@@ -992,17 +1611,16 @@ mod tests {
                 "\"c\"",
             ]
         );
-        let tcp = compile_host_egress_rule("172.16.0.2", "1.2.3.4:443", "\"c\"").unwrap();
+        let tcp = compile_host_egress_rule(&alloc, "1.2.3.4:443", "\"c\"").unwrap();
         assert!(tcp.windows(3).any(|w| w == ["tcp", "dport", "443"]));
         assert_eq!(tcp.last().unwrap(), "\"c\"");
 
-        let canonical =
-            compile_host_egress_rule("172.16.0.2", "192.0.2.42/24:443", "\"c\"").unwrap();
+        let canonical = compile_host_egress_rule(&alloc, "192.0.2.42/24:443", "\"c\"").unwrap();
         assert!(canonical
             .windows(3)
             .any(|w| w == ["ip", "daddr", "192.0.2.0/24"]));
 
-        let host = compile_host_egress_rule("172.16.0.2", "192.0.2.42", "\"c\"").unwrap();
+        let host = compile_host_egress_rule(&alloc, "192.0.2.42", "\"c\"").unwrap();
         assert!(host
             .windows(3)
             .any(|w| w == ["ip", "daddr", "192.0.2.42/32"]));
@@ -1119,10 +1737,18 @@ mod tests {
         let stale_line = format!(
             "ip saddr 172.16.0.6 oif eth0 masquerade comment \"taritd slot=1 vm={old_vm} tap=insta1\" # handle 5"
         );
+        let stale_egress_line = format!(
+            "iifname \"insta1\" ip saddr 172.16.0.6 drop comment \"taritd-egress slot=1 vm={old_vm} tap=insta1\" # handle 6"
+        );
+        let stale_input_line = format!(
+            "iifname \"insta1\" ip drop comment \"taritd-input slot=1 vm={old_vm} tap=insta1\" # handle 7"
+        );
         let foreign_line = "ip saddr 10.0.0.0/8 masquerade # handle 6";
 
         assert!(!is_orphan_taritd_nft_rule(&active_line, &active));
         assert!(is_orphan_taritd_nft_rule(&stale_line, &active));
+        assert!(is_orphan_taritd_nft_rule(&stale_egress_line, &active));
+        assert!(is_orphan_taritd_nft_rule(&stale_input_line, &active));
         assert!(!is_orphan_taritd_nft_rule(foreign_line, &active));
         assert_eq!(nft_handle(&stale_line).as_deref(), Some("5"));
     }
