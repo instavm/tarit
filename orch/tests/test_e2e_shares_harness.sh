@@ -4,10 +4,12 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SYSTEM_STAT="$(command -v stat)"
-export SYSTEM_STAT
+SYSTEM_CHOWN="$(command -v chown)"
+export SYSTEM_STAT SYSTEM_CHOWN
 WORK_DIR="$(mktemp -d "$SCRIPT_DIR/.e2e-shares-harness-test.XXXXXX")"
 BIN_DIR="$WORK_DIR/bin"
 mkdir -p -- "$BIN_DIR"
+chmod 0711 "$WORK_DIR"
 
 cleanup_test_artifacts() {
   rm -rf -- "$WORK_DIR"
@@ -50,6 +52,16 @@ fi
 exec /usr/bin/stat "$@"
 SH
 chmod 0700 "$BIN_DIR/stat"
+
+cat >"$BIN_DIR/chown" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ -n "${FAKE_CHOWN_CALLS:-}" ]]; then
+  printf '%s\0' "$@" >>"$FAKE_CHOWN_CALLS"
+fi
+exec "$SYSTEM_CHOWN" "$@"
+SH
+chmod 0700 "$BIN_DIR/chown"
 
 cat >"$BIN_DIR/psql" <<'SH'
 #!/usr/bin/env bash
@@ -187,6 +199,7 @@ test_secret_free_child_commands() {
 }
 
 test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
+  local workspace_mode=""
   local run_dir_mode=""
   local run_dir_uid=""
   local pg_data_mode=""
@@ -195,24 +208,39 @@ test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
 
   if [[ "$(uname -s)" != "Linux" ]]; then
     printf 'SKIP: local PostgreSQL ownership helper requires Linux users\n'
-    return 0
+    return 77
   fi
   if [[ "$(id -u)" != "0" || -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
     printf 'SKIP: local PostgreSQL ownership helper requires sudo -E from a non-root user\n'
-    return 0
+    return 77
   fi
   if ! command -v runuser >/dev/null 2>&1 || ! id "$SUDO_USER" >/dev/null 2>&1; then
     printf 'SKIP: local PostgreSQL ownership helper requires runuser and SUDO_USER\n'
-    return 0
+    return 77
   fi
 
   PG_OS_USER="$SUDO_USER"
   RUN_DIR="$(mktemp -d "$WORK_DIR/local-pg-run.XXXXXX")"
   chmod 0700 "$RUN_DIR"
   chown root:root "$RUN_DIR"
+  workspace_mode="$("$SYSTEM_STAT" -c '%a' -- "$WORK_DIR")"
+  [[ "$workspace_mode" == "711" ]] ||
+    fail_test "workspace parent above RUN_DIR was not traversable"
   printf 'root-only-secret\n' >"$RUN_DIR/root-secret"
   chmod 0600 "$RUN_DIR/root-secret"
   chown root:root "$RUN_DIR/root-secret"
+  PG_DATA_DIR="$RUN_DIR/postgres"
+  mkdir "$PG_DATA_DIR"
+  chown "$PG_OS_USER" "$PG_DATA_DIR"
+  chmod 0700 "$PG_DATA_DIR"
+
+  [[ "$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")" == "700" &&
+    "$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR")" == "0" ]] ||
+    fail_test "modeled pre-fix run directory was not root-owned and owner-private"
+  assert_nonzero "modeled pre-fix PostgreSQL traversal of root-owned RUN_DIR" \
+    runuser -u "$PG_OS_USER" -- test -x "$RUN_DIR"
+  assert_nonzero "modeled pre-fix PostgreSQL traversal of PG_DIR" \
+    runuser -u "$PG_OS_USER" -- test -x "$PG_DATA_DIR"
 
   export E2E_SHARES_HARNESS_REAL_STAT=1
   grant_postgres_run_access
@@ -226,11 +254,8 @@ test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
   secret_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR/root-secret")"
   secret_uid="$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR/root-secret")"
   [[ "$secret_mode" == "600" && "$secret_uid" == "0" ]] ||
-    fail_test "non-PostgreSQL secret did not remain root-owned and private"
+    fail_test "root-owned secret did not deny group and other reads"
 
-  PG_DATA_DIR="$(mktemp -d "$RUN_DIR/postgres.XXXXXX")"
-  chown "$PG_OS_USER" "$PG_DATA_DIR"
-  chmod 0700 "$PG_DATA_DIR"
   pg_data_mode="$("$SYSTEM_STAT" -c '%a' -- "$PG_DATA_DIR")"
   [[ "$pg_data_mode" == "700" ]] ||
     fail_test "PostgreSQL data directory mode was not owner-private"
@@ -238,8 +263,10 @@ test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
     fail_test "PostgreSQL user could not traverse its run directory"
   runuser -u "$PG_OS_USER" -- test -x "$PG_DATA_DIR" ||
     fail_test "PostgreSQL user could not traverse its data directory"
-  assert_nonzero "PostgreSQL user reading root-only secret" \
+  assert_nonzero "other user reading root-only secret" \
     runuser -u "$PG_OS_USER" -- cat "$RUN_DIR/root-secret"
+  assert_nonzero "root-group user reading root-only secret" \
+    runuser -u "$PG_OS_USER" -g root -- cat "$RUN_DIR/root-secret"
 
   restore_run_dir_permissions
   restore_run_dir_permissions
@@ -248,11 +275,65 @@ test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
   unset E2E_SHARES_HARNESS_REAL_STAT
 }
 
-test_probe_failure_fails_closed
-test_zero_taps_is_distinct_from_probe_failure
-test_metric_absence_is_failure
-test_cleanup_sql_failure_is_reported_and_verified
-test_lock_path_is_immutable
-test_secret_free_child_commands
-test_sudo_local_postgres_uses_a_private_pg_owned_run_dir
+test_external_postgres_does_not_chown_run_dir() {
+  RUN_DIR="$(mktemp -d "$WORK_DIR/external-pg-run.XXXXXX")"
+  export FAKE_CHOWN_CALLS="$WORK_DIR/external-chown-args"
+  : >"$FAKE_CHOWN_CALLS"
+  export FAKE_PSQL_ARGS="$WORK_DIR/external-psql-args"
+  export FAKE_PSQL_CALLS="$WORK_DIR/external-psql-calls"
+  export REQUESTED_DATABASE_URL='postgresql://tarit@database.example.test:5432/tarit?sslmode=require'
+  export PSQL_BIN="$BIN_DIR/psql"
+  export OWNER_KEY=external-owner
+  export HOST_PREFIX=external-host
+
+  configure_database >/dev/null
+
+  [[ ! -s "$FAKE_CHOWN_CALLS" ]] ||
+    fail_test "external PostgreSQL mode changed ownership"
+}
+
+PASS_COUNT=0
+SKIP_COUNT=0
+FAIL_COUNT=0
+
+run_test() {
+  local name="$1"
+  local status=0
+
+  if ( "$name" ); then
+    printf 'PASS: %s\n' "$name"
+    PASS_COUNT=$((PASS_COUNT + 1))
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$status" == "77" ]]; then
+    printf 'SKIP: %s\n' "$name"
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    return 0
+  fi
+  printf 'FAIL: %s (exit %d)\n' "$name" "$status" >&2
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  return 0
+}
+
+run_test test_probe_failure_fails_closed
+run_test test_zero_taps_is_distinct_from_probe_failure
+run_test test_metric_absence_is_failure
+run_test test_cleanup_sql_failure_is_reported_and_verified
+run_test test_lock_path_is_immutable
+run_test test_secret_free_child_commands
+run_test test_external_postgres_does_not_chown_run_dir
+run_test test_sudo_local_postgres_uses_a_private_pg_owned_run_dir
+
+printf 'SUMMARY: %d passed, %d skipped, %d failed\n' \
+  "$PASS_COUNT" "$SKIP_COUNT" "$FAIL_COUNT"
+if [[ "$FAIL_COUNT" -ne 0 ]]; then
+  printf 'E2E_SHARES_HARNESS_HELPERS_FAIL\n' >&2
+  exit 1
+fi
+if [[ "$SKIP_COUNT" -ne 0 ]]; then
+  printf 'E2E_SHARES_HARNESS_HELPERS_PASS_WITH_SKIPS\n'
+  exit 0
+fi
 printf 'E2E_SHARES_HARNESS_HELPERS_PASS\n'
