@@ -7,10 +7,10 @@ fit) and `OPERATIONS.md` (how to run and troubleshoot).
 
 ## Test environment
 
-All KVM-dependent validation runs on a nested-virt EC2 host (`c8i.xlarge`).
-Cluster and durability tests use a dedicated PostgreSQL fleet store (an
-isolated RDS instance provisioned by `deploy/provision-rds.sh`). No other
-infrastructure is touched.
+KVM-dependent validation runs on Linux hosts with KVM, either directly or with
+nested virtualization enabled. Cluster and durability tests use a configured
+PostgreSQL fleet store. The test scripts use namespaced records and restore any
+host-network state they create before completing.
 
 Test scripts live in `tests/`. Each row below names the script and the pass
 marker it prints. To reproduce, see "Running the suite" at the end.
@@ -55,15 +55,15 @@ database blip.
 | PostgreSQL recovery | Connections re-establish through the pool; heartbeats resume; `healthy_nodes` climbs back to N within about 30s | e2e: `e2e_pg_blip.sh` (health 0 -> 1 -> 2 after unblock) |
 | Two nodes race for leadership | Lease row `INSERT ... ON CONFLICT ... WHERE leader_id = self OR expires_at < now()` admits exactly one writer; no split-brain leader | unit + design (`tarit-fleet` `try_acquire_leader`) |
 | Missing peer secret in cluster mode | Startup refuses the default `dev-peer-secret` when `TARIT_DATABASE_URL` is set | unit + design (config validation) |
-| RDS TLS | The RDS CA bundle is added to the rustls root store alongside native roots (`TARIT_RDS_CA_FILE`) | e2e (all cluster tests connect over `sslmode=require`) |
+| PostgreSQL TLS | A configured CA bundle is added to the Rust TLS root store alongside native roots | e2e (cluster tests connect over `sslmode=require`) |
 | Usage/audit write-behind | Per-key usage stats and audit events buffer in a local SQLite outbox and flush to Postgres; a DB outage delays but never drops them, and re-sends are idempotent (`UNIQUE(vm_id, kind, window_end)`) | e2e: `e2e_usage_audit.sh` + outbox design |
 
 Result: `PG_BLIP_PASS` (no crash during outage, full recovery after).
 
 The DB outage is injected with an nftables drop rule to the database endpoint, so
 the test is self-contained and does not depend on a cloud control-plane API. A
-managed failover (RDS reboot / Multi-AZ promotion) presents to the node as the
-same connection loss and recovery this test exercises.
+managed database failover presents to the node as the same connection loss and
+recovery this test exercises.
 
 ## 3. Capacity, admission, and autoscaling (scalability)
 
@@ -144,14 +144,35 @@ sshd or network service.
 | WebSocket PTY | `WS /v1/vms/{id}/pty/{pty_id}/connect` relays raw bytes and JSON resize/exit frames to the same guest PTY | e2e: `e2e_ssh_pty.sh` |
 | Terminal resize and clean exit | Window-change maps to `TIOCSWINSZ`; child exit propagates an exit code | e2e: VMM `pty-validate.sh` (`stty size` reflects resize, exit 0) |
 
+## 9. Port-share gateway
+
+`tests/e2e_shares.sh` is the KVM release gate for shared guest ports. It starts
+two Tarit nodes, boots real networked guests, runs an HTTP/WebSocket application
+on guest port `43127`, and sends gateway traffic through the node that does not
+own the guest. It exits successfully and prints `SHARES_PASS` only after every
+assertion below succeeds.
+
+| Failure domain | Required gate behavior |
+| --- | --- |
+| Listener and route isolation | The control listener cannot serve share-host traffic; the share listener cannot expose control or internal peer routes. |
+| Host, path, and forwarding validation | Root and nested paths preserve their query strings; malformed hosts and untrusted or ambiguous forwarding headers are rejected or normalized before reaching the application. |
+| HTTP streaming | A public response of at least 32 MiB is SHA-256 verified while streamed, with application-observed response and upload backpressure; delayed first data and large uploads remain streaming operations. |
+| Header boundary | Request method, query string, and application `Authorization` are preserved exactly. `X-API-Key`, share-token, peer, and client-supplied forwarding headers do not reach the guest. A trusted HTTPS scheme is rebuilt for the application. |
+| Share authorization | Public access works; private access rejects anonymous and malformed tokens, accepts a newly issued token, expires it, invalidates it on version rotation, and returns the documented result after revocation. |
+| Owner routing and peer trust | Share control and data traffic through the non-owner node reach the owner only with a valid signed peer identity. Missing, forged, and unsigned peer calls fail closed. |
+| Guest availability | Retargeting changes the active guest target. A stopped target returns `503`; a revoked share returns `404`. |
+| WebSocket transport | Text, binary, ping, pong, graceful close, and abrupt client disconnect traverse the non-owner route without leaving active gateway gauges. |
+| Host-network isolation | The gate takes an exclusive host-network lock, refuses a host with existing Tarit guest-network state, then removes its owned rules and restores the prior forwarding setting after both nodes stop. |
+| Metrics and shutdown | Metrics have fixed cardinality and do not expose share identifiers or credentials. Coordinated shutdown reaps owned guests, closes admission, and cannot create a guest after shutdown begins. |
+
 ## Running the suite
 
-Cluster and durability tests expect the fleet RDS env (written by
-`deploy/provision-rds.sh`) and a release `taritd` build on the KVM host:
+Cluster and durability tests require a configured fleet database and a release
+`taritd` build on the KVM host:
 
 ```sh
-# on the KVM host, with the fleet DB env sourced
-set -a; . ~/.taritd/cp-rds.env; set +a
+# configure TARIT_DATABASE_URL and TARIT_PEER_SECRET through the deployment
+# environment, then build the daemon
 cargo build --release -p taritd
 
 # coordination-plane resilience
@@ -160,8 +181,8 @@ sudo -E bash tests/e2e_pg_blip.sh      # PostgreSQL outage durability
 bash tests/e2e_autoscale.sh            # autoscaler provider actuation
 sudo -E bash tests/e2e_usage_audit.sh  # per-key usage stats + audit trail
 
-# full 3-node cluster e2e against the RDS (creates real VMs)
-sudo bash tests/run_cluster_rds.sh && cat /tmp/cluster-result.log
+# full cluster e2e (creates real VMs)
+sudo bash tests/e2e_cluster.sh
 
 # single-node feature validations
 sudo bash tests/e2e_ssh_pty.sh
@@ -169,6 +190,9 @@ sudo bash tests/e2e_net_scale.sh
 sudo bash tests/e2e_lifecycle.sh
 sudo bash tests/e2e_multitenant.sh
 sudo bash tests/e2e_cpu_refill.sh
+
+# two-node, real-KVM port-share gateway gate
+sudo -E bash tests/e2e_shares.sh
 ```
 
 VMM-side validations (`pty-validate.sh`, `restore-clone-validate.sh`,
@@ -180,12 +204,11 @@ VMM-side validations (`pty-validate.sh`, `restore-clone-validate.sh`,
 These are tracked and called out so the matrix above is not read as complete
 coverage:
 
-- Managed RDS hardware failover (Multi-AZ promotion) is simulated as a connection
-  outage (section 2), not driven through the cloud API in an automated test.
+- Managed database failover is simulated as a connection outage (section 2), not
+  driven through a provider control API in an automated test.
 - `virtio-balloon` reclaim needs a balloon-enabled guest kernel; the current test
   kernel lacks `CONFIG_VIRTIO_BALLOON`.
 - `aarch64` guests are unsupported (KVM VM/vCPU/GIC/PSCI/FDT path pending).
-- Live migration across hosts needs bare-metal support and is out of scope.
 - Cold boot (create to first exec) is not latency-optimized; sub-100ms today
   comes from restore/warm-pool, not cold boot.
 - Public and internal routes share one listener; isolate `/internal/v1/*` with

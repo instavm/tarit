@@ -743,6 +743,7 @@ async fn create_vm_impl(
     identity: &ApiIdentity,
     mut req: CreateVmRequest,
 ) -> Result<(StatusCode, Json<VmRecord>), ApiError> {
+    ensure_create_admission_open(state)?;
     req.owner_key = Some(identity.tenant.clone());
     req.api_key_id = Some(identity.api_key_id.clone());
     enforce_create_path_policy(identity, &req)?;
@@ -814,6 +815,16 @@ pub(crate) fn enforce_create_path_policy(
     Ok(())
 }
 
+/// Reject a create before owner lookup, local scheduling, or peer placement once
+/// shutdown has closed admission. The short-lived permit serializes this check
+/// with `VmAdmissionGate::close`; peer placement takes its own permit at the
+/// task-spawn boundary below.
+fn ensure_create_admission_open(state: &AppState) -> Result<(), ApiError> {
+    let admission = state.supervisor.admission_gate();
+    let _permit = admission.enter()?;
+    Ok(())
+}
+
 /// Exhaustively try to place `req` on peers: iterate every healthy peer that
 /// currently advertises capacity (best-first) and forward the create until one
 /// accepts. Returns `Ok(None)` only if no peer could take it right now.
@@ -828,7 +839,15 @@ async fn place_on_peer(
         let req = req.clone();
         let identity = identity.clone();
         let rpc_for_log = rpc.clone();
-        let res = tokio::task::spawn_blocking(move || peer.create_remote(&rpc, &req, &identity))
+        // Serialize admission with shutdown at the side-effect boundary. This
+        // mirrors the autoscaler provider: a request admitted before shutdown
+        // may finish, but a draining node cannot launch a new peer-create task.
+        let task = {
+            let admission = state.supervisor.admission_gate();
+            let _permit = admission.enter()?;
+            tokio::task::spawn_blocking(move || peer.create_remote(&rpc, &req, &identity))
+        };
+        let res = task
             .await
             .map_err(|e| OrchError::Internal(format!("join: {e}")))?;
         match res {
@@ -1686,6 +1705,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex, RwLock,
     };
+    use std::time::Duration;
     use tarit_store::Store;
     use tower::ServiceExt;
 
@@ -1812,6 +1832,40 @@ mod tests {
             .unwrap();
         let error: ErrorBody = serde_json::from_slice(&body).unwrap();
         assert!(error.error.contains("quota"));
+        drop(rt);
+    }
+
+    #[test]
+    fn shutdown_rejects_vm_create_before_cluster_placement() {
+        let (mut state, mut writes) = test_state_with_audit();
+        state.config.admission_timeout_ms = 60_000;
+        state.supervisor.begin_shutdown();
+        let app = router(state);
+        let rt = test_runtime();
+
+        let response = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    request_json(
+                        app,
+                        "POST",
+                        "/v1/vms",
+                        "admin-key",
+                        serde_json::json!({"memory_mib": 256, "vcpus": 1}),
+                    ),
+                )
+                .await
+            })
+            .expect("shutdown must reject create without waiting for placement");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        while let Ok(write) = writes.try_recv() {
+            assert!(
+                !matches!(write, StoreWrite::Vm(_)),
+                "shutdown rejection must not enqueue a provisional VM record"
+            );
+        }
         drop(rt);
     }
 
