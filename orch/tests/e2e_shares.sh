@@ -43,7 +43,7 @@ Useful overrides:
 When TARIT_DATABASE_URL is unset, the harness starts an isolated local
 PostgreSQL instance using initdb and pg_ctl. It never uses Docker. The Linux
 host must provide Caddy, curl, Python 3 (with sqlite3), the sqlite3 CLI, GNU coreutils
-(sha256sum, timeout, mktemp, stat, cmp, chown, and chgrp), iproute2, nftables, procps, util-linux
+(sha256sum, timeout, mktemp, stat, cmp, and chown), iproute2, nftables, procps, util-linux
 (flock and, for local PostgreSQL, runuser), and PostgreSQL's psql. Local
 PostgreSQL mode additionally needs initdb and pg_ctl. The guest rootfs must
 provide Node.js. Caddy is mandatory: this gate does not fall back to plaintext
@@ -416,27 +416,23 @@ run_as_pg_user() {
 
 grant_postgres_run_access() {
   [[ "$PG_OS_USER" == "$(id -un)" ]] && return 0
-  RUN_DIR_ORIGINAL_GID="$(stat -c '%g' -- "$RUN_DIR")" ||
-    fail "could not read run-directory owner before PostgreSQL setup"
-  PG_OS_GID="$(id -g "$PG_OS_USER")" ||
-    fail "could not determine PostgreSQL OS group"
-  chgrp "$PG_OS_GID" "$RUN_DIR" ||
-    fail "could not grant the isolated PostgreSQL user traversal to the run directory"
-  chmod 0710 "$RUN_DIR" ||
-    fail "could not set private PostgreSQL traversal permissions"
-  [[ "$(stat -c '%a' -- "$RUN_DIR")" == "710" &&
-    "$(stat -c '%g' -- "$RUN_DIR")" == "$PG_OS_GID" ]] ||
-    fail "run directory did not retain owner-only data permissions for PostgreSQL setup"
+  PG_OS_UID="$(id -u "$PG_OS_USER")" ||
+    fail "could not determine the local PostgreSQL OS user ID"
+  chown "$PG_OS_USER" "$RUN_DIR" ||
+    fail "could not make the isolated PostgreSQL user own the private run directory"
+  chmod 0700 "$RUN_DIR" ||
+    fail "could not retain private PostgreSQL run-directory permissions"
+  [[ "$(stat -c '%a' -- "$RUN_DIR")" == "700" &&
+    "$(stat -c '%u' -- "$RUN_DIR")" == "$PG_OS_UID" ]] ||
+    fail "isolated PostgreSQL user does not own an owner-private run directory"
   RUN_DIR_PG_TRAVERSE_GRANTED=1
 }
 
 restore_run_dir_permissions() {
   [[ "${RUN_DIR_PG_TRAVERSE_GRANTED:-0}" == "1" ]] || return 0
-  chgrp "$RUN_DIR_ORIGINAL_GID" "$RUN_DIR" ||
+  [[ "$(stat -c '%a' -- "$RUN_DIR")" == "700" &&
+    "$(stat -c '%u' -- "$RUN_DIR")" == "$PG_OS_UID" ]] ||
     return 1
-  chmod 0700 "$RUN_DIR" ||
-    return 1
-  private_path "$RUN_DIR" || return 1
   RUN_DIR_PG_TRAVERSE_GRANTED=0
 }
 
@@ -1060,7 +1056,6 @@ preflight() {
   require_command awk "install awk"
   require_command bash "install bash"
   require_command cat "install coreutils"
-  require_command chgrp "install coreutils"
   require_command chmod "install coreutils"
   require_command chown "install coreutils"
   require_command cmp "install coreutils"
@@ -1133,7 +1128,6 @@ preflight() {
       skip "local PostgreSQL OS user '$PG_OS_USER' does not exist; set TARIT_E2E_POSTGRES_OS_USER or TARIT_DATABASE_URL"
     require_command runuser "install util-linux or set TARIT_DATABASE_URL"
     require_command chown "install coreutils or set TARIT_DATABASE_URL"
-    require_command chgrp "install coreutils or set TARIT_DATABASE_URL"
   else
     PSQL_BIN="$(find_pg_binary psql "${TARIT_E2E_PSQL:-}" || true)"
     [[ -n "$PSQL_BIN" ]] ||
@@ -1229,8 +1223,7 @@ NFT_TABLE_CREATED_BY_RUN=0
 NFT_TABLE_BASELINE=""
 IP_FORWARD_CHANGED_BY_RUN=0
 RUN_DIR_PG_TRAVERSE_GRANTED=0
-RUN_DIR_ORIGINAL_GID=""
-PG_OS_GID=""
+PG_OS_UID=""
 VMM_LAUNCHER=""
 RACE_VMM_ARM=""
 RACE_VMM_READY=""

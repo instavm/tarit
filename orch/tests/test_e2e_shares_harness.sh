@@ -3,6 +3,8 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SYSTEM_STAT="$(command -v stat)"
+export SYSTEM_STAT
 WORK_DIR="$(mktemp -d "$SCRIPT_DIR/.e2e-shares-harness-test.XXXXXX")"
 BIN_DIR="$WORK_DIR/bin"
 mkdir -p -- "$BIN_DIR"
@@ -34,8 +36,15 @@ chmod 0700 "$BIN_DIR/ip"
 cat >"$BIN_DIR/stat" <<'SH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+if [[ "${E2E_SHARES_HARNESS_REAL_STAT:-0}" == "1" ]]; then
+  exec "$SYSTEM_STAT" "$@"
+fi
 if [[ "$1" == "-c" && "$2" == "%a" ]]; then
   printf '600\n'
+  exit 0
+fi
+if [[ "$1" == "-c" && "$2" == "%g" ]]; then
+  id -g
   exit 0
 fi
 exec /usr/bin/stat "$@"
@@ -177,10 +186,73 @@ test_secret_free_child_commands() {
     fail_test "curl config did not carry the share token"
 }
 
+test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
+  local run_dir_mode=""
+  local run_dir_uid=""
+  local pg_data_mode=""
+  local secret_mode=""
+  local secret_uid=""
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    printf 'SKIP: local PostgreSQL ownership helper requires Linux users\n'
+    return 0
+  fi
+  if [[ "$(id -u)" != "0" || -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
+    printf 'SKIP: local PostgreSQL ownership helper requires sudo -E from a non-root user\n'
+    return 0
+  fi
+  if ! command -v runuser >/dev/null 2>&1 || ! id "$SUDO_USER" >/dev/null 2>&1; then
+    printf 'SKIP: local PostgreSQL ownership helper requires runuser and SUDO_USER\n'
+    return 0
+  fi
+
+  PG_OS_USER="$SUDO_USER"
+  RUN_DIR="$(mktemp -d "$WORK_DIR/local-pg-run.XXXXXX")"
+  chmod 0700 "$RUN_DIR"
+  chown root:root "$RUN_DIR"
+  printf 'root-only-secret\n' >"$RUN_DIR/root-secret"
+  chmod 0600 "$RUN_DIR/root-secret"
+  chown root:root "$RUN_DIR/root-secret"
+
+  export E2E_SHARES_HARNESS_REAL_STAT=1
+  grant_postgres_run_access
+
+  run_dir_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")"
+  run_dir_uid="$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR")"
+  [[ "$run_dir_mode" == "700" ]] ||
+    fail_test "PostgreSQL run directory mode was not owner-private"
+  [[ "$run_dir_uid" == "$(id -u "$PG_OS_USER")" ]] ||
+    fail_test "PostgreSQL user did not own the private run directory"
+  secret_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR/root-secret")"
+  secret_uid="$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR/root-secret")"
+  [[ "$secret_mode" == "600" && "$secret_uid" == "0" ]] ||
+    fail_test "non-PostgreSQL secret did not remain root-owned and private"
+
+  PG_DATA_DIR="$(mktemp -d "$RUN_DIR/postgres.XXXXXX")"
+  chown "$PG_OS_USER" "$PG_DATA_DIR"
+  chmod 0700 "$PG_DATA_DIR"
+  pg_data_mode="$("$SYSTEM_STAT" -c '%a' -- "$PG_DATA_DIR")"
+  [[ "$pg_data_mode" == "700" ]] ||
+    fail_test "PostgreSQL data directory mode was not owner-private"
+  runuser -u "$PG_OS_USER" -- test -x "$RUN_DIR" ||
+    fail_test "PostgreSQL user could not traverse its run directory"
+  runuser -u "$PG_OS_USER" -- test -x "$PG_DATA_DIR" ||
+    fail_test "PostgreSQL user could not traverse its data directory"
+  assert_nonzero "PostgreSQL user reading root-only secret" \
+    runuser -u "$PG_OS_USER" -- cat "$RUN_DIR/root-secret"
+
+  restore_run_dir_permissions
+  restore_run_dir_permissions
+  [[ "$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")" == "700" ]] ||
+    fail_test "cleanup changed the private run directory mode"
+  unset E2E_SHARES_HARNESS_REAL_STAT
+}
+
 test_probe_failure_fails_closed
 test_zero_taps_is_distinct_from_probe_failure
 test_metric_absence_is_failure
 test_cleanup_sql_failure_is_reported_and_verified
 test_lock_path_is_immutable
 test_secret_free_child_commands
+test_sudo_local_postgres_uses_a_private_pg_owned_run_dir
 printf 'E2E_SHARES_HARNESS_HELPERS_PASS\n'

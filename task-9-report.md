@@ -3,12 +3,20 @@
 2026-07-12
 
 - `bash -n orch/tests/e2e_shares.sh && bash -n orch/tests/test_e2e_shares_harness.sh` — PASS.
-- `bash orch/tests/test_e2e_shares_harness.sh` — PASS: `E2E_SHARES_HARNESS_HELPERS_PASS`. The deterministic helper cases cover an `ip` probe failure, zero-tap distinction, missing gauge, SQL cleanup failure plus verification query, immutable lock path, and secret-free `psql`/`curl` child arguments.
+- `bash orch/tests/test_e2e_shares_harness.sh` — PASS: `E2E_SHARES_HARNESS_HELPERS_PASS`. The deterministic helper cases cover an `ip` probe failure, zero-tap distinction, missing gauge, SQL cleanup failure plus verification query, immutable lock path, secret-free `psql`/`curl` child arguments, and the sudo-caller/local-PostgreSQL ownership regression (skipped on macOS).
 - `(cd orch/tests && shellcheck -x --shell=bash e2e_shares.sh test_e2e_shares_harness.sh)` — PASS.
 - `(cd orch && cargo fmt --all -- --check)` — PASS.
 - `(cd orch && cargo clippy --workspace --all-targets -- -D warnings)` — PASS.
 - `(cd orch && cargo test --workspace)` — PASS: 177 unit tests passed; all workspace doctest suites passed.
 - `git diff --check` — PASS.
+
+## Ubuntu c8i RED
+
+- `sudo -E bash orch/tests/e2e_shares.sh` failed during isolated `initdb` with
+  `could not access directory .../shares.<id>/postgres.<id>: Permission denied`.
+  The preserved tree showed `RUN_DIR` as `0700 root:root` and `PG_DIR` as
+  `ubuntu:root`; the selected `PG_OS_USER` was `ubuntu`, so it could not
+  traverse the parent directory.
 
 ## Remote prerequisite
 
