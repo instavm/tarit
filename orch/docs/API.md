@@ -211,8 +211,9 @@ Use the token only in the guest request header:
 X-Tarit-Share-Token: <token>
 ```
 
-The gateway rejects absent, malformed, duplicate, expired, revoked, or
-token-version-mismatched private tokens with `401`. Tokens expire at
+The gateway rejects absent, malformed, duplicate, expired, or
+token-version-mismatched private tokens with `401`; revoked shares return
+`404` before token verification. Tokens expire at
 `expires_at`, which is issuance time plus `TARIT_SHARE_TOKEN_TTL_SECS`. Public
 shares do not need a token; share tokens are not accepted in query parameters.
 For `POST /v1/shares/{id}/tokens`, `400` means an invalid identifier or a
