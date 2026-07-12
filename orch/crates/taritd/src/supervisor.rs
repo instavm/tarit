@@ -17,6 +17,8 @@ use tarit_vmm_client::{
 use uuid::Uuid;
 
 pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5";
+const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VmSpawnConfig {
@@ -136,6 +138,7 @@ pub struct VmmSupervisor {
     booting: Mutex<HashMap<Uuid, BootingVm>>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
+    golden_artifacts: Mutex<Vec<PathBuf>>,
     net: Option<NetProvisioner>,
     shutting_down: AtomicBool,
 }
@@ -181,6 +184,7 @@ impl VmmSupervisor {
             running: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
             warm: Mutex::new(VecDeque::new()),
+            golden_artifacts: Mutex::new(Vec::new()),
             net,
             shutting_down: AtomicBool::new(false),
         }
@@ -438,6 +442,10 @@ impl VmmSupervisor {
     /// here (restore is used for the fast warm/resume path).
     pub fn restore_vm(&self, id: Uuid, snapshot_path: &str) -> Result<(u32, PathBuf), OrchError> {
         let vm = self.spawn_and_restore(id, snapshot_path, None, SpawnPurpose::Live)?;
+        if let Err(e) = self.await_ready(&vm.socket_path) {
+            self.teardown_vm(id, vm);
+            return Err(e);
+        }
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
         if self.is_shutting_down() {
@@ -534,31 +542,30 @@ impl VmmSupervisor {
 
     /// Boot one warm-pool VM of `class` and park it in the warm queue. The boot
     /// happens without the warm lock held; only the final enqueue takes it.
-    /// Block until the guest agent can actually run a command, so we never park a
-    /// still-booting VM. A freshly-parked, not-yet-ready VM handed out during a
-    /// burst blocks the caller for seconds on its first agent dial (the burst
-    /// p95 tail). Bounded; parks anyway on timeout so a wedged guest can't stall
-    /// replenishment forever.
-    fn await_ready(&self, socket: &Path) {
+    /// Block until the guest agent can actually run a command.
+    fn await_ready(&self, socket: &Path) -> Result<(), OrchError> {
         let client = VmmClient::new(socket);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if client
-                .exec("true", 1000)
-                .map(|(code, _, _, _)| code == 0)
-                .unwrap_or(false)
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_guest_ready(GUEST_READY_TIMEOUT, || match client.exec("true", 1000) {
+            Ok((0, _, _, _)) => Ok(true),
+            Ok((code, _, _, _)) => Err(format!("readiness command exited with status {code}")),
+            Err(error) => Err(error.to_string()),
+        })
+        .map_err(|last| {
+            OrchError::Vmm(format!(
+                "guest agent never became ready at {}: {last}",
+                socket.display()
+            ))
+        })
     }
 
     pub fn spawn_warm(&self, class: &WarmClass) -> Result<(), OrchError> {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
-        self.await_ready(&vm.socket_path);
+        if let Err(e) = self.await_ready(&vm.socket_path) {
+            self.teardown_vm(id, vm);
+            return Err(e);
+        }
         if self.is_shutting_down() {
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
@@ -586,7 +593,10 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
-        self.await_ready(&vm.socket_path);
+        if let Err(e) = self.await_ready(&vm.socket_path) {
+            self.teardown_vm(id, vm);
+            return Err(e);
+        }
         if self.is_shutting_down() {
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
@@ -600,7 +610,25 @@ impl VmmSupervisor {
             }
         };
 
-        self.teardown_vm(id, vm);
+        if self.is_shutting_down() {
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts([PathBuf::from(&snapshot_path)]);
+            return Err(self.shutdown_error());
+        }
+        if let Err(e) = self.remember_golden_artifacts(
+            &snapshot_path,
+            overlay_path_for_config(id, &spec).as_deref(),
+        ) {
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts([PathBuf::from(&snapshot_path)]);
+            return Err(e);
+        }
+        if self.is_shutting_down() {
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts([PathBuf::from(&snapshot_path)]);
+            return Err(self.shutdown_error());
+        }
+        self.teardown_vm_preserving_overlay(id, vm);
         Ok(snapshot_path)
     }
 
@@ -614,7 +642,10 @@ impl VmmSupervisor {
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let overlay = overlay_path_for_config(id, &spec);
         let vm = self.spawn_and_restore(id, snapshot_path, overlay, SpawnPurpose::Refill)?;
-        self.await_ready(&vm.socket_path);
+        if let Err(e) = self.await_ready(&vm.socket_path) {
+            self.teardown_vm(id, vm);
+            return Err(e);
+        }
         if self.is_shutting_down() {
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
@@ -639,28 +670,43 @@ impl VmmSupervisor {
     /// running set under its own id. Returns (id, pid, socket) or None if the
     /// pool has no match (caller then cold-starts).
     pub fn take_warm(&self, want: &VmSpawnConfig) -> Option<(Uuid, u32, PathBuf)> {
-        if self.is_shutting_down() {
-            return None;
+        loop {
+            if self.is_shutting_down() {
+                return None;
+            }
+            let taken = {
+                let mut warm = self.warm.lock().ok()?;
+                let pos = warm.iter().position(|w| &w.spec == want)?;
+                warm.remove(pos)?
+            };
+            if let Err(error) = self.await_ready(&taken.vm.socket_path) {
+                tracing::warn!(id = %taken.id, error = %error, "discarding unready warm VM");
+                self.teardown_vm(taken.id, taken.vm);
+                continue;
+            }
+
+            let pid = taken.vm.pid;
+            let socket = taken.vm.socket_path.clone();
+            self.move_pid_to_default_cgroup(pid);
+            if self.is_shutting_down() {
+                self.teardown_vm(taken.id, taken.vm);
+                return None;
+            }
+            let mut running = match self.running.lock() {
+                Ok(running) => running,
+                Err(_) => {
+                    self.teardown_vm(taken.id, taken.vm);
+                    return None;
+                }
+            };
+            if self.is_shutting_down() {
+                drop(running);
+                self.teardown_vm(taken.id, taken.vm);
+                return None;
+            }
+            running.insert(taken.id, taken.vm);
+            return Some((taken.id, pid, socket));
         }
-        let mut warm = self.warm.lock().ok()?;
-        let pos = warm.iter().position(|w| &w.spec == want)?;
-        let taken = warm.remove(pos)?;
-        drop(warm);
-        let pid = taken.vm.pid;
-        let socket = taken.vm.socket_path.clone();
-        self.move_pid_to_default_cgroup(pid);
-        if self.is_shutting_down() {
-            self.teardown_vm(taken.id, taken.vm);
-            return None;
-        }
-        let mut running = self.running.lock().ok()?;
-        if self.is_shutting_down() {
-            drop(running);
-            self.teardown_vm(taken.id, taken.vm);
-            return None;
-        }
-        running.insert(taken.id, taken.vm);
-        Some((taken.id, pid, socket))
     }
 
     /// Number of warm VMs currently parked for the given class shape.
@@ -673,6 +719,24 @@ impl VmmSupervisor {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    fn remember_golden_artifacts(
+        &self,
+        snapshot_path: &str,
+        overlay_path: Option<&str>,
+    ) -> Result<(), OrchError> {
+        self.ensure_accepting_work()?;
+        let mut artifacts = self
+            .golden_artifacts
+            .lock()
+            .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?;
+        self.ensure_accepting_work()?;
+        artifacts.push(PathBuf::from(snapshot_path));
+        if let Some(overlay_path) = overlay_path {
+            artifacts.push(PathBuf::from(overlay_path));
+        }
+        Ok(())
     }
 
     fn client_for(&self, id: Uuid) -> Result<VmmClient, OrchError> {
@@ -834,7 +898,13 @@ impl VmmSupervisor {
                 .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?;
             guard.drain().collect::<Vec<_>>()
         };
-
+        let golden_artifacts = {
+            let mut guard = self
+                .golden_artifacts
+                .lock()
+                .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?;
+            guard.drain(..).collect::<Vec<_>>()
+        };
         let running_ids = running.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         let summary = ShutdownSummary {
             running_ids,
@@ -858,14 +928,25 @@ impl VmmSupervisor {
             let _ = std::fs::remove_file(&vm.socket_path);
             let _ = std::fs::remove_file(overlay_path_for(id));
         }
+        cleanup_golden_artifacts(golden_artifacts);
 
         Ok(summary)
     }
 
     fn teardown_vm(&self, id: Uuid, vm: RunningVm) {
+        self.teardown_vm_inner(id, vm, true);
+    }
+
+    fn teardown_vm_preserving_overlay(&self, id: Uuid, vm: RunningVm) {
+        self.teardown_vm_inner(id, vm, false);
+    }
+
+    fn teardown_vm_inner(&self, id: Uuid, vm: RunningVm, remove_overlay: bool) {
         vm.process.kill_wait();
         let _ = std::fs::remove_file(&vm.socket_path);
-        let _ = std::fs::remove_file(overlay_path_for(id));
+        if remove_overlay {
+            let _ = std::fs::remove_file(overlay_path_for(id));
+        }
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
             p.teardown(a);
         }
@@ -885,6 +966,33 @@ impl Drop for VmmSupervisor {
             }
         }
     }
+}
+
+fn cleanup_golden_artifacts(paths: impl IntoIterator<Item = PathBuf>) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn wait_for_guest_ready<F>(timeout: Duration, mut probe: F) -> Result<(), String>
+where
+    F: FnMut() -> Result<bool, String>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last = "guest agent returned no successful readiness response".to_string();
+
+    while Instant::now() < deadline {
+        match probe() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                last = "guest agent readiness command did not succeed".to_string();
+            }
+            Err(error) => last = error,
+        }
+        std::thread::sleep(GUEST_READY_POLL_INTERVAL);
+    }
+
+    Err(format!("guest agent never became ready: {last}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1090,5 +1198,49 @@ mod tests {
             parse_self_cgroup("0::/\n"),
             Some(PathBuf::from("/sys/fs/cgroup"))
         );
+    }
+
+    #[test]
+    fn guest_readiness_gate_rejects_an_unresponsive_agent() {
+        let error = wait_for_guest_ready(Duration::ZERO, || Ok(false))
+            .expect_err("an unresponsive guest must not pass the readiness gate");
+
+        assert!(error.contains("guest agent never became ready"));
+    }
+
+    #[test]
+    fn guest_readiness_gate_accepts_a_successful_probe() {
+        let mut attempts = 0;
+
+        wait_for_guest_ready(Duration::from_secs(1), || {
+            attempts += 1;
+            Ok(true)
+        })
+        .expect("a successful guest-agent probe must pass the readiness gate");
+
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn golden_artifact_cleanup_removes_snapshot_and_overlay() {
+        let dir = std::env::temp_dir().join(format!(
+            "golden-artifact-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("golden.snap");
+        let overlay = dir.join("golden.overlay");
+        std::fs::write(&snapshot, b"snapshot").expect("write snapshot");
+        std::fs::write(&overlay, b"overlay").expect("write overlay");
+
+        cleanup_golden_artifacts([snapshot.clone(), overlay.clone()]);
+
+        assert!(!snapshot.exists(), "golden snapshot must be removed");
+        assert!(!overlay.exists(), "golden overlay must be removed");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

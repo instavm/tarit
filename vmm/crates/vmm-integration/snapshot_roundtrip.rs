@@ -28,6 +28,22 @@ fn local_test_dir(name: &str) -> PathBuf {
     dir
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
+struct RestoreCloneArtifacts {
+    dir: PathBuf,
+    snapshots: Vec<PathBuf>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
+impl Drop for RestoreCloneArtifacts {
+    fn drop(&mut self) {
+        for snapshot in &self.snapshots {
+            let _ = std::fs::remove_file(snapshot);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[test]
 #[ignore = "needs KVM + snapshot path (M10)"]
 fn snapshot_restore_continuity() {
@@ -53,6 +69,10 @@ fn restored_clones_get_private_rootfs_overlays() {
     }
 
     let dir = local_test_dir("restore-clone-overlays");
+    let mut artifacts = RestoreCloneArtifacts {
+        dir: dir.clone(),
+        snapshots: Vec::new(),
+    };
     let golden_overlay = dir.join("golden.overlay");
     let overlay_a = dir.join("clone-a.overlay");
     let overlay_b = dir.join("clone-b.overlay");
@@ -62,9 +82,10 @@ fn restored_clones_get_private_rootfs_overlays() {
     let config = |overlay: &PathBuf| VmConfig {
         kernel: KernelConfig {
             path: kernel.to_string_lossy().into_owned(),
-            cmdline:
-                "console=ttyS0 reboot=k panic=1 nokaslr root=/dev/vda rw init=/usr/sbin/vmm-agent"
-                    .into(),
+            cmdline: "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 \
+                pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw \
+                virtio_mmio.device=4K@0xd0000000:5 init=/usr/sbin/vmm-agent"
+                .into(),
             initramfs: None,
         },
         memory: MemoryConfig { size_mib: 256 },
@@ -81,8 +102,15 @@ fn restored_clones_get_private_rootfs_overlays() {
     golden
         .create_live(config(&golden_overlay))
         .expect("boot golden");
+    let (code, _, _) = golden
+        .exec("true", 30_000)
+        .expect("golden must be command-ready before snapshot");
+    assert_eq!(code, 0, "golden readiness command must succeed");
     let snap_path = golden.snapshot(false).expect("snapshot golden");
+    artifacts.snapshots.push(PathBuf::from(&snap_path));
     golden.stop().ok();
+    let original_golden_overlay =
+        std::fs::read(&golden_overlay).expect("read reusable golden overlay");
 
     let clone_a = VmmController::new();
     clone_a
@@ -106,14 +134,53 @@ fn restored_clones_get_private_rootfs_overlays() {
         .expect("read marker state in clone B");
     assert_eq!(code, 0, "clone B must not see clone A marker: {out}");
     assert!(out.contains("isolated"));
+    let (code, out, _) = clone_b
+        .exec("printf clone-b", 30_000)
+        .expect("execute command in clone B");
+    assert_eq!(code, 0, "clone B command must succeed: {out}");
+    assert!(out.contains("clone-b"));
     clone_b.stop().ok();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let golden_inode = std::fs::metadata(&golden_overlay)
+            .expect("golden overlay metadata")
+            .ino();
+        assert_ne!(
+            std::fs::metadata(&overlay_a)
+                .expect("clone A overlay metadata")
+                .ino(),
+            golden_inode,
+            "clone A must not share the golden writable backing file"
+        );
+        assert_ne!(
+            std::fs::metadata(&overlay_b)
+                .expect("clone B overlay metadata")
+                .ino(),
+            golden_inode,
+            "clone B must not share the golden writable backing file"
+        );
+        assert_ne!(
+            std::fs::metadata(&overlay_a)
+                .expect("clone A overlay metadata")
+                .ino(),
+            std::fs::metadata(&overlay_b)
+                .expect("clone B overlay metadata")
+                .ino(),
+            "clones must not share a writable backing file"
+        );
+    }
 
     assert_eq!(
         std::fs::read(&base_rootfs).expect("reread base rootfs"),
         original_base,
         "base rootfs must stay byte-identical"
     );
-
-    let _ = std::fs::remove_file(&snap_path);
-    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(
+        std::fs::read(&golden_overlay).expect("reread reusable golden overlay"),
+        original_golden_overlay,
+        "golden writable disk state must stay byte-identical after clones run"
+    );
 }

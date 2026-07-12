@@ -7,7 +7,10 @@ use crate::config::VmConfig;
 use crate::error::{Result, VmmError};
 use crate::gc::OwnedScratchFile;
 use crate::state::VmState;
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -888,9 +891,13 @@ impl VmmController {
             volumes,
             net,
         };
+        let overlay_seed = restore_overlay_seed(&config, overlay.as_deref())?;
         apply_restore_overlay(&mut config, overlay)?;
         config.validate()?;
         let overlay_guard = OwnedOverlayGuard::new(&config);
+        if let Some((golden_overlay, clone_overlay)) = overlay_seed {
+            seed_restore_overlay(&golden_overlay, &clone_overlay)?;
+        }
 
         // Keep the owned state blob aligned with the restored config. Future
         // snapshots start from this blob and only patch in live device/vCPU
@@ -1655,16 +1662,206 @@ fn apply_restore_overlay(config: &mut VmConfig, overlay: Option<String>) -> Resu
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
+fn restore_overlay_seed(
+    config: &VmConfig,
+    overlay: Option<&str>,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let Some(target) = overlay else {
+        return Ok(None);
+    };
+    let Some(index) = restore_overlay_volume_index(&config.volumes) else {
+        return Err(VmmError::InvalidConfig(
+            "restore overlay requested but snapshot has no volumes".into(),
+        ));
+    };
+    let Some(source) = config.volumes[index].overlay.as_deref() else {
+        return Ok(None);
+    };
+    if source == target {
+        return Ok(None);
+    }
+    Ok(Some((PathBuf::from(source), PathBuf::from(target))))
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn seed_restore_overlay(source: &Path, target: &Path) -> Result<()> {
+    if source == target {
+        return Ok(());
+    }
+
+    copy_restore_overlay(source, target).map_err(|e| {
+        let _ = std::fs::remove_file(target);
+        VmmError::Snapshot(format!(
+            "seed restore overlay {} -> {}: {e}",
+            source.display(),
+            target.display()
+        ))
+    })
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn copy_restore_overlay(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        copy_sparse_restore_overlay(source, target)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        copy_dense_restore_overlay(source, target)
+    }
+}
+
+#[cfg(all(
+    not(target_os = "linux"),
+    any(test, all(target_arch = "x86_64", feature = "boot"))
+))]
+fn copy_dense_restore_overlay(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut source = std::fs::File::open(source)?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    source.seek(SeekFrom::Start(0))?;
+    target.seek(SeekFrom::Start(0))?;
+    std::io::copy(&mut source, &mut target)?;
+    target.sync_all()
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(test, all(target_arch = "x86_64", feature = "boot"))
+))]
+fn copy_sparse_restore_overlay(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    let mut source = std::fs::File::open(source)?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    let length = source.metadata()?.len();
+    target.set_len(length)?;
+
+    let mut offset = 0u64;
+    while offset < length {
+        let data = unsafe {
+            libc::lseek(
+                source.as_raw_fd(),
+                offset.try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "overlay offset too large",
+                    )
+                })?,
+                libc::SEEK_DATA,
+            )
+        };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+            ) {
+                target.set_len(0)?;
+                source.seek(SeekFrom::Start(0))?;
+                target.seek(SeekFrom::Start(0))?;
+                std::io::copy(&mut source, &mut target)?;
+                return target.sync_all();
+            }
+            return Err(error);
+        }
+        let data = u64::try_from(data).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "negative overlay data offset",
+            )
+        })?;
+        let hole = unsafe {
+            libc::lseek(
+                source.as_raw_fd(),
+                data.try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "overlay offset too large",
+                    )
+                })?,
+                libc::SEEK_HOLE,
+            )
+        };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let hole = u64::try_from(hole).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "negative overlay hole offset",
+            )
+        })?;
+        if hole < data || hole > length {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid overlay data extent",
+            ));
+        }
+
+        source.seek(SeekFrom::Start(data))?;
+        target.seek(SeekFrom::Start(data))?;
+        let mut remaining = hole.saturating_sub(data);
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("bounded copy length fits usize");
+            let read = source.read(&mut buffer[..wanted])?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "overlay data extent ended early",
+                ));
+            }
+            target.write_all(&buffer[..read])?;
+            remaining -= read as u64;
+        }
+        offset = hole;
+    }
+    target.sync_all()
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn select_restore_overlay_volume(
     volumes: &mut [crate::config::VolumeConfig],
 ) -> Option<&mut crate::config::VolumeConfig> {
+    let index = restore_overlay_volume_index(volumes)?;
+    volumes.get_mut(index)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn restore_overlay_volume_index(volumes: &[crate::config::VolumeConfig]) -> Option<usize> {
     // If the golden was already CoW, that volume is the rootfs upper layer we
     // must replace. Otherwise fall back to volume 0: configs attach rootfs first.
-    let idx = volumes
+    let index = volumes
         .iter()
         .position(|vol| vol.overlay.is_some())
         .unwrap_or(0);
-    volumes.get_mut(idx)
+    volumes.get(index).map(|_| index)
 }
 
 /// Write a snapshot file with CRC32 integrity.
@@ -3214,6 +3411,14 @@ mod tests {
             overlay: Some("/golden/rootfs.overlay".into()),
         }];
 
+        assert_eq!(
+            restore_overlay_seed(&config, Some("/clones/a.overlay"))
+                .expect("derive golden overlay seed"),
+            Some((
+                PathBuf::from("/golden/rootfs.overlay"),
+                PathBuf::from("/clones/a.overlay")
+            ))
+        );
         apply_restore_overlay(&mut config, Some("/clones/a.overlay".into())).unwrap();
 
         assert_eq!(config.volumes[0].path, "/base/rootfs.ext4");
@@ -3221,6 +3426,52 @@ mod tests {
             config.volumes[0].overlay.as_deref(),
             Some("/clones/a.overlay")
         );
+    }
+
+    #[test]
+    fn restore_overlay_seed_is_a_private_copy_of_the_golden_upper() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let golden = dir.join(format!("{unique}-golden.cow"));
+        let clone = dir.join(format!("{unique}-clone.cow"));
+        let cleanup = [golden.clone(), clone.clone()];
+        let golden_bytes = b"golden writable upper state";
+
+        std::fs::write(&golden, golden_bytes).expect("write golden upper");
+        seed_restore_overlay(&golden, &clone).expect("seed clone upper");
+
+        assert_eq!(
+            std::fs::read(&clone).expect("read clone upper"),
+            golden_bytes,
+            "a clone must start from the golden writable upper state"
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            std::fs::metadata(&golden).expect("golden metadata").ino(),
+            std::fs::metadata(&clone).expect("clone metadata").ino(),
+            "the clone must not share the golden writable backing file"
+        );
+
+        std::fs::write(&clone, b"clone-private-state").expect("mutate clone upper");
+        assert_eq!(
+            std::fs::read(&golden).expect("reread golden upper"),
+            golden_bytes,
+            "clone writes must not modify the reusable golden upper state"
+        );
+
+        for path in cleanup {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
