@@ -28,7 +28,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -78,7 +78,10 @@ enum BridgeCommand {
         complete: oneshot::Sender<()>,
     },
     #[cfg(test)]
-    Count(oneshot::Sender<usize>),
+    Pause {
+        resume: oneshot::Receiver<()>,
+        paused: oneshot::Sender<()>,
+    },
 }
 
 struct BridgeReaper {
@@ -86,9 +89,54 @@ struct BridgeReaper {
     handle: JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct BridgeTaskTracker {
+    pending: AtomicUsize,
+    active: AtomicUsize,
+    completed: AtomicUsize,
+}
+
+impl BridgeTaskTracker {
+    #[cfg(test)]
+    fn snapshot(&self) -> TrackedBridgeTasks {
+        TrackedBridgeTasks {
+            pending: self.pending.load(Ordering::Relaxed),
+            active: self.active.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct ActiveBridgeTask {
+    tracker: Arc<BridgeTaskTracker>,
+}
+
+impl ActiveBridgeTask {
+    fn new(tracker: Arc<BridgeTaskTracker>) -> Self {
+        tracker.active.fetch_add(1, Ordering::Relaxed);
+        Self { tracker }
+    }
+}
+
+impl Drop for ActiveBridgeTask {
+    fn drop(&mut self) {
+        self.tracker.active.fetch_sub(1, Ordering::Relaxed);
+        self.tracker.completed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrackedBridgeTasks {
+    pending: usize,
+    active: usize,
+    completed: usize,
+}
+
 struct BridgeState {
     accepting: bool,
     reaper: Option<BridgeReaper>,
+    tracker: Arc<BridgeTaskTracker>,
 }
 
 pub(crate) struct ShareRuntime {
@@ -145,6 +193,7 @@ impl ShareRuntime {
             bridges: Mutex::new(BridgeState {
                 accepting: true,
                 reaper: None,
+                tracker: Arc::new(BridgeTaskTracker::default()),
             }),
             shutdown_lock: AsyncMutex::new(()),
         }
@@ -190,15 +239,17 @@ impl ShareRuntime {
         if self.is_shutting_down() || !bridges.accepting {
             return Err(resource);
         }
+        let tracker = Arc::clone(&bridges.tracker);
         let reaper = bridges.reaper.get_or_insert_with(|| {
             let (commands, receiver) = mpsc::channel(MAX_PENDING_BRIDGE_COMMANDS);
             BridgeReaper {
                 commands,
-                handle: tokio::spawn(run_bridge_reaper(receiver)),
+                handle: tokio::spawn(run_bridge_reaper(receiver, tracker)),
             }
         });
         match reaper.commands.clone().try_reserve_owned() {
             Ok(permit) => {
+                bridges.tracker.pending.fetch_add(1, Ordering::Relaxed);
                 permit.send(BridgeCommand::Spawn(Box::pin(build(resource))));
             }
             Err(mpsc::error::TrySendError::Full(_)) => return Err(resource),
@@ -259,22 +310,47 @@ impl ShareRuntime {
     }
 
     #[cfg(test)]
-    async fn tracked_bridge_count(&self) -> usize {
-        let Some(commands) = self
-            .bridges
+    fn tracked_bridge_tasks(&self) -> TrackedBridgeTasks {
+        self.bridges
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .reaper
-            .as_ref()
-            .map(|reaper| reaper.commands.clone())
-        else {
-            return 0;
+            .tracker
+            .snapshot()
+    }
+
+    #[cfg(test)]
+    async fn pause_bridge_reaper(&self) -> oneshot::Sender<()> {
+        let commands = {
+            let mut bridges = self
+                .bridges
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let tracker = Arc::clone(&bridges.tracker);
+            bridges
+                .reaper
+                .get_or_insert_with(|| {
+                    let (commands, receiver) = mpsc::channel(MAX_PENDING_BRIDGE_COMMANDS);
+                    BridgeReaper {
+                        commands,
+                        handle: tokio::spawn(run_bridge_reaper(receiver, tracker)),
+                    }
+                })
+                .commands
+                .clone()
         };
-        let (count_tx, count_rx) = oneshot::channel();
-        if commands.send(BridgeCommand::Count(count_tx)).await.is_err() {
-            return 0;
-        }
-        count_rx.await.unwrap_or(0)
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (paused_tx, paused_rx) = oneshot::channel();
+        commands
+            .send(BridgeCommand::Pause {
+                resume: resume_rx,
+                paused: paused_tx,
+            })
+            .await
+            .expect("test bridge reaper must remain available");
+        paused_rx
+            .await
+            .expect("test bridge reaper must acknowledge its pause");
+        resume_tx
     }
 
     async fn wait_for_pending_upgrades(&self, warning_after: Duration) {
@@ -309,30 +385,39 @@ impl ShareRuntime {
     }
 }
 
-async fn run_bridge_reaper(mut commands: mpsc::Receiver<BridgeCommand>) {
+async fn run_bridge_reaper(
+    mut commands: mpsc::Receiver<BridgeCommand>,
+    tracker: Arc<BridgeTaskTracker>,
+) {
     let mut bridges = JoinSet::new();
     loop {
         tokio::select! {
             biased;
             command = commands.recv() => match command {
                 Some(BridgeCommand::Spawn(bridge)) => {
-                    reap_completed_bridges(&mut bridges);
-                    bridges.spawn(bridge);
+                    tracker.pending.fetch_sub(1, Ordering::Relaxed);
+                    reap_completed_bridges(&mut bridges, &tracker);
+                    let task = ActiveBridgeTask::new(Arc::clone(&tracker));
+                    bridges.spawn(async move {
+                        let _task = task;
+                        bridge.await;
+                    });
                 }
                 Some(BridgeCommand::Stop { timeout, complete }) => {
-                    drain_bridges(&mut bridges, timeout).await;
+                    drain_bridges(&mut bridges, &tracker, timeout).await;
                     let _ = complete.send(());
                     return;
                 }
                 #[cfg(test)]
-                Some(BridgeCommand::Count(count)) => {
-                    reap_completed_bridges(&mut bridges);
-                    let _ = count.send(bridges.len());
+                Some(BridgeCommand::Pause { resume, paused }) => {
+                    let _ = paused.send(());
+                    let _ = resume.await;
                 }
                 None => {
                     tracing::warn!("share WebSocket bridge reaper lost its runtime owner; aborting bridges");
                     bridges.abort_all();
                     while let Some(result) = bridges.join_next().await {
+                        tracker.completed.fetch_sub(1, Ordering::Relaxed);
                         observe_bridge_result(result, "while aborting after reaper ownership loss");
                     }
                     return;
@@ -340,6 +425,7 @@ async fn run_bridge_reaper(mut commands: mpsc::Receiver<BridgeCommand>) {
             },
             result = bridges.join_next(), if !bridges.is_empty() => {
                 if let Some(result) = result {
+                    tracker.completed.fetch_sub(1, Ordering::Relaxed);
                     observe_bridge_result(result, "during normal operation");
                 }
             }
@@ -347,17 +433,21 @@ async fn run_bridge_reaper(mut commands: mpsc::Receiver<BridgeCommand>) {
     }
 }
 
-fn reap_completed_bridges(bridges: &mut JoinSet<()>) {
+fn reap_completed_bridges(bridges: &mut JoinSet<()>, tracker: &BridgeTaskTracker) {
     while let Some(result) = bridges.try_join_next() {
+        tracker.completed.fetch_sub(1, Ordering::Relaxed);
         observe_bridge_result(result, "while registering a bridge");
     }
 }
 
-async fn drain_bridges(bridges: &mut JoinSet<()>, timeout: Duration) {
+async fn drain_bridges(bridges: &mut JoinSet<()>, tracker: &BridgeTaskTracker, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !bridges.is_empty() {
         match time::timeout_at(deadline, bridges.join_next()).await {
-            Ok(Some(result)) => observe_bridge_result(result, "during shutdown"),
+            Ok(Some(result)) => {
+                tracker.completed.fetch_sub(1, Ordering::Relaxed);
+                observe_bridge_result(result, "during shutdown");
+            }
             Ok(None) => break,
             Err(_) => {
                 tracing::warn!(
@@ -365,6 +455,7 @@ async fn drain_bridges(bridges: &mut JoinSet<()>, timeout: Duration) {
                 );
                 bridges.abort_all();
                 while let Some(result) = bridges.join_next().await {
+                    tracker.completed.fetch_sub(1, Ordering::Relaxed);
                     observe_bridge_result(result, "while aborting");
                 }
                 break;
@@ -1646,8 +1737,8 @@ fn upstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
 mod tests {
     use super::{
         meter_response_body, proxy_http_to_target, proxy_websocket_to_target,
-        router as gateway_router, share_slug, ShareRuntime, TrustedForwarding, UpstreamTarget,
-        WebSocketTargetRequest,
+        router as gateway_router, share_slug, ActiveBridgeTask, BridgeTaskTracker, ShareRuntime,
+        TrackedBridgeTasks, TrustedForwarding, UpstreamTarget, WebSocketTargetRequest,
     };
     use axum::{
         body::{Body, Bytes},
@@ -1727,7 +1818,9 @@ mod tests {
         }
     }
 
-    struct InspectingChatProtocol;
+    struct InspectingChatProtocol {
+        expected_authorization: Option<&'static [u8]>,
+    }
 
     impl Callback for InspectingChatProtocol {
         fn on_request(
@@ -1744,7 +1837,12 @@ mod tests {
                 "https://client.example"
             );
             assert_eq!(request.headers().get(COOKIE).unwrap(), "session=guest");
-            assert!(request.headers().contains_key(AUTHORIZATION));
+            if let Some(expected_authorization) = self.expected_authorization {
+                assert_eq!(
+                    request.headers().get(AUTHORIZATION).unwrap().as_bytes(),
+                    expected_authorization
+                );
+            }
             assert!(request.headers().get("x-tarit-share-token").is_none());
             assert_eq!(
                 request.headers().get(FORWARDED).unwrap(),
@@ -2046,24 +2144,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn share_runtime_reaps_short_lived_bridges_before_shutdown() {
+    async fn bridge_tracking_handles_abort_before_a_bridge_is_polled() {
+        let tracker = Arc::new(BridgeTaskTracker::default());
+        let mut bridges = tokio::task::JoinSet::new();
+        tracker
+            .pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracker
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let task = ActiveBridgeTask::new(Arc::clone(&tracker));
+        bridges.spawn(async move {
+            let _task = task;
+            std::future::pending::<()>().await;
+        });
+        bridges.abort_all();
+        let _ = bridges
+            .join_next()
+            .await
+            .expect("the aborted bridge must leave the join set");
+        tracker
+            .completed
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            tracker.snapshot(),
+            TrackedBridgeTasks {
+                pending: 0,
+                active: 0,
+                completed: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn share_runtime_autonomously_reaps_short_lived_bridges_and_recovers_from_queue_pressure()
+    {
         let (shutdown_tx, shutdown_rx) = watch::channel(None);
         let runtime = ShareRuntime::new(shutdown_tx, shutdown_rx);
 
-        for _ in 0..128 {
+        let resume_reaper = runtime.pause_bridge_reaper().await;
+        for _ in 0..super::MAX_PENDING_BRIDGE_COMMANDS {
             runtime.spawn_bridge((), |_| async {}).await.unwrap();
         }
+        assert_eq!(
+            runtime.tracked_bridge_tasks().pending,
+            super::MAX_PENDING_BRIDGE_COMMANDS
+        );
+        assert_eq!(
+            runtime
+                .spawn_bridge("overloaded", |_| async {})
+                .await
+                .unwrap_err(),
+            "overloaded"
+        );
+        resume_reaper.send(()).unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if runtime.tracked_bridge_count().await == 0 {
+                let tasks = runtime.tracked_bridge_tasks();
+                if tasks.pending == 0 && tasks.active == 0 && tasks.completed == 0 {
                     return;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("completed bridges must be reaped before shutdown");
+        .expect("the reaper must restore bridge-command capacity after overload");
+
+        for _ in 0..128 {
+            runtime.spawn_bridge((), |_| async {}).await.unwrap();
+        }
+        let resume_short_lived_reaper = runtime.pause_bridge_reaper().await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let tasks = runtime.tracked_bridge_tasks();
+                if tasks.pending == 0 && tasks.active == 0 && tasks.completed == 128 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all 128 short-lived bridges must complete before autonomous reaping resumes");
+        resume_short_lived_reaper.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let tasks = runtime.tracked_bridge_tasks();
+                if tasks.pending == 0 && tasks.active == 0 && tasks.completed == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the autonomous reaper must drain the completed short-lived bridges");
     }
 
     #[test]
@@ -2380,7 +2557,10 @@ mod tests {
 
     #[tokio::test]
     async fn bridges_websocket_frames_and_negotiates_the_upstream_protocol() {
-        let (upstream, observed) = spawn_websocket_echo_upstream().await;
+        let (upstream, observed) = spawn_websocket_echo_upstream_with_expected_authorization(Some(
+            b"Bearer app-authorization-token-7",
+        ))
+        .await;
         let (gateway, metrics) = start_gateway_router(upstream, Duration::from_secs(1)).await;
         let mut request = format!("ws://{gateway}/socket?keep=this")
             .into_client_request()
@@ -2403,11 +2583,11 @@ mod tests {
             .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
         request.headers_mut().insert(
             AUTHORIZATION,
-            HeaderValue::from_static("Bearer application-credential"),
+            HeaderValue::from_static("Bearer app-authorization-token-7"),
         );
         request.headers_mut().insert(
             "x-tarit-share-token",
-            HeaderValue::from_static("share-token"),
+            HeaderValue::from_static("share-token-that-must-be-stripped"),
         );
 
         let (mut client, response) = connect_async(request).await.unwrap();
@@ -3502,14 +3682,25 @@ mod tests {
     }
 
     async fn spawn_websocket_echo_upstream() -> (SocketAddr, oneshot::Receiver<Vec<&'static str>>) {
+        spawn_websocket_echo_upstream_with_expected_authorization(None).await
+    }
+
+    async fn spawn_websocket_echo_upstream_with_expected_authorization(
+        expected_authorization: Option<&'static [u8]>,
+    ) -> (SocketAddr, oneshot::Receiver<Vec<&'static str>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (observed_tx, observed_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_hdr_async(stream, InspectingChatProtocol)
-                .await
-                .unwrap();
+            let mut socket = accept_hdr_async(
+                stream,
+                InspectingChatProtocol {
+                    expected_authorization,
+                },
+            )
+            .await
+            .unwrap();
             let mut observed = Vec::new();
             while let Some(message) = socket.next().await {
                 match message.unwrap() {
