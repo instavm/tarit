@@ -43,6 +43,35 @@ use tarit_fleet::PostgresFleet;
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct ShutdownCoordinator {
+    tx: watch::Sender<Option<&'static str>>,
+    supervisor: Arc<VmmSupervisor>,
+}
+
+impl ShutdownCoordinator {
+    fn new(tx: watch::Sender<Option<&'static str>>, supervisor: Arc<VmmSupervisor>) -> Self {
+        Self { tx, supervisor }
+    }
+
+    fn close_admission(&self) {
+        self.supervisor.begin_shutdown();
+    }
+
+    fn request(&self, reason: &'static str) {
+        self.close_admission();
+        self.tx.send_if_modified(|current| {
+            if current.is_none() {
+                *current = Some(reason);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 type FleetStartup = (
     Option<Arc<PostgresFleet>>,
     Option<JoinHandle<()>>,
@@ -158,6 +187,7 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
     }
     let (store_tx, mut store_rx) = tokio::sync::mpsc::unbounded_channel::<api::StoreWrite>();
     let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
+    let shutdown = ShutdownCoordinator::new(shutdown_tx.clone(), Arc::clone(&supervisor));
 
     // Connect the global fleet registry (Postgres) if configured. In cluster
     // mode this drives cross-node placement, VM->owner routing, and membership;
@@ -175,7 +205,12 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
             Arc::clone(&scheduler),
             shutdown_rx.clone(),
         );
-        let autoscaler = autoscale::spawn(Arc::clone(&fleet), config.clone(), shutdown_rx.clone());
+        let autoscaler = autoscale::spawn(
+            Arc::clone(&fleet),
+            config.clone(),
+            supervisor.admission_gate(),
+            shutdown_rx.clone(),
+        );
         tracing::info!("fleet: connected to global control-plane store");
         (Some(fleet), Some(fleet_sync), autoscaler)
     } else {
@@ -259,18 +294,18 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
     let outbox_flusher =
         usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
 
-    let shutdown_signal_task = spawn_shutdown_signal(shutdown_tx.clone(), shutdown_rx.clone());
+    let shutdown_signal_task = spawn_shutdown_signal(shutdown.clone(), shutdown_rx.clone());
     let worker_tasks = BackgroundTasks::new(
-        shutdown_tx.clone(),
+        shutdown.clone(),
         [
             Some(store_writer),
             fleet_sync,
-            autoscaler,
-            warm_pool,
             Some(usage_meter),
             outbox_flusher,
             Some(shutdown_signal_task),
         ],
+        warm_pool,
+        autoscaler,
     );
 
     let (app, share_app) = server_routers(state.clone());
@@ -286,13 +321,12 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         control_server,
         share_server,
         ssh_server,
-        shutdown_tx,
+        shutdown,
         shutdown_rx,
         HTTP_DRAIN_TIMEOUT,
     )
     .await;
 
-    state.supervisor.begin_shutdown();
     let shutdown_state = state.clone();
     let shutdown_share_runtime = Arc::clone(&share_runtime);
     finalize_lifecycle(
@@ -332,18 +366,24 @@ async fn bind_server_listeners(config: &Config) -> anyhow::Result<ServerListener
 }
 
 struct BackgroundTasks {
-    shutdown_tx: watch::Sender<Option<&'static str>>,
+    shutdown: ShutdownCoordinator,
     handles: Vec<JoinHandle<()>>,
+    warm_pool: Option<warmpool::Replenisher>,
+    autoscaler: Option<JoinHandle<()>>,
 }
 
 impl BackgroundTasks {
     fn new<const N: usize>(
-        shutdown_tx: watch::Sender<Option<&'static str>>,
+        shutdown: ShutdownCoordinator,
         handles: [Option<JoinHandle<()>>; N],
+        warm_pool: Option<warmpool::Replenisher>,
+        autoscaler: Option<JoinHandle<()>>,
     ) -> Self {
         Self {
-            shutdown_tx,
+            shutdown,
             handles: handles.into_iter().flatten().collect(),
+            warm_pool,
+            autoscaler,
         }
     }
 
@@ -352,7 +392,14 @@ impl BackgroundTasks {
     }
 
     async fn stop_with_timeout(self, timeout: Duration) {
-        request_shutdown(&self.shutdown_tx, "shutdown");
+        self.shutdown.request("shutdown");
+        if let Some(autoscaler) = self.autoscaler {
+            await_quiescent_task("autoscaler", autoscaler, timeout).await;
+        }
+        if let Some(warm_pool) = self.warm_pool {
+            warm_pool.quiesce(timeout).await;
+        }
+
         let deadline = tokio::time::Instant::now() + timeout;
         let mut timed_out = Vec::new();
         for mut handle in self.handles {
@@ -372,27 +419,38 @@ impl BackgroundTasks {
     }
 }
 
+async fn await_quiescent_task(
+    name: &'static str,
+    mut task: JoinHandle<()>,
+    warning_after: Duration,
+) {
+    match tokio::time::timeout(warning_after, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(task = name, %error, "background task failed while stopping")
+        }
+        Err(_) => {
+            tracing::warn!(
+                task = name,
+                "background task is still quiescing after shutdown; waiting before sweep"
+            );
+            if let Err(error) = task.await {
+                tracing::warn!(task = name, %error, "background task failed while stopping");
+            }
+        }
+    }
+}
+
 fn spawn_shutdown_signal(
-    shutdown_tx: watch::Sender<Option<&'static str>>,
+    shutdown: ShutdownCoordinator,
     shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         tokio::select! {
-            reason = shutdown_signal() => request_shutdown(&shutdown_tx, reason),
+            reason = shutdown_signal() => shutdown.request(reason),
             _ = wait_for_shutdown(shutdown_rx.clone()) => {}
         }
     })
-}
-
-fn request_shutdown(shutdown_tx: &watch::Sender<Option<&'static str>>, reason: &'static str) {
-    shutdown_tx.send_if_modified(|current| {
-        if current.is_none() {
-            *current = Some(reason);
-            true
-        } else {
-            false
-        }
-    });
 }
 
 type ServerHandle = tokio::task::JoinHandle<anyhow::Result<()>>;
@@ -503,7 +561,7 @@ async fn supervise_servers(
     mut control: ServerHandle,
     mut share: Option<ServerHandle>,
     mut ssh: Option<ServerHandle>,
-    shutdown_tx: watch::Sender<Option<&'static str>>,
+    shutdown: ShutdownCoordinator,
     shutdown_rx: watch::Receiver<Option<&'static str>>,
     drain_timeout: Duration,
 ) -> LifecycleOutcome {
@@ -542,6 +600,10 @@ async fn supervise_servers(
         }
     };
 
+    // Close VM admission at the lifecycle edge, before classifying a failed
+    // task or giving any listener a drain timeout.
+    shutdown.close_admission();
+
     let mut control_exited = false;
     let mut share_exited = false;
     let mut ssh_exited = false;
@@ -556,7 +618,7 @@ async fn supervise_servers(
                 shutdown_rx.borrow().is_some(),
                 &mut first_error,
             );
-            shutdown_after_server_exit(&shutdown_tx, &first_error)
+            shutdown_after_server_exit(&shutdown, &shutdown_rx, &first_error)
         }
         ServerEvent::Share(result) => {
             share_exited = true;
@@ -566,7 +628,7 @@ async fn supervise_servers(
                 shutdown_rx.borrow().is_some(),
                 &mut first_error,
             );
-            shutdown_after_server_exit(&shutdown_tx, &first_error)
+            shutdown_after_server_exit(&shutdown, &shutdown_rx, &first_error)
         }
         ServerEvent::Ssh(result) => {
             ssh_exited = true;
@@ -576,7 +638,7 @@ async fn supervise_servers(
                 shutdown_rx.borrow().is_some(),
                 &mut first_error,
             );
-            shutdown_after_server_exit(&shutdown_tx, &first_error)
+            shutdown_after_server_exit(&shutdown, &shutdown_rx, &first_error)
         }
     };
 
@@ -613,13 +675,14 @@ async fn supervise_servers(
 }
 
 fn shutdown_after_server_exit(
-    shutdown_tx: &watch::Sender<Option<&'static str>>,
+    shutdown: &ShutdownCoordinator,
+    shutdown_rx: &watch::Receiver<Option<&'static str>>,
     first_error: &Option<anyhow::Error>,
 ) -> &'static str {
     if first_error.is_some() {
-        request_shutdown(shutdown_tx, "server error");
+        shutdown.request("server error");
     }
-    shutdown_tx.borrow().as_ref().copied().unwrap_or("shutdown")
+    shutdown_rx.borrow().as_ref().copied().unwrap_or("shutdown")
 }
 
 fn classify_server_exit(
@@ -749,6 +812,10 @@ mod tests {
     use std::path::PathBuf;
     use tokio::net::TcpListener;
     use tower::ServiceExt;
+
+    fn test_shutdown(tx: watch::Sender<Option<&'static str>>) -> ShutdownCoordinator {
+        ShutdownCoordinator::new(tx, Arc::new(VmmSupervisor::new(test_config())))
+    }
 
     #[tokio::test]
     async fn share_bind_failure_releases_the_unserved_control_listener() {
@@ -890,6 +957,69 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn normal_shutdown_closes_vm_admission_before_draining_servers() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
+        let supervisor = Arc::new(VmmSupervisor::new(test_config()));
+        let shutdown = ShutdownCoordinator::new(shutdown_tx.clone(), Arc::clone(&supervisor));
+        let drain_supervisor = Arc::clone(&supervisor);
+        let control_rx = shutdown_rx.clone();
+        let control = tokio::spawn(async move {
+            wait_for_shutdown(control_rx).await;
+            assert!(
+                drain_supervisor.admission_is_closed(),
+                "normal shutdown must close admission before server drain"
+            );
+            Ok(())
+        });
+        let share = tokio::spawn(async move {
+            wait_for_shutdown(shutdown_rx).await;
+            Ok(())
+        });
+
+        shutdown_tx.send(Some("test")).unwrap();
+        let outcome = supervise_servers(
+            control,
+            Some(share),
+            None,
+            shutdown,
+            shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn fatal_server_exit_closes_vm_admission_before_sibling_drain() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
+        let supervisor = Arc::new(VmmSupervisor::new(test_config()));
+        let shutdown = ShutdownCoordinator::new(shutdown_tx.clone(), Arc::clone(&supervisor));
+        let drain_supervisor = Arc::clone(&supervisor);
+        let control = tokio::spawn(async { Err(anyhow::anyhow!("control failed")) });
+        let share = tokio::spawn(async move {
+            wait_for_shutdown(shutdown_rx).await;
+            assert!(
+                drain_supervisor.admission_is_closed(),
+                "fatal server exit must close admission before sibling drain"
+            );
+            Ok(())
+        });
+
+        let outcome = supervise_servers(
+            control,
+            Some(share),
+            None,
+            shutdown,
+            shutdown_tx.subscribe(),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(outcome.error.is_some());
+    }
+
     async fn finish_for_test(outcome: LifecycleOutcome, events: Events) -> anyhow::Result<()> {
         let stopped = Arc::clone(&events);
         let swept = Arc::clone(&events);
@@ -922,7 +1052,7 @@ mod tests {
             control,
             Some(share),
             None,
-            shutdown_tx,
+            test_shutdown(shutdown_tx),
             shutdown_rx,
             Duration::from_secs(1),
         )
@@ -958,7 +1088,7 @@ mod tests {
             control,
             Some(share),
             None,
-            shutdown_tx,
+            test_shutdown(shutdown_tx),
             shutdown_rx,
             Duration::from_secs(1),
         )
@@ -991,7 +1121,7 @@ mod tests {
             control,
             Some(share),
             None,
-            shutdown_tx,
+            test_shutdown(shutdown_tx),
             shutdown_rx,
             Duration::from_secs(1),
         )
@@ -1015,7 +1145,7 @@ mod tests {
             control,
             Some(share),
             None,
-            shutdown_tx,
+            test_shutdown(shutdown_tx),
             shutdown_rx,
             Duration::from_secs(1),
         )
@@ -1044,7 +1174,7 @@ mod tests {
             control,
             Some(share),
             None,
-            shutdown_tx,
+            test_shutdown(shutdown_tx),
             shutdown_rx,
             Duration::from_secs(1),
         )
@@ -1109,11 +1239,84 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        BackgroundTasks::new(shutdown_tx, [Some(task)])
+        BackgroundTasks::new(test_shutdown(shutdown_tx), [Some(task)], None, None)
             .stop_with_timeout(Duration::from_millis(5))
             .await;
 
         dropped_rx.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn held_warm_blocking_work_quiesces_before_sweep_without_creating_a_vm() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let created = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_created = Arc::clone(&created);
+        let warm_worker = tokio::spawn(async move {
+            let mut child = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                if !worker_cancelled.load(Ordering::Acquire) {
+                    worker_created.store(true, Ordering::Release);
+                }
+            });
+            tokio::select! {
+                _ = wait_for_shutdown(shutdown_rx) => {
+                    cancelled.store(true, Ordering::Release);
+                    child.await.unwrap();
+                }
+                _ = &mut child => {}
+            }
+        });
+        started_rx.await.unwrap();
+
+        let workers = BackgroundTasks::new(
+            test_shutdown(shutdown_tx),
+            [],
+            Some(warmpool::Replenisher::for_test(warm_worker)),
+            None,
+        );
+        let swept = Arc::new(AtomicBool::new(false));
+        let sweep_marker = Arc::clone(&swept);
+        let mut lifecycle = tokio::spawn(async move {
+            finalize_lifecycle(
+                LifecycleOutcome::normal("test"),
+                || async {},
+                move || async move {
+                    workers.stop_with_timeout(Duration::from_millis(5)).await;
+                },
+                move |_| async move {
+                    sweep_marker.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut lifecycle)
+                .await
+                .is_err(),
+            "sweep must wait for the held spawn_blocking child"
+        );
+        assert!(!swept.load(Ordering::Acquire));
+        assert!(!created.load(Ordering::Acquire));
+
+        release_tx.send(()).unwrap();
+        lifecycle.await.unwrap().unwrap();
+        assert!(swept.load(Ordering::Acquire));
+        assert!(
+            !created.load(Ordering::Acquire),
+            "the cancellation signal must make a late warm create harmless"
+        );
     }
 
     fn test_config() -> Config {

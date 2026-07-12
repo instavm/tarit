@@ -203,6 +203,50 @@ enum SpawnPurpose {
     Refill,
 }
 
+#[derive(Default)]
+pub(crate) struct VmAdmissionGate {
+    closed: AtomicBool,
+    operation: Mutex<()>,
+}
+
+impl VmAdmissionGate {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
+    pub(crate) fn enter(&self) -> Result<std::sync::MutexGuard<'_, ()>, OrchError> {
+        let operation = self
+            .operation
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor admission lock poisoned".into()))?;
+        if self.is_closed() {
+            return Err(shutdown_error());
+        }
+        Ok(operation)
+    }
+
+    #[cfg(test)]
+    fn admit<T>(&self, operation: impl FnOnce() -> T) -> Result<T, OrchError> {
+        let _operation = self.enter()?;
+        Ok(operation())
+    }
+}
+
+fn shutdown_error() -> OrchError {
+    OrchError::Overloaded {
+        message: "taritd is shutting down".into(),
+        retry_after_secs: 1,
+    }
+}
+
 pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
@@ -213,6 +257,7 @@ pub struct VmmSupervisor {
     warm: Mutex<VecDeque<WarmVm>>,
     net: Option<NetProvisioner>,
     shutting_down: AtomicBool,
+    admission: Arc<VmAdmissionGate>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -260,6 +305,7 @@ impl VmmSupervisor {
             warm: Mutex::new(VecDeque::new()),
             net,
             shutting_down: AtomicBool::new(false),
+            admission: Arc::new(VmAdmissionGate::default()),
         }
     }
 
@@ -295,18 +341,25 @@ impl VmmSupervisor {
     }
 
     fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::SeqCst)
+        self.shutting_down.load(Ordering::Acquire) || self.admission.is_closed()
     }
 
     pub fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+        self.admission.close();
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn admission_gate(&self) -> Arc<VmAdmissionGate> {
+        Arc::clone(&self.admission)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_is_closed(&self) -> bool {
+        self.admission.is_closed()
     }
 
     fn shutdown_error(&self) -> OrchError {
-        OrchError::Overloaded {
-            message: "taritd is shutting down".into(),
-            retry_after_secs: 1,
-        }
+        shutdown_error()
     }
 
     fn ensure_accepting_work(&self) -> Result<(), OrchError> {
@@ -412,23 +465,26 @@ impl VmmSupervisor {
         let _ = std::fs::remove_file(&socket_path);
 
         let cgroup_args = self.cgroup_args(id, Some(vm_config.memory_mib));
-        let child = Command::new(&self.config.vmm_bin)
-            .arg("serve")
-            .arg("--socket")
-            .arg(&socket_path)
-            .args(&cgroup_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| OrchError::Internal(format!("spawn vmm: {e}")))?;
-
-        let process = ManagedProcess::new(child);
-        let pid = process.pid;
-        if purpose == SpawnPurpose::Refill {
-            self.move_pid_to_refill_cgroup(pid);
-        }
-        self.track_booting(id, socket_path.clone(), process.clone())?;
+        let (process, pid) = {
+            let _admission = self.admission.enter()?;
+            let child = Command::new(&self.config.vmm_bin)
+                .arg("serve")
+                .arg("--socket")
+                .arg(&socket_path)
+                .args(&cgroup_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| OrchError::Internal(format!("spawn vmm: {e}")))?;
+            let process = ManagedProcess::new(child);
+            let pid = process.pid;
+            if purpose == SpawnPurpose::Refill {
+                self.move_pid_to_refill_cgroup(pid);
+            }
+            self.track_booting(id, socket_path.clone(), process.clone())?;
+            (process, pid)
+        };
 
         if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
@@ -476,7 +532,13 @@ impl VmmSupervisor {
 
         let vmm_config = build_vmm_config(id, vm_config, net_alloc.as_ref());
         let client = VmmClient::new(&socket_path);
-        if let Err(e) = client.create(vmm_config) {
+        let create_result = match self.admission.enter() {
+            Ok(_admission) => client
+                .create(vmm_config)
+                .map_err(|error| OrchError::Vmm(format!("create vm: {error}"))),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = create_result {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
@@ -484,7 +546,7 @@ impl VmmSupervisor {
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
                 p.teardown(a);
             }
-            return Err(OrchError::Vmm(format!("create vm: {e}")));
+            return Err(error);
         }
         self.untrack_booting(id);
         if self.refill_cancelled(refill_cancelled) {
@@ -592,22 +654,26 @@ impl VmmSupervisor {
         let _ = std::fs::remove_file(&socket_path);
 
         let cgroup_args = self.cgroup_args(id, None);
-        let child = Command::new(&self.config.vmm_bin)
-            .arg("serve")
-            .arg("--socket")
-            .arg(&socket_path)
-            .args(&cgroup_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| OrchError::Internal(format!("spawn vmm: {e}")))?;
-        let process = ManagedProcess::new(child);
-        let pid = process.pid;
-        if purpose == SpawnPurpose::Refill {
-            self.move_pid_to_refill_cgroup(pid);
-        }
-        self.track_booting(id, socket_path.clone(), process.clone())?;
+        let (process, pid) = {
+            let _admission = self.admission.enter()?;
+            let child = Command::new(&self.config.vmm_bin)
+                .arg("serve")
+                .arg("--socket")
+                .arg(&socket_path)
+                .args(&cgroup_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| OrchError::Internal(format!("spawn vmm: {e}")))?;
+            let process = ManagedProcess::new(child);
+            let pid = process.pid;
+            if purpose == SpawnPurpose::Refill {
+                self.move_pid_to_refill_cgroup(pid);
+            }
+            self.track_booting(id, socket_path.clone(), process.clone())?;
+            (process, pid)
+        };
 
         if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
@@ -625,14 +691,20 @@ impl VmmSupervisor {
         }
 
         let client = VmmClient::new(&socket_path);
-        if let Err(e) = client.restore(snapshot_path, overlay.clone()) {
+        let restore_result = match self.admission.enter() {
+            Ok(_admission) => client
+                .restore(snapshot_path, overlay.clone())
+                .map_err(|error| OrchError::Vmm(format!("restore vm: {error}"))),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = restore_result {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
             if let Some(overlay) = overlay {
                 let _ = std::fs::remove_file(overlay);
             }
-            return Err(OrchError::Vmm(format!("restore vm: {e}")));
+            return Err(error);
         }
         self.untrack_booting(id);
         if self.refill_cancelled(refill_cancelled) {
@@ -734,11 +806,17 @@ impl VmmSupervisor {
         }
         let client = VmmClient::new(&vm.socket_path);
         self.ensure_refill_active(cancelled)?;
-        let snapshot_path = match client.snapshot(false) {
+        let snapshot_result = match self.admission.enter() {
+            Ok(_admission) => client
+                .snapshot(false)
+                .map_err(|error| OrchError::Vmm(format!("snapshot golden: {error}"))),
+            Err(error) => Err(error),
+        };
+        let snapshot_path = match snapshot_result {
             Ok(path) => path,
-            Err(e) => {
+            Err(error) => {
                 self.teardown_vm(id, vm);
-                return Err(OrchError::Vmm(format!("snapshot golden: {e}")));
+                return Err(error);
             }
         };
 
@@ -793,9 +871,7 @@ impl VmmSupervisor {
     /// running set under its own id. Returns (id, pid, socket) or None if the
     /// pool has no match (caller then cold-starts).
     pub fn take_warm(&self, want: &VmSpawnConfig) -> Option<(Uuid, u32, PathBuf)> {
-        if self.is_shutting_down() {
-            return None;
-        }
+        let _admission = self.admission.enter().ok()?;
         let mut warm = self.warm.lock().ok()?;
         let pos = warm.iter().position(|w| &w.spec == want)?;
         let taken = warm.remove(pos)?;
@@ -890,6 +966,7 @@ impl VmmSupervisor {
 
     pub fn resume_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let client = self.client_for(id)?;
+        let _admission = self.admission.enter()?;
         client.resume().map_err(|e| OrchError::Vmm(e.to_string()))
     }
 
@@ -1417,6 +1494,41 @@ mod tests {
         );
         drop(supervisor);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn admission_gate_rejects_refill_after_shutdown_between_planning_and_create() {
+        use std::sync::{Arc, Barrier};
+
+        let gate = Arc::new(VmAdmissionGate::default());
+        let planned = Arc::new(Barrier::new(2));
+        let release_create = Arc::new(Barrier::new(2));
+        let created = Arc::new(AtomicBool::new(false));
+        let worker_gate = Arc::clone(&gate);
+        let worker_planned = Arc::clone(&planned);
+        let worker_release = Arc::clone(&release_create);
+        let worker_created = Arc::clone(&created);
+
+        let refill = std::thread::spawn(move || {
+            worker_planned.wait();
+            worker_release.wait();
+            worker_gate
+                .admit(|| worker_created.store(true, Ordering::Release))
+                .unwrap_err()
+        });
+
+        planned.wait();
+        gate.close();
+        release_create.wait();
+
+        assert!(matches!(
+            refill.join().unwrap(),
+            OrchError::Overloaded { .. }
+        ));
+        assert!(
+            !created.load(Ordering::Acquire),
+            "a refill planned before shutdown must not create a VMM after admission closes"
+        );
     }
 
     #[test]

@@ -37,3 +37,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

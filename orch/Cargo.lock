@@ -3068,6 +3068,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "hmac 0.12.1",
+ "libc",
  "reqwest",
  "russh",
  "serde",

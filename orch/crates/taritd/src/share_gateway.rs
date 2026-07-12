@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use axum::{
-    body::{Body, Bytes},
+    body::{Body, Bytes, HttpBody as _},
     extract::{
         ws::{CloseFrame as AxumCloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, FromRequestParts, State,
@@ -63,10 +63,37 @@ type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
 const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
 
+struct PendingUpgradeState {
+    accepting: bool,
+    count: usize,
+}
+
 pub(crate) struct ShareRuntime {
     shutdown_tx: watch::Sender<Option<&'static str>>,
     shutdown_rx: watch::Receiver<Option<&'static str>>,
+    pending_upgrades: Mutex<PendingUpgradeState>,
+    pending_upgrade_tx: watch::Sender<usize>,
+    pending_upgrade_rx: watch::Receiver<usize>,
     bridges: AsyncMutex<JoinSet<()>>,
+}
+
+pub(crate) struct PendingUpgrade {
+    runtime: Arc<ShareRuntime>,
+}
+
+impl Drop for PendingUpgrade {
+    fn drop(&mut self) {
+        let count = {
+            let mut state = self
+                .runtime
+                .pending_upgrades
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.count = state.count.saturating_sub(1);
+            state.count
+        };
+        self.runtime.pending_upgrade_tx.send_replace(count);
+    }
 }
 
 impl Default for ShareRuntime {
@@ -81,9 +108,16 @@ impl ShareRuntime {
         shutdown_tx: watch::Sender<Option<&'static str>>,
         shutdown_rx: watch::Receiver<Option<&'static str>>,
     ) -> Self {
+        let (pending_upgrade_tx, pending_upgrade_rx) = watch::channel(0);
         Self {
             shutdown_tx,
             shutdown_rx,
+            pending_upgrades: Mutex::new(PendingUpgradeState {
+                accepting: true,
+                count: 0,
+            }),
+            pending_upgrade_tx,
+            pending_upgrade_rx,
             bridges: AsyncMutex::new(JoinSet::new()),
         }
     }
@@ -94,6 +128,21 @@ impl ShareRuntime {
 
     pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<Option<&'static str>> {
         self.shutdown_rx.clone()
+    }
+
+    pub(crate) fn register_upgrade(self: &Arc<Self>) -> Option<PendingUpgrade> {
+        let mut state = self
+            .pending_upgrades
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.is_shutting_down() || !state.accepting {
+            return None;
+        }
+        state.count += 1;
+        self.pending_upgrade_tx.send_replace(state.count);
+        Some(PendingUpgrade {
+            runtime: Arc::clone(self),
+        })
     }
 
     pub(crate) async fn spawn_bridge<T, Build, Bridge>(
@@ -124,6 +173,15 @@ impl ShareRuntime {
             }
         });
 
+        {
+            let mut state = self
+                .pending_upgrades
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.accepting = false;
+        }
+        self.wait_for_pending_upgrades(timeout).await;
+
         let deadline = Instant::now() + timeout;
         let mut bridges = self.bridges.lock().await;
         while !bridges.is_empty() {
@@ -147,6 +205,36 @@ impl ShareRuntime {
                         }
                     }
                     break;
+                }
+            }
+        }
+    }
+
+    async fn wait_for_pending_upgrades(&self, warning_after: Duration) {
+        let mut pending_upgrades = self.pending_upgrade_rx.clone();
+        let mut warned = false;
+        loop {
+            if *pending_upgrades.borrow_and_update() == 0 {
+                return;
+            }
+            if warned {
+                if pending_upgrades.changed().await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            tokio::select! {
+                changed = pending_upgrades.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = time::sleep(warning_after) => {
+                    warned = true;
+                    tracing::warn!(
+                        pending = *pending_upgrades.borrow(),
+                        "share WebSocket upgrade callbacks are still pending during shutdown"
+                    );
                 }
             }
         }
@@ -390,7 +478,7 @@ fn meter_response_body(
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status = parts.status.as_u16();
-    if response_has_no_body(&parts, &request_method) {
+    if response_has_no_body(&parts, &request_method, body.size_hint().exact()) {
         active_request.finish(status);
     }
     let stream = stream::unfold(
@@ -418,6 +506,7 @@ fn meter_response_body(
 fn response_has_no_body(
     parts: &axum::http::response::Parts,
     request_method: &axum::http::Method,
+    body_exact_size: Option<u64>,
 ) -> bool {
     request_method == axum::http::Method::HEAD
         || matches!(
@@ -428,6 +517,7 @@ fn response_has_no_body(
             .headers
             .get(axum::http::header::CONTENT_LENGTH)
             .is_some_and(|value| value.as_bytes() == b"0")
+        || body_exact_size == Some(0)
 }
 
 fn metered_body(body: Body, metrics: Arc<Metrics>) -> Body {
@@ -518,9 +608,20 @@ async fn proxy_remote_websocket(
     if runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
+    let pending_upgrade = runtime
+        .register_upgrade()
+        .ok_or(GatewayError::Unavailable)?;
     Ok(websocket.on_upgrade(move |client| async move {
-        start_tracked_websocket_bridge(client, upstream, None, idle_timeout, metrics, runtime)
-            .await;
+        run_pending_websocket_upgrade(
+            client,
+            upstream,
+            None,
+            idle_timeout,
+            metrics,
+            runtime,
+            pending_upgrade,
+        )
+        .await;
     }))
 }
 
@@ -1034,9 +1135,20 @@ async fn proxy_websocket_to_target(
     if runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
+    let pending_upgrade = runtime
+        .register_upgrade()
+        .ok_or(GatewayError::Unavailable)?;
     Ok(websocket.on_upgrade(move |client| async move {
-        start_tracked_websocket_bridge(client, upstream, lease, idle_timeout, metrics, runtime)
-            .await;
+        run_pending_websocket_upgrade(
+            client,
+            upstream,
+            lease,
+            idle_timeout,
+            metrics,
+            runtime,
+            pending_upgrade,
+        )
+        .await;
     }))
 }
 
@@ -1065,7 +1177,6 @@ async fn start_tracked_websocket_bridge(
     runtime: Arc<ShareRuntime>,
 ) {
     if runtime.is_shutting_down() {
-        close_client_websocket(client, idle_timeout).await;
         return;
     }
     let shutdown_rx = runtime.shutdown_receiver();
@@ -1077,7 +1188,27 @@ async fn start_tracked_websocket_bridge(
         })
         .await
     {
+        if runtime.is_shutting_down() {
+            return;
+        }
         close_client_websocket(client, idle_timeout).await;
+    }
+}
+
+async fn run_pending_websocket_upgrade(
+    client: WebSocket,
+    upstream: UpstreamWebSocket,
+    lease: Option<NetworkLease>,
+    idle_timeout: Duration,
+    metrics: Arc<Metrics>,
+    runtime: Arc<ShareRuntime>,
+    _pending_upgrade: PendingUpgrade,
+) {
+    let mut shutdown_rx = runtime.shutdown_receiver();
+    tokio::select! {
+        biased;
+        _ = wait_for_bridge_shutdown(&mut shutdown_rx) => {}
+        _ = start_tracked_websocket_bridge(client, upstream, lease, idle_timeout, metrics, runtime) => {}
     }
 }
 
@@ -1621,6 +1752,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn share_runtime_waits_for_an_upgrade_registered_before_callback_resolution() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        let runtime = Arc::new(ShareRuntime::new(shutdown_tx, shutdown_rx));
+        let pending_upgrade = runtime
+            .register_upgrade()
+            .expect("runtime must accept the upgrade before shutdown");
+        let runtime_for_stop = Arc::clone(&runtime);
+        let mut stop = tokio::spawn(async move {
+            runtime_for_stop.stop(Duration::from_millis(5)).await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut stop)
+                .await
+                .is_err(),
+            "shutdown must not sweep while the unresolved upgrade callback is pending"
+        );
+
+        drop(pending_upgrade);
+        tokio::time::timeout(Duration::from_secs(1), &mut stop)
+            .await
+            .expect("shutdown must finish after the pending callback resolves")
+            .unwrap();
+        assert!(
+            runtime.register_upgrade().is_none(),
+            "shutdown must reject upgrades registered after it starts"
+        );
+    }
+
+    #[tokio::test]
     async fn share_runtime_aborts_and_awaits_a_stuck_bridge_after_deadline() {
         struct Notifier(Option<oneshot::Sender<()>>);
 
@@ -1670,6 +1831,32 @@ mod tests {
     #[test]
     fn explicit_zero_length_response_completes_metrics_without_polling_the_body() {
         assert_bodyless_response_completion(StatusCode::OK, Method::GET, true);
+    }
+
+    #[test]
+    fn headerless_zero_size_response_completes_metrics_without_polling_the_body() {
+        assert_bodyless_response_completion(StatusCode::OK, Method::GET, false);
+    }
+
+    #[test]
+    fn nonempty_response_dropped_before_eof_remains_cancelled() {
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.track_share_http();
+        active.set_visibility(crate::metrics::ShareMetricVisibility::Public);
+        let response = meter_response_body(
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from("body"))
+                .unwrap(),
+            Arc::clone(&metrics),
+            active,
+            Method::GET,
+        );
+        drop(response);
+
+        assert!(metrics.render_share_metrics().contains(
+            "taritd_share_requests_total{visibility=\"public\",status_class=\"cancelled\"} 1"
+        ));
     }
 
     #[tokio::test]
