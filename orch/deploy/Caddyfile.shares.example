@@ -1,0 +1,24 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# Supply a wildcard certificate for *.${TARIT_SHARE_DOMAIN} using the
+# deployment's certificate-management process. This example intentionally
+# contains no DNS-provider credentials.
+*.{$TARIT_SHARE_DOMAIN} {
+	tls {$TARIT_SHARE_TLS_CERT} {$TARIT_SHARE_TLS_KEY}
+
+	@internal path /internal/v1 /internal/v1/*
+	handle @internal {
+		respond "not found" 404
+	}
+
+	handle {
+		# Caddy proxies WebSocket upgrades automatically.
+		reverse_proxy {$TARIT_SHARE_UPSTREAM} {
+			header_up Host {host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}

@@ -95,6 +95,43 @@ The `TARIT_CONFIG` TOML schema does not define an `[autoscale]` table. Configure
 | `TARIT_SSH_GATEWAY_ADDR` | socket address | `127.0.0.1:2222` | SSH gateway bind address. Invalid socket addresses are rejected. |
 | `TARIT_SSH_GATEWAY_HOST_KEY` | path | `~/.taritd/ssh_host_ed25519` | OpenSSH Ed25519 host key path. `~/` is expanded. |
 
+## Port shares
+
+Port shares are disabled unless `TARIT_SHARE_LISTEN` is set. The share listener
+is distinct from `TARIT_LISTEN`: expose only the share listener through a
+trusted Caddy or Envoy edge. That edge must terminate public TLS, preserve the
+incoming `Host` and scheme, support WebSocket upgrades, and never route
+`/internal/v1/*` from the public edge.
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_SHARE_LISTEN` | socket address | unset (disabled) | Bind address for the guest port-share gateway. It is required to be a valid socket address when set. Enabling it also requires `TARIT_SHARE_DOMAIN` and `TARIT_SHARE_TOKEN_KEY`. |
+| `TARIT_SHARE_DOMAIN` | normalized DNS domain | unset | Base domain for guest hosts, so a share slug is served at `<slug>.<domain>`. Case is normalized to lowercase; a single trailing dot is removed. |
+| `TARIT_SHARE_TOKEN_KEY` | canonical base64url | unset | Secret used to sign and verify private-share tokens. It must decode to exactly 32 bytes. Keep it out of source control and rotate it through the deployment secret mechanism. |
+| `TARIT_SHARE_TOKEN_TTL_SECS` | positive integer seconds | `300` | Lifetime of an issued private-share token. |
+| `TARIT_SHARE_CONNECT_TIMEOUT_MS` | positive integer milliseconds | `10000` | Maximum time to establish an upstream HTTP or WebSocket connection to the guest. |
+| `TARIT_SHARE_IDLE_TIMEOUT_SECS` | positive integer seconds | `300` | Maximum idle period while proxying an HTTP body or WebSocket connection. |
+
+Startup validation:
+
+- `TARIT_SHARE_LISTEN` must parse as a socket address.
+- When `TARIT_SHARE_LISTEN` is configured, `TARIT_SHARE_DOMAIN` must also be
+  configured and normalized. A domain cannot be empty, contain whitespace,
+  resolve syntactically as an IP address, exceed DNS label/domain limits, or
+  contain labels other than lowercase ASCII letters, digits, and internal
+  hyphens.
+- When `TARIT_SHARE_LISTEN` is configured, `TARIT_SHARE_TOKEN_KEY` must be
+  canonical unpadded base64url and decode to exactly 32 bytes.
+- Each timeout and TTL setting must be a positive integer. The token TTL must
+  also fit UTC timestamp arithmetic.
+
+Use a wildcard DNS record and a wildcard certificate for
+`*.${TARIT_SHARE_DOMAIN}`. The checked-in
+[`deploy/Caddyfile.shares.example`](../deploy/Caddyfile.shares.example) accepts
+certificate and key paths through environment variables, so no DNS-provider
+credential is embedded in the example. The share listener is a guest data
+plane; do not send it `/v1/*`, `/internal/v1/*`, or control-plane credentials.
+
 ## Usage stats and audit trail
 
 See [USAGE-AND-AUDIT.md](USAGE-AND-AUDIT.md). Attribution and the query APIs need

@@ -125,6 +125,98 @@ No authentication. Returns Swagger UI HTML that loads `/openapi.yaml`.
 
 Response `200`: `text/html`.
 
+### Port shares
+
+Port-share control routes use `X-API-Key` and are separate from the guest
+gateway. The gateway listens only when share configuration is enabled and
+accepts requests for `<slug>.<TARIT_SHARE_DOMAIN>`; it is not an API-key route.
+See [CONFIGURATION.md](CONFIGURATION.md) and
+`deploy/Caddyfile.shares.example`.
+
+`ShareRecord`:
+
+```json
+{
+  "id": "uuid",
+  "slug": "lowercase-dns-label",
+  "owner_key": "tenant-a",
+  "vm_id": "uuid",
+  "guest_port": 8080,
+  "visibility": "private",
+  "token_version": 0,
+  "revoked_at": null,
+  "created_at": "2026-07-12T00:00:00Z",
+  "updated_at": "2026-07-12T00:00:00Z"
+}
+```
+
+Visibility is `private` or `public`; omitted create visibility defaults to
+`private`. `guest_port` must be in `1..=65535`. Create and update bodies reject
+unknown fields.
+
+| Method | Path | Success | Behavior |
+| --- | --- | --- | --- |
+| `POST` | `/v1/shares` | `201 ShareRecord` | Create a share for a running VM the caller can access. |
+| `GET` | `/v1/shares` | `200 ShareRecord[]` | List shares owned by the caller's tenant. |
+| `GET` | `/v1/shares/{id}` | `200 ShareRecord` | Get a share if the caller owns it or is an admin. |
+| `PATCH` | `/v1/shares/{id}` | `200 ShareRecord` | Update the VM, guest port, and/or visibility. |
+| `DELETE` | `/v1/shares/{id}` | `204` | Revoke a share. |
+| `POST` | `/v1/shares/{id}/tokens` | `200 ShareTokenResponse` | Issue a private-share gateway token. |
+
+Create request:
+
+```json
+{
+  "vm_id": "uuid",
+  "guest_port": 8080,
+  "visibility": "private"
+}
+```
+
+Update request fields are all optional:
+
+```json
+{
+  "guest_port": 3000,
+  "visibility": "public"
+}
+```
+
+The replacement `vm_id`, when supplied, must identify a running VM accessible
+to the caller and owned by the same tenant as the share. A revoked share cannot
+be updated. Changing `vm_id`, `guest_port`, or `visibility` increments
+`token_version` and invalidates all previously issued private-share tokens.
+Revocation also increments `token_version`, sets `revoked_at`, removes the
+share from the gateway, and is idempotent for an authorized caller.
+
+Only active private shares can issue tokens:
+
+```json
+{
+  "token": "base64url-payload.base64url-signature",
+  "expires_at": "2026-07-12T00:05:00Z"
+}
+```
+
+Use the token only in the guest request header:
+
+```text
+X-Tarit-Share-Token: <token>
+```
+
+The gateway rejects absent, malformed, duplicate, expired, revoked, or
+token-version-mismatched private tokens with `401`. Tokens expire at
+`expires_at`, which is issuance time plus `TARIT_SHARE_TOKEN_TTL_SECS`. Public
+shares do not need a token; share tokens are not accepted in query parameters.
+
+Share control error bodies are JSON: `{ "error": "..." }`. Across the six
+control operations, `400` means an invalid identifier or request body, `401`
+means a missing or invalid API key, `403` means another tenant's share or VM,
+`404` means an unknown share or VM, `409` means a revoked share, non-running VM,
+or mutation conflict, and `503` means the share owner, share service, or audit
+service is unavailable. `GET /v1/shares` can return `200`, `401`, or `503`;
+other statuses apply only where their operation can produce that condition.
+
 ### `POST /v1/vms`
 
 Create a VM owned by the caller's tenant. The receiving node tries local warm or cold capacity first, then all healthy peers with capacity. If the tenant is at its configured VM quota, the response is `403 Forbidden`. If the whole visible cluster remains full for the admission window, it returns `429 Too Many Requests` with `Retry-After: <seconds>`.
