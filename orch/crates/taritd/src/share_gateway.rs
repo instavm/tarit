@@ -23,6 +23,7 @@ use futures_util::{
 };
 use std::{
     collections::{HashSet, VecDeque},
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
     str::FromStr,
@@ -35,7 +36,8 @@ use std::{
 use tarit_types::{ErrorBody, OrchError, ShareRecord};
 use tokio::{
     net::TcpStream,
-    sync::watch,
+    sync::{watch, Mutex as AsyncMutex},
+    task::JoinSet,
     time::{self, Instant},
 };
 use tokio_tungstenite::{
@@ -60,6 +62,96 @@ use crate::{
 type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
 const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
+
+pub(crate) struct ShareRuntime {
+    shutdown_tx: watch::Sender<Option<&'static str>>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+    bridges: AsyncMutex<JoinSet<()>>,
+}
+
+impl Default for ShareRuntime {
+    fn default() -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        Self::new(shutdown_tx, shutdown_rx)
+    }
+}
+
+impl ShareRuntime {
+    pub(crate) fn new(
+        shutdown_tx: watch::Sender<Option<&'static str>>,
+        shutdown_rx: watch::Receiver<Option<&'static str>>,
+    ) -> Self {
+        Self {
+            shutdown_tx,
+            shutdown_rx,
+            bridges: AsyncMutex::new(JoinSet::new()),
+        }
+    }
+
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutdown_rx.borrow().is_some()
+    }
+
+    pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<Option<&'static str>> {
+        self.shutdown_rx.clone()
+    }
+
+    pub(crate) async fn spawn_bridge<T, Build, Bridge>(
+        &self,
+        resource: T,
+        build: Build,
+    ) -> Result<(), T>
+    where
+        T: Send + 'static,
+        Build: FnOnce(T) -> Bridge,
+        Bridge: Future<Output = ()> + Send + 'static,
+    {
+        let mut bridges = self.bridges.lock().await;
+        if self.is_shutting_down() {
+            return Err(resource);
+        }
+        bridges.spawn(build(resource));
+        Ok(())
+    }
+
+    pub(crate) async fn stop(&self, timeout: Duration) {
+        self.shutdown_tx.send_if_modified(|reason| {
+            if reason.is_none() {
+                *reason = Some("shutdown");
+                true
+            } else {
+                false
+            }
+        });
+
+        let deadline = Instant::now() + timeout;
+        let mut bridges = self.bridges.lock().await;
+        while !bridges.is_empty() {
+            match time::timeout_at(deadline, bridges.join_next()).await {
+                Ok(Some(Ok(()))) => {}
+                Ok(Some(Err(error))) if error.is_cancelled() => {}
+                Ok(Some(Err(error))) => {
+                    tracing::warn!(%error, "share WebSocket bridge task failed");
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "share WebSocket bridge drain timed out; aborting remaining bridges"
+                    );
+                    bridges.abort_all();
+                    while let Some(result) = bridges.join_next().await {
+                        if let Err(error) = result {
+                            if !error.is_cancelled() {
+                                tracing::warn!(%error, "share WebSocket bridge task failed while aborting");
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct PendingPings {
@@ -195,6 +287,7 @@ async fn reject_internal_path() -> Response {
 async fn handle_request(State(state): State<AppState>, request: Request<Body>) -> Response {
     let active_request = state.metrics.track_share_http();
     let metrics = Arc::clone(&state.metrics);
+    let request_method = request.method().clone();
     let request = meter_request_body(request, Arc::clone(&metrics));
     let result = async {
         let domain = state
@@ -224,6 +317,9 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             })?;
 
         if is_websocket_request(&parts) {
+            if state.share_runtime.is_shutting_down() {
+                return Err(GatewayError::Unavailable);
+            }
             let protocols = requested_subprotocols(&parts.headers)?;
             let websocket = WebSocketUpgrade::from_request_parts(&mut parts, &state)
                 .await
@@ -278,7 +374,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             error.into_response()
         }
     };
-    meter_response_body(response, metrics, active_request)
+    meter_response_body(response, metrics, active_request, request_method)
 }
 
 fn meter_request_body(request: Request<Body>, metrics: Arc<Metrics>) -> Request<Body> {
@@ -290,9 +386,13 @@ fn meter_response_body(
     response: Response,
     metrics: Arc<Metrics>,
     active_request: ActiveShareHttp,
+    request_method: axum::http::Method,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status = parts.status.as_u16();
+    if response_has_no_body(&parts, &request_method) {
+        active_request.finish(status);
+    }
     let stream = stream::unfold(
         (Box::pin(body.into_data_stream()), active_request),
         move |(mut body, active_request)| {
@@ -313,6 +413,21 @@ fn meter_response_body(
         },
     );
     Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn response_has_no_body(
+    parts: &axum::http::response::Parts,
+    request_method: &axum::http::Method,
+) -> bool {
+    request_method == axum::http::Method::HEAD
+        || matches!(
+            parts.status,
+            StatusCode::SWITCHING_PROTOCOLS | StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        )
+        || parts
+            .headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .is_some_and(|value| value.as_bytes() == b"0")
 }
 
 fn metered_body(body: Body, metrics: Arc<Metrics>) -> Body {
@@ -399,9 +514,13 @@ async fn proxy_remote_websocket(
     };
     let idle_timeout = idle_timeout(state);
     let metrics = Arc::clone(&state.metrics);
+    let runtime = Arc::clone(&state.share_runtime);
+    if runtime.is_shutting_down() {
+        return Err(GatewayError::Unavailable);
+    }
     Ok(websocket.on_upgrade(move |client| async move {
-        let _active_websocket = metrics.track_share_websocket();
-        bridge_websocket(client, upstream, idle_timeout, metrics).await;
+        start_tracked_websocket_bridge(client, upstream, None, idle_timeout, metrics, runtime)
+            .await;
     }))
 }
 
@@ -818,6 +937,9 @@ async fn proxy_local_websocket(
     connect_timeout: Duration,
     idle_timeout: Duration,
 ) -> Result<Response, GatewayError> {
+    if state.share_runtime.is_shutting_down() {
+        return Err(GatewayError::Unavailable);
+    }
     let (target, lease) = local_target(state, share).map_err(|error| {
         state.metrics.inc_share_target_failures();
         error
@@ -836,6 +958,7 @@ async fn proxy_local_websocket(
         idle_timeout,
         Some(lease),
         Arc::clone(&state.metrics),
+        Arc::clone(&state.share_runtime),
     )
     .await;
     if result.is_err() {
@@ -855,6 +978,7 @@ async fn proxy_websocket_to_target(
     idle_timeout: Duration,
     lease: Option<NetworkLease>,
     metrics: Arc<crate::metrics::Metrics>,
+    runtime: Arc<ShareRuntime>,
 ) -> Result<Response, GatewayError> {
     let request_uri = path_and_query
         .parse::<Uri>()
@@ -907,10 +1031,12 @@ async fn proxy_websocket_to_target(
     } else {
         websocket
     };
+    if runtime.is_shutting_down() {
+        return Err(GatewayError::Unavailable);
+    }
     Ok(websocket.on_upgrade(move |client| async move {
-        let _lease = lease;
-        let _active_websocket = metrics.track_share_websocket();
-        bridge_websocket(client, upstream, idle_timeout, metrics).await;
+        start_tracked_websocket_bridge(client, upstream, lease, idle_timeout, metrics, runtime)
+            .await;
     }))
 }
 
@@ -930,11 +1056,41 @@ fn negotiated_protocol(
     Ok(Some(protocol.into()))
 }
 
+async fn start_tracked_websocket_bridge(
+    client: WebSocket,
+    upstream: UpstreamWebSocket,
+    lease: Option<NetworkLease>,
+    idle_timeout: Duration,
+    metrics: Arc<Metrics>,
+    runtime: Arc<ShareRuntime>,
+) {
+    if runtime.is_shutting_down() {
+        close_client_websocket(client, idle_timeout).await;
+        return;
+    }
+    let shutdown_rx = runtime.shutdown_receiver();
+    if let Err(client) = runtime
+        .spawn_bridge(client, move |client| async move {
+            let _lease = lease;
+            let _active_websocket = metrics.track_share_websocket();
+            bridge_websocket(client, upstream, idle_timeout, metrics, shutdown_rx).await;
+        })
+        .await
+    {
+        close_client_websocket(client, idle_timeout).await;
+    }
+}
+
+async fn close_client_websocket(mut client: WebSocket, idle_timeout: Duration) {
+    let _ = time::timeout(idle_timeout, client.send(AxumMessage::Close(None))).await;
+}
+
 async fn bridge_websocket(
     client: WebSocket,
     upstream: UpstreamWebSocket,
     idle_timeout: Duration,
     metrics: Arc<Metrics>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) {
     let (client_tx, client_rx) = client.split();
     let (upstream_tx, upstream_rx) = upstream.split();
@@ -943,7 +1099,7 @@ async fn bridge_websocket(
     let client_closed = Arc::new(AtomicBool::new(false));
     let upstream_closed = Arc::new(AtomicBool::new(false));
     let client_pings = Arc::new(Mutex::new(PendingPings::default()));
-    let mut client_to_upstream = tokio::spawn(forward_client_to_upstream(
+    let mut client_to_upstream = Box::pin(forward_client_to_upstream(
         client_rx,
         upstream_tx,
         activity_tx.clone(),
@@ -954,8 +1110,9 @@ async fn bridge_websocket(
         client_close_tx.clone(),
         Arc::clone(&client_pings),
         Arc::clone(&metrics),
+        shutdown_rx.clone(),
     ));
-    let mut upstream_to_client = tokio::spawn(forward_upstream_to_client(
+    let mut upstream_to_client = Box::pin(forward_upstream_to_client(
         upstream_rx,
         client_tx,
         activity_tx,
@@ -966,16 +1123,15 @@ async fn bridge_websocket(
         client_close_rx,
         client_pings,
         metrics,
+        shutdown_rx,
     ));
 
     tokio::select! {
         _ = &mut client_to_upstream => {
             let _ = time::timeout(idle_timeout, &mut upstream_to_client).await;
-            upstream_to_client.abort();
         }
         _ = &mut upstream_to_client => {
             let _ = time::timeout(idle_timeout, &mut client_to_upstream).await;
-            client_to_upstream.abort();
         }
     }
 }
@@ -991,10 +1147,15 @@ async fn forward_client_to_upstream(
     client_close_tx: watch::Sender<bool>,
     client_pings: Arc<Mutex<PendingPings>>,
     metrics: Arc<Metrics>,
+    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) {
     loop {
         let deadline = *activity_rx.borrow() + idle_timeout;
         tokio::select! {
+            _ = wait_for_bridge_shutdown(&mut shutdown_rx) => {
+                let _ = time::timeout(idle_timeout, sink.send(TungsteniteMessage::Close(None))).await;
+                return;
+            }
             _ = time::sleep_until(deadline) => {
                 let _ = sink.send(TungsteniteMessage::Close(None)).await;
                 return;
@@ -1049,10 +1210,15 @@ async fn forward_upstream_to_client(
     mut client_close_rx: watch::Receiver<bool>,
     client_pings: Arc<Mutex<PendingPings>>,
     metrics: Arc<Metrics>,
+    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) {
     loop {
         let deadline = *activity_rx.borrow() + idle_timeout;
         tokio::select! {
+            _ = wait_for_bridge_shutdown(&mut shutdown_rx) => {
+                let _ = time::timeout(idle_timeout, sink.send(AxumMessage::Close(None))).await;
+                return;
+            }
             _ = time::sleep_until(deadline) => {
                 let _ = sink.send(AxumMessage::Close(None)).await;
                 return;
@@ -1103,6 +1269,19 @@ async fn forward_upstream_to_client(
                     return;
                 }
             }
+        }
+    }
+}
+
+async fn wait_for_bridge_shutdown(
+    shutdown_rx: &mut watch::Receiver<Option<&'static str>>,
+) -> &'static str {
+    loop {
+        if let Some(reason) = *shutdown_rx.borrow() {
+            return reason;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            return "shutdown";
         }
     }
 }
@@ -1158,8 +1337,8 @@ fn upstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
 #[cfg(test)]
 mod tests {
     use super::{
-        proxy_http_to_target, proxy_websocket_to_target, router as gateway_router, share_slug,
-        TrustedForwarding, UpstreamTarget,
+        meter_response_body, proxy_http_to_target, proxy_websocket_to_target,
+        router as gateway_router, share_slug, ShareRuntime, TrustedForwarding, UpstreamTarget,
     };
     use axum::{
         body::{Body, Bytes},
@@ -1191,7 +1370,7 @@ mod tests {
     use tarit_types::{ShareRecord, ShareVisibility};
     use tokio::{
         net::TcpListener,
-        sync::{mpsc, oneshot},
+        sync::{mpsc, oneshot, watch},
     };
     use tokio_tungstenite::{
         accept_hdr_async, connect_async,
@@ -1408,6 +1587,89 @@ mod tests {
             "taritd_share_requests_total{visibility=\"public\",status_class=\"cancelled\"} 1"
         ));
         assert!(rendered.contains("taritd_share_active_http 0"));
+    }
+
+    #[tokio::test]
+    async fn share_runtime_rejects_upgrades_and_joins_bridges_after_shutdown() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        let runtime = ShareRuntime::new(shutdown_tx.clone(), shutdown_rx);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (ended_tx, ended_rx) = oneshot::channel();
+        let bridge_shutdown = runtime.shutdown_receiver();
+
+        assert!(runtime
+            .spawn_bridge((), move |_| async move {
+                let _ = started_tx.send(());
+                wait_for_runtime_shutdown(bridge_shutdown).await;
+                let _ = ended_tx.send(());
+            })
+            .await
+            .is_ok());
+        started_rx.await.unwrap();
+
+        shutdown_tx.send(Some("test")).unwrap();
+        runtime.stop(Duration::from_secs(1)).await;
+
+        ended_rx.await.unwrap();
+        assert_eq!(
+            runtime
+                .spawn_bridge("client", |_| async {})
+                .await
+                .unwrap_err(),
+            "client"
+        );
+    }
+
+    #[tokio::test]
+    async fn share_runtime_aborts_and_awaits_a_stuck_bridge_after_deadline() {
+        struct Notifier(Option<oneshot::Sender<()>>);
+
+        impl Drop for Notifier {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        let runtime = ShareRuntime::new(shutdown_tx.clone(), shutdown_rx);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        assert!(runtime
+            .spawn_bridge((), move |_| async move {
+                let _notifier = Notifier(Some(dropped_tx));
+                std::future::pending::<()>().await;
+            })
+            .await
+            .is_ok());
+
+        shutdown_tx.send(Some("test")).unwrap();
+        runtime.stop(Duration::from_millis(5)).await;
+
+        dropped_rx.await.unwrap();
+    }
+
+    #[test]
+    fn head_response_completes_metrics_without_polling_the_body() {
+        assert_bodyless_response_completion(StatusCode::OK, Method::HEAD, false);
+    }
+
+    #[test]
+    fn upgrade_response_completes_metrics_without_polling_the_body() {
+        assert_bodyless_response_completion(StatusCode::SWITCHING_PROTOCOLS, Method::GET, false);
+    }
+
+    #[test]
+    fn no_content_response_completes_metrics_without_polling_the_body() {
+        assert_bodyless_response_completion(StatusCode::NO_CONTENT, Method::GET, false);
+    }
+
+    #[test]
+    fn not_modified_response_completes_metrics_without_polling_the_body() {
+        assert_bodyless_response_completion(StatusCode::NOT_MODIFIED, Method::GET, false);
+    }
+
+    #[test]
+    fn explicit_zero_length_response_completes_metrics_without_polling_the_body() {
+        assert_bodyless_response_completion(StatusCode::OK, Method::GET, true);
     }
 
     #[tokio::test]
@@ -2460,6 +2722,7 @@ mod tests {
             shares,
             fleet: None,
             metrics: Arc::new(Metrics::default()),
+            share_runtime: Arc::new(ShareRuntime::default()),
         }
     }
 
@@ -2705,12 +2968,15 @@ mod tests {
         idle: Duration,
     ) -> (SocketAddr, Arc<Metrics>) {
         let metrics = Arc::new(Metrics::default());
+        let runtime = Arc::new(ShareRuntime::default());
         let app = Router::new().route(
             "/socket",
             get({
                 let metrics = Arc::clone(&metrics);
+                let runtime = Arc::clone(&runtime);
                 move |headers: HeaderMap, ws: WebSocketUpgrade| {
                     let metrics = Arc::clone(&metrics);
+                    let runtime = Arc::clone(&runtime);
                     async move {
                         proxy_websocket_to_target(
                             UpstreamTarget::new(upstream.ip(), upstream.port()),
@@ -2726,6 +2992,7 @@ mod tests {
                             idle,
                             None,
                             metrics,
+                            runtime,
                         )
                         .await
                         .unwrap()
@@ -2734,6 +3001,52 @@ mod tests {
             }),
         );
         (start_axum(app).await, metrics)
+    }
+
+    fn assert_bodyless_response_completion(
+        status: StatusCode,
+        method: Method,
+        explicit_zero_length: bool,
+    ) {
+        let metrics = Arc::new(Metrics::default());
+        let active = metrics.track_share_http();
+        active.set_visibility(crate::metrics::ShareMetricVisibility::Public);
+        let mut response = Response::builder().status(status);
+        if explicit_zero_length {
+            response = response.header("content-length", "0");
+        }
+        let response = meter_response_body(
+            response.body(Body::empty()).unwrap(),
+            metrics.clone(),
+            active,
+            method,
+        );
+        drop(response);
+
+        let rendered = metrics.render_share_metrics();
+        let status_class = match status.as_u16() {
+            100..=199 => "1xx",
+            200..=299 => "2xx",
+            300..=399 => "3xx",
+            400..=499 => "4xx",
+            _ => "5xx",
+        };
+        assert!(rendered.contains(&format!(
+            "taritd_share_requests_total{{visibility=\"public\",status_class=\"{status_class}\"}} 1"
+        )));
+        assert!(!rendered.contains(
+            "taritd_share_requests_total{visibility=\"public\",status_class=\"cancelled\"} 1"
+        ));
+        assert!(rendered.contains("taritd_share_active_http 0"));
+    }
+
+    async fn wait_for_runtime_shutdown(mut shutdown_rx: watch::Receiver<Option<&'static str>>) {
+        loop {
+            if shutdown_rx.borrow().is_some() {
+                return;
+            }
+            shutdown_rx.changed().await.unwrap();
+        }
     }
 
     async fn start_axum(app: Router) -> SocketAddr {

@@ -881,6 +881,7 @@ mod tests {
             shares,
             fleet: None,
             metrics: Arc::new(Metrics::default()),
+            share_runtime: Arc::new(crate::share_gateway::ShareRuntime::default()),
         }
     }
 }

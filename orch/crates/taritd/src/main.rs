@@ -42,6 +42,7 @@ use uuid::Uuid;
 use tarit_fleet::PostgresFleet;
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 type FleetStartup = (
     Option<Arc<PostgresFleet>>,
     Option<JoinHandle<()>>,
@@ -156,6 +157,7 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         }
     }
     let (store_tx, mut store_rx) = tokio::sync::mpsc::unbounded_channel::<api::StoreWrite>();
+    let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
 
     // Connect the global fleet registry (Postgres) if configured. In cluster
     // mode this drives cross-node placement, VM->owner routing, and membership;
@@ -171,14 +173,19 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
             Arc::clone(&store),
             config.clone(),
             Arc::clone(&scheduler),
+            shutdown_rx.clone(),
         );
-        let autoscaler = autoscale::spawn(Arc::clone(&fleet), config.clone());
+        let autoscaler = autoscale::spawn(Arc::clone(&fleet), config.clone(), shutdown_rx.clone());
         tracing::info!("fleet: connected to global control-plane store");
         (Some(fleet), Some(fleet_sync), autoscaler)
     } else {
         (None, None, None)
     };
 
+    let share_runtime = Arc::new(share_gateway::ShareRuntime::new(
+        shutdown_tx.clone(),
+        shutdown_rx.clone(),
+    ));
     let shares = shares::ShareRepository::new(Arc::clone(&store), fleet.clone());
     let state = AppState {
         config: config.clone(),
@@ -194,13 +201,23 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         shares,
         fleet,
         metrics: Arc::new(metrics::Metrics::default()),
+        share_runtime: Arc::clone(&share_runtime),
     };
 
     // Start every background worker only after all listener binds succeeded.
     let store_writer = {
         let store = Arc::clone(&state.store);
+        let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            while let Some(op) = store_rx.recv().await {
+            loop {
+                let op = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                    op = store_rx.recv() => op,
+                };
+                let Some(op) = op else {
+                    break;
+                };
                 if let Ok(s) = store.lock() {
                     match op {
                         api::StoreWrite::Vm(rec) => {
@@ -224,6 +241,7 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         Arc::clone(&supervisor),
         config.clone(),
         Arc::clone(&scheduler),
+        shutdown_rx.clone(),
     );
 
     // Usage metering (VM runtime seconds) plus write-behind flush of usage and
@@ -237,20 +255,23 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
-    let usage_meter = usage::spawn_usage_meter(state.clone(), meter_secs);
-    let outbox_flusher = usage::spawn_outbox_flusher(state.clone(), flush_secs);
+    let usage_meter = usage::spawn_usage_meter(state.clone(), meter_secs, shutdown_rx.clone());
+    let outbox_flusher =
+        usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
-    let shutdown_signal_task = spawn_shutdown_signal(shutdown_tx.clone());
-    let worker_tasks = BackgroundTasks::new([
-        Some(store_writer),
-        fleet_sync,
-        autoscaler,
-        warm_pool,
-        Some(usage_meter),
-        outbox_flusher,
-        Some(shutdown_signal_task),
-    ]);
+    let shutdown_signal_task = spawn_shutdown_signal(shutdown_tx.clone(), shutdown_rx.clone());
+    let worker_tasks = BackgroundTasks::new(
+        shutdown_tx.clone(),
+        [
+            Some(store_writer),
+            fleet_sync,
+            autoscaler,
+            warm_pool,
+            Some(usage_meter),
+            outbox_flusher,
+            Some(shutdown_signal_task),
+        ],
+    );
 
     let (app, share_app) = server_routers(state.clone());
     tracing::info!("control listener listening on http://{}", config.listen);
@@ -271,9 +292,14 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
     )
     .await;
 
+    state.supervisor.begin_shutdown();
     let shutdown_state = state.clone();
+    let shutdown_share_runtime = Arc::clone(&share_runtime);
     finalize_lifecycle(
         outcome,
+        move || async move {
+            shutdown_share_runtime.stop(HTTP_DRAIN_TIMEOUT).await;
+        },
         move || async move {
             worker_tasks.stop().await;
         },
@@ -306,29 +332,55 @@ async fn bind_server_listeners(config: &Config) -> anyhow::Result<ServerListener
 }
 
 struct BackgroundTasks {
+    shutdown_tx: watch::Sender<Option<&'static str>>,
     handles: Vec<JoinHandle<()>>,
 }
 
 impl BackgroundTasks {
-    fn new<const N: usize>(handles: [Option<JoinHandle<()>>; N]) -> Self {
+    fn new<const N: usize>(
+        shutdown_tx: watch::Sender<Option<&'static str>>,
+        handles: [Option<JoinHandle<()>>; N],
+    ) -> Self {
         Self {
+            shutdown_tx,
             handles: handles.into_iter().flatten().collect(),
         }
     }
 
     async fn stop(self) {
-        for handle in &self.handles {
+        self.stop_with_timeout(BACKGROUND_DRAIN_TIMEOUT).await;
+    }
+
+    async fn stop_with_timeout(self, timeout: Duration) {
+        request_shutdown(&self.shutdown_tx, "shutdown");
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut timed_out = Vec::new();
+        for mut handle in self.handles {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                timed_out.push(handle);
+            }
+        }
+        for handle in &timed_out {
             handle.abort();
         }
-        for handle in self.handles {
+        for handle in timed_out {
             let _ = handle.await;
         }
     }
 }
 
-fn spawn_shutdown_signal(shutdown_tx: watch::Sender<Option<&'static str>>) -> JoinHandle<()> {
+fn spawn_shutdown_signal(
+    shutdown_tx: watch::Sender<Option<&'static str>>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        request_shutdown(&shutdown_tx, shutdown_signal().await);
+        tokio::select! {
+            reason = shutdown_signal() => request_shutdown(&shutdown_tx, reason),
+            _ = wait_for_shutdown(shutdown_rx.clone()) => {}
+        }
     })
 }
 
@@ -410,17 +462,28 @@ impl LifecycleOutcome {
     }
 }
 
-async fn finalize_lifecycle<Stop, StopFuture, Sweep, SweepFuture>(
+async fn finalize_lifecycle<
+    StopBridges,
+    StopBridgesFuture,
+    StopWorkers,
+    StopWorkersFuture,
+    Sweep,
+    SweepFuture,
+>(
     outcome: LifecycleOutcome,
-    stop_workers: Stop,
+    stop_bridges: StopBridges,
+    stop_workers: StopWorkers,
     sweep: Sweep,
 ) -> anyhow::Result<()>
 where
-    Stop: FnOnce() -> StopFuture,
-    StopFuture: Future<Output = ()>,
+    StopBridges: FnOnce() -> StopBridgesFuture,
+    StopBridgesFuture: Future<Output = ()>,
+    StopWorkers: FnOnce() -> StopWorkersFuture,
+    StopWorkersFuture: Future<Output = ()>,
     Sweep: FnOnce(&'static str) -> SweepFuture,
     SweepFuture: Future<Output = anyhow::Result<()>>,
 {
+    stop_bridges().await;
     stop_workers().await;
     let sweep_result = sweep(outcome.reason).await;
     match outcome.error {
@@ -832,6 +895,7 @@ mod tests {
         let swept = Arc::clone(&events);
         finalize_lifecycle(
             outcome,
+            || async {},
             move || async move {
                 event(&stopped, "workers");
             },
@@ -1002,6 +1066,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn lifecycle_stops_bridges_before_workers_and_the_single_sweep() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let bridges = Arc::clone(&events);
+        let workers = Arc::clone(&events);
+        let sweep = Arc::clone(&events);
+
+        finalize_lifecycle(
+            LifecycleOutcome::normal("test"),
+            move || async move {
+                event(&bridges, "bridges");
+            },
+            move || async move {
+                event(&workers, "workers");
+            },
+            move |_| async move {
+                event(&sweep, "sweep");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*events.lock().unwrap(), ["bridges", "workers", "sweep"]);
+    }
+
+    #[tokio::test]
+    async fn background_stop_aborts_and_awaits_a_stuck_worker_before_returning() {
+        struct Notifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for Notifier {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+
+        let (shutdown_tx, _shutdown_rx) = watch::channel(None);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _notifier = Notifier(Some(dropped_tx));
+            std::future::pending::<()>().await;
+        });
+
+        BackgroundTasks::new(shutdown_tx, [Some(task)])
+            .stop_with_timeout(Duration::from_millis(5))
+            .await;
+
+        dropped_rx.await.unwrap();
+    }
+
     fn test_config() -> Config {
         Config {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -1069,6 +1183,7 @@ mod tests {
             shares,
             fleet: None,
             metrics: Arc::new(metrics::Metrics::default()),
+            share_runtime: Arc::new(share_gateway::ShareRuntime::default()),
         }
     }
 }
@@ -1078,11 +1193,16 @@ fn spawn_fleet_sync(
     store: Arc<Mutex<Store>>,
     config: Config,
     scheduler: Arc<Scheduler>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
             let cap = scheduler.local_capacity(1, 256);
             let host = tarit_fleet::host_record_from_capacity(
                 &config.host_id,

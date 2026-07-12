@@ -298,6 +298,10 @@ impl VmmSupervisor {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
     fn shutdown_error(&self) -> OrchError {
         OrchError::Overloaded {
             message: "taritd is shutting down".into(),
@@ -311,6 +315,19 @@ impl VmmSupervisor {
         } else {
             Ok(())
         }
+    }
+
+    fn ensure_refill_active(&self, cancelled: &AtomicBool) -> Result<(), OrchError> {
+        if cancelled.load(Ordering::Acquire) {
+            Err(self.shutdown_error())
+        } else {
+            self.ensure_accepting_work()
+        }
+    }
+
+    fn refill_cancelled(&self, cancelled: Option<&AtomicBool>) -> bool {
+        self.is_shutting_down()
+            || cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
     }
 
     fn move_pid_to_refill_cgroup(&self, pid: u32) {
@@ -385,8 +402,12 @@ impl VmmSupervisor {
         id: Uuid,
         vm_config: &VmSpawnConfig,
         purpose: SpawnPurpose,
+        refill_cancelled: Option<&AtomicBool>,
     ) -> Result<RunningVm, OrchError> {
         self.ensure_accepting_work()?;
+        if let Some(cancelled) = refill_cancelled {
+            self.ensure_refill_active(cancelled)?;
+        }
         let socket_path = self.socket_path_for(id);
         let _ = std::fs::remove_file(&socket_path);
 
@@ -409,12 +430,13 @@ impl VmmSupervisor {
         }
         self.track_booting(id, socket_path.clone(), process.clone())?;
 
-        if let Err(e) = wait_for_socket(&socket_path, Duration::from_secs(30)) {
+        if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
             process.kill_wait();
-            return Err(OrchError::Vmm(format!("wait for socket: {e}")));
+            return Err(e);
         }
-        if self.is_shutting_down() {
+
+        if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
@@ -441,7 +463,7 @@ impl VmmSupervisor {
             },
             None => None,
         };
-        if self.is_shutting_down() {
+        if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
@@ -465,7 +487,7 @@ impl VmmSupervisor {
             return Err(OrchError::Vmm(format!("create vm: {e}")));
         }
         self.untrack_booting(id);
-        if self.is_shutting_down() {
+        if self.refill_cancelled(refill_cancelled) {
             let vm = RunningVm {
                 pid,
                 socket_path,
@@ -484,12 +506,32 @@ impl VmmSupervisor {
         })
     }
 
+    fn wait_for_socket(
+        &self,
+        socket_path: &Path,
+        refill_cancelled: Option<&AtomicBool>,
+    ) -> Result<(), OrchError> {
+        let Some(cancelled) = refill_cancelled else {
+            return wait_for_socket(socket_path, Duration::from_secs(30))
+                .map_err(|e| OrchError::Vmm(format!("wait for socket: {e}")));
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            self.ensure_refill_active(cancelled)?;
+            if UnixStream::connect(socket_path).is_ok() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(OrchError::Vmm("wait for socket: timed out".into()))
+    }
+
     pub fn spawn_vm(
         &self,
         id: Uuid,
         vm_config: VmSpawnConfig,
     ) -> Result<(u32, PathBuf), OrchError> {
-        let vm = self.boot_vm(id, &vm_config, SpawnPurpose::Live)?;
+        let vm = self.boot_vm(id, &vm_config, SpawnPurpose::Live, None)?;
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
         if self.is_shutting_down() {
@@ -514,7 +556,7 @@ impl VmmSupervisor {
     /// guest's device/net config, so we do not re-provision host networking
     /// here (restore is used for the fast warm/resume path).
     pub fn restore_vm(&self, id: Uuid, snapshot_path: &str) -> Result<(u32, PathBuf), OrchError> {
-        let vm = self.spawn_and_restore(id, snapshot_path, None, SpawnPurpose::Live)?;
+        let vm = self.spawn_and_restore(id, snapshot_path, None, SpawnPurpose::Live, None)?;
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
         if self.is_shutting_down() {
@@ -540,8 +582,12 @@ impl VmmSupervisor {
         snapshot_path: &str,
         overlay: Option<String>,
         purpose: SpawnPurpose,
+        refill_cancelled: Option<&AtomicBool>,
     ) -> Result<RunningVm, OrchError> {
         self.ensure_accepting_work()?;
+        if let Some(cancelled) = refill_cancelled {
+            self.ensure_refill_active(cancelled)?;
+        }
         let socket_path = self.socket_path_for(id);
         let _ = std::fs::remove_file(&socket_path);
 
@@ -563,12 +609,12 @@ impl VmmSupervisor {
         }
         self.track_booting(id, socket_path.clone(), process.clone())?;
 
-        if let Err(e) = wait_for_socket(&socket_path, Duration::from_secs(30)) {
+        if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
             process.kill_wait();
-            return Err(OrchError::Vmm(format!("wait for socket: {e}")));
+            return Err(e);
         }
-        if self.is_shutting_down() {
+        if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
@@ -589,7 +635,7 @@ impl VmmSupervisor {
             return Err(OrchError::Vmm(format!("restore vm: {e}")));
         }
         self.untrack_booting(id);
-        if self.is_shutting_down() {
+        if self.refill_cancelled(refill_cancelled) {
             let vm = RunningVm {
                 pid,
                 socket_path: socket_path.clone(),
@@ -616,27 +662,37 @@ impl VmmSupervisor {
     /// burst blocks the caller for seconds on its first agent dial (the burst
     /// p95 tail). Bounded; parks anyway on timeout so a wedged guest can't stall
     /// replenishment forever.
-    fn await_ready(&self, socket: &Path) {
+    fn await_ready(&self, socket: &Path, cancelled: &AtomicBool) -> Result<(), OrchError> {
         let client = VmmClient::new(socket);
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
+            self.ensure_refill_active(cancelled)?;
             if client
                 .exec("true", 1000)
                 .map(|(code, _, _, _)| code == 0)
                 .unwrap_or(false)
             {
-                return;
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        self.ensure_refill_active(cancelled)
     }
 
-    pub fn spawn_warm(&self, class: &WarmClass) -> Result<(), OrchError> {
+    pub fn spawn_warm_cancellable(
+        &self,
+        class: &WarmClass,
+        cancelled: &AtomicBool,
+    ) -> Result<(), OrchError> {
+        self.ensure_refill_active(cancelled)?;
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
-        let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
-        self.await_ready(&vm.socket_path);
-        if self.is_shutting_down() {
+        let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill, Some(cancelled))?;
+        if let Err(error) = self.await_ready(&vm.socket_path, cancelled) {
+            self.teardown_vm(id, vm);
+            return Err(error);
+        }
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
         }
@@ -647,7 +703,7 @@ impl VmmSupervisor {
                 return Err(OrchError::Internal("warm lock poisoned".into()));
             }
         };
-        if self.is_shutting_down() {
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             drop(warm);
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
@@ -659,16 +715,25 @@ impl VmmSupervisor {
     /// Cold-boot one VM for `class`, wait until it is ready, take a full golden
     /// snapshot, then tear down the builder VM. Runtime warm capacity is filled
     /// by restoring clones from the returned snapshot.
-    pub fn create_golden(&self, class: &WarmClass) -> Result<String, OrchError> {
+    pub fn create_golden_cancellable(
+        &self,
+        class: &WarmClass,
+        cancelled: &AtomicBool,
+    ) -> Result<String, OrchError> {
+        self.ensure_refill_active(cancelled)?;
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
-        let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
-        self.await_ready(&vm.socket_path);
-        if self.is_shutting_down() {
+        let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill, Some(cancelled))?;
+        if let Err(error) = self.await_ready(&vm.socket_path, cancelled) {
+            self.teardown_vm(id, vm);
+            return Err(error);
+        }
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
         }
         let client = VmmClient::new(&vm.socket_path);
+        self.ensure_refill_active(cancelled)?;
         let snapshot_path = match client.snapshot(false) {
             Ok(path) => path,
             Err(e) => {
@@ -678,21 +743,33 @@ impl VmmSupervisor {
         };
 
         self.teardown_vm(id, vm);
+        self.ensure_refill_active(cancelled)?;
         Ok(snapshot_path)
     }
 
     /// Restore one warm-pool VM from an existing golden snapshot and park it.
-    pub fn spawn_warm_restore(
+    pub fn spawn_warm_restore_cancellable(
         &self,
         class: &WarmClass,
         snapshot_path: &str,
+        cancelled: &AtomicBool,
     ) -> Result<(), OrchError> {
+        self.ensure_refill_active(cancelled)?;
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let overlay = overlay_path_for_config(id, &spec);
-        let vm = self.spawn_and_restore(id, snapshot_path, overlay, SpawnPurpose::Refill)?;
-        self.await_ready(&vm.socket_path);
-        if self.is_shutting_down() {
+        let vm = self.spawn_and_restore(
+            id,
+            snapshot_path,
+            overlay,
+            SpawnPurpose::Refill,
+            Some(cancelled),
+        )?;
+        if let Err(error) = self.await_ready(&vm.socket_path, cancelled) {
+            self.teardown_vm(id, vm);
+            return Err(error);
+        }
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
         }
@@ -703,7 +780,7 @@ impl VmmSupervisor {
                 return Err(OrchError::Internal("warm lock poisoned".into()));
             }
         };
-        if self.is_shutting_down() {
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             drop(warm);
             self.teardown_vm(id, vm);
             return Err(self.shutdown_error());
@@ -1258,6 +1335,7 @@ fn overlay_path_for_config(id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
 
     fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
         VmSpawnConfig {
@@ -1268,6 +1346,77 @@ mod tests {
             cmdline: DEFAULT_CMDLINE.to_string(),
             read_only,
         }
+    }
+
+    #[test]
+    fn shutdown_prevents_warm_refill_before_vmm_spawn() {
+        let root = PathBuf::from(format!(
+            "target/taritd-supervisor-shutdown-{}",
+            Uuid::new_v4()
+        ));
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
+                "test-key".into(),
+                "tenant-a".into(),
+                ApiRole::Admin,
+                0,
+            )])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: root.join("vmm-must-not-run"),
+            kernel: root.join("kernel"),
+            rootfs: root.join("rootfs"),
+            socket_dir: root.join("sockets"),
+            db_path: root.join("fleet.db"),
+            net_state_path: root.join("net-state.json"),
+            images_dir: root.join("images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: None,
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: root.join("ssh_host"),
+            share_listen: None,
+            share_domain: None,
+            share_token_key: None,
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 1_000,
+            share_idle_timeout_secs: 1,
+        };
+        let class = config.warm_pool.classes[0].clone();
+        let supervisor = VmmSupervisor::new(config.clone());
+        supervisor.begin_shutdown();
+
+        let error = supervisor
+            .spawn_warm_cancellable(&class, &AtomicBool::new(false))
+            .unwrap_err();
+
+        assert!(matches!(error, OrchError::Overloaded { .. }));
+        assert!(
+            std::fs::read_dir(&config.socket_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "shutdown must reject refill before it creates a VMM socket"
+        );
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

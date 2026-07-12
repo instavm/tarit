@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 use tarit_fleet::PostgresFleet;
 
@@ -27,7 +28,11 @@ const LEADER_TTL_SECS: i64 = 30;
 const HOST_FRESH: Duration = Duration::from_secs(15);
 const COOLDOWN: Duration = Duration::from_secs(60);
 
-pub fn spawn(fleet: Arc<PostgresFleet>, config: Config) -> Option<tokio::task::JoinHandle<()>> {
+pub fn spawn(
+    fleet: Arc<PostgresFleet>,
+    config: Config,
+    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !config.autoscale.enabled {
         return None;
     }
@@ -40,7 +45,11 @@ pub fn spawn(fleet: Arc<PostgresFleet>, config: Config) -> Option<tokio::task::J
         let mut tick = tokio::time::interval(TICK);
         let mut last_action = Instant::now() - COOLDOWN;
         loop {
-            tick.tick().await;
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => break,
+                _ = tick.tick() => {}
+            }
 
             // Leader election: exactly one node runs the control loop.
             match fleet
@@ -102,6 +111,17 @@ pub fn spawn(fleet: Arc<PostgresFleet>, config: Config) -> Option<tokio::task::J
             }
         }
     }))
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<Option<&'static str>>) {
+    loop {
+        if shutdown_rx.borrow().is_some() {
+            return;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 fn actuate(

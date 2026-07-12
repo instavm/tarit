@@ -11,6 +11,7 @@
 //! not-yet-acked batch is idempotent.
 
 use std::time::Duration;
+use tokio::sync::watch;
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -27,11 +28,19 @@ type AliveVm = (Uuid, Option<String>, Option<String>, DateTime<Utc>);
 
 /// Spawn the VM-runtime meter. Every `interval_secs` it bills each alive local
 /// VM for the wall-clock seconds since its last billed watermark.
-pub fn spawn_usage_meter(state: AppState, interval_secs: u64) -> tokio::task::JoinHandle<()> {
+pub fn spawn_usage_meter(
+    state: AppState,
+    interval_secs: u64,
+    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
-            tick.tick().await;
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => break,
+                _ = tick.tick() => {}
+            }
             meter_runtime_once(&state);
         }
     })
@@ -172,15 +181,31 @@ fn runtime_event(
 pub fn spawn_outbox_flusher(
     state: AppState,
     interval_secs: u64,
+    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let fleet = state.fleet.clone()?;
     Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
         loop {
-            tick.tick().await;
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown_rx) => break,
+                _ = tick.tick() => {}
+            }
             flush_once(&state, &fleet).await;
         }
     }))
+}
+
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<Option<&'static str>>) {
+    loop {
+        if shutdown_rx.borrow().is_some() {
+            return;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn flush_once(state: &AppState, fleet: &PostgresFleet) {

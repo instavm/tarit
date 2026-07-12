@@ -121,6 +121,7 @@ pub struct AppState {
     /// enables cross-node placement, VM->owner routing, and membership.
     pub fleet: Option<Arc<tarit_fleet::PostgresFleet>>,
     pub metrics: Arc<crate::metrics::Metrics>,
+    pub(crate) share_runtime: Arc<crate::share_gateway::ShareRuntime>,
 }
 
 pub struct ApiError(pub OrchError);
@@ -2872,6 +2873,7 @@ mod tests {
                 shares,
                 fleet: None,
                 metrics: Arc::new(Metrics::default()),
+                share_runtime: Arc::new(crate::share_gateway::ShareRuntime::default()),
             },
             store_rx,
         )
