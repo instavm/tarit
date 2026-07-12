@@ -106,6 +106,14 @@ acquire_host_network_lock() {
   fi
 }
 
+release_host_network_lock() {
+  local release_status=0
+
+  flock -u 9 || release_status=1
+  exec 9>&- || release_status=1
+  return "$release_status"
+}
+
 host_network_lock_path() {
   printf '%s\n' '/run/lock/tarit-e2e-shares.lock'
 }
@@ -1462,12 +1470,6 @@ cleanup() {
 
   trap - EXIT INT TERM HUP
   set +e
-  if stop_local_postgres; then
-    postgres_stopped=1
-  else
-    cleanup_failed=1
-    warn "local PostgreSQL stop was not confirmed; preserving run-path metadata and artifacts"
-  fi
   stop_caddy || cleanup_failed=1
   delete_known_vms_best_effort || cleanup_failed=1
   if [[ -n "${NODE_A_PID:-}" ]]; then
@@ -1478,10 +1480,16 @@ cleanup() {
   fi
   stop_tracked_vmm_processes || cleanup_failed=1
   cleanup_database_rows || cleanup_failed=1
-  restore_host_networking || cleanup_failed=1
+  if stop_local_postgres; then
+    postgres_stopped=1
+  else
+    cleanup_failed=1
+    warn "local PostgreSQL stop was not confirmed; preserving run-path metadata and artifacts"
+  fi
   if [[ "$postgres_stopped" == "1" ]]; then
     restore_run_dir_permissions || cleanup_failed=1
   fi
+  restore_host_networking || cleanup_failed=1
   if [[ "$cleanup_failed" -eq 0 ]] && ! safe_remove_run_dir; then
     cleanup_failed=1
   fi
@@ -3736,16 +3744,16 @@ main() {
 
   log "== coordinated shutdown and post-shutdown admission gate =="
   stop_node_a_for_shutdown_gate
-  stop_local_postgres ||
-    fail "isolated PostgreSQL did not complete PID-specific shutdown"
   stop_caddy
   stop_node_b_after_gate
   cleanup_database_rows ||
     fail "external PostgreSQL cleanup did not remove and verify this run's fleet rows"
-  restore_host_networking ||
-    fail "guest-network host state could not be restored safely"
+  stop_local_postgres ||
+    fail "isolated PostgreSQL did not complete PID-specific shutdown"
   restore_run_dir_permissions ||
     fail "per-run artifact directory could not be restored to private permissions"
+  restore_host_networking ||
+    fail "guest-network host state could not be restored safely"
   safe_remove_run_dir ||
     fail "per-run artifacts could not be removed after successful cleanup"
 
