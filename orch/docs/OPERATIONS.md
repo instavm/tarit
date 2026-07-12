@@ -197,29 +197,41 @@ When enabled, `taritd`:
 5. Creates one tap per VM named `insta<N>` where `N` is the slot.
 6. Gives each VM a deterministic private `/30`: host `.1`, guest `.2`.
 7. Persists the slot map and each allocation's egress allowlist/default-deny policy in
-   `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers both on restart.
+   version-2 `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers both on
+   restart. Version-1 state with any live allocation is rejected; only an empty or
+   entirely stale version-1 file is safely migrated.
 8. Adds a per-slot nftables masquerade rule tagged with an `taritd` comment.
 9. Installs per-tap forward guards before bringing the tap up: guest traffic may
    leave only through the detected uplink and cannot target the `172.16.0.0/16`
    VM pool; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
-On startup, `taritd` reconciles the persisted map with live local VM records.
-It validates the required nft base-chain hooks before atomically inserting
-top-of-chain forward and input drop quarantines for every recovered TAP. It
-then takes every recovered TAP down, removes Tarit-owned stale policy for all
-their slots, and programs and verifies every netdev IPv4/ARP, source,
-VM-pool lateral, uplink, host-input, masquerade, and persisted egress policy
-while all TAPs remain contained. Missing legacy egress state fails recovery
-closed instead of restoring default-open forwarding. It completes any
-failure-prone stale/orphan sweep while contained and preserves ingress tables
-whose exact allocation identity cannot be proven. Only after the entire set is
-ready does it raise the links and
-atomically remove every quarantine. A containment or reconciliation failure
-cleans partial policy and keeps every TAP down; if a link cannot be lowered,
-`taritd` attempts to delete it as a last-resort kernel isolation step. Startup
-therefore fails closed rather than exposing a partial recovered set. Stop/delete
-teardown is idempotent and best-effort for tap deletion, nft cleanup, and slot freeing.
+On startup, `taritd` first enumerates strict `insta<N>` names with structured
+`ip -j link` output and lowers them before any uplink or state-file discovery.
+It then reconciles the persisted map with live local VM records, validates the
+required nft base-chain hooks, and atomically inserts top-of-chain forward and
+input drop quarantines for every recovered TAP. It removes Tarit-owned stale
+policy for all their slots and programs and verifies every netdev IPv4/ARP,
+source, VM-pool lateral, uplink, host-input, masquerade, and persisted egress
+policy while all TAPs remain contained.
+
+`taritd_nat` forward and input chains are closed Tarit ownership domains:
+every rule relevant to a recovered TAP must have a recognized Tarit comment and
+the exact managed rule shape. Operator or ambiguous rules are preserved but
+make recovery fail closed; no TAP is activated behind an earlier ambiguous
+accept. The completed allocator state is persisted before quarantines release.
+Live egress updates likewise install a top-of-chain quarantine, replace all
+egress rules in one nft transaction, verify the effective stateful-return,
+allow, and final default-deny ordering, persist, and only then release.
+
+A containment or reconciliation failure cleans partial policy and keeps every
+TAP down or quarantined. If quarantine installation fails, `taritd` also
+best-effort lowers/deletes every strict Tarit TAP and disables IPv4 and IPv6
+forwarding before returning an aggregated fatal error. If link deletion and
+both forwarding disables all fail, no stronger in-process kernel invariant can
+be guaranteed; `taritd` remains unavailable and reports every failed
+containment action rather than claiming containment. Stop/delete teardown is
+idempotent and best-effort for tap deletion, nft cleanup, and slot freeing.
 
 Requirements:
 

@@ -14,7 +14,7 @@ VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
 RUN_ROOT="$TARITD_HOME/egress-recovery-runs"
-LOCK_FILE="$TARITD_HOME/egress-recovery.lock"
+LOCK_FILE=/run/lock/taritd-egress-recovery.lock
 RUN_DIR=
 ROOTFS="$RUN_DIR/rootfs.ext4"
 SERVER_LOG="$RUN_DIR/taritd.log"
@@ -23,6 +23,9 @@ SERVER_START_TICKS=
 VM_A=
 VM_B=
 VM_C=
+TAP_A=
+TAP_B=
+TAP_C=
 IPV6_FORWARDING=
 IPV6_FORWARDING_CHANGED=0
 
@@ -31,7 +34,7 @@ fail() {
   exit 1
 }
 
-for command in curl flock ip nft python3 sysctl timeout; do
+for command in curl flock ip nft ps python3 ss stat sysctl timeout; do
   command -v "$command" >/dev/null || fail "required host command is missing: $command"
 done
 [ -x "$TARIT" ] || fail "taritd binary is not executable: $TARIT"
@@ -50,6 +53,12 @@ PY
 
 umask 077
 mkdir -p "$RUN_ROOT"
+mkdir -p /run/lock
+touch "$LOCK_FILE"
+chown root:root "$LOCK_FILE"
+chmod 0600 "$LOCK_FILE"
+[ "$(stat -c '%u:%a' "$LOCK_FILE")" = "0:600" ] ||
+  fail "global lock is not root-owned mode 0600: $LOCK_FILE"
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail "another egress recovery run already holds $LOCK_FILE"
 RUN_DIR="$RUN_ROOT/run-$(date +%s)-$$-$RANDOM"
@@ -79,13 +88,20 @@ server_pid_is_current() {
     [ "$(awk '{print $22}' "/proc/$SERVER_PID/stat")" = "$SERVER_START_TICKS" ]
 }
 
+server_listener_is_current() {
+  server_pid_is_current &&
+    ss -lntp "sport = :8080" 2>/dev/null |
+      grep -F "127.0.0.1:8080" |
+      grep -F "pid=$SERVER_PID," >/dev/null
+}
+
 start_taritd() {
   "$TARIT" serve >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   SERVER_START_TICKS=$(awk '{print $22}' "/proc/$SERVER_PID/stat") ||
     fail "could not read launched taritd start time"
   for _ in $(seq 1 40); do
-    server_pid_is_current &&
+    server_listener_is_current &&
       curl -fsS "$TARIT_BASE_URL/health" >/dev/null 2>&1 &&
       return
     sleep 1
@@ -107,14 +123,50 @@ stop_taritd() {
 delete_vm() {
   local vm_id=$1
   [ -n "$vm_id" ] || return
-  server_pid_is_current || return
+  server_pid_is_current || return 1
   "$TARIT" vm delete "$vm_id" >/dev/null
+}
+
+cleanup_run_vmm_processes() {
+  [ -n "$RUN_DIR" ] || return
+  ps -eo pid=,args= |
+    awk -v sockets="$RUN_DIR/sockets/" 'index($0, sockets) { print $1 }' |
+    while IFS= read -r pid; do
+      [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
+    done
+}
+
+cleanup_tap_policy() {
+  local tap=$1 slot chain handle
+  [ -n "$tap" ] || return
+  slot=${tap#insta}
+  [ "$slot" != "$tap" ] && [ "$slot" -ge 0 ] 2>/dev/null || return
+  for chain in post vm_egress vm_input; do
+    while IFS= read -r handle; do
+      [ -n "$handle" ] &&
+        nft delete rule ip taritd_nat "$chain" handle "$handle" >/dev/null 2>&1 || true
+    done < <(
+      nft -a list chain ip taritd_nat "$chain" 2>/dev/null |
+        awk -v tap="$tap" '
+          index($0, "comment \"taritd") &&
+          index($0, "tap=" tap "\"") &&
+          match($0, /# handle [0-9]+$/) {
+            print substr($0, RSTART + 9, RLENGTH - 9)
+          }'
+    )
+  done
+  nft delete table netdev "taritd_ingress_$slot" >/dev/null 2>&1 || true
+  ip link del "$tap" >/dev/null 2>&1 || true
 }
 
 cleanup() {
   delete_vm "$VM_C" || true
   delete_vm "$VM_B" || true
   delete_vm "$VM_A" || true
+  cleanup_run_vmm_processes
+  cleanup_tap_policy "$TAP_C"
+  cleanup_tap_policy "$TAP_B"
+  cleanup_tap_policy "$TAP_A"
   stop_taritd
   if [ "$IPV6_FORWARDING_CHANGED" = 1 ]; then
     sysctl -qw "net.ipv6.conf.all.forwarding=$IPV6_FORWARDING" || true
@@ -217,6 +269,36 @@ require_rule() {
     fail "missing rule: $expected"
 }
 
+assert_closed_tarit_chain_for_tap() {
+  local listing=$1 tap=$2 vm_id=$3 line
+  while IFS= read -r line; do
+    case "$line" in
+      *"iifname \"$tap\""*)
+        [[ "$line" == *"comment \"taritd"* &&
+          "$line" == *"slot=${tap#insta} vm=$vm_id tap=$tap\""* ]] ||
+          fail "unmanaged or malformed rule precedes policy for $tap: $line"
+        ;;
+    esac
+  done <<<"$listing"
+}
+
+assert_egress_rule_order() {
+  local listing=$1 tap=$2 guest=$3 vm_id=$4 stateful allow deny
+  stateful=$(grep -nF \
+    "iifname \"$tap\" ip saddr $guest ct state established,related accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
+    <<<"$listing" | head -1 | cut -d: -f1)
+  allow=$(grep -nF \
+    "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
+    <<<"$listing" | head -1 | cut -d: -f1)
+  deny=$(grep -nF \
+    "iifname \"$tap\" ip saddr $guest drop comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
+    <<<"$listing" | tail -1 | cut -d: -f1)
+  [ -n "$stateful" ] && [ -n "$allow" ] && [ -n "$deny" ] ||
+    fail "missing stateful-return, allow, or final default-deny for $tap"
+  [ "$stateful" -lt "$allow" ] && [ "$allow" -lt "$deny" ] ||
+    fail "default-open or misordered egress policy for $tap"
+}
+
 assert_recovered_policy() {
   local vm_id=$1 tap=$2 guest=$3 slot=${2#insta} netdev forward input nat
   local uplink=$4
@@ -226,11 +308,14 @@ assert_recovered_policy() {
   require_rule "$netdev" "policy drop"
   require_rule "$netdev" "ether type arp accept"
   require_rule "$netdev" "ether type ip accept"
-  forward=$(nft list chain ip taritd_nat vm_egress)
+  forward=$(nft -a list chain ip taritd_nat vm_egress)
+  assert_closed_tarit_chain_for_tap "$forward" "$tap" "$vm_id"
   require_rule "$forward" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$forward" "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop"
   require_rule "$forward" "iifname \"$tap\" ip saddr $guest oifname != \"$uplink\" drop"
-  input=$(nft list chain ip taritd_nat vm_input)
+  assert_egress_rule_order "$forward" "$tap" "$guest" "$vm_id"
+  input=$(nft -a list chain ip taritd_nat vm_input)
+  assert_closed_tarit_chain_for_tap "$input" "$tap" "$vm_id"
   require_rule "$input" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$input" "iifname \"$tap\" ct state established,related accept"
   require_rule "$input" "iifname \"$tap\" ip drop"
@@ -395,6 +480,11 @@ VM_C=$(create_vm)
 TAP_C=$(tap_for_vm "$VM_C")
 [ "$TAP_C" = "$TAP_A" ] || fail "slot was not reused: expected $TAP_A, got $TAP_C"
 GUEST_C=$(guest_ip_for_tap "$TAP_C")
+curl -fsS -X PATCH \
+  -H "X-API-Key: $TARIT_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "{\"allowlist\":[\"$EGRESS_TEST_IP/32:$EGRESS_TEST_PORT/tcp\"],\"allow_existing\":true}" \
+  "$TARIT_BASE_URL/v1/egress/vm/$VM_C" >/dev/null
 assert_recovered_policy "$VM_C" "$TAP_C" "$GUEST_C" "$UPLINK"
 ! nft -a list table ip taritd_nat | grep -F "vm=$OLD_VM_A tap=$TAP_C" >/dev/null ||
   fail "slot reuse retained prior-owner policy for $OLD_VM_A"
