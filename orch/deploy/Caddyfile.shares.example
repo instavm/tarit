@@ -21,15 +21,18 @@
 			# Never forward control-plane or proxy credentials to a guest.
 			header_up -X-API-Key
 			header_up -Proxy-Authorization
+			header_up -X-Peer-Secret
 			# Remove any client-supplied forwarding chain, then set one edge value.
 			header_up -Forwarded
 			header_up -X-Forwarded-For
 			header_up -X-Forwarded-Host
 			header_up -X-Forwarded-Proto
+			header_up -X-Real-IP
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Host {host}
 			header_up X-Forwarded-Proto {scheme}
+			header_up Forwarded "for={remote_host};host={host};proto={scheme}"
 		}
 	}
 }

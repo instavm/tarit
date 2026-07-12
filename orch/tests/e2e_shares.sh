@@ -9,6 +9,7 @@
 # Inputs are deliberately environment-configurable. No credential is embedded:
 # per-run API, peer, and share-token keys are generated in memory.
 set -Eeuo pipefail
+umask 077
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ORCH_ROOT="${ORCH_ROOT:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)}"
@@ -28,14 +29,21 @@ Required guest asset:
 Useful overrides:
   TARITD_BIN, TARIT_VMM_BIN (or VMM_BIN), TARIT_KERNEL, TARIT_SHARE_ROOTFS
   TARIT_DATABASE_URL                 Existing PostgreSQL fleet database.
-  TARIT_E2E_POSTGRES_DIR             Ephemeral local PostgreSQL data directory.
-  TARIT_E2E_BASE_PORT                First of four local listener ports.
+  TARIT_E2E_BASE_PORT                First of five local listener ports.
+  TARIT_E2E_EDGE_SLUG                Fixed Caddy test hostname label (default: tarit-e2e-edge).
+  TARIT_CADDY_BIN                    Caddy executable (default: caddy).
   TARIT_E2E_GUEST_PORT               Guest test-server port (default 43127).
   TARIT_E2E_RUN_ROOT                 Per-run artifact root (default: orch/e).
   TARIT_E2E_KEEP_ARTIFACTS=1         Keep the per-run directory after cleanup.
 
 When TARIT_DATABASE_URL is unset, the harness starts an isolated local
-PostgreSQL instance using initdb and pg_ctl. It never uses Docker.
+PostgreSQL instance using initdb and pg_ctl. It never uses Docker. The Linux
+host must provide Caddy, curl, Python 3 (with sqlite3), GNU coreutils
+(sha256sum, timeout, mktemp, stat, cmp, chown, and chgrp), iproute2, nftables, procps, util-linux
+(flock and, for local PostgreSQL, runuser), and PostgreSQL's psql. Local
+PostgreSQL mode additionally needs initdb and pg_ctl. The guest rootfs must
+provide Node.js. Caddy is mandatory: this gate does not fall back to plaintext
+share traffic.
 USAGE
 }
 
@@ -83,20 +91,45 @@ require_command() {
 }
 
 acquire_host_network_lock() {
-  local git_common_dir=""
-  git_common_dir="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)" ||
-    fail "could not locate the repository-wide network lock directory"
-  if [[ "$git_common_dir" != /* ]]; then
-    git_common_dir="$REPO_ROOT/$git_common_dir"
-  fi
-  NETWORK_LOCK_PATH="$git_common_dir/tarit-e2e-shares-network.lock"
+  NETWORK_LOCK_PATH="${TARIT_E2E_NETWORK_LOCK_PATH:-/run/lock/tarit-e2e-shares.lock}"
+  case "$NETWORK_LOCK_PATH" in
+    /run/lock/*)
+      ;;
+    *)
+      fail "TARIT_E2E_NETWORK_LOCK_PATH must be below /run/lock"
+      ;;
+  esac
   exec 9>"$NETWORK_LOCK_PATH"
   flock -n 9 ||
     skip "another Tarit share E2E run owns the host-network lock"
+  private_path "$NETWORK_LOCK_PATH"
 }
 
 canonical_path() {
   readlink -f -- "$1"
+}
+
+private_path() {
+  local path="$1"
+  local mode=""
+
+  [[ -e "$path" && ! -L "$path" ]] ||
+    fail "expected private artifact '$path' is missing or is a symlink"
+  mode="$(stat -c '%a' -- "$path")" ||
+    fail "could not read permissions for '$path'"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] ||
+    fail "unexpected permissions for '$path'"
+  (( (8#$mode & 8#077) == 0 )) ||
+    fail "artifact '$path' is accessible to group or other users"
+}
+
+subprocess_timeout_seconds() {
+  local fallback="$1"
+  local value="${TARIT_E2E_ACTIVE_WAIT_TIMEOUT_SECS:-$fallback}"
+
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] ||
+    fail "subprocess timeout must be a positive integer"
+  printf '%s\n' "$value"
 }
 
 allocate_port() {
@@ -138,16 +171,18 @@ allocate_listener_ports() {
     CONTROL_PORT_B="$((TARIT_E2E_BASE_PORT + 1))"
     SHARE_PORT_A="$((TARIT_E2E_BASE_PORT + 2))"
     SHARE_PORT_B="$((TARIT_E2E_BASE_PORT + 3))"
+    CADDY_PORT="$((TARIT_E2E_BASE_PORT + 4))"
   else
     local listener_ports=()
-    mapfile -t listener_ports < <(allocate_ports 4)
+    mapfile -t listener_ports < <(allocate_ports 5)
     CONTROL_PORT_A="${listener_ports[0]}"
     CONTROL_PORT_B="${listener_ports[1]}"
     SHARE_PORT_A="${listener_ports[2]}"
     SHARE_PORT_B="${listener_ports[3]}"
+    CADDY_PORT="${listener_ports[4]}"
   fi
 
-  python3 - "$CONTROL_PORT_A" "$CONTROL_PORT_B" "$SHARE_PORT_A" "$SHARE_PORT_B" <<'PY'
+  python3 - "$CONTROL_PORT_A" "$CONTROL_PORT_B" "$SHARE_PORT_A" "$SHARE_PORT_B" "$CADDY_PORT" <<'PY'
 import sys
 
 ports = [int(port) for port in sys.argv[1:]]
@@ -191,6 +226,78 @@ pid_matches_binary() {
   [[ "$actual" == "$expected" ]]
 }
 
+process_environment_has() {
+  local pid="$1"
+  local expected="$2"
+  local entry=""
+  local environment="/proc/$pid/environ"
+
+  [[ -r "$environment" ]] || return 1
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == "$expected" ]] && return 0
+  done <"$environment"
+  return 1
+}
+
+pid_belongs_to_this_run() {
+  local pid="$1"
+
+  [[ -n "${RUN_ID:-}" && -n "${RUN_DIR:-}" && -f "${RUN_MARKER:-}" ]] ||
+    return 1
+  process_environment_has "$pid" "TARIT_E2E_SHARES_RUN_ID=$RUN_ID" &&
+    process_environment_has "$pid" "TARIT_E2E_SHARES_RUN_DIR=$RUN_DIR"
+}
+
+pid_matches_owned_binary() {
+  local pid="$1"
+  local expected="$2"
+
+  pid_matches_binary "$pid" "$expected" &&
+    pid_belongs_to_this_run "$pid"
+}
+
+is_tarit_or_vmm_process() {
+  local pid="$1"
+  local actual=""
+  local name=""
+
+  [[ -r "/proc/$pid/exe" ]] || return 1
+  actual="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
+  name="${actual##*/}"
+  [[ "$name" == "taritd" || "$name" == "vmm" ]] ||
+    [[ -n "${TARITD_BIN_REAL:-}" && "$actual" == "$TARITD_BIN_REAL" ]] ||
+    [[ -n "${VMM_BIN_REAL:-}" && "$actual" == "$VMM_BIN_REAL" ]]
+}
+
+unrelated_tarit_or_vmm_processes_present() {
+  local proc=""
+  local pid=""
+  local actual=""
+
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+    is_tarit_or_vmm_process "$pid" || continue
+    pid_belongs_to_this_run "$pid" && continue
+    actual="$(readlink -f -- "/proc/$pid/exe" 2>/dev/null || true)"
+    warn "unrelated Tarit process is present (PID $pid, executable $actual)"
+    return 0
+  done
+  return 1
+}
+
+any_tarit_or_vmm_processes_present() {
+  local proc=""
+  local pid=""
+
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+    is_tarit_or_vmm_process "$pid" && return 0
+  done
+  return 1
+}
+
 pid_is_gone() {
   local pid="$1"
   ! kill -0 "$pid" >/dev/null 2>&1
@@ -200,7 +307,17 @@ wait_until() {
   local description="$1"
   local timeout_seconds="$2"
   shift 2
+  local probe_timeout="${TARIT_E2E_WAIT_CALL_TIMEOUT_SECS:-3}"
   local deadline=$((SECONDS + timeout_seconds))
+  local TARIT_E2E_ACTIVE_WAIT_TIMEOUT_SECS=""
+
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
+    fail "wait timeout for $description must be a positive integer"
+  if ! [[ "$probe_timeout" =~ ^[1-9][0-9]*$ ]] ||
+    ! (( probe_timeout < timeout_seconds )); then
+    fail "per-call wait timeout must be shorter than the $timeout_seconds-second $description deadline"
+  fi
+  TARIT_E2E_ACTIVE_WAIT_TIMEOUT_SECS="$probe_timeout"
 
   while (( SECONDS < deadline )); do
     if "$@"; then
@@ -215,13 +332,20 @@ wait_for_pid_exit() {
   local pid="$1"
   local timeout_seconds="$2"
   local deadline=$((SECONDS + timeout_seconds))
+  local probe_timeout=1
+  local process_state=""
+
+  (( probe_timeout < timeout_seconds )) ||
+    fail "PID wait timeout must exceed its per-call process probe timeout"
 
   while (( SECONDS < deadline )); do
     if pid_is_gone "$pid"; then
       wait "$pid" 2>/dev/null || true
       return 0
     fi
-    if [[ "$(ps -o stat= -p "$pid" 2>/dev/null | tr -d '[:space:]')" == Z* ]]; then
+    process_state="$("$TIMEOUT_BIN" "${probe_timeout}s" ps -o stat= -p "$pid" 2>/dev/null || true)"
+    process_state="${process_state//[[:space:]]/}"
+    if [[ "$process_state" == Z* ]]; then
       wait "$pid" 2>/dev/null || true
       return 0
     fi
@@ -240,14 +364,14 @@ terminate_expected_pid() {
     wait "$pid" 2>/dev/null || true
     return 0
   fi
-  pid_matches_binary "$pid" "$binary" ||
-    fail "refusing to terminate $label PID $pid because it no longer matches $binary"
+  pid_matches_owned_binary "$pid" "$binary" ||
+    fail "refusing to terminate $label PID $pid because it is not this run's expected $binary"
 
   kill -TERM "$pid"
   if ! wait_for_pid_exit "$pid" 30; then
     warn "$label PID $pid did not exit after SIGTERM; sending SIGKILL to that tracked PID"
-    pid_matches_binary "$pid" "$binary" ||
-      fail "refusing to SIGKILL $label PID $pid because it no longer matches $binary"
+    pid_matches_owned_binary "$pid" "$binary" ||
+      fail "refusing to SIGKILL $label PID $pid because it is not this run's expected $binary"
     kill -KILL "$pid"
     wait_for_pid_exit "$pid" 10 ||
       fail "$label PID $pid did not exit after SIGKILL"
@@ -259,10 +383,10 @@ safe_remove_run_dir() {
     log "Keeping artifacts at $RUN_DIR"
     return 0
   }
-  [[ -n "${RUN_DIR:-}" && -f "$RUN_DIR/.tarit-e2e-shares-run" ]] ||
+  [[ -n "${RUN_DIR:-}" && -f "${RUN_MARKER:-}" ]] ||
     return 0
   case "$RUN_DIR" in
-    "$RUN_ROOT"/shares-*)
+    "$RUN_ROOT"/shares.*)
       rm -rf -- "$RUN_DIR"
       ;;
     *)
@@ -279,11 +403,37 @@ run_as_pg_user() {
   fi
 }
 
+grant_postgres_run_access() {
+  [[ "$PG_OS_USER" == "$(id -un)" ]] && return 0
+  RUN_DIR_ORIGINAL_GID="$(stat -c '%g' -- "$RUN_DIR")" ||
+    fail "could not read run-directory owner before PostgreSQL setup"
+  PG_OS_GID="$(id -g "$PG_OS_USER")" ||
+    fail "could not determine PostgreSQL OS group"
+  chgrp "$PG_OS_GID" "$RUN_DIR" ||
+    fail "could not grant the isolated PostgreSQL user traversal to the run directory"
+  chmod 0710 "$RUN_DIR" ||
+    fail "could not set private PostgreSQL traversal permissions"
+  [[ "$(stat -c '%a' -- "$RUN_DIR")" == "710" &&
+    "$(stat -c '%g' -- "$RUN_DIR")" == "$PG_OS_GID" ]] ||
+    fail "run directory did not retain owner-only data permissions for PostgreSQL setup"
+  RUN_DIR_PG_TRAVERSE_GRANTED=1
+}
+
+restore_run_dir_permissions() {
+  [[ "${RUN_DIR_PG_TRAVERSE_GRANTED:-0}" == "1" ]] || return 0
+  chgrp "$RUN_DIR_ORIGINAL_GID" "$RUN_DIR" ||
+    return 1
+  chmod 0700 "$RUN_DIR" ||
+    return 1
+  private_path "$RUN_DIR" || return 1
+  RUN_DIR_PG_TRAVERSE_GRANTED=0
+}
+
 cleanup_database_rows() {
   [[ "$DATABASE_MODE" == "external" ]] || return 0
   [[ -n "${PSQL_BIN:-}" && -n "${DATABASE_URL:-}" ]] || return 0
 
-  "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -q \
+  "$TIMEOUT_BIN" 15s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -q \
     -v ON_ERROR_STOP=0 \
     -v owner_key="$OWNER_KEY" \
     -v host_prefix="$HOST_PREFIX%" <<'SQL' >/dev/null 2>&1 || true
@@ -296,8 +446,10 @@ SQL
 
 stop_local_postgres() {
   [[ "$DATABASE_MODE" == "local" ]] || return 0
-  [[ -n "${PG_PID:-}" && "${PG_PID}" =~ ^[0-9]+$ ]] ||
-    return 1
+  if ! [[ -n "${PG_PID:-}" && "${PG_PID}" =~ ^[0-9]+$ ]]; then
+    DATABASE_MODE="stopped"
+    return 0
+  fi
   if pid_is_gone "$PG_PID"; then
     DATABASE_MODE="stopped"
     return 0
@@ -327,24 +479,90 @@ tarit_network_artifacts_present() {
 }
 
 capture_host_networking() {
+  if nft list table ip taritd_nat >/dev/null 2>&1; then
+    fail "refusing to capture a pre-existing taritd_nat nft table"
+  fi
   ORIGINAL_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" ||
     fail "could not read net.ipv4.ip_forward before guest-network setup"
   [[ "$ORIGINAL_IP_FORWARD" =~ ^[01]$ ]] ||
     fail "unexpected net.ipv4.ip_forward value '$ORIGINAL_IP_FORWARD'"
-  NETWORK_STATE_OWNED=1
+  NETWORK_SNAPSHOT_CAPTURED=1
+  NETWORK_START_ATTEMPTED=0
+  NFT_TABLE_CREATED_BY_RUN=0
+  IP_FORWARD_CHANGED_BY_RUN=0
+}
+
+record_owned_host_networking() {
+  [[ "${NETWORK_SNAPSHOT_CAPTURED:-0}" == "1" ]] ||
+    fail "host-network state was not captured before node startup"
+  nft list table ip taritd_nat >/dev/null 2>&1 ||
+    fail "taritd did not create its expected nft table"
+  local current_ip_forward=""
+  current_ip_forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" ||
+    fail "could not read net.ipv4.ip_forward after guest-network setup"
+  [[ "$current_ip_forward" == "1" ]] ||
+    fail "taritd guest networking did not enable IPv4 forwarding"
+  [[ "$ORIGINAL_IP_FORWARD" == "$current_ip_forward" ]] ||
+    IP_FORWARD_CHANGED_BY_RUN=1
+  NFT_TABLE_BASELINE="$(mktemp "$RUN_DIR/nft-baseline.XXXXXX")" ||
+    fail "could not create a private nft baseline artifact"
+  nft list table ip taritd_nat >"$NFT_TABLE_BASELINE" ||
+    fail "could not capture the owned taritd nft table baseline"
+  private_path "$NFT_TABLE_BASELINE"
+  NFT_TABLE_CREATED_BY_RUN=1
+}
+
+nft_table_matches_owned_baseline() {
+  local current=""
+  current="$(mktemp "$RUN_DIR/nft-current.XXXXXX")" ||
+    return 1
+  if ! nft list table ip taritd_nat >"$current"; then
+    rm -f -- "$current"
+    return 1
+  fi
+  if cmp -s "$NFT_TABLE_BASELINE" "$current"; then
+    rm -f -- "$current"
+    return 0
+  fi
+  rm -f -- "$current"
+  return 1
 }
 
 restore_host_networking() {
-  [[ "${NETWORK_STATE_OWNED:-0}" == "1" ]] || return 0
+  [[ "${NETWORK_SNAPSHOT_CAPTURED:-0}" == "1" ]] || return 0
+  if any_tarit_or_vmm_processes_present; then
+    warn "refusing to alter host networking while a Tarit process still exists"
+    return 1
+  fi
   if tarit_network_artifacts_present; then
     warn "refusing to remove taritd_nat while guest-network interfaces still exist"
     return 1
   fi
-  if nft list table ip taritd_nat >/dev/null 2>&1; then
-    nft delete table ip taritd_nat >/dev/null 2>&1 || return 1
+  if [[ "${NETWORK_START_ATTEMPTED:-0}" == "1" &&
+    "${NFT_TABLE_CREATED_BY_RUN:-0}" != "1" ]]; then
+    if nft list table ip taritd_nat >/dev/null 2>&1 ||
+      [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "$ORIGINAL_IP_FORWARD" ]]; then
+      warn "refusing to alter host networking because startup ownership was not fully recorded"
+      return 1
+    fi
   fi
-  sysctl -qw "net.ipv4.ip_forward=$ORIGINAL_IP_FORWARD" || return 1
-  NETWORK_STATE_OWNED=0
+  if [[ "${NFT_TABLE_CREATED_BY_RUN:-0}" == "1" ]]; then
+    nft list table ip taritd_nat >/dev/null 2>&1 ||
+      return 1
+    if ! nft_table_matches_owned_baseline; then
+      warn "refusing to delete a taritd_nat table that differs from this run's baseline"
+      return 1
+    fi
+    nft delete table ip taritd_nat >/dev/null 2>&1 ||
+      return 1
+  fi
+  if [[ "${IP_FORWARD_CHANGED_BY_RUN:-0}" == "1" ]]; then
+    [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] ||
+      return 1
+    sysctl -qw "net.ipv4.ip_forward=$ORIGINAL_IP_FORWARD" ||
+      return 1
+  fi
+  NETWORK_SNAPSHOT_CAPTURED=0
   return 0
 }
 
@@ -362,10 +580,16 @@ delete_known_vms_best_effort() {
 stop_tracked_vmm_processes() {
   local pid
   for pid in "${VMM_PIDS[@]:-}"; do
-    if pid_matches_binary "$pid" "$VMM_BIN_REAL"; then
+    if pid_matches_owned_binary "$pid" "$VMM_BIN_REAL"; then
       terminate_expected_pid "$pid" "$VMM_BIN_REAL" "VMM child" || true
     fi
   done
+}
+
+stop_caddy() {
+  [[ -n "${CADDY_PID:-}" ]] || return 0
+  terminate_expected_pid "$CADDY_PID" "$CADDY_BIN_REAL" "Caddy edge"
+  CADDY_PID=""
 }
 
 cleanup() {
@@ -373,6 +597,7 @@ cleanup() {
   local cleanup_failed=0
   trap - EXIT INT TERM HUP
   set +e
+  stop_caddy || cleanup_failed=1
   delete_known_vms_best_effort
   [[ -n "${NODE_A_PID:-}" ]] &&
     terminate_expected_pid "$NODE_A_PID" "$TARITD_BIN_REAL" "node A" || true
@@ -382,10 +607,13 @@ cleanup() {
   cleanup_database_rows
   restore_host_networking || cleanup_failed=1
   stop_local_postgres || cleanup_failed=1
+  if [[ "$DATABASE_MODE" == "stopped" ]]; then
+    restore_run_dir_permissions || cleanup_failed=1
+  fi
   if [[ "$cleanup_failed" -eq 0 ]]; then
     safe_remove_run_dir
   else
-    warn "cleanup could not stop the tracked PostgreSQL instance; preserving $RUN_DIR"
+    warn "cleanup could not safely release every owned resource; preserving $RUN_DIR"
     [[ "$status" -eq 0 ]] && status=1
   fi
   exit "$status"
@@ -409,14 +637,15 @@ preflight() {
   require_command grep "install grep"
   require_command sysctl "install procps"
   require_command flock "install util-linux"
-  require_command git "install git"
-
-  acquire_host_network_lock
-  if tarit_network_artifacts_present; then
-    skip "existing Tarit guest-network interfaces were found; run this gate only on an otherwise idle networking host"
-  fi
-  if nft list table ip taritd_nat >/dev/null 2>&1; then
-    skip "existing Tarit guest-network rules were found; run this gate only on an otherwise idle networking host"
+  require_command "$TIMEOUT_BIN" "install GNU coreutils timeout"
+  require_command mktemp "install coreutils"
+  require_command stat "install coreutils"
+  require_command cmp "install coreutils"
+  require_command awk "install awk"
+  require_command find "install findutils"
+  if ! command -v "$CADDY_BIN" >/dev/null 2>&1; then
+    fail "Caddy is required for the TLS edge gate but '$CADDY_BIN' is unavailable; install Caddy or set TARIT_CADDY_BIN"
+    return 1
   fi
 
   [[ -x "$TARITD_BIN" ]] ||
@@ -427,6 +656,23 @@ preflight() {
     skip "guest kernel not found at TARIT_KERNEL=$KERNEL; build guest assets or set TARIT_KERNEL"
   [[ -r "$ROOTFS" ]] ||
     skip "Node.js guest rootfs not found at TARIT_SHARE_ROOTFS=$ROOTFS; set it to an agent-enabled Node.js rootfs"
+  TARITD_BIN_REAL="$(canonical_path "$TARITD_BIN")"
+  VMM_BIN_REAL="$(canonical_path "$VMM_BIN")"
+  CADDY_BIN_REAL="$(canonical_path "$(command -v "$CADDY_BIN")")"
+
+  acquire_host_network_lock
+  if unrelated_tarit_or_vmm_processes_present; then
+    fail "refusing to start with unrelated taritd or VMM processes"
+    return 1
+  fi
+  if tarit_network_artifacts_present; then
+    fail "refusing to start with existing Tarit guest-network interfaces"
+    return 1
+  fi
+  if nft list table ip taritd_nat >/dev/null 2>&1; then
+    fail "refusing to start with a pre-existing taritd_nat nft table"
+    return 1
+  fi
 
   if [[ -z "$REQUESTED_DATABASE_URL" ]]; then
     INITDB_BIN="$(find_pg_binary initdb "${TARIT_E2E_INITDB:-}" || true)"
@@ -446,6 +692,8 @@ preflight() {
     id "$PG_OS_USER" >/dev/null 2>&1 ||
       skip "local PostgreSQL OS user '$PG_OS_USER' does not exist; set TARIT_E2E_POSTGRES_OS_USER or TARIT_DATABASE_URL"
     require_command runuser "install util-linux or set TARIT_DATABASE_URL"
+    require_command chown "install coreutils or set TARIT_DATABASE_URL"
+    require_command chgrp "install coreutils or set TARIT_DATABASE_URL"
   else
     PSQL_BIN="$(find_pg_binary psql "${TARIT_E2E_PSQL:-}" || true)"
     [[ -n "$PSQL_BIN" ]] ||
@@ -458,15 +706,30 @@ preflight() {
 
 TARITD_BIN="${TARITD_BIN:-${TARIT_BIN:-$ORCH_ROOT/target/release/taritd}}"
 VMM_BIN="${TARIT_VMM_BIN:-${VMM_BIN:-$VMM_ROOT/target/release/vmm}}"
+CADDY_BIN="${TARIT_CADDY_BIN:-caddy}"
+TIMEOUT_BIN="${TARIT_E2E_TIMEOUT_BIN:-timeout}"
 KERNEL="${TARIT_KERNEL:-$REPO_ROOT/guest-assets/vmlinux}"
 ROOTFS="${TARIT_SHARE_ROOTFS:-${TARIT_ROOTFS:-$REPO_ROOT/guest-assets/share-node-rootfs.ext4}}"
 GUEST_PORT="${TARIT_E2E_GUEST_PORT:-43127}"
 SHARE_DOMAIN="${TARIT_SHARE_DOMAIN:-shares.e2e.test}"
+EDGE_SLUG="${TARIT_E2E_EDGE_SLUG:-tarit-e2e-edge}"
 RUN_ROOT="${TARIT_E2E_RUN_ROOT:-$ORCH_ROOT/e}"
 REQUESTED_DATABASE_URL="${TARIT_DATABASE_URL:-}"
+RUN_ID="shares-$(date -u +%Y%m%dT%H%M%S)-$$"
+RUN_DIR=""
+RUN_MARKER=""
+TARITD_BIN_REAL=""
+VMM_BIN_REAL=""
+CADDY_BIN_REAL=""
 
 if ! [[ "$GUEST_PORT" =~ ^[0-9]+$ ]] || (( GUEST_PORT < 1 || GUEST_PORT > 65535 )); then
   fail "TARIT_E2E_GUEST_PORT must be in 1..=65535"
+fi
+if ! [[ "$EDGE_SLUG" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+  fail "TARIT_E2E_EDGE_SLUG must be a lowercase DNS label"
+fi
+if ! [[ "$SHARE_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+  fail "TARIT_SHARE_DOMAIN must be a lowercase DNS name for the Caddy test edge"
 fi
 
 preflight
@@ -474,23 +737,21 @@ if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
   exit 0
 fi
 
-TARITD_BIN_REAL="$(canonical_path "$TARITD_BIN")"
-VMM_BIN_REAL="$(canonical_path "$VMM_BIN")"
-RUN_ID="shares-$(date -u +%Y%m%dT%H%M%S)-$$"
-RUN_DIR="$RUN_ROOT/$RUN_ID"
 mkdir -p -- "$RUN_ROOT"
-mkdir -m 0711 -- "$RUN_DIR"
-: >"$RUN_DIR/.tarit-e2e-shares-run"
+RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")" ||
+  fail "could not create a private per-run artifact directory"
+RUN_MARKER="$RUN_DIR/.tarit-e2e-shares-run"
+: >"$RUN_MARKER"
+private_path "$RUN_DIR"
+private_path "$RUN_MARKER"
+export TARIT_E2E_SHARES_RUN_ID="$RUN_ID"
+export TARIT_E2E_SHARES_RUN_DIR="$RUN_DIR"
 
-NODE_A_DIR="$RUN_DIR/node-a"
-NODE_B_DIR="$RUN_DIR/node-b"
-mkdir -p -- "$NODE_A_DIR/sockets" "$NODE_B_DIR/sockets"
-NODE_A_LOG="$NODE_A_DIR/taritd.log"
-NODE_B_LOG="$NODE_B_DIR/taritd.log"
 CONTROL_URL_A=""
 CONTROL_URL_B=""
 NODE_A_PID=""
 NODE_B_PID=""
+CADDY_PID=""
 VM_IDS=()
 VMM_PIDS=()
 CREATED_VM_ID=""
@@ -500,8 +761,30 @@ PG_DATA_DIR=""
 PG_PORT=""
 PG_PID=""
 ORIGINAL_IP_FORWARD=""
-NETWORK_STATE_OWNED=0
-PG_OS_USER="${PG_OS_USER:-}"
+NETWORK_SNAPSHOT_CAPTURED=0
+NETWORK_START_ATTEMPTED=0
+NFT_TABLE_CREATED_BY_RUN=0
+NFT_TABLE_BASELINE=""
+IP_FORWARD_CHANGED_BY_RUN=0
+RUN_DIR_PG_TRAVERSE_GRANTED=0
+RUN_DIR_ORIGINAL_GID=""
+PG_OS_GID=""
+VMM_LAUNCHER=""
+RACE_VMM_ARM=""
+RACE_VMM_READY=""
+RACE_VMM_RELEASE=""
+RACE_VMM_PID=""
+PROPOSED_VM_ID=""
+EDGE_HOST="$EDGE_SLUG.$SHARE_DOMAIN"
+CADDY_CONFIG=""
+CADDY_LOG=""
+CADDY_HOME=""
+CADDY_XDG_DATA_HOME=""
+CADDY_XDG_CONFIG_HOME=""
+CADDY_XDG_CACHE_HOME=""
+CADDY_STORAGE_ROOT=""
+CADDY_CA_CERT=""
+CADDY_CA_KEY=""
 HOST_PREFIX="share-e2e-$RUN_ID"
 NODE_A_HOST="$HOST_PREFIX-a"
 NODE_B_HOST="$HOST_PREFIX-b"
@@ -511,7 +794,19 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
-readarray -t GENERATED_SECRETS < <(python3 - <<'PY'
+NODE_A_DIR="$(mktemp -d "$RUN_DIR/node-a.XXXXXX")"
+NODE_B_DIR="$(mktemp -d "$RUN_DIR/node-b.XXXXXX")"
+mkdir -p -- "$NODE_A_DIR/sockets" "$NODE_B_DIR/sockets"
+private_path "$NODE_A_DIR"
+private_path "$NODE_B_DIR"
+private_path "$NODE_A_DIR/sockets"
+private_path "$NODE_B_DIR/sockets"
+NODE_A_LOG="$(mktemp "$NODE_A_DIR/taritd.log.XXXXXX")"
+NODE_B_LOG="$(mktemp "$NODE_B_DIR/taritd.log.XXXXXX")"
+private_path "$NODE_A_LOG"
+private_path "$NODE_B_LOG"
+
+readarray -t GENERATED_SECRETS < <("$TIMEOUT_BIN" 5s python3 - <<'PY'
 import base64
 import secrets
 
@@ -525,8 +820,12 @@ PEER_SECRET="${GENERATED_SECRETS[1]}"
 SHARE_TOKEN_KEY="${GENERATED_SECRETS[2]}"
 unset GENERATED_SECRETS
 
-LAST_BODY="$RUN_DIR/last-body"
-LAST_HEADERS="$RUN_DIR/last-headers"
+LAST_BODY="$(mktemp "$RUN_DIR/last-body.XXXXXX")"
+LAST_HEADERS="$(mktemp "$RUN_DIR/last-headers.XXXXXX")"
+REQUEST_BODY_FILE="$(mktemp "$RUN_DIR/request-body.XXXXXX")"
+private_path "$LAST_BODY"
+private_path "$LAST_HEADERS"
+private_path "$REQUEST_BODY_FILE"
 LAST_STATUS=""
 LAST_CURL_STATUS=""
 
@@ -535,13 +834,19 @@ http_request() {
   local url="$2"
   local body_path="$3"
   shift 3
+  local max_time="${TARIT_E2E_HTTP_TIMEOUT_SECS:-60}"
+  if [[ -n "${TARIT_E2E_ACTIVE_WAIT_TIMEOUT_SECS:-}" ]]; then
+    max_time="$TARIT_E2E_ACTIVE_WAIT_TIMEOUT_SECS"
+  fi
+  [[ "$max_time" =~ ^[1-9][0-9]*$ ]] ||
+    fail "HTTP timeout must be a positive integer"
   local -a args=(
     curl
     --noproxy '*'
     --silent
     --show-error
     --connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}"
-    --max-time "${TARIT_E2E_HTTP_TIMEOUT_SECS:-60}"
+    --max-time "$max_time"
     -X "$method"
     -D "$LAST_HEADERS"
     -o "$LAST_BODY"
@@ -571,17 +876,12 @@ expect_status() {
     fail "$description: expected HTTP $expected, received $LAST_STATUS"
 }
 
-expect_status_one_of() {
-  local allowed="$1"
-  local description="$2"
-  [[ " $allowed " == *" $LAST_STATUS "* ]] ||
-    fail "$description: expected one of [$allowed], received $LAST_STATUS"
-}
-
 json_get() {
   local file="$1"
   local path="$2"
-  JSON_FILE="$file" JSON_PATH="$path" python3 - <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  JSON_FILE="$file" JSON_PATH="$path" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 import sys
@@ -606,7 +906,9 @@ json_assert_eq() {
   local file="$1"
   local path="$2"
   local expected="$3"
-  JSON_FILE="$file" JSON_PATH="$path" JSON_EXPECTED="$expected" python3 - <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  JSON_FILE="$file" JSON_PATH="$path" JSON_EXPECTED="$expected" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 import sys
@@ -627,39 +929,58 @@ if actual != os.environ["JSON_EXPECTED"]:
 PY
 }
 
-json_assert_missing() {
+json_assert_exact_error() {
   local file="$1"
-  local path="$2"
-  JSON_FILE="$file" JSON_PATH="$path" python3 - <<'PY'
+  local expected="$2"
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  JSON_FILE="$file" JSON_EXPECTED="$expected" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 
 value = json.load(open(os.environ["JSON_FILE"], encoding="utf-8"))
-parts = os.environ["JSON_PATH"].split(".")
-for part in parts[:-1]:
-    if not isinstance(value, dict) or part not in value:
-        raise SystemExit(0)
-    value = value[part]
-if isinstance(value, dict) and parts[-1] in value:
-    raise SystemExit(f"FAIL: JSON path {os.environ['JSON_PATH']} must be absent")
+if value != {"error": os.environ["JSON_EXPECTED"]}:
+    raise SystemExit("FAIL: error response was not the expected stable JSON object")
 PY
 }
 
-json_assert_contains() {
+json_assert_forwarding_boundary() {
   local file="$1"
-  local path="$2"
-  local expected_fragment="$3"
-  JSON_FILE="$file" JSON_PATH="$path" JSON_FRAGMENT="$expected_fragment" python3 - <<'PY'
+  local expected_host="$2"
+  local expected_authorization="$3"
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  JSON_FILE="$file" EXPECTED_HOST="$expected_host" EXPECTED_AUTHORIZATION="$expected_authorization" \
+    "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 
-value = json.load(open(os.environ["JSON_FILE"], encoding="utf-8"))
-for part in os.environ["JSON_PATH"].split("."):
-    if not isinstance(value, dict) or part not in value:
-        raise SystemExit(f"FAIL: missing JSON path {os.environ['JSON_PATH']}")
-    value = value[part]
-if os.environ["JSON_FRAGMENT"] not in str(value):
-    raise SystemExit(f"FAIL: JSON path {os.environ['JSON_PATH']} did not contain the required value")
+data = json.load(open(os.environ["JSON_FILE"], encoding="utf-8"))
+headers = data.get("headers")
+counts = data.get("header_counts")
+if not isinstance(headers, dict) or not isinstance(counts, dict):
+    raise SystemExit("FAIL: guest did not return parsed request headers and counts")
+
+host = os.environ["EXPECTED_HOST"]
+expected = {
+    "authorization": os.environ["EXPECTED_AUTHORIZATION"],
+    "x-forwarded-host": host,
+    "x-forwarded-proto": "https",
+    "forwarded": f"host={host};proto=https",
+}
+for name, value in expected.items():
+    if headers.get(name) != value or counts.get(name) != 1:
+        raise SystemExit(f"FAIL: forwarding boundary did not produce exactly one expected {name} value")
+
+for name in (
+    "x-api-key",
+    "x-tarit-share-token",
+    "x-peer-secret",
+    "x-real-ip",
+    "x-forwarded-for",
+):
+    if name in headers or counts.get(name, 0) != 0:
+        raise SystemExit(f"FAIL: sensitive header {name} reached the guest")
 PY
 }
 
@@ -667,7 +988,9 @@ json_assert_int_at_least() {
   local file="$1"
   local path="$2"
   local minimum="$3"
-  JSON_FILE="$file" JSON_PATH="$path" JSON_MINIMUM="$minimum" python3 - <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  JSON_FILE="$file" JSON_PATH="$path" JSON_MINIMUM="$minimum" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 
@@ -683,9 +1006,8 @@ PY
 
 write_json_body() {
   local payload="$1"
-  local path="$RUN_DIR/request.json"
-  printf '%s' "$payload" >"$path"
-  printf '%s\n' "$path"
+  printf '%s' "$payload" >"$REQUEST_BODY_FILE"
+  printf '%s\n' "$REQUEST_BODY_FILE"
 }
 
 control_request() {
@@ -723,7 +1045,7 @@ api_empty() {
 }
 
 share_host() {
-  printf '%s.%s\n' "$SHARE_SLUG" "$SHARE_DOMAIN"
+  printf '%s\n' "$EDGE_HOST"
 }
 
 share_request() {
@@ -734,12 +1056,14 @@ share_request() {
   local host=""
   host="$(share_host)"
   local -a headers=(
-    --resolve "$host:$SHARE_PORT_B:127.0.0.1"
+    --proto '=https'
+    --cacert "$CADDY_CA_CERT"
+    --resolve "$host:$CADDY_PORT:127.0.0.1"
     -H "Host: $host"
   )
   [[ -n "$token" ]] && headers+=(-H "X-Tarit-Share-Token: $token")
   headers+=("$@")
-  http_request "$method" "http://$host:$SHARE_PORT_B$path" "" "${headers[@]}"
+  http_request "$method" "https://$host:$CADDY_PORT$path" "" "${headers[@]}"
 }
 
 wait_for_health() {
@@ -757,7 +1081,10 @@ wait_for_health() {
 wait_for_cluster() {
   api_empty a GET /v1/cluster
   [[ "$LAST_STATUS" == "200" ]] || return 1
-  CLUSTER_FILE="$LAST_BODY" NODE_A_HOST="$NODE_A_HOST" NODE_B_HOST="$NODE_B_HOST" python3 - <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  CLUSTER_FILE="$LAST_BODY" NODE_A_HOST="$NODE_A_HOST" NODE_B_HOST="$NODE_B_HOST" \
+    "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 
@@ -774,7 +1101,9 @@ wait_for_vm_running() {
   local vm_id="$1"
   api_empty b GET "/v1/vms/$vm_id/status"
   [[ "$LAST_STATUS" == "200" ]] || return 1
-  VM_STATUS_FILE="$LAST_BODY" python3 - <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  VM_STATUS_FILE="$LAST_BODY" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 
@@ -787,7 +1116,9 @@ PY
 exec_payload() {
   local vm_id="$1"
   local command="$2"
-  python3 - "$vm_id" "$command" <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - "$vm_id" "$command" <<'PY'
 import json
 import sys
 
@@ -803,7 +1134,9 @@ guest_command_is_ready() {
   local vm_id="$1"
   api_json b POST /v1/execute "$(exec_payload "$vm_id" 'node --version')"
   [[ "$LAST_STATUS" == "200" ]] || return 1
-  JSON_FILE="$LAST_BODY" python3 - <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  JSON_FILE="$LAST_BODY" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import json
 import os
 
@@ -826,10 +1159,75 @@ exec_guest_or_fail() {
 }
 
 create_vm_payload() {
-  python3 - <<'PY'
+  local requested_id="${1:-}"
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - "$requested_id" <<'PY'
 import json
-print(json.dumps({"memory_mib": 256, "vcpus": 1}, separators=(",", ":")))
+import sys
+
+payload = {"memory_mib": 256, "vcpus": 1}
+if sys.argv[1]:
+    payload["id"] = sys.argv[1]
+print(json.dumps(payload, separators=(",", ":")))
 PY
+}
+
+write_vmm_launcher() {
+  VMM_LAUNCHER="$(mktemp "$RUN_DIR/vmm-launcher.XXXXXX")" ||
+    fail "could not create a private VMM launcher"
+  RACE_VMM_ARM="$(mktemp "$RUN_DIR/vmm-race-arm.XXXXXX")" ||
+    fail "could not allocate a VMM-race arm path"
+  RACE_VMM_READY="$(mktemp "$RUN_DIR/vmm-race-ready.XXXXXX")" ||
+    fail "could not allocate a VMM-race ready path"
+  RACE_VMM_RELEASE="$(mktemp "$RUN_DIR/vmm-race-release.XXXXXX")" ||
+    fail "could not allocate a VMM-race release path"
+  rm -f -- "$RACE_VMM_ARM" "$RACE_VMM_READY" "$RACE_VMM_RELEASE"
+  cat >"$VMM_LAUNCHER" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ -n "${TARIT_E2E_VMM_RACE_ARM:-}" && -f "$TARIT_E2E_VMM_RACE_ARM" ]]; then
+  : "${TARIT_E2E_VMM_RACE_READY:?missing deterministic race-ready path}"
+  : "${TARIT_E2E_VMM_RACE_RELEASE:?missing deterministic race-release path}"
+  printf '%s\n' "$$" >"$TARIT_E2E_VMM_RACE_READY"
+  deadline=$((SECONDS + ${TARIT_E2E_VMM_RACE_WAIT_SECS:-20}))
+  while [[ ! -f "$TARIT_E2E_VMM_RACE_RELEASE" ]]; do
+    (( SECONDS < deadline )) || exit 70
+    sleep 0.05
+  done
+fi
+
+exec "${TARIT_E2E_VMM_REAL:?missing real VMM path}" "$@"
+SH
+  chmod 0700 "$VMM_LAUNCHER"
+  private_path "$VMM_LAUNCHER"
+}
+
+verify_real_kvm_vmm() {
+  local vm_id="$1"
+  local reported_pid="$2"
+  local resolved_pid=""
+  local fd=""
+  local target=""
+  local kvm_fds=0
+
+  api_empty a GET "/v1/vms/$vm_id"
+  expect_status 200 "resolve exact VMM PID after VM creation"
+  resolved_pid="$(json_get "$LAST_BODY" pid)"
+  [[ "$resolved_pid" == "$reported_pid" ]] ||
+    fail "VM record did not resolve to the VMM PID returned by creation"
+  pid_matches_owned_binary "$resolved_pid" "$VMM_BIN_REAL" ||
+    fail "resolved VMM PID is not this run's expected VMM executable"
+  [[ -d "/proc/$resolved_pid/fd" ]] ||
+    fail "resolved VMM PID does not expose /proc/$resolved_pid/fd"
+  for fd in "/proc/$resolved_pid/fd/"*; do
+    [[ -e "$fd" ]] || continue
+    target="$(readlink -f -- "$fd" 2>/dev/null || true)"
+    [[ "$target" == "/dev/kvm" ]] && ((kvm_fds += 1))
+  done
+  (( kvm_fds > 0 )) ||
+    fail "resolved VMM PID has no open /dev/kvm descriptor"
 }
 
 create_vm_on_node_a() {
@@ -843,6 +1241,7 @@ create_vm_on_node_a() {
     fail "VM creation did not return a UUID"
   [[ "$vmm_pid" =~ ^[0-9]+$ ]] ||
     fail "VM creation did not return its tracked VMM PID"
+  verify_real_kvm_vmm "$vm_id" "$vmm_pid"
   VM_IDS+=("$vm_id")
   VMM_PIDS+=("$vmm_pid")
   CREATED_VM_ID="$vm_id"
@@ -851,7 +1250,9 @@ create_vm_on_node_a() {
 create_share_payload() {
   local vm_id="$1"
   local visibility="$2"
-  python3 - "$vm_id" "$GUEST_PORT" "$visibility" <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - "$vm_id" "$GUEST_PORT" "$visibility" <<'PY'
 import json
 import sys
 print(json.dumps({
@@ -864,7 +1265,9 @@ PY
 
 patch_share_payload() {
   local vm_id="$1"
-  python3 - "$vm_id" <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - "$vm_id" <<'PY'
 import json
 import sys
 print(json.dumps({"vm_id": sys.argv[1]}, separators=(",", ":")))
@@ -873,7 +1276,9 @@ PY
 
 patch_visibility_payload() {
   local visibility="$1"
-  python3 - "$visibility" <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - "$visibility" <<'PY'
 import json
 import sys
 print(json.dumps({"visibility": sys.argv[1]}, separators=(",", ":")))
@@ -882,7 +1287,9 @@ PY
 
 stream_digest() {
   local byte_count="$1"
-  python3 - "$byte_count" <<'PY'
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 20)"
+  "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - "$byte_count" <<'PY'
 import hashlib
 import sys
 
@@ -902,24 +1309,32 @@ run_stream_sha_gate() {
   local expected=""
   local host=""
   local status=""
+  local headers_file=""
+  local digest_file=""
   expected="$(stream_digest "$byte_count")"
   host="$(share_host)"
+  headers_file="$(mktemp "$RUN_DIR/stream-headers.XXXXXX")"
+  digest_file="$(mktemp "$RUN_DIR/stream-sha.XXXXXX")"
+  private_path "$headers_file"
+  private_path "$digest_file"
 
   if ! curl --noproxy '*' --silent --show-error --no-buffer \
+    --proto '=https' \
+    --cacert "$CADDY_CA_CERT" \
     --connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}" \
     --max-time "${TARIT_E2E_STREAM_TIMEOUT_SECS:-90}" \
     --limit-rate "${TARIT_E2E_STREAM_RATE_LIMIT:-4M}" \
-    --resolve "$host:$SHARE_PORT_B:127.0.0.1" \
+    --resolve "$host:$CADDY_PORT:127.0.0.1" \
     -H "Host: $host" \
-    -D "$RUN_DIR/stream.headers" \
-    "http://$host:$SHARE_PORT_B/stream?bytes=$byte_count&chunk=65536" |
-    sha256sum | awk '{print $1}' >"$RUN_DIR/stream.sha"; then
+    -D "$headers_file" \
+    "https://$host:$CADDY_PORT/stream?bytes=$byte_count&chunk=65536" |
+    sha256sum | awk '{print $1}' >"$digest_file"; then
     fail "32 MiB share response did not stream through the non-owner node"
   fi
-  status="$(awk '/^HTTP\// { code=$2 } END { print code }' "$RUN_DIR/stream.headers")"
+  status="$(awk '/^HTTP\// { code=$2 } END { print code }' "$headers_file")"
   [[ "$status" == "200" ]] ||
     fail "streaming response returned HTTP $status instead of 200"
-  [[ "$(cat "$RUN_DIR/stream.sha")" == "$expected" ]] ||
+  [[ "$(cat "$digest_file")" == "$expected" ]] ||
     fail "streaming SHA-256 differed from the deterministic 32 MiB guest response"
 }
 
@@ -927,12 +1342,15 @@ run_large_upload_gate() {
   local byte_count="${TARIT_E2E_UPLOAD_BYTES:-33554432}"
   local expected=""
   local host=""
+  local status_file=""
   expected="$(stream_digest "$byte_count")"
   host="$(share_host)"
+  status_file="$(mktemp "$RUN_DIR/upload-status.XXXXXX")"
+  private_path "$status_file"
   : >"$LAST_BODY"
   : >"$LAST_HEADERS"
 
-  if ! python3 - "$byte_count" <<'PY' |
+  if ! "$TIMEOUT_BIN" "${TARIT_E2E_UPLOAD_TIMEOUT_SECS:-90}s" python3 - "$byte_count" <<'PY' |
 import sys
 
 remaining = int(sys.argv[1])
@@ -944,32 +1362,48 @@ while remaining:
     remaining -= len(part)
 PY
     curl --noproxy '*' --silent --show-error \
+      --proto '=https' \
+      --cacert "$CADDY_CA_CERT" \
       --connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}" \
       --max-time "${TARIT_E2E_UPLOAD_TIMEOUT_SECS:-90}" \
       -X POST \
-      --resolve "$host:$SHARE_PORT_B:127.0.0.1" \
+      --resolve "$host:$CADDY_PORT:127.0.0.1" \
       -H "Host: $host" \
       -H 'Content-Type: application/octet-stream' \
       --data-binary @- \
       -D "$LAST_HEADERS" \
       -o "$LAST_BODY" \
       -w '%{http_code}' \
-      "http://$host:$SHARE_PORT_B/upload" >"$RUN_DIR/upload.status"; then
+      "https://$host:$CADDY_PORT/upload" >"$status_file"; then
     fail "large upload did not stream through the non-owner node"
   fi
-  LAST_STATUS="$(cat "$RUN_DIR/upload.status")"
+  LAST_STATUS="$(cat "$status_file")"
   expect_status 200 "large streaming upload"
   json_assert_eq "$LAST_BODY" bytes "$byte_count"
   json_assert_eq "$LAST_BODY" sha256 "$expected"
 }
 
 assert_delayed_first_chunk() {
-  SHARE_HOST="$(share_host)" SHARE_PORT="$SHARE_PORT_B" python3 - <<'PY'
+  SHARE_HOST="$(share_host)" SHARE_PORT="$CADDY_PORT" SHARE_CA_CERT="$CADDY_CA_CERT" \
+    "$TIMEOUT_BIN" 15s python3 - <<'PY'
 import http.client
 import os
+import socket
+import ssl
 import time
 
-connection = http.client.HTTPConnection("127.0.0.1", int(os.environ["SHARE_PORT"]), timeout=10)
+class ResolvedHttpsConnection(http.client.HTTPSConnection):
+    def connect(self):
+        raw = socket.create_connection(("127.0.0.1", self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+context = ssl.create_default_context(cafile=os.environ["SHARE_CA_CERT"])
+connection = ResolvedHttpsConnection(
+    os.environ["SHARE_HOST"],
+    int(os.environ["SHARE_PORT"]),
+    timeout=10,
+    context=context,
+)
 connection.putrequest("GET", "/delayed", skip_host=True)
 connection.putheader("Host", os.environ["SHARE_HOST"])
 connection.endheaders()
@@ -989,7 +1423,7 @@ PY
 }
 
 assert_malformed_hosts() {
-  SHARE_DOMAIN="$SHARE_DOMAIN" SHARE_PORT="$SHARE_PORT_B" python3 - <<'PY'
+  SHARE_DOMAIN="$SHARE_DOMAIN" SHARE_PORT="$SHARE_PORT_B" "$TIMEOUT_BIN" 10s python3 - <<'PY'
 import os
 import socket
 
@@ -1035,9 +1469,16 @@ assert_listener_isolation() {
   expect_status 404 "share listener must reject internal peer paths"
 }
 
+assert_caddy_internal_route_blocked() {
+  share_request GET "/internal/v1/shares/$SHARE_ID" ""
+  expect_status 404 "Caddy must block public internal peer paths"
+  [[ "$(cat "$LAST_BODY")" == "edge-internal-route-blocked" ]] ||
+    fail "internal route was not rejected by the Caddy edge"
+}
+
 assert_peer_rejections() {
   local forged_nonce=""
-  forged_nonce="$(python3 - <<'PY'
+  forged_nonce="$("$TIMEOUT_BIN" 5s python3 - <<'PY'
 import uuid
 print(uuid.uuid4())
 PY
@@ -1075,54 +1516,124 @@ PY
 metric_value() {
   local file="$1"
   local name="$2"
-  awk -v metric="$name" '$1 == metric { print $2; exit }' "$file"
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  METRICS_FILE="$file" METRIC_NAME="$name" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
+import os
+
+values = []
+for line in open(os.environ["METRICS_FILE"], encoding="utf-8"):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split()
+    if len(parts) == 2 and parts[0] == os.environ["METRIC_NAME"]:
+        values.append(parts[1])
+if len(values) != 1:
+    raise SystemExit("metric must have exactly one unlabelled sample")
+print(values[0])
+PY
+}
+
+share_gauges_are_zero_if_exposed() {
+  local file="$1"
+  local timeout_seconds=""
+  timeout_seconds="$(subprocess_timeout_seconds 10)"
+  METRICS_FILE="$file" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
+import os
+
+samples = {}
+for line in open(os.environ["METRICS_FILE"], encoding="utf-8"):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split()
+    if len(parts) == 2 and parts[0] in {
+        "taritd_share_active_http",
+        "taritd_share_active_websockets",
+    }:
+        samples.setdefault(parts[0], []).append(parts[1])
+
+if samples:
+    for name in ("taritd_share_active_http", "taritd_share_active_websockets"):
+        if samples.get(name) != ["0"]:
+            raise SystemExit(f"{name} did not return to zero exactly once")
+PY
 }
 
 share_gauges_are_zero() {
-  control_request b GET /metrics ""
-  [[ "$LAST_STATUS" == "200" ]] || return 1
-  local active_http=""
-  local active_websockets=""
-  active_http="$(metric_value "$LAST_BODY" taritd_share_active_http)"
-  active_websockets="$(metric_value "$LAST_BODY" taritd_share_active_websockets)"
-  [[ "$active_http" == "0" && "$active_websockets" == "0" ]]
+  local node=""
+  for node in a b; do
+    control_request "$node" GET /metrics ""
+    [[ "$LAST_STATUS" == "200" ]] || return 1
+    share_gauges_are_zero_if_exposed "$LAST_BODY" || return 1
+  done
+}
+
+assert_metric_secrecy() {
+  local metrics_file="$1"
+  local node="$2"
+  local value=""
+
+  for value in \
+    "$SHARE_SLUG" \
+    "$SHARE_ID" \
+    "$API_KEY" \
+    "$PEER_SECRET" \
+    "$OWNER_KEY" \
+    "$VM1" \
+    "$VM2" \
+    "$TOKEN_EXPIRING" \
+    "$TOKEN_BEFORE_RETARGET" \
+    "$TOKEN_AFTER_RETARGET" \
+    "$TOKEN_TARGET_UNAVAILABLE"; do
+    [[ -n "$value" ]] || continue
+    grep -Fq -- "$value" "$metrics_file" &&
+      fail "share metrics on node $node leaked a confidential share, tenant, token, or VM identifier"
+  done
+}
+
+assert_metrics_for_node() {
+  local node="$1"
+  local metrics_file="$2"
+  local request_series=""
+  request_series="$(grep -c '^taritd_share_requests_total{' "$metrics_file")"
+  [[ "$request_series" == "18" ]] ||
+    fail "share request metrics on node $node must expose exactly 18 bounded visibility/status series"
+  assert_metric_secrecy "$metrics_file" "$node"
+  share_gauges_are_zero_if_exposed "$metrics_file"
 }
 
 assert_metrics() {
-  control_request b GET /metrics ""
-  expect_status 200 "share metrics endpoint"
-  cp -- "$LAST_BODY" "$RUN_DIR/share-metrics.txt"
-  local metrics_file="$RUN_DIR/share-metrics.txt"
-  local request_series=""
+  local node=""
+  local metrics_file=""
   local bytes_in=""
   local bytes_out=""
-  request_series="$(grep -c '^taritd_share_requests_total{' "$metrics_file")"
-  [[ "$request_series" == "18" ]] ||
-    fail "share request metrics must expose exactly 18 bounded visibility/status series"
 
-  grep -Fq -- "$SHARE_SLUG" "$metrics_file" &&
-    fail "share metrics leaked a share slug"
-  grep -Fq -- "$API_KEY" "$metrics_file" &&
-    fail "share metrics leaked an API key"
-  grep -Fq -- "$PEER_SECRET" "$metrics_file" &&
-    fail "share metrics leaked a peer secret"
-  grep -Fq -- "$OWNER_KEY" "$metrics_file" &&
-    fail "share metrics leaked a tenant identifier"
-  grep -Fq -- "$TOKEN_AFTER_RETARGET" "$metrics_file" &&
-    fail "share metrics leaked a share token"
+  for node in a b; do
+    control_request "$node" GET /metrics ""
+    expect_status 200 "share metrics endpoint on node $node"
+    metrics_file="$(mktemp "$RUN_DIR/share-metrics-$node.XXXXXX")"
+    cp -- "$LAST_BODY" "$metrics_file"
+    private_path "$metrics_file"
+    assert_metrics_for_node "$node" "$metrics_file"
+    if [[ "$node" != "b" ]]; then
+      continue
+    fi
 
-  bytes_in="$(metric_value "$metrics_file" taritd_share_bytes_in_total)"
-  bytes_out="$(metric_value "$metrics_file" taritd_share_bytes_out_total)"
+    bytes_in="$(metric_value "$metrics_file" taritd_share_bytes_in_total)"
+    bytes_out="$(metric_value "$metrics_file" taritd_share_bytes_out_total)"
   [[ "$bytes_in" =~ ^[0-9]+$ && "$bytes_out" =~ ^[0-9]+$ ]] ||
     fail "share byte metrics must be numeric"
   (( bytes_in >= TARIT_E2E_UPLOAD_BYTES_EFFECTIVE )) ||
     fail "share input byte metric did not observe the large upload"
   (( bytes_out >= TARIT_E2E_STREAM_BYTES_EFFECTIVE )) ||
     fail "share output byte metric did not observe the 32 MiB stream"
+  done
 }
 
 node_shutdown_started() {
-  grep -q 'shutdown signal received; draining HTTP listeners' "$NODE_A_LOG"
+  "$TIMEOUT_BIN" 1s grep -q 'shutdown signal received; draining HTTP listeners' "$NODE_A_LOG"
 }
 
 assert_no_vmm_sockets() {
@@ -1176,7 +1687,11 @@ start_node() {
     export TARIT_SHARE_CONNECT_TIMEOUT_MS="${TARIT_E2E_CONNECT_TIMEOUT_MS:-5000}"
     export TARIT_SHARE_IDLE_TIMEOUT_SECS="${TARIT_E2E_IDLE_TIMEOUT_SECS:-45}"
     export TARIT_RPC_ADDR="http://127.0.0.1:$control_port"
-    export TARIT_VMM_BIN="$VMM_BIN_REAL"
+    export TARIT_VMM_BIN="$VMM_LAUNCHER"
+    export TARIT_E2E_VMM_REAL="$VMM_BIN_REAL"
+    export TARIT_E2E_VMM_RACE_ARM="$RACE_VMM_ARM"
+    export TARIT_E2E_VMM_RACE_READY="$RACE_VMM_READY"
+    export TARIT_E2E_VMM_RACE_RELEASE="$RACE_VMM_RELEASE"
     export TARIT_KERNEL="$KERNEL"
     export TARIT_ROOTFS="$ROOTFS"
     export TARIT_ROOTFS_READONLY=1
@@ -1205,21 +1720,19 @@ start_node() {
 start_local_postgres() {
   DATABASE_MODE="local"
   PG_PORT="$(allocate_port)"
-  PG_DATA_DIR="${TARIT_E2E_POSTGRES_DIR:-$RUN_DIR/postgres}"
-  case "$PG_DATA_DIR" in
-    "$RUN_DIR"/*)
-      ;;
-    *)
-      fail "TARIT_E2E_POSTGRES_DIR must be inside this run directory for safe cleanup"
-      ;;
-  esac
-  mkdir -p -- "$PG_DATA_DIR"
+  [[ -z "${TARIT_E2E_POSTGRES_DIR:-}" ]] ||
+    fail "TARIT_E2E_POSTGRES_DIR is unsupported: the harness creates a private mktemp data directory"
+  grant_postgres_run_access
+  PG_DATA_DIR="$(mktemp -d "$RUN_DIR/postgres.XXXXXX")" ||
+    fail "could not create a private local PostgreSQL data directory"
   chown "$PG_OS_USER" "$PG_DATA_DIR"
   chmod 0700 "$PG_DATA_DIR"
+  [[ "$(stat -c '%a' -- "$PG_DATA_DIR")" == "700" ]] ||
+    fail "local PostgreSQL data directory is not owner-private"
   run_as_pg_user "$INITDB_BIN" -D "$PG_DATA_DIR" \
     --auth=trust --no-locale --encoding=UTF8 --username=tarit_e2e \
-    >"$RUN_DIR/initdb.log" 2>&1 ||
-    fail "isolated PostgreSQL initialization failed; inspect $RUN_DIR/initdb.log"
+    >"$PG_DATA_DIR/initdb.log" 2>&1 ||
+    fail "isolated PostgreSQL initialization failed; inspect $PG_DATA_DIR/initdb.log"
   run_as_pg_user "$PG_CTL_BIN" -D "$PG_DATA_DIR" \
     -l "$PG_DATA_DIR/postgres.log" \
     -o "-h 127.0.0.1 -p $PG_PORT" \
@@ -1230,7 +1743,7 @@ start_local_postgres() {
   record_local_postgres_pid ||
     fail "isolated PostgreSQL did not publish a valid postmaster PID"
   DATABASE_URL="postgresql://tarit_e2e@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
-  "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAtc 'SELECT 1' >/dev/null ||
+  "$TIMEOUT_BIN" 15s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAtc 'SELECT 1' >/dev/null ||
     fail "isolated PostgreSQL did not accept a connection"
 }
 
@@ -1238,7 +1751,7 @@ configure_database() {
   if [[ -n "$REQUESTED_DATABASE_URL" ]]; then
     DATABASE_MODE="external"
     DATABASE_URL="$REQUESTED_DATABASE_URL"
-    "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAtc 'SELECT 1' >/dev/null ||
+    "$TIMEOUT_BIN" 15s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAtc 'SELECT 1' >/dev/null ||
       fail "TARIT_DATABASE_URL is not reachable"
     cleanup_database_rows
   else
@@ -1246,8 +1759,114 @@ configure_database() {
   fi
 }
 
+set_deterministic_share_slug() {
+  local conflict_count=""
+  local applied_slug=""
+
+  conflict_count="$("$TIMEOUT_BIN" 12s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAt \
+    -v ON_ERROR_STOP=1 \
+    -v slug="$EDGE_SLUG" \
+    -v share_id="$SHARE_ID" \
+    -c "SELECT count(*) FROM fleet_shares WHERE slug = :'slug' AND id <> :'share_id';")" ||
+    fail "could not check deterministic Caddy hostname availability"
+  [[ "$conflict_count" == "0" ]] ||
+    fail "deterministic Caddy hostname is already owned by a different share"
+  applied_slug="$("$TIMEOUT_BIN" 12s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAt \
+    -v ON_ERROR_STOP=1 \
+    -v slug="$EDGE_SLUG" \
+    -v share_id="$SHARE_ID" \
+    -v owner_key="$OWNER_KEY" \
+    -c "UPDATE fleet_shares SET slug = :'slug' WHERE id = :'share_id' AND owner_key = :'owner_key' RETURNING slug;")" ||
+    fail "could not set the deterministic Caddy hostname"
+  [[ "$applied_slug" == "$EDGE_SLUG" ]] ||
+    fail "deterministic Caddy hostname update did not affect exactly this run's share"
+  SHARE_SLUG="$EDGE_SLUG"
+}
+
+write_caddy_config() {
+  CADDY_HOME="$(mktemp -d "$RUN_DIR/caddy-home.XXXXXX")"
+  CADDY_XDG_DATA_HOME="$(mktemp -d "$RUN_DIR/caddy-data.XXXXXX")"
+  CADDY_XDG_CONFIG_HOME="$(mktemp -d "$RUN_DIR/caddy-config.XXXXXX")"
+  CADDY_XDG_CACHE_HOME="$(mktemp -d "$RUN_DIR/caddy-cache.XXXXXX")"
+  CADDY_STORAGE_ROOT="$(mktemp -d "$RUN_DIR/caddy-storage.XXXXXX")"
+  CADDY_CONFIG="$(mktemp "$RUN_DIR/Caddyfile.XXXXXX")"
+  CADDY_LOG="$(mktemp "$RUN_DIR/caddy.log.XXXXXX")"
+  private_path "$CADDY_HOME"
+  private_path "$CADDY_XDG_DATA_HOME"
+  private_path "$CADDY_XDG_CONFIG_HOME"
+  private_path "$CADDY_XDG_CACHE_HOME"
+  private_path "$CADDY_STORAGE_ROOT"
+  private_path "$CADDY_CONFIG"
+  private_path "$CADDY_LOG"
+  CADDY_CA_CERT="$CADDY_STORAGE_ROOT/pki/authorities/local/root.crt"
+  CADDY_CA_KEY="$CADDY_STORAGE_ROOT/pki/authorities/local/root.key"
+  cat >"$CADDY_CONFIG" <<CADDY
+{
+  auto_https off
+  admin off
+  skip_install_trust
+  storage file_system "$CADDY_STORAGE_ROOT"
+}
+
+https://$EDGE_HOST:$CADDY_PORT {
+  tls internal
+
+  @internal path /internal/v1 /internal/v1/*
+  handle @internal {
+    respond "edge-internal-route-blocked" 404
+  }
+
+  handle {
+    reverse_proxy 127.0.0.1:$SHARE_PORT_B {
+      header_up -X-API-Key
+      header_up -Proxy-Authorization
+      header_up -X-Peer-Secret
+      header_up -Forwarded
+      header_up -X-Forwarded-For
+      header_up -X-Forwarded-Host
+      header_up -X-Forwarded-Proto
+      header_up -X-Real-IP
+      header_up Host {host}
+      header_up X-Forwarded-For {remote_host}
+      header_up X-Forwarded-Host {host}
+      header_up X-Forwarded-Proto {scheme}
+      header_up Forwarded "for={remote_host};host={host};proto={scheme}"
+    }
+  }
+}
+CADDY
+  private_path "$CADDY_CONFIG"
+}
+
+caddy_ca_is_ready() {
+  [[ -r "$CADDY_CA_CERT" && -r "$CADDY_CA_KEY" ]]
+}
+
+caddy_edge_is_ready() {
+  share_request GET /__caddy-edge-ready ""
+  [[ "$LAST_STATUS" == "404" ]]
+}
+
+start_caddy_edge() {
+  write_caddy_config
+  "$TIMEOUT_BIN" 15s "$CADDY_BIN_REAL" validate \
+    --config "$CADDY_CONFIG" --adapter caddyfile >"$CADDY_LOG" 2>&1 ||
+    fail "Caddy rejected the generated TLS edge configuration; inspect $CADDY_LOG"
+  (
+    export HOME="$CADDY_HOME"
+    export XDG_DATA_HOME="$CADDY_XDG_DATA_HOME"
+    export XDG_CONFIG_HOME="$CADDY_XDG_CONFIG_HOME"
+    export XDG_CACHE_HOME="$CADDY_XDG_CACHE_HOME"
+    exec "$CADDY_BIN_REAL" run --config "$CADDY_CONFIG" --adapter caddyfile
+  ) >>"$CADDY_LOG" 2>&1 &
+  CADDY_PID="$!"
+  wait_until "Caddy internal CA material" 15 caddy_ca_is_ready
+  private_path "$CADDY_CA_KEY"
+  wait_until "Caddy TLS edge with verified CA" 15 caddy_edge_is_ready
+}
+
 write_guest_server() {
-  GUEST_SERVER_SOURCE="$RUN_DIR/guest-share-server.js"
+  GUEST_SERVER_SOURCE="$(mktemp "$RUN_DIR/guest-share-server.XXXXXX")"
   cat >"$GUEST_SERVER_SOURCE" <<'NODE'
 const crypto = require("crypto");
 const http = require("http");
@@ -1285,6 +1904,15 @@ function sendFrame(socket, opcode, payload) {
     throw new Error("test WebSocket frame unexpectedly large");
   }
   socket.write(Buffer.concat([header, body]));
+}
+
+function headerCounts(request) {
+  const counts = {};
+  for (let index = 0; index < request.rawHeaders.length; index += 2) {
+    const name = request.rawHeaders[index].toLowerCase();
+    counts[name] = (counts[name] || 0) + 1;
+  }
+  return counts;
 }
 
 function websocketAccept(key) {
@@ -1384,6 +2012,7 @@ const server = http.createServer((request, response) => {
       method: request.method,
       url: request.url,
       headers: request.headers,
+      header_counts: headerCounts(request),
     });
     return;
   }
@@ -1458,7 +2087,8 @@ server.on("upgrade", (request, socket, head) => {
 server.listen(port, "0.0.0.0");
 NODE
 
-  GUEST_SERVER_B64="$(python3 - "$GUEST_SERVER_SOURCE" <<'PY'
+  private_path "$GUEST_SERVER_SOURCE"
+  GUEST_SERVER_B64="$("$TIMEOUT_BIN" 10s python3 - "$GUEST_SERVER_SOURCE" <<'PY'
 import base64
 import gzip
 from pathlib import Path
@@ -1480,12 +2110,13 @@ start_guest_server() {
 }
 
 write_websocket_client() {
-  WS_CLIENT="$RUN_DIR/ws_client.py"
+  WS_CLIENT="$(mktemp "$RUN_DIR/ws-client.XXXXXX")"
   cat >"$WS_CLIENT" <<'PY'
 #!/usr/bin/env python3
 import base64
 import os
 import socket
+import ssl
 import struct
 import sys
 
@@ -1546,8 +2177,10 @@ def receive_until(sock, expected_text=None, expected_opcode=None, expected_paylo
     raise RuntimeError("expected WebSocket frame was not observed")
 
 
-def connect(port, host):
-    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+def connect(port, host, ca_cert):
+    raw = socket.create_connection(("127.0.0.1", port), timeout=10)
+    context = ssl.create_default_context(cafile=ca_cert)
+    sock = context.wrap_socket(raw, server_hostname=host)
     sock.settimeout(10)
     key = base64.b64encode(os.urandom(16)).decode()
     request = (
@@ -1570,8 +2203,8 @@ def connect(port, host):
     return sock
 
 
-def exercise(port, host, abrupt):
-    sock = connect(port, host)
+def exercise(port, host, ca_cert, abrupt):
+    sock = connect(port, host, ca_cert)
     receive_until(sock, expected_text="server-saw-pong:676174657761792d70696e67")
 
     text = "text-through-non-owner"
@@ -1603,47 +2236,149 @@ def exercise(port, host, abrupt):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4 or sys.argv[3] not in {"graceful", "abrupt"}:
-        raise SystemExit("usage: ws_client.py PORT HOST graceful|abrupt")
-    exercise(int(sys.argv[1]), sys.argv[2], sys.argv[3] == "abrupt")
+    if len(sys.argv) != 5 or sys.argv[4] not in {"graceful", "abrupt"}:
+        raise SystemExit("usage: ws_client.py PORT HOST CA_CERT graceful|abrupt")
+    exercise(int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == "abrupt")
 PY
   chmod 0700 "$WS_CLIENT"
+  private_path "$WS_CLIENT"
 }
 
 run_websocket_gate() {
   local host=""
+  local graceful_output=""
+  local abrupt_output=""
   host="$(share_host)"
-  python3 "$WS_CLIENT" "$SHARE_PORT_B" "$host" graceful >"$RUN_DIR/ws-graceful.out"
-  grep -qx 'WS_GRACEFUL_PASS' "$RUN_DIR/ws-graceful.out" ||
+  graceful_output="$(mktemp "$RUN_DIR/ws-graceful.XXXXXX")"
+  abrupt_output="$(mktemp "$RUN_DIR/ws-abrupt.XXXXXX")"
+  private_path "$graceful_output"
+  private_path "$abrupt_output"
+  "$TIMEOUT_BIN" 20s python3 "$WS_CLIENT" "$CADDY_PORT" "$host" "$CADDY_CA_CERT" graceful >"$graceful_output"
+  grep -qx 'WS_GRACEFUL_PASS' "$graceful_output" ||
     fail "WebSocket text/binary/ping/pong/graceful-close gate failed"
 
-  python3 "$WS_CLIENT" "$SHARE_PORT_B" "$host" abrupt >"$RUN_DIR/ws-abrupt.out"
-  grep -qx 'WS_ABRUPT_PASS' "$RUN_DIR/ws-abrupt.out" ||
+  "$TIMEOUT_BIN" 20s python3 "$WS_CLIENT" "$CADDY_PORT" "$host" "$CADDY_CA_CERT" abrupt >"$abrupt_output"
+  grep -qx 'WS_ABRUPT_PASS' "$abrupt_output" ||
     fail "WebSocket abrupt-disconnect gate failed"
   wait_until "share HTTP and WebSocket gauge cleanup" 20 share_gauges_are_zero
+}
+
+race_vmm_barrier_reached() {
+  [[ -s "$RACE_VMM_READY" ]]
+}
+
+assert_rejected_vm_has_no_state() {
+  local vm_id="$1"
+  local vmm_pid="$2"
+  local fleet_count=""
+
+  VM_ID="$vm_id" NODE_DB="$NODE_A_DIR/taritd.sqlite" "$TIMEOUT_BIN" 10s python3 - <<'PY'
+import os
+import sqlite3
+
+db_path = os.environ["NODE_DB"]
+vm_id = os.environ["VM_ID"]
+connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+try:
+    count = connection.execute("SELECT count(*) FROM vms WHERE id = ?", (vm_id,)).fetchone()[0]
+finally:
+    connection.close()
+if count != 0:
+    raise SystemExit("FAIL: rejected shutdown create persisted a local VM record")
+PY
+  fleet_count="$("$TIMEOUT_BIN" 12s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAt \
+    -v ON_ERROR_STOP=1 \
+    -v vm_id="$vm_id" \
+    -c "SELECT count(*) FROM fleet_vms WHERE id = :'vm_id';")" ||
+    fail "could not query authoritative fleet state after shutdown rejection"
+  [[ "$fleet_count" == "0" ]] ||
+    fail "rejected shutdown create persisted an authoritative fleet VM record"
+  pid_is_gone "$vmm_pid" ||
+    fail "rejected shutdown create left its resolved VMM PID running"
+  [[ ! -e "$NODE_A_DIR/sockets/$vm_id.sock" ]] ||
+    fail "rejected shutdown create left a VMM socket"
+  VM_ID="$vm_id" NET_STATE="$NODE_A_DIR/net-state.json" "$TIMEOUT_BIN" 10s python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+path = Path(os.environ["NET_STATE"])
+if not path.is_file():
+    raise SystemExit("FAIL: missing network state while checking shutdown cleanup")
+data = json.loads(path.read_text(encoding="utf-8"))
+if any(entry.get("vm_id") == os.environ["VM_ID"] for entry in data.get("allocations", [])):
+    raise SystemExit("FAIL: rejected shutdown create retained a network allocation")
+PY
+  if nft list table ip taritd_nat 2>/dev/null | grep -Fq -- "$vm_id"; then
+    fail "rejected shutdown create retained an nft network allocation"
+  fi
 }
 
 stop_node_a_for_shutdown_gate() {
   [[ -n "$NODE_A_PID" ]] || fail "node A PID was not tracked"
   local tracked_pid="$NODE_A_PID"
-  pid_matches_binary "$tracked_pid" "$TARITD_BIN_REAL" ||
-    fail "node A PID changed before shutdown test"
-  kill -TERM "$tracked_pid"
-  wait_until "node A shutdown admission closure" 15 node_shutdown_started
+  local request_body=""
+  local request_headers=""
+  local request_status=""
+  local request_stderr=""
+  local proposed_id_file=""
+  local status=""
 
-  local shutdown_vm_id=""
-  shutdown_vm_id="$(python3 - <<'PY'
+  pid_matches_owned_binary "$tracked_pid" "$TARITD_BIN_REAL" ||
+    fail "node A PID changed before shutdown test"
+  PROPOSED_VM_ID="$("$TIMEOUT_BIN" 5s python3 - <<'PY'
 import uuid
 print(uuid.uuid4())
 PY
 )"
-  api_json a POST /v1/vms "$(python3 - "$shutdown_vm_id" <<'PY'
-import json
-import sys
-print(json.dumps({"id": sys.argv[1], "memory_mib": 256, "vcpus": 1}, separators=(",", ":")))
-PY
-)"
-  expect_status_one_of "000 429" "VM creation after shutdown admission closes"
+  proposed_id_file="$(mktemp "$RUN_DIR/shutdown-race-vm-id.XXXXXX")"
+  printf '%s\n' "$PROPOSED_VM_ID" >"$proposed_id_file"
+  private_path "$proposed_id_file"
+  request_body="$(write_json_body "$(create_vm_payload "$PROPOSED_VM_ID")")"
+  request_headers="$(mktemp "$RUN_DIR/shutdown-race-headers.XXXXXX")"
+  request_status="$(mktemp "$RUN_DIR/shutdown-race-status.XXXXXX")"
+  request_stderr="$(mktemp "$RUN_DIR/shutdown-race-curl-stderr.XXXXXX")"
+  SHUTDOWN_RACE_BODY="$(mktemp "$RUN_DIR/shutdown-race-body.XXXXXX")"
+  private_path "$request_headers"
+  private_path "$request_status"
+  private_path "$request_stderr"
+  private_path "$SHUTDOWN_RACE_BODY"
+  : >"$RACE_VMM_ARM"
+  private_path "$RACE_VMM_ARM"
+
+  curl --noproxy '*' --silent --show-error \
+    --connect-timeout 3 --max-time 20 \
+    -X POST \
+    -H "X-API-Key: $API_KEY" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$request_body" \
+    -D "$request_headers" \
+    -o "$SHUTDOWN_RACE_BODY" \
+    -w '%{http_code}' \
+    "$CONTROL_URL_A/v1/vms" >"$request_status" 2>"$request_stderr" &
+  local request_pid="$!"
+  wait_until "deterministic in-flight VM create barrier" 15 race_vmm_barrier_reached
+  private_path "$RACE_VMM_READY"
+  RACE_VMM_PID="$(cat "$RACE_VMM_READY")"
+  [[ "$RACE_VMM_PID" =~ ^[0-9]+$ ]] ||
+    fail "deterministic in-flight create did not publish a VMM PID"
+  pid_belongs_to_this_run "$RACE_VMM_PID" ||
+    fail "deterministic in-flight create barrier PID is not owned by this run"
+
+  kill -TERM "$tracked_pid"
+  wait_until "node A shutdown admission closure" 15 node_shutdown_started
+  : >"$RACE_VMM_RELEASE"
+  private_path "$RACE_VMM_RELEASE"
+  wait_for_pid_exit "$request_pid" 25 ||
+    fail "in-flight shutdown create did not return before its bounded curl deadline"
+  status="$(cat "$request_status")"
+  [[ -n "$status" && "$status" != "000" ]] ||
+    fail "in-flight shutdown create did not receive an API response (HTTP 000 is not a pass)"
+  [[ "$status" == "429" ]] ||
+    fail "in-flight shutdown create must receive HTTP 429 after admission closes"
+  json_assert_exact_error "$SHUTDOWN_RACE_BODY" "taritd is shutting down"
+  wait_for_pid_exit "$RACE_VMM_PID" 20 ||
+    fail "rejected in-flight create did not reap its VMM process"
 
   wait_for_pid_exit "$tracked_pid" 35 ||
     fail "node A did not complete coordinated shutdown"
@@ -1652,6 +2387,9 @@ PY
     fail "node A did not report its VM reaping shutdown sweep"
   assert_no_vmm_sockets "$NODE_A_DIR/sockets" ||
     fail "node A left a VMM socket after coordinated shutdown"
+  assert_rejected_vm_has_no_state "$PROPOSED_VM_ID" "$RACE_VMM_PID"
+  VM_IDS=()
+  VMM_PIDS=()
 }
 
 stop_node_b_after_gate() {
@@ -1683,8 +2421,11 @@ main() {
 
   log "== starting node A and node B with independent control/share listeners =="
   capture_host_networking
+  write_vmm_launcher
+  NETWORK_START_ATTEMPTED=1
   start_node a
   wait_until "node A health" 45 wait_for_health a
+  record_owned_host_networking
   start_node b
   wait_until "node B health" 45 wait_for_health b
   wait_until "two-node fleet membership" 45 wait_for_cluster
@@ -1715,16 +2456,22 @@ main() {
   json_assert_eq "$LAST_BODY" visibility public
   [[ "$SHARE_ID" =~ ^[0-9a-f-]{36}$ && "$SHARE_SLUG" =~ ^[a-z0-9-]+$ ]] ||
     fail "share creation did not return a valid id and hostname label"
+  set_deterministic_share_slug
+  api_empty b GET "/v1/shares/$SHARE_ID"
+  expect_status 200 "read deterministic share hostname through node B"
+  json_assert_eq "$LAST_BODY" slug "$EDGE_SLUG"
+  start_caddy_edge
 
   api_empty b GET "/v1/vms/$VM1"
   expect_status 200 "non-owner VM lookup"
   json_assert_eq "$LAST_BODY" host_id "$NODE_A_HOST"
 
   assert_listener_isolation
+  assert_caddy_internal_route_blocked
   assert_malformed_hosts
   assert_peer_rejections
 
-  log "== public HTTP, root/nested path, and trusted forwarding gate =="
+  log "== Caddy TLS public HTTP, root/nested path, and trusted forwarding gate =="
   share_request GET / ""
   expect_status 200 "public root request"
   json_assert_eq "$LAST_BODY" instance "$VM1"
@@ -1740,29 +2487,15 @@ main() {
     -H "Authorization: $APP_AUTHORIZATION" \
     -H "X-API-Key: $API_KEY" \
     -H "X-Peer-Secret: $PEER_SECRET" \
-    -H 'X-Forwarded-Proto: https' \
+    -H 'X-Forwarded-Proto: http' \
+    -H 'X-Forwarded-Proto: attacker' \
     -H 'Forwarded: for=attacker.example;proto=http' \
     -H 'X-Forwarded-For: attacker.example' \
     -H 'X-Real-IP: attacker.example'
   expect_status 200 "header preservation request"
   json_assert_eq "$LAST_BODY" method PATCH
   json_assert_eq "$LAST_BODY" url '/inspect?query=preserved&repeat=a&repeat=b'
-  json_assert_eq "$LAST_BODY" headers.authorization "$APP_AUTHORIZATION"
-  json_assert_eq "$LAST_BODY" headers.x-forwarded-proto https
-  json_assert_contains "$LAST_BODY" headers.forwarded 'proto=https'
-  json_assert_missing "$LAST_BODY" headers.x-api-key
-  json_assert_missing "$LAST_BODY" headers.x-tarit-share-token
-  json_assert_missing "$LAST_BODY" headers.x-peer-secret
-  json_assert_missing "$LAST_BODY" headers.x-real-ip
-  json_assert_missing "$LAST_BODY" headers.x-forwarded-for
-  json_assert_contains "$LAST_BODY" headers.forwarded "$SHARE_SLUG.$SHARE_DOMAIN"
-
-  share_request GET /inspect "" \
-    -H 'X-Forwarded-Proto: https' \
-    -H 'X-Forwarded-Proto: https'
-  expect_status 200 "ambiguous forwarded scheme request"
-  json_assert_eq "$LAST_BODY" headers.x-forwarded-proto http
-  json_assert_contains "$LAST_BODY" headers.forwarded 'proto=http'
+  json_assert_forwarding_boundary "$LAST_BODY" "$EDGE_HOST" "$APP_AUTHORIZATION"
 
   assert_delayed_first_chunk
 
@@ -1846,6 +2579,7 @@ main() {
   TOKEN_TARGET_UNAVAILABLE="$(json_get "$LAST_BODY" token)"
   share_request GET / "$TOKEN_TARGET_UNAVAILABLE"
   expect_status 503 "stopped share target"
+  json_assert_exact_error "$LAST_BODY" "share unavailable"
 
   api_empty b DELETE "/v1/shares/$SHARE_ID"
   expect_status 204 "revoke retargeted share"
@@ -1858,11 +2592,14 @@ main() {
 
   log "== coordinated shutdown and post-shutdown admission gate =="
   stop_node_a_for_shutdown_gate
+  stop_caddy
   stop_node_b_after_gate
   restore_host_networking ||
     fail "guest-network host state could not be restored safely"
   stop_local_postgres ||
     fail "isolated PostgreSQL did not complete PID-specific shutdown"
+  restore_run_dir_permissions ||
+    fail "per-run artifact directory could not be restored to private permissions"
 
   log "SHARES_PASS"
 }

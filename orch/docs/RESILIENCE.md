@@ -154,16 +154,16 @@ assertion below succeeds.
 
 | Failure domain | Required gate behavior |
 | --- | --- |
-| Listener and route isolation | The control listener cannot serve share-host traffic; the share listener cannot expose control or internal peer routes. |
-| Host, path, and forwarding validation | Root and nested paths preserve their query strings; malformed hosts and untrusted or ambiguous forwarding headers are rejected or normalized before reaching the application. |
+| TLS edge, listener, and route isolation | A real Caddy `tls internal` edge fronts node B's share listener at a deterministic test hostname. Clients verify Caddy's ephemeral CA; Caddy preserves `Host` and WebSocket upgrades, strips `X-API-Key`, overwrites forwarding headers, and returns its own 404 for `/internal/v1/*`. The control listener cannot serve share-host traffic and the share listener cannot expose control or internal peer routes. |
+| Host, path, and forwarding validation | Root and nested paths preserve their query strings. Parsed guest headers prove exactly one edge-generated forwarding value, including `https`, after malicious duplicate and conflicting client forwarding headers. |
 | HTTP streaming | A public response of at least 32 MiB is SHA-256 verified while streamed, with application-observed response and upload backpressure; delayed first data and large uploads remain streaming operations. |
 | Header boundary | Request method, query string, and application `Authorization` are preserved exactly. `X-API-Key`, share-token, peer, and client-supplied forwarding headers do not reach the guest. A trusted HTTPS scheme is rebuilt for the application. |
 | Share authorization | Public access works; private access rejects anonymous and malformed tokens, accepts a newly issued token, expires it, invalidates it on version rotation, and returns the documented result after revocation. |
 | Owner routing and peer trust | Share control and data traffic through the non-owner node reach the owner only with a valid signed peer identity. Missing, forged, and unsigned peer calls fail closed. |
-| Guest availability | Retargeting changes the active guest target. A stopped target returns `503`; a revoked share returns `404`. |
+| Real KVM and guest availability | Each created VM resolves to its exact VMM PID; its `/proc/<pid>/exe` must be the expected VMM and `/proc/<pid>/fd` must hold `/dev/kvm`. Retargeting changes the active guest target. A stopped target returns the stable `503` JSON error and a revoked share returns `404`. |
 | WebSocket transport | Text, binary, ping, pong, graceful close, and abrupt client disconnect traverse the non-owner route without leaving active gateway gauges. |
-| Host-network isolation | The gate takes an exclusive host-network lock, refuses a host with existing Tarit guest-network state, then removes its owned rules and restores the prior forwarding setting after both nodes stop. |
-| Metrics and shutdown | Metrics have fixed cardinality and do not expose share identifiers or credentials. Coordinated shutdown reaps owned guests, closes admission, and cannot create a guest after shutdown begins. |
+| Host-network isolation | The gate takes a host-global `/run/lock` lock and refuses unrelated Tarit/VMM processes, tap state, or a pre-existing `taritd_nat` table. It deletes a table only when it created it and its baseline still matches; it restores `ip_forward` only after ownership checks. |
+| Metrics and shutdown | Both owner and non-owner metrics have fixed cardinality and expose no raw slug, token, tenant, or VM identifier; exposed HTTP/WebSocket gauges must return to zero. A deterministic in-flight create race records its proposed ID, requires stable `429` JSON (never HTTP `000`), and verifies no local-store, fleet, process, socket, or network-allocation state survives shutdown. |
 
 ## Running the suite
 
@@ -194,6 +194,14 @@ sudo bash tests/e2e_cpu_refill.sh
 # two-node, real-KVM port-share gateway gate
 sudo -E bash tests/e2e_shares.sh
 ```
+
+The share gate must run as root on an otherwise idle Linux KVM host. It requires
+`caddy`, `curl`, `python3` (with `sqlite3`), GNU coreutils (`sha256sum`,
+`timeout`, `mktemp`, `stat`, `cmp`, `chown`, and `chgrp`), `ip`, `nft`, `ps`,
+`readlink`, `grep`, `awk`, `find`, `sysctl`, and `flock`; it also needs `psql` plus `initdb`,
+`pg_ctl`, and `runuser` when `TARIT_DATABASE_URL` is unset. The guest rootfs
+must include Node.js. Caddy is mandatory; the gate intentionally has no
+plaintext fallback.
 
 VMM-side validations (`pty-validate.sh`, `restore-clone-validate.sh`,
 `suspend-validate.sh`, `gc-validate.sh`, `cgroup-validate.sh`,

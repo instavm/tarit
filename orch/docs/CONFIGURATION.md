@@ -105,14 +105,16 @@ control routes on `TARIT_LISTEN`. The edge must terminate public TLS, preserve
 the incoming `Host`, support WebSocket upgrades, and never route
 `/internal/v1/*` from the public edge.
 
-The edge must overwrite—not append—forwarding headers. Tarit accepts one
+The edge must overwrite—not append—`Forwarded` and `X-Forwarded-*` headers.
+Tarit accepts one
 `X-Forwarded-Proto` value only when it is exactly lowercase `http` or `https`;
 missing, repeated, comma-separated, or other values are treated as `http`.
 Tarit then rebuilds the forwarding headers sent to the guest. The checked-in
-Caddy example removes `X-API-Key` and `Proxy-Authorization`; Tarit removes
-those headers plus the private-share token after gateway authorization. Guest
-applications needing an application credential must use `Authorization` or a
-different non-reserved header, never `X-API-Key`.
+Caddy example removes `X-API-Key` and `Proxy-Authorization`, resets the
+forwarding chain to one edge value, and preserves `Host` for share routing;
+Tarit removes those headers plus the private-share token after gateway
+authorization. Guest applications needing an application credential must use
+`Authorization` or a different non-reserved header, never `X-API-Key`.
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |

@@ -135,15 +135,15 @@ impl From<OrchError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let err = self.0;
+        let error = match &err {
+            OrchError::Overloaded { message, .. } if message == "taritd is shutting down" => {
+                message.clone()
+            }
+            _ => err.to_string(),
+        };
         let status =
             StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let mut response = (
-            status,
-            Json(ErrorBody {
-                error: err.to_string(),
-            }),
-        )
-            .into_response();
+        let mut response = (status, Json(ErrorBody { error })).into_response();
         if let Some(retry_after_secs) = err.retry_after_secs() {
             if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -1860,6 +1860,10 @@ mod tests {
             .expect("shutdown must reject create without waiting for placement");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            rt.block_on(response_json(response)),
+            serde_json::json!({"error": "taritd is shutting down"})
+        );
         while let Ok(write) = writes.try_recv() {
             assert!(
                 !matches!(write, StoreWrite::Vm(_)),
