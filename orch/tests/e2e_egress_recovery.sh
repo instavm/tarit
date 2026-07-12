@@ -28,6 +28,8 @@ TAP_B=
 TAP_C=
 IPV6_FORWARDING=
 IPV6_FORWARDING_CHANGED=0
+IPV4_FORWARDING=
+IPV4_FORWARDING_CHANGED=0
 
 fail() {
   echo "FAIL: $*" >&2
@@ -171,6 +173,9 @@ cleanup() {
   if [ "$IPV6_FORWARDING_CHANGED" = 1 ]; then
     sysctl -qw "net.ipv6.conf.all.forwarding=$IPV6_FORWARDING" || true
   fi
+  if [ "$IPV4_FORWARDING_CHANGED" = 1 ]; then
+    sysctl -qw "net.ipv4.ip_forward=$IPV4_FORWARDING" || true
+  fi
   [ -n "$RUN_DIR" ] && rm -rf -- "$RUN_DIR"
 }
 trap cleanup EXIT
@@ -269,21 +274,56 @@ require_rule() {
     fail "missing rule: $expected"
 }
 
+normalize_nft_counter() {
+  local rule=$1
+  if [[ "$rule" =~ ^(.*)\ counter\ packets\ ([0-9]+)\ bytes\ ([0-9]+)\ drop$ ]]; then
+    printf '%s counter drop\n' "${BASH_REMATCH[1]}"
+  else
+    printf '%s\n' "$rule"
+  fi
+}
+
 assert_closed_tarit_chain_for_tap() {
-  local listing=$1 tap=$2 vm_id=$3 line
+  local listing=$1 chain=$2 tap=$3 vm_id=$4 guest=$5 uplink=$6 line rule comment
   while IFS= read -r line; do
-    case "$line" in
-      *"iifname \"$tap\""*)
-        [[ "$line" == *"comment \"taritd"* &&
-          "$line" == *"slot=${tap#insta} vm=$vm_id tap=$tap\""* ]] ||
-          fail "unmanaged or malformed rule precedes policy for $tap: $line"
+    [[ "$line" == *"type filter"* || "$line" == "table "* || "$line" == "chain "* ||
+      "$line" == "}" ]] && continue
+    [[ "$line" == *" accept"* && "$line" != *'iifname "'* ]] &&
+      fail "broad accept lacks an exact TAP matcher in $chain: $line"
+    [[ "$line" == *"iifname \"$tap\""* ]] || continue
+    rule=${line%% comment \"*}
+    comment=${line#* comment \"}
+    comment=${comment%%\"*}
+    rule=$(normalize_nft_counter "$rule")
+    case "$chain:$rule:$comment" in
+      "vm_egress:iifname \"$tap\" ip saddr != $guest counter drop:taritd-guard slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_egress:iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop:taritd-guard slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_egress:iifname \"$tap\" ip saddr $guest oifname != \"$uplink\" drop:taritd-guard slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_egress:iifname \"$tap\" ip saddr $guest ct state established,related accept:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_egress:iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_egress:iifname \"$tap\" ip saddr $guest drop:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_input:iifname \"$tap\" ip saddr != $guest counter drop:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_input:iifname \"$tap\" ct state established,related accept:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_input:iifname \"$tap\" ip drop:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap")
+        ;;
+      *)
+        fail "unmanaged or unrecognized Tarit rule shape in $chain for $tap: $line"
         ;;
     esac
   done <<<"$listing"
 }
 
 assert_egress_rule_order() {
-  local listing=$1 tap=$2 guest=$3 vm_id=$4 stateful allow deny
+  local listing=$1 tap=$2 guest=$3 vm_id=$4 source lateral uplink stateful allow deny
+  source=$(grep -nF \
+    "iifname \"$tap\" ip saddr != $guest counter" \
+    <<<"$listing" | head -1 | cut -d: -f1)
+  lateral=$(grep -nF \
+    "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop" \
+    <<<"$listing" | head -1 | cut -d: -f1)
+  uplink=$(grep -nF \
+    "iifname \"$tap\" ip saddr $guest oifname !=" \
+    <<<"$listing" | head -1 | cut -d: -f1)
   stateful=$(grep -nF \
     "iifname \"$tap\" ip saddr $guest ct state established,related accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
     <<<"$listing" | head -1 | cut -d: -f1)
@@ -293,9 +333,12 @@ assert_egress_rule_order() {
   deny=$(grep -nF \
     "iifname \"$tap\" ip saddr $guest drop comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
     <<<"$listing" | tail -1 | cut -d: -f1)
-  [ -n "$stateful" ] && [ -n "$allow" ] && [ -n "$deny" ] ||
-    fail "missing stateful-return, allow, or final default-deny for $tap"
-  [ "$stateful" -lt "$allow" ] && [ "$allow" -lt "$deny" ] ||
+  [ -n "$source" ] && [ -n "$lateral" ] && [ -n "$uplink" ] &&
+    [ -n "$stateful" ] && [ -n "$allow" ] && [ -n "$deny" ] ||
+    fail "missing guard, stateful-return, allow, or final default-deny for $tap"
+  [ "$source" -lt "$stateful" ] && [ "$lateral" -lt "$stateful" ] &&
+    [ "$uplink" -lt "$stateful" ] && [ "$stateful" -lt "$allow" ] &&
+    [ "$allow" -lt "$deny" ] ||
     fail "default-open or misordered egress policy for $tap"
 }
 
@@ -309,13 +352,13 @@ assert_recovered_policy() {
   require_rule "$netdev" "ether type arp accept"
   require_rule "$netdev" "ether type ip accept"
   forward=$(nft -a list chain ip taritd_nat vm_egress)
-  assert_closed_tarit_chain_for_tap "$forward" "$tap" "$vm_id"
+  assert_closed_tarit_chain_for_tap "$forward" vm_egress "$tap" "$vm_id" "$guest" "$uplink"
   require_rule "$forward" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$forward" "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop"
   require_rule "$forward" "iifname \"$tap\" ip saddr $guest oifname != \"$uplink\" drop"
   assert_egress_rule_order "$forward" "$tap" "$guest" "$vm_id"
   input=$(nft -a list chain ip taritd_nat vm_input)
-  assert_closed_tarit_chain_for_tap "$input" "$tap" "$vm_id"
+  assert_closed_tarit_chain_for_tap "$input" vm_input "$tap" "$vm_id" "$guest" "$uplink"
   require_rule "$input" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$input" "iifname \"$tap\" ct state established,related accept"
   require_rule "$input" "iifname \"$tap\" ip drop"
@@ -345,6 +388,8 @@ forged_source_drop_packets() {
 mkdir -p "$TARIT_SOCKET_DIR"
 : >"$TARIT_CONFIG"
 cp -f "$BASE_ROOTFS" "$ROOTFS"
+IPV4_FORWARDING=$(sysctl -n net.ipv4.ip_forward)
+IPV4_FORWARDING_CHANGED=1
 
 start_taritd
 VM_A=$(create_vm)

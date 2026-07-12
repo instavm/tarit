@@ -44,8 +44,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     if cli.runs_server() {
         init_tracing();
+        let preflight_taps = net::startup_preflight().context(
+            "contain pre-existing Tarit TAPs before configuration, database, image, or VM discovery",
+        )?;
         let config = Config::from_env().context("load config")?;
-        run_server(config).await
+        run_server(config, preflight_taps).await
     } else {
         cli::run_client(cli).await
     }
@@ -61,7 +64,7 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_server(mut config: Config) -> anyhow::Result<()> {
+async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::Result<()> {
     tracing::info!(
         listen = %config.listen,
         host_id = %config.host_id,
@@ -77,13 +80,9 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
 
     let store = Store::open(&config.db_path).context("open store")?;
     image::resolve_warm_pool_images(&mut config, &store).context("resolve warm-pool images")?;
-    let persisted_vms = match store.list_vms() {
-        Ok(vms) => vms,
-        Err(e) => {
-            tracing::warn!("failed to load persisted VMs during startup: {e}");
-            Vec::new()
-        }
-    };
+    let persisted_vms = store
+        .list_vms()
+        .context("load persisted VMs during startup")?;
     let live_vm_ids = persisted_vms
         .iter()
         .filter(|vm| {
@@ -92,10 +91,10 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         })
         .map(|vm| vm.id)
         .collect::<Vec<_>>();
-    let supervisor = Arc::new(VmmSupervisor::new_with_live_vms(
-        config.clone(),
-        live_vm_ids,
-    ));
+    let supervisor = Arc::new(
+        VmmSupervisor::new_with_live_vms(config.clone(), live_vm_ids, &preflight_taps)
+            .context("initialize fail-closed network recovery")?,
+    );
     let scheduler = Arc::new(Scheduler::new(config.clone()));
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio

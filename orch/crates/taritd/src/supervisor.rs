@@ -157,33 +157,33 @@ impl ShutdownSummary {
 impl VmmSupervisor {
     #[cfg(test)]
     pub fn new(config: Config) -> Self {
-        Self::new_with_live_vms(config, std::iter::empty())
+        Self::new_with_live_vms(config, std::iter::empty(), &[])
+            .expect("test supervisor networking setup must succeed")
     }
 
-    pub fn new_with_live_vms(config: Config, live_vm_ids: impl IntoIterator<Item = Uuid>) -> Self {
+    pub fn new_with_live_vms(
+        config: Config,
+        live_vm_ids: impl IntoIterator<Item = Uuid>,
+        preflight_taps: &[String],
+    ) -> Result<Self, OrchError> {
         std::fs::create_dir_all(&config.socket_dir).ok();
+        let live_vm_ids = live_vm_ids.into_iter().collect::<Vec<_>>();
+        validate_network_startup_mode(config.enable_net, preflight_taps, live_vm_ids.len())?;
         let net = if config.enable_net {
-            match NetProvisioner::new(config.net_state_path.clone(), live_vm_ids) {
-                Ok(p) => {
-                    tracing::info!(uplink = p.uplink(), "per-VM networking enabled");
-                    Some(p)
-                }
-                Err(e) => {
-                    tracing::error!("net provisioning disabled (setup failed): {e}");
-                    None
-                }
-            }
+            let provisioner = NetProvisioner::new(config.net_state_path.clone(), live_vm_ids)?;
+            tracing::info!(uplink = provisioner.uplink(), "per-VM networking enabled");
+            Some(provisioner)
         } else {
             None
         };
-        Self {
+        Ok(Self {
             config,
             running: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
             warm: Mutex::new(VecDeque::new()),
             net,
             shutting_down: AtomicBool::new(false),
-        }
+        })
     }
 
     fn socket_path_for(&self, id: Uuid) -> PathBuf {
@@ -1019,6 +1019,20 @@ fn build_vmm_config(id: Uuid, cfg: &VmSpawnConfig, net: Option<&NetAlloc>) -> Vm
     }
 }
 
+fn validate_network_startup_mode(
+    enable_net: bool,
+    preflight_taps: &[String],
+    recovered_live_vm_count: usize,
+) -> Result<(), OrchError> {
+    if !enable_net && (!preflight_taps.is_empty() || recovered_live_vm_count > 0) {
+        return Err(OrchError::Internal(
+            "network-disabled startup refused: contained Tarit TAPs or recovered live VMs require TARIT_ENABLE_NET=1"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn path_exists(p: &Path) -> bool {
     p.exists()
@@ -1050,6 +1064,14 @@ mod tests {
             cmdline: DEFAULT_CMDLINE.to_string(),
             read_only,
         }
+    }
+
+    #[test]
+    fn network_disabled_startup_rejects_contained_taps_or_live_recovery() {
+        assert!(validate_network_startup_mode(false, &[], 0).is_ok());
+        assert!(validate_network_startup_mode(false, &["insta7".into()], 0).is_err());
+        assert!(validate_network_startup_mode(false, &[], 1).is_err());
+        assert!(validate_network_startup_mode(true, &["insta7".into()], 1).is_ok());
     }
 
     #[test]

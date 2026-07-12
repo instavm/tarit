@@ -10,6 +10,7 @@
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -89,8 +90,24 @@ impl NetAlloc {
 /// Allocates and provisions per-VM taps. `uplink` is the host egress iface.
 pub struct NetProvisioner {
     inner: Mutex<SlotAllocator>,
+    egress_updates: EgressUpdateLock,
     state_path: PathBuf,
     uplink: String,
+}
+
+#[derive(Default)]
+struct EgressUpdateLock {
+    inner: Mutex<()>,
+}
+
+impl EgressUpdateLock {
+    fn run<T>(&self, work: impl FnOnce() -> T) -> Result<T, OrchError> {
+        let _guard = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net egress update lock poisoned".into()))?;
+        Ok(work())
+    }
 }
 
 impl NetProvisioner {
@@ -104,7 +121,7 @@ impl NetProvisioner {
         // This is deliberately the first fallible startup action. A corrupt
         // state file or failed uplink lookup must not leave an old Tarit TAP
         // forwarding while recovery cannot establish its owner or policy.
-        contain_existing_tarit_taps_before_recovery()?;
+        let _ = startup_preflight()?;
         let uplink = default_uplink()?;
         let entries = load_state(&state_path, &live_vm_ids)?;
         let (allocator, dropped) = SlotAllocator::from_entries(entries, &live_vm_ids);
@@ -116,6 +133,7 @@ impl NetProvisioner {
         }
         let provisioner = Self {
             inner: Mutex::new(allocator),
+            egress_updates: EgressUpdateLock::default(),
             state_path,
             uplink,
         };
@@ -201,6 +219,16 @@ impl NetProvisioner {
     /// related return traffic survives when `allow_existing` is set). Returns
     /// the number of allow rules programmed.
     pub fn apply_egress(
+        &self,
+        alloc: &NetAlloc,
+        allowlist: &[String],
+        allow_existing: bool,
+    ) -> Result<usize, OrchError> {
+        self.egress_updates
+            .run(|| self.apply_egress_locked(alloc, allowlist, allow_existing))?
+    }
+
+    fn apply_egress_locked(
         &self,
         alloc: &NetAlloc,
         allowlist: &[String],
@@ -347,7 +375,10 @@ impl NetProvisioner {
         )?;
         let handles = listing
             .lines()
-            .filter(|line| is_egress_update_quarantine_rule_for_alloc(line, alloc))
+            .filter(|line| {
+                is_recognized_taritd_rule(NFT_FWD_CHAIN, line)
+                    && is_egress_update_quarantine_rule_for_alloc(line, alloc)
+            })
             .map(|line| {
                 nft_handle(line).ok_or_else(|| {
                     OrchError::Internal(format!(
@@ -411,12 +442,13 @@ impl NetProvisioner {
                 error,
             ));
         }
-        let isolation_failures = self.emergency_isolate_recovered_taps(allocations);
-        if !isolation_failures.is_empty() {
-            return Err(OrchError::Internal(format!(
-                "net: cannot isolate recovered allocations before reconciliation: {}",
-                isolation_failures.join("; ")
-            )));
+        let isolation = self.emergency_isolate_recovered_taps(allocations);
+        if !isolation.failures.is_empty() {
+            return Err(self.recovery_failure_after_emergency_isolation(
+                allocations,
+                "isolate recovered allocations before reconciliation",
+                OrchError::Internal(isolation.failures.join("; ")),
+            ));
         }
         for alloc in allocations {
             if let Err(error) = self.egress_policy_for(alloc) {
@@ -521,7 +553,8 @@ impl NetProvisioner {
         context: &str,
         original_error: OrchError,
     ) -> OrchError {
-        let mut failures = self.emergency_isolate_all_tarit_taps(allocations);
+        let isolation = self.emergency_isolate_all_tarit_taps(allocations);
+        let mut failures = isolation.failures;
         for argv in emergency_forwarding_disable_argv() {
             if let Err(error) = run_argv(&argv) {
                 failures.push(format!(
@@ -540,7 +573,7 @@ impl NetProvisioner {
         ))
     }
 
-    fn emergency_isolate_recovered_taps(&self, allocations: &[NetAlloc]) -> Vec<String> {
+    fn emergency_isolate_recovered_taps(&self, allocations: &[NetAlloc]) -> IsolationReport {
         let taps = allocations
             .iter()
             .map(|alloc| alloc.tap.clone())
@@ -548,7 +581,7 @@ impl NetProvisioner {
         emergency_isolate_tap_names(&taps)
     }
 
-    fn emergency_isolate_all_tarit_taps(&self, allocations: &[NetAlloc]) -> Vec<String> {
+    fn emergency_isolate_all_tarit_taps(&self, allocations: &[NetAlloc]) -> IsolationReport {
         let mut taps = allocations
             .iter()
             .map(|alloc| alloc.tap.clone())
@@ -556,20 +589,25 @@ impl NetProvisioner {
         match discover_strict_tap_names() {
             Ok(discovered) => taps.extend(discovered),
             Err(error) => {
-                let mut failures = vec![format!("discover strict Tarit TAPs: {error}")];
-                failures.extend(emergency_isolate_tap_names(
-                    &taps.into_iter().collect::<Vec<_>>(),
-                ));
-                return failures;
+                let mut isolation =
+                    emergency_isolate_tap_names(&taps.into_iter().collect::<Vec<_>>());
+                isolation
+                    .failures
+                    .insert(0, format!("discover strict Tarit TAPs: {error}"));
+                return isolation;
             }
         }
         emergency_isolate_tap_names(&taps.into_iter().collect::<Vec<_>>())
     }
 
     fn validate_security_chain_ownership(&self) -> Result<(), OrchError> {
-        for chain in [NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
+        for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
             let listing = command_stdout("nft", &["-a", "list", "chain", "ip", NFT_TABLE, chain])?;
-            validate_taritd_security_chain(chain, &listing)?;
+            if chain == NFT_CHAIN {
+                validate_taritd_nat_chain(&listing)?;
+            } else {
+                validate_taritd_security_chain(chain, &listing)?;
+            }
         }
         Ok(())
     }
@@ -580,8 +618,17 @@ impl NetProvisioner {
         context: &str,
         original_error: OrchError,
     ) -> OrchError {
-        let mut failures = self.best_effort_recovery_cleanup(allocations);
-        failures.extend(self.emergency_isolate_recovered_taps(allocations));
+        let isolation = self.emergency_isolate_all_tarit_taps(allocations);
+        let mut failures = isolation.failures;
+        for argv in emergency_forwarding_disable_argv() {
+            if let Err(error) = run_argv(&argv) {
+                failures.push(format!(
+                    "emergency host forwarding disable failed ({}): {error}",
+                    argv.join(" ")
+                ));
+            }
+        }
+        failures.extend(self.best_effort_recovery_cleanup(allocations, &isolation.contained));
         if failures.is_empty() {
             OrchError::Internal(format!("net: {context}: {original_error}"))
         } else {
@@ -662,9 +709,20 @@ impl NetProvisioner {
         Ok(())
     }
 
-    fn best_effort_recovery_cleanup(&self, allocations: &[NetAlloc]) -> Vec<String> {
+    fn best_effort_recovery_cleanup(
+        &self,
+        allocations: &[NetAlloc],
+        contained_taps: &BTreeSet<String>,
+    ) -> Vec<String> {
         let mut failures = Vec::new();
         for alloc in allocations {
+            if !contained_taps.contains(&alloc.tap) {
+                failures.push(format!(
+                    "retained ingress and policy for {} because link containment failed",
+                    alloc.tap
+                ));
+                continue;
+            }
             if let Err(error) = self.delete_recovery_rules_for_alloc(alloc) {
                 failures.push(format!(
                     "partial recovered policy cleanup failed for {}: {error}",
@@ -751,8 +809,9 @@ impl NetProvisioner {
     fn delete_nft_rules_for_alloc(&self, alloc: &NetAlloc) -> Result<usize, OrchError> {
         let mut removed = 0;
         for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
-            removed +=
-                delete_nft_rules_in_chain(chain, |line| is_taritd_nft_rule_for_alloc(line, alloc))?;
+            removed += delete_nft_rules_in_chain(chain, |line| {
+                is_recognized_taritd_rule(chain, line) && is_taritd_nft_rule_for_alloc(line, alloc)
+            })?;
         }
         removed += delete_ingress_table_for_alloc(alloc)?;
         Ok(removed)
@@ -762,7 +821,8 @@ impl NetProvisioner {
         let mut removed = 0;
         for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
             removed += delete_nft_rules_in_chain(chain, |line| {
-                is_recovery_nft_rule_for_alloc(line, alloc)
+                is_recognized_taritd_rule(chain, line)
+                    && is_recovery_nft_rule_for_alloc(line, alloc)
             })?;
         }
         Ok(removed)
@@ -772,7 +832,8 @@ impl NetProvisioner {
         let mut removed = 0;
         for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
             removed += delete_nft_rules_in_chain(chain, |line| {
-                is_stale_recovery_rule_for_alloc(line, alloc)
+                is_recognized_taritd_rule(chain, line)
+                    && is_stale_recovery_rule_for_alloc(line, alloc)
             })?;
         }
         removed += delete_ingress_table_for_alloc(alloc)?;
@@ -782,8 +843,9 @@ impl NetProvisioner {
     fn delete_nft_rules_for_slot(&self, slot: u32) -> Result<usize, OrchError> {
         let mut removed = 0;
         for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
-            removed +=
-                delete_nft_rules_in_chain(chain, |line| is_taritd_nft_rule_for_slot(line, slot))?;
+            removed += delete_nft_rules_in_chain(chain, |line| {
+                is_recognized_taritd_rule(chain, line) && is_taritd_nft_rule_for_slot(line, slot)
+            })?;
         }
         Ok(removed)
     }
@@ -791,8 +853,9 @@ impl NetProvisioner {
     fn delete_orphan_nft_rules(&self, active: &BTreeMap<u32, Uuid>) -> Result<usize, OrchError> {
         let mut removed = 0;
         for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
-            removed +=
-                delete_nft_rules_in_chain(chain, |line| is_orphan_taritd_nft_rule(line, active))?;
+            removed += delete_nft_rules_in_chain(chain, |line| {
+                is_recognized_taritd_rule(chain, line) && is_orphan_taritd_nft_rule(line, active)
+            })?;
         }
         Ok(removed)
     }
@@ -1052,8 +1115,30 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), O
     let text = serde_json::to_string_pretty(&state)
         .map_err(|e| OrchError::Internal(format!("encode net state: {e}")))?;
     let tmp = state_write_path(path);
-    std::fs::write(&tmp, text)
-        .map_err(|e| OrchError::Internal(format!("write net state {}: {e}", tmp.display())))?;
+    let mut file = {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(&tmp).map_err(|e| {
+            OrchError::Internal(format!("create net state temp {}: {e}", tmp.display()))
+        })?
+    };
+    if let Err(error) = file
+        .write_all(text.as_bytes())
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(OrchError::Internal(format!(
+            "write durable net state {}: {error}",
+            tmp.display()
+        )));
+    }
+    drop(file);
     std::fs::rename(&tmp, path).map_err(|e| {
         OrchError::Internal(format!(
             "replace net state {} with {}: {e}",
@@ -1061,6 +1146,15 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), O
             tmp.display()
         ))
     })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| {
+            OrchError::Internal(format!(
+                "sync net state directory {}: {e}",
+                parent.display()
+            ))
+        })?;
     Ok(())
 }
 
@@ -1528,7 +1622,10 @@ fn discover_strict_tap_names() -> Result<Vec<String>, OrchError> {
     strict_tap_names_from_link_json(&command_stdout("ip", &["-j", "link", "show"])?)
 }
 
-fn contain_existing_tarit_taps_before_recovery() -> Result<(), OrchError> {
+/// Quarantine pre-existing strict Tarit TAPs before any configuration, database,
+/// image, or VM discovery can fail. Repeating this is safe: lowering an already
+/// down TAP is idempotent.
+pub fn startup_preflight() -> Result<Vec<String>, OrchError> {
     let taps = match discover_strict_tap_names() {
         Ok(taps) => taps,
         Err(error) => {
@@ -1538,13 +1635,13 @@ fn contain_existing_tarit_taps_before_recovery() -> Result<(), OrchError> {
             ))
         }
     };
-    let failures = emergency_isolate_tap_names(&taps);
-    if failures.is_empty() {
-        Ok(())
+    let isolation = emergency_isolate_tap_names(&taps);
+    if isolation.failures.is_empty() {
+        Ok(taps)
     } else {
         Err(catastrophic_startup_containment_error(
             "contain pre-existing Tarit TAPs before recovery",
-            failures,
+            isolation.failures,
         ))
     }
 }
@@ -1564,25 +1661,39 @@ fn catastrophic_startup_containment_error(context: &str, mut failures: Vec<Strin
     ))
 }
 
-fn emergency_isolate_tap_names(taps: &[String]) -> Vec<String> {
-    let mut failures = Vec::new();
+#[derive(Default)]
+struct IsolationReport {
+    contained: BTreeSet<String>,
+    failures: Vec<String>,
+}
+
+fn emergency_isolate_tap_names(taps: &[String]) -> IsolationReport {
+    let mut report = IsolationReport::default();
     for tap in taps {
-        if let Err(link_down_error) = run("ip", &["link", "set", tap, "down"]) {
-            failures.push(format!(
-                "emergency link-down failed for {tap}: {link_down_error}"
-            ));
-            match run("ip", &["link", "del", tap]) {
-                Ok(()) => tracing::warn!(
-                    tap,
-                    "net: deleted recovered tap after link-down isolation failed"
-                ),
-                Err(link_delete_error) => failures.push(format!(
-                    "emergency link-delete failed for {tap}: {link_delete_error}"
-                )),
+        match run("ip", &["link", "set", tap, "down"]) {
+            Ok(()) => {
+                report.contained.insert(tap.clone());
+            }
+            Err(link_down_error) => {
+                report.failures.push(format!(
+                    "emergency link-down failed for {tap}: {link_down_error}"
+                ));
+                match run("ip", &["link", "del", tap]) {
+                    Ok(()) => {
+                        report.contained.insert(tap.clone());
+                        tracing::warn!(
+                            tap,
+                            "net: deleted recovered tap after link-down isolation failed"
+                        );
+                    }
+                    Err(link_delete_error) => report.failures.push(format!(
+                        "emergency link-delete failed for {tap}: {link_delete_error}"
+                    )),
+                }
             }
         }
     }
-    failures
+    report
 }
 
 fn emergency_forwarding_disable_argv() -> Vec<Vec<String>> {
@@ -1846,7 +1957,10 @@ fn recovery_quarantine_delete_script(allocations: &[NetAlloc]) -> Result<String,
         for alloc in allocations {
             let handles = listing
                 .lines()
-                .filter(|line| is_recovery_quarantine_rule_for_alloc(line, alloc))
+                .filter(|line| {
+                    is_recognized_taritd_rule(chain, line)
+                        && is_recovery_quarantine_rule_for_alloc(line, alloc)
+                })
                 .filter_map(nft_handle)
                 .collect::<Vec<_>>();
             if handles.is_empty() {
@@ -2064,7 +2178,10 @@ fn egress_replacement_script(
 ) -> Result<String, OrchError> {
     let mut commands = listing
         .lines()
-        .filter(|line| is_egress_nft_rule_for_alloc(line, alloc))
+        .filter(|line| {
+            is_recognized_taritd_rule(NFT_FWD_CHAIN, line)
+                && is_egress_nft_rule_for_alloc(line, alloc)
+        })
         .map(|line| {
             nft_handle(line).ok_or_else(|| {
                 OrchError::Internal(format!(
@@ -2215,9 +2332,67 @@ fn is_orphan_taritd_nft_rule(line: &str, active: &BTreeMap<u32, Uuid>) -> bool {
         .is_some_and(|tag| active.get(&tag.slot).copied() != Some(tag.vm_id))
 }
 
-fn security_chain_rule_text(line: &str) -> Option<&str> {
+fn security_chain_rule_text(line: &str) -> Option<String> {
     let (rule, _) = line.rsplit_once(" comment \"")?;
-    Some(rule.trim())
+    let words = rule.split_whitespace().collect::<Vec<_>>();
+    let mut normalized = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        if words[index] == "counter"
+            && matches!(
+                words.get(index + 1..index + 5),
+                Some(["packets", packets, "bytes", bytes])
+                    if packets.bytes().all(|byte| byte.is_ascii_digit())
+                        && bytes.bytes().all(|byte| byte.is_ascii_digit())
+            )
+        {
+            normalized.push("counter");
+            index += 5;
+        } else {
+            normalized.push(words[index]);
+            index += 1;
+        }
+    }
+    Some(normalized.join(" "))
+}
+
+fn is_recognized_taritd_rule(chain: &str, line: &str) -> bool {
+    let Some(tag) = parse_taritd_nft_rule_tag(line) else {
+        return false;
+    };
+    let Some(rule) = security_chain_rule_text(line) else {
+        return false;
+    };
+    match chain {
+        NFT_CHAIN => {
+            let tap = nft_quote(&tag.tap);
+            let Some(alloc) = NetAlloc::for_slot(tag.vm_id, tag.slot).ok() else {
+                return false;
+            };
+            tag.kind == TaritdNftRuleKind::Nat
+                && valid_masquerade_rule(&rule, &tap, &alloc.guest_ip)
+        }
+        NFT_FWD_CHAIN | NFT_INPUT_CHAIN => valid_taritd_security_rule(chain, &rule, &tag).is_some(),
+        _ => false,
+    }
+}
+
+fn validate_taritd_nat_chain(listing: &str) -> Result<(), OrchError> {
+    for line in listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if !line.contains("comment \"taritd") {
+            continue;
+        }
+        if !is_recognized_taritd_rule(NFT_CHAIN, line) {
+            return Err(OrchError::Internal(format!(
+                "net: refusing activation: invalid tagged rule shape in {NFT_CHAIN}: {line}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_taritd_security_chain(chain: &str, listing: &str) -> Result<(), OrchError> {
@@ -2248,7 +2423,7 @@ fn validate_taritd_security_chain(chain: &str, listing: &str) -> Result<(), Orch
                 "net: refusing activation: malformed managed rule in {chain}: {line}"
             )));
         };
-        let role = valid_taritd_security_rule(chain, rule, &tag).ok_or_else(|| {
+        let role = valid_taritd_security_rule(chain, &rule, &tag).ok_or_else(|| {
             OrchError::Internal(format!(
                 "net: refusing activation: invalid managed rule shape in {chain}: {line}"
             ))
@@ -2361,6 +2536,19 @@ fn valid_uplink_guard_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
     matches!(
         words.as_slice(),
         ["iifname", interface, "ip", "saddr", source, "oifname", "!=", uplink, "drop"]
+            if *interface == tap
+                && *source == guest_ip
+                && uplink.starts_with('"')
+                && uplink.ends_with('"')
+                && uplink.len() > 2
+    )
+}
+
+fn valid_masquerade_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
+    let words = rule.split_whitespace().collect::<Vec<_>>();
+    matches!(
+        words.as_slice(),
+        ["iifname", interface, "ip", "saddr", source, "oifname", uplink, "masquerade"]
             if *interface == tap
                 && *source == guest_ip
                 && uplink.starts_with('"')
@@ -3827,6 +4015,7 @@ esac
         let recovered = NetAlloc::for_slot(vm_id, 7).unwrap();
         let provisioner = NetProvisioner {
             inner: Mutex::new(allocator),
+            egress_updates: EgressUpdateLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
         };
@@ -4185,6 +4374,17 @@ esac
         assert!(result.is_err());
         let commands = std::fs::read_to_string(&log).unwrap();
         let quarantine_script = std::fs::read_to_string(&quarantine).unwrap();
+        let first_cleanup = commands
+            .find("nft delete rule ip taritd_nat post handle 11")
+            .unwrap();
+        for tap in ["insta7", "insta8"] {
+            assert!(
+                commands
+                    .rfind(&format!("ip link set {tap} down"))
+                    .is_some_and(|index| index < first_cleanup),
+                "cleanup began before the late containment of {tap}:\n{commands}"
+            );
+        }
         for expected in [
             "taritd-recovery-quarantine slot=7",
             "taritd-recovery-quarantine slot=8",
@@ -4649,6 +4849,7 @@ esac
         allocator.by_vm.insert(vm_id, 7);
         let provisioner = NetProvisioner {
             inner: Mutex::new(allocator),
+            egress_updates: EgressUpdateLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
         };
@@ -4764,5 +4965,105 @@ esac
                 argv(&["sysctl", "-qw", "net.ipv6.conf.all.forwarding=0"]),
             ]
         );
+    }
+
+    #[test]
+    fn security_chain_accepts_real_nft_counter_output() {
+        let alloc = NetAlloc::for_idx(7);
+        let listing = format!(
+            "iifname \"insta7\" ip saddr != 172.16.0.30 counter packets 17 bytes 4096 drop comment \"{}\" # handle 41",
+            guard_comment(&alloc)
+        );
+
+        assert!(validate_taritd_security_chain(NFT_FWD_CHAIN, &listing).is_ok());
+    }
+
+    #[test]
+    fn unknown_tagged_egress_shape_is_not_selected_for_deletion() {
+        let alloc = NetAlloc::for_idx(7);
+        let listing = format!(
+            "iifname \"insta7\" ip saddr 172.16.0.30 tcp flags syn accept comment \"{}\" # handle 55",
+            egress_comment(&alloc)
+        );
+
+        let replacement = egress_replacement_script(
+            &alloc,
+            &EgressPolicy {
+                allowlist: Vec::new(),
+                allow_existing: false,
+            },
+            &listing,
+        )
+        .unwrap();
+
+        assert!(!replacement.contains("handle 55"), "{replacement}");
+        assert!(validate_taritd_security_chain(NFT_FWD_CHAIN, &listing).is_err());
+
+        let malformed_nat = format!(
+            "iifname \"insta7\" ip saddr 172.16.0.30 accept comment \"{}\" # handle 56",
+            nft_comment(&alloc)
+        );
+        assert!(!is_recognized_taritd_rule(NFT_CHAIN, &malformed_nat));
+        assert!(validate_taritd_nat_chain(&malformed_nat).is_err());
+    }
+
+    #[test]
+    fn persisted_network_state_is_private_and_has_no_leftover_temp_file() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-state-persistence-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+
+        persist_entries(&state_path, Vec::new()).unwrap();
+
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(std::fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("\"version\": 2"));
+        assert!(!state_write_path(&state_path).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn egress_update_lock_serializes_concurrent_transactions() {
+        let lock = std::sync::Arc::new(EgressUpdateLock::default());
+        let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let lock = std::sync::Arc::clone(&lock);
+            let in_flight = std::sync::Arc::clone(&in_flight);
+            let maximum = std::sync::Arc::clone(&maximum);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                lock.run(|| {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
     }
 }

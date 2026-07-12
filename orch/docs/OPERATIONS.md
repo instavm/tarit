@@ -206,9 +206,13 @@ When enabled, `taritd`:
    VM pool; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
-On startup, `taritd` first enumerates strict `insta<N>` names with structured
-`ip -j link` output and lowers them before any uplink or state-file discovery.
-It then reconciles the persisted map with live local VM records, validates the
+Before loading configuration, opening a database, resolving images, or looking
+up VMs, `taritd` enumerates strict `insta<N>` names with structured `ip -j
+link` output and lowers them. A containment, VM-list, or recovery error is
+fatal: no supervisor or HTTP listener is published. Network-disabled startup
+is allowed only when that preflight found no Tarit TAP and there are no local
+live VM records requiring recovery. It then reconciles the persisted map with
+live local VM records, validates the
 required nft base-chain hooks, and atomically inserts top-of-chain forward and
 input drop quarantines for every recovered TAP. It removes Tarit-owned stale
 policy for all their slots and programs and verifies every netdev IPv4/ARP,
@@ -219,10 +223,13 @@ policy while all TAPs remain contained.
 every rule relevant to a recovered TAP must have a recognized Tarit comment and
 the exact managed rule shape. Operator or ambiguous rules are preserved but
 make recovery fail closed; no TAP is activated behind an earlier ambiguous
-accept. The completed allocator state is persisted before quarantines release.
+accept. The completed allocator state is persisted before quarantines release
+using a mode-0600 temp file, write/flush/file sync, atomic rename, and parent
+directory sync.
 Live egress updates likewise install a top-of-chain quarantine, replace all
 egress rules in one nft transaction, verify the effective stateful-return,
-allow, and final default-deny ordering, persist, and only then release.
+allow, and final default-deny ordering, durably persist, and only then release.
+Updates are serialized across the host-owned nft/state transaction.
 
 A containment or reconciliation failure cleans partial policy and keeps every
 TAP down or quarantined. If quarantine installation fails, `taritd` also
