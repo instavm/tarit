@@ -13,10 +13,13 @@ ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-RUN_DIR="$TARITD_HOME/egress-recovery"
+RUN_ROOT="$TARITD_HOME/egress-recovery-runs"
+LOCK_FILE="$TARITD_HOME/egress-recovery.lock"
+RUN_DIR=
 ROOTFS="$RUN_DIR/rootfs.ext4"
 SERVER_LOG="$RUN_DIR/taritd.log"
 SERVER_PID=
+SERVER_START_TICKS=
 VM_A=
 VM_B=
 VM_C=
@@ -28,7 +31,7 @@ fail() {
   exit 1
 }
 
-for command in curl ip nft python3 sysctl timeout; do
+for command in curl flock ip nft python3 sysctl timeout; do
   command -v "$command" >/dev/null || fail "required host command is missing: $command"
 done
 [ -x "$TARIT" ] || fail "taritd binary is not executable: $TARIT"
@@ -45,6 +48,15 @@ if not 1 <= port <= 65535:
     raise ValueError("port out of range")
 PY
 
+umask 077
+mkdir -p "$RUN_ROOT"
+exec 9>"$LOCK_FILE"
+flock -n 9 || fail "another egress recovery run already holds $LOCK_FILE"
+RUN_DIR="$RUN_ROOT/run-$(date +%s)-$$-$RANDOM"
+mkdir "$RUN_DIR" || fail "could not create run directory $RUN_DIR"
+ROOTFS="$RUN_DIR/rootfs.ext4"
+SERVER_LOG="$RUN_DIR/taritd.log"
+
 export TARIT_API_KEY="egress-recovery-key"
 export TARIT_LISTEN="127.0.0.1:8080"
 export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
@@ -59,28 +71,43 @@ export TARIT_NET_STATE="$RUN_DIR/net.json"
 export TARIT_CONFIG="$RUN_DIR/empty.toml"
 export TARIT_BASE_URL="http://127.0.0.1:8080"
 
+server_pid_is_current() {
+  [ -n "$SERVER_PID" ] &&
+    [ -n "$SERVER_START_TICKS" ] &&
+    kill -0 "$SERVER_PID" 2>/dev/null &&
+    [ -r "/proc/$SERVER_PID/stat" ] &&
+    [ "$(awk '{print $22}' "/proc/$SERVER_PID/stat")" = "$SERVER_START_TICKS" ]
+}
+
 start_taritd() {
   "$TARIT" serve >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
+  SERVER_START_TICKS=$(awk '{print $22}' "/proc/$SERVER_PID/stat") ||
+    fail "could not read launched taritd start time"
   for _ in $(seq 1 40); do
-    curl -fsS "$TARIT_BASE_URL/health" >/dev/null 2>&1 && return
+    server_pid_is_current &&
+      curl -fsS "$TARIT_BASE_URL/health" >/dev/null 2>&1 &&
+      return
     sleep 1
   done
   cat "$SERVER_LOG" >&2
-  fail "taritd did not become healthy"
+  fail "launched taritd did not remain healthy"
 }
 
 stop_taritd() {
   [ -n "$SERVER_PID" ] || return
-  kill "$SERVER_PID" 2>/dev/null || true
-  wait "$SERVER_PID" 2>/dev/null || true
+  if server_pid_is_current; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
   SERVER_PID=
+  SERVER_START_TICKS=
 }
 
 delete_vm() {
   local vm_id=$1
   [ -n "$vm_id" ] || return
-  [ -n "$SERVER_PID" ] || return
+  server_pid_is_current || return
   "$TARIT" vm delete "$vm_id" >/dev/null
 }
 
@@ -92,7 +119,7 @@ cleanup() {
   if [ "$IPV6_FORWARDING_CHANGED" = 1 ]; then
     sysctl -qw "net.ipv6.conf.all.forwarding=$IPV6_FORWARDING" || true
   fi
-  rm -rf "$RUN_DIR"
+  [ -n "$RUN_DIR" ] && rm -rf -- "$RUN_DIR"
 }
 trap cleanup EXIT
 
@@ -162,6 +189,28 @@ wait_for_guest_listener() {
   fail "$protocol listener on guest $vm_id port $port was not ready"
 }
 
+wait_for_host_ipv6_address() {
+  local tap=$1 address=$2
+  for _ in $(seq 1 20); do
+    ip -6 addr show dev "$tap" scope global |
+      grep -F "$address/" |
+      grep -vq tentative &&
+      return
+    sleep 1
+  done
+  fail "IPv6 address $address on $tap did not complete DAD"
+}
+
+wait_for_guest_ipv6_address() {
+  local vm_id=$1 address=$2
+  for _ in $(seq 1 20); do
+    run_guest "$vm_id" "ip -6 addr show dev eth0 scope global | grep -F '$address/' | grep -vq tentative"
+    [ "$GUEST_STATUS" = 0 ] && return
+    sleep 1
+  done
+  fail "guest $vm_id IPv6 address $address did not complete DAD"
+}
+
 require_rule() {
   local text=$1 expected=$2
   grep -F -- "$expected" <<<"$text" >/dev/null ||
@@ -209,8 +258,6 @@ forged_source_drop_packets() {
 }
 
 mkdir -p "$TARIT_SOCKET_DIR"
-rm -rf "$RUN_DIR"
-mkdir -p "$TARIT_SOCKET_DIR"
 : >"$TARIT_CONFIG"
 cp -f "$BASE_ROOTFS" "$ROOTFS"
 
@@ -254,18 +301,57 @@ FORGED_DROPS_AFTER=$(forged_source_drop_packets "$TAP_A" "$GUEST_A")
   fail "forged-source packet did not increment the host source-guard counter"
 expect_guest_success "$VM_A" 'ip addr del 172.16.255.250/32 dev eth0'
 
-# Configure a routable IPv6 subnet at both ends while host forwarding is on.
-# Without the netdev ingress guard, the guest would have a real host path.
+# Configure distinct routed IPv6 prefixes for both guests while host forwarding
+# is forced on. Without the netdev ingress guard, guest A can route through the
+# host to guest B.
 IPV6_FORWARDING=$(sysctl -n net.ipv6.conf.all.forwarding)
 IPV6_FORWARDING_CHANGED=1
-sysctl -qw net.ipv6.conf.all.forwarding=1
-IPV6_HOST_A=2001:db8:7::1
-IPV6_GUEST_A=2001:db8:7::2
-sysctl -qw "net.ipv6.conf.$TAP_A.disable_ipv6=0"
-sysctl -qw "net.ipv6.conf.$TAP_A.forwarding=1"
-ip -6 addr replace "$IPV6_HOST_A/64" dev "$TAP_A"
-expect_guest_success "$VM_A" "sysctl -qw net.ipv6.conf.all.disable_ipv6=0; sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0; ip -6 addr replace $IPV6_GUEST_A/64 dev eth0; ip -6 route replace default via $IPV6_HOST_A dev eth0"
-expect_guest_denial "$VM_A" "ping -6 -I eth0 -c 1 -W 2 $IPV6_HOST_A"
+sysctl -qw net.ipv6.conf.all.forwarding=1 ||
+  fail "could not force host IPv6 forwarding"
+IPV6_PREFIX_A=2001:db8:7:1::/64
+IPV6_PREFIX_B=2001:db8:7:2::/64
+IPV6_HOST_A=2001:db8:7:1::1
+IPV6_GUEST_A=2001:db8:7:1::2
+IPV6_HOST_B=2001:db8:7:2::1
+IPV6_GUEST_B=2001:db8:7:2::2
+for tap in "$TAP_A" "$TAP_B"; do
+  sysctl -qw "net.ipv6.conf.$tap.disable_ipv6=0" ||
+    fail "could not enable IPv6 on $tap for the forwarding-path test"
+  sysctl -qw "net.ipv6.conf.$tap.forwarding=1" ||
+    fail "could not enable IPv6 forwarding on $tap"
+  sysctl -qw "net.ipv6.conf.$tap.accept_ra=0" ||
+    fail "could not disable IPv6 router advertisements on $tap"
+done
+ip -6 addr replace "$IPV6_HOST_A/64" dev "$TAP_A" ||
+  fail "could not configure $IPV6_HOST_A on $TAP_A"
+ip -6 addr replace "$IPV6_HOST_B/64" dev "$TAP_B" ||
+  fail "could not configure $IPV6_HOST_B on $TAP_B"
+wait_for_host_ipv6_address "$TAP_A" "$IPV6_HOST_A"
+wait_for_host_ipv6_address "$TAP_B" "$IPV6_HOST_B"
+
+for vm_id in "$VM_A" "$VM_B"; do
+  expect_guest_success "$vm_id" 'sysctl -qw net.ipv6.conf.all.disable_ipv6=0'
+  expect_guest_success "$vm_id" 'sysctl -qw net.ipv6.conf.eth0.disable_ipv6=0'
+  expect_guest_success "$vm_id" 'sysctl -qw net.ipv6.conf.eth0.accept_ra=0'
+done
+expect_guest_success "$VM_A" "ip -6 addr replace $IPV6_GUEST_A/64 dev eth0"
+expect_guest_success "$VM_B" "ip -6 addr replace $IPV6_GUEST_B/64 dev eth0"
+wait_for_guest_ipv6_address "$VM_A" "$IPV6_GUEST_A"
+wait_for_guest_ipv6_address "$VM_B" "$IPV6_GUEST_B"
+expect_guest_success "$VM_A" "ip -6 route replace $IPV6_PREFIX_B via $IPV6_HOST_A dev eth0"
+expect_guest_success "$VM_B" "ip -6 route replace $IPV6_PREFIX_A via $IPV6_HOST_B dev eth0"
+expect_guest_success "$VM_A" "ip -6 route get $IPV6_GUEST_B | grep -F 'via $IPV6_HOST_A dev eth0'"
+expect_guest_success "$VM_B" "ip -6 route get $IPV6_GUEST_A | grep -F 'via $IPV6_HOST_B dev eth0'"
+ip -6 route get "$IPV6_GUEST_B" from "$IPV6_HOST_A" |
+  grep -F "dev $TAP_B" >/dev/null ||
+  fail "host lacks a routed IPv6 path from $TAP_A to $TAP_B"
+nft list table netdev "taritd_ingress_${TAP_A#insta}" |
+  grep -F "policy drop" >/dev/null ||
+  fail "missing IPv6 netdev default-deny on $TAP_A"
+nft list table netdev "taritd_ingress_${TAP_B#insta}" |
+  grep -F "policy drop" >/dev/null ||
+  fail "missing IPv6 netdev default-deny on $TAP_B"
+expect_guest_denial "$VM_A" "ping -6 -I eth0 -c 1 -W 3 $IPV6_GUEST_B"
 
 # A guest cannot initiate host-local traffic through its TAP.
 expect_guest_denial "$VM_A" "ping -c 1 -W 2 $UPLINK_IP"

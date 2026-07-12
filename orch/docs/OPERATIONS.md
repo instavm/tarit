@@ -196,7 +196,8 @@ When enabled, `taritd`:
 4. Allocates one reusable slot per VM from the 172.16.0.0/16 `/30` pool.
 5. Creates one tap per VM named `insta<N>` where `N` is the slot.
 6. Gives each VM a deterministic private `/30`: host `.1`, guest `.2`.
-7. Persists the slot map in `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers it on restart.
+7. Persists the slot map and each allocation's egress allowlist/default-deny policy in
+   `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers both on restart.
 8. Adds a per-slot nftables masquerade rule tagged with an `taritd` comment.
 9. Installs per-tap forward guards before bringing the tap up: guest traffic may
    leave only through the detected uplink and cannot target the `172.16.0.0/16`
@@ -208,15 +209,17 @@ It validates the required nft base-chain hooks before atomically inserting
 top-of-chain forward and input drop quarantines for every recovered TAP. It
 then takes every recovered TAP down, removes Tarit-owned stale policy for all
 their slots, and programs and verifies every netdev IPv4/ARP, source,
-VM-pool lateral, uplink, host-input, and masquerade guard while all TAPs remain
-contained. Only after the entire set is ready does it raise the links and
+VM-pool lateral, uplink, host-input, masquerade, and persisted egress policy
+while all TAPs remain contained. Missing legacy egress state fails recovery
+closed instead of restoring default-open forwarding. It completes any
+failure-prone stale/orphan sweep while contained and preserves ingress tables
+whose exact allocation identity cannot be proven. Only after the entire set is
+ready does it raise the links and
 atomically remove every quarantine. A containment or reconciliation failure
 cleans partial policy and keeps every TAP down; if a link cannot be lowered,
 `taritd` attempts to delete it as a last-resort kernel isolation step. Startup
-therefore fails closed rather than exposing a partial recovered set. It then runs an age-gated sweep
-for stale `insta<N>` taps and orphaned `taritd` nftables rules. Stop/delete
-teardown is idempotent and best-effort for tap deletion, nft cleanup, and slot
-freeing.
+therefore fails closed rather than exposing a partial recovered set. Stop/delete
+teardown is idempotent and best-effort for tap deletion, nft cleanup, and slot freeing.
 
 Requirements:
 

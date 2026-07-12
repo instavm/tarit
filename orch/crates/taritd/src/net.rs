@@ -131,15 +131,6 @@ impl NetProvisioner {
                 .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
             persist_allocator(&provisioner.state_path, &allocator)?;
         }
-        let report = provisioner.sweep_orphans()?;
-        if report.has_work() {
-            tracing::info!(
-                taps_removed = report.taps_removed,
-                nft_rules_removed = report.nft_rules_removed,
-                ingress_tables_removed = report.ingress_tables_removed,
-                "net: startup stale sweep completed"
-            );
-        }
         Ok(provisioner)
     }
 
@@ -160,7 +151,8 @@ impl NetProvisioner {
             alloc
         };
 
-        if let Err(e) = self.provision_host(&alloc) {
+        let policy = self.egress_policy_for(&alloc)?;
+        if let Err(e) = self.provision_host(&alloc, &policy) {
             self.best_effort_delete(&alloc);
             self.free_allocation(&alloc);
             return Err(e);
@@ -191,9 +183,18 @@ impl NetProvisioner {
         // Build every rule before touching nft, so a bad rule cannot leave a
         // half-applied policy (default-open) on the host.
         let rules = egress_policy_argv(alloc, allowlist, allow_existing)?;
-        self.delete_egress_rules_for_alloc(alloc)?;
+        let policy = EgressPolicy {
+            allowlist: allowlist.to_vec(),
+            allow_existing,
+        };
+        self.persist_egress_policy(alloc, policy)?;
+        if let Err(error) = self.delete_egress_rules_for_alloc(alloc) {
+            return Err(self.fail_egress_update(alloc, error));
+        }
         for argv in rules {
-            run_argv(&argv)?;
+            if let Err(error) = run_argv(&argv) {
+                return Err(self.fail_egress_update(alloc, error));
+            }
         }
         Ok(allowlist.len())
     }
@@ -223,18 +224,65 @@ impl NetProvisioner {
         }
     }
 
-    fn provision_host(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+    fn provision_host(&self, alloc: &NetAlloc, policy: &EgressPolicy) -> Result<(), OrchError> {
         let tap = tap_name(alloc.idx);
         let _ = run("ip", &["link", "del", &tap]);
         self.delete_nft_rules_for_slot(alloc.idx)?;
         for argv in tap_provision_argv(alloc, &self.uplink) {
             run_argv(&argv)?;
         }
-        self.add_nft_rule(alloc)
+        self.add_nft_rule(alloc)?;
+        self.install_egress_policy(alloc, policy)?;
+        run("ip", &["link", "set", &alloc.tap, "up"])
     }
 
     fn add_nft_rule(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
         run_argv(&masquerade_nft_argv(alloc, &self.uplink))
+    }
+
+    fn egress_policy_for(&self, alloc: &NetAlloc) -> Result<EgressPolicy, OrchError> {
+        self.inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?
+            .egress_policy_for(alloc)
+    }
+
+    fn persist_egress_policy(
+        &self,
+        alloc: &NetAlloc,
+        policy: EgressPolicy,
+    ) -> Result<(), OrchError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+        let previous = inner.replace_egress_policy(alloc, policy)?;
+        if let Err(error) = persist_allocator(&self.state_path, &inner) {
+            inner.egress_by_vm.insert(alloc.vm_id, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn install_egress_policy(
+        &self,
+        alloc: &NetAlloc,
+        policy: &EgressPolicy,
+    ) -> Result<(), OrchError> {
+        for argv in egress_policy_argv(alloc, &policy.allowlist, policy.allow_existing)? {
+            run_argv(&argv)?;
+        }
+        Ok(())
+    }
+
+    fn fail_egress_update(&self, alloc: &NetAlloc, error: OrchError) -> OrchError {
+        match run("ip", &["link", "set", &alloc.tap, "down"]) {
+            Ok(()) => error,
+            Err(isolation_error) => OrchError::Internal(format!(
+                "net: update egress policy for {}: {error}; failed to isolate tap: {isolation_error}",
+                alloc.tap
+            )),
+        }
     }
 
     fn recovered_allocations(&self) -> Result<Vec<NetAlloc>, OrchError> {
@@ -261,6 +309,15 @@ impl NetProvisioner {
                 "net: cannot isolate recovered allocations before reconciliation: {}",
                 isolation_failures.join("; ")
             )));
+        }
+        for alloc in allocations {
+            if let Err(error) = self.egress_policy_for(alloc) {
+                return Err(self.recovery_failure_after_emergency_isolation(
+                    allocations,
+                    "load persisted recovered egress policy",
+                    error,
+                ));
+            }
         }
 
         for alloc in allocations {
@@ -290,6 +347,24 @@ impl NetProvisioner {
             }
         }
 
+        let report = match self.sweep_orphans() {
+            Ok(report) => report,
+            Err(error) => {
+                return Err(self.recovery_failure_after_cleanup(
+                    allocations,
+                    "sweep stale networking artifacts",
+                    error,
+                ));
+            }
+        };
+        if report.has_work() {
+            tracing::info!(
+                taps_removed = report.taps_removed,
+                nft_rules_removed = report.nft_rules_removed,
+                ingress_tables_removed = report.ingress_tables_removed,
+                "net: startup stale sweep completed"
+            );
+        }
         self.activate_recovered_allocations(allocations)
             .map_err(|error| {
                 self.recovery_failure_after_cleanup(
@@ -391,7 +466,8 @@ impl NetProvisioner {
         for argv in recovered_tap_reconcile_argv(alloc, &self.uplink) {
             run_argv(&argv)?;
         }
-        self.add_nft_rule(alloc)
+        self.add_nft_rule(alloc)?;
+        self.install_egress_policy(alloc, &self.egress_policy_for(alloc)?)
     }
 
     fn verify_recovered_allocation_policy(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -437,6 +513,21 @@ impl NetProvisioner {
                 )));
             }
         }
+        let policy = self.egress_policy_for(alloc)?;
+        let expected_egress = egress_policy_argv(alloc, &policy.allowlist, policy.allow_existing)?;
+        let forward = command_stdout(
+            "nft",
+            &["-a", "list", "chain", "ip", NFT_TABLE, NFT_FWD_CHAIN],
+        )?;
+        for rule in expected_egress {
+            let expected = rule[6..].join(" ");
+            if !forward.contains(&expected) {
+                return Err(OrchError::Internal(format!(
+                    "net: recovered tap {} is missing persisted egress policy rule {expected:?}",
+                    alloc.tap
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -449,7 +540,7 @@ impl NetProvisioner {
                     alloc.tap
                 ));
             }
-            if let Err(error) = delete_ingress_table_for_slot(alloc.idx) {
+            if let Err(error) = delete_ingress_table_for_alloc(alloc) {
                 failures.push(format!(
                     "partial recovered ingress cleanup failed for {}: {error}",
                     alloc.tap
@@ -506,17 +597,19 @@ impl NetProvisioner {
         let mut report = SweepReport::default();
         for tap in stale_taps {
             if let Some(slot) = slot_from_tap(&tap.name) {
-                match self.delete_nft_rules_for_slot(slot) {
-                    Ok(n) => report.nft_rules_removed += n,
-                    Err(e) => {
-                        tracing::warn!(tap = %tap.name, slot, "net: failed to delete stale tap nft rule(s): {e}")
-                    }
+                let removed = self.delete_nft_rules_for_slot(slot)?;
+                report.nft_rules_removed += removed;
+                if removed == 0 {
+                    tracing::debug!(
+                        tap = %tap.name,
+                        slot,
+                        "net: preserving unowned stale-named tap without Tarit policy"
+                    );
+                    continue;
                 }
             }
-            match run("ip", &["link", "del", &tap.name]) {
-                Ok(()) => report.taps_removed += 1,
-                Err(e) => tracing::warn!(tap = %tap.name, "net: failed to delete stale tap: {e}"),
-            }
+            run("ip", &["link", "del", &tap.name])?;
+            report.taps_removed += 1;
         }
 
         report.nft_rules_removed += self.delete_orphan_nft_rules(&active)?;
@@ -530,7 +623,7 @@ impl NetProvisioner {
             removed +=
                 delete_nft_rules_in_chain(chain, |line| is_taritd_nft_rule_for_alloc(line, alloc))?;
         }
-        removed += delete_ingress_table_for_slot(alloc.idx)?;
+        removed += delete_ingress_table_for_alloc(alloc)?;
         Ok(removed)
     }
 
@@ -551,7 +644,7 @@ impl NetProvisioner {
                 is_stale_recovery_rule_for_alloc(line, alloc)
             })?;
         }
-        removed += delete_ingress_table_for_slot(alloc.idx)?;
+        removed += delete_ingress_table_for_alloc(alloc)?;
         Ok(removed)
     }
 
@@ -561,7 +654,6 @@ impl NetProvisioner {
             removed +=
                 delete_nft_rules_in_chain(chain, |line| is_taritd_nft_rule_for_slot(line, slot))?;
         }
-        removed += delete_ingress_table_for_slot(slot)?;
         Ok(removed)
     }
 
@@ -578,15 +670,10 @@ impl NetProvisioner {
         &self,
         active: &BTreeMap<u32, Uuid>,
     ) -> Result<usize, OrchError> {
-        let active_slots = active.keys().copied().collect::<HashSet<_>>();
-        let tables = ingress_table_names()?;
-        let stale = stale_ingress_tables_to_sweep(&tables, &active_slots);
-        for table in &stale {
-            let slot = ingress_slot_from_table_name(table)
-                .expect("stale ingress table names are parsed from the fixed prefix");
-            run_argv(&delete_ingress_table_argv(slot))?;
-        }
-        Ok(stale.len())
+        let _ = active;
+        // A table name only encodes a slot. Without a recovered or explicitly
+        // torn-down allocation we cannot prove its VM identity, so preserve it.
+        Ok(0)
     }
 }
 
@@ -608,6 +695,13 @@ struct SlotAllocator {
     free: BTreeSet<u32>,
     by_slot: BTreeMap<u32, Uuid>,
     by_vm: HashMap<Uuid, u32>,
+    egress_by_vm: HashMap<Uuid, Option<EgressPolicy>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct EgressPolicy {
+    allowlist: Vec<String>,
+    allow_existing: bool,
 }
 
 impl SlotAllocator {
@@ -616,25 +710,33 @@ impl SlotAllocator {
             free: (0..NET_POOL_SLOTS).collect(),
             by_slot: BTreeMap::new(),
             by_vm: HashMap::new(),
+            egress_by_vm: HashMap::new(),
         }
     }
 
     fn from_entries(entries: Vec<NetStateEntry>, live_vm_ids: &HashSet<Uuid>) -> (Self, usize) {
         let mut allocator = Self::empty();
         let mut dropped = 0;
-        for entry in entries {
-            if !live_vm_ids.contains(&entry.vm_id)
-                || entry.slot >= NET_POOL_SLOTS
-                || entry.tap != tap_name(entry.slot)
-                || allocator.by_slot.contains_key(&entry.slot)
-                || allocator.by_vm.contains_key(&entry.vm_id)
+        for NetStateEntry {
+            slot,
+            vm_id,
+            tap,
+            egress,
+        } in entries
+        {
+            if !live_vm_ids.contains(&vm_id)
+                || slot >= NET_POOL_SLOTS
+                || tap != tap_name(slot)
+                || allocator.by_slot.contains_key(&slot)
+                || allocator.by_vm.contains_key(&vm_id)
             {
                 dropped += 1;
                 continue;
             }
-            allocator.free.remove(&entry.slot);
-            allocator.by_slot.insert(entry.slot, entry.vm_id);
-            allocator.by_vm.insert(entry.vm_id, entry.slot);
+            allocator.free.remove(&slot);
+            allocator.by_slot.insert(slot, vm_id);
+            allocator.by_vm.insert(vm_id, slot);
+            allocator.egress_by_vm.insert(vm_id, egress);
         }
         (allocator, dropped)
     }
@@ -653,6 +755,8 @@ impl SlotAllocator {
         };
         self.by_slot.insert(slot, vm_id);
         self.by_vm.insert(vm_id, slot);
+        self.egress_by_vm
+            .insert(vm_id, Some(EgressPolicy::default()));
         NetAlloc::for_slot(vm_id, slot)
     }
 
@@ -661,11 +765,13 @@ impl SlotAllocator {
             Some(slot) => {
                 self.by_slot.remove(&slot);
                 self.free.insert(slot);
+                self.egress_by_vm.remove(&alloc.vm_id);
             }
             None => match self.by_slot.get(&alloc.idx).copied() {
                 Some(owner) if owner == alloc.vm_id => {
                     self.by_slot.remove(&alloc.idx);
                     self.free.insert(alloc.idx);
+                    self.egress_by_vm.remove(&alloc.vm_id);
                 }
                 Some(owner) => tracing::warn!(
                     slot = alloc.idx,
@@ -681,6 +787,36 @@ impl SlotAllocator {
         }
     }
 
+    fn egress_policy_for(&self, alloc: &NetAlloc) -> Result<EgressPolicy, OrchError> {
+        match (
+            self.by_vm.get(&alloc.vm_id).copied(),
+            self.egress_by_vm.get(&alloc.vm_id),
+        ) {
+            (Some(slot), Some(Some(policy))) if slot == alloc.idx => Ok(policy.clone()),
+            _ => Err(OrchError::Internal(format!(
+                "net: missing persisted egress policy for recovered allocation {} (slot {}); refusing recovery",
+                alloc.vm_id, alloc.idx
+            ))),
+        }
+    }
+
+    fn replace_egress_policy(
+        &mut self,
+        alloc: &NetAlloc,
+        policy: EgressPolicy,
+    ) -> Result<Option<EgressPolicy>, OrchError> {
+        if self.by_vm.get(&alloc.vm_id).copied() != Some(alloc.idx) {
+            return Err(OrchError::Internal(format!(
+                "net: cannot persist egress policy for unallocated VM {}",
+                alloc.vm_id
+            )));
+        }
+        Ok(self
+            .egress_by_vm
+            .insert(alloc.vm_id, Some(policy))
+            .flatten())
+    }
+
     fn active_allocations(&self) -> BTreeMap<u32, Uuid> {
         self.by_slot.clone()
     }
@@ -692,6 +828,7 @@ impl SlotAllocator {
                 slot: *slot,
                 vm_id: *vm_id,
                 tap: tap_name(*slot),
+                egress: self.egress_by_vm.get(vm_id).cloned().flatten(),
             })
             .collect()
     }
@@ -708,6 +845,8 @@ struct NetStateEntry {
     slot: u32,
     vm_id: Uuid,
     tap: String,
+    #[serde(default)]
+    egress: Option<EgressPolicy>,
 }
 
 fn load_state(path: &Path) -> Result<Vec<NetStateEntry>, OrchError> {
@@ -780,13 +919,6 @@ fn ensure_host_networking() -> Result<(), OrchError> {
     }
     for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
         validate_existing_nft_base_chain_topology(chain)?;
-    }
-    match delete_nft_rules_matching(is_legacy_masquerade_rule) {
-        Ok(deleted) if deleted > 0 => {
-            tracing::info!(deleted, "net: removed legacy broad masquerade rule(s)")
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("net: failed to remove legacy broad masquerade rule(s): {e}"),
     }
     Ok(())
 }
@@ -1052,7 +1184,6 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
             "comment".into(),
             input_comment,
         ],
-        command_argv(&["ip", "link", "set", &tap, "up"]),
     ]);
     argv
 }
@@ -1308,6 +1439,7 @@ fn ingress_table_names() -> Result<Vec<String>, OrchError> {
         .collect())
 }
 
+#[cfg(test)]
 fn stale_ingress_tables_to_sweep(tables: &[String], active_slots: &HashSet<u32>) -> Vec<String> {
     tables
         .iter()
@@ -1328,12 +1460,46 @@ fn delete_ingress_table_argv(slot: u32) -> Vec<String> {
     ]
 }
 
-fn delete_ingress_table_for_slot(slot: u32) -> Result<usize, OrchError> {
-    let table = ingress_table_name(slot);
+fn ingress_table_belongs_to_alloc(listing: &str, alloc: &NetAlloc) -> bool {
+    let expected_comment = ingress_comment(alloc);
+    let expected_arp = format!("ether type arp accept comment \"{expected_comment}\"");
+    let expected_ip = format!("ether type ip accept comment \"{expected_comment}\"");
+    let expected_header = format!(
+        "type filter hook ingress device \"{}\" priority filter; policy drop",
+        alloc.tap
+    );
+    let Some((_, chain)) = listing.split_once(&format!("chain {NFT_INGRESS_CHAIN} {{")) else {
+        return false;
+    };
+    if !listing.contains(&format!("table netdev {}", ingress_table_name(alloc.idx)))
+        || listing.matches(&expected_arp).count() != 1
+        || listing.matches(&expected_ip).count() != 1
+        || !chain.contains(&expected_header)
+    {
+        return false;
+    }
+    let remaining = chain
+        .replace(&expected_header, "")
+        .replace(&expected_arp, "")
+        .replace(&expected_ip, "");
+    remaining
+        .chars()
+        .all(|character| character.is_whitespace() || matches!(character, ';' | '}'))
+}
+
+fn delete_ingress_table_for_alloc(alloc: &NetAlloc) -> Result<usize, OrchError> {
+    let table = ingress_table_name(alloc.idx);
     if !ingress_table_names()?.iter().any(|name| name == &table) {
         return Ok(0);
     }
-    run_argv(&delete_ingress_table_argv(slot))?;
+    let listing = command_stdout("nft", &["-a", "list", "table", "netdev", &table])?;
+    if !ingress_table_belongs_to_alloc(&listing, alloc) {
+        return Err(OrchError::Internal(format!(
+            "net: refusing to delete ingress table {table}: it is not the exact managed policy for VM {} on {}",
+            alloc.vm_id, alloc.tap
+        )));
+    }
+    run_argv(&delete_ingress_table_argv(alloc.idx))?;
     Ok(1)
 }
 
@@ -1426,10 +1592,6 @@ fn recovery_quarantine_delete_script(allocations: &[NetAlloc]) -> Result<String,
         }
     }
     Ok(commands.join("\n") + "\n")
-}
-
-fn delete_nft_rules_matching(predicate: impl FnMut(&str) -> bool) -> Result<usize, OrchError> {
-    delete_nft_rules_in_chain(NFT_CHAIN, predicate)
 }
 
 fn delete_nft_rules_in_chain(
@@ -1632,12 +1794,6 @@ fn nft_handle(line: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn is_legacy_masquerade_rule(line: &str) -> bool {
-    line.contains("ip saddr 172.16.0.0/16")
-        && line.contains("masquerade")
-        && !line.contains("taritd slot=")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaritdNftRuleKind {
     Nat,
@@ -1708,7 +1864,10 @@ fn is_recovery_nft_rule_for_alloc(line: &str, alloc: &NetAlloc) -> bool {
             && tag.tap == alloc.tap
             && matches!(
                 tag.kind,
-                TaritdNftRuleKind::Nat | TaritdNftRuleKind::Guard | TaritdNftRuleKind::Input
+                TaritdNftRuleKind::Nat
+                    | TaritdNftRuleKind::Egress
+                    | TaritdNftRuleKind::Guard
+                    | TaritdNftRuleKind::Input
             )
     })
 }
@@ -1845,6 +2004,69 @@ mod tests {
         assert!(validate_nft_base_chain_topology_json(NFT_FWD_CHAIN, &wrong_hook).is_err());
         let unhooked = valid.replace("\"hook\": \"forward\",", "");
         assert!(validate_nft_base_chain_topology_json(NFT_FWD_CHAIN, &unhooked).is_err());
+    }
+
+    #[test]
+    fn base_setup_preserves_untagged_operator_masquerade_rules() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-operator-masquerade-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-a list chain ip taritd_nat post") echo 'ip saddr 172.16.0.0/16 oifname "eth0" masquerade comment "operator NAT" # handle 99' ;;
+esac
+"#;
+        for name in ["nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        let result = ensure_host_networking();
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+
+        result.unwrap();
+        let commands = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            !commands.contains("nft delete rule ip taritd_nat post handle 99"),
+            "{commands}"
+        );
     }
 
     #[test]
@@ -2004,7 +2226,6 @@ mod tests {
                     "comment",
                     "\"taritd-input slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
                 ]),
-                argv(&["ip", "link", "set", "insta0", "up"]),
             ]
         );
     }
@@ -2335,6 +2556,107 @@ mod tests {
     }
 
     #[test]
+    fn ingress_table_cleanup_rejects_a_slot_collision_owned_by_another_vm() {
+        let recovered = NetAlloc::for_idx(7);
+        let colliding_vm = Uuid::new_v4();
+        let owned = format!(
+            r#"table netdev taritd_ingress_7 {{
+ chain ingress {{
+  type filter hook ingress device "insta7" priority filter; policy drop;
+  ether type arp accept comment "{}"
+  ether type ip accept comment "{}"
+ }}
+}}"#,
+            ingress_comment(&recovered),
+            ingress_comment(&recovered),
+        );
+        let collision = owned.replace(&recovered.vm_id.to_string(), &colliding_vm.to_string());
+        let operator_rule = owned.replace(
+            &format!(
+                "  ether type ip accept comment \"{}\"",
+                ingress_comment(&recovered)
+            ),
+            "  counter accept",
+        );
+
+        assert!(ingress_table_belongs_to_alloc(&owned, &recovered));
+        assert!(!ingress_table_belongs_to_alloc(&collision, &recovered));
+        assert!(!ingress_table_belongs_to_alloc(&operator_rule, &recovered));
+    }
+
+    #[test]
+    fn ingress_table_cleanup_preserves_a_slot_collision() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recovered_vm = Uuid::new_v4();
+        let colliding_vm = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-ingress-collision-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "nft:list tables netdev") echo "table netdev taritd_ingress_7" ;;
+  "nft:-a list table netdev taritd_ingress_7") cat <<EOF
+table netdev taritd_ingress_7 {
+ chain ingress {
+  type filter hook ingress device "insta7" priority filter; policy drop;
+  ether type arp accept comment "taritd-ingress slot=7 vm=$TARIT_TEST_COLLIDING_VM tap=insta7"
+  ether type ip accept comment "taritd-ingress slot=7 vm=$TARIT_TEST_COLLIDING_VM tap=insta7"
+ }
+}
+EOF
+    ;;
+esac
+"#;
+        let path = bin.join("nft");
+        std::fs::write(&path, command).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        }
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_COLLIDING_VM", colliding_vm.to_string());
+        let result = delete_ingress_table_for_alloc(&NetAlloc::for_slot(recovered_vm, 7).unwrap());
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+        std::env::remove_var("TARIT_TEST_COLLIDING_VM");
+
+        assert!(result.is_err());
+        let commands = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            !commands.contains("nft delete table netdev taritd_ingress_7"),
+            "{commands}"
+        );
+    }
+
+    #[test]
     fn masquerade_rule_is_bound_to_its_tap_and_guest_source() {
         let alloc = NetAlloc::for_idx(0);
         assert_eq!(
@@ -2554,16 +2876,19 @@ mod tests {
                 slot: 7,
                 vm_id: live_vm,
                 tap: "insta7".into(),
+                egress: Some(EgressPolicy::default()),
             },
             NetStateEntry {
                 slot: 8,
                 vm_id: stale_vm,
                 tap: "insta8".into(),
+                egress: Some(EgressPolicy::default()),
             },
             NetStateEntry {
                 slot: NET_POOL_SLOTS,
                 vm_id: Uuid::new_v4(),
                 tap: format!("insta{NET_POOL_SLOTS}"),
+                egress: Some(EgressPolicy::default()),
             },
         ];
         let (mut allocator, dropped) =
@@ -2576,7 +2901,113 @@ mod tests {
     }
 
     #[test]
-    fn recovered_live_allocation_reconciles_every_egress_guard_before_available() {
+    fn recovered_legacy_allocation_without_egress_state_fails_closed() {
+        let vm_id = Uuid::new_v4();
+        let (allocator, dropped) = SlotAllocator::from_entries(
+            vec![NetStateEntry {
+                slot: 7,
+                vm_id,
+                tap: "insta7".into(),
+                egress: None,
+            }],
+            &HashSet::from([vm_id]),
+        );
+        let alloc = NetAlloc::for_slot(vm_id, 7).unwrap();
+
+        assert_eq!(dropped, 0);
+        assert!(matches!(
+            allocator.egress_policy_for(&alloc),
+            Err(OrchError::Internal(message)) if message.contains("missing persisted egress policy")
+        ));
+    }
+
+    #[test]
+    fn legacy_recovery_without_egress_state_keeps_tap_quarantined_and_down() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-legacy-egress-recovery-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let quarantine = root.join("quarantine.nft");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &state_path,
+            format!(
+                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7"}}]}}"#
+            ),
+        )
+        .unwrap();
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
+  "nft:-j list chain ip taritd_nat post") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_egress") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
+  "nft:-f -") cat > "$TARIT_TEST_QUARANTINE" ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_QUARANTINE", &quarantine);
+        let result = NetProvisioner::new(state_path, [vm_id]);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+        std::env::remove_var("TARIT_TEST_QUARANTINE");
+
+        let error = match result {
+            Ok(_) => panic!("legacy state without egress policy unexpectedly recovered"),
+            Err(error) => error,
+        };
+        let commands = std::fs::read_to_string(&log).unwrap();
+        let quarantine_script = std::fs::read_to_string(&quarantine).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("missing persisted egress policy"),
+            "{error}"
+        );
+        assert!(quarantine_script.contains("taritd-recovery-quarantine slot=7"));
+        assert!(commands.contains("ip link set insta7 down"), "{commands}");
+        assert!(!commands.contains("ip link set insta7 up"), "{commands}");
+    }
+
+    #[test]
+    fn recovered_live_allocation_restores_narrow_egress_policy_before_available() {
         let _environment_guard = RECOVERY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2598,7 +3029,7 @@ mod tests {
         std::fs::write(
             &state_path,
             format!(
-                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7"}}]}}"#
+                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7","egress":{{"allowlist":["198.51.100.10:443"],"allow_existing":true}}}}]}}"#
             ),
         )
         .unwrap();
@@ -2614,11 +3045,22 @@ case "${0##*/}:$*" in
   "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
   "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
   "nft:-f -")
-    calls=$(cat "$TARIT_TEST_FAKE_STATE.nft-calls" 2>/dev/null || echo 0)
-    calls=$((calls + 1))
-    echo "$calls" > "$TARIT_TEST_FAKE_STATE.nft-calls"
-    cat >/dev/null
-    if [ $((calls % 2)) -eq 1 ]; then touch "$TARIT_TEST_FAKE_STATE.quarantine"; else rm -f "$TARIT_TEST_FAKE_STATE.quarantine"; fi
+    script=$(cat)
+    case "$script" in
+      *"insert rule ip taritd_nat vm_egress iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\""*)
+        printf '%s\n' "$script" > "$TARIT_TEST_FAKE_STATE.quarantine-install"
+        printf '%s\n' "$script" | grep -F "insert rule ip taritd_nat vm_input iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"" >/dev/null ||
+          exit 1
+        touch "$TARIT_TEST_FAKE_STATE.quarantine"
+        ;;
+      *"delete rule ip taritd_nat vm_egress handle "*)
+        printf '%s\n' "$script" > "$TARIT_TEST_FAKE_STATE.quarantine-release"
+        printf '%s\n' "$script" | grep -F "delete rule ip taritd_nat vm_input handle " >/dev/null ||
+          exit 1
+        rm -f "$TARIT_TEST_FAKE_STATE.quarantine"
+        ;;
+      *) echo "unexpected nft recovery transaction: $script" >&2; exit 1 ;;
+    esac
     ;;
   "nft:list tables netdev")
     if [ -e "$TARIT_TEST_FAKE_STATE.policy" ] || [ ! -e "$TARIT_TEST_FAKE_STATE.initial-ingress-removed" ]; then
@@ -2626,7 +3068,7 @@ case "${0##*/}:$*" in
     fi
     ;;
   "nft:-a list table netdev taritd_ingress_7")
-    [ ! -e "$TARIT_TEST_FAKE_STATE.policy" ] || echo "table netdev taritd_ingress_7 { chain ingress { type filter hook ingress device \"insta7\" priority filter; policy drop; ether type arp accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; ether type ip accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; } }"
+    echo "table netdev taritd_ingress_7 { chain ingress { type filter hook ingress device \"insta7\" priority filter; policy drop; ether type arp accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; ether type ip accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; } }"
     ;;
   "nft:add table netdev taritd_ingress_7") touch "$TARIT_TEST_FAKE_STATE.policy" ;;
   "nft:-a list chain ip taritd_nat post")
@@ -2645,6 +3087,9 @@ case "${0##*/}:$*" in
       echo "iifname \"insta7\" ip saddr != 172.16.0.30 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 12"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 13"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 14"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 15"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10/32 tcp dport 443 accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 16"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 17"
     fi
     ;;
   "nft:-a list chain ip taritd_nat vm_input")
@@ -2703,8 +3148,19 @@ esac
 
         result.unwrap();
         let commands = std::fs::read_to_string(&log).unwrap();
+        let quarantine_install =
+            std::fs::read_to_string(fake_state.with_extension("quarantine-install")).unwrap();
+        let quarantine_release =
+            std::fs::read_to_string(fake_state.with_extension("quarantine-release")).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
 
+        assert!(quarantine_install.contains("insert rule ip taritd_nat vm_egress"));
+        assert!(quarantine_install.contains("insert rule ip taritd_nat vm_input"));
+        assert!(quarantine_install.contains(&recovery_quarantine_comment(
+            &NetAlloc::for_slot(vm_id, 7).unwrap()
+        )));
+        assert!(quarantine_release.contains("delete rule ip taritd_nat vm_egress handle"));
+        assert!(quarantine_release.contains("delete rule ip taritd_nat vm_input handle"));
         assert!(!commands.contains("ip tuntap add dev insta7 mode tap"));
         assert!(
             commands.find("nft -f -").unwrap() < commands.find("ip link set insta7 down").unwrap()
@@ -2771,6 +3227,9 @@ esac
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr != 172.16.0.30 counter drop",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10/32 tcp dport 443 accept",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 drop",
             "nft add rule ip taritd_nat vm_input iifname \"insta7\" ip saddr != 172.16.0.30 counter drop",
             "nft add rule ip taritd_nat vm_input iifname \"insta7\" ct state established,related accept",
             "nft add rule ip taritd_nat vm_input iifname \"insta7\" ip drop",
@@ -2786,6 +3245,134 @@ esac
                 "recovery delayed required guard {expected:?}:\n{commands}"
             );
         }
+    }
+
+    #[test]
+    fn recovery_sweep_failure_keeps_recovered_tap_contained_before_activation() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-recovery-sweep-failure-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let fake_state = root.join("fake-state");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:-o link show") echo "7: insta7: <BROADCAST,UP> mtu 1500" ;;
+  "nft:list tables netdev")
+    calls=$(cat "$TARIT_TEST_FAKE_STATE.table-calls" 2>/dev/null || echo 0)
+    calls=$((calls + 1))
+    echo "$calls" > "$TARIT_TEST_FAKE_STATE.table-calls"
+    [ "$calls" -eq 1 ] || { echo "simulated orphan sweep failure" >&2; exit 1; }
+    echo "table netdev taritd_ingress_7"
+    ;;
+  "nft:-a list table netdev taritd_ingress_7") cat <<EOF
+table netdev taritd_ingress_7 {
+ chain ingress {
+  type filter hook ingress device "insta7" priority filter; policy drop;
+  ether type arp accept comment "taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7"
+  ether type ip accept comment "taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7"
+ }
+}
+EOF
+    ;;
+  "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
+  "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "nft:-a list chain ip taritd_nat "*)
+    calls=$(cat "$TARIT_TEST_FAKE_STATE.chain-calls" 2>/dev/null || echo 0)
+    calls=$((calls + 1))
+    echo "$calls" > "$TARIT_TEST_FAKE_STATE.chain-calls"
+    [ "$calls" -lt 8 ] || { echo "simulated orphan sweep failure" >&2; exit 1; }
+    case "$*" in
+      "-a list chain ip taritd_nat post") echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 1" ;;
+      "-a list chain ip taritd_nat vm_egress") cat <<EOF
+iifname "insta7" drop comment "taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 20
+iifname "insta7" ip saddr != 172.16.0.30 counter drop comment "taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 2
+iifname "insta7" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment "taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 3
+iifname "insta7" ip saddr 172.16.0.30 oifname != "eth0" drop comment "taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 4
+iifname "insta7" ip saddr 172.16.0.30 drop comment "taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 5
+EOF
+        ;;
+      "-a list chain ip taritd_nat vm_input") cat <<EOF
+iifname "insta7" drop comment "taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 21
+iifname "insta7" ip saddr != 172.16.0.30 counter drop comment "taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 6
+iifname "insta7" ct state established,related accept comment "taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 7
+iifname "insta7" ip drop comment "taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 8
+EOF
+        ;;
+    esac
+    ;;
+  "nft:-f -") cat >/dev/null ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let mut allocator = SlotAllocator::empty();
+        let _alloc = allocator.allocate(vm_id).unwrap();
+        allocator.by_slot.remove(&0);
+        allocator.by_slot.insert(7, vm_id);
+        allocator.by_vm.insert(vm_id, 7);
+        let recovered = NetAlloc::for_slot(vm_id, 7).unwrap();
+        let provisioner = NetProvisioner {
+            inner: Mutex::new(allocator),
+            state_path: root.join("state.json"),
+            uplink: "eth0".into(),
+        };
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
+        std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
+        let result = provisioner.reconcile_recovered_allocations(&[recovered]);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        for variable in [
+            "TARIT_TEST_COMMAND_LOG",
+            "TARIT_TEST_FAKE_STATE",
+            "TARIT_TEST_VM_ID",
+        ] {
+            std::env::remove_var(variable);
+        }
+
+        let error = result.expect_err("an orphan sweep failure must fail recovery");
+        let commands = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            error.to_string().contains("simulated orphan sweep failure"),
+            "{error}"
+        );
+        assert!(!commands.contains("ip link set insta7 up"), "{commands}");
     }
 
     #[test]
@@ -2809,7 +3396,7 @@ esac
         std::fs::write(
             &state_path,
             format!(
-                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7"}}]}}"#
+                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7","egress":{{"allowlist":[],"allow_existing":false}}}}]}}"#
             ),
         )
         .unwrap();
@@ -2891,7 +3478,7 @@ esac
         std::fs::write(
             &state_path,
             format!(
-                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{first_vm_id}","tap":"insta7"}},{{"slot":8,"vm_id":"{second_vm_id}","tap":"insta8"}}]}}"#,
+                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{first_vm_id}","tap":"insta7","egress":{{"allowlist":[],"allow_existing":false}}}},{{"slot":8,"vm_id":"{second_vm_id}","tap":"insta8","egress":{{"allowlist":[],"allow_existing":false}}}}]}}"#,
             ),
         )
         .unwrap();
@@ -2990,7 +3577,7 @@ esac
         std::fs::write(
             &state_path,
             format!(
-                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{first_vm_id}","tap":"insta7"}},{{"slot":8,"vm_id":"{second_vm_id}","tap":"insta8"}}]}}"#,
+                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{first_vm_id}","tap":"insta7","egress":{{"allowlist":[],"allow_existing":false}}}},{{"slot":8,"vm_id":"{second_vm_id}","tap":"insta8","egress":{{"allowlist":[],"allow_existing":false}}}}]}}"#,
             ),
         )
         .unwrap();
@@ -3019,6 +3606,9 @@ case "${0##*/}:$*" in
   "nft:-a list table netdev taritd_ingress_7") [ ! -e "$TARIT_TEST_FAKE_STATE.policy7" ] || {
     echo "table netdev taritd_ingress_7 { chain ingress { type filter hook ingress device \"insta7\" priority filter; policy drop; ether type arp accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\"; ether type ip accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\"; } }"
   } ;;
+  "nft:-a list table netdev taritd_ingress_8") [ ! -e "$TARIT_TEST_FAKE_STATE.policy8" ] || {
+    echo "table netdev taritd_ingress_8 { chain ingress { type filter hook ingress device \"insta8\" priority filter; policy drop; ether type arp accept comment \"taritd-ingress slot=8 vm=$TARIT_TEST_VM_8 tap=insta8\"; ether type ip accept comment \"taritd-ingress slot=8 vm=$TARIT_TEST_VM_8 tap=insta8\"; } }"
+  } ;;
   "nft:-a list chain ip taritd_nat post")
     [ ! -e "$TARIT_TEST_FAKE_STATE.policy7" ] || echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 11"
     ;;
@@ -3029,6 +3619,7 @@ case "${0##*/}:$*" in
       echo "iifname \"insta7\" ip saddr != 172.16.0.30 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 12"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 15"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 16"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 19"
     }
     [ ! -e "$TARIT_TEST_FAKE_STATE.partial8" ] || echo "iifname \"insta8\" ip saddr != 172.16.0.34 drop comment \"taritd-guard slot=8 vm=$TARIT_TEST_VM_8 tap=insta8\" # handle 13"
     ;;
@@ -3044,6 +3635,7 @@ case "${0##*/}:$*" in
   "nft:delete rule ip taritd_nat post handle 11") touch "$TARIT_TEST_FAKE_STATE.policy7-nat-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_egress handle 12") touch "$TARIT_TEST_FAKE_STATE.policy7-guard-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_egress handle 15"|"nft:delete rule ip taritd_nat vm_egress handle 16") touch "$TARIT_TEST_FAKE_STATE.policy7-guard-cleaned" ;;
+  "nft:delete rule ip taritd_nat vm_egress handle 19") touch "$TARIT_TEST_FAKE_STATE.policy7-egress-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_egress handle 13") touch "$TARIT_TEST_FAKE_STATE.policy8-guard-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_input handle 14") touch "$TARIT_TEST_FAKE_STATE.policy7-input-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_input handle 17"|"nft:delete rule ip taritd_nat vm_input handle 18") touch "$TARIT_TEST_FAKE_STATE.policy7-input-cleaned" ;;
@@ -3108,6 +3700,7 @@ esac
             fake_state.with_extension("insta8.down"),
             fake_state.with_extension("policy7-nat-cleaned"),
             fake_state.with_extension("policy7-guard-cleaned"),
+            fake_state.with_extension("policy7-egress-cleaned"),
             fake_state.with_extension("policy7-input-cleaned"),
             fake_state.with_extension("policy7-ingress-cleaned"),
             fake_state.with_extension("policy8-guard-cleaned"),
@@ -3150,7 +3743,7 @@ esac
         std::fs::write(
             &state_path,
             format!(
-                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7"}}]}}"#
+                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7","egress":{{"allowlist":[],"allow_existing":false}}}}]}}"#
             ),
         )
         .unwrap();
@@ -3167,6 +3760,7 @@ case "${0##*/}:$*" in
   "nft:add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"") touch "$TARIT_TEST_FAKE_STATE.partial"; exit 1 ;;
   "nft:-a list chain ip taritd_nat vm_egress") [ ! -e "$TARIT_TEST_FAKE_STATE.partial" ] || echo "iifname \"insta7\" ip saddr != 172.16.0.30 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 10" ;;
   "nft:list tables netdev") [ ! -e "$TARIT_TEST_FAKE_STATE.ingress" ] || echo "table netdev taritd_ingress_7" ;;
+  "nft:-a list table netdev taritd_ingress_7") [ ! -e "$TARIT_TEST_FAKE_STATE.ingress" ] || echo "table netdev taritd_ingress_7 { chain ingress { type filter hook ingress device \"insta7\" priority filter; policy drop; ether type arp accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; ether type ip accept comment \"taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\"; } }" ;;
   "nft:delete rule ip taritd_nat vm_egress handle 10") touch "$TARIT_TEST_FAKE_STATE.guard-cleaned" ;;
   "nft:delete table netdev taritd_ingress_7") touch "$TARIT_TEST_FAKE_STATE.ingress-cleaned" ;;
 esac
