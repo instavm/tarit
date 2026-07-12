@@ -213,7 +213,7 @@ impl NetProvisioner {
         let tap = tap_name(alloc.idx);
         let _ = run("ip", &["link", "del", &tap]);
         self.delete_nft_rules_for_slot(alloc.idx)?;
-        for argv in tap_provision_argv(alloc) {
+        for argv in tap_provision_argv(alloc, &self.uplink) {
             run_argv(&argv)?;
         }
         self.add_nft_rule(alloc)
@@ -565,13 +565,14 @@ fn host_nft_base_argv() -> Vec<Vec<String>> {
     ]
 }
 
-fn tap_provision_argv(alloc: &NetAlloc) -> Vec<Vec<String>> {
+fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
     let tap = tap_name(alloc.idx);
     let ingress_table = ingress_table_name(alloc.idx);
     let ingress_comment = nft_quote(&ingress_comment(alloc));
     let guard_comment = nft_quote(&guard_comment(alloc));
     let input_comment = nft_quote(&input_comment(alloc));
     let interface = nft_quote(&tap);
+    let uplink = nft_quote(uplink);
     let mut argv = vec![vec![
         "ip".into(),
         "tuntap".into(),
@@ -648,6 +649,44 @@ fn tap_provision_argv(alloc: &NetAlloc) -> Vec<Vec<String>> {
             "saddr".into(),
             "!=".into(),
             alloc.guest_ip.clone(),
+            "drop".into(),
+            "comment".into(),
+            guard_comment.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_FWD_CHAIN.into(),
+            "iifname".into(),
+            interface.clone(),
+            "ip".into(),
+            "saddr".into(),
+            alloc.guest_ip.clone(),
+            "ip".into(),
+            "daddr".into(),
+            "172.16.0.0/16".into(),
+            "drop".into(),
+            "comment".into(),
+            guard_comment.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_FWD_CHAIN.into(),
+            "iifname".into(),
+            interface.clone(),
+            "ip".into(),
+            "saddr".into(),
+            alloc.guest_ip.clone(),
+            "oifname".into(),
+            "!=".into(),
+            uplink,
             "drop".into(),
             "comment".into(),
             guard_comment,
@@ -1312,7 +1351,7 @@ mod tests {
     #[test]
     fn tap_provision_plan_hardens_before_link_is_up() {
         let alloc = NetAlloc::for_idx(0);
-        let plan = tap_provision_argv(&alloc);
+        let plan = tap_provision_argv(&alloc, "eth0");
         assert_eq!(
             plan,
             vec![
@@ -1385,6 +1424,44 @@ mod tests {
                     "rule",
                     "ip",
                     "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ip",
+                    "daddr",
+                    "172.16.0.0/16",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "oifname",
+                    "!=",
+                    "\"eth0\"",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
                     "vm_input",
                     "iifname",
                     "\"insta0\"",
@@ -1428,6 +1505,210 @@ mod tests {
                 ]),
                 argv(&["ip", "link", "set", "insta0", "up"]),
             ]
+        );
+    }
+
+    #[test]
+    fn forward_egress_guards_precede_broad_guest_allowlists() {
+        let alloc = NetAlloc::for_idx(0);
+        let mut forward_rules = tap_provision_argv(&alloc, "eth0")
+            .into_iter()
+            .filter(|rule| rule.get(5).is_some_and(|chain| chain == NFT_FWD_CHAIN))
+            .collect::<Vec<_>>();
+        forward_rules.extend(
+            egress_policy_argv(
+                &alloc,
+                &["0.0.0.0/0".to_string(), "172.16.0.0/16".to_string()],
+                true,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            forward_rules,
+            vec![
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "!=",
+                    "172.16.0.2",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ip",
+                    "daddr",
+                    "172.16.0.0/16",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "oifname",
+                    "!=",
+                    "\"eth0\"",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ct",
+                    "state",
+                    "established,related",
+                    "accept",
+                    "comment",
+                    "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ip",
+                    "daddr",
+                    "0.0.0.0/0",
+                    "accept",
+                    "comment",
+                    "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ip",
+                    "daddr",
+                    "172.16.0.0/16",
+                    "accept",
+                    "comment",
+                    "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "drop",
+                    "comment",
+                    "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn broad_guest_policy_remains_bound_to_its_own_tap_and_source() {
+        let guest_a = NetAlloc::for_idx(0);
+        let guest_b = NetAlloc::for_idx(1);
+        let policy_a = egress_policy_argv(&guest_a, &["0.0.0.0/0".to_string()], false).unwrap();
+        let policy_b = egress_policy_argv(&guest_b, &["0.0.0.0/0".to_string()], false).unwrap();
+
+        assert_eq!(
+            policy_a[0],
+            argv(&[
+                "nft",
+                "add",
+                "rule",
+                "ip",
+                "taritd_nat",
+                "vm_egress",
+                "iifname",
+                "\"insta0\"",
+                "ip",
+                "saddr",
+                "172.16.0.2",
+                "ip",
+                "daddr",
+                "0.0.0.0/0",
+                "accept",
+                "comment",
+                "\"taritd-egress slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+            ])
+        );
+        assert_eq!(
+            policy_b[0],
+            argv(&[
+                "nft",
+                "add",
+                "rule",
+                "ip",
+                "taritd_nat",
+                "vm_egress",
+                "iifname",
+                "\"insta1\"",
+                "ip",
+                "saddr",
+                "172.16.0.6",
+                "ip",
+                "daddr",
+                "0.0.0.0/0",
+                "accept",
+                "comment",
+                "\"taritd-egress slot=1 vm=00000000-0000-0000-0000-000000000000 tap=insta1\"",
+            ])
         );
     }
 

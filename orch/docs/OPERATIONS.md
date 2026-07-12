@@ -198,7 +198,10 @@ When enabled, `taritd`:
 6. Gives each VM a deterministic private `/30`: host `.1`, guest `.2`.
 7. Persists the slot map in `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers it on restart.
 8. Adds a per-slot nftables masquerade rule tagged with an `taritd` comment.
-9. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
+9. Installs per-tap forward guards before bringing the tap up: guest traffic may
+   leave only through the detected uplink and cannot target the `172.16.0.0/16`
+   VM pool; established and related return traffic remains allowed.
+10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
 On startup, `taritd` reconciles the persisted map with live local VM records and
 runs an age-gated sweep for stale `insta<N>` taps and orphaned `taritd` nftables
