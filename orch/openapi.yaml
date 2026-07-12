@@ -867,7 +867,7 @@ paths:
   /v1/ssh-keys:
     post:
       summary: Register SSH public key
-      description: Registers an OpenSSH public key for the caller's tenant, for use with the SSH gateway.
+      description: Registers an OpenSSH public key for the caller's tenant. RSA keys remain valid for guest authorized-key injection but cannot authenticate to the SSH gateway.
       requestBody:
         required: true
         content:

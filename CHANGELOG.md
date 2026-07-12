@@ -10,6 +10,10 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- SSH gateway client authentication no longer accepts RSA public keys.
+
 ## [0.1.0] - 2026-07-03
 
 Initial public release of Tarit, a microVM platform for secure, fast,
