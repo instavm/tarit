@@ -37,14 +37,13 @@ Useful overrides:
   TARIT_E2E_EDGE_SLUG                Fixed Caddy test hostname label (default: tarit-e2e-edge).
   TARIT_CADDY_BIN                    Caddy executable (default: caddy).
   TARIT_E2E_GUEST_PORT               Guest test-server port (default 43127).
-  TARIT_E2E_RUN_ROOT                 Per-run artifact root (default: orch/e).
   TARIT_E2E_KEEP_ARTIFACTS=1         Keep the per-run directory after cleanup.
 
 When TARIT_DATABASE_URL is unset, the harness starts an isolated local
 PostgreSQL instance using initdb and pg_ctl. It never uses Docker. The Linux
 host must provide Caddy, curl, Python 3 (with sqlite3), the sqlite3 CLI, GNU coreutils
 (sha256sum, timeout, mktemp, stat, cmp, and chown), iproute2, nftables, procps, util-linux
-(flock and, for local PostgreSQL, runuser), and PostgreSQL's psql. Local
+(flock, mountpoint, and, for local PostgreSQL, runuser), and PostgreSQL's psql. Local
 PostgreSQL mode additionally needs initdb, pg_ctl, and chgrp. The guest rootfs must
 provide Node.js. Caddy is mandatory: this gate does not fall back to plaintext
 share traffic.
@@ -129,87 +128,223 @@ private_path() {
     fail "artifact '$path' is accessible to group or other users"
 }
 
-prepare_run_root() {
-  local run_root_canonical=""
+directory_metadata_matches() {
+  local path="$1"
+  local uid="$2"
+  local gid="$3"
+  local mode="$4"
 
-  [[ "$RUN_ROOT" == /* ]] || {
-    fail "TARIT_E2E_RUN_ROOT must be an absolute path"
+  [[ -d "$path" && ! -L "$path" ]] &&
+    [[ "$(stat -c '%u' -- "$path")" == "$uid" ]] &&
+    [[ "$(stat -c '%g' -- "$path")" == "$gid" ]] &&
+    [[ "$(stat -c '%a' -- "$path")" == "$mode" ]]
+}
+
+path_has_no_symlink_ancestors() {
+  local path="$1"
+  local label="$2"
+  local ancestor="$path"
+
+  [[ "$path" == /* ]] || {
+    fail "$label must be an absolute path"
     return 1
   }
-  if [[ -n "${TARIT_E2E_RUN_ROOT:-}" ]]; then
+  while :; do
+    [[ ! -L "$ancestor" ]] || {
+      fail "$label has a symlink ancestor '$ancestor'"
+      return 1
+    }
+    [[ "$ancestor" == "/" ]] && return 0
+    ancestor="${ancestor%/*}"
+    [[ -n "$ancestor" ]] || ancestor="/"
+  done
+}
+
+path_is_not_mountpoint() {
+  local path="$1"
+  local label="$2"
+  local mount_status=0
+
+  if mountpoint -q -- "$path"; then
+    fail "$label must not be a mountpoint"
+    return 1
+  else
+    mount_status=$?
+  fi
+  [[ "$mount_status" == "1" ]] || {
+    fail "could not determine whether $label is a mountpoint"
+    return 1
+  }
+}
+
+reject_configurable_run_root() {
+  [[ -z "${TARIT_E2E_RUN_ROOT+x}" ]] || {
+    fail "TARIT_E2E_RUN_ROOT is unsupported; the fixed run root is $FIXED_RUN_ROOT"
+    return 1
+  }
+}
+
+validate_fixed_run_root_parent() {
+  local parent_uid=""
+  local parent_gid=""
+  local parent_mode=""
+  local parent_canonical=""
+
+  [[ "$FIXED_RUN_ROOT" == "$FIXED_RUN_ROOT_PARENT/tarit-e2e-shares" ]] || {
+    fail "fixed run root is not a direct child of its fixed parent"
+    return 1
+  }
+  [[ -d "$FIXED_RUN_ROOT_PARENT" && ! -L "$FIXED_RUN_ROOT_PARENT" ]] || {
+    fail "fixed run-root parent is missing or is a symlink"
+    return 1
+  }
+  path_has_no_symlink_ancestors "$FIXED_RUN_ROOT_PARENT" "fixed run-root parent" ||
+    return 1
+  parent_canonical="$(canonical_path "$FIXED_RUN_ROOT_PARENT")" || {
+    fail "could not canonicalize fixed run-root parent"
+    return 1
+  }
+  [[ "$parent_canonical" == "$FIXED_RUN_ROOT_PARENT" ]] || {
+    fail "fixed run-root parent is not canonical"
+    return 1
+  }
+  parent_uid="$(stat -c '%u' -- "$FIXED_RUN_ROOT_PARENT")" ||
+    return 1
+  parent_gid="$(stat -c '%g' -- "$FIXED_RUN_ROOT_PARENT")" ||
+    return 1
+  parent_mode="$(stat -c '%a' -- "$FIXED_RUN_ROOT_PARENT")" ||
+    return 1
+  [[ "$parent_uid" == "0" && "$parent_gid" == "0" &&
+    "$parent_mode" =~ ^[0-7]{3,4}$ ]] ||
+    {
+      fail "fixed run-root parent must be root-owned with a valid mode"
+      return 1
+    }
+  (( (8#$parent_mode & 8#1000) != 0 )) || {
+    fail "fixed run-root parent must retain its sticky bit"
+    return 1
+  }
+}
+
+validate_fixed_run_root_structure() {
+  local run_root_canonical=""
+
+  [[ "$RUN_ROOT" == "$FIXED_RUN_ROOT" ]] || {
+    fail "run root does not match the fixed path"
+    return 1
+  }
+  validate_fixed_run_root_parent || return 1
+  [[ -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]] || {
+    fail "fixed run root is missing or is a symlink"
+    return 1
+  }
+  path_has_no_symlink_ancestors "$RUN_ROOT" "fixed run root" || return 1
+  run_root_canonical="$(canonical_path "$RUN_ROOT")" || {
+    fail "could not canonicalize fixed run root"
+    return 1
+  }
+  [[ "$run_root_canonical" == "$FIXED_RUN_ROOT" ]] || {
+    fail "fixed run root is not canonical"
+    return 1
+  }
+  path_is_not_mountpoint "$RUN_ROOT" "fixed run root"
+}
+
+prepare_fixed_run_root() {
+  local run_root_uid=""
+
+  reject_configurable_run_root || return 1
+  RUN_ROOT="$FIXED_RUN_ROOT"
+  RUN_ROOT_READY=0
+  validate_fixed_run_root_parent || return 1
+  if [[ -e "$RUN_ROOT" || -L "$RUN_ROOT" ]]; then
     [[ -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]] || {
-      fail "custom TARIT_E2E_RUN_ROOT must be an existing non-symlink directory"
+      fail "fixed run root is not a directory"
       return 1
     }
   else
-    mkdir -p -- "$RUN_ROOT" || {
-      fail "could not create the default per-run artifact root"
+    mkdir -m 0700 -- "$RUN_ROOT" || {
+      fail "could not create fixed run root"
       return 1
     }
   fi
-  [[ -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]] || {
-    fail "per-run artifact root is missing or is a symlink"
+  validate_fixed_run_root_structure || return 1
+  run_root_uid="$(stat -c '%u' -- "$RUN_ROOT")" ||
+    return 1
+  [[ "$run_root_uid" == "0" ]] || {
+    fail "fixed run root must be root-owned"
     return 1
   }
-  run_root_canonical="$(canonical_path "$RUN_ROOT")" || {
-    fail "could not canonicalize per-run artifact root"
+  if ! directory_metadata_matches "$RUN_ROOT" 0 0 700; then
+    chown 0:0 -- "$RUN_ROOT" ||
+      return 1
+    chmod 0700 -- "$RUN_ROOT" ||
+      return 1
+  fi
+  validate_fixed_run_root_structure || return 1
+  directory_metadata_matches "$RUN_ROOT" 0 0 700 || {
+    fail "fixed run root must be root:root 0700"
     return 1
   }
-  [[ "$RUN_ROOT" == "$run_root_canonical" && "$run_root_canonical" != "/" ]] || {
-    fail "per-run artifact root must be a canonical non-root path without symlink ancestors"
-    return 1
-  }
-  RUN_ROOT="$run_root_canonical"
+  RUN_ROOT_READY=1
 }
 
-validate_run_directory_containment() {
+validate_run_directory_structure() {
   local run_root_canonical=""
   local run_dir_canonical=""
 
-  [[ -n "${RUN_ROOT:-}" && -n "${RUN_DIR:-}" ]] || {
-    fail "per-run artifact root and directory must be set"
+  [[ "${RUN_ROOT_READY:-0}" == "1" ]] || {
+    fail "fixed run root is not prepared"
     return 1
   }
-  [[ -d "$RUN_ROOT" && ! -L "$RUN_ROOT" && -d "$RUN_DIR" && ! -L "$RUN_DIR" ]] || {
-    fail "per-run artifact root or directory is missing or is a symlink"
+  [[ -n "${RUN_DIR:-}" ]] || {
+    fail "per-run artifact directory is not set"
     return 1
   }
-  run_root_canonical="$(canonical_path "$RUN_ROOT")" || {
-    fail "could not canonicalize per-run artifact root"
+  validate_fixed_run_root_structure || return 1
+  [[ -d "$RUN_DIR" && ! -L "$RUN_DIR" ]] || {
+    fail "per-run artifact directory is missing or is a symlink"
     return 1
   }
-  run_dir_canonical="$(canonical_path "$RUN_DIR")" || {
-    fail "could not canonicalize per-run artifact directory"
+  path_has_no_symlink_ancestors "$RUN_DIR" "per-run artifact directory" ||
     return 1
-  }
-  [[ "$RUN_ROOT" == "$run_root_canonical" &&
-    "$RUN_DIR" == "$run_dir_canonical" &&
-    "$run_root_canonical" != "/" &&
-    "${run_dir_canonical%/*}" == "$run_root_canonical" &&
+  run_root_canonical="$(canonical_path "$RUN_ROOT")" || return 1
+  run_dir_canonical="$(canonical_path "$RUN_DIR")" || return 1
+  [[ "$run_root_canonical" == "$FIXED_RUN_ROOT" &&
+    "$run_dir_canonical" == "$RUN_DIR" &&
+    "${run_dir_canonical%/*}" == "$FIXED_RUN_ROOT" &&
     "${run_dir_canonical##*/}" == shares.* ]] || {
-    fail "per-run artifact directory is not a canonical non-symlink child of the run root"
+    fail "per-run artifact directory is not a canonical direct child of the fixed run root"
     return 1
   }
-  RUN_ROOT_CANONICAL="$run_root_canonical"
-  RUN_DIR_CANONICAL="$run_dir_canonical"
+  path_is_not_mountpoint "$RUN_DIR" "per-run artifact directory"
 }
 
-validate_private_root_owned_directory() {
-  local path="$1"
-  local label="$2"
-  local uid=""
+validate_run_marker() {
+  local marker_canonical=""
+  local marker_contents=""
 
-  [[ -d "$path" && ! -L "$path" ]] || {
-    fail "$label is missing or is a symlink"
+  [[ -n "${RUN_MARKER:-}" &&
+    "$RUN_MARKER" == "$RUN_DIR/.tarit-e2e-shares-run" &&
+    -f "$RUN_MARKER" && ! -L "$RUN_MARKER" ]] || {
+    fail "per-run marker is missing or is a symlink"
     return 1
   }
-  private_path "$path" || return 1
-  uid="$(stat -c '%u' -- "$path")" || {
-    fail "could not read owner for $label"
+  path_has_no_symlink_ancestors "$RUN_MARKER" "per-run marker" || return 1
+  marker_canonical="$(canonical_path "$RUN_MARKER")" || return 1
+  [[ "$marker_canonical" == "$RUN_MARKER" ]] || {
+    fail "per-run marker is not canonical"
     return 1
   }
-  [[ "$uid" == "0" ]] || {
-    fail "$label must be root-owned before PostgreSQL traversal access is granted"
+  [[ "$(stat -c '%u' -- "$RUN_MARKER")" == "0" &&
+    "$(stat -c '%g' -- "$RUN_MARKER")" == "0" &&
+    "$(stat -c '%a' -- "$RUN_MARKER")" == "600" ]] || {
+    fail "per-run marker must be root:root 0600"
+    return 1
+  }
+  marker_contents="$(<"$RUN_MARKER")"
+  [[ "$marker_contents" == "$RUN_ID" ]] || {
+    fail "per-run marker does not identify this run"
     return 1
   }
 }
@@ -229,17 +364,83 @@ snapshot_postgres_run_path_metadata() {
     return 1
 }
 
+create_run_directory() {
+  [[ "${RUN_ROOT_READY:-0}" == "1" ]] || {
+    fail "fixed run root is not prepared"
+    return 1
+  }
+  validate_fixed_run_root_structure || return 1
+  directory_metadata_matches "$RUN_ROOT" 0 0 700 || {
+    fail "fixed run root must be root:root 0700 before creating artifacts"
+    return 1
+  }
+  RUN_DIR=""
+  RUN_MARKER=""
+  RUN_DIR_READY=0
+  RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")" || {
+    fail "could not create a private per-run artifact directory"
+    return 1
+  }
+  validate_run_directory_structure || return 1
+  directory_metadata_matches "$RUN_DIR" 0 0 700 || {
+    fail "per-run artifact directory must be root:root 0700"
+    return 1
+  }
+  RUN_MARKER="$RUN_DIR/.tarit-e2e-shares-run"
+  printf '%s\n' "$RUN_ID" >"$RUN_MARKER" ||
+    return 1
+  chown 0:0 -- "$RUN_MARKER" ||
+    return 1
+  chmod 0600 -- "$RUN_MARKER" ||
+    return 1
+  RUN_ACCESS_PROBE="$RUN_DIR/.tarit-e2e-root-access-probe"
+  : >"$RUN_ACCESS_PROBE" ||
+    return 1
+  chown 0:0 -- "$RUN_ACCESS_PROBE" ||
+    return 1
+  chmod 0600 -- "$RUN_ACCESS_PROBE" ||
+    return 1
+  validate_run_marker || return 1
+  private_path "$RUN_ACCESS_PROBE" || return 1
+  snapshot_postgres_run_path_metadata || return 1
+  RUN_DIR_READY=1
+}
+
+validate_private_fixed_run_paths() {
+  validate_run_directory_structure || return 1
+  directory_metadata_matches "$RUN_ROOT" 0 0 700 &&
+    directory_metadata_matches "$RUN_DIR" 0 0 700
+}
+
+validate_external_run_paths() {
+  validate_run_directory_structure || return 1
+  validate_private_fixed_run_paths || {
+    fail "external PostgreSQL requires root:root 0700 fixed run paths"
+    return 1
+  }
+}
+
+validate_marked_run_directory_for_cleanup() {
+  [[ "${RUN_DIR_READY:-0}" == "1" ]] || {
+    fail "per-run artifact directory was not prepared"
+    return 1
+  }
+  validate_private_fixed_run_paths || {
+    fail "per-run cleanup requires root:root 0700 fixed run paths"
+    return 1
+  }
+  validate_run_marker
+}
+
 set_postgres_traverse_path() {
   local path="$1"
   local label="$2"
 
-  chgrp "$PG_OS_GID" "$path" ||
+  chgrp "$PG_PRIMARY_GID" -- "$path" ||
     return 1
-  chmod 0710 "$path" ||
+  chmod 0710 -- "$path" ||
     return 1
-  [[ "$(stat -c '%a' -- "$path")" == "710" &&
-    "$(stat -c '%u' -- "$path")" == "0" &&
-    "$(stat -c '%g' -- "$path")" == "$PG_OS_GID" ]] || {
+  directory_metadata_matches "$path" 0 "$PG_PRIMARY_GID" 710 || {
     fail "$label did not retain root-owned group traverse-only permissions"
     return 1
   }
@@ -251,8 +452,8 @@ restore_postgres_run_path_metadata() {
   local gid="$3"
   local mode="$4"
 
-  chown "$uid:$gid" "$path" &&
-    chmod "$mode" "$path"
+  chown "$uid:$gid" -- "$path" &&
+    chmod "$mode" -- "$path"
 }
 
 subprocess_timeout_seconds() {
@@ -516,20 +717,26 @@ terminate_expected_pid() {
 }
 
 safe_remove_run_dir() {
+  [[ -n "${RUN_DIR:-}" ]] ||
+    return 0
+  validate_marked_run_directory_for_cleanup || return 1
   [[ "${TARIT_E2E_KEEP_ARTIFACTS:-0}" == "1" ]] && {
     log "Keeping artifacts at $RUN_DIR"
     return 0
   }
-  [[ -n "${RUN_DIR:-}" && -f "${RUN_MARKER:-}" ]] ||
-    return 0
-  case "$RUN_DIR" in
-    "$RUN_ROOT"/shares.*)
-      rm -rf -- "$RUN_DIR"
-      ;;
-    *)
-      warn "refusing to remove unexpected run directory '$RUN_DIR'"
-      ;;
-  esac
+  rm -rf --one-file-system -- "$RUN_DIR" || {
+    fail "could not remove marked per-run artifact directory"
+    return 1
+  }
+  [[ ! -e "$RUN_DIR" && ! -L "$RUN_DIR" ]] || {
+    fail "marked per-run artifact directory remains after removal"
+    return 1
+  }
+  validate_fixed_run_root_structure || return 1
+  directory_metadata_matches "$RUN_ROOT" 0 0 700 || {
+    fail "fixed run root metadata changed during per-run artifact removal"
+    return 1
+  }
 }
 
 run_as_pg_user() {
@@ -543,19 +750,27 @@ run_as_pg_user() {
 grant_postgres_run_access() {
   PG_OS_UID="$(id -u "$PG_OS_USER")" ||
     fail "could not determine the local PostgreSQL OS user ID"
-  PG_OS_GID="$(id -g "$PG_OS_USER")" ||
+  PG_PRIMARY_GID="$(id -g "$PG_OS_USER")" ||
     fail "could not determine the local PostgreSQL OS group"
-  [[ "$PG_OS_USER" == "$(id -un)" ]] && return 0
+  [[ "$DATABASE_MODE" == "local" ]] || {
+    fail "PostgreSQL run-path traversal is only valid for local PostgreSQL"
+    return 1
+  }
+  [[ "$PG_OS_UID" != "0" ]] || {
+    fail "local PostgreSQL OS user must not be root"
+    return 1
+  }
   [[ "${RUN_DIR_PG_TRAVERSE_GRANTED:-0}" == "1" ]] && return 0
-  validate_run_directory_containment || return 1
-  validate_private_root_owned_directory "$RUN_ROOT" "per-run artifact root" || return 1
-  validate_private_root_owned_directory "$RUN_DIR" "per-run artifact directory" || return 1
+  validate_private_fixed_run_paths || {
+    fail "local PostgreSQL requires root:root 0700 fixed run paths before traversal access"
+    return 1
+  }
   snapshot_postgres_run_path_metadata || {
     fail "could not snapshot per-run artifact ownership before PostgreSQL setup"
     return 1
   }
   RUN_DIR_PG_TRAVERSE_GRANTED=1
-  if ! set_postgres_traverse_path "$RUN_ROOT" "per-run artifact root" ||
+  if ! set_postgres_traverse_path "$RUN_ROOT" "fixed run root" ||
     ! set_postgres_traverse_path "$RUN_DIR" "per-run artifact directory"; then
     restore_run_dir_permissions ||
       warn "could not restore per-run artifact ownership after PostgreSQL setup failed"
@@ -568,10 +783,18 @@ restore_run_dir_permissions() {
   local restore_failed=0
 
   [[ "${RUN_DIR_PG_TRAVERSE_GRANTED:-0}" == "1" ]] || return 0
-  validate_run_directory_containment ||
+  [[ "${LOCAL_POSTGRES_STOP_CONFIRMED:-0}" == "1" ]] || {
+    warn "refusing to restore run-path permissions before PostgreSQL stop is confirmed"
     return 1
-  [[ "$RUN_ROOT" == "$RUN_ROOT_CANONICAL" &&
-    "$RUN_DIR" == "$RUN_DIR_CANONICAL" ]] ||
+  }
+  validate_run_directory_structure ||
+    return 1
+  [[ -n "${RUN_ROOT_ORIGINAL_UID:-}" &&
+    -n "${RUN_ROOT_ORIGINAL_GID:-}" &&
+    -n "${RUN_ROOT_ORIGINAL_MODE:-}" &&
+    -n "${RUN_DIR_ORIGINAL_UID:-}" &&
+    -n "${RUN_DIR_ORIGINAL_GID:-}" &&
+    -n "${RUN_DIR_ORIGINAL_MODE:-}" ]] ||
     return 1
   restore_postgres_run_path_metadata \
     "$RUN_DIR" "$RUN_DIR_ORIGINAL_UID" "$RUN_DIR_ORIGINAL_GID" "$RUN_DIR_ORIGINAL_MODE" ||
@@ -579,14 +802,12 @@ restore_run_dir_permissions() {
   restore_postgres_run_path_metadata \
     "$RUN_ROOT" "$RUN_ROOT_ORIGINAL_UID" "$RUN_ROOT_ORIGINAL_GID" "$RUN_ROOT_ORIGINAL_MODE" ||
     restore_failed=1
-  [[ "$restore_failed" -eq 0 &&
-    "$(stat -c '%u' -- "$RUN_ROOT")" == "$RUN_ROOT_ORIGINAL_UID" &&
-    "$(stat -c '%g' -- "$RUN_ROOT")" == "$RUN_ROOT_ORIGINAL_GID" &&
-    "$(stat -c '%a' -- "$RUN_ROOT")" == "$RUN_ROOT_ORIGINAL_MODE" &&
-    "$(stat -c '%u' -- "$RUN_DIR")" == "$RUN_DIR_ORIGINAL_UID" &&
-    "$(stat -c '%g' -- "$RUN_DIR")" == "$RUN_DIR_ORIGINAL_GID" &&
-    "$(stat -c '%a' -- "$RUN_DIR")" == "$RUN_DIR_ORIGINAL_MODE" ]] ||
+  [[ "$restore_failed" -eq 0 ]] ||
     return 1
+  validate_private_fixed_run_paths || {
+    fail "fixed run paths did not restore to root:root 0700"
+    return 1
+  }
   RUN_DIR_PG_TRAVERSE_GRANTED=0
 }
 
@@ -597,15 +818,21 @@ verify_postgres_data_dir_access() {
     fail "local PostgreSQL data directory is missing or is a symlink"
     return 1
   }
-  validate_run_directory_containment || return 1
+  validate_run_directory_structure || return 1
+  if ! directory_metadata_matches "$RUN_ROOT" 0 "$PG_PRIMARY_GID" 710 ||
+    ! directory_metadata_matches "$RUN_DIR" 0 "$PG_PRIMARY_GID" 710; then
+    fail "local PostgreSQL traversal paths are not root-owned group execute-only directories"
+    return 1
+  fi
   pg_data_dir_canonical="$(canonical_path "$PG_DATA_DIR")" || {
     fail "could not canonicalize local PostgreSQL data directory"
     return 1
   }
   [[ "$PG_DATA_DIR" == "$pg_data_dir_canonical" &&
-    "${pg_data_dir_canonical%/*}" == "$RUN_DIR_CANONICAL" &&
+    "${pg_data_dir_canonical%/*}" == "$RUN_DIR" &&
     "$(stat -c '%a' -- "$PG_DATA_DIR")" == "700" &&
-    "$(stat -c '%u' -- "$PG_DATA_DIR")" == "$PG_OS_UID" ]] || {
+    "$(stat -c '%u' -- "$PG_DATA_DIR")" == "$PG_OS_UID" &&
+    "$(stat -c '%g' -- "$PG_DATA_DIR")" == "$PG_PRIMARY_GID" ]] || {
     fail "local PostgreSQL data directory is not a canonical PostgreSQL-owned private child of the run directory"
     return 1
   }
@@ -613,6 +840,24 @@ verify_postgres_data_dir_access() {
     fail "local PostgreSQL OS user cannot traverse the exact data directory"
     return 1
   }
+  if run_as_pg_user ls -- "$RUN_ROOT" >/dev/null 2>&1 ||
+    run_as_pg_user ls -- "$RUN_DIR" >/dev/null 2>&1; then
+    fail "local PostgreSQL OS user can list fixed run artifacts"
+    return 1
+  fi
+  if run_as_pg_user cat -- "$RUN_ACCESS_PROBE" >/dev/null 2>&1; then
+    fail "local PostgreSQL OS user can read a root artifact"
+    return 1
+  fi
+  if run_as_pg_user touch -- "$RUN_DIR/.tarit-e2e-postgres-write-probe"; then
+    rm -f -- "$RUN_DIR/.tarit-e2e-postgres-write-probe"
+    fail "local PostgreSQL OS user can create a root artifact"
+    return 1
+  fi
+  if run_as_pg_user rm -- "$RUN_ACCESS_PROBE"; then
+    fail "local PostgreSQL OS user can delete a root artifact"
+    return 1
+  fi
 }
 
 postgres_connect_timeout_seconds() {
@@ -853,13 +1098,27 @@ SQL
 }
 
 stop_local_postgres() {
-  [[ "$DATABASE_MODE" == "local" ]] || return 0
-  if ! [[ -n "${PG_PID:-}" && "${PG_PID}" =~ ^[0-9]+$ ]]; then
-    DATABASE_MODE="stopped"
+  [[ "$DATABASE_MODE" == "local" ||
+    "${PG_SERVER_START_ATTEMPTED:-0}" == "1" ]] || {
+    LOCAL_POSTGRES_STOP_CONFIRMED=1
     return 0
+  }
+  [[ "${LOCAL_POSTGRES_STOP_CONFIRMED:-0}" == "1" ]] && return 0
+  if ! [[ -n "${PG_PID:-}" && "${PG_PID}" =~ ^[0-9]+$ ]]; then
+    record_local_postgres_pid || true
+  fi
+  if ! [[ -n "${PG_PID:-}" && "${PG_PID}" =~ ^[0-9]+$ ]]; then
+    if [[ "${PG_SERVER_START_ATTEMPTED:-0}" != "1" ]]; then
+      DATABASE_MODE="stopped"
+      LOCAL_POSTGRES_STOP_CONFIRMED=1
+      return 0
+    fi
+    warn "cannot confirm local PostgreSQL is stopped because its PID is unavailable"
+    return 1
   fi
   if pid_is_gone "$PG_PID"; then
     DATABASE_MODE="stopped"
+    LOCAL_POSTGRES_STOP_CONFIRMED=1
     return 0
   fi
   local cmdline=""
@@ -873,7 +1132,9 @@ stop_local_postgres() {
     kill -INT "$PG_PID" || return 1
     wait_for_pid_exit "$PG_PID" 15 || return 1
   fi
+  PG_PID=""
   DATABASE_MODE="stopped"
+  LOCAL_POSTGRES_STOP_CONFIRMED=1
   return 0
 }
 
@@ -1197,8 +1458,16 @@ stop_caddy() {
 cleanup() {
   local status=$?
   local cleanup_failed=0
+  local postgres_stopped=0
+
   trap - EXIT INT TERM HUP
   set +e
+  if stop_local_postgres; then
+    postgres_stopped=1
+  else
+    cleanup_failed=1
+    warn "local PostgreSQL stop was not confirmed; preserving run-path metadata and artifacts"
+  fi
   stop_caddy || cleanup_failed=1
   delete_known_vms_best_effort || cleanup_failed=1
   if [[ -n "${NODE_A_PID:-}" ]]; then
@@ -1210,8 +1479,9 @@ cleanup() {
   stop_tracked_vmm_processes || cleanup_failed=1
   cleanup_database_rows || cleanup_failed=1
   restore_host_networking || cleanup_failed=1
-  stop_local_postgres || cleanup_failed=1
-  restore_run_dir_permissions || cleanup_failed=1
+  if [[ "$postgres_stopped" == "1" ]]; then
+    restore_run_dir_permissions || cleanup_failed=1
+  fi
   if [[ "$cleanup_failed" -eq 0 ]] && ! safe_remove_run_dir; then
     cleanup_failed=1
   fi
@@ -1249,6 +1519,7 @@ preflight() {
   require_command lscpu "install util-linux"
   require_command mkdir "install coreutils"
   require_command mktemp "install coreutils"
+  require_command mountpoint "install util-linux"
   require_command nft "install nftables"
   require_command nproc "install coreutils"
   require_command ps "install procps"
@@ -1327,11 +1598,26 @@ ROOTFS="${TARIT_SHARE_ROOTFS:-${TARIT_ROOTFS:-$REPO_ROOT/guest-assets/share-node
 GUEST_PORT="${TARIT_E2E_GUEST_PORT:-43127}"
 SHARE_DOMAIN="${TARIT_SHARE_DOMAIN:-shares.e2e.test}"
 EDGE_SLUG="${TARIT_E2E_EDGE_SLUG:-tarit-e2e-edge}"
-RUN_ROOT="${TARIT_E2E_RUN_ROOT:-$ORCH_ROOT/e}"
+FIXED_RUN_ROOT='/var/tmp/tarit-e2e-shares'
+FIXED_RUN_ROOT_PARENT='/var/tmp'
+RUN_ROOT="$FIXED_RUN_ROOT"
 REQUESTED_DATABASE_URL="${TARIT_DATABASE_URL:-}"
 RUN_ID=""
 RUN_DIR=""
 RUN_MARKER=""
+RUN_ACCESS_PROBE=""
+RUN_ROOT_READY=0
+RUN_DIR_READY=0
+RUN_DIR_PG_TRAVERSE_GRANTED=0
+RUN_ROOT_ORIGINAL_UID=""
+RUN_ROOT_ORIGINAL_GID=""
+RUN_ROOT_ORIGINAL_MODE=""
+RUN_DIR_ORIGINAL_UID=""
+RUN_DIR_ORIGINAL_GID=""
+RUN_DIR_ORIGINAL_MODE=""
+LOCAL_POSTGRES_STOP_CONFIRMED=1
+PG_SERVER_START_ATTEMPTED=0
+PG_PRIMARY_GID=""
 TARITD_BIN_REAL=""
 VMM_BIN_REAL=""
 CADDY_BIN_REAL=""
@@ -1346,6 +1632,7 @@ IP_FORWARD_PROBE_OUTPUT=""
 ORIGINAL_IP_FORWARD=""
 
 if [[ "$HELPERS_ONLY" != "1" ]]; then
+  reject_configurable_run_root || exit 1
   if ! [[ "$GUEST_PORT" =~ ^[0-9]+$ ]] || (( GUEST_PORT < 1 || GUEST_PORT > 65535 )); then
     fail "TARIT_E2E_GUEST_PORT must be in 1..=65535"
   fi
@@ -1362,14 +1649,23 @@ if [[ "$HELPERS_ONLY" != "1" ]]; then
   fi
 
   RUN_ID="shares-$(date -u +%Y%m%dT%H%M%S)-$$"
-  prepare_run_root || return 1
-  RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")" ||
-    fail "could not create a private per-run artifact directory"
-  validate_run_directory_containment || return 1
-  RUN_MARKER="$RUN_DIR/.tarit-e2e-shares-run"
-  : >"$RUN_MARKER"
-  private_path "$RUN_DIR"
-  private_path "$RUN_MARKER"
+  RUN_DIR=""
+  RUN_MARKER=""
+  RUN_ACCESS_PROBE=""
+  RUN_ROOT_READY=0
+  RUN_DIR_READY=0
+  RUN_DIR_PG_TRAVERSE_GRANTED=0
+  RUN_ROOT_ORIGINAL_UID=""
+  RUN_ROOT_ORIGINAL_GID=""
+  RUN_ROOT_ORIGINAL_MODE=""
+  RUN_DIR_ORIGINAL_UID=""
+  RUN_DIR_ORIGINAL_GID=""
+  RUN_DIR_ORIGINAL_MODE=""
+  LOCAL_POSTGRES_STOP_CONFIRMED=1
+  PG_SERVER_START_ATTEMPTED=0
+  PG_PRIMARY_GID=""
+  prepare_fixed_run_root || exit 1
+  create_run_directory || exit 1
   export TARIT_E2E_SHARES_RUN_ID="$RUN_ID"
   export TARIT_E2E_SHARES_RUN_DIR="$RUN_DIR"
 
@@ -1401,17 +1697,7 @@ IP_FORWARD_SNAPSHOT_CAPTURED=0
 NFT_TABLE_CREATED_BY_RUN=0
 NFT_TABLE_BASELINE=""
 IP_FORWARD_CHANGED_BY_RUN=0
-RUN_DIR_PG_TRAVERSE_GRANTED=0
-RUN_ROOT_CANONICAL=""
-RUN_DIR_CANONICAL=""
-RUN_ROOT_ORIGINAL_UID=""
-RUN_ROOT_ORIGINAL_GID=""
-RUN_ROOT_ORIGINAL_MODE=""
-RUN_DIR_ORIGINAL_UID=""
-RUN_DIR_ORIGINAL_GID=""
-RUN_DIR_ORIGINAL_MODE=""
 PG_OS_UID=""
-PG_OS_GID=""
 VMM_LAUNCHER=""
 RACE_VMM_ARM=""
 RACE_VMM_READY=""
@@ -2513,6 +2799,8 @@ start_node() {
 
 start_local_postgres() {
   DATABASE_MODE="local"
+  LOCAL_POSTGRES_STOP_CONFIRMED=1
+  PG_SERVER_START_ATTEMPTED=0
   PG_PORT="$(allocate_port)" || return 1
   [[ -z "${TARIT_E2E_POSTGRES_DIR:-}" ]] || {
     fail "TARIT_E2E_POSTGRES_DIR is unsupported: the harness creates a private mktemp data directory"
@@ -2523,10 +2811,12 @@ start_local_postgres() {
     fail "could not create a private local PostgreSQL data directory"
     return 1
   }
-  chown "$PG_OS_USER" "$PG_DATA_DIR" || return 1
-  chmod 0700 "$PG_DATA_DIR" || return 1
-  [[ "$(stat -c '%a' -- "$PG_DATA_DIR")" == "700" ]] || {
-    fail "local PostgreSQL data directory is not owner-private"
+  chown "$PG_OS_UID:$PG_PRIMARY_GID" -- "$PG_DATA_DIR" || return 1
+  chmod 0700 -- "$PG_DATA_DIR" || return 1
+  [[ "$(stat -c '%a' -- "$PG_DATA_DIR")" == "700" &&
+    "$(stat -c '%u' -- "$PG_DATA_DIR")" == "$PG_OS_UID" &&
+    "$(stat -c '%g' -- "$PG_DATA_DIR")" == "$PG_PRIMARY_GID" ]] || {
+    fail "local PostgreSQL data directory is not PostgreSQL-owned and owner-private"
     return 1
   }
   verify_postgres_data_dir_access || return 1
@@ -2536,6 +2826,8 @@ start_local_postgres() {
     fail "isolated PostgreSQL initialization failed; inspect $PG_DATA_DIR/initdb.log"
     return 1
   }
+  PG_SERVER_START_ATTEMPTED=1
+  LOCAL_POSTGRES_STOP_CONFIRMED=0
   run_as_pg_user "$PG_CTL_BIN" -D "$PG_DATA_DIR" \
     -l "$PG_DATA_DIR/postgres.log" \
     -o "-h 127.0.0.1 -p $PG_PORT" \
@@ -2566,7 +2858,9 @@ start_local_postgres() {
 
 configure_database() {
   if [[ -n "$REQUESTED_DATABASE_URL" ]]; then
+    validate_external_run_paths || return 1
     DATABASE_MODE="external"
+    LOCAL_POSTGRES_STOP_CONFIRMED=1
     DATABASE_URL="$REQUESTED_DATABASE_URL"
     configure_external_postgres_connection || {
       fail "could not configure private PostgreSQL credentials"
@@ -3442,14 +3736,14 @@ main() {
 
   log "== coordinated shutdown and post-shutdown admission gate =="
   stop_node_a_for_shutdown_gate
+  stop_local_postgres ||
+    fail "isolated PostgreSQL did not complete PID-specific shutdown"
   stop_caddy
   stop_node_b_after_gate
   cleanup_database_rows ||
     fail "external PostgreSQL cleanup did not remove and verify this run's fleet rows"
   restore_host_networking ||
     fail "guest-network host state could not be restored safely"
-  stop_local_postgres ||
-    fail "isolated PostgreSQL did not complete PID-specific shutdown"
   restore_run_dir_permissions ||
     fail "per-run artifact directory could not be restored to private permissions"
   safe_remove_run_dir ||

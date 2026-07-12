@@ -209,7 +209,158 @@ test_secret_free_child_commands() {
     fail_test "curl config did not carry the share token"
 }
 
-test_sudo_local_postgres_gets_traverse_only_run_paths() {
+test_fixed_run_root_rejects_environment_override_before_artifacts() {
+  local rejected_root="$WORK_DIR/rejected-run-root"
+  local output=""
+
+  export TARIT_E2E_RUN_ROOT="$rejected_root"
+  RUN_ROOT="$rejected_root"
+  if output="$(prepare_fixed_run_root 2>&1)"; then
+    fail_test "TARIT_E2E_RUN_ROOT override was accepted"
+  fi
+  [[ "$output" == *"TARIT_E2E_RUN_ROOT is unsupported"* ]] ||
+    fail_test "TARIT_E2E_RUN_ROOT override was not rejected explicitly"
+  [[ "${FIXED_RUN_ROOT:-}" == "/var/tmp/tarit-e2e-shares" ]] ||
+    fail_test "run root is not the fixed /var/tmp/tarit-e2e-shares path"
+  [[ ! -e "$rejected_root" && ! -L "$rejected_root" ]] ||
+    fail_test "override rejection created a run-root artifact"
+  unset TARIT_E2E_RUN_ROOT
+}
+
+test_run_directory_creation_requires_fixed_root_preparation() {
+  local output=""
+
+  RUN_ID="helper-unprepared-$$"
+  RUN_ROOT="$WORK_DIR/unprepared-run-root"
+  RUN_DIR=""
+  RUN_MARKER=""
+  RUN_ROOT_READY=0
+  if output="$(create_run_directory 2>&1)"; then
+    fail_test "run directory was created before fixed-root preparation"
+  fi
+  [[ "$output" == *"fixed run root is not prepared"* ]] ||
+    fail_test "run-directory creation did not fail for an unprepared fixed root"
+  [[ -z "$RUN_DIR" && -z "$RUN_MARKER" ]] ||
+    fail_test "unprepared run-directory creation recorded artifacts"
+}
+
+test_cleanup_stops_postgres_before_other_cleanup() {
+  local calls="$WORK_DIR/cleanup-order"
+  local expected_calls="stop-local-postgres,stop-caddy,delete-known-vms,stop-vmms,cleanup-database,restore-network,restore-paths,remove-run-dir,"
+
+  : >"$calls"
+  record_cleanup_call() {
+    printf '%s\n' "$1" >>"$calls"
+  }
+  stop_local_postgres() { record_cleanup_call stop-local-postgres; }
+  stop_caddy() { record_cleanup_call stop-caddy; }
+  delete_known_vms_best_effort() { record_cleanup_call delete-known-vms; }
+  stop_tracked_vmm_processes() { record_cleanup_call stop-vmms; }
+  cleanup_database_rows() { record_cleanup_call cleanup-database; }
+  restore_host_networking() { record_cleanup_call restore-network; }
+  restore_run_dir_permissions() { record_cleanup_call restore-paths; }
+  safe_remove_run_dir() { record_cleanup_call remove-run-dir; }
+
+  NODE_A_PID=""
+  NODE_B_PID=""
+  RUN_DIR="$WORK_DIR/cleanup-order-run"
+  if ! (cleanup); then
+    fail_test "cleanup unexpectedly failed while all teardown helpers succeeded"
+  fi
+  [[ "$(head -n 1 "$calls")" == "stop-local-postgres" ]] ||
+    fail_test "cleanup did not stop PostgreSQL before other teardown"
+  [[ "$(tr '\n' ',' <"$calls")" == "$expected_calls" ]] ||
+    fail_test "cleanup helper ordering changed unexpectedly"
+}
+
+test_cleanup_preserves_paths_when_postgres_stop_fails() {
+  local calls="$WORK_DIR/cleanup-stop-failure"
+
+  : >"$calls"
+  record_cleanup_call() {
+    printf '%s\n' "$1" >>"$calls"
+  }
+  stop_local_postgres() { record_cleanup_call stop-local-postgres; return 1; }
+  stop_caddy() { record_cleanup_call stop-caddy; }
+  delete_known_vms_best_effort() { record_cleanup_call delete-known-vms; }
+  stop_tracked_vmm_processes() { record_cleanup_call stop-vmms; }
+  cleanup_database_rows() { record_cleanup_call cleanup-database; }
+  restore_host_networking() { record_cleanup_call restore-network; }
+  restore_run_dir_permissions() { record_cleanup_call restore-paths; }
+  safe_remove_run_dir() { record_cleanup_call remove-run-dir; }
+
+  NODE_A_PID=""
+  NODE_B_PID=""
+  RUN_DIR="$WORK_DIR/cleanup-stop-failure-run"
+  if (cleanup); then
+    fail_test "cleanup succeeded after PostgreSQL stop failure"
+  fi
+  if grep -Fxq restore-paths "$calls"; then
+    fail_test "cleanup restored run-path permissions after PostgreSQL stop failure"
+  fi
+  if grep -Fxq remove-run-dir "$calls"; then
+    fail_test "cleanup removed artifacts after PostgreSQL stop failure"
+  fi
+}
+
+test_restore_refuses_unconfirmed_postgres_stop() {
+  local output=""
+
+  RUN_DIR_PG_TRAVERSE_GRANTED=1
+  LOCAL_POSTGRES_STOP_CONFIRMED=0
+  if output="$(restore_run_dir_permissions 2>&1)"; then
+    fail_test "run-path restoration was allowed before PostgreSQL stop confirmation"
+  fi
+  [[ "$output" == *"refusing to restore run-path permissions before PostgreSQL stop is confirmed"* ]] ||
+    fail_test "run-path restoration did not reject an unconfirmed PostgreSQL stop"
+}
+
+require_linux_root_sudo_user() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    printf 'SKIP: fixed-root helpers require Linux users\n'
+    return 77
+  fi
+  if [[ "$(id -u)" != "0" || -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
+    printf 'SKIP: fixed-root helpers require sudo -E from a non-root user\n'
+    return 77
+  fi
+  if ! command -v runuser >/dev/null 2>&1 || ! id "$SUDO_USER" >/dev/null 2>&1; then
+    printf 'SKIP: fixed-root helpers require runuser and SUDO_USER\n'
+    return 77
+  fi
+  export E2E_SHARES_HARNESS_REAL_STAT=1
+}
+
+setup_fixed_run_paths() {
+  RUN_ID="helper-fixed-$$-$RANDOM"
+  RUN_ROOT="$FIXED_RUN_ROOT"
+  RUN_DIR=""
+  RUN_MARKER=""
+  RUN_ROOT_READY=0
+  RUN_DIR_READY=0
+  RUN_DIR_PG_TRAVERSE_GRANTED=0
+  LOCAL_POSTGRES_STOP_CONFIRMED=1
+  DATABASE_MODE=""
+  unset TARIT_E2E_RUN_ROOT
+  prepare_fixed_run_root || return 1
+  create_run_directory
+}
+
+teardown_fixed_run_paths() {
+  local status=$?
+  local cleanup_status=0
+
+  trap - EXIT
+  if [[ -n "${RUN_DIR:-}" && -d "$RUN_DIR" && ! -L "$RUN_DIR" ]]; then
+    LOCAL_POSTGRES_STOP_CONFIRMED=1
+    restore_run_dir_permissions >/dev/null 2>&1 || cleanup_status=1
+    safe_remove_run_dir >/dev/null 2>&1 || cleanup_status=1
+  fi
+  [[ "$status" -ne 0 ]] && return "$status"
+  return "$cleanup_status"
+}
+
+test_sudo_local_postgres_gets_fixed_traverse_only_run_paths() {
   local run_root_mode=""
   local run_root_uid=""
   local run_root_gid=""
@@ -218,31 +369,17 @@ test_sudo_local_postgres_gets_traverse_only_run_paths() {
   local run_dir_gid=""
   local pg_data_mode=""
   local pg_data_uid=""
+  local pg_data_gid=""
   local pg_gid=""
   local original_run_root=""
   local original_run_dir=""
 
-  if [[ "$(uname -s)" != "Linux" ]]; then
-    printf 'SKIP: local PostgreSQL traversal helper requires Linux users\n'
-    return 77
-  fi
-  if [[ "$(id -u)" != "0" || -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
-    printf 'SKIP: local PostgreSQL traversal helper requires sudo -E from a non-root user\n'
-    return 77
-  fi
-  if ! command -v runuser >/dev/null 2>&1 || ! id "$SUDO_USER" >/dev/null 2>&1; then
-    printf 'SKIP: local PostgreSQL traversal helper requires runuser and SUDO_USER\n'
-    return 77
-  fi
+  require_linux_root_sudo_user || return $?
 
   PG_OS_USER="$SUDO_USER"
   pg_gid="$(id -g "$PG_OS_USER")"
-  RUN_ROOT="$(mktemp -d "$WORK_DIR/local-pg-root.XXXXXX")"
-  chmod 0700 "$RUN_ROOT"
-  chown root:root "$RUN_ROOT"
-  RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")"
-  chmod 0700 "$RUN_DIR"
-  chown root:root "$RUN_DIR"
+  setup_fixed_run_paths || return 1
+  trap 'teardown_fixed_run_paths' EXIT
   original_run_root="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")"
   original_run_dir="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")"
   printf 'root-only-root-secret\n' >"$RUN_ROOT/root-secret"
@@ -253,7 +390,7 @@ test_sudo_local_postgres_gets_traverse_only_run_paths() {
   chown root:root "$RUN_DIR/root-secret"
   PG_DATA_DIR="$RUN_DIR/postgres"
   mkdir "$PG_DATA_DIR"
-  chown "$PG_OS_USER" "$PG_DATA_DIR"
+  chown "$PG_OS_USER:$pg_gid" "$PG_DATA_DIR"
   chmod 0700 "$PG_DATA_DIR"
 
   [[ "$("$SYSTEM_STAT" -c '%a' -- "$RUN_ROOT")" == "700" &&
@@ -265,6 +402,7 @@ test_sudo_local_postgres_gets_traverse_only_run_paths() {
     runuser -u "$PG_OS_USER" -- test -x "$PG_DATA_DIR"
 
   export E2E_SHARES_HARNESS_REAL_STAT=1
+  DATABASE_MODE=local
   grant_postgres_run_access
 
   run_root_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_ROOT")"
@@ -273,6 +411,8 @@ test_sudo_local_postgres_gets_traverse_only_run_paths() {
   [[ "$run_root_mode" == "710" && "$run_root_uid" == "0" &&
     "$run_root_gid" == "$pg_gid" ]] ||
     fail_test "PostgreSQL run root was not root-owned with group traverse-only access"
+  [[ "${PG_PRIMARY_GID:-}" == "$pg_gid" ]] ||
+    fail_test "PostgreSQL primary group was not recorded"
   run_dir_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")"
   run_dir_uid="$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR")"
   run_dir_gid="$("$SYSTEM_STAT" -c '%g' -- "$RUN_DIR")"
@@ -282,7 +422,9 @@ test_sudo_local_postgres_gets_traverse_only_run_paths() {
 
   pg_data_mode="$("$SYSTEM_STAT" -c '%a' -- "$PG_DATA_DIR")"
   pg_data_uid="$("$SYSTEM_STAT" -c '%u' -- "$PG_DATA_DIR")"
-  [[ "$pg_data_mode" == "700" && "$pg_data_uid" == "$(id -u "$PG_OS_USER")" ]] ||
+  pg_data_gid="$("$SYSTEM_STAT" -c '%g' -- "$PG_DATA_DIR")"
+  [[ "$pg_data_mode" == "700" && "$pg_data_uid" == "$(id -u "$PG_OS_USER")" &&
+    "$pg_data_gid" == "$pg_gid" ]] ||
     fail_test "PostgreSQL data directory was not PostgreSQL-owned and owner-private"
   runuser -u "$PG_OS_USER" -- test -x "$PG_DATA_DIR" ||
     fail_test "PostgreSQL user could not traverse the exact PostgreSQL data directory"
@@ -308,41 +450,37 @@ test_sudo_local_postgres_gets_traverse_only_run_paths() {
   unset E2E_SHARES_HARNESS_REAL_STAT
 }
 
-test_sudo_local_postgres_rejects_unsafe_custom_run_root() {
+test_fixed_root_cleanup_rejects_swapped_run_dir() {
+  local target=""
+
+  require_linux_root_sudo_user || return $?
+  setup_fixed_run_paths || return 1
+  trap 'teardown_fixed_run_paths' EXIT
+  target="$(mktemp -d "$RUN_ROOT/cleanup-target.XXXXXX")"
+  printf 'must-survive\n' >"$target/sentinel"
+  rm -rf -- "$RUN_DIR"
+  ln -s "$target" "$RUN_DIR"
+
+  assert_nonzero "swapped per-run directory cleanup" safe_remove_run_dir
+  [[ -L "$RUN_DIR" ]] ||
+    fail_test "cleanup did not preserve the rejected swapped path for inspection"
+  [[ -f "$target/sentinel" ]] ||
+    fail_test "cleanup followed the swapped path"
+
+  rm -f -- "$RUN_DIR"
+  rm -rf -- "$target"
+  RUN_DIR=""
+}
+
+test_external_postgres_keeps_fixed_run_paths_root_private() {
   local original_run_root=""
   local original_run_dir=""
 
-  if [[ "$(uname -s)" != "Linux" ]]; then
-    printf 'SKIP: local PostgreSQL traversal helper requires Linux users\n'
-    return 77
-  fi
-  if [[ "$(id -u)" != "0" || -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
-    printf 'SKIP: local PostgreSQL traversal helper requires sudo -E from a non-root user\n'
-    return 77
-  fi
-
-  PG_OS_USER="$SUDO_USER"
-  RUN_ROOT="$(mktemp -d "$WORK_DIR/unsafe-pg-root.XXXXXX")"
-  chmod 0755 "$RUN_ROOT"
-  chown root:root "$RUN_ROOT"
-  RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")"
-  chmod 0700 "$RUN_DIR"
-  chown root:root "$RUN_DIR"
+  require_linux_root_sudo_user || return $?
+  setup_fixed_run_paths || return 1
+  trap 'teardown_fixed_run_paths' EXIT
   original_run_root="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")"
   original_run_dir="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")"
-
-  export E2E_SHARES_HARNESS_REAL_STAT=1
-  assert_nonzero "unsafe custom RUN_ROOT" grant_postgres_run_access
-  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")" == "$original_run_root" ]] ||
-    fail_test "unsafe custom RUN_ROOT was mutated"
-  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")" == "$original_run_dir" ]] ||
-    fail_test "unsafe custom RUN_DIR was mutated"
-  unset E2E_SHARES_HARNESS_REAL_STAT
-}
-
-test_external_postgres_does_not_chown_run_dir() {
-  RUN_DIR="$(mktemp -d "$WORK_DIR/external-pg-run.XXXXXX")"
-  RUN_ROOT="$WORK_DIR"
   export FAKE_CHOWN_CALLS="$WORK_DIR/external-chown-args"
   : >"$FAKE_CHOWN_CALLS"
   export FAKE_CHGRP_CALLS="$WORK_DIR/external-chgrp-args"
@@ -360,6 +498,43 @@ test_external_postgres_does_not_chown_run_dir() {
     fail_test "external PostgreSQL mode changed ownership"
   [[ ! -s "$FAKE_CHGRP_CALLS" ]] ||
     fail_test "external PostgreSQL mode changed group ownership"
+  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")" == "$original_run_root" &&
+    "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")" == "$original_run_dir" ]] ||
+    fail_test "external PostgreSQL mode changed fixed run-path metadata"
+}
+
+test_external_postgres_rejects_nonprivate_fixed_run_dir() {
+  local original_run_dir=""
+  local output=""
+
+  require_linux_root_sudo_user || return $?
+  setup_fixed_run_paths || return 1
+  trap 'teardown_fixed_run_paths' EXIT
+  original_run_dir="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")"
+  chgrp "$(id -g "$SUDO_USER")" "$RUN_DIR"
+  chmod 0710 "$RUN_DIR"
+  export FAKE_CHOWN_CALLS="$WORK_DIR/external-invalid-chown-args"
+  : >"$FAKE_CHOWN_CALLS"
+  export FAKE_CHGRP_CALLS="$WORK_DIR/external-invalid-chgrp-args"
+  : >"$FAKE_CHGRP_CALLS"
+  export FAKE_PSQL_ARGS="$WORK_DIR/external-invalid-psql-args"
+  export FAKE_PSQL_CALLS="$WORK_DIR/external-invalid-psql-calls"
+  export REQUESTED_DATABASE_URL='postgresql://tarit@database.example.test:5432/tarit?sslmode=require'
+  export PSQL_BIN="$BIN_DIR/psql"
+  export OWNER_KEY=external-invalid-owner
+  export HOST_PREFIX=external-invalid-host
+
+  if output="$(configure_database 2>&1)"; then
+    fail_test "external PostgreSQL accepted non-private fixed run paths"
+  fi
+  [[ "$output" == *"external PostgreSQL requires root:root 0700 fixed run paths"* ]] ||
+    fail_test "external PostgreSQL did not reject non-private fixed run paths explicitly"
+  [[ ! -s "$FAKE_CHOWN_CALLS" && ! -s "$FAKE_CHGRP_CALLS" ]] ||
+    fail_test "external PostgreSQL repaired non-private paths instead of refusing them"
+  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")" != "$original_run_dir" ]] ||
+    fail_test "external invalid-path test did not model altered metadata"
+  chown root:root "$RUN_DIR"
+  chmod 0700 "$RUN_DIR"
 }
 
 PASS_COUNT=0
@@ -393,9 +568,15 @@ run_test test_metric_absence_is_failure
 run_test test_cleanup_sql_failure_is_reported_and_verified
 run_test test_lock_path_is_immutable
 run_test test_secret_free_child_commands
-run_test test_external_postgres_does_not_chown_run_dir
-run_test test_sudo_local_postgres_gets_traverse_only_run_paths
-run_test test_sudo_local_postgres_rejects_unsafe_custom_run_root
+run_test test_fixed_run_root_rejects_environment_override_before_artifacts
+run_test test_run_directory_creation_requires_fixed_root_preparation
+run_test test_cleanup_stops_postgres_before_other_cleanup
+run_test test_cleanup_preserves_paths_when_postgres_stop_fails
+run_test test_restore_refuses_unconfirmed_postgres_stop
+run_test test_sudo_local_postgres_gets_fixed_traverse_only_run_paths
+run_test test_fixed_root_cleanup_rejects_swapped_run_dir
+run_test test_external_postgres_keeps_fixed_run_paths_root_private
+run_test test_external_postgres_rejects_nonprivate_fixed_run_dir
 
 printf 'SUMMARY: %d passed, %d skipped, %d failed\n' \
   "$PASS_COUNT" "$SKIP_COUNT" "$FAIL_COUNT"
