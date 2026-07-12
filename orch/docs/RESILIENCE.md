@@ -196,12 +196,14 @@ sudo -E bash tests/e2e_shares.sh
 ```
 
 The share gate must run as root on an otherwise idle Linux KVM host. It requires
-`caddy`, `curl`, `python3` (with `sqlite3`), GNU coreutils (`sha256sum`,
+`caddy`, `curl`, `python3` (with `sqlite3`), the `sqlite3` CLI, GNU coreutils (`sha256sum`,
 `timeout`, `mktemp`, `stat`, `cmp`, `chown`, and `chgrp`), `ip`, `nft`, `ps`,
 `readlink`, `grep`, `awk`, `find`, `sysctl`, and `flock`; it also needs `psql` plus `initdb`,
 `pg_ctl`, and `runuser` when `TARIT_DATABASE_URL` is unset. The guest rootfs
 must include Node.js. Caddy is mandatory; the gate intentionally has no
-plaintext fallback.
+plaintext fallback. The gate serializes host-network ownership with the fixed
+`/run/lock/tarit-e2e-shares.lock` lock and uses a private `PGPASSFILE` for its
+bounded PostgreSQL cleanup queries.
 
 VMM-side validations (`pty-validate.sh`, `restore-clone-validate.sh`,
 `suspend-validate.sh`, `gc-validate.sh`, `cgroup-validate.sh`,

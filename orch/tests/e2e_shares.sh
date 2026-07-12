@@ -11,7 +11,11 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "${BASH_SOURCE[0]}" == */* ]]; then
+  SCRIPT_DIR="$(CDPATH='' cd -- "${BASH_SOURCE[0]%/*}" && pwd)"
+else
+  SCRIPT_DIR="$PWD"
+fi
 ORCH_ROOT="${ORCH_ROOT:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)}"
 REPO_ROOT="${REPO_ROOT:-$(CDPATH='' cd -- "$ORCH_ROOT/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$REPO_ROOT/vmm}"
@@ -38,7 +42,7 @@ Useful overrides:
 
 When TARIT_DATABASE_URL is unset, the harness starts an isolated local
 PostgreSQL instance using initdb and pg_ctl. It never uses Docker. The Linux
-host must provide Caddy, curl, Python 3 (with sqlite3), GNU coreutils
+host must provide Caddy, curl, Python 3 (with sqlite3), the sqlite3 CLI, GNU coreutils
 (sha256sum, timeout, mktemp, stat, cmp, chown, and chgrp), iproute2, nftables, procps, util-linux
 (flock and, for local PostgreSQL, runuser), and PostgreSQL's psql. Local
 PostgreSQL mode additionally needs initdb and pg_ctl. The guest rootfs must
@@ -91,18 +95,20 @@ require_command() {
 }
 
 acquire_host_network_lock() {
-  NETWORK_LOCK_PATH="${TARIT_E2E_NETWORK_LOCK_PATH:-/run/lock/tarit-e2e-shares.lock}"
-  case "$NETWORK_LOCK_PATH" in
-    /run/lock/*)
-      ;;
-    *)
-      fail "TARIT_E2E_NETWORK_LOCK_PATH must be below /run/lock"
-      ;;
-  esac
-  exec 9>"$NETWORK_LOCK_PATH"
-  flock -n 9 ||
-    skip "another Tarit share E2E run owns the host-network lock"
-  private_path "$NETWORK_LOCK_PATH"
+  local lock_path=""
+  lock_path="$(host_network_lock_path)"
+  if ! { exec 9>>"$lock_path"; }; then
+    fail "could not open fixed host-network lock '$lock_path'"
+    return 1
+  fi
+  if ! flock -n 9; then
+    fail "fixed host-network lock '$lock_path' is held by another Tarit share E2E run"
+    return 1
+  fi
+}
+
+host_network_lock_path() {
+  printf '%s\n' '/run/lock/tarit-e2e-shares.lock'
 }
 
 canonical_path() {
@@ -206,6 +212,7 @@ find_pg_binary() {
     return 0
   fi
   if command -v pg_config >/dev/null 2>&1; then
+    require_command pg_config "install PostgreSQL development tools"
     bindir="$(pg_config --bindir 2>/dev/null || true)"
     if [[ -n "$bindir" && -x "$bindir/$name" ]]; then
       printf '%s\n' "$bindir/$name"
@@ -364,15 +371,19 @@ terminate_expected_pid() {
     wait "$pid" 2>/dev/null || true
     return 0
   fi
-  pid_matches_owned_binary "$pid" "$binary" ||
+  pid_matches_owned_binary "$pid" "$binary" || {
     fail "refusing to terminate $label PID $pid because it is not this run's expected $binary"
+    return 1
+  }
 
-  kill -TERM "$pid"
+  kill -TERM "$pid" || return 1
   if ! wait_for_pid_exit "$pid" 30; then
     warn "$label PID $pid did not exit after SIGTERM; sending SIGKILL to that tracked PID"
-    pid_matches_owned_binary "$pid" "$binary" ||
+    pid_matches_owned_binary "$pid" "$binary" || {
       fail "refusing to SIGKILL $label PID $pid because it is not this run's expected $binary"
-    kill -KILL "$pid"
+      return 1
+    }
+    kill -KILL "$pid" || return 1
     wait_for_pid_exit "$pid" 10 ||
       fail "$label PID $pid did not exit after SIGKILL"
   fi
@@ -429,19 +440,241 @@ restore_run_dir_permissions() {
   RUN_DIR_PG_TRAVERSE_GRANTED=0
 }
 
-cleanup_database_rows() {
-  [[ "$DATABASE_MODE" == "external" ]] || return 0
-  [[ -n "${PSQL_BIN:-}" && -n "${DATABASE_URL:-}" ]] || return 0
+postgres_connect_timeout_seconds() {
+  local timeout_seconds="${TARIT_E2E_POSTGRES_CONNECT_TIMEOUT_SECS:-5}"
 
-  "$TIMEOUT_BIN" 15s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -q \
-    -v ON_ERROR_STOP=0 \
-    -v owner_key="$OWNER_KEY" \
-    -v host_prefix="$HOST_PREFIX%" <<'SQL' >/dev/null 2>&1 || true
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
+    {
+      fail "PostgreSQL connect timeout must be a positive integer"
+      return 1
+    }
+  printf '%s\n' "$timeout_seconds"
+}
+
+postgres_statement_timeout_milliseconds() {
+  local timeout_milliseconds="${TARIT_E2E_POSTGRES_STATEMENT_TIMEOUT_MS:-10000}"
+
+  [[ "$timeout_milliseconds" =~ ^[1-9][0-9]*$ ]] ||
+    {
+      fail "PostgreSQL statement timeout must be a positive integer"
+      return 1
+    }
+  printf '%s\n' "$timeout_milliseconds"
+}
+
+postgres_command_timeout_seconds() {
+  local timeout_seconds="${TARIT_E2E_POSTGRES_COMMAND_TIMEOUT_SECS:-15}"
+
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
+    {
+      fail "PostgreSQL command timeout must be a positive integer"
+      return 1
+    }
+  printf '%s\n' "$timeout_seconds"
+}
+
+psql_execute() {
+  local connect_timeout=""
+  local statement_timeout=""
+  local command_timeout=""
+
+  [[ -n "${PSQL_BIN:-}" && -n "${PGPASSFILE:-}" ]] || {
+    fail "PostgreSQL command is not configured"
+    return 1
+  }
+  [[ -n "${DATABASE_HOST:-}" && -n "${DATABASE_PORT:-}" &&
+    -n "${DATABASE_NAME:-}" && -n "${DATABASE_USER:-}" ]] || {
+    fail "PostgreSQL connection fields are incomplete"
+    return 1
+  }
+  connect_timeout="$(postgres_connect_timeout_seconds)" || return 1
+  statement_timeout="$(postgres_statement_timeout_milliseconds)" || return 1
+  command_timeout="$(postgres_command_timeout_seconds)" || return 1
+  (
+    export PGPASSFILE
+    export PGCONNECT_TIMEOUT="$connect_timeout"
+    export PGOPTIONS="-c statement_timeout=$statement_timeout"
+    [[ -z "${PGSSLMODE:-}" ]] || export PGSSLMODE
+    [[ -z "${PGSSLROOTCERT:-}" ]] || export PGSSLROOTCERT
+    [[ -z "${PGSSLCERT:-}" ]] || export PGSSLCERT
+    [[ -z "${PGSSLKEY:-}" ]] || export PGSSLKEY
+    "$TIMEOUT_BIN" "${command_timeout}s" "$PSQL_BIN" \
+      --no-psqlrc --no-password --set=ON_ERROR_STOP=1 --quiet --tuples-only --no-align \
+      --host "$DATABASE_HOST" --port "$DATABASE_PORT" \
+      --username "$DATABASE_USER" --dbname "$DATABASE_NAME"
+  )
+}
+
+create_pgpass_file() {
+  PGPASSFILE="$(mktemp "$RUN_DIR/pgpass.XXXXXX")" || {
+    fail "could not create a private PostgreSQL password file"
+    return 1
+  }
+  chmod 0600 "$PGPASSFILE" || {
+    fail "could not set private PostgreSQL password-file permissions"
+    rm -f -- "$PGPASSFILE"
+    return 1
+  }
+  private_path "$PGPASSFILE" || {
+    rm -f -- "$PGPASSFILE"
+    return 1
+  }
+}
+
+write_local_pgpass() {
+  create_pgpass_file || return 1
+  printf '%s:%s:%s:%s:\n' \
+    "$DATABASE_HOST" "$DATABASE_PORT" "$DATABASE_NAME" "$DATABASE_USER" >"$PGPASSFILE" || return 1
+  chmod 0600 "$PGPASSFILE" || {
+    fail "could not retain private PostgreSQL password-file permissions"
+    return 1
+  }
+  private_path "$PGPASSFILE"
+}
+
+configure_external_postgres_connection() {
+  local connection_file=""
+  local field=""
+  local -a fields=()
+
+  create_pgpass_file || return 1
+  connection_file="$(mktemp "$RUN_DIR/pg-connection.XXXXXX")" || {
+    fail "could not create a private PostgreSQL connection artifact"
+    return 1
+  }
+  private_path "$connection_file" || {
+    rm -f -- "$connection_file"
+    return 1
+  }
+  TARIT_E2E_DATABASE_URL="$DATABASE_URL" \
+    TARIT_E2E_PGPASSFILE="$PGPASSFILE" \
+    TARIT_E2E_PG_CONNECTION_FILE="$connection_file" \
+    "$TIMEOUT_BIN" 10s python3 - <<'PY' || {
+import os
+from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlsplit
+
+url = os.environ["TARIT_E2E_DATABASE_URL"]
+parsed = urlsplit(url)
+if parsed.scheme not in {"postgres", "postgresql"}:
+    raise SystemExit("TARIT_DATABASE_URL must use the postgres or postgresql scheme")
+if not parsed.hostname:
+    raise SystemExit("TARIT_DATABASE_URL must include a PostgreSQL host")
+try:
+    port = parsed.port or 5432
+except ValueError as error:
+    raise SystemExit("TARIT_DATABASE_URL has an invalid PostgreSQL port") from error
+database = unquote(parsed.path[1:])
+user = unquote(parsed.username or "")
+password = unquote(parsed.password or "")
+if not database or not user:
+    raise SystemExit("TARIT_DATABASE_URL must include a database name and user")
+if any("\n" in value or "\r" in value or "\x00" in value for value in
+       (parsed.hostname, database, user, password)):
+    raise SystemExit("TARIT_DATABASE_URL contains an unsupported PostgreSQL connection value")
+
+query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+for forbidden in ("password", "passfile", "service"):
+    if forbidden in query:
+        raise SystemExit(f"TARIT_DATABASE_URL must not use the {forbidden} query parameter")
+
+def pgpass_escape(value):
+    return value.replace("\\", "\\\\").replace(":", "\\:")
+
+pgpass = Path(os.environ["TARIT_E2E_PGPASSFILE"])
+pgpass.write_text(
+    ":".join(pgpass_escape(value) for value in
+             (parsed.hostname, str(port), database, user, password)) + "\n",
+    encoding="utf-8",
+)
+os.chmod(pgpass, 0o600)
+
+ssl_keys = ("sslmode", "sslrootcert", "sslcert", "sslkey")
+for key in ssl_keys:
+    value = query.get(key, "")
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise SystemExit(f"TARIT_DATABASE_URL has an invalid {key} value")
+fields = [parsed.hostname, str(port), database, user] + [query.get(key, "") for key in ssl_keys]
+Path(os.environ["TARIT_E2E_PG_CONNECTION_FILE"]).write_bytes(
+    b"\0".join(value.encode("utf-8") for value in fields) + b"\0"
+)
+PY
+    rm -f -- "$connection_file" "$PGPASSFILE"
+    return 1
+  }
+  private_path "$PGPASSFILE" || {
+    rm -f -- "$connection_file" "$PGPASSFILE"
+    return 1
+  }
+  private_path "$connection_file" || {
+    rm -f -- "$connection_file" "$PGPASSFILE"
+    return 1
+  }
+  while IFS= read -r -d '' field; do
+    fields+=("$field")
+  done <"$connection_file"
+  if [[ "${#fields[@]}" != "8" ]]; then
+    fail "could not parse private PostgreSQL connection fields"
+    rm -f -- "$connection_file" "$PGPASSFILE"
+    return 1
+  fi
+  DATABASE_HOST="${fields[0]}"
+  DATABASE_PORT="${fields[1]}"
+  DATABASE_NAME="${fields[2]}"
+  DATABASE_USER="${fields[3]}"
+  PGSSLMODE="${fields[4]}"
+  PGSSLROOTCERT="${fields[5]}"
+  PGSSLCERT="${fields[6]}"
+  PGSSLKEY="${fields[7]}"
+  rm -f -- "$connection_file" || return 1
+}
+
+cleanup_database_rows() {
+  local cleanup_failed=0
+  local remaining_rows=""
+
+  [[ "$DATABASE_MODE" == "external" ]] || return 0
+  [[ -n "${PSQL_BIN:-}" && -n "${PGPASSFILE:-}" ]] || {
+    fail "external PostgreSQL cleanup was not configured"
+    return 1
+  }
+
+  if ! TARIT_E2E_SQL_OWNER_KEY="$OWNER_KEY" \
+    TARIT_E2E_SQL_HOST_PREFIX="$HOST_PREFIX%" \
+    psql_execute <<'SQL'
+\getenv owner_key TARIT_E2E_SQL_OWNER_KEY
+\getenv host_prefix TARIT_E2E_SQL_HOST_PREFIX
 DELETE FROM fleet_shares WHERE owner_key = :'owner_key';
 DELETE FROM fleet_vms WHERE host_id LIKE :'host_prefix';
 DELETE FROM fleet_hosts WHERE host_id LIKE :'host_prefix';
 DELETE FROM fleet_leader WHERE leader_id LIKE :'host_prefix';
 SQL
+  then
+    warn "external PostgreSQL cleanup DELETE statements failed"
+    cleanup_failed=1
+  fi
+
+  if ! remaining_rows="$(
+    TARIT_E2E_SQL_OWNER_KEY="$OWNER_KEY" \
+      TARIT_E2E_SQL_HOST_PREFIX="$HOST_PREFIX%" \
+      psql_execute <<'SQL'
+\getenv owner_key TARIT_E2E_SQL_OWNER_KEY
+\getenv host_prefix TARIT_E2E_SQL_HOST_PREFIX
+SELECT
+  (SELECT count(*) FROM fleet_shares WHERE owner_key = :'owner_key') +
+  (SELECT count(*) FROM fleet_vms WHERE host_id LIKE :'host_prefix') +
+  (SELECT count(*) FROM fleet_hosts WHERE host_id LIKE :'host_prefix') +
+  (SELECT count(*) FROM fleet_leader WHERE leader_id LIKE :'host_prefix');
+SQL
+  )"; then
+    warn "external PostgreSQL cleanup verification query failed"
+    return 1
+  fi
+  if [[ "$remaining_rows" != "0" ]]; then
+    warn "external PostgreSQL cleanup left $remaining_rows test rows behind"
+    return 1
+  fi
+  [[ "$cleanup_failed" -eq 0 ]]
 }
 
 stop_local_postgres() {
@@ -459,10 +692,10 @@ stop_local_postgres() {
   [[ "$cmdline" == *postgres* && "$cmdline" == *"$PG_DATA_DIR"* ]] ||
     return 1
 
-  kill -TERM "$PG_PID"
+  kill -TERM "$PG_PID" || return 1
   if ! wait_for_pid_exit "$PG_PID" 30; then
     warn "isolated PostgreSQL PID $PG_PID did not exit after SIGTERM; sending SIGINT to that tracked PID"
-    kill -INT "$PG_PID"
+    kill -INT "$PG_PID" || return 1
     wait_for_pid_exit "$PG_PID" 15 || return 1
   fi
   DATABASE_MODE="stopped"
@@ -474,52 +707,185 @@ record_local_postgres_pid() {
   [[ -n "$PG_PID" && "$PG_PID" =~ ^[0-9]+$ ]]
 }
 
-tarit_network_artifacts_present() {
-  ip -o link show | grep -Eq '^[0-9]+: insta[0-9]+(:|@)'
+host_network_probe_timeout_seconds() {
+  local timeout_seconds="${TARIT_E2E_HOST_NETWORK_PROBE_TIMEOUT_SECS:-5}"
+
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] ||
+    {
+      fail "host-network probe timeout must be a positive integer"
+      return 1
+    }
+  printf '%s\n' "$timeout_seconds"
+}
+
+run_captured_host_network_probe() {
+  local description="$1"
+  local output_variable="$2"
+  shift 2
+  local timeout_seconds=""
+  local output=""
+  local status=0
+
+  timeout_seconds="$(host_network_probe_timeout_seconds)" || return 2
+  if output="$("$TIMEOUT_BIN" "${timeout_seconds}s" "$@" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf -v "$output_variable" '%s' "$output"
+  if [[ "$status" -ne 0 ]]; then
+    warn "$description probe failed with status $status; refusing host-network mutation"
+    return 2
+  fi
+  return 0
+}
+
+probe_tarit_network_artifacts() {
+  local line=""
+  local timeout_seconds=""
+
+  timeout_seconds="$(host_network_probe_timeout_seconds)" || return 2
+  if HOST_NETWORK_PROBE_OUTPUT="$("$TIMEOUT_BIN" "${timeout_seconds}s" ip -o link show 2>&1)"; then
+    HOST_NETWORK_PROBE_STATUS=0
+  else
+    HOST_NETWORK_PROBE_STATUS=$?
+    warn "guest-network link inventory probe failed with status $HOST_NETWORK_PROBE_STATUS; refusing host-network mutation"
+    return 2
+  fi
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[0-9]+:\ insta[0-9]+(:|@) ]] && return 0
+  done <<<"$HOST_NETWORK_PROBE_OUTPUT"
+  return 1
+}
+
+probe_tarit_nft_table() {
+  local line=""
+
+  run_captured_host_network_probe \
+    "nftables table inventory" \
+    NFT_TABLE_PROBE_OUTPUT \
+    nft list tables || return $?
+  while IFS= read -r line; do
+    [[ "$line" == "table ip taritd_nat" ]] && return 0
+  done <<<"$NFT_TABLE_PROBE_OUTPUT"
+  return 1
+}
+
+probe_ip_forward() {
+  run_captured_host_network_probe \
+    "IPv4 forwarding sysctl" \
+    IP_FORWARD_PROBE_OUTPUT \
+    sysctl -n net.ipv4.ip_forward || return $?
+  [[ "$IP_FORWARD_PROBE_OUTPUT" =~ ^[01]$ ]] ||
+    return 2
+  return 0
+}
+
+assert_clean_host_network_preflight() {
+  local probe_status=0
+
+  if probe_tarit_network_artifacts; then
+    fail "refusing to start with existing Tarit guest-network interfaces"
+    return 1
+  else
+    probe_status=$?
+    if [[ "$probe_status" -ne 1 ]]; then
+      fail "could not reliably inspect guest-network interfaces before mutation"
+      return 1
+    fi
+  fi
+
+  if probe_tarit_nft_table; then
+    fail "refusing to start with a pre-existing taritd_nat nft table"
+    return 1
+  else
+    probe_status=$?
+    if [[ "$probe_status" -ne 1 ]]; then
+      fail "could not reliably inspect nftables ownership before mutation"
+      return 1
+    fi
+  fi
+
+  if ! probe_ip_forward; then
+    fail "could not read a valid net.ipv4.ip_forward before guest-network setup"
+    return 1
+  fi
+  ORIGINAL_IP_FORWARD="$IP_FORWARD_PROBE_OUTPUT"
+  HOST_NETWORK_PREFLIGHT_CHECKED=1
+  return 0
+}
+
+capture_owned_nft_table() {
+  run_captured_host_network_probe \
+    "owned taritd_nat nft table" \
+    NFT_TABLE_CONTENT \
+    nft list table ip taritd_nat
 }
 
 capture_host_networking() {
-  if nft list table ip taritd_nat >/dev/null 2>&1; then
-    fail "refusing to capture a pre-existing taritd_nat nft table"
-  fi
-  ORIGINAL_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" ||
-    fail "could not read net.ipv4.ip_forward before guest-network setup"
-  [[ "$ORIGINAL_IP_FORWARD" =~ ^[01]$ ]] ||
-    fail "unexpected net.ipv4.ip_forward value '$ORIGINAL_IP_FORWARD'"
+  assert_clean_host_network_preflight ||
+    return 1
   NETWORK_SNAPSHOT_CAPTURED=1
-  NETWORK_START_ATTEMPTED=0
+  NFT_TABLE_ABSENT_BEFORE_RUN=1
+  IP_FORWARD_SNAPSHOT_CAPTURED=1
   NFT_TABLE_CREATED_BY_RUN=0
   IP_FORWARD_CHANGED_BY_RUN=0
 }
 
 record_owned_host_networking() {
-  [[ "${NETWORK_SNAPSHOT_CAPTURED:-0}" == "1" ]] ||
-    fail "host-network state was not captured before node startup"
-  nft list table ip taritd_nat >/dev/null 2>&1 ||
-    fail "taritd did not create its expected nft table"
   local current_ip_forward=""
-  current_ip_forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" ||
+
+  [[ "${NETWORK_SNAPSHOT_CAPTURED:-0}" == "1" ]] || {
+    fail "host-network state was not captured before node startup"
+    return 1
+  }
+  [[ "${HOST_NETWORK_PREFLIGHT_CHECKED:-0}" == "1" ]] || {
+    fail "host-network preflight was not completed before node startup"
+    return 1
+  }
+  [[ "${NFT_TABLE_ABSENT_BEFORE_RUN:-0}" == "1" &&
+    "${IP_FORWARD_SNAPSHOT_CAPTURED:-0}" == "1" ]] || {
+    fail "host-network ownership was not proven before node startup"
+    return 1
+  }
+  pid_matches_owned_binary "$NODE_A_PID" "$TARITD_BIN_REAL" || {
+    fail "cannot prove that this run started the node which created host-network state"
+    return 1
+  }
+  if ! capture_owned_nft_table; then
+    fail "taritd did not create a readable taritd_nat nft table for this run"
+    return 1
+  fi
+  if ! probe_ip_forward; then
     fail "could not read net.ipv4.ip_forward after guest-network setup"
-  [[ "$current_ip_forward" == "1" ]] ||
+    return 1
+  fi
+  current_ip_forward="$IP_FORWARD_PROBE_OUTPUT"
+  [[ "$current_ip_forward" == "1" ]] || {
     fail "taritd guest networking did not enable IPv4 forwarding"
+    return 1
+  }
   [[ "$ORIGINAL_IP_FORWARD" == "$current_ip_forward" ]] ||
     IP_FORWARD_CHANGED_BY_RUN=1
-  NFT_TABLE_BASELINE="$(mktemp "$RUN_DIR/nft-baseline.XXXXXX")" ||
+  NFT_TABLE_BASELINE="$(mktemp "$RUN_DIR/nft-baseline.XXXXXX")" || {
     fail "could not create a private nft baseline artifact"
-  nft list table ip taritd_nat >"$NFT_TABLE_BASELINE" ||
-    fail "could not capture the owned taritd nft table baseline"
-  private_path "$NFT_TABLE_BASELINE"
+    return 1
+  }
+  printf '%s\n' "$NFT_TABLE_CONTENT" >"$NFT_TABLE_BASELINE" || return 1
+  private_path "$NFT_TABLE_BASELINE" || return 1
   NFT_TABLE_CREATED_BY_RUN=1
 }
 
 nft_table_matches_owned_baseline() {
   local current=""
+
   current="$(mktemp "$RUN_DIR/nft-current.XXXXXX")" ||
     return 1
-  if ! nft list table ip taritd_nat >"$current"; then
+  if ! capture_owned_nft_table; then
     rm -f -- "$current"
     return 1
   fi
+  printf '%s\n' "$NFT_TABLE_CONTENT" >"$current"
   if cmp -s "$NFT_TABLE_BASELINE" "$current"; then
     rm -f -- "$current"
     return 0
@@ -528,67 +894,128 @@ nft_table_matches_owned_baseline() {
   return 1
 }
 
+host_network_state_is_unchanged() {
+  local probe_status=0
+
+  if probe_tarit_network_artifacts; then
+    return 1
+  else
+    probe_status=$?
+    [[ "$probe_status" -eq 1 ]] || return 1
+  fi
+  if probe_tarit_nft_table; then
+    return 1
+  else
+    probe_status=$?
+    [[ "$probe_status" -eq 1 ]] || return 1
+  fi
+  probe_ip_forward || return 1
+  [[ "$IP_FORWARD_PROBE_OUTPUT" == "$ORIGINAL_IP_FORWARD" ]]
+}
+
 restore_host_networking() {
+  local timeout_seconds=""
+  local probe_status=0
+
   [[ "${NETWORK_SNAPSHOT_CAPTURED:-0}" == "1" ]] || return 0
   if any_tarit_or_vmm_processes_present; then
     warn "refusing to alter host networking while a Tarit process still exists"
     return 1
   fi
-  if tarit_network_artifacts_present; then
-    warn "refusing to remove taritd_nat while guest-network interfaces still exist"
+  if ! host_network_state_is_unchanged &&
+    [[ "${NFT_TABLE_CREATED_BY_RUN:-0}" != "1" ]]; then
+    warn "refusing to alter host networking because startup ownership was not fully recorded"
     return 1
   fi
-  if [[ "${NETWORK_START_ATTEMPTED:-0}" == "1" &&
-    "${NFT_TABLE_CREATED_BY_RUN:-0}" != "1" ]]; then
-    if nft list table ip taritd_nat >/dev/null 2>&1 ||
-      [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "$ORIGINAL_IP_FORWARD" ]]; then
-      warn "refusing to alter host networking because startup ownership was not fully recorded"
+  if [[ "${NFT_TABLE_CREATED_BY_RUN:-0}" == "1" ]]; then
+    if [[ "${NFT_TABLE_ABSENT_BEFORE_RUN:-0}" != "1" ]]; then
+      warn "refusing to delete a taritd_nat table without this run's absence receipt"
       return 1
     fi
-  fi
-  if [[ "${NFT_TABLE_CREATED_BY_RUN:-0}" == "1" ]]; then
-    nft list table ip taritd_nat >/dev/null 2>&1 ||
+    if probe_tarit_network_artifacts; then
+      warn "refusing to remove taritd_nat while guest-network interfaces still exist or cannot be inspected"
       return 1
+    else
+      probe_status=$?
+      if [[ "$probe_status" -ne 1 ]]; then
+        warn "refusing to remove taritd_nat because guest-network interfaces could not be inspected"
+        return 1
+      fi
+    fi
+    if ! probe_tarit_nft_table; then
+      warn "refusing to delete an owned taritd_nat table that is no longer present or cannot be inspected"
+      return 1
+    fi
     if ! nft_table_matches_owned_baseline; then
       warn "refusing to delete a taritd_nat table that differs from this run's baseline"
       return 1
     fi
-    nft delete table ip taritd_nat >/dev/null 2>&1 ||
+    timeout_seconds="$(host_network_probe_timeout_seconds)" || return 1
+    "$TIMEOUT_BIN" "${timeout_seconds}s" nft delete table ip taritd_nat ||
       return 1
+    NFT_TABLE_CREATED_BY_RUN=0
   fi
   if [[ "${IP_FORWARD_CHANGED_BY_RUN:-0}" == "1" ]]; then
-    [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] ||
+    if [[ "${IP_FORWARD_SNAPSHOT_CAPTURED:-0}" != "1" ]]; then
+      warn "refusing to restore IPv4 forwarding without this run's snapshot receipt"
       return 1
-    sysctl -qw "net.ipv4.ip_forward=$ORIGINAL_IP_FORWARD" ||
+    fi
+    probe_ip_forward || return 1
+    [[ "$IP_FORWARD_PROBE_OUTPUT" == "1" ]] ||
       return 1
+    timeout_seconds="$(host_network_probe_timeout_seconds)" || return 1
+    "$TIMEOUT_BIN" "${timeout_seconds}s" sysctl -qw "net.ipv4.ip_forward=$ORIGINAL_IP_FORWARD" ||
+      return 1
+    IP_FORWARD_CHANGED_BY_RUN=0
   fi
   NETWORK_SNAPSHOT_CAPTURED=0
+  HOST_NETWORK_PREFLIGHT_CHECKED=0
+  NFT_TABLE_ABSENT_BEFORE_RUN=0
+  IP_FORWARD_SNAPSHOT_CAPTURED=0
   return 0
 }
 
 delete_known_vms_best_effort() {
   local vm_id
-  [[ -n "${CONTROL_URL_A:-}" ]] || return 0
+  local cleanup_failed=0
+
+  [[ "${#VM_IDS[@]}" -eq 0 ]] && return 0
+  if [[ -z "${CONTROL_URL_A:-}" ]]; then
+    warn "cannot delete tracked VMs during cleanup because node A's control URL is unavailable"
+    return 1
+  fi
   for vm_id in "${VM_IDS[@]:-}"; do
-    curl --noproxy '*' --silent --show-error --connect-timeout 2 --max-time 15 \
-      -X DELETE \
-      -H "X-API-Key: $API_KEY" \
-      "$CONTROL_URL_A/v1/vms/$vm_id" >/dev/null 2>&1 || true
+    if ! control_request a DELETE "/v1/vms/$vm_id" ""; then
+      warn "could not construct cleanup request for tracked VM $vm_id"
+      cleanup_failed=1
+      continue
+    fi
+    if [[ "$LAST_STATUS" != "204" && "$LAST_STATUS" != "404" ]]; then
+      warn "could not delete tracked VM $vm_id during cleanup (HTTP $LAST_STATUS)"
+      cleanup_failed=1
+    fi
   done
+  [[ "$cleanup_failed" -eq 0 ]]
 }
 
 stop_tracked_vmm_processes() {
   local pid
+  local cleanup_failed=0
+
   for pid in "${VMM_PIDS[@]:-}"; do
     if pid_matches_owned_binary "$pid" "$VMM_BIN_REAL"; then
-      terminate_expected_pid "$pid" "$VMM_BIN_REAL" "VMM child" || true
+      terminate_expected_pid "$pid" "$VMM_BIN_REAL" "VMM child" || cleanup_failed=1
+    elif ! pid_is_gone "$pid"; then
+      warn "refusing to terminate unproven VMM child PID $pid"
+      cleanup_failed=1
     fi
   done
+  [[ "$cleanup_failed" -eq 0 ]]
 }
 
 stop_caddy() {
   [[ -n "${CADDY_PID:-}" ]] || return 0
-  terminate_expected_pid "$CADDY_PID" "$CADDY_BIN_REAL" "Caddy edge"
+  terminate_expected_pid "$CADDY_PID" "$CADDY_BIN_REAL" "Caddy edge" || return 1
   CADDY_PID=""
 }
 
@@ -598,21 +1025,24 @@ cleanup() {
   trap - EXIT INT TERM HUP
   set +e
   stop_caddy || cleanup_failed=1
-  delete_known_vms_best_effort
-  [[ -n "${NODE_A_PID:-}" ]] &&
-    terminate_expected_pid "$NODE_A_PID" "$TARITD_BIN_REAL" "node A" || true
-  [[ -n "${NODE_B_PID:-}" ]] &&
-    terminate_expected_pid "$NODE_B_PID" "$TARITD_BIN_REAL" "node B" || true
-  stop_tracked_vmm_processes
-  cleanup_database_rows
+  delete_known_vms_best_effort || cleanup_failed=1
+  if [[ -n "${NODE_A_PID:-}" ]]; then
+    terminate_expected_pid "$NODE_A_PID" "$TARITD_BIN_REAL" "node A" || cleanup_failed=1
+  fi
+  if [[ -n "${NODE_B_PID:-}" ]]; then
+    terminate_expected_pid "$NODE_B_PID" "$TARITD_BIN_REAL" "node B" || cleanup_failed=1
+  fi
+  stop_tracked_vmm_processes || cleanup_failed=1
+  cleanup_database_rows || cleanup_failed=1
   restore_host_networking || cleanup_failed=1
   stop_local_postgres || cleanup_failed=1
   if [[ "$DATABASE_MODE" == "stopped" ]]; then
     restore_run_dir_permissions || cleanup_failed=1
   fi
-  if [[ "$cleanup_failed" -eq 0 ]]; then
-    safe_remove_run_dir
-  else
+  if [[ "$cleanup_failed" -eq 0 ]] && ! safe_remove_run_dir; then
+    cleanup_failed=1
+  fi
+  if [[ "$cleanup_failed" -ne 0 ]]; then
     warn "cleanup could not safely release every owned resource; preserving $RUN_DIR"
     [[ "$status" -eq 0 ]] && status=1
   fi
@@ -627,26 +1057,40 @@ preflight() {
   [[ -e /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] ||
     skip "/dev/kvm is unavailable or inaccessible; use a bare-metal or nested-KVM Linux host"
 
-  require_command curl "install curl"
-  require_command python3 "install Python 3"
-  require_command sha256sum "install coreutils"
-  require_command ip "install iproute2"
-  require_command nft "install nftables"
-  require_command ps "install procps"
-  require_command readlink "install coreutils"
-  require_command grep "install grep"
-  require_command sysctl "install procps"
-  require_command flock "install util-linux"
-  require_command "$TIMEOUT_BIN" "install GNU coreutils timeout"
-  require_command mktemp "install coreutils"
-  require_command stat "install coreutils"
-  require_command cmp "install coreutils"
   require_command awk "install awk"
+  require_command bash "install bash"
+  require_command cat "install coreutils"
+  require_command chgrp "install coreutils"
+  require_command chmod "install coreutils"
+  require_command chown "install coreutils"
+  require_command cmp "install coreutils"
+  require_command cp "install coreutils"
+  require_command curl "install curl"
+  require_command date "install coreutils"
+  require_command env "install coreutils"
   require_command find "install findutils"
-  if ! command -v "$CADDY_BIN" >/dev/null 2>&1; then
-    fail "Caddy is required for the TLS edge gate but '$CADDY_BIN' is unavailable; install Caddy or set TARIT_CADDY_BIN"
-    return 1
-  fi
+  require_command flock "install util-linux"
+  require_command grep "install grep"
+  require_command head "install coreutils"
+  require_command id "install coreutils"
+  require_command ip "install iproute2"
+  require_command lscpu "install util-linux"
+  require_command mkdir "install coreutils"
+  require_command mktemp "install coreutils"
+  require_command nft "install nftables"
+  require_command nproc "install coreutils"
+  require_command ps "install procps"
+  require_command python3 "install Python 3"
+  require_command readlink "install coreutils"
+  require_command rm "install coreutils"
+  require_command sha256sum "install coreutils"
+  require_command sleep "install coreutils"
+  require_command sqlite3 "install sqlite3"
+  require_command stat "install coreutils"
+  require_command sysctl "install procps"
+  require_command "$TIMEOUT_BIN" "install GNU coreutils timeout"
+  require_command tr "install coreutils"
+  require_command "$CADDY_BIN" "install Caddy or set TARIT_CADDY_BIN"
 
   [[ -x "$TARITD_BIN" ]] ||
     skip "taritd binary not found at TARITD_BIN=$TARITD_BIN; build orch with cargo build --release -p taritd or set TARITD_BIN"
@@ -665,14 +1109,7 @@ preflight() {
     fail "refusing to start with unrelated taritd or VMM processes"
     return 1
   fi
-  if tarit_network_artifacts_present; then
-    fail "refusing to start with existing Tarit guest-network interfaces"
-    return 1
-  fi
-  if nft list table ip taritd_nat >/dev/null 2>&1; then
-    fail "refusing to start with a pre-existing taritd_nat nft table"
-    return 1
-  fi
+  assert_clean_host_network_preflight || return 1
 
   if [[ -z "$REQUESTED_DATABASE_URL" ]]; then
     INITDB_BIN="$(find_pg_binary initdb "${TARIT_E2E_INITDB:-}" || true)"
@@ -680,6 +1117,9 @@ preflight() {
     PSQL_BIN="$(find_pg_binary psql "${TARIT_E2E_PSQL:-}" || true)"
     [[ -n "$INITDB_BIN" && -n "$PG_CTL_BIN" && -n "$PSQL_BIN" ]] ||
       skip "no TARIT_DATABASE_URL and local PostgreSQL tools are unavailable; install initdb/pg_ctl/psql or set TARIT_DATABASE_URL"
+    require_command "$INITDB_BIN" "install PostgreSQL initdb"
+    require_command "$PG_CTL_BIN" "install PostgreSQL pg_ctl"
+    require_command "$PSQL_BIN" "install PostgreSQL psql"
     if [[ -n "${TARIT_E2E_POSTGRES_OS_USER:-}" ]]; then
       PG_OS_USER="$TARIT_E2E_POSTGRES_OS_USER"
     elif [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
@@ -698,6 +1138,7 @@ preflight() {
     PSQL_BIN="$(find_pg_binary psql "${TARIT_E2E_PSQL:-}" || true)"
     [[ -n "$PSQL_BIN" ]] ||
       skip "TARIT_DATABASE_URL is set but psql is unavailable for the isolated-run cleanup"
+    require_command "$PSQL_BIN" "install PostgreSQL psql"
   fi
 
   detect_virt
@@ -708,6 +1149,7 @@ TARITD_BIN="${TARITD_BIN:-${TARIT_BIN:-$ORCH_ROOT/target/release/taritd}}"
 VMM_BIN="${TARIT_VMM_BIN:-${VMM_BIN:-$VMM_ROOT/target/release/vmm}}"
 CADDY_BIN="${TARIT_CADDY_BIN:-caddy}"
 TIMEOUT_BIN="${TARIT_E2E_TIMEOUT_BIN:-timeout}"
+HELPERS_ONLY="${TARIT_E2E_SHARES_HELPERS_ONLY:-0}"
 KERNEL="${TARIT_KERNEL:-$REPO_ROOT/guest-assets/vmlinux}"
 ROOTFS="${TARIT_SHARE_ROOTFS:-${TARIT_ROOTFS:-$REPO_ROOT/guest-assets/share-node-rootfs.ext4}}"
 GUEST_PORT="${TARIT_E2E_GUEST_PORT:-43127}"
@@ -715,37 +1157,48 @@ SHARE_DOMAIN="${TARIT_SHARE_DOMAIN:-shares.e2e.test}"
 EDGE_SLUG="${TARIT_E2E_EDGE_SLUG:-tarit-e2e-edge}"
 RUN_ROOT="${TARIT_E2E_RUN_ROOT:-$ORCH_ROOT/e}"
 REQUESTED_DATABASE_URL="${TARIT_DATABASE_URL:-}"
-RUN_ID="shares-$(date -u +%Y%m%dT%H%M%S)-$$"
+RUN_ID=""
 RUN_DIR=""
 RUN_MARKER=""
 TARITD_BIN_REAL=""
 VMM_BIN_REAL=""
 CADDY_BIN_REAL=""
+HOST_NETWORK_PREFLIGHT_CHECKED=0
+NFT_TABLE_ABSENT_BEFORE_RUN=0
+IP_FORWARD_SNAPSHOT_CAPTURED=0
+HOST_NETWORK_PROBE_OUTPUT=""
+HOST_NETWORK_PROBE_STATUS=""
+NFT_TABLE_PROBE_OUTPUT=""
+NFT_TABLE_CONTENT=""
+IP_FORWARD_PROBE_OUTPUT=""
+ORIGINAL_IP_FORWARD=""
 
-if ! [[ "$GUEST_PORT" =~ ^[0-9]+$ ]] || (( GUEST_PORT < 1 || GUEST_PORT > 65535 )); then
-  fail "TARIT_E2E_GUEST_PORT must be in 1..=65535"
-fi
-if ! [[ "$EDGE_SLUG" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
-  fail "TARIT_E2E_EDGE_SLUG must be a lowercase DNS label"
-fi
-if ! [[ "$SHARE_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-  fail "TARIT_SHARE_DOMAIN must be a lowercase DNS name for the Caddy test edge"
-fi
+if [[ "$HELPERS_ONLY" != "1" ]]; then
+  if ! [[ "$GUEST_PORT" =~ ^[0-9]+$ ]] || (( GUEST_PORT < 1 || GUEST_PORT > 65535 )); then
+    fail "TARIT_E2E_GUEST_PORT must be in 1..=65535"
+  fi
+  if ! [[ "$EDGE_SLUG" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    fail "TARIT_E2E_EDGE_SLUG must be a lowercase DNS label"
+  fi
+  if ! [[ "$SHARE_DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    fail "TARIT_SHARE_DOMAIN must be a lowercase DNS name for the Caddy test edge"
+  fi
 
-preflight
-if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
-  exit 0
-fi
+  preflight
+  if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+    exit 0
+  fi
 
-mkdir -p -- "$RUN_ROOT"
-RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")" ||
-  fail "could not create a private per-run artifact directory"
-RUN_MARKER="$RUN_DIR/.tarit-e2e-shares-run"
-: >"$RUN_MARKER"
-private_path "$RUN_DIR"
-private_path "$RUN_MARKER"
-export TARIT_E2E_SHARES_RUN_ID="$RUN_ID"
-export TARIT_E2E_SHARES_RUN_DIR="$RUN_DIR"
+  RUN_ID="shares-$(date -u +%Y%m%dT%H%M%S)-$$"
+  mkdir -p -- "$RUN_ROOT"
+  RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")" ||
+    fail "could not create a private per-run artifact directory"
+  RUN_MARKER="$RUN_DIR/.tarit-e2e-shares-run"
+  : >"$RUN_MARKER"
+  private_path "$RUN_DIR"
+  private_path "$RUN_MARKER"
+  export TARIT_E2E_SHARES_RUN_ID="$RUN_ID"
+  export TARIT_E2E_SHARES_RUN_DIR="$RUN_DIR"
 
 CONTROL_URL_A=""
 CONTROL_URL_B=""
@@ -757,12 +1210,21 @@ VMM_PIDS=()
 CREATED_VM_ID=""
 DATABASE_MODE=""
 DATABASE_URL=""
+DATABASE_HOST=""
+DATABASE_PORT=""
+DATABASE_NAME=""
+DATABASE_USER=""
+PGPASSFILE=""
+PGSSLMODE=""
+PGSSLROOTCERT=""
+PGSSLCERT=""
+PGSSLKEY=""
 PG_DATA_DIR=""
 PG_PORT=""
 PG_PID=""
-ORIGINAL_IP_FORWARD=""
 NETWORK_SNAPSHOT_CAPTURED=0
-NETWORK_START_ATTEMPTED=0
+NFT_TABLE_ABSENT_BEFORE_RUN=0
+IP_FORWARD_SNAPSHOT_CAPTURED=0
 NFT_TABLE_CREATED_BY_RUN=0
 NFT_TABLE_BASELINE=""
 IP_FORWARD_CHANGED_BY_RUN=0
@@ -828,6 +1290,119 @@ private_path "$LAST_HEADERS"
 private_path "$REQUEST_BODY_FILE"
 LAST_STATUS=""
 LAST_CURL_STATUS=""
+fi
+
+curl_config_escape() {
+  local value="$1"
+
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || {
+    fail "refusing a curl configuration value containing a line break"
+    return 1
+  }
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "$value"
+}
+
+curl_config_flag() {
+  local config="$1"
+  local flag="$2"
+
+  printf '%s\n' "$flag" >>"$config"
+}
+
+curl_config_value() {
+  local config="$1"
+  local option="$2"
+  local value="$3"
+  local escaped=""
+
+  escaped="$(curl_config_escape "$value")" || return 1
+  printf '%s = "%s"\n' "$option" "$escaped" >>"$config"
+}
+
+new_curl_config() {
+  local config=""
+
+  config="$(mktemp "$RUN_DIR/curl-request.XXXXXX")" || {
+    fail "could not create a private curl configuration"
+    return 1
+  }
+  chmod 0600 "$config" || {
+    fail "could not set private curl-configuration permissions"
+    rm -f -- "$config"
+    return 1
+  }
+  private_path "$config" || {
+    rm -f -- "$config"
+    return 1
+  }
+  if ! curl_config_flag "$config" silent ||
+    ! curl_config_flag "$config" show-error ||
+    ! curl_config_value "$config" noproxy '*'; then
+    rm -f -- "$config"
+    return 1
+  fi
+  printf '%s\n' "$config"
+}
+
+append_curl_option() {
+  local config="$1"
+  shift
+
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -H|--header)
+        [[ "$#" -ge 2 ]] || {
+          fail "curl header option is missing its value"
+          return 1
+        }
+        curl_config_value "$config" header "$2" || return 1
+        shift 2
+        ;;
+      --proto)
+        [[ "$#" -ge 2 ]] || {
+          fail "curl protocol option is missing its value"
+          return 1
+        }
+        curl_config_value "$config" proto "$2" || return 1
+        shift 2
+        ;;
+      --cacert)
+        [[ "$#" -ge 2 ]] || {
+          fail "curl CA option is missing its value"
+          return 1
+        }
+        curl_config_value "$config" cacert "$2" || return 1
+        shift 2
+        ;;
+      --resolve)
+        [[ "$#" -ge 2 ]] || {
+          fail "curl resolve option is missing its value"
+          return 1
+        }
+        curl_config_value "$config" resolve "$2" || return 1
+        shift 2
+        ;;
+      --limit-rate)
+        [[ "$#" -ge 2 ]] || {
+          fail "curl rate-limit option is missing its value"
+          return 1
+        }
+        curl_config_value "$config" limit-rate "$2" || return 1
+        shift 2
+        ;;
+      --no-buffer)
+        curl_config_flag "$config" no-buffer
+        shift
+        ;;
+      *)
+        fail "unsupported curl option '$1' in secure request builder"
+        return 1
+        ;;
+    esac
+  done
+}
 
 http_request() {
   local method="$1"
@@ -835,32 +1410,43 @@ http_request() {
   local body_path="$3"
   shift 3
   local max_time="${TARIT_E2E_HTTP_TIMEOUT_SECS:-60}"
+  local config=""
+  local curl_status=0
+
   if [[ -n "${TARIT_E2E_ACTIVE_WAIT_TIMEOUT_SECS:-}" ]]; then
     max_time="$TARIT_E2E_ACTIVE_WAIT_TIMEOUT_SECS"
   fi
-  [[ "$max_time" =~ ^[1-9][0-9]*$ ]] ||
+  [[ "$max_time" =~ ^[1-9][0-9]*$ ]] || {
     fail "HTTP timeout must be a positive integer"
-  local -a args=(
-    curl
-    --noproxy '*'
-    --silent
-    --show-error
-    --connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}"
-    --max-time "$max_time"
-    -X "$method"
-    -D "$LAST_HEADERS"
-    -o "$LAST_BODY"
-    -w '%{http_code}'
-  )
-
-  [[ -n "$body_path" ]] && args+=(--data-binary "@$body_path")
-  args+=("$@" "$url")
+    return 1
+  }
+  config="$(new_curl_config)" || return 1
+  if ! curl_config_value "$config" connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}" ||
+    ! curl_config_value "$config" max-time "$max_time" ||
+    ! curl_config_value "$config" request "$method" ||
+    ! curl_config_value "$config" dump-header "$LAST_HEADERS" ||
+    ! curl_config_value "$config" output "$LAST_BODY" ||
+    ! curl_config_value "$config" write-out '%{http_code}' ||
+    { [[ -n "$body_path" ]] && ! curl_config_value "$config" data-binary "@$body_path"; }; then
+    rm -f -- "$config"
+    return 1
+  fi
+  append_curl_option "$config" "$@" || {
+    rm -f -- "$config"
+    return 1
+  }
+  curl_config_value "$config" url "$url" || {
+    rm -f -- "$config"
+    return 1
+  }
   : >"$LAST_BODY"
   : >"$LAST_HEADERS"
-  set +e
-  LAST_CURL_STATUS="$("${args[@]}")"
-  local curl_status=$?
-  set -e
+  if LAST_CURL_STATUS="$(curl --config "$config")"; then
+    curl_status=0
+  else
+    curl_status=$?
+  fi
+  rm -f -- "$config"
   if [[ "$curl_status" -ne 0 ]]; then
     LAST_STATUS="000"
   else
@@ -976,6 +1562,7 @@ for name in (
     "x-api-key",
     "x-tarit-share-token",
     "x-peer-secret",
+    "proxy-authorization",
     "x-real-ip",
     "x-forwarded-for",
 ):
@@ -1311,26 +1898,30 @@ run_stream_sha_gate() {
   local status=""
   local headers_file=""
   local digest_file=""
+  local curl_config=""
   expected="$(stream_digest "$byte_count")"
   host="$(share_host)"
   headers_file="$(mktemp "$RUN_DIR/stream-headers.XXXXXX")"
   digest_file="$(mktemp "$RUN_DIR/stream-sha.XXXXXX")"
   private_path "$headers_file"
   private_path "$digest_file"
+  curl_config="$(new_curl_config)" || return 1
+  curl_config_flag "$curl_config" no-buffer
+  curl_config_value "$curl_config" proto '=https'
+  curl_config_value "$curl_config" cacert "$CADDY_CA_CERT"
+  curl_config_value "$curl_config" connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}"
+  curl_config_value "$curl_config" max-time "${TARIT_E2E_STREAM_TIMEOUT_SECS:-90}"
+  curl_config_value "$curl_config" limit-rate "${TARIT_E2E_STREAM_RATE_LIMIT:-4M}"
+  curl_config_value "$curl_config" resolve "$host:$CADDY_PORT:127.0.0.1"
+  curl_config_value "$curl_config" header "Host: $host"
+  curl_config_value "$curl_config" dump-header "$headers_file"
+  curl_config_value "$curl_config" url "https://$host:$CADDY_PORT/stream?bytes=$byte_count&chunk=65536"
 
-  if ! curl --noproxy '*' --silent --show-error --no-buffer \
-    --proto '=https' \
-    --cacert "$CADDY_CA_CERT" \
-    --connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}" \
-    --max-time "${TARIT_E2E_STREAM_TIMEOUT_SECS:-90}" \
-    --limit-rate "${TARIT_E2E_STREAM_RATE_LIMIT:-4M}" \
-    --resolve "$host:$CADDY_PORT:127.0.0.1" \
-    -H "Host: $host" \
-    -D "$headers_file" \
-    "https://$host:$CADDY_PORT/stream?bytes=$byte_count&chunk=65536" |
-    sha256sum | awk '{print $1}' >"$digest_file"; then
+  if ! curl --config "$curl_config" | sha256sum | awk '{print $1}' >"$digest_file"; then
+    rm -f -- "$curl_config"
     fail "32 MiB share response did not stream through the non-owner node"
   fi
+  rm -f -- "$curl_config"
   status="$(awk '/^HTTP\// { code=$2 } END { print code }' "$headers_file")"
   [[ "$status" == "200" ]] ||
     fail "streaming response returned HTTP $status instead of 200"
@@ -1343,12 +1934,27 @@ run_large_upload_gate() {
   local expected=""
   local host=""
   local status_file=""
+  local curl_config=""
   expected="$(stream_digest "$byte_count")"
   host="$(share_host)"
   status_file="$(mktemp "$RUN_DIR/upload-status.XXXXXX")"
   private_path "$status_file"
   : >"$LAST_BODY"
   : >"$LAST_HEADERS"
+  curl_config="$(new_curl_config)" || return 1
+  curl_config_value "$curl_config" proto '=https'
+  curl_config_value "$curl_config" cacert "$CADDY_CA_CERT"
+  curl_config_value "$curl_config" connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}"
+  curl_config_value "$curl_config" max-time "${TARIT_E2E_UPLOAD_TIMEOUT_SECS:-90}"
+  curl_config_value "$curl_config" request POST
+  curl_config_value "$curl_config" resolve "$host:$CADDY_PORT:127.0.0.1"
+  curl_config_value "$curl_config" header "Host: $host"
+  curl_config_value "$curl_config" header 'Content-Type: application/octet-stream'
+  curl_config_value "$curl_config" data-binary '@-'
+  curl_config_value "$curl_config" dump-header "$LAST_HEADERS"
+  curl_config_value "$curl_config" output "$LAST_BODY"
+  curl_config_value "$curl_config" write-out '%{http_code}'
+  curl_config_value "$curl_config" url "https://$host:$CADDY_PORT/upload"
 
   if ! "$TIMEOUT_BIN" "${TARIT_E2E_UPLOAD_TIMEOUT_SECS:-90}s" python3 - "$byte_count" <<'PY' |
 import sys
@@ -1361,22 +1967,11 @@ while remaining:
     out.write(part)
     remaining -= len(part)
 PY
-    curl --noproxy '*' --silent --show-error \
-      --proto '=https' \
-      --cacert "$CADDY_CA_CERT" \
-      --connect-timeout "${TARIT_E2E_CONNECT_TIMEOUT_SECS:-3}" \
-      --max-time "${TARIT_E2E_UPLOAD_TIMEOUT_SECS:-90}" \
-      -X POST \
-      --resolve "$host:$CADDY_PORT:127.0.0.1" \
-      -H "Host: $host" \
-      -H 'Content-Type: application/octet-stream' \
-      --data-binary @- \
-      -D "$LAST_HEADERS" \
-      -o "$LAST_BODY" \
-      -w '%{http_code}' \
-      "https://$host:$CADDY_PORT/upload" >"$status_file"; then
+    curl --config "$curl_config" >"$status_file"; then
+    rm -f -- "$curl_config"
     fail "large upload did not stream through the non-owner node"
   fi
+  rm -f -- "$curl_config"
   LAST_STATUS="$(cat "$status_file")"
   expect_status 200 "large streaming upload"
   json_assert_eq "$LAST_BODY" bytes "$byte_count"
@@ -1470,10 +2065,19 @@ assert_listener_isolation() {
 }
 
 assert_caddy_internal_route_blocked() {
-  share_request GET "/internal/v1/shares/$SHARE_ID" ""
+  share_request GET "/internal/v1/shares/$SHARE_ID" "" \
+    -H 'X-Forwarded-Host: attacker.example.test' \
+    -H 'X-Forwarded-Host: alternate.example.test' \
+    -H 'X-Forwarded-Proto: http' \
+    -H 'X-Forwarded-Proto: https, http' \
+    -H 'Forwarded: for=attacker.example.test;host=attacker.example.test;proto=http' \
+    -H 'Forwarded: for=alternate.example.test;host=alternate.example.test;proto=https' \
+    -H 'X-Forwarded-For: attacker.example.test' \
+    -H 'X-Forwarded-For: alternate.example.test' \
+    -H 'Proxy-Authorization: Basic YXR0YWNrZXI6c2VjcmV0'
   expect_status 404 "Caddy must block public internal peer paths"
   [[ "$(cat "$LAST_BODY")" == "edge-internal-route-blocked" ]] ||
-    fail "internal route was not rejected by the Caddy edge"
+    fail "Caddy internal-route rejection body disclosed or differed from its exact stable value"
 }
 
 assert_peer_rejections() {
@@ -1535,38 +2139,47 @@ print(values[0])
 PY
 }
 
-share_gauges_are_zero_if_exposed() {
+share_gauges_are_zero() {
   local file="$1"
   local timeout_seconds=""
   timeout_seconds="$(subprocess_timeout_seconds 10)"
   METRICS_FILE="$file" "$TIMEOUT_BIN" "${timeout_seconds}s" python3 - <<'PY'
 import os
 
-samples = {}
+expected = (
+    "taritd_share_active_http",
+    "taritd_share_active_websockets",
+)
+samples = {name: [] for name in expected}
 for line in open(os.environ["METRICS_FILE"], encoding="utf-8"):
     line = line.strip()
     if not line or line.startswith("#"):
         continue
     parts = line.split()
-    if len(parts) == 2 and parts[0] in {
-        "taritd_share_active_http",
-        "taritd_share_active_websockets",
-    }:
-        samples.setdefault(parts[0], []).append(parts[1])
+    if len(parts) != 2:
+        continue
+    metric_name = parts[0].split("{", 1)[0]
+    if metric_name in samples:
+        samples[metric_name].append(parts[1])
 
-if samples:
-    for name in ("taritd_share_active_http", "taritd_share_active_websockets"):
-        if samples.get(name) != ["0"]:
-            raise SystemExit(f"{name} did not return to zero exactly once")
+for name, values in samples.items():
+    if len(values) != 1:
+        raise SystemExit(f"{name} must exist exactly once on every node")
+    try:
+        value = float(values[0])
+    except ValueError as error:
+        raise SystemExit(f"{name} must be numeric") from error
+    if value != 0:
+        raise SystemExit(f"{name} did not return to zero")
 PY
 }
 
-share_gauges_are_zero() {
+share_gauges_are_zero_on_all_nodes() {
   local node=""
   for node in a b; do
     control_request "$node" GET /metrics ""
     [[ "$LAST_STATUS" == "200" ]] || return 1
-    share_gauges_are_zero_if_exposed "$LAST_BODY" || return 1
+    share_gauges_are_zero "$LAST_BODY" || return 1
   done
 }
 
@@ -1601,7 +2214,7 @@ assert_metrics_for_node() {
   [[ "$request_series" == "18" ]] ||
     fail "share request metrics on node $node must expose exactly 18 bounded visibility/status series"
   assert_metric_secrecy "$metrics_file" "$node"
-  share_gauges_are_zero_if_exposed "$metrics_file"
+  share_gauges_are_zero "$metrics_file"
 }
 
 assert_metrics() {
@@ -1719,43 +2332,71 @@ start_node() {
 
 start_local_postgres() {
   DATABASE_MODE="local"
-  PG_PORT="$(allocate_port)"
-  [[ -z "${TARIT_E2E_POSTGRES_DIR:-}" ]] ||
+  PG_PORT="$(allocate_port)" || return 1
+  [[ -z "${TARIT_E2E_POSTGRES_DIR:-}" ]] || {
     fail "TARIT_E2E_POSTGRES_DIR is unsupported: the harness creates a private mktemp data directory"
-  grant_postgres_run_access
-  PG_DATA_DIR="$(mktemp -d "$RUN_DIR/postgres.XXXXXX")" ||
+    return 1
+  }
+  grant_postgres_run_access || return 1
+  PG_DATA_DIR="$(mktemp -d "$RUN_DIR/postgres.XXXXXX")" || {
     fail "could not create a private local PostgreSQL data directory"
-  chown "$PG_OS_USER" "$PG_DATA_DIR"
-  chmod 0700 "$PG_DATA_DIR"
-  [[ "$(stat -c '%a' -- "$PG_DATA_DIR")" == "700" ]] ||
+    return 1
+  }
+  chown "$PG_OS_USER" "$PG_DATA_DIR" || return 1
+  chmod 0700 "$PG_DATA_DIR" || return 1
+  [[ "$(stat -c '%a' -- "$PG_DATA_DIR")" == "700" ]] || {
     fail "local PostgreSQL data directory is not owner-private"
+    return 1
+  }
   run_as_pg_user "$INITDB_BIN" -D "$PG_DATA_DIR" \
     --auth=trust --no-locale --encoding=UTF8 --username=tarit_e2e \
-    >"$PG_DATA_DIR/initdb.log" 2>&1 ||
+    >"$PG_DATA_DIR/initdb.log" 2>&1 || {
     fail "isolated PostgreSQL initialization failed; inspect $PG_DATA_DIR/initdb.log"
+    return 1
+  }
   run_as_pg_user "$PG_CTL_BIN" -D "$PG_DATA_DIR" \
     -l "$PG_DATA_DIR/postgres.log" \
     -o "-h 127.0.0.1 -p $PG_PORT" \
     -w -t 30 start >/dev/null || {
     record_local_postgres_pid || true
     fail "isolated PostgreSQL did not start; inspect $PG_DATA_DIR/postgres.log"
+    return 1
   }
-  record_local_postgres_pid ||
+  record_local_postgres_pid || {
     fail "isolated PostgreSQL did not publish a valid postmaster PID"
+    return 1
+  }
   DATABASE_URL="postgresql://tarit_e2e@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
-  "$TIMEOUT_BIN" 15s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAtc 'SELECT 1' >/dev/null ||
+  DATABASE_HOST=127.0.0.1
+  DATABASE_PORT="$PG_PORT"
+  DATABASE_NAME=postgres
+  DATABASE_USER=tarit_e2e
+  PGSSLMODE=disable
+  PGSSLROOTCERT=""
+  PGSSLCERT=""
+  PGSSLKEY=""
+  write_local_pgpass || return 1
+  psql_execute <<<'SELECT 1;' >/dev/null || {
     fail "isolated PostgreSQL did not accept a connection"
+    return 1
+  }
 }
 
 configure_database() {
   if [[ -n "$REQUESTED_DATABASE_URL" ]]; then
     DATABASE_MODE="external"
     DATABASE_URL="$REQUESTED_DATABASE_URL"
-    "$TIMEOUT_BIN" 15s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAtc 'SELECT 1' >/dev/null ||
+    configure_external_postgres_connection || {
+      fail "could not configure private PostgreSQL credentials"
+      return 1
+    }
+    psql_execute <<<'SELECT 1;' >/dev/null || {
       fail "TARIT_DATABASE_URL is not reachable"
-    cleanup_database_rows
+      return 1
+    }
+    cleanup_database_rows || return 1
   else
-    start_local_postgres
+    start_local_postgres || return 1
   fi
 }
 
@@ -1763,20 +2404,32 @@ set_deterministic_share_slug() {
   local conflict_count=""
   local applied_slug=""
 
-  conflict_count="$("$TIMEOUT_BIN" 12s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAt \
-    -v ON_ERROR_STOP=1 \
-    -v slug="$EDGE_SLUG" \
-    -v share_id="$SHARE_ID" \
-    -c "SELECT count(*) FROM fleet_shares WHERE slug = :'slug' AND id <> :'share_id';")" ||
+  conflict_count="$(
+    TARIT_E2E_SQL_SLUG="$EDGE_SLUG" \
+      TARIT_E2E_SQL_SHARE_ID="$SHARE_ID" \
+      psql_execute <<'SQL'
+\getenv slug TARIT_E2E_SQL_SLUG
+\getenv share_id TARIT_E2E_SQL_SHARE_ID
+SELECT count(*) FROM fleet_shares WHERE slug = :'slug' AND id <> :'share_id';
+SQL
+  )" ||
     fail "could not check deterministic Caddy hostname availability"
   [[ "$conflict_count" == "0" ]] ||
     fail "deterministic Caddy hostname is already owned by a different share"
-  applied_slug="$("$TIMEOUT_BIN" 12s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAt \
-    -v ON_ERROR_STOP=1 \
-    -v slug="$EDGE_SLUG" \
-    -v share_id="$SHARE_ID" \
-    -v owner_key="$OWNER_KEY" \
-    -c "UPDATE fleet_shares SET slug = :'slug' WHERE id = :'share_id' AND owner_key = :'owner_key' RETURNING slug;")" ||
+  applied_slug="$(
+    TARIT_E2E_SQL_SLUG="$EDGE_SLUG" \
+      TARIT_E2E_SQL_SHARE_ID="$SHARE_ID" \
+      TARIT_E2E_SQL_OWNER_KEY="$OWNER_KEY" \
+      psql_execute <<'SQL'
+\getenv slug TARIT_E2E_SQL_SLUG
+\getenv share_id TARIT_E2E_SQL_SHARE_ID
+\getenv owner_key TARIT_E2E_SQL_OWNER_KEY
+UPDATE fleet_shares
+SET slug = :'slug'
+WHERE id = :'share_id' AND owner_key = :'owner_key'
+RETURNING slug;
+SQL
+  )" ||
     fail "could not set the deterministic Caddy hostname"
   [[ "$applied_slug" == "$EDGE_SLUG" ]] ||
     fail "deterministic Caddy hostname update did not affect exactly this run's share"
@@ -2260,7 +2913,7 @@ run_websocket_gate() {
   "$TIMEOUT_BIN" 20s python3 "$WS_CLIENT" "$CADDY_PORT" "$host" "$CADDY_CA_CERT" abrupt >"$abrupt_output"
   grep -qx 'WS_ABRUPT_PASS' "$abrupt_output" ||
     fail "WebSocket abrupt-disconnect gate failed"
-  wait_until "share HTTP and WebSocket gauge cleanup" 20 share_gauges_are_zero
+  wait_until "share HTTP and WebSocket gauge cleanup" 20 share_gauges_are_zero_on_all_nodes
 }
 
 race_vmm_barrier_reached() {
@@ -2286,10 +2939,13 @@ finally:
 if count != 0:
     raise SystemExit("FAIL: rejected shutdown create persisted a local VM record")
 PY
-  fleet_count="$("$TIMEOUT_BIN" 12s "$PSQL_BIN" "$DATABASE_URL" --no-psqlrc -qAt \
-    -v ON_ERROR_STOP=1 \
-    -v vm_id="$vm_id" \
-    -c "SELECT count(*) FROM fleet_vms WHERE id = :'vm_id';")" ||
+  fleet_count="$(
+    TARIT_E2E_SQL_VM_ID="$vm_id" \
+      psql_execute <<'SQL'
+\getenv vm_id TARIT_E2E_SQL_VM_ID
+SELECT count(*) FROM fleet_vms WHERE id = :'vm_id';
+SQL
+  )" ||
     fail "could not query authoritative fleet state after shutdown rejection"
   [[ "$fleet_count" == "0" ]] ||
     fail "rejected shutdown create persisted an authoritative fleet VM record"
@@ -2309,7 +2965,10 @@ data = json.loads(path.read_text(encoding="utf-8"))
 if any(entry.get("vm_id") == os.environ["VM_ID"] for entry in data.get("allocations", [])):
     raise SystemExit("FAIL: rejected shutdown create retained a network allocation")
 PY
-  if nft list table ip taritd_nat 2>/dev/null | grep -Fq -- "$vm_id"; then
+  if ! capture_owned_nft_table; then
+    fail "could not inspect the owned nft table after rejected shutdown create"
+  fi
+  if [[ "$NFT_TABLE_CONTENT" == *"$vm_id"* ]]; then
     fail "rejected shutdown create retained an nft network allocation"
   fi
 }
@@ -2322,6 +2981,7 @@ stop_node_a_for_shutdown_gate() {
   local request_status=""
   local request_stderr=""
   local proposed_id_file=""
+  local request_config=""
   local status=""
 
   pid_matches_owned_binary "$tracked_pid" "$TARITD_BIN_REAL" ||
@@ -2343,19 +3003,22 @@ PY
   private_path "$request_status"
   private_path "$request_stderr"
   private_path "$SHUTDOWN_RACE_BODY"
+  request_config="$(new_curl_config)" ||
+    fail "could not create the shutdown-race curl configuration"
+  curl_config_value "$request_config" connect-timeout 3
+  curl_config_value "$request_config" max-time 20
+  curl_config_value "$request_config" request POST
+  curl_config_value "$request_config" header "X-API-Key: $API_KEY"
+  curl_config_value "$request_config" header 'Content-Type: application/json'
+  curl_config_value "$request_config" data-binary "@$request_body"
+  curl_config_value "$request_config" dump-header "$request_headers"
+  curl_config_value "$request_config" output "$SHUTDOWN_RACE_BODY"
+  curl_config_value "$request_config" write-out '%{http_code}'
+  curl_config_value "$request_config" url "$CONTROL_URL_A/v1/vms"
   : >"$RACE_VMM_ARM"
   private_path "$RACE_VMM_ARM"
 
-  curl --noproxy '*' --silent --show-error \
-    --connect-timeout 3 --max-time 20 \
-    -X POST \
-    -H "X-API-Key: $API_KEY" \
-    -H 'Content-Type: application/json' \
-    --data-binary "@$request_body" \
-    -D "$request_headers" \
-    -o "$SHUTDOWN_RACE_BODY" \
-    -w '%{http_code}' \
-    "$CONTROL_URL_A/v1/vms" >"$request_status" 2>"$request_stderr" &
+  curl --config "$request_config" >"$request_status" 2>"$request_stderr" &
   local request_pid="$!"
   wait_until "deterministic in-flight VM create barrier" 15 race_vmm_barrier_reached
   private_path "$RACE_VMM_READY"
@@ -2371,6 +3034,7 @@ PY
   private_path "$RACE_VMM_RELEASE"
   wait_for_pid_exit "$request_pid" 25 ||
     fail "in-flight shutdown create did not return before its bounded curl deadline"
+  rm -f -- "$request_config"
   status="$(cat "$request_status")"
   [[ -n "$status" && "$status" != "000" ]] ||
     fail "in-flight shutdown create did not receive an API response (HTTP 000 is not a pass)"
@@ -2422,7 +3086,6 @@ main() {
   log "== starting node A and node B with independent control/share listeners =="
   capture_host_networking
   write_vmm_launcher
-  NETWORK_START_ATTEMPTED=1
   start_node a
   wait_until "node A health" 45 wait_for_health a
   record_owned_host_networking
@@ -2487,10 +3150,15 @@ main() {
     -H "Authorization: $APP_AUTHORIZATION" \
     -H "X-API-Key: $API_KEY" \
     -H "X-Peer-Secret: $PEER_SECRET" \
+    -H 'Proxy-Authorization: Basic YXR0YWNrZXI6c2VjcmV0' \
+    -H 'X-Forwarded-Host: attacker.example.test' \
+    -H 'X-Forwarded-Host: alternate.example.test' \
     -H 'X-Forwarded-Proto: http' \
-    -H 'X-Forwarded-Proto: attacker' \
+    -H 'X-Forwarded-Proto: https, http' \
     -H 'Forwarded: for=attacker.example;proto=http' \
+    -H 'Forwarded: for=alternate.example;host=attacker.example.test;proto=https' \
     -H 'X-Forwarded-For: attacker.example' \
+    -H 'X-Forwarded-For: alternate.example' \
     -H 'X-Real-IP: attacker.example'
   expect_status 200 "header preservation request"
   json_assert_eq "$LAST_BODY" method PATCH
@@ -2587,21 +3255,28 @@ main() {
   expect_status 404 "revoked share"
 
   log "== metrics secrecy, bounded cardinality, and gauge cleanup gate =="
-  wait_until "final share gauge cleanup" 20 share_gauges_are_zero
+  wait_until "final share gauge cleanup" 20 share_gauges_are_zero_on_all_nodes
   assert_metrics
 
   log "== coordinated shutdown and post-shutdown admission gate =="
   stop_node_a_for_shutdown_gate
   stop_caddy
   stop_node_b_after_gate
+  cleanup_database_rows ||
+    fail "external PostgreSQL cleanup did not remove and verify this run's fleet rows"
   restore_host_networking ||
     fail "guest-network host state could not be restored safely"
   stop_local_postgres ||
     fail "isolated PostgreSQL did not complete PID-specific shutdown"
   restore_run_dir_permissions ||
     fail "per-run artifact directory could not be restored to private permissions"
+  safe_remove_run_dir ||
+    fail "per-run artifacts could not be removed after successful cleanup"
 
+  trap - EXIT INT TERM HUP
   log "SHARES_PASS"
 }
 
-main "$@"
+if [[ "$HELPERS_ONLY" != "1" ]]; then
+  main "$@"
+fi
