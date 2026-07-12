@@ -6,11 +6,12 @@
 
 - `bash -n orch/tests/e2e_shares.sh && bash -n orch/tests/test_e2e_shares_harness.sh` — PASS.
 - `(cd orch/tests && shellcheck -x --shell=bash e2e_shares.sh test_e2e_shares_harness.sh)` — PASS.
-- `bash orch/tests/test_e2e_shares_harness.sh` — exit 0 with `SUMMARY: 7 passed, 1 skipped, 0 failed` and `E2E_SHARES_HARNESS_HELPERS_PASS_WITH_SKIPS`.
-  The skipped case is `test_sudo_local_postgres_uses_a_private_pg_owned_run_dir`:
-  `SKIP: local PostgreSQL ownership helper requires Linux users`. It did not pass
+- `bash orch/tests/test_e2e_shares_harness.sh` — exit 0 with `SUMMARY: 7 passed, 2 skipped, 0 failed` and `E2E_SHARES_HARNESS_HELPERS_PASS_WITH_SKIPS`.
+  The skipped Linux/root cases are
+  `test_sudo_local_postgres_gets_traverse_only_run_paths` and
+  `test_sudo_local_postgres_rejects_unsafe_custom_run_root`. They did not pass
   or execute on macOS. The seven passing cases include the external-PostgreSQL
-  no-`chown` check.
+  no-ownership-or-group-change check.
 
 ## Earlier workspace checks (not rerun in this focused follow-up)
 
@@ -28,14 +29,29 @@
   `ubuntu:root`; the selected `PG_OS_USER` was `ubuntu`, so it could not
   traverse the parent directory.
 
+## Second Ubuntu c8i failure (`namei` evidence)
+
+- The first fix made `RUN_DIR` and `PG_DIR` `0700 ubuntu`, but isolated
+  `initdb` still failed with permission denied. `namei -l` on the exact data
+  directory path proved that the blocked ancestor was
+  `/home/ubuntu/tarit/orch/e`: it remained `0700 root`, so `ubuntu` could not
+  traverse the path even though it owned both descendant directories.
+- The local PostgreSQL helper now keeps that dedicated `RUN_ROOT` and the
+  per-run `RUN_DIR` root-owned, changes only their group to the PostgreSQL
+  user's primary group, and grants group execute-only access (`0710`). It
+  preserves `PG_DIR` as PostgreSQL-owned `0700`, rejects non-canonical or
+  symlinked roots/children, and restores the exact original uid/gid/mode before
+  either deleting or preserving artifacts.
+
 ## Linux root/runuser verification still required
 
 - The local regression test is intentionally skipped on macOS. Run
   `sudo -E bash orch/tests/test_e2e_shares_harness.sh` on Linux from a non-root
-  sudo caller to execute it. That case models the inaccessible root-owned
-  `RUN_DIR`/PG data directory state, verifies the helper changes it, verifies
-  root-owned `0600` secret access stays denied to both group and other users,
-  and checks PostgreSQL can traverse both directories.
+  sudo caller to execute both local-permission cases. They model the blocked
+  root-owned `RUN_ROOT` ancestor, prove pre-fix PG-directory traversal is
+  denied, then prove exact `PG_DIR` traversal while list/create/delete/read of
+  root artifacts remain denied. They also verify exact metadata restoration is
+  idempotent and that unsafe custom roots are rejected without mutation.
 - The full KVM/Caddy gate was not run locally. The controller must run
   `sudo -E bash orch/tests/e2e_shares.sh` on an idle Linux host with root access,
   `/dev/kvm`, nftables privileges, Caddy, SQLite CLI, and either reachable

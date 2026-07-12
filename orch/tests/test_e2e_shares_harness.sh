@@ -5,7 +5,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SYSTEM_STAT="$(command -v stat)"
 SYSTEM_CHOWN="$(command -v chown)"
-export SYSTEM_STAT SYSTEM_CHOWN
+SYSTEM_CHGRP="$(command -v chgrp)"
+export SYSTEM_STAT SYSTEM_CHOWN SYSTEM_CHGRP
 WORK_DIR="$(mktemp -d "$SCRIPT_DIR/.e2e-shares-harness-test.XXXXXX")"
 BIN_DIR="$WORK_DIR/bin"
 mkdir -p -- "$BIN_DIR"
@@ -62,6 +63,16 @@ fi
 exec "$SYSTEM_CHOWN" "$@"
 SH
 chmod 0700 "$BIN_DIR/chown"
+
+cat >"$BIN_DIR/chgrp" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ -n "${FAKE_CHGRP_CALLS:-}" ]]; then
+  printf '%s\0' "$@" >>"$FAKE_CHGRP_CALLS"
+fi
+exec "$SYSTEM_CHGRP" "$@"
+SH
+chmod 0700 "$BIN_DIR/chgrp"
 
 cat >"$BIN_DIR/psql" <<'SH'
 #!/usr/bin/env bash
@@ -198,34 +209,45 @@ test_secret_free_child_commands() {
     fail_test "curl config did not carry the share token"
 }
 
-test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
-  local workspace_mode=""
+test_sudo_local_postgres_gets_traverse_only_run_paths() {
+  local run_root_mode=""
+  local run_root_uid=""
+  local run_root_gid=""
   local run_dir_mode=""
   local run_dir_uid=""
+  local run_dir_gid=""
   local pg_data_mode=""
-  local secret_mode=""
-  local secret_uid=""
+  local pg_data_uid=""
+  local pg_gid=""
+  local original_run_root=""
+  local original_run_dir=""
 
   if [[ "$(uname -s)" != "Linux" ]]; then
-    printf 'SKIP: local PostgreSQL ownership helper requires Linux users\n'
+    printf 'SKIP: local PostgreSQL traversal helper requires Linux users\n'
     return 77
   fi
   if [[ "$(id -u)" != "0" || -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
-    printf 'SKIP: local PostgreSQL ownership helper requires sudo -E from a non-root user\n'
+    printf 'SKIP: local PostgreSQL traversal helper requires sudo -E from a non-root user\n'
     return 77
   fi
   if ! command -v runuser >/dev/null 2>&1 || ! id "$SUDO_USER" >/dev/null 2>&1; then
-    printf 'SKIP: local PostgreSQL ownership helper requires runuser and SUDO_USER\n'
+    printf 'SKIP: local PostgreSQL traversal helper requires runuser and SUDO_USER\n'
     return 77
   fi
 
   PG_OS_USER="$SUDO_USER"
-  RUN_DIR="$(mktemp -d "$WORK_DIR/local-pg-run.XXXXXX")"
+  pg_gid="$(id -g "$PG_OS_USER")"
+  RUN_ROOT="$(mktemp -d "$WORK_DIR/local-pg-root.XXXXXX")"
+  chmod 0700 "$RUN_ROOT"
+  chown root:root "$RUN_ROOT"
+  RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")"
   chmod 0700 "$RUN_DIR"
   chown root:root "$RUN_DIR"
-  workspace_mode="$("$SYSTEM_STAT" -c '%a' -- "$WORK_DIR")"
-  [[ "$workspace_mode" == "711" ]] ||
-    fail_test "workspace parent above RUN_DIR was not traversable"
+  original_run_root="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")"
+  original_run_dir="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")"
+  printf 'root-only-root-secret\n' >"$RUN_ROOT/root-secret"
+  chmod 0600 "$RUN_ROOT/root-secret"
+  chown root:root "$RUN_ROOT/root-secret"
   printf 'root-only-secret\n' >"$RUN_DIR/root-secret"
   chmod 0600 "$RUN_DIR/root-secret"
   chown root:root "$RUN_DIR/root-secret"
@@ -234,51 +256,97 @@ test_sudo_local_postgres_uses_a_private_pg_owned_run_dir() {
   chown "$PG_OS_USER" "$PG_DATA_DIR"
   chmod 0700 "$PG_DATA_DIR"
 
-  [[ "$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")" == "700" &&
+  [[ "$("$SYSTEM_STAT" -c '%a' -- "$RUN_ROOT")" == "700" &&
+    "$("$SYSTEM_STAT" -c '%u' -- "$RUN_ROOT")" == "0" &&
+    "$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")" == "700" &&
     "$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR")" == "0" ]] ||
-    fail_test "modeled pre-fix run directory was not root-owned and owner-private"
-  assert_nonzero "modeled pre-fix PostgreSQL traversal of root-owned RUN_DIR" \
-    runuser -u "$PG_OS_USER" -- test -x "$RUN_DIR"
-  assert_nonzero "modeled pre-fix PostgreSQL traversal of PG_DIR" \
+    fail_test "modeled pre-fix run root and run directory were not root-owned and owner-private"
+  assert_nonzero "modeled pre-fix PostgreSQL traversal through blocked RUN_ROOT to PG_DIR" \
     runuser -u "$PG_OS_USER" -- test -x "$PG_DATA_DIR"
 
   export E2E_SHARES_HARNESS_REAL_STAT=1
   grant_postgres_run_access
 
+  run_root_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_ROOT")"
+  run_root_uid="$("$SYSTEM_STAT" -c '%u' -- "$RUN_ROOT")"
+  run_root_gid="$("$SYSTEM_STAT" -c '%g' -- "$RUN_ROOT")"
+  [[ "$run_root_mode" == "710" && "$run_root_uid" == "0" &&
+    "$run_root_gid" == "$pg_gid" ]] ||
+    fail_test "PostgreSQL run root was not root-owned with group traverse-only access"
   run_dir_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")"
   run_dir_uid="$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR")"
-  [[ "$run_dir_mode" == "700" ]] ||
-    fail_test "PostgreSQL run directory mode was not owner-private"
-  [[ "$run_dir_uid" == "$(id -u "$PG_OS_USER")" ]] ||
-    fail_test "PostgreSQL user did not own the private run directory"
-  secret_mode="$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR/root-secret")"
-  secret_uid="$("$SYSTEM_STAT" -c '%u' -- "$RUN_DIR/root-secret")"
-  [[ "$secret_mode" == "600" && "$secret_uid" == "0" ]] ||
-    fail_test "root-owned secret did not deny group and other reads"
+  run_dir_gid="$("$SYSTEM_STAT" -c '%g' -- "$RUN_DIR")"
+  [[ "$run_dir_mode" == "710" && "$run_dir_uid" == "0" &&
+    "$run_dir_gid" == "$pg_gid" ]] ||
+    fail_test "PostgreSQL run directory was not root-owned with group traverse-only access"
 
   pg_data_mode="$("$SYSTEM_STAT" -c '%a' -- "$PG_DATA_DIR")"
-  [[ "$pg_data_mode" == "700" ]] ||
-    fail_test "PostgreSQL data directory mode was not owner-private"
-  runuser -u "$PG_OS_USER" -- test -x "$RUN_DIR" ||
-    fail_test "PostgreSQL user could not traverse its run directory"
+  pg_data_uid="$("$SYSTEM_STAT" -c '%u' -- "$PG_DATA_DIR")"
+  [[ "$pg_data_mode" == "700" && "$pg_data_uid" == "$(id -u "$PG_OS_USER")" ]] ||
+    fail_test "PostgreSQL data directory was not PostgreSQL-owned and owner-private"
   runuser -u "$PG_OS_USER" -- test -x "$PG_DATA_DIR" ||
-    fail_test "PostgreSQL user could not traverse its data directory"
-  assert_nonzero "other user reading root-only secret" \
+    fail_test "PostgreSQL user could not traverse the exact PostgreSQL data directory"
+  assert_nonzero "PostgreSQL user listing root-only RUN_ROOT artifacts" \
+    runuser -u "$PG_OS_USER" -- ls "$RUN_ROOT"
+  assert_nonzero "PostgreSQL user listing root-only RUN_DIR artifacts" \
+    runuser -u "$PG_OS_USER" -- ls "$RUN_DIR"
+  assert_nonzero "PostgreSQL user creating a RUN_DIR artifact" \
+    runuser -u "$PG_OS_USER" -- touch "$RUN_DIR/postgres-must-not-create"
+  assert_nonzero "PostgreSQL user deleting a root-owned RUN_DIR artifact" \
+    runuser -u "$PG_OS_USER" -- rm "$RUN_DIR/root-secret"
+  assert_nonzero "PostgreSQL user reading root-only RUN_ROOT secret" \
+    runuser -u "$PG_OS_USER" -- cat "$RUN_ROOT/root-secret"
+  assert_nonzero "PostgreSQL user reading root-only RUN_DIR secret" \
     runuser -u "$PG_OS_USER" -- cat "$RUN_DIR/root-secret"
-  assert_nonzero "root-group user reading root-only secret" \
-    runuser -u "$PG_OS_USER" -g root -- cat "$RUN_DIR/root-secret"
 
   restore_run_dir_permissions
   restore_run_dir_permissions
-  [[ "$("$SYSTEM_STAT" -c '%a' -- "$RUN_DIR")" == "700" ]] ||
-    fail_test "cleanup changed the private run directory mode"
+  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")" == "$original_run_root" ]] ||
+    fail_test "cleanup did not restore the exact run-root metadata"
+  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")" == "$original_run_dir" ]] ||
+    fail_test "cleanup did not restore the exact run-directory metadata idempotently"
+  unset E2E_SHARES_HARNESS_REAL_STAT
+}
+
+test_sudo_local_postgres_rejects_unsafe_custom_run_root() {
+  local original_run_root=""
+  local original_run_dir=""
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    printf 'SKIP: local PostgreSQL traversal helper requires Linux users\n'
+    return 77
+  fi
+  if [[ "$(id -u)" != "0" || -z "${SUDO_USER:-}" || "$SUDO_USER" == "root" ]]; then
+    printf 'SKIP: local PostgreSQL traversal helper requires sudo -E from a non-root user\n'
+    return 77
+  fi
+
+  PG_OS_USER="$SUDO_USER"
+  RUN_ROOT="$(mktemp -d "$WORK_DIR/unsafe-pg-root.XXXXXX")"
+  chmod 0755 "$RUN_ROOT"
+  chown root:root "$RUN_ROOT"
+  RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")"
+  chmod 0700 "$RUN_DIR"
+  chown root:root "$RUN_DIR"
+  original_run_root="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")"
+  original_run_dir="$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")"
+
+  export E2E_SHARES_HARNESS_REAL_STAT=1
+  assert_nonzero "unsafe custom RUN_ROOT" grant_postgres_run_access
+  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_ROOT")" == "$original_run_root" ]] ||
+    fail_test "unsafe custom RUN_ROOT was mutated"
+  [[ "$("$SYSTEM_STAT" -c '%u:%g:%a' -- "$RUN_DIR")" == "$original_run_dir" ]] ||
+    fail_test "unsafe custom RUN_DIR was mutated"
   unset E2E_SHARES_HARNESS_REAL_STAT
 }
 
 test_external_postgres_does_not_chown_run_dir() {
   RUN_DIR="$(mktemp -d "$WORK_DIR/external-pg-run.XXXXXX")"
+  RUN_ROOT="$WORK_DIR"
   export FAKE_CHOWN_CALLS="$WORK_DIR/external-chown-args"
   : >"$FAKE_CHOWN_CALLS"
+  export FAKE_CHGRP_CALLS="$WORK_DIR/external-chgrp-args"
+  : >"$FAKE_CHGRP_CALLS"
   export FAKE_PSQL_ARGS="$WORK_DIR/external-psql-args"
   export FAKE_PSQL_CALLS="$WORK_DIR/external-psql-calls"
   export REQUESTED_DATABASE_URL='postgresql://tarit@database.example.test:5432/tarit?sslmode=require'
@@ -290,6 +358,8 @@ test_external_postgres_does_not_chown_run_dir() {
 
   [[ ! -s "$FAKE_CHOWN_CALLS" ]] ||
     fail_test "external PostgreSQL mode changed ownership"
+  [[ ! -s "$FAKE_CHGRP_CALLS" ]] ||
+    fail_test "external PostgreSQL mode changed group ownership"
 }
 
 PASS_COUNT=0
@@ -324,7 +394,8 @@ run_test test_cleanup_sql_failure_is_reported_and_verified
 run_test test_lock_path_is_immutable
 run_test test_secret_free_child_commands
 run_test test_external_postgres_does_not_chown_run_dir
-run_test test_sudo_local_postgres_uses_a_private_pg_owned_run_dir
+run_test test_sudo_local_postgres_gets_traverse_only_run_paths
+run_test test_sudo_local_postgres_rejects_unsafe_custom_run_root
 
 printf 'SUMMARY: %d passed, %d skipped, %d failed\n' \
   "$PASS_COUNT" "$SKIP_COUNT" "$FAIL_COUNT"

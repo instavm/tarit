@@ -45,7 +45,7 @@ PostgreSQL instance using initdb and pg_ctl. It never uses Docker. The Linux
 host must provide Caddy, curl, Python 3 (with sqlite3), the sqlite3 CLI, GNU coreutils
 (sha256sum, timeout, mktemp, stat, cmp, and chown), iproute2, nftables, procps, util-linux
 (flock and, for local PostgreSQL, runuser), and PostgreSQL's psql. Local
-PostgreSQL mode additionally needs initdb and pg_ctl. The guest rootfs must
+PostgreSQL mode additionally needs initdb, pg_ctl, and chgrp. The guest rootfs must
 provide Node.js. Caddy is mandatory: this gate does not fall back to plaintext
 share traffic.
 USAGE
@@ -127,6 +127,132 @@ private_path() {
     fail "unexpected permissions for '$path'"
   (( (8#$mode & 8#077) == 0 )) ||
     fail "artifact '$path' is accessible to group or other users"
+}
+
+prepare_run_root() {
+  local run_root_canonical=""
+
+  [[ "$RUN_ROOT" == /* ]] || {
+    fail "TARIT_E2E_RUN_ROOT must be an absolute path"
+    return 1
+  }
+  if [[ -n "${TARIT_E2E_RUN_ROOT:-}" ]]; then
+    [[ -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]] || {
+      fail "custom TARIT_E2E_RUN_ROOT must be an existing non-symlink directory"
+      return 1
+    }
+  else
+    mkdir -p -- "$RUN_ROOT" || {
+      fail "could not create the default per-run artifact root"
+      return 1
+    }
+  fi
+  [[ -d "$RUN_ROOT" && ! -L "$RUN_ROOT" ]] || {
+    fail "per-run artifact root is missing or is a symlink"
+    return 1
+  }
+  run_root_canonical="$(canonical_path "$RUN_ROOT")" || {
+    fail "could not canonicalize per-run artifact root"
+    return 1
+  }
+  [[ "$RUN_ROOT" == "$run_root_canonical" && "$run_root_canonical" != "/" ]] || {
+    fail "per-run artifact root must be a canonical non-root path without symlink ancestors"
+    return 1
+  }
+  RUN_ROOT="$run_root_canonical"
+}
+
+validate_run_directory_containment() {
+  local run_root_canonical=""
+  local run_dir_canonical=""
+
+  [[ -n "${RUN_ROOT:-}" && -n "${RUN_DIR:-}" ]] || {
+    fail "per-run artifact root and directory must be set"
+    return 1
+  }
+  [[ -d "$RUN_ROOT" && ! -L "$RUN_ROOT" && -d "$RUN_DIR" && ! -L "$RUN_DIR" ]] || {
+    fail "per-run artifact root or directory is missing or is a symlink"
+    return 1
+  }
+  run_root_canonical="$(canonical_path "$RUN_ROOT")" || {
+    fail "could not canonicalize per-run artifact root"
+    return 1
+  }
+  run_dir_canonical="$(canonical_path "$RUN_DIR")" || {
+    fail "could not canonicalize per-run artifact directory"
+    return 1
+  }
+  [[ "$RUN_ROOT" == "$run_root_canonical" &&
+    "$RUN_DIR" == "$run_dir_canonical" &&
+    "$run_root_canonical" != "/" &&
+    "${run_dir_canonical%/*}" == "$run_root_canonical" &&
+    "${run_dir_canonical##*/}" == shares.* ]] || {
+    fail "per-run artifact directory is not a canonical non-symlink child of the run root"
+    return 1
+  }
+  RUN_ROOT_CANONICAL="$run_root_canonical"
+  RUN_DIR_CANONICAL="$run_dir_canonical"
+}
+
+validate_private_root_owned_directory() {
+  local path="$1"
+  local label="$2"
+  local uid=""
+
+  [[ -d "$path" && ! -L "$path" ]] || {
+    fail "$label is missing or is a symlink"
+    return 1
+  }
+  private_path "$path" || return 1
+  uid="$(stat -c '%u' -- "$path")" || {
+    fail "could not read owner for $label"
+    return 1
+  }
+  [[ "$uid" == "0" ]] || {
+    fail "$label must be root-owned before PostgreSQL traversal access is granted"
+    return 1
+  }
+}
+
+snapshot_postgres_run_path_metadata() {
+  RUN_ROOT_ORIGINAL_UID="$(stat -c '%u' -- "$RUN_ROOT")" ||
+    return 1
+  RUN_ROOT_ORIGINAL_GID="$(stat -c '%g' -- "$RUN_ROOT")" ||
+    return 1
+  RUN_ROOT_ORIGINAL_MODE="$(stat -c '%a' -- "$RUN_ROOT")" ||
+    return 1
+  RUN_DIR_ORIGINAL_UID="$(stat -c '%u' -- "$RUN_DIR")" ||
+    return 1
+  RUN_DIR_ORIGINAL_GID="$(stat -c '%g' -- "$RUN_DIR")" ||
+    return 1
+  RUN_DIR_ORIGINAL_MODE="$(stat -c '%a' -- "$RUN_DIR")" ||
+    return 1
+}
+
+set_postgres_traverse_path() {
+  local path="$1"
+  local label="$2"
+
+  chgrp "$PG_OS_GID" "$path" ||
+    return 1
+  chmod 0710 "$path" ||
+    return 1
+  [[ "$(stat -c '%a' -- "$path")" == "710" &&
+    "$(stat -c '%u' -- "$path")" == "0" &&
+    "$(stat -c '%g' -- "$path")" == "$PG_OS_GID" ]] || {
+    fail "$label did not retain root-owned group traverse-only permissions"
+    return 1
+  }
+}
+
+restore_postgres_run_path_metadata() {
+  local path="$1"
+  local uid="$2"
+  local gid="$3"
+  local mode="$4"
+
+  chown "$uid:$gid" "$path" &&
+    chmod "$mode" "$path"
 }
 
 subprocess_timeout_seconds() {
@@ -415,25 +541,78 @@ run_as_pg_user() {
 }
 
 grant_postgres_run_access() {
-  [[ "$PG_OS_USER" == "$(id -un)" ]] && return 0
   PG_OS_UID="$(id -u "$PG_OS_USER")" ||
     fail "could not determine the local PostgreSQL OS user ID"
-  chown "$PG_OS_USER" "$RUN_DIR" ||
-    fail "could not make the isolated PostgreSQL user own the private run directory"
-  chmod 0700 "$RUN_DIR" ||
-    fail "could not retain private PostgreSQL run-directory permissions"
-  [[ "$(stat -c '%a' -- "$RUN_DIR")" == "700" &&
-    "$(stat -c '%u' -- "$RUN_DIR")" == "$PG_OS_UID" ]] ||
-    fail "isolated PostgreSQL user does not own an owner-private run directory"
+  PG_OS_GID="$(id -g "$PG_OS_USER")" ||
+    fail "could not determine the local PostgreSQL OS group"
+  [[ "$PG_OS_USER" == "$(id -un)" ]] && return 0
+  [[ "${RUN_DIR_PG_TRAVERSE_GRANTED:-0}" == "1" ]] && return 0
+  validate_run_directory_containment || return 1
+  validate_private_root_owned_directory "$RUN_ROOT" "per-run artifact root" || return 1
+  validate_private_root_owned_directory "$RUN_DIR" "per-run artifact directory" || return 1
+  snapshot_postgres_run_path_metadata || {
+    fail "could not snapshot per-run artifact ownership before PostgreSQL setup"
+    return 1
+  }
   RUN_DIR_PG_TRAVERSE_GRANTED=1
+  if ! set_postgres_traverse_path "$RUN_ROOT" "per-run artifact root" ||
+    ! set_postgres_traverse_path "$RUN_DIR" "per-run artifact directory"; then
+    restore_run_dir_permissions ||
+      warn "could not restore per-run artifact ownership after PostgreSQL setup failed"
+    fail "could not grant the isolated PostgreSQL user traversal-only access to the per-run artifact paths"
+    return 1
+  fi
 }
 
 restore_run_dir_permissions() {
+  local restore_failed=0
+
   [[ "${RUN_DIR_PG_TRAVERSE_GRANTED:-0}" == "1" ]] || return 0
-  [[ "$(stat -c '%a' -- "$RUN_DIR")" == "700" &&
-    "$(stat -c '%u' -- "$RUN_DIR")" == "$PG_OS_UID" ]] ||
+  validate_run_directory_containment ||
+    return 1
+  [[ "$RUN_ROOT" == "$RUN_ROOT_CANONICAL" &&
+    "$RUN_DIR" == "$RUN_DIR_CANONICAL" ]] ||
+    return 1
+  restore_postgres_run_path_metadata \
+    "$RUN_DIR" "$RUN_DIR_ORIGINAL_UID" "$RUN_DIR_ORIGINAL_GID" "$RUN_DIR_ORIGINAL_MODE" ||
+    restore_failed=1
+  restore_postgres_run_path_metadata \
+    "$RUN_ROOT" "$RUN_ROOT_ORIGINAL_UID" "$RUN_ROOT_ORIGINAL_GID" "$RUN_ROOT_ORIGINAL_MODE" ||
+    restore_failed=1
+  [[ "$restore_failed" -eq 0 &&
+    "$(stat -c '%u' -- "$RUN_ROOT")" == "$RUN_ROOT_ORIGINAL_UID" &&
+    "$(stat -c '%g' -- "$RUN_ROOT")" == "$RUN_ROOT_ORIGINAL_GID" &&
+    "$(stat -c '%a' -- "$RUN_ROOT")" == "$RUN_ROOT_ORIGINAL_MODE" &&
+    "$(stat -c '%u' -- "$RUN_DIR")" == "$RUN_DIR_ORIGINAL_UID" &&
+    "$(stat -c '%g' -- "$RUN_DIR")" == "$RUN_DIR_ORIGINAL_GID" &&
+    "$(stat -c '%a' -- "$RUN_DIR")" == "$RUN_DIR_ORIGINAL_MODE" ]] ||
     return 1
   RUN_DIR_PG_TRAVERSE_GRANTED=0
+}
+
+verify_postgres_data_dir_access() {
+  local pg_data_dir_canonical=""
+
+  [[ -n "${PG_DATA_DIR:-}" && -d "$PG_DATA_DIR" && ! -L "$PG_DATA_DIR" ]] || {
+    fail "local PostgreSQL data directory is missing or is a symlink"
+    return 1
+  }
+  validate_run_directory_containment || return 1
+  pg_data_dir_canonical="$(canonical_path "$PG_DATA_DIR")" || {
+    fail "could not canonicalize local PostgreSQL data directory"
+    return 1
+  }
+  [[ "$PG_DATA_DIR" == "$pg_data_dir_canonical" &&
+    "${pg_data_dir_canonical%/*}" == "$RUN_DIR_CANONICAL" &&
+    "$(stat -c '%a' -- "$PG_DATA_DIR")" == "700" &&
+    "$(stat -c '%u' -- "$PG_DATA_DIR")" == "$PG_OS_UID" ]] || {
+    fail "local PostgreSQL data directory is not a canonical PostgreSQL-owned private child of the run directory"
+    return 1
+  }
+  run_as_pg_user test -x "$PG_DATA_DIR" || {
+    fail "local PostgreSQL OS user cannot traverse the exact data directory"
+    return 1
+  }
 }
 
 postgres_connect_timeout_seconds() {
@@ -1032,9 +1211,7 @@ cleanup() {
   cleanup_database_rows || cleanup_failed=1
   restore_host_networking || cleanup_failed=1
   stop_local_postgres || cleanup_failed=1
-  if [[ "$DATABASE_MODE" == "stopped" ]]; then
-    restore_run_dir_permissions || cleanup_failed=1
-  fi
+  restore_run_dir_permissions || cleanup_failed=1
   if [[ "$cleanup_failed" -eq 0 ]] && ! safe_remove_run_dir; then
     cleanup_failed=1
   fi
@@ -1128,6 +1305,7 @@ preflight() {
       skip "local PostgreSQL OS user '$PG_OS_USER' does not exist; set TARIT_E2E_POSTGRES_OS_USER or TARIT_DATABASE_URL"
     require_command runuser "install util-linux or set TARIT_DATABASE_URL"
     require_command chown "install coreutils or set TARIT_DATABASE_URL"
+    require_command chgrp "install coreutils or set TARIT_DATABASE_URL"
   else
     PSQL_BIN="$(find_pg_binary psql "${TARIT_E2E_PSQL:-}" || true)"
     [[ -n "$PSQL_BIN" ]] ||
@@ -1184,9 +1362,10 @@ if [[ "$HELPERS_ONLY" != "1" ]]; then
   fi
 
   RUN_ID="shares-$(date -u +%Y%m%dT%H%M%S)-$$"
-  mkdir -p -- "$RUN_ROOT"
+  prepare_run_root || return 1
   RUN_DIR="$(mktemp -d "$RUN_ROOT/shares.XXXXXX")" ||
     fail "could not create a private per-run artifact directory"
+  validate_run_directory_containment || return 1
   RUN_MARKER="$RUN_DIR/.tarit-e2e-shares-run"
   : >"$RUN_MARKER"
   private_path "$RUN_DIR"
@@ -1223,7 +1402,16 @@ NFT_TABLE_CREATED_BY_RUN=0
 NFT_TABLE_BASELINE=""
 IP_FORWARD_CHANGED_BY_RUN=0
 RUN_DIR_PG_TRAVERSE_GRANTED=0
+RUN_ROOT_CANONICAL=""
+RUN_DIR_CANONICAL=""
+RUN_ROOT_ORIGINAL_UID=""
+RUN_ROOT_ORIGINAL_GID=""
+RUN_ROOT_ORIGINAL_MODE=""
+RUN_DIR_ORIGINAL_UID=""
+RUN_DIR_ORIGINAL_GID=""
+RUN_DIR_ORIGINAL_MODE=""
 PG_OS_UID=""
+PG_OS_GID=""
 VMM_LAUNCHER=""
 RACE_VMM_ARM=""
 RACE_VMM_READY=""
@@ -2341,6 +2529,7 @@ start_local_postgres() {
     fail "local PostgreSQL data directory is not owner-private"
     return 1
   }
+  verify_postgres_data_dir_access || return 1
   run_as_pg_user "$INITDB_BIN" -D "$PG_DATA_DIR" \
     --auth=trust --no-locale --encoding=UTF8 --username=tarit_e2e \
     >"$PG_DATA_DIR/initdb.log" 2>&1 || {
