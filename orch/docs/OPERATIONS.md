@@ -203,10 +203,14 @@ When enabled, `taritd`:
    VM pool; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
-On startup, `taritd` reconciles the persisted map with live local VM records and
-runs an age-gated sweep for stale `insta<N>` taps and orphaned `taritd` nftables
-rules. Stop/delete teardown is idempotent and best-effort for tap deletion, nft
-cleanup, and slot freeing.
+On startup, `taritd` reconciles the persisted map with live local VM records.
+Before a recovered allocation is available, it takes its TAP down, replaces its
+netdev IPv4/ARP guard and its source, VM-pool lateral, uplink, host-input, and
+masquerade rules, then brings the TAP back up. If that reconciliation fails,
+the TAP remains down and the recovered allocation is not made available. It
+then runs an age-gated sweep for stale `insta<N>` taps and orphaned `taritd`
+nftables rules. Stop/delete teardown is idempotent and best-effort for tap
+deletion, nft cleanup, and slot freeing.
 
 Requirements:
 

@@ -111,13 +111,19 @@ impl NetProvisioner {
                 "net: pruned stale allocation records during recovery"
             );
         }
-        persist_allocator(&state_path, &allocator)?;
-
         let provisioner = Self {
             inner: Mutex::new(allocator),
             state_path,
             uplink,
         };
+        provisioner.reconcile_recovered_allocations()?;
+        {
+            let allocator = provisioner
+                .inner
+                .lock()
+                .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+            persist_allocator(&provisioner.state_path, &allocator)?;
+        }
         let report = provisioner.sweep_orphans()?;
         if report.has_work() {
             tracing::info!(
@@ -223,6 +229,69 @@ impl NetProvisioner {
         run_argv(&masquerade_nft_argv(alloc, &self.uplink))
     }
 
+    fn reconcile_recovered_allocations(&self) -> Result<(), OrchError> {
+        let allocations = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?
+            .active_allocations()
+            .into_iter()
+            .map(|(slot, vm_id)| NetAlloc::for_slot(vm_id, slot))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut isolation_error = None;
+        for alloc in &allocations {
+            if let Err(error) = run("ip", &["link", "set", &alloc.tap, "down"]) {
+                tracing::error!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: cannot isolate recovered allocation: {error}");
+                isolation_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = isolation_error {
+            return Err(OrchError::Internal(format!(
+                "net: cannot isolate recovered allocations before reconciliation: {error}"
+            )));
+        }
+
+        for alloc in allocations {
+            self.reconcile_recovered_allocation(&alloc)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_recovered_allocation(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let result: Result<(), OrchError> = (|| {
+            self.delete_recovery_rules_for_alloc(alloc)?;
+            delete_ingress_table_for_slot(alloc.idx)?;
+            for argv in recovered_tap_reconcile_argv(alloc, &self.uplink) {
+                run_argv(&argv)?;
+            }
+            self.add_nft_rule(alloc)?;
+            run("ip", &["link", "set", &alloc.tap, "up"])?;
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            self.best_effort_recovery_cleanup(alloc);
+            return Err(OrchError::Internal(format!(
+                "net: recovered allocation {} reconciliation failed: {error}",
+                alloc.vm_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn best_effort_recovery_cleanup(&self, alloc: &NetAlloc) {
+        if let Err(e) = self.delete_recovery_rules_for_alloc(alloc) {
+            tracing::warn!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: failed to remove partial recovered allocation rules: {e}");
+        }
+        if let Err(e) = delete_ingress_table_for_slot(alloc.idx) {
+            tracing::warn!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: failed to remove partial recovered ingress table: {e}");
+        }
+        if let Err(e) = run("ip", &["link", "set", &alloc.tap, "down"]) {
+            tracing::warn!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: failed to keep unreconciled tap down: {e}");
+        }
+    }
+
     fn best_effort_delete(&self, alloc: &NetAlloc) {
         let tap = tap_name(alloc.idx);
         if let Err(e) = run("ip", &["link", "del", &tap]) {
@@ -295,6 +364,16 @@ impl NetProvisioner {
                 delete_nft_rules_in_chain(chain, |line| is_taritd_nft_rule_for_alloc(line, alloc))?;
         }
         removed += delete_ingress_table_for_slot(alloc.idx)?;
+        Ok(removed)
+    }
+
+    fn delete_recovery_rules_for_alloc(&self, alloc: &NetAlloc) -> Result<usize, OrchError> {
+        let mut removed = 0;
+        for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
+            removed += delete_nft_rules_in_chain(chain, |line| {
+                is_recovery_nft_rule_for_alloc(line, alloc)
+            })?;
+        }
         Ok(removed)
     }
 
@@ -741,6 +820,24 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
         command_argv(&["ip", "link", "set", &tap, "up"]),
     ]);
     argv
+}
+
+fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
+    tap_provision_argv(alloc, uplink)
+        .into_iter()
+        .filter_map(|mut argv| {
+            if argv.starts_with(&["ip".into(), "tuntap".into(), "add".into()]) {
+                return None;
+            }
+            if argv.starts_with(&["ip".into(), "link".into(), "set".into()]) {
+                return None;
+            }
+            if argv.starts_with(&["ip".into(), "addr".into(), "add".into()]) {
+                argv[2] = "replace".into();
+            }
+            Some(argv)
+        })
+        .collect()
 }
 
 fn tap_sysctl_argv(tap: &str) -> Vec<Vec<String>> {
@@ -1228,6 +1325,16 @@ fn is_taritd_nft_rule_for_alloc(line: &str, alloc: &NetAlloc) -> bool {
             || line.contains(&format!("tap={}", tap_name(alloc.idx))))
 }
 
+fn is_recovery_nft_rule_for_alloc(line: &str, alloc: &NetAlloc) -> bool {
+    [
+        nft_comment(alloc),
+        guard_comment(alloc),
+        input_comment(alloc),
+    ]
+    .iter()
+    .any(|comment| line.contains(comment))
+}
+
 fn is_taritd_nft_rule_for_slot(line: &str, slot: u32) -> bool {
     is_taritd_nft_rule(line)
         && parse_nft_comment_value(line, "slot=").and_then(|s| s.parse::<u32>().ok()) == Some(slot)
@@ -1271,6 +1378,9 @@ fn parse_nft_comment_value(line: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static RECOVERY_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn alloc_addressing_is_a_slash30() {
@@ -1970,6 +2080,119 @@ mod tests {
         assert_eq!(allocator.by_vm.get(&live_vm), Some(&7));
         let alloc = allocator.allocate(Uuid::new_v4()).unwrap();
         assert_eq!(alloc.idx, 0);
+    }
+
+    #[test]
+    fn recovered_live_allocation_reconciles_every_egress_guard_before_available() {
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-recovery-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            &state_path,
+            format!(
+                r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
+  "ip:-o link show") echo "7: insta7: <BROADCAST,UP> mtu 1500" ;;
+  "nft:list tables netdev") echo "table netdev taritd_ingress_7" ;;
+  "nft:-a list chain ip taritd_nat post") echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 1" ;;
+  "nft:-a list chain ip taritd_nat vm_egress") echo "iifname \"insta7\" ip saddr != 172.16.0.30 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 2" ;;
+  "nft:-a list chain ip taritd_nat vm_input") echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 3" ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
+        let result = NetProvisioner::new(state_path.clone(), [vm_id])
+            .and_then(|_| NetProvisioner::new(state_path, [vm_id]));
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+        std::env::remove_var("TARIT_TEST_VM_ID");
+
+        result.unwrap();
+        let commands = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(!commands.contains("ip tuntap add dev insta7 mode tap"));
+        assert!(
+            commands.find("ip link set insta7 down").unwrap()
+                < commands
+                    .find("nft add table netdev taritd_ingress_7")
+                    .unwrap()
+        );
+        assert!(
+            commands.rfind("nft add rule ip taritd_nat post").unwrap()
+                < commands.rfind("ip link set insta7 up").unwrap()
+        );
+        assert_eq!(
+            commands
+                .matches("nft delete table netdev taritd_ingress_7")
+                .count(),
+            2
+        );
+        for expected in [
+            "nft delete rule ip taritd_nat post handle 1",
+            "nft delete rule ip taritd_nat vm_egress handle 2",
+            "nft delete rule ip taritd_nat vm_input handle 3",
+        ] {
+            assert_eq!(commands.matches(expected).count(), 2, "{commands}");
+        }
+        for expected in [
+            "sysctl -qw net.ipv6.conf.insta7.disable_ipv6=1",
+            "nft add table netdev taritd_ingress_7",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr != 172.16.0.30 drop",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop",
+            "nft add rule ip taritd_nat vm_input iifname \"insta7\" ip saddr != 172.16.0.30 drop",
+            "nft add rule ip taritd_nat vm_input iifname \"insta7\" ct state established,related accept",
+            "nft add rule ip taritd_nat vm_input iifname \"insta7\" ip drop",
+            "nft add rule ip taritd_nat post iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade",
+        ] {
+            assert!(
+                commands.contains(expected),
+                "recovery omitted required guard {expected:?}:\n{commands}"
+            );
+        }
     }
 
     #[test]
