@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
 tarit-proto = { path = "../../../proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }

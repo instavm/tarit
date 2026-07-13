@@ -1,6 +1,8 @@
 use crate::config::{Config, WarmClass};
 use crate::net::{NetAlloc, NetProvisioner};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -11,12 +13,33 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tarit_types::OrchError;
 use tarit_vmm_client::{
-    wait_for_socket, KernelConfig, MemoryConfig, NetConfig, VcpuConfig, VmConfig, VmmClient,
-    VolumeConfig,
+    wait_for_socket, KernelConfig, MemoryConfig, NetConfig, ScratchIdentity, VcpuConfig, VmConfig,
+    VmmClient, VolumeConfig,
 };
 use uuid::Uuid;
 
 pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5";
+const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const WARM_HANDOFF_READY_TIMEOUT: Duration = Duration::from_millis(200);
+const GUEST_READY_EXEC_TIMEOUT: Duration = Duration::from_secs(1);
+const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn graceful_stop_vmm(socket_path: &Path) {
+    if socket_path.as_os_str().is_empty() || !socket_path.exists() {
+        return;
+    }
+
+    let _ = VmmClient::new(socket_path)
+        .with_request_timeout(TEARDOWN_STOP_TIMEOUT)
+        .stop();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessCheck {
+    Boot,
+    WarmHandoff,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VmSpawnConfig {
@@ -166,6 +189,89 @@ struct ManagedProcess {
     child: Arc<Mutex<Child>>,
 }
 
+/// A golden artifact claimed by the supervisor after the builder VMM releases
+/// its exact scratch token. The open descriptor protects it from VMM GC while
+/// it remains reusable.
+#[derive(Debug)]
+struct OwnedArtifact {
+    path: PathBuf,
+    identity: ScratchIdentity,
+    _file: File,
+}
+
+impl OwnedArtifact {
+    fn capture(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        Ok(Self {
+            identity: scratch_identity_from_metadata(&metadata),
+            path,
+            _file: file,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn identity(&self) -> ScratchIdentity {
+        self.identity.clone()
+    }
+
+    fn matches(&self, path: &Path, identity: &ScratchIdentity) -> bool {
+        self.path == path && &self.identity == identity
+    }
+
+    fn remove(&self) -> std::io::Result<bool> {
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if scratch_identity_from_metadata(&metadata) != self.identity {
+            return Ok(false);
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn scratch_identity_from_metadata(metadata: &std::fs::Metadata) -> ScratchIdentity {
+    let (created_secs, created_nanos) = metadata
+        .created()
+        .ok()
+        .and_then(|created| {
+            created
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| {
+                    i64::try_from(duration.as_secs())
+                        .ok()
+                        .map(|seconds| (Some(seconds), Some(duration.subsec_nanos())))
+                })
+        })
+        .unwrap_or((None, None));
+    ScratchIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        created_secs,
+        created_nanos,
+    }
+}
+
 impl ManagedProcess {
     fn new(child: Child) -> Self {
         let pid = child.id();
@@ -255,6 +361,7 @@ pub struct VmmSupervisor {
     booting: Mutex<HashMap<Uuid, BootingVm>>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
+    golden_artifacts: Mutex<Vec<OwnedArtifact>>,
     net: Option<NetProvisioner>,
     shutting_down: AtomicBool,
     admission: Arc<VmAdmissionGate>,
@@ -303,6 +410,7 @@ impl VmmSupervisor {
             network_leases: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
             warm: Mutex::new(VecDeque::new()),
+            golden_artifacts: Mutex::new(Vec::new()),
             net,
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(VmAdmissionGate::default()),
@@ -488,12 +596,14 @@ impl VmmSupervisor {
 
         if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             return Err(e);
         }
 
         if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
             return Err(self.shutdown_error());
@@ -506,12 +616,14 @@ impl VmmSupervisor {
                 Ok(a) => Some(a),
                 Err(e @ OrchError::Overloaded { .. }) => {
                     self.untrack_booting(id);
+                    graceful_stop_vmm(&socket_path);
                     process.kill_wait();
                     let _ = std::fs::remove_file(&socket_path);
                     return Err(e);
                 }
                 Err(e) => {
                     self.untrack_booting(id);
+                    graceful_stop_vmm(&socket_path);
                     process.kill_wait();
                     let _ = std::fs::remove_file(&socket_path);
                     return Err(OrchError::Internal(format!("net provision: {e}")));
@@ -521,9 +633,9 @@ impl VmmSupervisor {
         };
         if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
                 p.teardown(a);
             }
@@ -540,9 +652,9 @@ impl VmmSupervisor {
         };
         if let Err(error) = create_result {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
                 p.teardown(a);
             }
@@ -618,7 +730,12 @@ impl VmmSupervisor {
     /// guest's device/net config, so we do not re-provision host networking
     /// here (restore is used for the fast warm/resume path).
     pub fn restore_vm(&self, id: Uuid, snapshot_path: &str) -> Result<(u32, PathBuf), OrchError> {
-        let vm = self.spawn_and_restore(id, snapshot_path, None, SpawnPurpose::Live, None)?;
+        let purpose = SpawnPurpose::Live;
+        let vm = self.spawn_and_restore(id, snapshot_path, None, purpose, None)?;
+        if let Err(e) = self.await_restore_ready(&vm.socket_path, purpose, None) {
+            self.teardown_vm(id, vm);
+            return Err(e);
+        }
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
         if self.is_shutting_down() {
@@ -677,16 +794,15 @@ impl VmmSupervisor {
 
         if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             return Err(e);
         }
         if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            if let Some(overlay) = overlay {
-                let _ = std::fs::remove_file(overlay);
-            }
             return Err(self.shutdown_error());
         }
 
@@ -699,11 +815,9 @@ impl VmmSupervisor {
         };
         if let Err(error) = restore_result {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            if let Some(overlay) = overlay {
-                let _ = std::fs::remove_file(overlay);
-            }
             return Err(error);
         }
         self.untrack_booting(id);
@@ -729,26 +843,56 @@ impl VmmSupervisor {
 
     /// Boot one warm-pool VM of `class` and park it in the warm queue. The boot
     /// happens without the warm lock held; only the final enqueue takes it.
-    /// Block until the guest agent can actually run a command, so we never park a
-    /// still-booting VM. A freshly-parked, not-yet-ready VM handed out during a
-    /// burst blocks the caller for seconds on its first agent dial (the burst
-    /// p95 tail). Bounded; parks anyway on timeout so a wedged guest can't stall
-    /// replenishment forever.
-    fn await_ready(&self, socket: &Path, cancelled: &AtomicBool) -> Result<(), OrchError> {
-        let client = VmmClient::new(socket);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            self.ensure_refill_active(cancelled)?;
-            if client
-                .exec("true", 1000)
-                .map(|(code, _, _, _)| code == 0)
-                .unwrap_or(false)
-            {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(20));
+    /// Block until the guest agent can actually run a command.
+    fn await_ready(
+        &self,
+        socket: &Path,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), OrchError> {
+        wait_for_guest_ready(
+            timeout,
+            || {
+                if let Some(cancelled) = cancelled {
+                    self.ensure_refill_active(cancelled)?;
+                }
+                Ok(())
+            },
+            |remaining| {
+                let request_timeout = readiness_request_timeout(remaining);
+                let exec_timeout_ms = readiness_exec_timeout_ms(request_timeout);
+                let client = VmmClient::new(socket)
+                    .with_connect_timeout(request_timeout)
+                    .with_request_timeout(request_timeout);
+                match client.exec("true", exec_timeout_ms) {
+                    Ok((0, _, _, _)) => Ok(true),
+                    Ok((code, _, _, _)) => {
+                        Err(format!("readiness command exited with status {code}"))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        )
+        .map_err(|error| match error {
+            ReadinessWaitError::Cancelled(error) => error,
+            ReadinessWaitError::TimedOut(last) => OrchError::Vmm(format!(
+                "guest agent never became ready at {}: {last}",
+                socket.display()
+            )),
+        })
+    }
+
+    fn await_restore_ready(
+        &self,
+        socket: &Path,
+        purpose: SpawnPurpose,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), OrchError> {
+        if restore_requires_guest_readiness(purpose) {
+            self.await_ready(socket, readiness_timeout(ReadinessCheck::Boot), cancelled)
+        } else {
+            Ok(())
         }
-        self.ensure_refill_active(cancelled)
     }
 
     pub fn spawn_warm_cancellable(
@@ -760,7 +904,11 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill, Some(cancelled))?;
-        if let Err(error) = self.await_ready(&vm.socket_path, cancelled) {
+        if let Err(error) = self.await_ready(
+            &vm.socket_path,
+            readiness_timeout(ReadinessCheck::Boot),
+            Some(cancelled),
+        ) {
             self.teardown_vm(id, vm);
             return Err(error);
         }
@@ -796,7 +944,11 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill, Some(cancelled))?;
-        if let Err(error) = self.await_ready(&vm.socket_path, cancelled) {
+        if let Err(error) = self.await_ready(
+            &vm.socket_path,
+            readiness_timeout(ReadinessCheck::Boot),
+            Some(cancelled),
+        ) {
             self.teardown_vm(id, vm);
             return Err(error);
         }
@@ -808,7 +960,7 @@ impl VmmSupervisor {
         self.ensure_refill_active(cancelled)?;
         let snapshot_result = match self.admission.enter() {
             Ok(_admission) => client
-                .snapshot(false)
+                .snapshot_unreleased(false)
                 .map_err(|error| OrchError::Vmm(format!("snapshot golden: {error}"))),
             Err(error) => Err(error),
         };
@@ -820,8 +972,48 @@ impl VmmSupervisor {
             }
         };
 
+        let mut artifacts = match self.capture_golden_artifacts(
+            &snapshot_path,
+            overlay_path_for_config(id, &spec).as_deref(),
+        ) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                self.teardown_vm(id, vm);
+                return Err(error);
+            }
+        };
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts(artifacts);
+            return Err(self.shutdown_error());
+        }
+        for artifact in &artifacts {
+            let path = artifact.path().display().to_string();
+            let identity = artifact.identity();
+            if let Err(error) = client.release_scratch(&path, identity) {
+                self.teardown_vm(id, vm);
+                cleanup_golden_artifacts(artifacts);
+                return Err(OrchError::Vmm(format!(
+                    "release golden scratch {path}: {error}"
+                )));
+            }
+        }
+        let artifact_keys = artifacts
+            .iter()
+            .map(|artifact| (artifact.path.clone(), artifact.identity()))
+            .collect::<Vec<_>>();
+        if let Err(error) = self.remember_golden_artifacts(cancelled, &mut artifacts) {
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts(artifacts);
+            return Err(error);
+        }
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
+            let artifacts = self.take_golden_artifacts(&artifact_keys);
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts(artifacts);
+            return Err(self.shutdown_error());
+        }
         self.teardown_vm(id, vm);
-        self.ensure_refill_active(cancelled)?;
         Ok(snapshot_path)
     }
 
@@ -836,16 +1028,11 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let overlay = overlay_path_for_config(id, &spec);
-        let vm = self.spawn_and_restore(
-            id,
-            snapshot_path,
-            overlay,
-            SpawnPurpose::Refill,
-            Some(cancelled),
-        )?;
-        if let Err(error) = self.await_ready(&vm.socket_path, cancelled) {
+        let purpose = SpawnPurpose::Refill;
+        let vm = self.spawn_and_restore(id, snapshot_path, overlay, purpose, Some(cancelled))?;
+        if let Err(e) = self.await_restore_ready(&vm.socket_path, purpose, Some(cancelled)) {
             self.teardown_vm(id, vm);
-            return Err(error);
+            return Err(e);
         }
         if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             self.teardown_vm(id, vm);
@@ -872,25 +1059,48 @@ impl VmmSupervisor {
     /// pool has no match (caller then cold-starts).
     pub fn take_warm(&self, want: &VmSpawnConfig) -> Option<(Uuid, u32, PathBuf)> {
         let _admission = self.admission.enter().ok()?;
-        let mut warm = self.warm.lock().ok()?;
-        let pos = warm.iter().position(|w| &w.spec == want)?;
-        let taken = warm.remove(pos)?;
-        drop(warm);
-        let pid = taken.vm.pid;
-        let socket = taken.vm.socket_path.clone();
-        self.move_pid_to_default_cgroup(pid);
-        if self.is_shutting_down() {
-            self.teardown_vm(taken.id, taken.vm);
-            return None;
+        let not_cancelled = AtomicBool::new(false);
+        loop {
+            if self.is_shutting_down() {
+                return None;
+            }
+            let taken = {
+                let mut warm = self.warm.lock().ok()?;
+                let pos = warm.iter().position(|w| &w.spec == want)?;
+                warm.remove(pos)?
+            };
+            if let Err(error) = self.await_ready(
+                &taken.vm.socket_path,
+                readiness_timeout(ReadinessCheck::WarmHandoff),
+                Some(&not_cancelled),
+            ) {
+                tracing::warn!(id = %taken.id, error = %error, "discarding unready warm VM");
+                self.teardown_vm(taken.id, taken.vm);
+                continue;
+            }
+
+            let pid = taken.vm.pid;
+            let socket = taken.vm.socket_path.clone();
+            self.move_pid_to_default_cgroup(pid);
+            if self.is_shutting_down() {
+                self.teardown_vm(taken.id, taken.vm);
+                return None;
+            }
+            let mut running = match self.running.lock() {
+                Ok(running) => running,
+                Err(_) => {
+                    self.teardown_vm(taken.id, taken.vm);
+                    return None;
+                }
+            };
+            if self.is_shutting_down() {
+                drop(running);
+                self.teardown_vm(taken.id, taken.vm);
+                return None;
+            }
+            running.insert(taken.id, taken.vm);
+            return Some((taken.id, pid, socket));
         }
-        let mut running = self.running.lock().ok()?;
-        if self.is_shutting_down() {
-            drop(running);
-            self.teardown_vm(taken.id, taken.vm);
-            return None;
-        }
-        running.insert(taken.id, taken.vm);
-        Some((taken.id, pid, socket))
     }
 
     /// Number of warm VMs currently parked for the given class shape.
@@ -903,6 +1113,44 @@ impl VmmSupervisor {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    fn capture_golden_artifacts(
+        &self,
+        snapshot_path: &str,
+        overlay_path: Option<&str>,
+    ) -> Result<Vec<OwnedArtifact>, OrchError> {
+        let mut artifacts = vec![OwnedArtifact::capture(snapshot_path)
+            .map_err(|error| OrchError::Internal(format!("capture golden snapshot: {error}")))?];
+        if let Some(overlay_path) = overlay_path {
+            artifacts.push(OwnedArtifact::capture(overlay_path).map_err(|error| {
+                OrchError::Internal(format!("capture golden overlay: {error}"))
+            })?);
+        }
+        Ok(artifacts)
+    }
+
+    fn remember_golden_artifacts(
+        &self,
+        cancelled: &AtomicBool,
+        artifacts: &mut Vec<OwnedArtifact>,
+    ) -> Result<(), OrchError> {
+        self.ensure_refill_active(cancelled)?;
+        let mut registered = self
+            .golden_artifacts
+            .lock()
+            .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?;
+        self.ensure_refill_active(cancelled)?;
+        registered.append(artifacts);
+        Ok(())
+    }
+
+    fn take_golden_artifacts(&self, keys: &[(PathBuf, ScratchIdentity)]) -> Vec<OwnedArtifact> {
+        let mut registered = self.golden_artifacts.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("golden artifact lock poisoned during cancellation cleanup");
+            poisoned.into_inner()
+        });
+        take_matching_artifacts(&mut registered, keys)
     }
 
     fn client_for(&self, id: Uuid) -> Result<VmmClient, OrchError> {
@@ -953,8 +1201,6 @@ impl VmmSupervisor {
             return Ok(());
         };
 
-        let client = VmmClient::new(&running.socket_path);
-        let _ = client.stop();
         self.teardown_vm(id, running);
         Ok(())
     }
@@ -1137,7 +1383,13 @@ impl VmmSupervisor {
                 .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?;
             guard.drain().collect::<Vec<_>>()
         };
-
+        let golden_artifacts = {
+            let mut guard = self
+                .golden_artifacts
+                .lock()
+                .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?;
+            guard.drain(..).collect::<Vec<_>>()
+        };
         let running_ids = running.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         let summary = ShutdownSummary {
             running_ids,
@@ -1147,29 +1399,30 @@ impl VmmSupervisor {
         };
 
         for (id, vm) in running {
-            let client = VmmClient::new(&vm.socket_path);
-            let _ = client.stop();
             self.teardown_vm(id, vm);
             self.complete_stop(id);
         }
         for warm_vm in warm {
-            let client = VmmClient::new(&warm_vm.vm.socket_path);
-            let _ = client.stop();
             self.teardown_vm(warm_vm.id, warm_vm.vm);
         }
-        for (id, vm) in booting {
+        for (_, vm) in booting {
+            graceful_stop_vmm(&vm.socket_path);
             vm.process.kill_wait();
             let _ = std::fs::remove_file(&vm.socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
         }
+        cleanup_golden_artifacts(golden_artifacts);
 
         Ok(summary)
     }
 
     fn teardown_vm(&self, id: Uuid, vm: RunningVm) {
+        self.teardown_vm_inner(id, vm);
+    }
+
+    fn teardown_vm_inner(&self, id: Uuid, vm: RunningVm) {
+        graceful_stop_vmm(&vm.socket_path);
         vm.process.kill_wait();
         let _ = std::fs::remove_file(&vm.socket_path);
-        let _ = std::fs::remove_file(overlay_path_for(id));
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
             if let Some(allocation) = self.defer_network_teardown(id, a.clone()) {
                 p.teardown(&allocation);
@@ -1257,6 +1510,110 @@ impl Drop for VmmSupervisor {
             }
         }
     }
+}
+
+fn cleanup_golden_artifacts(artifacts: impl IntoIterator<Item = OwnedArtifact>) {
+    for artifact in artifacts {
+        match artifact.remove() {
+            Ok(true) => {
+                tracing::info!(path = %artifact.path().display(), "removed golden artifact")
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                path = %artifact.path().display(),
+                "remove golden artifact failed: {error}"
+            ),
+        }
+    }
+}
+
+fn take_matching_artifacts(
+    artifacts: &mut Vec<OwnedArtifact>,
+    keys: &[(PathBuf, ScratchIdentity)],
+) -> Vec<OwnedArtifact> {
+    let mut removed = Vec::new();
+    let mut retained = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts.drain(..) {
+        if keys
+            .iter()
+            .any(|(path, identity)| artifact.matches(path, identity))
+        {
+            removed.push(artifact);
+        } else {
+            retained.push(artifact);
+        }
+    }
+    *artifacts = retained;
+    removed
+}
+
+fn restore_requires_guest_readiness(purpose: SpawnPurpose) -> bool {
+    purpose == SpawnPurpose::Refill
+}
+
+fn readiness_timeout(check: ReadinessCheck) -> Duration {
+    match check {
+        ReadinessCheck::Boot => GUEST_READY_TIMEOUT,
+        ReadinessCheck::WarmHandoff => WARM_HANDOFF_READY_TIMEOUT,
+    }
+}
+
+fn readiness_exec_timeout_ms(remaining: Duration) -> u64 {
+    let timeout = remaining.min(GUEST_READY_EXEC_TIMEOUT);
+    u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+fn readiness_request_timeout(remaining: Duration) -> Duration {
+    remaining.min(GUEST_READY_EXEC_TIMEOUT)
+}
+
+fn readiness_poll_sleep(remaining: Duration) -> Duration {
+    remaining.min(GUEST_READY_POLL_INTERVAL)
+}
+
+#[derive(Debug)]
+enum ReadinessWaitError {
+    Cancelled(OrchError),
+    TimedOut(String),
+}
+
+fn wait_for_guest_ready<C, F>(
+    timeout: Duration,
+    mut ensure_active: C,
+    mut probe: F,
+) -> Result<(), ReadinessWaitError>
+where
+    C: FnMut() -> Result<(), OrchError>,
+    F: FnMut(Duration) -> Result<bool, String>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last = "guest agent returned no successful readiness response".to_string();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        ensure_active().map_err(ReadinessWaitError::Cancelled)?;
+        match probe(remaining) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                last = "guest agent readiness command did not succeed".to_string();
+            }
+            Err(error) => last = error,
+        }
+        ensure_active().map_err(ReadinessWaitError::Cancelled)?;
+        let sleep = readiness_poll_sleep(deadline.saturating_duration_since(Instant::now()));
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+    }
+
+    Err(ReadinessWaitError::TimedOut(format!(
+        "guest agent never became ready: {last}"
+    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -1413,25 +1770,10 @@ fn overlay_path_for_config(id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
+    use std::io::{Read, Write};
 
-    fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
-        VmSpawnConfig {
-            memory_mib: 256,
-            vcpus: 1,
-            kernel_path: PathBuf::from("/kernel"),
-            rootfs_path,
-            cmdline: DEFAULT_CMDLINE.to_string(),
-            read_only,
-        }
-    }
-
-    #[test]
-    fn shutdown_prevents_warm_refill_before_vmm_spawn() {
-        let root = PathBuf::from(format!(
-            "target/taritd-supervisor-shutdown-{}",
-            Uuid::new_v4()
-        ));
-        let config = Config {
+    fn supervisor_config(root: &Path) -> Config {
+        Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
                 "test-key".into(),
@@ -1475,7 +1817,27 @@ mod tests {
             share_token_ttl_secs: 300,
             share_connect_timeout_ms: 1_000,
             share_idle_timeout_secs: 1,
-        };
+        }
+    }
+
+    fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
+        VmSpawnConfig {
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: PathBuf::from("/kernel"),
+            rootfs_path,
+            cmdline: DEFAULT_CMDLINE.to_string(),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn shutdown_prevents_warm_refill_before_vmm_spawn() {
+        let root = PathBuf::from(format!(
+            "target/taritd-supervisor-shutdown-{}",
+            Uuid::new_v4()
+        ));
+        let config = supervisor_config(&root);
         let class = config.warm_pool.classes[0].clone();
         let supervisor = VmmSupervisor::new(config.clone());
         supervisor.begin_shutdown();
@@ -1494,6 +1856,118 @@ mod tests {
         );
         drop(supervisor);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn teardown_vm_stops_vmm_before_killing_process() {
+        let root = PathBuf::from(format!(
+            "target/taritd-supervisor-teardown-{}",
+            Uuid::new_v4()
+        ));
+        let socket_path = PathBuf::from(format!(
+            "target/taritd-teardown-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test VMM socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make test VMM socket nonblocking");
+        let process = ManagedProcess::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn test VMM process"),
+        );
+        let process_for_liveness_check = process.clone();
+        let process_for_assertion = process.clone();
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<
+            Result<(tarit_vmm_client::ApiRequest, bool), String>,
+        >(1);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut length = [0; 4];
+                        stream.read_exact(&mut length).expect("read request length");
+                        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                        stream.read_exact(&mut body).expect("read request body");
+                        let request = serde_json::from_slice(&body).expect("decode request");
+                        let child_alive = process_for_liveness_check
+                            .child
+                            .lock()
+                            .expect("lock child")
+                            .try_wait()
+                            .expect("inspect child")
+                            .is_none();
+                        let response =
+                            serde_json::to_vec(&tarit_vmm_client::ApiResponse::Ok).unwrap();
+                        stream
+                            .write_all(&(response.len() as u32).to_be_bytes())
+                            .expect("write response length");
+                        stream.write_all(&response).expect("write response body");
+                        stream.flush().expect("flush response");
+                        request_tx
+                            .send(Ok((request, child_alive)))
+                            .expect("record request");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            request_tx
+                                .send(Err("timed out waiting for VMM request".into()))
+                                .expect("record timeout");
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        request_tx
+                            .send(Err(error.to_string()))
+                            .expect("record accept error");
+                        return;
+                    }
+                }
+            }
+        });
+        let vm = RunningVm {
+            pid: process.pid,
+            socket_path: socket_path.clone(),
+            process,
+            net: None,
+        };
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+
+        supervisor.teardown_vm(Uuid::new_v4(), vm);
+
+        let (request, child_alive) = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("teardown must contact the VMM")
+            .expect("test VMM server must receive a request");
+        assert!(
+            matches!(request, tarit_vmm_client::ApiRequest::Stop),
+            "teardown must send Stop before killing the VMM, got {request:?}"
+        );
+        assert!(
+            child_alive,
+            "the VMM process must still be alive when it receives Stop"
+        );
+        server.join().expect("join test VMM server");
+        assert!(
+            process_for_assertion
+                .child
+                .lock()
+                .expect("lock child")
+                .try_wait()
+                .expect("inspect child")
+                .is_some(),
+            "teardown must reap the VMM process"
+        );
+
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1600,5 +2074,191 @@ mod tests {
             parse_self_cgroup("0::/\n"),
             Some(PathBuf::from("/sys/fs/cgroup"))
         );
+    }
+
+    #[test]
+    fn guest_readiness_gate_rejects_an_unresponsive_agent() {
+        let error = wait_for_guest_ready(Duration::ZERO, || Ok(()), |_| Ok(false))
+            .expect_err("an unresponsive guest must not pass the readiness gate");
+
+        assert!(matches!(
+            error,
+            ReadinessWaitError::TimedOut(message) if message.contains("guest agent never became ready")
+        ));
+    }
+
+    #[test]
+    fn guest_readiness_gate_accepts_a_successful_probe() {
+        let mut attempts = 0;
+
+        wait_for_guest_ready(
+            Duration::from_secs(1),
+            || Ok(()),
+            |_| {
+                attempts += 1;
+                Ok(true)
+            },
+        )
+        .expect("a successful guest-agent probe must pass the readiness gate");
+
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn guest_readiness_gate_stops_when_refill_is_cancelled_between_probes() {
+        let cancelled = AtomicBool::new(false);
+        let mut attempts = 0;
+
+        let error = wait_for_guest_ready(
+            Duration::from_secs(1),
+            || {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(shutdown_error());
+                }
+                Ok(())
+            },
+            |_| {
+                attempts += 1;
+                cancelled.store(true, Ordering::Release);
+                Ok(false)
+            },
+        )
+        .expect_err("a cancelled refill must stop waiting for guest readiness");
+
+        assert_eq!(
+            attempts, 1,
+            "cancellation must prevent another readiness probe"
+        );
+        assert!(matches!(
+            error,
+            ReadinessWaitError::Cancelled(OrchError::Overloaded { .. })
+        ));
+    }
+
+    #[test]
+    fn boot_and_warm_handoff_use_their_respective_readiness_timeouts() {
+        assert_eq!(
+            readiness_timeout(ReadinessCheck::Boot),
+            GUEST_READY_TIMEOUT,
+            "newly booted, refilled, and golden-builder VMs need the full readiness window"
+        );
+        assert_eq!(
+            readiness_timeout(ReadinessCheck::WarmHandoff),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn warm_handoff_exec_timeout_is_short_and_nonzero() {
+        assert_eq!(
+            readiness_exec_timeout_ms(Duration::from_secs(20)),
+            1_000,
+            "long boot readiness retains its existing per-exec timeout"
+        );
+        assert_eq!(
+            readiness_exec_timeout_ms(Duration::from_millis(200)),
+            200,
+            "a wedged parked VM must not use the long readiness probe timeout"
+        );
+        assert_eq!(readiness_exec_timeout_ms(Duration::ZERO), 1);
+    }
+
+    #[test]
+    fn readiness_request_timeout_is_capped_by_the_per_probe_limit() {
+        assert_eq!(
+            readiness_request_timeout(Duration::from_secs(20)),
+            GUEST_READY_EXEC_TIMEOUT
+        );
+        assert_eq!(
+            readiness_request_timeout(Duration::from_millis(200)),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn readiness_poll_sleep_never_exceeds_the_remaining_deadline() {
+        assert_eq!(
+            readiness_poll_sleep(Duration::from_millis(200)),
+            GUEST_READY_POLL_INTERVAL
+        );
+        assert_eq!(
+            readiness_poll_sleep(Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(readiness_poll_sleep(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn only_warm_refill_restores_require_guest_agent_readiness() {
+        assert!(!restore_requires_guest_readiness(SpawnPurpose::Live));
+        assert!(restore_requires_guest_readiness(SpawnPurpose::Refill));
+    }
+
+    #[test]
+    fn golden_artifact_cleanup_removes_snapshot_and_overlay() {
+        let dir = PathBuf::from(format!("target/golden-artifact-cleanup-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("golden.snap");
+        let overlay = dir.join("golden.overlay");
+        std::fs::write(&snapshot, b"snapshot").expect("write snapshot");
+        std::fs::write(&overlay, b"overlay").expect("write overlay");
+
+        let artifacts = [
+            OwnedArtifact::capture(&snapshot).expect("capture snapshot"),
+            OwnedArtifact::capture(&overlay).expect("capture overlay"),
+        ];
+        cleanup_golden_artifacts(artifacts);
+
+        assert!(!snapshot.exists(), "golden snapshot must be removed");
+        assert!(!overlay.exists(), "golden overlay must be removed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn golden_artifact_cleanup_preserves_replacements() {
+        let dir = PathBuf::from(format!(
+            "target/golden-artifact-replacement-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("vmm-snap-123-456.snap");
+        std::fs::write(&snapshot, b"owned snapshot").expect("write owned snapshot");
+        let artifact = OwnedArtifact::capture(&snapshot).expect("capture owned artifact");
+        std::fs::remove_file(&snapshot).expect("replace owned artifact");
+        std::fs::write(&snapshot, b"replacement").expect("write replacement");
+
+        cleanup_golden_artifacts([artifact]);
+
+        assert_eq!(
+            std::fs::read(&snapshot).expect("replacement survives cleanup"),
+            b"replacement"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn golden_cancellation_removes_registry_entry_and_preserves_replacement() {
+        let dir = PathBuf::from(format!(
+            "target/golden-artifact-cancellation-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("vmm-snap-123-456.snap");
+        std::fs::write(&snapshot, b"owned snapshot").expect("write owned snapshot");
+        let artifact = OwnedArtifact::capture(&snapshot).expect("capture golden artifact");
+        let key = (artifact.path.clone(), artifact.identity());
+        let mut registry = vec![artifact];
+
+        let cancelled = take_matching_artifacts(&mut registry, &[key]);
+        assert!(
+            registry.is_empty(),
+            "cancellation must remove the registry entry"
+        );
+        std::fs::remove_file(&snapshot).expect("replace the cancelled artifact");
+        std::fs::write(&snapshot, b"replacement").expect("write replacement");
+        cleanup_golden_artifacts(cancelled);
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"replacement");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

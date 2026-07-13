@@ -6,10 +6,12 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
+use tarit_proto::ScratchIdentity;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -17,6 +19,7 @@ use std::os::unix::fs::MetadataExt;
 /// Scratch file classes the VMM is allowed to collect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScratchKind {
+    Snapshot,
     LiveSnapshot,
     SuspendSnapshot,
     OwnedOverlay,
@@ -38,39 +41,84 @@ pub struct GcReport {
 }
 
 /// A file this VM explicitly created and may unlink on stop/drop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct OwnedScratchFile {
     path: PathBuf,
-    #[cfg(unix)]
-    identity: Option<FileIdentity>,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    dev: u64,
-    ino: u64,
-    // File creation (birth) time distinguishes a replacement from the file we
-    // remembered even when the OS reuses the inode number (common on Linux).
-    // Unlike ctime/mtime it is stable across content writes, so remembering a
-    // file that is later written to (e.g. a CoW overlay) still matches on cleanup.
-    created: Option<SystemTime>,
+    identity: Option<ScratchIdentity>,
+    // Keep the creator's descriptor open for the whole ownership lifetime. This
+    // both pins the identity and lets GC detect active artifacts on Linux.
+    _file: File,
 }
 
 impl OwnedScratchFile {
-    /// Remember the current file at `path`. If it is later replaced by another
-    /// process, `remove` will skip it instead of unlinking someone else's file.
-    pub fn remember(path: impl Into<PathBuf>) -> Self {
+    /// Atomically create a private regular file and retain its creation identity.
+    ///
+    /// Existing paths are never adopted: callers can own a file only when this
+    /// call created it.
+    pub fn create_new(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        Self {
-            #[cfg(unix)]
-            identity: fs::metadata(&path).ok().map(file_identity),
-            path,
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
+        let file = options.open(&path)?;
+        Self::from_created_file(path, file)
+    }
+
+    fn from_created_file(path: PathBuf, file: File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            #[cfg(unix)]
+            identity: Some(file_identity(metadata)),
+            #[cfg(not(unix))]
+            identity: None,
+            path,
+            _file: file,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn identity(&self) -> Option<ScratchIdentity> {
+        self.identity.clone()
+    }
+
+    /// Read an existing regular file's identity without claiming ownership.
+    pub fn identity_for(path: &Path) -> io::Result<ScratchIdentity> {
+        #[cfg(unix)]
+        {
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.file_type().is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} is not a regular file", path.display()),
+                ));
+            }
+            Ok(file_identity(metadata))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "scratch identities require Unix",
+            ))
+        }
+    }
+
+    /// Return whether `identity` is this owned file and the path still names it.
+    pub fn matches_identity(&self, identity: &ScratchIdentity) -> bool {
+        self.identity.as_ref() == Some(identity)
+            && self.still_points_to_owned_file().unwrap_or(false)
+    }
+
+    pub fn file(&self) -> &File {
+        &self._file
     }
 
     /// Remove the file if it still points at the inode this VM created.
@@ -88,11 +136,14 @@ impl OwnedScratchFile {
     fn still_points_to_owned_file(&self) -> io::Result<bool> {
         #[cfg(unix)]
         {
-            let Some(identity) = self.identity else {
+            let Some(identity) = self.identity.as_ref() else {
                 return Ok(false);
             };
-            match fs::metadata(&self.path) {
-                Ok(metadata) => Ok(file_identity(metadata) == identity),
+            match fs::symlink_metadata(&self.path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    Ok(file_identity(metadata) == *identity)
+                }
+                Ok(_) => Ok(false),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(e),
             }
@@ -187,6 +238,9 @@ fn should_collect_entry(
 
 fn scratch_kind_for_name(name: &OsStr) -> Option<ScratchKind> {
     let name = name.to_str()?;
+    if is_snapshot_name(name) {
+        return Some(ScratchKind::Snapshot);
+    }
     if name == "vmm-live.snap" || is_live_snapshot_name(name) {
         return Some(ScratchKind::LiveSnapshot);
     }
@@ -197,6 +251,16 @@ fn scratch_kind_for_name(name: &OsStr) -> Option<ScratchKind> {
         return Some(ScratchKind::OwnedOverlay);
     }
     None
+}
+
+fn is_snapshot_name(name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix("vmm-snap-")
+        .and_then(|s| s.strip_suffix(".snap"))
+    else {
+        return false;
+    };
+    has_pid_timestamp(rest)
 }
 
 fn is_live_snapshot_name(name: &str) -> bool {
@@ -241,11 +305,26 @@ fn has_pid_timestamp(rest: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
-        created: metadata.created().ok(),
+fn file_identity(metadata: fs::Metadata) -> ScratchIdentity {
+    let (created_secs, created_nanos) = metadata
+        .created()
+        .ok()
+        .and_then(|created| {
+            created
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| {
+                    i64::try_from(duration.as_secs())
+                        .ok()
+                        .map(|secs| (Some(secs), Some(duration.subsec_nanos())))
+                })
+        })
+        .unwrap_or((None, None));
+    ScratchIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        created_secs,
+        created_nanos,
     }
 }
 
@@ -323,6 +402,15 @@ mod tests {
             ),
             Some(ScratchKind::OwnedOverlay)
         );
+        assert_eq!(
+            should_collect_entry(
+                OsStr::new("vmm-snap-123-456.snap"),
+                Some(old()),
+                now(),
+                max_age
+            ),
+            Some(ScratchKind::Snapshot)
+        );
 
         assert_eq!(
             should_collect_entry(OsStr::new("random.snap"), Some(old()), now(), max_age),
@@ -375,14 +463,68 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vmm-live.snap");
+        let owned = OwnedScratchFile::create_new(&path).unwrap();
         fs::write(&path, b"owned").unwrap();
-        let owned = OwnedScratchFile::remember(&path);
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"replacement").unwrap();
 
         assert!(!owned.remove().unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"replacement");
 
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn owned_scratch_identity_must_match_for_release() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-work/gc-owned-release")
+            .join(format!("{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmm-snap-123-456.snap");
+        let owned = OwnedScratchFile::create_new(&path).unwrap();
+        let identity = owned.identity().expect("new file has an identity");
+
+        assert!(owned.matches_identity(&identity));
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(!owned.matches_identity(&identity));
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_owned_snapshot_cleanup_removes_partial_file() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-work/gc-partial-snapshot")
+            .join(format!("{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmm-snap-123-456.snap");
+        let owned = OwnedScratchFile::create_new(&path).unwrap();
+        fs::write(&path, b"partial snapshot").unwrap();
+
+        assert!(owned.remove().unwrap());
+        assert!(!path.exists(), "partial owned snapshots must be removed");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_owned_artifact_is_protected_from_gc() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-work/gc-open-owner")
+            .join(format!("{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vmm-snap-123-456.snap");
+        let owned = OwnedScratchFile::create_new(&path).unwrap();
+
+        assert!(has_open_owner(&path));
+
+        owned.remove().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 }

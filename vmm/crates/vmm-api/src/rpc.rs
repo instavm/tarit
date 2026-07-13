@@ -97,6 +97,14 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 msg: format!("{e}"),
             },
         },
+        ApiRequest::ReleaseScratch { path, identity } => {
+            match controller.release_scratch(&path, identity) {
+                Ok(()) => ApiResponse::Ok,
+                Err(e) => ApiResponse::Err {
+                    msg: format!("{e}"),
+                },
+            }
+        }
         ApiRequest::Restore {
             snapshot_path,
             overlay,
@@ -622,6 +630,47 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn release_scratch_requires_the_vmm_owned_identity() {
+        let controller = VmmController::new();
+        if controller.create(cfg()).is_err() {
+            return;
+        }
+        let path = controller.snapshot(false).expect("create snapshot");
+        let identity = vmm_core::gc::OwnedScratchFile::identity_for(Path::new(&path))
+            .expect("snapshot identity");
+        let mut wrong_identity = identity.clone();
+        wrong_identity.inode = wrong_identity.inode.saturating_add(1);
+
+        assert!(matches!(
+            dispatch(
+                ApiRequest::ReleaseScratch {
+                    path: path.clone(),
+                    identity: wrong_identity,
+                },
+                &controller
+            ),
+            ApiResponse::Err { .. }
+        ));
+        assert!(matches!(
+            dispatch(
+                ApiRequest::ReleaseScratch {
+                    path: path.clone(),
+                    identity
+                },
+                &controller
+            ),
+            ApiResponse::Ok
+        ));
+
+        controller.stop().expect("stop VM");
+        assert!(
+            Path::new(&path).exists(),
+            "released snapshot survives VM stop"
+        );
+        std::fs::remove_file(path).expect("clean up released snapshot");
     }
 
     #[test]
