@@ -23,6 +23,7 @@ const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const WARM_HANDOFF_READY_TIMEOUT: Duration = Duration::from_millis(200);
 const GUEST_READY_EXEC_TIMEOUT: Duration = Duration::from_secs(1);
 const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadinessCheck {
@@ -1181,8 +1182,6 @@ impl VmmSupervisor {
             return Ok(());
         };
 
-        let client = VmmClient::new(&running.socket_path);
-        let _ = client.stop();
         self.teardown_vm(id, running);
         Ok(())
     }
@@ -1405,6 +1404,11 @@ impl VmmSupervisor {
     }
 
     fn teardown_vm_inner(&self, id: Uuid, vm: RunningVm) {
+        if !vm.socket_path.as_os_str().is_empty() {
+            let _ = VmmClient::new(&vm.socket_path)
+                .with_request_timeout(TEARDOWN_STOP_TIMEOUT)
+                .stop();
+        }
         vm.process.kill_wait();
         let _ = std::fs::remove_file(&vm.socket_path);
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
@@ -1754,25 +1758,10 @@ fn overlay_path_for_config(id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
+    use std::io::{Read, Write};
 
-    fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
-        VmSpawnConfig {
-            memory_mib: 256,
-            vcpus: 1,
-            kernel_path: PathBuf::from("/kernel"),
-            rootfs_path,
-            cmdline: DEFAULT_CMDLINE.to_string(),
-            read_only,
-        }
-    }
-
-    #[test]
-    fn shutdown_prevents_warm_refill_before_vmm_spawn() {
-        let root = PathBuf::from(format!(
-            "target/taritd-supervisor-shutdown-{}",
-            Uuid::new_v4()
-        ));
-        let config = Config {
+    fn supervisor_config(root: &Path) -> Config {
+        Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
                 "test-key".into(),
@@ -1816,7 +1805,27 @@ mod tests {
             share_token_ttl_secs: 300,
             share_connect_timeout_ms: 1_000,
             share_idle_timeout_secs: 1,
-        };
+        }
+    }
+
+    fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
+        VmSpawnConfig {
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: PathBuf::from("/kernel"),
+            rootfs_path,
+            cmdline: DEFAULT_CMDLINE.to_string(),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn shutdown_prevents_warm_refill_before_vmm_spawn() {
+        let root = PathBuf::from(format!(
+            "target/taritd-supervisor-shutdown-{}",
+            Uuid::new_v4()
+        ));
+        let config = supervisor_config(&root);
         let class = config.warm_pool.classes[0].clone();
         let supervisor = VmmSupervisor::new(config.clone());
         supervisor.begin_shutdown();
@@ -1835,6 +1844,102 @@ mod tests {
         );
         drop(supervisor);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn teardown_vm_stops_vmm_before_killing_process() {
+        let root = PathBuf::from(format!(
+            "target/taritd-supervisor-teardown-{}",
+            Uuid::new_v4()
+        ));
+        let socket_path = PathBuf::from(format!(
+            "target/taritd-teardown-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test VMM socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make test VMM socket nonblocking");
+        let (request_tx, request_rx) =
+            std::sync::mpsc::sync_channel::<Result<tarit_vmm_client::ApiRequest, String>>(1);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut length = [0; 4];
+                        stream.read_exact(&mut length).expect("read request length");
+                        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                        stream.read_exact(&mut body).expect("read request body");
+                        let request = serde_json::from_slice(&body).expect("decode request");
+                        let response =
+                            serde_json::to_vec(&tarit_vmm_client::ApiResponse::Ok).unwrap();
+                        stream
+                            .write_all(&(response.len() as u32).to_be_bytes())
+                            .expect("write response length");
+                        stream.write_all(&response).expect("write response body");
+                        stream.flush().expect("flush response");
+                        request_tx.send(Ok(request)).expect("record request");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            request_tx
+                                .send(Err("timed out waiting for VMM request".into()))
+                                .expect("record timeout");
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        request_tx
+                            .send(Err(error.to_string()))
+                            .expect("record accept error");
+                        return;
+                    }
+                }
+            }
+        });
+        let process = ManagedProcess::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn test VMM process"),
+        );
+        let process_for_assertion = process.clone();
+        let vm = RunningVm {
+            pid: process.pid,
+            socket_path: socket_path.clone(),
+            process,
+            net: None,
+        };
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+
+        supervisor.teardown_vm(Uuid::new_v4(), vm);
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("teardown must contact the VMM");
+        assert!(
+            matches!(request, Ok(tarit_vmm_client::ApiRequest::Stop)),
+            "teardown must send Stop before killing the VMM, got {request:?}"
+        );
+        server.join().expect("join test VMM server");
+        assert!(
+            process_for_assertion
+                .child
+                .lock()
+                .expect("lock child")
+                .try_wait()
+                .expect("inspect child")
+                .is_some(),
+            "teardown must reap the VMM process"
+        );
+
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
