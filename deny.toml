@@ -26,19 +26,6 @@ version = 2
 # A yanked crate in a lockfile is worth noticing but should not block
 # unrelated work; Dependabot picks up the replacement.
 yanked = "warn"
-# Advisories that do not apply to Tarit. Keep each entry commented with a
-# reason and revisit on every toolchain or dependency bump.
-ignore = [
-    # RUSTSEC-2023-0071: "Marvin Attack" timing sidechannel in the `rsa` crate,
-    # pulled in transitively by `russh` (the optional SSH gateway) through
-    # `ssh-key`. There is no fixed release of `rsa` yet (the advisory states no
-    # safe upgrade is available). Tarit's SSH gateway is disabled by default and
-    # uses Ed25519 host keys, so the vulnerable RSA path is not exercised in the
-    # default configuration. Revisit when `rsa` ships a constant-time release or
-    # `russh` drops the dependency.
-    "RUSTSEC-2023-0071",
-]
-
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
 [licenses]
 version = 2

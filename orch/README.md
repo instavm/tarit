@@ -231,10 +231,11 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 
 ## SSH gateway
 
-When enabled, the embedded gateway authenticates OpenSSH public keys registered
-with `POST /v1/ssh-keys`, treats the SSH username as the target VM UUID, verifies
-that the key owner created/restored that VM, and bridges the SSH channel to the
-same PTY stream used by the WebSocket PTY API:
+When enabled, the embedded gateway authenticates registered OpenSSH public keys
+for supported algorithms (RSA client keys are not supported), treats the SSH
+username as the target VM UUID, verifies that the key owner created/restored
+that VM, and bridges the SSH channel to the same PTY stream used by the WebSocket
+PTY API:
 
 ```sh
 export TARIT_SSH_GATEWAY=1

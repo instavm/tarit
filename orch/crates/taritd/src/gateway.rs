@@ -54,8 +54,16 @@ pub(crate) async fn run(state: AppState) -> Result<()> {
 
 fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey> {
     if path.exists() {
-        return PrivateKey::read_openssh_file(path)
-            .with_context(|| format!("read SSH gateway host key {}", path.display()));
+        let key = PrivateKey::read_openssh_file(path)
+            .with_context(|| format!("read SSH gateway host key {}", path.display()))?;
+        if key.algorithm() != Algorithm::Ed25519 {
+            anyhow::bail!(
+                "SSH gateway host key {} must use Ed25519; {} host keys are not supported",
+                path.display(),
+                key.algorithm()
+            );
+        }
+        return Ok(key);
     }
 
     if let Some(parent) = path.parent() {
@@ -658,11 +666,22 @@ enum BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh::keys::HashAlg;
+    use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
+    use crate::metrics::Metrics;
+    use crate::peer::PeerClient;
+    use crate::pty::PtyRegistry;
+    use crate::scheduler::Scheduler;
+    use crate::supervisor::VmmSupervisor;
+    use chrono::Utc;
+    use russh::keys::{EcdsaCurve, HashAlg};
+    use russh::server::Handler as _;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, RwLock};
+    use tarit_store::Store;
 
     const ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g test@example";
     const ED25519_FINGERPRINT: &str = "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4";
-
     #[test]
     fn parses_vm_id_username() {
         let vm_id = Uuid::new_v4();
@@ -682,5 +701,145 @@ mod tests {
             public_key_fingerprint_sha256(&key).unwrap(),
             key.fingerprint(HashAlg::Sha256).to_string()
         );
+    }
+
+    #[test]
+    fn generates_ed25519_host_key() {
+        let dir = std::path::PathBuf::from("target")
+            .join(format!("taritd-gateway-test-{}", Uuid::new_v4()));
+        let path = dir.join("ssh_host");
+
+        let key = load_or_generate_host_key(&path).unwrap();
+
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(key.algorithm(), Algorithm::Ed25519);
+    }
+
+    #[test]
+    fn accepts_registered_ed25519_public_key() {
+        let state = test_state();
+        let key = PublicKey::from_openssh(ED25519_KEY).unwrap();
+        let fingerprint = public_key_fingerprint_sha256(&key).unwrap();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert_ssh_key(&SshKeyRecord {
+                id: Uuid::new_v4(),
+                owner_key: "test-owner".into(),
+                fingerprint,
+                public_key: ED25519_KEY.into(),
+                key_type: "ssh-ed25519".into(),
+                created_at: Utc::now(),
+                is_active: true,
+            })
+            .unwrap();
+        let mut handler = GatewayHandler::new(state, None);
+        let vm_id = Uuid::new_v4();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let auth = runtime
+            .block_on(handler.auth_publickey(&vm_id.to_string(), &key))
+            .unwrap();
+
+        assert!(matches!(auth, server::Auth::Accept));
+        assert_eq!(handler.auth.as_ref().unwrap().owner_key, "test-owner");
+    }
+
+    #[test]
+    fn reports_host_key_parse_errors_without_algorithm_claims() {
+        let dir = std::path::PathBuf::from("target")
+            .join(format!("taritd-gateway-test-{}", Uuid::new_v4()));
+        let path = dir.join("ssh_host");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "not an OpenSSH private key").unwrap();
+
+        let err = load_or_generate_host_key(&path).unwrap_err();
+
+        let _ = std::fs::remove_dir_all(dir);
+        let message = err.to_string();
+        assert!(message.contains("read SSH gateway host key"), "{err:#}");
+        assert!(!message.contains("not supported"), "{err:#}");
+        assert!(!message.contains("RSA"), "{err:#}");
+    }
+
+    #[test]
+    fn reports_the_actual_unsupported_host_key_algorithm() {
+        let dir = std::path::PathBuf::from("target")
+            .join(format!("taritd-gateway-test-{}", Uuid::new_v4()));
+        let path = dir.join("ssh_host");
+        std::fs::create_dir_all(&dir).unwrap();
+        let algorithm = Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        };
+        let key = PrivateKey::random(&mut russh::keys::key::safe_rng(), algorithm.clone()).unwrap();
+        key.write_openssh_file(&path, russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+
+        let err = load_or_generate_host_key(&path).unwrap_err();
+
+        let _ = std::fs::remove_dir_all(dir);
+        let message = err.to_string();
+        assert!(message.contains("must use Ed25519"), "{err:#}");
+        assert!(message.contains(&algorithm.to_string()), "{err:#}");
+        assert!(!message.contains("RSA"), "{err:#}");
+    }
+
+    fn test_state() -> AppState {
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: ApiKeyRegistry::from_plaintext_entries(vec![
+                ("tenant-a-key".into(), "tenant-a".into(), ApiRole::User, 1),
+                ("admin-key".into(), "admin".into(), ApiRole::Admin, 0),
+            ])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: PathBuf::from("target/taritd-gateway-test/vmm"),
+            kernel: PathBuf::from("target/taritd-gateway-test/kernel"),
+            rootfs: PathBuf::from("target/taritd-gateway-test/rootfs"),
+            socket_dir: PathBuf::from("target/taritd-gateway-test/sockets"),
+            db_path: PathBuf::from("target/taritd-gateway-test/fleet.db"),
+            net_state_path: PathBuf::from("target/taritd-gateway-test/net-state.json"),
+            images_dir: PathBuf::from("target/taritd-gateway-test/images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: None,
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: PathBuf::from("target/taritd-gateway-test/ssh_host"),
+        };
+        let store = Store::open(":memory:").unwrap();
+        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        AppState {
+            config: config.clone(),
+            store: Arc::new(Mutex::new(store)),
+            exec_cache: Arc::new(RwLock::new(HashMap::new())),
+            vm_cache: Arc::new(RwLock::new(HashMap::new())),
+            store_tx,
+            pty_registry: Arc::new(PtyRegistry::default()),
+            supervisor: Arc::new(VmmSupervisor::new(config.clone())),
+            scheduler: Arc::new(Scheduler::new(config)),
+            peer: Arc::new(PeerClient::new("peer-secret".into())),
+            fleet: None,
+            metrics: Arc::new(Metrics::default()),
+        }
     }
 }
