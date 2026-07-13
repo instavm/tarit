@@ -38,6 +38,8 @@ const TAP_PREFIX: &str = "insta";
 const NET_POOL_SLOTS: u32 = 1 << 14;
 const NET_STATE_VERSION: u32 = 2;
 const STALE_TAP_MIN_AGE: Duration = Duration::from_secs(30);
+static STATE_WRITE_SEQUENCE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// A provisioned per-VM network: the tap name and the /30 addressing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,17 +92,20 @@ impl NetAlloc {
 /// Allocates and provisions per-VM taps. `uplink` is the host egress iface.
 pub struct NetProvisioner {
     inner: Mutex<SlotAllocator>,
-    egress_updates: EgressUpdateLock,
+    network_transactions: NetworkTransactionLock,
     state_path: PathBuf,
     uplink: String,
 }
 
 #[derive(Default)]
-struct EgressUpdateLock {
+struct NetworkTransactionLock {
+    // Acquire this before `NetProvisioner::inner`; never acquire it while
+    // holding the allocator lock. This keeps update, teardown, and slot reuse
+    // in one order.
     inner: Mutex<()>,
 }
 
-impl EgressUpdateLock {
+impl NetworkTransactionLock {
     fn run<T>(&self, work: impl FnOnce() -> T) -> Result<T, OrchError> {
         let _guard = self
             .inner
@@ -133,7 +138,7 @@ impl NetProvisioner {
         }
         let provisioner = Self {
             inner: Mutex::new(allocator),
-            egress_updates: EgressUpdateLock::default(),
+            network_transactions: NetworkTransactionLock::default(),
             state_path,
             uplink,
         };
@@ -159,7 +164,7 @@ impl NetProvisioner {
                 error,
             ));
         }
-        if let Err(error) = provisioner.validate_security_chain_ownership() {
+        if let Err(error) = provisioner.validate_complete_effective_policies(None) {
             return Err(provisioner.recovery_failure_after_cleanup(
                 &recovered_allocations,
                 "revalidate closed Tarit security-chain ownership before quarantine release",
@@ -185,6 +190,11 @@ impl NetProvisioner {
     /// Create a tap for a new VM: allocate a reusable slot, persist ownership,
     /// create `ip tuntap`, configure the host /30, and add an nft NAT rule.
     pub fn provision(&self, vm_id: Uuid) -> Result<NetAlloc, OrchError> {
+        self.network_transactions
+            .run(|| self.provision_locked(vm_id))?
+    }
+
+    fn provision_locked(&self, vm_id: Uuid) -> Result<NetAlloc, OrchError> {
         let alloc = {
             let mut inner = self
                 .inner
@@ -198,7 +208,7 @@ impl NetProvisioner {
         let policy = self.egress_policy_for(&alloc)?;
         if let Err(e) = self.provision_host(&alloc, &policy) {
             self.best_effort_delete(&alloc);
-            self.free_allocation(&alloc);
+            self.free_allocation_locked(&alloc);
             return Err(e);
         }
 
@@ -208,8 +218,23 @@ impl NetProvisioner {
     /// Remove a VM's tap and nft rule(s), then free and persist the slot.
     /// Idempotent and best-effort: every step is attempted and failures are logged.
     pub fn teardown(&self, alloc: &NetAlloc) {
+        if self
+            .network_transactions
+            .run(|| self.teardown_locked(alloc))
+            .is_err()
+        {
+            tracing::warn!(
+                tap = %alloc.tap,
+                vm_id = %alloc.vm_id,
+                slot = alloc.idx,
+                "net transaction lock poisoned while tearing down allocation"
+            );
+        }
+    }
+
+    fn teardown_locked(&self, alloc: &NetAlloc) {
         self.best_effort_delete(alloc);
-        self.free_allocation(alloc);
+        self.free_allocation_locked(alloc);
     }
 
     /// Enforce a VM's egress allowlist on the host (R-005). The orchestrator
@@ -224,7 +249,7 @@ impl NetProvisioner {
         allowlist: &[String],
         allow_existing: bool,
     ) -> Result<usize, OrchError> {
-        self.egress_updates
+        self.network_transactions
             .run(|| self.apply_egress_locked(alloc, allowlist, allow_existing))?
     }
 
@@ -234,6 +259,7 @@ impl NetProvisioner {
         allowlist: &[String],
         allow_existing: bool,
     ) -> Result<usize, OrchError> {
+        self.require_active_allocation(alloc)?;
         // Build every rule before touching nft, so a bad rule cannot leave a
         // half-applied policy (default-open) on the host.
         let policy = EgressPolicy {
@@ -253,7 +279,7 @@ impl NetProvisioner {
             run_nft_script(&egress_replacement_script(alloc, &policy, &listing)?)?;
             self.verify_egress_policy(alloc, &policy)?;
             self.persist_egress_policy(alloc, policy)?;
-            self.validate_security_chain_ownership()?;
+            self.validate_complete_effective_policies(None)?;
             self.delete_egress_update_quarantine_atomically(alloc)
         })() {
             return Err(self.fail_egress_update(alloc, error));
@@ -264,6 +290,16 @@ impl NetProvisioner {
     /// Teardown by VM id from recovered persistent state. This covers restart
     /// cases where the supervisor no longer has a RunningVm/NetAlloc in memory.
     pub fn teardown_vm_id(&self, vm_id: Uuid) {
+        if self
+            .network_transactions
+            .run(|| self.teardown_vm_id_locked(vm_id))
+            .is_err()
+        {
+            tracing::warn!(%vm_id, "net transaction lock poisoned while looking up VM teardown");
+        }
+    }
+
+    fn teardown_vm_id_locked(&self, vm_id: Uuid) {
         let alloc = match self.inner.lock() {
             Ok(inner) => inner
                 .by_vm
@@ -276,7 +312,7 @@ impl NetProvisioner {
             }
         };
         if let Some(alloc) = alloc {
-            self.teardown(&alloc);
+            self.teardown_locked(&alloc);
         }
     }
 
@@ -289,7 +325,7 @@ impl NetProvisioner {
         }
         self.add_nft_rule(alloc)?;
         self.install_egress_policy(alloc, policy)?;
-        self.validate_security_chain_ownership()?;
+        self.validate_complete_effective_policies(None)?;
         run("ip", &["link", "set", &alloc.tap, "up"])
     }
 
@@ -407,7 +443,7 @@ impl NetProvisioner {
         alloc: &NetAlloc,
         policy: &EgressPolicy,
     ) -> Result<(), OrchError> {
-        self.validate_security_chain_ownership()?;
+        self.validate_complete_effective_policies(Some((alloc, policy)))?;
         let listing = command_stdout(
             "nft",
             &["-a", "list", "chain", "ip", NFT_TABLE, NFT_FWD_CHAIN],
@@ -612,6 +648,48 @@ impl NetProvisioner {
         Ok(())
     }
 
+    fn validate_complete_effective_policies(
+        &self,
+        replacement: Option<(&NetAlloc, &EgressPolicy)>,
+    ) -> Result<(), OrchError> {
+        let mut policies = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+            inner
+                .active_allocations()
+                .into_iter()
+                .map(|(slot, vm_id)| {
+                    let alloc = NetAlloc::for_slot(vm_id, slot)?;
+                    let policy = inner.egress_policy_for(&alloc)?;
+                    Ok((alloc, policy))
+                })
+                .collect::<Result<Vec<_>, OrchError>>()?
+        };
+        if let Some((alloc, policy)) = replacement {
+            let entry = policies
+                .iter_mut()
+                .find(|(candidate, _)| candidate == alloc)
+                .ok_or_else(|| {
+                    OrchError::NotFound(format!(
+                        "network allocation for VM {} is no longer active",
+                        alloc.vm_id
+                    ))
+                })?;
+            entry.1 = policy.clone();
+        }
+        let forward = command_stdout(
+            "nft",
+            &["-a", "list", "chain", "ip", NFT_TABLE, NFT_FWD_CHAIN],
+        )?;
+        let input = command_stdout(
+            "nft",
+            &["-a", "list", "chain", "ip", NFT_TABLE, NFT_INPUT_CHAIN],
+        )?;
+        validate_complete_effective_security_policies(&policies, &forward, &input)
+    }
+
     fn recovery_failure_after_cleanup(
         &self,
         allocations: &[NetAlloc],
@@ -759,7 +837,7 @@ impl NetProvisioner {
         }
     }
 
-    fn free_allocation(&self, alloc: &NetAlloc) {
+    fn free_allocation_locked(&self, alloc: &NetAlloc) {
         match self.inner.lock() {
             Ok(mut inner) => {
                 inner.free(alloc);
@@ -767,9 +845,27 @@ impl NetProvisioner {
                     tracing::warn!(vm_id = %alloc.vm_id, slot = alloc.idx, "net: failed to persist freed slot: {e}");
                 }
             }
+
             Err(_) => {
                 tracing::warn!(vm_id = %alloc.vm_id, slot = alloc.idx, "net allocator lock poisoned while freeing slot")
             }
+        }
+    }
+
+    fn require_active_allocation(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+        if inner.by_vm.get(&alloc.vm_id) == Some(&alloc.idx)
+            && inner.by_slot.get(&alloc.idx) == Some(&alloc.vm_id)
+        {
+            Ok(())
+        } else {
+            Err(OrchError::NotFound(format!(
+                "network allocation for VM {} is no longer active",
+                alloc.vm_id
+            )))
         }
     }
 
@@ -1114,17 +1210,45 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), O
     };
     let text = serde_json::to_string_pretty(&state)
         .map_err(|e| OrchError::Internal(format!("encode net state: {e}")))?;
-    let tmp = state_write_path(path);
-    let mut file = {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+    let (tmp, mut file) = {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "net-state.json".into());
+        let mut created = None;
+        for _ in 0..128 {
+            let sequence = STATE_WRITE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".{file_name}.tmp-{}-{sequence}",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
+                Ok(file) => {
+                    created = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(OrchError::Internal(format!(
+                        "create net state temp {}: {error}",
+                        candidate.display()
+                    )));
+                }
+            }
         }
-        options.open(&tmp).map_err(|e| {
-            OrchError::Internal(format!("create net state temp {}: {e}", tmp.display()))
+        created.ok_or_else(|| {
+            OrchError::Internal(format!(
+                "create unique net state temp beside {}: exhausted retries",
+                path.display()
+            ))
         })?
     };
     if let Err(error) = file
@@ -1139,13 +1263,14 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), O
         )));
     }
     drop(file);
-    std::fs::rename(&tmp, path).map_err(|e| {
-        OrchError::Internal(format!(
-            "replace net state {} with {}: {e}",
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(OrchError::Internal(format!(
+            "replace net state {} with {}: {error}",
             path.display(),
             tmp.display()
-        ))
-    })?;
+        )));
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -1158,6 +1283,7 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), O
     Ok(())
 }
 
+#[cfg(test)]
 fn state_write_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -2401,8 +2527,7 @@ fn validate_taritd_security_chain(chain: &str, listing: &str) -> Result<(), Orch
             "net: {chain} is not a Tarit security chain"
         )));
     }
-    let mut order =
-        HashMap::<String, (Option<usize>, Option<usize>, Option<usize>, Option<usize>)>::new();
+    let mut order = HashMap::<String, Vec<(usize, SecurityRuleRole)>>::new();
     for (index, line) in listing.lines().enumerate() {
         let line = line.trim();
         if line.is_empty()
@@ -2428,34 +2553,137 @@ fn validate_taritd_security_chain(chain: &str, listing: &str) -> Result<(), Orch
                 "net: refusing activation: invalid managed rule shape in {chain}: {line}"
             ))
         })?;
-        let entry = order.entry(tag.tap.clone()).or_default();
-        match role {
-            SecurityRuleRole::Guard => entry.0 = Some(index),
-            SecurityRuleRole::EgressStateful => entry.1 = Some(index),
-            SecurityRuleRole::EgressAllow => entry.2 = Some(index),
-            SecurityRuleRole::EgressDeny => entry.3 = Some(index),
-            SecurityRuleRole::Quarantine => {}
-        }
+        order
+            .entry(tag.tap.clone())
+            .or_default()
+            .push((index, role));
     }
-    for (tap, (guard, stateful, allow, deny)) in order {
-        if let (Some(stateful), Some(allow)) = (stateful, allow) {
-            if stateful > allow {
-                return Err(OrchError::Internal(format!(
-                    "net: refusing activation: {tap} stateful return follows an egress allow"
-                )));
+    for (tap, rules) in order {
+        validate_security_rule_order(chain, &tap, &rules)?;
+    }
+    Ok(())
+}
+
+fn validate_security_rule_order(
+    chain: &str,
+    tap: &str,
+    rules: &[(usize, SecurityRuleRole)],
+) -> Result<(), OrchError> {
+    let first = |roles: &[SecurityRuleRole]| {
+        rules
+            .iter()
+            .filter(|(_, role)| roles.contains(role))
+            .map(|(index, _)| *index)
+            .min()
+    };
+    let last = |roles: &[SecurityRuleRole]| {
+        rules
+            .iter()
+            .filter(|(_, role)| roles.contains(role))
+            .map(|(index, _)| *index)
+            .max()
+    };
+    match chain {
+        NFT_FWD_CHAIN => {
+            let guards = [
+                SecurityRuleRole::ForwardSourceGuard,
+                SecurityRuleRole::ForwardLateralGuard,
+                SecurityRuleRole::ForwardUplinkGuard,
+            ];
+            let first_accept = first(&[
+                SecurityRuleRole::EgressStateful,
+                SecurityRuleRole::EgressAllow,
+            ]);
+            if let (Some(last_guard), Some(first_accept)) = (last(&guards), first_accept) {
+                if last_guard > first_accept {
+                    return Err(OrchError::Internal(format!(
+                        "net: refusing activation: {tap} guard follows an egress accept"
+                    )));
+                }
+            }
+            if let (Some(stateful), Some(allow)) = (
+                first(&[SecurityRuleRole::EgressStateful]),
+                first(&[SecurityRuleRole::EgressAllow]),
+            ) {
+                if stateful > allow {
+                    return Err(OrchError::Internal(format!(
+                        "net: refusing activation: {tap} stateful return follows an egress allow"
+                    )));
+                }
+            }
+            if let (Some(allow), Some(deny)) = (
+                last(&[SecurityRuleRole::EgressAllow]),
+                first(&[SecurityRuleRole::EgressDeny]),
+            ) {
+                if allow > deny {
+                    return Err(OrchError::Internal(format!(
+                        "net: refusing activation: {tap} default deny precedes an egress allow"
+                    )));
+                }
             }
         }
-        if let (Some(allow), Some(deny)) = (allow, deny) {
-            if allow > deny {
-                return Err(OrchError::Internal(format!(
-                    "net: refusing activation: {tap} default deny precedes an egress allow"
-                )));
+        NFT_INPUT_CHAIN => {
+            if let (Some(source), Some(accept)) = (
+                last(&[SecurityRuleRole::InputSourceGuard]),
+                first(&[SecurityRuleRole::InputStateful]),
+            ) {
+                if source > accept {
+                    return Err(OrchError::Internal(format!(
+                        "net: refusing activation: {tap} input source guard follows a return accept"
+                    )));
+                }
+            }
+            if let (Some(accept), Some(deny)) = (
+                last(&[SecurityRuleRole::InputStateful]),
+                first(&[SecurityRuleRole::InputDeny]),
+            ) {
+                if accept > deny {
+                    return Err(OrchError::Internal(format!(
+                        "net: refusing activation: {tap} input default deny precedes a return accept"
+                    )));
+                }
             }
         }
-        if let (Some(guard), Some(allow)) = (guard, allow) {
-            if guard > allow {
+        _ => unreachable!("security chain validated above"),
+    }
+    Ok(())
+}
+
+fn validate_complete_effective_security_policies(
+    allocations: &[(NetAlloc, EgressPolicy)],
+    forward: &str,
+    input: &str,
+) -> Result<(), OrchError> {
+    validate_taritd_security_chain(NFT_FWD_CHAIN, forward)?;
+    validate_taritd_security_chain(NFT_INPUT_CHAIN, input)?;
+    for (alloc, policy) in allocations {
+        validate_complete_forward_policy(alloc, policy, forward)?;
+        validate_complete_input_policy(alloc, input)?;
+    }
+    for (chain, listing) in [(NFT_FWD_CHAIN, forward), (NFT_INPUT_CHAIN, input)] {
+        for line in listing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            if line.starts_with("table ")
+                || line.starts_with("chain ")
+                || line.starts_with("type ")
+                || line == "}"
+            {
+                continue;
+            }
+            let tag = parse_taritd_nft_rule_tag(line).ok_or_else(|| {
+                OrchError::Internal(format!(
+                    "net: refusing activation: unrecognized rule in closed Tarit {chain} chain: {line}"
+                ))
+            })?;
+            if !allocations.iter().any(|(alloc, _)| {
+                alloc.idx == tag.slot && alloc.vm_id == tag.vm_id && alloc.tap == tag.tap
+            }) {
                 return Err(OrchError::Internal(format!(
-                    "net: refusing activation: {tap} guard follows an egress allow"
+                    "net: refusing activation: {chain} contains rule for inactive allocation {}",
+                    tag.tap
                 )));
             }
         }
@@ -2463,9 +2691,259 @@ fn validate_taritd_security_chain(chain: &str, listing: &str) -> Result<(), Orch
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+fn allocation_rules(
+    chain: &str,
+    listing: &str,
+    alloc: &NetAlloc,
+) -> Result<Vec<(usize, SecurityRuleRole, String)>, OrchError> {
+    listing
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            let tag = parse_taritd_nft_rule_tag(line)?;
+            (tag.slot == alloc.idx && tag.vm_id == alloc.vm_id && tag.tap == alloc.tap)
+                .then_some((index, line, tag))
+        })
+        .map(|(index, line, tag)| {
+            let rule = security_chain_rule_text(line).ok_or_else(|| {
+                OrchError::Internal(format!(
+                    "net: refusing activation: malformed managed rule for {}",
+                    alloc.tap
+                ))
+            })?;
+            let role = valid_taritd_security_rule(chain, &rule, &tag).ok_or_else(|| {
+                OrchError::Internal(format!(
+                    "net: refusing activation: invalid managed rule for {}",
+                    alloc.tap
+                ))
+            })?;
+            Ok((index, role, rule))
+        })
+        .collect()
+}
+
+fn exactly_one_rule(
+    alloc: &NetAlloc,
+    rules: &[(usize, SecurityRuleRole, String)],
+    role: SecurityRuleRole,
+    expected: &str,
+) -> Result<usize, OrchError> {
+    let matches = rules
+        .iter()
+        .filter(|(_, actual_role, rule)| *actual_role == role && rule == expected)
+        .map(|(index, _, _)| *index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(OrchError::Internal(format!(
+            "net: refusing activation: {} requires exactly one {role:?} rule {expected:?}, found {}",
+            alloc.tap,
+            matches.len()
+        )));
+    }
+    Ok(matches[0])
+}
+
+fn validate_complete_forward_policy(
+    alloc: &NetAlloc,
+    policy: &EgressPolicy,
+    listing: &str,
+) -> Result<(), OrchError> {
+    let rules = allocation_rules(NFT_FWD_CHAIN, listing, alloc)?;
+    let tap = nft_quote(&alloc.tap);
+    let guards = [
+        (
+            SecurityRuleRole::ForwardSourceGuard,
+            format!("iifname {tap} ip saddr != {} counter drop", alloc.guest_ip),
+        ),
+        (
+            SecurityRuleRole::ForwardLateralGuard,
+            format!(
+                "iifname {tap} ip saddr {} ip daddr 172.16.0.0/16 drop",
+                alloc.guest_ip
+            ),
+        ),
+        (
+            SecurityRuleRole::ForwardUplinkGuard,
+            format!("iifname {tap} ip saddr {} oifname != ", alloc.guest_ip),
+        ),
+    ];
+    let mut guard_positions = Vec::with_capacity(guards.len());
+    for (role, expected) in guards {
+        let position = match role {
+            SecurityRuleRole::ForwardUplinkGuard => {
+                let matches = rules
+                    .iter()
+                    .filter(|(_, actual_role, rule)| {
+                        *actual_role == role && valid_uplink_guard_rule(rule, &tap, &alloc.guest_ip)
+                    })
+                    .map(|(index, _, _)| *index)
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    return Err(OrchError::Internal(format!(
+                        "net: refusing activation: {} requires exactly one uplink guard, found {}",
+                        alloc.tap,
+                        matches.len()
+                    )));
+                }
+                matches[0]
+            }
+            _ => exactly_one_rule(alloc, &rules, role, &expected)?,
+        };
+        guard_positions.push(position);
+    }
+
+    let mut expected_allows = Vec::with_capacity(policy.allowlist.len());
+    let mut seen_allows = BTreeSet::new();
+    for entry in &policy.allowlist {
+        let argv = compile_host_egress_rule(alloc, entry, &nft_quote(&egress_comment(alloc)))?;
+        let expected = argv[5..argv.len() - 2].join(" ");
+        if !seen_allows.insert(expected.clone()) {
+            return Err(OrchError::Internal(format!(
+                "net: refusing activation: persisted policy for {} duplicates allow {entry:?}",
+                alloc.tap
+            )));
+        }
+        expected_allows.push(expected);
+    }
+    let stateful = if policy.allow_existing {
+        Some(exactly_one_rule(
+            alloc,
+            &rules,
+            SecurityRuleRole::EgressStateful,
+            &format!(
+                "iifname {tap} ip saddr {} ct state established,related accept",
+                alloc.guest_ip
+            ),
+        )?)
+    } else {
+        None
+    };
+    let mut allow_positions = Vec::with_capacity(expected_allows.len());
+    for expected in &expected_allows {
+        allow_positions.push(exactly_one_rule(
+            alloc,
+            &rules,
+            SecurityRuleRole::EgressAllow,
+            expected,
+        )?);
+    }
+    let deny = exactly_one_rule(
+        alloc,
+        &rules,
+        SecurityRuleRole::EgressDeny,
+        &format!("iifname {tap} ip saddr {} drop", alloc.guest_ip),
+    )?;
+    if rules
+        .iter()
+        .filter(|(_, role, _)| {
+            matches!(
+                role,
+                SecurityRuleRole::ForwardSourceGuard
+                    | SecurityRuleRole::ForwardLateralGuard
+                    | SecurityRuleRole::ForwardUplinkGuard
+                    | SecurityRuleRole::EgressStateful
+                    | SecurityRuleRole::EgressAllow
+                    | SecurityRuleRole::EgressDeny
+            )
+        })
+        .count()
+        != guard_positions.len() + usize::from(stateful.is_some()) + allow_positions.len() + 1
+    {
+        return Err(OrchError::Internal(format!(
+            "net: refusing activation: {} has duplicate or unpersisted egress policy rules",
+            alloc.tap
+        )));
+    }
+    let first_accept = stateful
+        .into_iter()
+        .chain(allow_positions.iter().copied())
+        .min();
+    if first_accept.is_some_and(|accept| guard_positions.iter().any(|guard| *guard > accept))
+        || guard_positions.iter().any(|guard| *guard > deny)
+    {
+        return Err(OrchError::Internal(format!(
+            "net: refusing activation: {} has an accept or default deny before all egress guards",
+            alloc.tap
+        )));
+    }
+    if let Some(stateful) = stateful {
+        if allow_positions.iter().any(|allow| stateful > *allow) {
+            return Err(OrchError::Internal(format!(
+                "net: refusing activation: {} stateful return follows a persisted allow",
+                alloc.tap
+            )));
+        }
+    }
+    if allow_positions
+        .windows(2)
+        .any(|positions| positions[0] > positions[1])
+        || allow_positions.iter().any(|allow| *allow > deny)
+    {
+        return Err(OrchError::Internal(format!(
+            "net: refusing activation: {} has misordered persisted allows or default deny",
+            alloc.tap
+        )));
+    }
+    Ok(())
+}
+
+fn validate_complete_input_policy(alloc: &NetAlloc, listing: &str) -> Result<(), OrchError> {
+    let rules = allocation_rules(NFT_INPUT_CHAIN, listing, alloc)?;
+    let tap = nft_quote(&alloc.tap);
+    let source = exactly_one_rule(
+        alloc,
+        &rules,
+        SecurityRuleRole::InputSourceGuard,
+        &format!("iifname {tap} ip saddr != {} counter drop", alloc.guest_ip),
+    )?;
+    let stateful = exactly_one_rule(
+        alloc,
+        &rules,
+        SecurityRuleRole::InputStateful,
+        &format!("iifname {tap} ct state established,related accept"),
+    )?;
+    let deny = exactly_one_rule(
+        alloc,
+        &rules,
+        SecurityRuleRole::InputDeny,
+        &format!("iifname {tap} ip drop"),
+    )?;
+    if rules
+        .iter()
+        .filter(|(_, role, _)| {
+            matches!(
+                role,
+                SecurityRuleRole::InputSourceGuard
+                    | SecurityRuleRole::InputStateful
+                    | SecurityRuleRole::InputDeny
+            )
+        })
+        .count()
+        != 3
+    {
+        return Err(OrchError::Internal(format!(
+            "net: refusing activation: {} has duplicate input policy rules",
+            alloc.tap
+        )));
+    }
+    if !(source < stateful && stateful < deny) {
+        return Err(OrchError::Internal(format!(
+            "net: refusing activation: {} has misordered input source guard, return accept, or default deny",
+            alloc.tap
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecurityRuleRole {
-    Guard,
+    ForwardSourceGuard,
+    ForwardLateralGuard,
+    ForwardUplinkGuard,
+    InputSourceGuard,
+    InputStateful,
+    InputDeny,
     EgressStateful,
     EgressAllow,
     EgressDeny,
@@ -2489,24 +2967,36 @@ fn valid_taritd_security_rule(
             Some(SecurityRuleRole::Quarantine)
         }
         (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard)
-            if [
-                format!("iifname {tap} ip saddr != {} counter drop", alloc.guest_ip),
-                format!(
+            if rule == format!("iifname {tap} ip saddr != {} counter drop", alloc.guest_ip) =>
+        {
+            Some(SecurityRuleRole::ForwardSourceGuard)
+        }
+        (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard)
+            if rule
+                == format!(
                     "iifname {tap} ip saddr {} ip daddr 172.16.0.0/16 drop",
                     alloc.guest_ip
-                ),
-            ]
-            .contains(&rule.to_owned())
-                || valid_uplink_guard_rule(rule, &tap, &alloc.guest_ip) =>
+                ) =>
         {
-            Some(SecurityRuleRole::Guard)
+            Some(SecurityRuleRole::ForwardLateralGuard)
+        }
+        (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard)
+            if valid_uplink_guard_rule(rule, &tap, &alloc.guest_ip) =>
+        {
+            Some(SecurityRuleRole::ForwardUplinkGuard)
         }
         (NFT_INPUT_CHAIN, TaritdNftRuleKind::Input)
-            if rule == format!("iifname {tap} ip saddr != {} counter drop", alloc.guest_ip)
-                || rule == format!("iifname {tap} ct state established,related accept")
-                || rule == format!("iifname {tap} ip drop") =>
+            if rule == format!("iifname {tap} ip saddr != {} counter drop", alloc.guest_ip) =>
         {
-            Some(SecurityRuleRole::Guard)
+            Some(SecurityRuleRole::InputSourceGuard)
+        }
+        (NFT_INPUT_CHAIN, TaritdNftRuleKind::Input)
+            if rule == format!("iifname {tap} ct state established,related accept") =>
+        {
+            Some(SecurityRuleRole::InputStateful)
+        }
+        (NFT_INPUT_CHAIN, TaritdNftRuleKind::Input) if rule == format!("iifname {tap} ip drop") => {
+            Some(SecurityRuleRole::InputDeny)
         }
         (NFT_FWD_CHAIN, TaritdNftRuleKind::Egress)
             if rule
@@ -2610,6 +3100,54 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    fn complete_policy_listings(alloc: &NetAlloc, policy: &EgressPolicy) -> (String, String) {
+        let tap = nft_quote(&alloc.tap);
+        let forward = [
+            format!(
+                "iifname {tap} ip saddr != {} counter drop comment {} # handle 1",
+                alloc.guest_ip,
+                nft_quote(&guard_comment(alloc))
+            ),
+            format!(
+                "iifname {tap} ip saddr {} ip daddr 172.16.0.0/16 drop comment {} # handle 2",
+                alloc.guest_ip,
+                nft_quote(&guard_comment(alloc))
+            ),
+            format!(
+                "iifname {tap} ip saddr {} oifname != \"eth0\" drop comment {} # handle 3",
+                alloc.guest_ip,
+                nft_quote(&guard_comment(alloc))
+            ),
+        ]
+        .into_iter()
+        .chain(
+            egress_policy_argv(alloc, &policy.allowlist, policy.allow_existing)
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .map(|(index, rule)| format!("{} # handle {}", rule[6..].join(" "), index + 4)),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+        let input = [
+            format!(
+                "iifname {tap} ip saddr != {} counter drop comment {} # handle 11",
+                alloc.guest_ip,
+                nft_quote(&input_comment(alloc))
+            ),
+            format!(
+                "iifname {tap} ct state established,related accept comment {} # handle 12",
+                nft_quote(&input_comment(alloc))
+            ),
+            format!(
+                "iifname {tap} ip drop comment {} # handle 13",
+                nft_quote(&input_comment(alloc))
+            ),
+        ]
+        .join("\n");
+        (forward, input)
     }
 
     #[test]
@@ -4015,7 +4553,7 @@ esac
         let recovered = NetAlloc::for_slot(vm_id, 7).unwrap();
         let provisioner = NetProvisioner {
             inner: Mutex::new(allocator),
-            egress_updates: EgressUpdateLock::default(),
+            network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
         };
@@ -4849,7 +5387,7 @@ esac
         allocator.by_vm.insert(vm_id, 7);
         let provisioner = NetProvisioner {
             inner: Mutex::new(allocator),
-            egress_updates: EgressUpdateLock::default(),
+            network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
         };
@@ -5038,7 +5576,7 @@ esac
 
     #[test]
     fn egress_update_lock_serializes_concurrent_transactions() {
-        let lock = std::sync::Arc::new(EgressUpdateLock::default());
+        let lock = std::sync::Arc::new(NetworkTransactionLock::default());
         let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let maximum = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -5065,5 +5603,237 @@ esac
         }
 
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn complete_policy_validation_rejects_each_missing_reordered_or_duplicated_rule() {
+        let alloc = NetAlloc::for_idx(7);
+        let policy = EgressPolicy {
+            allowlist: vec!["198.51.100.10:443".into(), "203.0.113.20:53/udp".into()],
+            allow_existing: true,
+        };
+        let (forward, input) = complete_policy_listings(&alloc, &policy);
+        assert!(validate_complete_effective_security_policies(
+            &[(alloc.clone(), policy.clone())],
+            &forward,
+            &input,
+        )
+        .is_ok());
+
+        for (chain, marker) in [
+            ("forward", "ip saddr != 172.16.0.30 counter drop"),
+            ("forward", "ip daddr 172.16.0.0/16 drop"),
+            ("forward", "oifname != \"eth0\" drop"),
+            ("forward", "ct state established,related accept"),
+            ("forward", "ip daddr 198.51.100.10/32 tcp dport 443 accept"),
+            ("forward", "ip daddr 203.0.113.20/32 udp dport 53 accept"),
+            ("forward", "ip saddr 172.16.0.30 drop"),
+            ("input", "ip saddr != 172.16.0.30 counter drop"),
+            ("input", "ct state established,related accept"),
+            ("input", "iifname \"insta7\" ip drop"),
+        ] {
+            let mut candidate_forward = forward.clone();
+            let mut candidate_input = input.clone();
+            let lines = if chain == "forward" {
+                &mut candidate_forward
+            } else {
+                &mut candidate_input
+            };
+            let position = lines
+                .lines()
+                .position(|line| line.contains(marker))
+                .expect("baseline policy contains rule");
+            *lines = lines
+                .lines()
+                .enumerate()
+                .filter(|(index, _)| *index != position)
+                .map(|(_, line)| line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                validate_complete_effective_security_policies(
+                    &[(alloc.clone(), policy.clone())],
+                    &candidate_forward,
+                    &candidate_input,
+                )
+                .is_err(),
+                "missing {chain} rule {marker:?} was accepted"
+            );
+        }
+
+        for (chain, marker) in [
+            ("forward", "ip saddr != 172.16.0.30 counter drop"),
+            ("forward", "ip daddr 172.16.0.0/16 drop"),
+            ("forward", "oifname != \"eth0\" drop"),
+            ("forward", "ct state established,related accept"),
+            ("forward", "ip daddr 198.51.100.10/32 tcp dport 443 accept"),
+            ("forward", "ip daddr 203.0.113.20/32 udp dport 53 accept"),
+            ("forward", "ip saddr 172.16.0.30 drop"),
+            ("input", "ip saddr != 172.16.0.30 counter drop"),
+            ("input", "ct state established,related accept"),
+            ("input", "iifname \"insta7\" ip drop"),
+        ] {
+            let mut candidate_forward = forward.clone();
+            let mut candidate_input = input.clone();
+            let lines = if chain == "forward" {
+                &mut candidate_forward
+            } else {
+                &mut candidate_input
+            };
+            let duplicate = lines
+                .lines()
+                .find(|line| line.contains(marker))
+                .expect("baseline policy contains rule")
+                .to_owned();
+            lines.push('\n');
+            lines.push_str(&duplicate);
+            assert!(
+                validate_complete_effective_security_policies(
+                    &[(alloc.clone(), policy.clone())],
+                    &candidate_forward,
+                    &candidate_input,
+                )
+                .is_err(),
+                "duplicate {chain} rule {marker:?} was accepted"
+            );
+        }
+
+        for (chain, marker, move_to_end) in [
+            ("forward", "ip saddr != 172.16.0.30 counter drop", true),
+            ("forward", "ip daddr 172.16.0.0/16 drop", true),
+            ("forward", "oifname != \"eth0\" drop", true),
+            ("forward", "ct state established,related accept", false),
+            (
+                "forward",
+                "ip daddr 198.51.100.10/32 tcp dport 443 accept",
+                false,
+            ),
+            (
+                "forward",
+                "ip daddr 203.0.113.20/32 udp dport 53 accept",
+                false,
+            ),
+            ("forward", "ip saddr 172.16.0.30 drop", false),
+            ("input", "ip saddr != 172.16.0.30 counter drop", true),
+            ("input", "ct state established,related accept", false),
+            ("input", "iifname \"insta7\" ip drop", false),
+        ] {
+            let mut candidate_forward = forward.clone();
+            let mut candidate_input = input.clone();
+            let lines = if chain == "forward" {
+                &mut candidate_forward
+            } else {
+                &mut candidate_input
+            };
+            let mut reordered = lines.lines().map(str::to_owned).collect::<Vec<_>>();
+            let position = reordered
+                .iter()
+                .position(|line| line.contains(marker))
+                .expect("baseline policy contains rule");
+            let moved = reordered.remove(position);
+            if move_to_end {
+                reordered.push(moved);
+            } else {
+                reordered.insert(0, moved);
+            }
+            *lines = reordered.join("\n");
+            assert!(
+                validate_complete_effective_security_policies(
+                    &[(alloc.clone(), policy.clone())],
+                    &candidate_forward,
+                    &candidate_input,
+                )
+                .is_err(),
+                "reordered {chain} rule {marker:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn network_transaction_serializes_update_against_release_and_slot_reuse() {
+        use std::sync::mpsc;
+
+        let lock = std::sync::Arc::new(NetworkTransactionLock::default());
+        let allocator = std::sync::Arc::new(Mutex::new(SlotAllocator::empty()));
+        let vm_id = Uuid::new_v4();
+        let released = allocator.lock().unwrap().allocate(vm_id).unwrap();
+        let update_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release_attempted = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (update_done_tx, update_done_rx) = mpsc::channel();
+        let (reuse_tx, reuse_rx) = mpsc::channel();
+
+        let update_lock = std::sync::Arc::clone(&lock);
+        let update_entered_worker = std::sync::Arc::clone(&update_entered);
+        let update = std::thread::spawn(move || {
+            update_lock
+                .run(|| {
+                    update_entered_worker.wait();
+                    update_done_rx.recv().unwrap();
+                })
+                .unwrap();
+        });
+
+        let release_lock = std::sync::Arc::clone(&lock);
+        let release_allocator = std::sync::Arc::clone(&allocator);
+        let release_attempted_worker = std::sync::Arc::clone(&release_attempted);
+        let released_for_worker = released.clone();
+        let release = std::thread::spawn(move || {
+            release_attempted_worker.wait();
+            release_lock
+                .run(|| {
+                    let mut allocator = release_allocator.lock().unwrap();
+                    allocator.free(&released_for_worker);
+                    reuse_tx
+                        .send(allocator.allocate(Uuid::new_v4()).unwrap().idx)
+                        .unwrap();
+                })
+                .unwrap();
+        });
+
+        update_entered.wait();
+        release_attempted.wait();
+        assert!(
+            reuse_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "release/reuse ran while the update transaction held the network lock"
+        );
+        update_done_tx.send(()).unwrap();
+        assert_eq!(reuse_rx.recv().unwrap(), released.idx);
+        update.join().unwrap();
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn stale_fixed_new_state_file_does_not_block_unique_persistence() {
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-state-stale-temp-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let state_path = root.join("state.json");
+        let stale = state_write_path(&state_path);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&stale, "unrelated stale writer").unwrap();
+
+        persist_entries(&state_path, Vec::new()).unwrap();
+
+        assert!(
+            stale.exists(),
+            "persistence must not select a fixed .new path"
+        );
+        assert!(std::fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("\"version\": 2"));
+        assert!(
+            std::fs::read_dir(&root).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")),
+            "failed persistence cleanup left a generated temporary file"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

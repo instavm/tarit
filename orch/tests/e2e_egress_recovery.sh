@@ -27,16 +27,18 @@ TAP_A=
 TAP_B=
 TAP_C=
 IPV6_FORWARDING=
-IPV6_FORWARDING_CHANGED=0
 IPV4_FORWARDING=
-IPV4_FORWARDING_CHANGED=0
+VM_IDS=()
+VM_TAPS=()
+VMM_PIDS=()
+VMM_START_TICKS=()
 
 fail() {
   echo "FAIL: $*" >&2
   exit 1
 }
 
-for command in curl flock ip nft ps python3 ss stat sysctl timeout; do
+for command in curl flock ip nft python3 readlink ss stat sysctl timeout; do
   command -v "$command" >/dev/null || fail "required host command is missing: $command"
 done
 [ -x "$TARIT" ] || fail "taritd binary is not executable: $TARIT"
@@ -52,6 +54,11 @@ port = int(sys.argv[2])
 if not 1 <= port <= 65535:
     raise ValueError("port out of range")
 PY
+
+IPV4_FORWARDING=$(sysctl -n net.ipv4.ip_forward) ||
+  fail "could not capture original IPv4 forwarding value"
+IPV6_FORWARDING=$(sysctl -n net.ipv6.conf.all.forwarding) ||
+  fail "could not capture original IPv6 forwarding value"
 
 umask 077
 mkdir -p "$RUN_ROOT"
@@ -130,50 +137,86 @@ delete_vm() {
 }
 
 cleanup_run_vmm_processes() {
-  [ -n "$RUN_DIR" ] || return
-  ps -eo pid=,args= |
-    awk -v sockets="$RUN_DIR/sockets/" 'index($0, sockets) { print $1 }' |
-    while IFS= read -r pid; do
-      [ -n "$pid" ] && [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null || true
-    done
+  local index pid start_ticks
+  for index in "${!VMM_PIDS[@]}"; do
+    pid=${VMM_PIDS[$index]}
+    start_ticks=${VMM_START_TICKS[$index]}
+    [ -n "$pid" ] && [ -n "$start_ticks" ] &&
+      [ -r "/proc/$pid/stat" ] &&
+      [ "$(awk '{print $22}' "/proc/$pid/stat")" = "$start_ticks" ] &&
+      kill "$pid" 2>/dev/null || true
+  done
 }
 
 cleanup_tap_policy() {
-  local tap=$1 slot chain handle
-  [ -n "$tap" ] || return
+  local vm_id=$1 tap=$2 slot chain handle owned=0 tag
+  [ -n "$vm_id" ] && [ -n "$tap" ] || return
   slot=${tap#insta}
   [ "$slot" != "$tap" ] && [ "$slot" -ge 0 ] 2>/dev/null || return
+  tag="slot=$slot vm=$vm_id tap=$tap"
   for chain in post vm_egress vm_input; do
     while IFS= read -r handle; do
-      [ -n "$handle" ] &&
+      if [ -n "$handle" ]; then
+        owned=1
         nft delete rule ip taritd_nat "$chain" handle "$handle" >/dev/null 2>&1 || true
+      fi
     done < <(
       nft -a list chain ip taritd_nat "$chain" 2>/dev/null |
-        awk -v tap="$tap" '
+        awk -v tag="$tag" '
           index($0, "comment \"taritd") &&
-          index($0, "tap=" tap "\"") &&
+          index($0, tag "\"") &&
           match($0, /# handle [0-9]+$/) {
             print substr($0, RSTART + 9, RLENGTH - 9)
           }'
     )
   done
-  nft delete table netdev "taritd_ingress_$slot" >/dev/null 2>&1 || true
-  ip link del "$tap" >/dev/null 2>&1 || true
+  if nft -a list table netdev "taritd_ingress_$slot" 2>/dev/null |
+    grep -F "comment \"taritd-ingress $tag\"" >/dev/null; then
+    owned=1
+    nft delete table netdev "taritd_ingress_$slot" >/dev/null 2>&1 || true
+  fi
+  [ "$owned" = 1 ] && ip link del "$tap" >/dev/null 2>&1 || true
+}
+
+tap_for_recorded_vm() {
+  local vm_id=$1
+  nft -a list table ip taritd_nat 2>/dev/null |
+    awk -v vm_id="$vm_id" '
+      index($0, "comment \"taritd") && index($0, "vm=" vm_id " tap=") {
+        match($0, /tap=insta[0-9]+"/)
+        if (RSTART) {
+          print substr($0, RSTART + 4, RLENGTH - 5)
+          exit
+        }
+      }'
+}
+
+cleanup_recorded_tap_policies() {
+  local index vm_id tap
+  for index in "${!VM_IDS[@]}"; do
+    vm_id=${VM_IDS[$index]}
+    tap=${VM_TAPS[$index]:-}
+    [ -n "$tap" ] || tap=$(tap_for_recorded_vm "$vm_id")
+    [ -n "$tap" ] && cleanup_tap_policy "$vm_id" "$tap"
+  done
+}
+
+delete_recorded_vms() {
+  local index
+  for ((index=${#VM_IDS[@]} - 1; index >= 0; index--)); do
+    delete_vm "${VM_IDS[$index]}" || true
+  done
 }
 
 cleanup() {
-  delete_vm "$VM_C" || true
-  delete_vm "$VM_B" || true
-  delete_vm "$VM_A" || true
+  delete_recorded_vms
   cleanup_run_vmm_processes
-  cleanup_tap_policy "$TAP_C"
-  cleanup_tap_policy "$TAP_B"
-  cleanup_tap_policy "$TAP_A"
+  cleanup_recorded_tap_policies
   stop_taritd
-  if [ "$IPV6_FORWARDING_CHANGED" = 1 ]; then
+  if [ -n "$IPV6_FORWARDING" ]; then
     sysctl -qw "net.ipv6.conf.all.forwarding=$IPV6_FORWARDING" || true
   fi
-  if [ "$IPV4_FORWARDING_CHANGED" = 1 ]; then
+  if [ -n "$IPV4_FORWARDING" ]; then
     sysctl -qw "net.ipv4.ip_forward=$IPV4_FORWARDING" || true
   fi
   [ -n "$RUN_DIR" ] && rm -rf -- "$RUN_DIR"
@@ -183,6 +226,46 @@ trap cleanup EXIT
 create_vm() {
   "$TARIT" --json vm create --vcpus 1 --memory-mib 256 |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+}
+
+vmm_pid_for_vm() {
+  local vm_id=$1 socket inode proc pid fd
+  socket="$TARIT_SOCKET_DIR/$vm_id.sock"
+  for _ in $(seq 1 20); do
+    inode=$(awk -v socket="$socket" '$8 == socket { print $7; exit }' /proc/net/unix)
+    if [ -n "$inode" ]; then
+      for proc in /proc/[0-9]*; do
+        pid=${proc#/proc/}
+        for fd in "$proc"/fd/*; do
+          [ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ] && {
+            printf '%s\n' "$pid"
+            return
+          }
+        done
+      done
+    fi
+    sleep 1
+  done
+  fail "could not record VMM PID for VM $vm_id"
+}
+
+record_vm_process() {
+  local vm_id=$1 pid
+  pid=$(vmm_pid_for_vm "$vm_id")
+  VM_TAPS+=("")
+  VMM_PIDS+=("$pid")
+  VMM_START_TICKS+=("$(awk '{print $22}' "/proc/$pid/stat")")
+}
+
+record_vm_tap() {
+  local vm_id=$1 tap=$2 index
+  for index in "${!VM_IDS[@]}"; do
+    if [ "${VM_IDS[$index]}" = "$vm_id" ]; then
+      VM_TAPS[$index]=$tap
+      return
+    fi
+  done
+  fail "cannot record TAP for unknown VM $vm_id"
 }
 
 tap_for_vm() {
@@ -234,12 +317,12 @@ expect_guest_denial() {
 wait_for_guest_listener() {
   local vm_id=$1 protocol=$2 port=$3 pid_file=$4 socket_check
   case "$protocol" in
-    tcp) socket_check='ss -ltn' ;;
-    udp) socket_check='ss -lun' ;;
+    tcp) socket_check='ss -lntp' ;;
+    udp) socket_check='ss -lunp' ;;
     *) fail "unsupported listener protocol: $protocol" ;;
   esac
   for _ in $(seq 1 20); do
-    run_guest "$vm_id" "pid=\$(cat $pid_file 2>/dev/null) && [ -n \"\$pid\" ] && kill -0 \"\$pid\" && $socket_check | grep -Eq ':$port([[:space:]]|$)'"
+    run_guest "$vm_id" "set -- \$(cat '$pid_file' 2>/dev/null); [ \"\$#\" = 2 ] && pid=\$1 && start_ticks=\$2 && case \"\$pid:\$start_ticks\" in *[!0-9:]*|:) exit 1;; esac && [ -r \"/proc/\$pid/stat\" ] && [ \"\$(awk '{print \$22}' \"/proc/\$pid/stat\")\" = \"\$start_ticks\" ] && $socket_check \"sport = :$port\" | grep -F \"pid=\$pid,\" >/dev/null"
     [ "$GUEST_STATUS" = 0 ] && return
     sleep 1
   done
@@ -274,23 +357,77 @@ require_rule() {
     fail "missing rule: $expected"
 }
 
+normalize_nft_rule() {
+  python3 -c '
+import sys
+
+text = sys.stdin.read().strip()
+out = []
+pending_space = False
+quoted = False
+escaped = False
+for char in text:
+    if quoted:
+        out.append(char)
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "\"":
+            quoted = False
+    elif char == "\"":
+        if pending_space and out:
+            out.append(" ")
+        pending_space = False
+        out.append(char)
+        quoted = True
+    elif char.isspace():
+        pending_space = True
+    else:
+        if pending_space and out:
+            out.append(" ")
+        pending_space = False
+        out.append(char)
+print("".join(out))
+' <<<"$1"
+}
+
 normalize_nft_counter() {
-  local rule=$1
-  if [[ "$rule" =~ ^(.*)\ counter\ packets\ ([0-9]+)\ bytes\ ([0-9]+)\ drop$ ]]; then
+  local rule
+  rule=$(normalize_nft_rule "$1")
+  if [[ "$rule" =~ ^(.*)\ counter\ packets\ ([0-9]+)\ bytes\ ([0-9]+)\ (drop)$ ]]; then
     printf '%s counter drop\n' "${BASH_REMATCH[1]}"
   else
     printf '%s\n' "$rule"
   fi
 }
 
+assert_known_tarit_tap() {
+  local line=$1 tap
+  for tap in "$TAP_A" "$TAP_B" "$TAP_C"; do
+    [ -n "$tap" ] && [[ "$line" == *"iifname \"$tap\""* ]] && return
+  done
+  fail "closed Tarit chain has an untracked TAP rule: $line"
+}
+
 assert_closed_tarit_chain_for_tap() {
   local listing=$1 chain=$2 tap=$3 vm_id=$4 guest=$5 uplink=$6 line rule comment
   while IFS= read -r line; do
+    line=$(normalize_nft_rule "$line")
     [[ "$line" == *"type filter"* || "$line" == "table "* || "$line" == "chain "* ||
       "$line" == "}" ]] && continue
-    [[ "$line" == *" accept"* && "$line" != *'iifname "'* ]] &&
-      fail "broad accept lacks an exact TAP matcher in $chain: $line"
-    [[ "$line" == *"iifname \"$tap\""* ]] || continue
+    rule=${line%% comment \"*}
+    [[ " $rule " == *" jump "* || " $rule " == *" goto "* ||
+      " $rule " == *" vmap "* || " $rule " == *" map "* ]] &&
+      fail "closed Tarit chain has an indirect verdict: $line"
+    [[ "$rule" == *" accept"* && ! "$rule" =~ ^iifname\ \"insta[0-9]+\"\  ]] &&
+      fail "accept lacks an exact TAP matcher in $chain: $line"
+    [[ "$rule" =~ ^iifname\ \"insta[0-9]+\"\  ]] ||
+      fail "closed Tarit chain has a globally effective unknown rule: $line"
+    [[ "$line" == *'comment "taritd'* ]] ||
+      fail "closed Tarit chain has an untagged rule: $line"
+    assert_known_tarit_tap "$rule"
+    [[ "$rule" == *"iifname \"$tap\""* ]] || continue
     rule=${line%% comment \"*}
     comment=${line#* comment \"}
     comment=${comment%%\"*}
@@ -313,8 +450,13 @@ assert_closed_tarit_chain_for_tap() {
   done <<<"$listing"
 }
 
+count_rule() {
+  grep -cF -- "$2" <<<"$1" || true
+}
+
 assert_egress_rule_order() {
   local listing=$1 tap=$2 guest=$3 vm_id=$4 source lateral uplink stateful allow deny
+  listing=$(while IFS= read -r line; do normalize_nft_rule "$line"; done <<<"$listing")
   source=$(grep -nF \
     "iifname \"$tap\" ip saddr != $guest counter" \
     <<<"$listing" | head -1 | cut -d: -f1)
@@ -336,10 +478,36 @@ assert_egress_rule_order() {
   [ -n "$source" ] && [ -n "$lateral" ] && [ -n "$uplink" ] &&
     [ -n "$stateful" ] && [ -n "$allow" ] && [ -n "$deny" ] ||
     fail "missing guard, stateful-return, allow, or final default-deny for $tap"
+  [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr != $guest counter")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest oifname !=")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest ct state established,related accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest drop comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] ||
+    fail "duplicate required egress policy rule for $tap"
   [ "$source" -lt "$stateful" ] && [ "$lateral" -lt "$stateful" ] &&
     [ "$uplink" -lt "$stateful" ] && [ "$stateful" -lt "$allow" ] &&
     [ "$allow" -lt "$deny" ] ||
     fail "default-open or misordered egress policy for $tap"
+}
+
+assert_input_rule_order() {
+  local listing=$1 tap=$2 guest=$3 vm_id=$4 source stateful deny
+  listing=$(while IFS= read -r line; do normalize_nft_rule "$line"; done <<<"$listing")
+  source=$(grep -nF "iifname \"$tap\" ip saddr != $guest counter" <<<"$listing" |
+    head -1 | cut -d: -f1)
+  stateful=$(grep -nF "iifname \"$tap\" ct state established,related accept comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"" <<<"$listing" |
+    head -1 | cut -d: -f1)
+  deny=$(grep -nF "iifname \"$tap\" ip drop comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"" <<<"$listing" |
+    tail -1 | cut -d: -f1)
+  [ -n "$source" ] && [ -n "$stateful" ] && [ -n "$deny" ] ||
+    fail "missing input source guard, return accept, or default deny for $tap"
+  [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr != $guest counter")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ct state established,related accept comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ip drop comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] ||
+    fail "duplicate required input policy rule for $tap"
+  [ "$source" -lt "$stateful" ] && [ "$stateful" -lt "$deny" ] ||
+    fail "misordered input policy for $tap"
 }
 
 assert_recovered_policy() {
@@ -362,6 +530,7 @@ assert_recovered_policy() {
   require_rule "$input" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$input" "iifname \"$tap\" ct state established,related accept"
   require_rule "$input" "iifname \"$tap\" ip drop"
+  assert_input_rule_order "$input" "$tap" "$guest" "$vm_id"
   nat=$(nft list chain ip taritd_nat post)
   require_rule "$nat" "iifname \"$tap\" ip saddr $guest oifname \"$uplink\" masquerade"
   nft -a list table ip taritd_nat | grep -F "vm=$vm_id tap=$tap" >/dev/null ||
@@ -388,14 +557,18 @@ forged_source_drop_packets() {
 mkdir -p "$TARIT_SOCKET_DIR"
 : >"$TARIT_CONFIG"
 cp -f "$BASE_ROOTFS" "$ROOTFS"
-IPV4_FORWARDING=$(sysctl -n net.ipv4.ip_forward)
-IPV4_FORWARDING_CHANGED=1
 
 start_taritd
 VM_A=$(create_vm)
+VM_IDS+=("$VM_A")
+record_vm_process "$VM_A"
 VM_B=$(create_vm)
+VM_IDS+=("$VM_B")
+record_vm_process "$VM_B"
 TAP_A=$(tap_for_vm "$VM_A")
 TAP_B=$(tap_for_vm "$VM_B")
+record_vm_tap "$VM_A" "$TAP_A"
+record_vm_tap "$VM_B" "$TAP_B"
 GUEST_A=$(guest_ip_for_tap "$TAP_A")
 GUEST_B=$(guest_ip_for_tap "$TAP_B")
 UPLINK=$(ip route get "$EGRESS_TEST_IP" |
@@ -411,7 +584,7 @@ for vm_id in "$VM_A" "$VM_B"; do
 done
 
 # Keep listeners on guest B alive while guest A attempts lateral TCP and UDP.
-expect_guest_success "$VM_B" 'rm -f /run/tarit-tcp.pid /run/tarit-udp.pid /run/tarit-udp; (while :; do nc -l -p 31337 >/dev/null 2>&1; done) & tcp_pid=$!; echo "$tcp_pid" >/run/tarit-tcp.pid; nc -u -l -p 31338 >/run/tarit-udp 2>&1 & udp_pid=$!; echo "$udp_pid" >/run/tarit-udp.pid; kill -0 "$tcp_pid" && kill -0 "$udp_pid"'
+expect_guest_success "$VM_B" 'rm -f /run/tarit-tcp.pid /run/tarit-udp.pid /run/tarit-udp; (while :; do nc -l -p 31337 >/dev/null 2>&1; done) & tcp_pid=$!; echo "$tcp_pid $(awk '"'"'{print $22}'"'"' /proc/$tcp_pid/stat)" >/run/tarit-tcp.pid; nc -u -l -p 31338 >/run/tarit-udp 2>&1 & udp_pid=$!; echo "$udp_pid $(awk '"'"'{print $22}'"'"' /proc/$udp_pid/stat)" >/run/tarit-udp.pid; kill -0 "$tcp_pid" && kill -0 "$udp_pid"'
 wait_for_guest_listener "$VM_B" tcp 31337 /run/tarit-tcp.pid
 wait_for_guest_listener "$VM_B" udp 31338 /run/tarit-udp.pid
 expect_guest_denial "$VM_A" "timeout 3 nc -z -w 2 $GUEST_B 31337"
@@ -434,8 +607,6 @@ expect_guest_success "$VM_A" 'ip addr del 172.16.255.250/32 dev eth0'
 # Configure distinct routed IPv6 prefixes for both guests while host forwarding
 # is forced on. Without the netdev ingress guard, guest A can route through the
 # host to guest B.
-IPV6_FORWARDING=$(sysctl -n net.ipv6.conf.all.forwarding)
-IPV6_FORWARDING_CHANGED=1
 sysctl -qw net.ipv6.conf.all.forwarding=1 ||
   fail "could not force host IPv6 forwarding"
 IPV6_PREFIX_A=2001:db8:7:1::/64
@@ -522,7 +693,10 @@ VM_A=
   fail "deleted nft rules leaked: $TAP_A"
 
 VM_C=$(create_vm)
+VM_IDS+=("$VM_C")
+record_vm_process "$VM_C"
 TAP_C=$(tap_for_vm "$VM_C")
+record_vm_tap "$VM_C" "$TAP_C"
 [ "$TAP_C" = "$TAP_A" ] || fail "slot was not reused: expected $TAP_A, got $TAP_C"
 GUEST_C=$(guest_ip_for_tap "$TAP_C")
 curl -fsS -X PATCH \
