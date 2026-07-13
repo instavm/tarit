@@ -12,7 +12,7 @@ use chrono::Utc;
 use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStatus};
 use uuid::Uuid;
 
-use crate::api::{running_record, AppState, StoreWrite};
+use crate::api::{running_record, AppState, PendingStop, StoreWrite};
 use crate::cluster;
 use crate::image;
 use crate::supervisor::{ShutdownSummary, VmSpawnConfig, VmmSupervisor};
@@ -66,7 +66,7 @@ fn stopped_record(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
     Ok(record)
 }
 
-fn commit_stopped_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+fn commit_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
     state
         .vm_cache
         .write()
@@ -86,12 +86,95 @@ async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<()
     })?
 }
 
-fn after_durable_persist(
-    persist: impl FnOnce() -> Result<(), OrchError>,
-    follow_up: impl FnOnce() -> Result<(), OrchError>,
-) -> Result<(), OrchError> {
-    persist()?;
-    follow_up()
+fn persist_running_record_blocking(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    let (completion, persisted) = tokio::sync::oneshot::channel();
+    state
+        .store_tx
+        .send(StoreWrite::VmDurable(record, completion))
+        .map_err(|_| {
+            OrchError::Internal("store writer unavailable during boot publication".into())
+        })?;
+    persisted.blocking_recv().map_err(|_| {
+        OrchError::Internal("store writer dropped boot publication confirmation".into())
+    })?
+}
+
+fn publish_running_record_blocking(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    let runtime = tokio::runtime::Handle::current();
+    runtime.block_on(cluster::record_ownership_required(state, &record))?;
+    if let Err(error) = persist_running_record_blocking(state, record.clone()) {
+        let cleanup = runtime.block_on(cluster::clear_ownership(state, record.id));
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(OrchError::Internal(format!(
+                "{error}; fleet ownership rollback after failed boot publication: {cleanup}"
+            ))),
+        };
+    }
+    commit_vm_record(state, record)
+}
+
+fn retain_pending_stop(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    state
+        .pending_stops
+        .lock()
+        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
+        .entry(record.id)
+        .or_insert(PendingStop {
+            record,
+            sqlite_persisted: false,
+        });
+    Ok(())
+}
+
+async fn finish_pending_stop(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    let pending = state
+        .pending_stops
+        .lock()
+        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| {
+            OrchError::Internal(format!("missing pending stop transition for VM {id}"))
+        })?;
+
+    if !pending.sqlite_persisted {
+        persist_stopped_record(state, pending.record.clone()).await?;
+        state
+            .pending_stops
+            .lock()
+            .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
+            .get_mut(&id)
+            .ok_or_else(|| {
+                OrchError::Internal(format!("pending stop transition disappeared for VM {id}"))
+            })?
+            .sqlite_persisted = true;
+    }
+    commit_vm_record(state, pending.record)?;
+    cluster::clear_ownership(state, id).await?;
+    state.scheduler.on_local_vm_stopped();
+    state
+        .pending_stops
+        .lock()
+        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
+        .remove(&id);
+    Ok(())
+}
+
+async fn retry_pending_stops(state: &AppState) -> Vec<String> {
+    let ids = match state.pending_stops.lock() {
+        Ok(pending) => pending.keys().copied().collect::<Vec<_>>(),
+        Err(_) => return vec!["pending stop transitions lock poisoned".into()],
+    };
+    let mut failures = Vec::new();
+    for id in ids {
+        if let Err(error) = finish_pending_stop(state, id).await {
+            failures.push(format!(
+                "VM {id} retained stopped transition, ownership, and scheduler reservation: {error}"
+            ));
+        }
+    }
+    failures
 }
 
 fn store_insert(state: &AppState, rec: &VmRecord) -> Result<(), OrchError> {
@@ -181,15 +264,22 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
 
         let sup = Arc::clone(&state.supervisor);
         let cfg = spawn_cfg.clone();
-        let spawned = tokio::task::spawn_blocking(move || sup.spawn_vm(id, cfg)).await;
-        return match spawned {
-            Ok(Ok((pid, socket_path))) => {
+        let publication_state = state.clone();
+        let publication_record = record.clone();
+        let spawned = tokio::task::spawn_blocking(move || {
+            sup.spawn_vm_with_publication(id, cfg, move |pid, socket_path| {
+                let mut record = publication_record;
                 record.status = VmStatus::Running;
                 record.pid = Some(pid);
                 record.socket_path = Some(socket_path.display().to_string());
                 record.updated_at = Utc::now();
-                store_update(state, &record)?;
-                cluster::record_ownership(state, &record).await;
+                publish_running_record_blocking(&publication_state, record.clone())?;
+                Ok(record)
+            })
+        })
+        .await;
+        return match spawned {
+            Ok(Ok(record)) => {
                 tracing::info!(id = %id, host = %state.config.host_id, "create: cold start");
                 Ok(record)
             }
@@ -240,40 +330,58 @@ pub async fn restore_local(
     }
     let id = id.unwrap_or_else(Uuid::new_v4);
     let now = Utc::now();
+    let mut record = VmRecord {
+        id,
+        host_id: state.config.host_id.clone(),
+        owner_key,
+        api_key_id,
+        status: VmStatus::Creating,
+        memory_mib: 0,
+        vcpus: 0,
+        kernel_path: "(restored)".into(),
+        rootfs_path: None,
+        cmdline: "(restored)".into(),
+        socket_path: None,
+        pid: None,
+        created_at: now,
+        updated_at: now,
+    };
+    store_insert(state, &record)?;
     let path = snapshot_path.to_string();
     let sup = Arc::clone(&state.supervisor);
-    let spawned = tokio::task::spawn_blocking(move || sup.restore_vm(id, &path)).await;
+    let publication_state = state.clone();
+    let publication_record = record.clone();
+    let spawned = tokio::task::spawn_blocking(move || {
+        sup.restore_vm_with_publication(id, &path, move |pid, socket_path| {
+            let mut record = publication_record;
+            record.status = VmStatus::Running;
+            record.pid = Some(pid);
+            record.socket_path = Some(socket_path.display().to_string());
+            record.updated_at = Utc::now();
+            publish_running_record_blocking(&publication_state, record.clone())?;
+            Ok(record)
+        })
+    })
+    .await;
     match spawned {
-        Ok(Ok((pid, socket_path))) => {
-            let record = VmRecord {
-                id,
-                host_id: state.config.host_id.clone(),
-                owner_key,
-                api_key_id,
-                status: VmStatus::Running,
-                memory_mib: 0,
-                vcpus: 0,
-                kernel_path: "(restored)".into(),
-                rootfs_path: None,
-                cmdline: "(restored)".into(),
-                socket_path: Some(socket_path.display().to_string()),
-                pid: Some(pid),
-                created_at: now,
-                updated_at: now,
-            };
-            store_insert(state, &record)?;
-            cluster::record_ownership(state, &record).await;
+        Ok(Ok(record)) => {
             tracing::info!(id = %id, host = %state.config.host_id, "restore: from snapshot");
             Ok(record)
         }
         Ok(Err(e)) => {
             if !state.supervisor.is_shutting_down() {
+                record.status = VmStatus::Error;
+                record.updated_at = Utc::now();
+                let _ = store_update(state, &record);
                 state.scheduler.release();
             }
             Err(e)
         }
         Err(e) => {
             if !state.supervisor.is_shutting_down() {
+                record.status = VmStatus::Error;
+                record.updated_at = Utc::now();
+                let _ = store_update(state, &record);
                 state.scheduler.release();
             }
             Err(OrchError::Internal(format!("join: {e}")))
@@ -295,6 +403,15 @@ pub async fn exec_local(
 }
 
 pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
+    if state
+        .pending_stops
+        .lock()
+        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
+        .contains_key(&id)
+    {
+        return finish_pending_stop(state, id).await;
+    }
     // Bill the final runtime interval before teardown, while the VM record (and
     // its owning key) is still in the cache, then drop its watermark.
     crate::usage::meter_vm_final(state, id);
@@ -302,13 +419,13 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     tokio::task::spawn_blocking(move || sup.stop_vm(id))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
-    vm_set_status(state, id, VmStatus::Stopped)?;
-    state.scheduler.on_local_vm_stopped();
-    cluster::clear_ownership(state, id).await;
-    Ok(())
+    retain_pending_stop(state, stopped_record(state, id)?)?;
+    finish_pending_stop(state, id).await
 }
 
 pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchError> {
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
+    let mut failures = retry_pending_stops(state).await;
     let sup = Arc::clone(&state.supervisor);
     let outcome = tokio::task::spawn_blocking(move || sup.stop_all())
         .await
@@ -318,10 +435,7 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
         Err(failure) => (failure.summary, Some(failure.error)),
     };
 
-    let mut failures = failure
-        .into_iter()
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
+    failures.extend(failure.into_iter().map(|error| error.to_string()));
     let stopped_ids = summary
         .running_ids
         .iter()
@@ -339,19 +453,19 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
                 continue;
             }
         };
-        let persisted = persist_stopped_record(state, record.clone()).await;
-        if let Err(error) =
-            after_durable_persist(|| persisted, || commit_stopped_record(state, record))
-        {
+        if let Err(error) = retain_pending_stop(state, record) {
             failures.push(format!(
                 "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
             ));
             continue;
         }
-        cluster::clear_ownership(state, id).await;
-        state.scheduler.on_local_vm_stopped();
+        if let Err(error) = finish_pending_stop(state, id).await {
+            failures.push(format!(
+                "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
+            ));
+        }
     }
-    for _ in 0..summary.warm {
+    for _ in 0..summary.warm + summary.internal_booting {
         state.scheduler.on_local_vm_stopped();
     }
 
@@ -487,46 +601,179 @@ fn ensure_vm_can_receive_live_op(state: &AppState, id: Uuid) -> Result<(), OrchE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
+    use crate::metrics::Metrics;
+    use crate::peer::PeerClient;
+    use crate::pty::PtyRegistry;
+    use crate::scheduler::Scheduler;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::{Mutex, RwLock};
+    use tarit_store::Store;
 
     #[test]
-    fn stopped_transition_persists_before_releasing_or_clearing_ownership() {
-        let events = RefCell::new(Vec::new());
+    fn ordinary_delete_writer_failure_keeps_a_retryable_transition_and_reservation() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        assert!(state.scheduler.try_reserve());
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            let writer = tokio::spawn(async move {
+                let StoreWrite::VmDurable(_, completion) = writes.recv().await.unwrap() else {
+                    panic!("ordinary stop must use the durable lifecycle writer");
+                };
+                completion
+                    .send(Err(OrchError::Internal("injected SQLite failure".into())))
+                    .unwrap();
+            });
 
-        let result = after_durable_persist(
-            || {
-                events.borrow_mut().push("persist");
-                Ok(())
-            },
-            || {
-                events.borrow_mut().extend(["clear-ownership", "release"]);
-                Ok(())
-            },
-        );
+            let error = stop_local(&state, id)
+                .await
+                .expect_err("ordinary stop must fail when SQLite rejects its stopped record");
+            writer.await.unwrap();
 
-        assert!(result.is_ok());
-        assert_eq!(
-            events.into_inner(),
-            vec!["persist", "clear-ownership", "release"]
-        );
+            assert!(error.to_string().contains("injected SQLite failure"));
+            assert!(state.pending_stops.lock().unwrap().contains_key(&id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+        });
+        drop(runtime);
+        drop(state);
     }
 
     #[test]
-    fn stopped_transition_retains_reservations_when_persistence_fails() {
-        let events = RefCell::new(Vec::new());
+    fn later_stop_retries_pending_persistence_without_releasing_early() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        assert!(state.scheduler.try_reserve());
+        let durable_attempts = Arc::new(AtomicUsize::new(0));
+        let writer_attempts = Arc::clone(&durable_attempts);
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            let writer = tokio::spawn(async move {
+                for result in [
+                    Err(OrchError::Internal("injected SQLite failure".into())),
+                    Ok(()),
+                ] {
+                    let StoreWrite::VmDurable(_, completion) = writes.recv().await.unwrap() else {
+                        panic!("terminal transitions must stay on the durable writer path");
+                    };
+                    writer_attempts.fetch_add(1, Ordering::SeqCst);
+                    completion.send(result).unwrap();
+                }
+            });
 
-        let result = after_durable_persist(
-            || {
-                events.borrow_mut().push("persist");
-                Err(OrchError::Internal("simulated store failure".into()))
+            assert!(stop_local(&state, id).await.is_err());
+            assert!(state.pending_stops.lock().unwrap().contains_key(&id));
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+
+            stop_local(&state, id)
+                .await
+                .expect("a later stop must retry only the retained stopped transition");
+            writer.await.unwrap();
+
+            assert_eq!(durable_attempts.load(Ordering::SeqCst), 2);
+            assert!(!state.pending_stops.lock().unwrap().contains_key(&id));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+        });
+        drop(runtime);
+        drop(state);
+    }
+
+    fn test_state_with_durable_writer(
+    ) -> (AppState, tokio::sync::mpsc::UnboundedReceiver<StoreWrite>) {
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
+                "test-key".into(),
+                "test".into(),
+                ApiRole::Admin,
+                0,
+            )])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: PathBuf::from("true"),
+            kernel: PathBuf::from("kernel"),
+            rootfs: PathBuf::from("rootfs"),
+            socket_dir: PathBuf::from("target/taritd-ops-test/sockets"),
+            db_path: PathBuf::from("target/taritd-ops-test/fleet.db"),
+            net_state_path: PathBuf::from("target/taritd-ops-test/net-state.json"),
+            images_dir: PathBuf::from("target/taritd-ops-test/images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: None,
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: PathBuf::from("target/taritd-ops-test/ssh_host"),
+        };
+        let (store_tx, store_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            AppState {
+                config: config.clone(),
+                store: Arc::new(Mutex::new(Store::open(":memory:").unwrap())),
+                exec_cache: Arc::new(RwLock::new(HashMap::new())),
+                vm_cache: Arc::new(RwLock::new(HashMap::new())),
+                store_tx,
+                pending_stops: Arc::new(Mutex::new(HashMap::new())),
+                terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
+                pty_registry: Arc::new(PtyRegistry::default()),
+                supervisor: Arc::new(VmmSupervisor::new(config.clone())),
+                scheduler: Arc::new(Scheduler::new(config)),
+                peer: Arc::new(PeerClient::new("peer-secret".into())),
+                fleet: None,
+                metrics: Arc::new(Metrics::default()),
             },
-            || {
-                events.borrow_mut().extend(["clear-ownership", "release"]);
-                Ok(())
+            store_rx,
+        )
+    }
+
+    fn insert_running_vm(state: &AppState) -> Uuid {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        state.vm_cache.write().unwrap().insert(
+            id,
+            VmRecord {
+                id,
+                host_id: state.config.host_id.clone(),
+                owner_key: Some("test".into()),
+                api_key_id: None,
+                status: VmStatus::Running,
+                memory_mib: 256,
+                vcpus: 1,
+                kernel_path: "kernel".into(),
+                rootfs_path: None,
+                cmdline: "console=ttyS0".into(),
+                socket_path: None,
+                pid: None,
+                created_at: now,
+                updated_at: now,
             },
         );
+        id
+    }
 
-        assert!(matches!(result, Err(OrchError::Internal(_))));
-        assert_eq!(events.into_inner(), vec!["persist"]);
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 }

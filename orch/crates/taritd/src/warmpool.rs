@@ -60,10 +60,13 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                                 continue;
                             }
                             let sup = Arc::clone(&sup);
+                            let golden_sup = Arc::clone(&sup);
                             let sched = Arc::clone(&scheduler);
                             let class = class.clone();
-                            match tokio::task::spawn_blocking(move || sup.create_golden(&class))
-                                .await
+                            match tokio::task::spawn_blocking(move || {
+                                golden_sup.create_golden(&class)
+                            })
+                            .await
                             {
                                 Ok(Ok(path)) => {
                                     sched.release();
@@ -78,7 +81,9 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                                     golden.insert(key, path);
                                 }
                                 Ok(Err(e)) => {
-                                    sched.release();
+                                    if !sup.is_shutting_down() {
+                                        sched.release();
+                                    }
                                     tracing::warn!("warm golden create failed: {e}");
                                 }
                                 Err(e) => {
@@ -117,7 +122,9 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                         let snapshot_path = snapshot_path.clone();
                         set.spawn_blocking(move || {
                             if let Err(e) = sup.spawn_warm_restore(&class, &snapshot_path) {
-                                sched.release();
+                                if !sup.is_shutting_down() {
+                                    sched.release();
+                                }
                                 tracing::warn!("warm restore spawn failed: {e}");
                             }
                         });
@@ -147,7 +154,9 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                         let class = class.clone();
                         set.spawn_blocking(move || {
                             if let Err(e) = sup.spawn_warm(&class) {
-                                sched.release();
+                                if !sup.is_shutting_down() {
+                                    sched.release();
+                                }
                                 tracing::warn!("warm spawn failed: {e}");
                             }
                         });

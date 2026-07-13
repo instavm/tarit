@@ -179,6 +179,15 @@ rootfs = "/var/lib/taritd/rootfs.ext4"
 Operational behavior:
 
 - Warm VMs reserve scheduler slots, so assigned plus warm VMs do not exceed `TARIT_MAX_VMS`.
+- Shutdown and user-boot publication share a boot gate. The global order is
+  `terminal transition gate` → `boot gate` → `running`/`warm` → `booting`;
+  shutdown releases the boot gate before its separate `running` → `warm`
+  teardown phase. Lifecycle publication never takes an earlier gate while
+  holding a later one. A user boot keeps its boot entry until its Running record
+  is durably written and fleet ownership is recorded. Terminal stop/delete
+  transitions retain a pending stopped record, ownership, and scheduler
+  reservation until SQLite acknowledgement completes; a later stop retries that
+  record without repeating teardown.
 - Warm handout is possible only when the create request exactly matches a warm class shape and boot config.
 - If the pool drains, creates cold boot instead of failing.
 - Replenishment loops every 150 ms and limits concurrent warm spawns by `replenish_concurrency`.

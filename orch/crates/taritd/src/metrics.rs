@@ -509,6 +509,8 @@ mod tests {
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
+            pending_stops: Arc::new(Mutex::new(HashMap::new())),
+            terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
             pty_registry: Arc::new(PtyRegistry::default()),
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),

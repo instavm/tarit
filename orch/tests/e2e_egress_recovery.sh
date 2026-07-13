@@ -237,7 +237,10 @@ stop_taritd() {
 delete_vm() {
   local vm_id=$1
   [ -n "$vm_id" ] || return
-  server_pid_is_current || return 1
+  server_listener_is_current || {
+    echo "WARN: skipping VM delete because recorded taritd listener ownership changed" >&2
+    return 1
+  }
   "$TARIT" vm delete "$vm_id" >/dev/null
 }
 

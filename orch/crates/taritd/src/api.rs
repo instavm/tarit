@@ -97,6 +97,14 @@ pub enum StoreWrite {
     Audit(AuditEvent),
 }
 
+/// A VM that has completed destructive teardown but whose terminal lifecycle
+/// commit still has to complete. It remains reserved and owned until removed.
+#[derive(Clone)]
+pub(crate) struct PendingStop {
+    pub(crate) record: VmRecord,
+    pub(crate) sqlite_persisted: bool,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
@@ -111,6 +119,14 @@ pub struct AppState {
     pub vm_cache: Arc<RwLock<HashMap<Uuid, VmRecord>>>,
     /// Channel to the background store writer (durability, write-behind).
     pub store_tx: tokio::sync::mpsc::UnboundedSender<StoreWrite>,
+    /// Terminal transitions retained after teardown until SQLite, fleet removal,
+    /// and scheduler release complete.
+    pub(crate) pending_stops: Arc<Mutex<HashMap<Uuid, PendingStop>>>,
+    /// Serializes terminal transition retries so a second stop cannot repeat
+    /// destructive teardown while the first stop awaits durable persistence.
+    /// When both are needed, this gate is acquired before the supervisor boot
+    /// gate; boot publication never acquires this gate.
+    pub(crate) terminal_transition_gate: Arc<tokio::sync::Mutex<()>>,
     pub(crate) pty_registry: Arc<crate::pty::PtyRegistry>,
     pub supervisor: Arc<VmmSupervisor>,
     pub scheduler: Arc<Scheduler>,
@@ -1451,6 +1467,8 @@ mod tests {
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
+            pending_stops: Arc::new(Mutex::new(HashMap::new())),
+            terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
             pty_registry: Arc::new(PtyRegistry::default()),
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),

@@ -208,6 +208,8 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         exec_cache: Arc::new(RwLock::new(HashMap::new())),
         vm_cache,
         store_tx,
+        pending_stops: Arc::new(Mutex::new(HashMap::new())),
+        terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
         pty_registry: Arc::new(pty::PtyRegistry::default()),
         supervisor: Arc::clone(&supervisor),
         scheduler: scheduler.clone(),
@@ -352,6 +354,7 @@ async fn shutdown_sweep(state: &AppState, reason: &'static str) -> anyhow::Resul
         running = summary.running,
         warm = summary.warm,
         booting = summary.booting,
+        internal_booting = summary.internal_booting,
         elapsed_ms = started.elapsed().as_millis(),
         "shutdown drain summary: reaped local VMs"
     );
