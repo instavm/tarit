@@ -1765,7 +1765,6 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
             NFT_INPUT_CHAIN.into(),
             "iifname".into(),
             interface,
-            "ip".into(),
             "drop".into(),
             "comment".into(),
             input_comment,
@@ -3288,7 +3287,7 @@ fn validate_complete_input_policy(alloc: &NetAlloc, listing: &str) -> Result<(),
         alloc,
         &rules,
         SecurityRuleRole::InputDeny,
-        &format!("iifname {tap} ip drop"),
+        &format!("iifname {tap} drop"),
     )?;
     if rules
         .iter()
@@ -3376,7 +3375,7 @@ fn valid_taritd_security_rule(
         {
             Some(SecurityRuleRole::InputStateful)
         }
-        (NFT_INPUT_CHAIN, TaritdNftRuleKind::Input) if rule == format!("iifname {tap} ip drop") => {
+        (NFT_INPUT_CHAIN, TaritdNftRuleKind::Input) if rule == format!("iifname {tap} drop") => {
             Some(SecurityRuleRole::InputDeny)
         }
         (NFT_FWD_CHAIN, TaritdNftRuleKind::Egress)
@@ -3547,7 +3546,7 @@ mod tests {
                 nft_quote(&input_comment(alloc))
             ),
             format!(
-                "iifname {tap} ip drop comment {} # handle 13",
+                "iifname {tap} drop comment {} # handle 13",
                 nft_quote(&input_comment(alloc))
             ),
         ]
@@ -3687,6 +3686,50 @@ esac
             !commands.contains("nft delete rule ip taritd_nat post handle 99"),
             "{commands}"
         );
+    }
+
+    #[test]
+    fn input_default_deny_uses_bare_drop_and_rejects_legacy_ip_drop() {
+        let alloc = NetAlloc::for_idx(0);
+        let comment = nft_quote(&input_comment(&alloc));
+        let expected = argv(&[
+            "nft",
+            "add",
+            "rule",
+            "ip",
+            "taritd_nat",
+            "vm_input",
+            "iifname",
+            "\"insta0\"",
+            "drop",
+            "comment",
+            &comment,
+        ]);
+        for (kind, plan) in [
+            ("provision", tap_provision_argv(&alloc, "eth0")),
+            ("reconcile", recovered_tap_reconcile_argv(&alloc, "eth0")),
+        ] {
+            let input_rules = plan
+                .into_iter()
+                .filter(|rule| rule.get(5).is_some_and(|chain| chain == NFT_INPUT_CHAIN))
+                .collect::<Vec<_>>();
+            assert!(
+                input_rules.contains(&expected),
+                "{kind} input default deny must compile as: {expected:?}\nactual rules: {input_rules:?}"
+            );
+        }
+
+        let listing = format!(
+            concat!(
+                "iifname \"insta0\" ip saddr != 172.16.0.2 counter drop comment {0} # handle 1\n",
+                "iifname \"insta0\" ct state established,related accept comment {0} # handle 2\n",
+                "iifname \"insta0\" drop comment {0} # handle 3"
+            ),
+            comment
+        );
+        assert!(validate_taritd_security_chain(NFT_INPUT_CHAIN, &listing).is_ok());
+        let legacy = listing.replace("iifname \"insta0\" drop", "iifname \"insta0\" ip drop");
+        assert!(validate_taritd_security_chain(NFT_INPUT_CHAIN, &legacy).is_err());
     }
 
     #[test]
@@ -3841,7 +3884,6 @@ esac
                     "vm_input",
                     "iifname",
                     "\"insta0\"",
-                    "ip",
                     "drop",
                     "comment",
                     "\"taritd-input slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
@@ -3884,7 +3926,7 @@ esac
                 "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm={prior_owner} tap=insta7\""
             ),
             format!(
-                "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm={prior_owner} tap=insta7\""
+                "iifname \"insta7\" drop comment \"taritd-input slot=7 vm={prior_owner} tap=insta7\""
             ),
         ] {
             assert!(is_stale_recovery_rule_for_alloc(&line, &recovered), "{line}");
@@ -4794,11 +4836,11 @@ case "${0##*/}:$*" in
   "nft:-a list chain ip taritd_nat vm_input")
     [ ! -e "$TARIT_TEST_FAKE_STATE.quarantine" ] || echo "iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 21"
     if [ ! -e "$TARIT_TEST_FAKE_STATE.initial-input-removed" ]; then
-      echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_OLD_VM_ID tap=insta7\" # handle 4"
+      echo "iifname \"insta7\" drop comment \"taritd-input slot=7 vm=$TARIT_TEST_OLD_VM_ID tap=insta7\" # handle 4"
     elif [ -e "$TARIT_TEST_FAKE_STATE.policy" ]; then
       echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 15"
       echo "iifname \"insta7\" ct state established,related accept comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 16"
-      echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 17"
+      echo "iifname \"insta7\" drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 17"
     fi
     ;;
   "nft:delete table netdev taritd_ingress_7") touch "$TARIT_TEST_FAKE_STATE.initial-ingress-removed" ;;
@@ -4931,7 +4973,7 @@ esac
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 drop",
             "nft add rule ip taritd_nat vm_input iifname \"insta7\" ip saddr != 172.16.0.30 counter drop",
             "nft add rule ip taritd_nat vm_input iifname \"insta7\" ct state established,related accept",
-            "nft add rule ip taritd_nat vm_input iifname \"insta7\" ip drop",
+            "nft add rule ip taritd_nat vm_input iifname \"insta7\" drop",
             "nft add rule ip taritd_nat post iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade",
         ] {
             let additions = commands
@@ -5007,7 +5049,7 @@ EOF
 iifname "insta7" drop comment "taritd-recovery-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 21
 iifname "insta7" ip saddr != 172.16.0.30 counter drop comment "taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 6
 iifname "insta7" ct state established,related accept comment "taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 7
-iifname "insta7" ip drop comment "taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 8
+iifname "insta7" drop comment "taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7" # handle 8
 EOF
         ;;
     esac
@@ -5335,7 +5377,7 @@ case "${0##*/}:$*" in
     [ ! -e "$TARIT_TEST_FAKE_STATE.policy7" ] || {
       echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 14"
       echo "iifname \"insta7\" ct state established,related accept comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 17"
-      echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 18"
+      echo "iifname \"insta7\" drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 18"
     }
     ;;
   "nft:delete rule ip taritd_nat post handle 11") touch "$TARIT_TEST_FAKE_STATE.policy7-nat-cleaned" ;;
@@ -5580,7 +5622,7 @@ esac
             "iifname \"insta1\" ip saddr 172.16.0.6 drop comment \"taritd-egress slot=1 vm={old_vm} tap=insta1\" # handle 6"
         );
         let stale_input_line = format!(
-            "iifname \"insta1\" ip drop comment \"taritd-input slot=1 vm={old_vm} tap=insta1\" # handle 7"
+            "iifname \"insta1\" drop comment \"taritd-input slot=1 vm={old_vm} tap=insta1\" # handle 7"
         );
         let foreign_line = "ip saddr 10.0.0.0/8 masquerade # handle 6";
 
@@ -5935,7 +5977,7 @@ case "${0##*/}:$*" in
   "nft:-a list chain ip taritd_nat vm_input")
     echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 31"
     echo "iifname \"insta7\" ct state established,related accept comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 32"
-    echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 33"
+    echo "iifname \"insta7\" drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 33"
     ;;
 esac
 "#;
@@ -6203,7 +6245,7 @@ esac
             ("forward", "ip saddr 172.16.0.30 drop"),
             ("input", "ip saddr != 172.16.0.30 counter drop"),
             ("input", "ct state established,related accept"),
-            ("input", "iifname \"insta7\" ip drop"),
+            ("input", "iifname \"insta7\" drop"),
         ] {
             let mut candidate_forward = forward.clone();
             let mut candidate_input = input.clone();
@@ -6246,7 +6288,7 @@ esac
             ("forward", "ip saddr 172.16.0.30 drop"),
             ("input", "ip saddr != 172.16.0.30 counter drop"),
             ("input", "ct state established,related accept"),
-            ("input", "iifname \"insta7\" ip drop"),
+            ("input", "iifname \"insta7\" drop"),
         ] {
             let mut candidate_forward = forward.clone();
             let mut candidate_input = input.clone();
@@ -6293,7 +6335,7 @@ esac
             ("forward", "ip saddr 172.16.0.30 drop", false),
             ("input", "ip saddr != 172.16.0.30 counter drop", true),
             ("input", "ct state established,related accept", false),
-            ("input", "iifname \"insta7\" ip drop", false),
+            ("input", "iifname \"insta7\" drop", false),
         ] {
             let mut candidate_forward = forward.clone();
             let mut candidate_input = input.clone();
@@ -6409,7 +6451,7 @@ case "${0##*/}:$*" in
   "ip:link del insta7") echo "simulated link-delete failure" >&2; exit 1 ;;
   "nft:-a list chain ip taritd_nat post") echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 1" ;;
   "nft:-a list chain ip taritd_nat vm_egress") echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 2" ;;
-  "nft:-a list chain ip taritd_nat vm_input") echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 3" ;;
+  "nft:-a list chain ip taritd_nat vm_input") echo "iifname \"insta7\" drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 3" ;;
   "nft:list tables netdev") echo "table netdev taritd_ingress_7" ;;
   "nft:-a list table netdev taritd_ingress_7") cat <<EOF
 table netdev taritd_ingress_7 {
@@ -6527,7 +6569,7 @@ case "${0##*/}:$*" in
     echo "iifname \"insta7\" ip saddr 172.16.0.30 tcp flags syn accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 55"
     ;;
   "nft:-a list chain ip taritd_nat vm_input")
-    echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 3"
+    echo "iifname \"insta7\" drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 3"
     ;;
   "nft:list tables netdev") ;;
   "nft:-a list table ip taritd_nat")

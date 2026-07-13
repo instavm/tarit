@@ -548,7 +548,7 @@ recognized_managed_cleanup_rule() {
     vm_input)
       [[ "$rule" == "iifname \"$tap\" ip saddr != $guest counter drop comment \"taritd-input $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" ct state established,related accept comment \"taritd-input $tag\"" ]] ||
-        [[ "$rule" == "iifname \"$tap\" ip drop comment \"taritd-input $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-input $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-recovery-quarantine $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-egress-update-quarantine $tag\"" ]]
       ;;
@@ -1012,7 +1012,7 @@ assert_closed_tarit_chain_for_tap() {
       "vm_egress:iifname \"$tap\" ip saddr $guest drop:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
       "vm_input:iifname \"$tap\" ip saddr != $guest counter drop:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap"|\
       "vm_input:iifname \"$tap\" ct state established,related accept:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap"|\
-      "vm_input:iifname \"$tap\" ip drop:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap")
+      "vm_input:iifname \"$tap\" drop:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap")
         ;;
       *)
         fail "unmanaged or unrecognized Tarit rule shape in $chain for $tap: $line"
@@ -1069,13 +1069,13 @@ assert_input_rule_order() {
     head -1 | cut -d: -f1)
   stateful=$(grep -nF "iifname \"$tap\" ct state established,related accept comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"" <<<"$listing" |
     head -1 | cut -d: -f1)
-  deny=$(grep -nF "iifname \"$tap\" ip drop comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"" <<<"$listing" |
+  deny=$(grep -nF "iifname \"$tap\" drop comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"" <<<"$listing" |
     tail -1 | cut -d: -f1)
   [ -n "$source" ] && [ -n "$stateful" ] && [ -n "$deny" ] ||
     fail "missing input source guard, return accept, or default deny for $tap"
   [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr != $guest counter")" = 1 ] &&
     [ "$(count_rule "$listing" "iifname \"$tap\" ct state established,related accept comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] &&
-    [ "$(count_rule "$listing" "iifname \"$tap\" ip drop comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] ||
+    [ "$(count_rule "$listing" "iifname \"$tap\" drop comment \"taritd-input slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] ||
     fail "duplicate required input policy rule for $tap"
   [ "$source" -lt "$stateful" ] && [ "$stateful" -lt "$deny" ] ||
     fail "misordered input policy for $tap"
@@ -1098,7 +1098,7 @@ assert_recovered_policy() {
   assert_closed_tarit_chain_for_tap "$input" vm_input "$tap" "$vm_id" "$guest" "$uplink"
   require_rule "$input" "iifname \"$tap\" ip saddr != $guest counter"
   require_rule "$input" "iifname \"$tap\" ct state established,related accept"
-  require_rule "$input" "iifname \"$tap\" ip drop"
+  require_rule "$input" "iifname \"$tap\" drop"
   assert_input_rule_order "$input" "$tap" "$guest" "$vm_id"
   nat=$(nft list chain ip taritd_nat post)
   require_rule "$nat" "iifname \"$tap\" ip saddr $guest oifname \"$uplink\" masquerade"
