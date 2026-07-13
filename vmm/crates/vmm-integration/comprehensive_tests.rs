@@ -43,6 +43,14 @@ fn vm_config() -> VmConfig {
     }
 }
 
+fn retain_snapshot(controller: &VmmController, path: &str) {
+    let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
+        .expect("snapshot identity");
+    controller
+        .release_scratch(path, identity)
+        .expect("transfer snapshot ownership");
+}
+
 /// Memory-consistency harness for live snapshot.
 /// Boot a VM with `create_live` (vCPU executing in background), then take a
 /// live snapshot while it runs and verify the snapshot is a consistent
@@ -203,6 +211,7 @@ fn perf_gates_comprehensive() {
 
         let t1 = Instant::now();
         let snap_path = controller.snapshot(false).expect("snapshot");
+        retain_snapshot(&controller, &snap_path);
         let snap_ms = t1.elapsed().as_millis();
         snapshot_times.push(snap_ms);
         flushed_eprintln!("iter {i}: snapshot done — {snap_ms}ms ({snap_path})");
@@ -370,6 +379,7 @@ fn snapshot_tampering_rejected() {
     let controller = VmmController::new();
     controller.create(vm_config()).expect("boot");
     let snap_path = controller.snapshot(false).expect("snapshot");
+    retain_snapshot(&controller, &snap_path);
 
     // Read the snapshot, flip a byte in the magic, write it back.
     let mut snap_bytes = std::fs::read(&snap_path).unwrap();

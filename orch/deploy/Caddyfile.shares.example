@@ -1,0 +1,38 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# Supply a wildcard certificate for *.${TARIT_SHARE_DOMAIN} using the
+# deployment's certificate-management process. This example intentionally
+# contains no DNS-provider credentials.
+# The upstream listener is private to this trusted edge; firewall direct public
+# access to TARIT_SHARE_UPSTREAM.
+*.{$TARIT_SHARE_DOMAIN} {
+	tls {$TARIT_SHARE_TLS_CERT} {$TARIT_SHARE_TLS_KEY}
+
+	@internal path /internal/v1 /internal/v1/*
+	handle @internal {
+		respond "not found" 404
+	}
+
+	handle {
+		# Caddy proxies WebSocket upgrades automatically.
+		reverse_proxy {$TARIT_SHARE_UPSTREAM} {
+			# Never forward control-plane or proxy credentials to a guest.
+			header_up -X-API-Key
+			header_up -Proxy-Authorization
+			header_up -X-Peer-Secret
+			# Remove any client-supplied forwarding chain, then set one edge value.
+			header_up -Forwarded
+			header_up -X-Forwarded-For
+			header_up -X-Forwarded-Host
+			header_up -X-Forwarded-Proto
+			header_up -X-Real-IP
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up Forwarded "for={remote_host};host={host};proto={scheme}"
+		}
+	}
+}

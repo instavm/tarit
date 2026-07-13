@@ -23,7 +23,7 @@ use crate::cluster::{self, Owner};
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
-pub(crate) async fn run(state: AppState) -> Result<()> {
+pub(crate) async fn run(state: AppState, listener: TcpListener) -> Result<()> {
     let host_key = load_or_generate_host_key(&state.config.ssh_gateway_host_key_path)?;
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::PublicKey);
@@ -36,9 +36,6 @@ pub(crate) async fn run(state: AppState) -> Result<()> {
         ..Default::default()
     });
 
-    let listener = TcpListener::bind(state.config.ssh_gateway_addr)
-        .await
-        .with_context(|| format!("bind SSH gateway {}", state.config.ssh_gateway_addr))?;
     tracing::info!(
         addr = %state.config.ssh_gateway_addr,
         host_key = %state.config.ssh_gateway_host_key_path.display(),
@@ -825,12 +822,20 @@ mod tests {
             ssh_gateway_enabled: false,
             ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
             ssh_gateway_host_key_path: PathBuf::from("target/taritd-gateway-test/ssh_host"),
+            share_listen: None,
+            share_domain: None,
+            share_token_key: None,
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 10_000,
+            share_idle_timeout_secs: 300,
         };
-        let store = Store::open(":memory:").unwrap();
+        let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let shares = crate::shares::ShareRepository::new(Arc::clone(&store), None);
         let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
         AppState {
             config: config.clone(),
-            store: Arc::new(Mutex::new(store)),
+            audit_outbox: Arc::new(crate::audit::LocalAuditOutbox::new(Arc::clone(&store))),
+            store,
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
@@ -842,8 +847,10 @@ mod tests {
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),
             peer: Arc::new(PeerClient::new("peer-secret".into())),
+            shares,
             fleet: None,
             metrics: Arc::new(Metrics::default()),
+            share_runtime: Arc::new(crate::share_gateway::ShareRuntime::default()),
         }
     }
 }

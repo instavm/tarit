@@ -62,6 +62,82 @@ pub struct VmRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Whether a shared VM port is public or requires a valid private-share token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareVisibility {
+    Public,
+    #[default]
+    Private,
+}
+
+fn default_share_visibility() -> ShareVisibility {
+    ShareVisibility::default()
+}
+
+/// Persistent tenant-owned VM port share record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareRecord {
+    pub id: Uuid,
+    pub slug: String,
+    pub owner_key: String,
+    pub vm_id: Uuid,
+    pub guest_port: u16,
+    pub visibility: ShareVisibility,
+    pub token_version: u64,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Request body for creating a shared VM port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateShareRequest {
+    pub vm_id: Uuid,
+    pub guest_port: u16,
+    #[serde(default = "default_share_visibility")]
+    pub visibility: ShareVisibility,
+}
+
+impl CreateShareRequest {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.guest_port == 0 {
+            return Err(OrchError::BadRequest(
+                "guest_port must be in 1..=65535".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Request body for updating a shared VM port.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateShareRequest {
+    pub vm_id: Option<Uuid>,
+    pub guest_port: Option<u16>,
+    pub visibility: Option<ShareVisibility>,
+}
+
+impl UpdateShareRequest {
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.guest_port == Some(0) {
+            return Err(OrchError::BadRequest(
+                "guest_port must be in 1..=65535".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A temporary bearer token for accessing a private share.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareTokenResponse {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Persistent public SSH key record scoped to an API caller.
 #[derive(Debug, Clone)]
 pub struct SshKeyRecord {
@@ -224,7 +300,7 @@ pub struct UsageSummary {
 
 /// An audited action taken through the orchestrator, attributed to an API key.
 /// `action` is a stable verb (see `audit_action` constants); `outcome` is
-/// `ok`, `denied`, or `error`.
+/// `attempt`, `ok`, `denied`, or `error`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub id: Uuid,
@@ -251,10 +327,15 @@ pub mod audit_action {
     pub const ATTACH_PTY: &str = "attach_pty";
     pub const SSH_ATTEMPT: &str = "ssh_attempt";
     pub const UPDATE_EGRESS: &str = "update_egress";
+    pub const CREATE_SHARE: &str = "create_share";
+    pub const UPDATE_SHARE: &str = "update_share";
+    pub const REVOKE_SHARE: &str = "revoke_share";
+    pub const ISSUE_SHARE_TOKEN: &str = "issue_share_token";
 }
 
 /// Stable audit outcome values.
 pub mod audit_outcome {
+    pub const ATTEMPT: &str = "attempt";
     pub const OK: &str = "ok";
     pub const DENIED: &str = "denied";
     pub const ERROR: &str = "error";
@@ -388,5 +469,56 @@ mod tests {
             openssh_sha256_fingerprint(&blob),
             "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4"
         );
+    }
+
+    #[test]
+    fn share_visibility_round_trips() {
+        let encoded = serde_json::to_string(&ShareVisibility::Private).unwrap();
+        assert_eq!(encoded, "\"private\"");
+        assert_eq!(
+            serde_json::from_str::<ShareVisibility>(&encoded).unwrap(),
+            ShareVisibility::Private
+        );
+    }
+
+    #[test]
+    fn create_share_rejects_zero_port() {
+        let req = CreateShareRequest {
+            vm_id: Uuid::nil(),
+            guest_port: 0,
+            visibility: ShareVisibility::Private,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn update_share_rejects_zero_port() {
+        let req = UpdateShareRequest {
+            guest_port: Some(0),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            req.validate(),
+            Err(OrchError::BadRequest(message)) if message == "guest_port must be in 1..=65535"
+        ));
+    }
+
+    #[test]
+    fn create_share_defaults_to_private_visibility() {
+        let req: CreateShareRequest = serde_json::from_str(
+            r#"{"vm_id":"00000000-0000-0000-0000-000000000000","guest_port":8080}"#,
+        )
+        .unwrap();
+
+        assert_eq!(req.visibility, ShareVisibility::Private);
+    }
+
+    #[test]
+    fn share_audit_actions_are_stable() {
+        assert_eq!(audit_action::CREATE_SHARE, "create_share");
+        assert_eq!(audit_action::UPDATE_SHARE, "update_share");
+        assert_eq!(audit_action::REVOKE_SHARE, "revoke_share");
+        assert_eq!(audit_action::ISSUE_SHARE_TOKEN, "issue_share_token");
     }
 }

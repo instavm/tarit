@@ -7,10 +7,10 @@ use crate::config::VmConfig;
 use crate::error::{Result, VmmError};
 use crate::gc::OwnedScratchFile;
 use crate::state::VmState;
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tarit_proto::ScratchIdentity;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const EXEC_OUTPUT_CAP: usize = 16 * 1024 * 1024;
@@ -92,14 +92,15 @@ impl Drop for VmInstance {
 pub struct VmTransientFiles {
     live_snapshot: Option<OwnedScratchFile>,
     suspend_snapshot: Option<OwnedScratchFile>,
+    snapshots: Vec<OwnedScratchFile>,
     owned_overlays: Vec<OwnedScratchFile>,
 }
 
 impl VmTransientFiles {
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-    fn from_owned_overlay_paths(paths: Vec<PathBuf>) -> Self {
+    fn from_owned_overlays(owned_overlays: Vec<OwnedScratchFile>) -> Self {
         Self {
-            owned_overlays: paths.into_iter().map(OwnedScratchFile::remember).collect(),
+            owned_overlays,
             ..Self::default()
         }
     }
@@ -112,13 +113,68 @@ impl VmTransientFiles {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-    fn set_suspend_snapshot(&mut self, path: PathBuf) {
-        if let Some(old) = self
-            .suspend_snapshot
-            .replace(OwnedScratchFile::remember(path))
-        {
+    fn set_suspend_snapshot(&mut self, path: OwnedScratchFile) {
+        if let Some(old) = self.suspend_snapshot.replace(path) {
             remove_owned_scratch_file(&old);
         }
+    }
+
+    fn add_snapshot(&mut self, snapshot: OwnedScratchFile) {
+        self.snapshots.push(snapshot);
+    }
+
+    fn release(&mut self, path: &str, identity: &ScratchIdentity) -> bool {
+        let path = Path::new(path);
+        let Some((kind, index)) = self.find_owned(path, identity) else {
+            return false;
+        };
+        match kind {
+            OwnedScratchKind::LiveSnapshot => {
+                self.live_snapshot.take();
+            }
+            OwnedScratchKind::SuspendSnapshot => {
+                self.suspend_snapshot.take();
+            }
+            OwnedScratchKind::Snapshot => {
+                self.snapshots.remove(index);
+            }
+            OwnedScratchKind::Overlay => {
+                self.owned_overlays.remove(index);
+            }
+        }
+        true
+    }
+
+    fn find_owned(
+        &self,
+        path: &Path,
+        identity: &ScratchIdentity,
+    ) -> Option<(OwnedScratchKind, usize)> {
+        if self
+            .live_snapshot
+            .as_ref()
+            .is_some_and(|file| file.path() == path && file.matches_identity(identity))
+        {
+            return Some((OwnedScratchKind::LiveSnapshot, 0));
+        }
+        if self
+            .suspend_snapshot
+            .as_ref()
+            .is_some_and(|file| file.path() == path && file.matches_identity(identity))
+        {
+            return Some((OwnedScratchKind::SuspendSnapshot, 0));
+        }
+        if let Some(index) = self
+            .snapshots
+            .iter()
+            .position(|file| file.path() == path && file.matches_identity(identity))
+        {
+            return Some((OwnedScratchKind::Snapshot, index));
+        }
+        self.owned_overlays
+            .iter()
+            .position(|file| file.path() == path && file.matches_identity(identity))
+            .map(|index| (OwnedScratchKind::Overlay, index))
     }
 
     fn cleanup(&mut self) {
@@ -128,10 +184,21 @@ impl VmTransientFiles {
         if let Some(path) = self.suspend_snapshot.take() {
             remove_owned_scratch_file(&path);
         }
+        for path in self.snapshots.drain(..) {
+            remove_owned_scratch_file(&path);
+        }
         for path in self.owned_overlays.drain(..) {
             remove_owned_scratch_file(&path);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OwnedScratchKind {
+    LiveSnapshot,
+    SuspendSnapshot,
+    Snapshot,
+    Overlay,
 }
 
 fn remove_owned_scratch_file(file: &OwnedScratchFile) {
@@ -144,22 +211,43 @@ fn remove_owned_scratch_file(file: &OwnedScratchFile) {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 struct OwnedOverlayGuard {
-    paths: Vec<PathBuf>,
+    files: Vec<OwnedScratchFile>,
     armed: bool,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 impl OwnedOverlayGuard {
-    fn new(config: &VmConfig) -> Self {
-        Self {
-            paths: vmm_created_overlay_candidates(config),
-            armed: true,
+    fn create(config: &VmConfig) -> Result<Self> {
+        let mut files = Vec::new();
+        for path in config
+            .volumes
+            .iter()
+            .filter_map(|volume| volume.overlay.as_deref())
+            .map(PathBuf::from)
+        {
+            match OwnedScratchFile::create_new(&path) {
+                Ok(file) => files.push(file),
+                Err(error) => {
+                    for file in files.drain(..) {
+                        remove_owned_scratch_file(&file);
+                    }
+                    return Err(VmmError::Snapshot(format!(
+                        "create private overlay {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
         }
+        Ok(Self { files, armed: true })
     }
 
-    fn disarm(mut self) -> Vec<PathBuf> {
+    fn from_created(files: Vec<OwnedScratchFile>) -> Self {
+        Self { files, armed: true }
+    }
+
+    fn disarm(mut self) -> Vec<OwnedScratchFile> {
         self.armed = false;
-        std::mem::take(&mut self.paths)
+        std::mem::take(&mut self.files)
     }
 }
 
@@ -169,29 +257,9 @@ impl Drop for OwnedOverlayGuard {
         if !self.armed {
             return;
         }
-        for path in &self.paths {
-            remove_file_if_exists(path);
+        for file in &self.files {
+            remove_owned_scratch_file(file);
         }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn vmm_created_overlay_candidates(config: &VmConfig) -> Vec<PathBuf> {
-    config
-        .volumes
-        .iter()
-        .filter_map(|vol| vol.overlay.as_deref())
-        .map(PathBuf::from)
-        .filter(|path| crate::gc::is_owned_overlay_name(path) && !path.exists())
-        .collect()
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn remove_file_if_exists(path: &std::path::Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => log::info!("removed VM scratch file {}", path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("remove VM scratch file {}: {e}", path.display()),
     }
 }
 
@@ -331,6 +399,8 @@ impl VmmController {
 
         let path_buf = unique_scratch_snapshot_path("vmm-snap")?;
         let path = path_buf.to_string_lossy().into_owned();
+        let owned_snapshot = OwnedScratchFile::create_new(&path_buf)
+            .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}")))?;
 
         let state_before = vm.state;
 
@@ -397,14 +467,20 @@ impl VmmController {
                         dirty.merge(&host_dirty);
                     }
                     let parent = vm.last_snapshot.clone().unwrap_or_default();
-                    write_scratch_diff_snapshot_file(&path, &parent, &state_blob, mem_slice, &dirty)
+                    write_scratch_diff_snapshot_file(
+                        &owned_snapshot,
+                        &parent,
+                        &state_blob,
+                        mem_slice,
+                        &dirty,
+                    )
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
                 {
                     Ok(0)
                 }
             } else {
-                write_scratch_snapshot_file(&path, &state_blob, mem_slice, false)?;
+                write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)?;
                 // Enable dirty logging (idempotent) + drain the initial bitmap so the
                 // next snapshot can diff against this full baseline.
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -436,10 +512,33 @@ impl VmmController {
         }
 
         vm.state = state_before;
-        let mem_len = snapshot_result?;
+        let mem_len = match snapshot_result {
+            Ok(mem_len) => mem_len,
+            Err(error) => {
+                remove_owned_scratch_file(&owned_snapshot);
+                return Err(error);
+            }
+        };
         vm.last_snapshot = Some(path.clone());
+        vm.transient_files.add_snapshot(owned_snapshot);
         log::info!("VM: snapshot saved to {path} ({mem_len} bytes mem, diff={diff})");
         Ok(path)
+    }
+
+    /// Transfer an exact, currently-owned scratch artifact to the caller.
+    pub fn release_scratch(&self, path: &str, identity: ScratchIdentity) -> Result<()> {
+        let mut slot = self.lock();
+        let vm = slot
+            .as_mut()
+            .ok_or_else(|| VmmError::InvalidConfig("no VM (boot first)".into()))?;
+        if vm.transient_files.release(path, &identity) {
+            log::info!("released VM scratch file {path}");
+            Ok(())
+        } else {
+            Err(VmmError::InvalidConfig(format!(
+                "scratch artifact is not owned by this VM: {path}"
+            )))
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -470,7 +569,7 @@ impl VmmController {
         // (confirmed against the KVM API docs §4.24/§4.38/§4.46: the irqchip
         // must exist before the guest relies on TSC-deadline timers).
         let full_boot = true;
-        let overlay_guard = OwnedOverlayGuard::new(&config);
+        let overlay_guard = OwnedOverlayGuard::create(&config)?;
 
         // Build virtio-blk (+ virtio-net) devices via the shared helper so the
         // create path and the restore path (build_running_vm) can never drift
@@ -676,7 +775,7 @@ impl VmmController {
             state: VmState::Running,
             created_at: std::time::Instant::now(),
             last_snapshot: None,
-            transient_files: VmTransientFiles::from_owned_overlay_paths(overlay_guard.disarm()),
+            transient_files: VmTransientFiles::from_owned_overlays(overlay_guard.disarm()),
             dirty_logging: false,
             config,
             guest_mem: Some(mem),
@@ -755,21 +854,25 @@ impl VmmController {
         let mut result = snap_result?;
         let live_path = unique_scratch_snapshot_path("vmm-live")?;
         let live_path_s = live_path.to_string_lossy().into_owned();
+        let owned_live_path = OwnedScratchFile::create_new(&live_path)
+            .map_err(|e| VmmError::Snapshot(format!("create {live_path_s}: {e}")))?;
         if let Err(e) =
-            write_scratch_snapshot_file(&live_path_s, &state_blob, &result.mem_snapshot, false)
+            write_scratch_snapshot_file(&owned_live_path, &state_blob, &result.mem_snapshot, false)
         {
-            let _ = std::fs::remove_file(&live_path);
+            remove_owned_scratch_file(&owned_live_path);
             return Err(e);
         }
         result.snapshot_path = live_path_s.clone();
-        let owned_live_path = OwnedScratchFile::remember(&live_path);
+        let mut owned_live_path = Some(owned_live_path);
         {
             let mut slot = self.lock();
             if let Some(vm) = slot.as_mut() {
-                vm.transient_files.set_live_snapshot_owned(owned_live_path);
-            } else {
-                remove_owned_scratch_file(&owned_live_path);
+                vm.transient_files
+                    .set_live_snapshot_owned(owned_live_path.take().expect("owned snapshot"));
             }
+        }
+        if let Some(owned_live_path) = owned_live_path {
+            remove_owned_scratch_file(&owned_live_path);
         }
         log::info!(
             "VM: live snapshot — {} rounds, {} pages, {:?}",
@@ -888,9 +991,20 @@ impl VmmController {
             volumes,
             net,
         };
+        let requested_overlay = overlay.is_some();
+        let overlay_seed = restore_overlay_seed(&config, overlay.as_deref())?;
         apply_restore_overlay(&mut config, overlay)?;
         config.validate()?;
-        let overlay_guard = OwnedOverlayGuard::new(&config);
+        let overlay_guard = if let Some((golden_overlay, clone_overlay)) = overlay_seed {
+            OwnedOverlayGuard::from_created(vec![seed_restore_overlay(
+                &golden_overlay,
+                &clone_overlay,
+            )?])
+        } else if requested_overlay {
+            OwnedOverlayGuard::create(&config)?
+        } else {
+            OwnedOverlayGuard::from_created(Vec::new())
+        };
 
         // Keep the owned state blob aligned with the restored config. Future
         // snapshots start from this blob and only patch in live device/vCPU
@@ -939,7 +1053,7 @@ impl VmmController {
             state,
             created_at: std::time::Instant::now(),
             last_snapshot: None,
-            transient_files: VmTransientFiles::from_owned_overlay_paths(overlay_guard.disarm()),
+            transient_files: VmTransientFiles::from_owned_overlays(overlay_guard.disarm()),
             dirty_logging: false,
             config,
             guest_mem: Some(mem),
@@ -1113,11 +1227,15 @@ impl VmmController {
         }
 
         // Check if we have a running VM with a serial channel.
-        let serial_handle = {
+        let (serial_handle, state) = {
             let slot = self.lock();
-            slot.as_ref()
-                .and_then(|vm| vm.running.as_ref())
-                .map(|r| r.vcpu_thread.serial.clone())
+            let vm = slot
+                .as_ref()
+                .ok_or_else(|| VmmError::InvalidConfig("no VM (create first)".into()))?;
+            (
+                vm.running.as_ref().map(|r| r.vcpu_thread.serial.clone()),
+                vm.state,
+            )
         };
 
         if let Some(serial) = serial_handle {
@@ -1191,8 +1309,33 @@ impl VmmController {
             )));
         }
 
-        // Fallback: boot a fresh VM with the command in cmdline.
-        self.exec_fresh_boot(command, timeout_ms)
+        if Self::fresh_boot_exec_allowed(state) {
+            self.exec_fresh_boot(command, timeout_ms)
+        } else {
+            Err(VmmError::Kvm(format!(
+                "exec unavailable without a live guest channel while VM is {state:?}"
+            )))
+        }
+    }
+
+    #[cfg(any(
+        test,
+        all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+    ))]
+    fn fresh_boot_exec_allowed(state: VmState) -> bool {
+        state == VmState::Created
+    }
+
+    #[cfg(any(
+        test,
+        all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+    ))]
+    fn fresh_boot_timeout_secs(timeout_ms: u64) -> u64 {
+        if timeout_ms == 0 {
+            10
+        } else {
+            timeout_ms.div_ceil(1_000)
+        }
     }
 
     /// Fallback exec: boot a fresh VM with the command baked into cmdline.
@@ -1211,11 +1354,7 @@ impl VmmController {
         config.validate()?;
 
         let start = Instant::now();
-        let timeout_secs = if timeout_ms > 0 {
-            timeout_ms / 1000
-        } else {
-            10
-        };
+        let timeout_secs = Self::fresh_boot_timeout_secs(timeout_ms);
         std::env::set_var("VMM_BOOT_TIMEOUT", timeout_secs.to_string());
 
         let mem_size = config.memory.size_bytes()?;
@@ -1463,6 +1602,8 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         let layout = full_snapshot_layout_for_lengths(state_len, mem_len_u64)
             .ok_or_else(|| VmmError::Snapshot("suspend file layout overflow".into()))?;
         let path = unique_suspend_snapshot_path()?;
+        let owned_snapshot = OwnedScratchFile::create_new(Path::new(&path))
+            .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}")))?;
 
         let mem_slice = {
             // SAFETY: guest_mem owns this mmap for the lifetime of `vm`; the vCPUs are
@@ -1470,20 +1611,21 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
             // we unregister the previous UFFD below.
             unsafe { std::slice::from_raw_parts(mem_ptr.cast_const(), mem_len) }
         };
-        if let Err(e) = write_scratch_snapshot_file(&path, &state_blob, mem_slice, false) {
-            let _ = std::fs::remove_file(&path);
+        if let Err(e) = write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)
+        {
+            remove_owned_scratch_file(&owned_snapshot);
             return Err(e);
         }
 
-        let file = match std::fs::File::open(&path) {
+        let file = match owned_snapshot.file().try_clone() {
             Ok(file) => file,
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                remove_owned_scratch_file(&owned_snapshot);
                 return Err(VmmError::Snapshot(format!("open {path}: {e}")));
             }
         };
         if let Err(e) = file.sync_all() {
-            let _ = std::fs::remove_file(&path);
+            remove_owned_scratch_file(&owned_snapshot);
             return Err(VmmError::Snapshot(format!("sync {path}: {e}")));
         }
 
@@ -1502,19 +1644,18 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         ) {
             Ok(lazy_restore) => lazy_restore,
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                remove_owned_scratch_file(&owned_snapshot);
                 return Err(VmmError::Snapshot(format!("UFFD suspend restore: {e}")));
             }
         };
 
         if let Err(e) = vmm_memory_backend::madvise_dontneed(mem_ptr, mem_len) {
             drop(lazy_restore);
-            let _ = std::fs::remove_file(&path);
+            remove_owned_scratch_file(&owned_snapshot);
             return Err(VmmError::Snapshot(format!("release guest RAM: {e}")));
         }
         drop_file_cache(&file, layout.mem_offset, layout.mem_len);
-        let tracked_path = std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
-        vm.transient_files.set_suspend_snapshot(tracked_path);
+        vm.transient_files.set_suspend_snapshot(owned_snapshot);
         vm.lazy_restore = Some(lazy_restore);
         vm.state = VmState::Suspended;
 
@@ -1655,16 +1796,233 @@ fn apply_restore_overlay(config: &mut VmConfig, overlay: Option<String>) -> Resu
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
+fn restore_overlay_seed(
+    config: &VmConfig,
+    overlay: Option<&str>,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let Some(target) = overlay else {
+        return Ok(None);
+    };
+    let Some(index) = restore_overlay_volume_index(&config.volumes) else {
+        return Err(VmmError::InvalidConfig(
+            "restore overlay requested but snapshot has no volumes".into(),
+        ));
+    };
+    let Some(source) = config.volumes[index].overlay.as_deref() else {
+        return Ok(None);
+    };
+    if source == target {
+        return Ok(None);
+    }
+    Ok(Some((PathBuf::from(source), PathBuf::from(target))))
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile> {
+    if source == target {
+        return Err(VmmError::InvalidConfig(format!(
+            "restore overlay must differ from golden overlay: {}",
+            target.display()
+        )));
+    }
+
+    let owned_target = OwnedScratchFile::create_new(target).map_err(|e| {
+        VmmError::Snapshot(format!(
+            "create private restore overlay {}: {e}",
+            target.display()
+        ))
+    })?;
+    let copy_result = (|| -> std::io::Result<()> {
+        let mut source_file = std::fs::File::open(source)?;
+        let mut target_file = owned_target.file().try_clone()?;
+        let result = copy_restore_overlay(&mut source_file, &mut target_file);
+        drop(target_file);
+        drop(source_file);
+        result
+    })();
+
+    if let Err(e) = copy_result {
+        remove_owned_scratch_file(&owned_target);
+        return Err(VmmError::Snapshot(format!(
+            "seed restore overlay {} -> {}: {e}",
+            source.display(),
+            target.display()
+        )));
+    }
+    Ok(owned_target)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn copy_restore_overlay(
+    source: &mut std::fs::File,
+    target: &mut std::fs::File,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        copy_sparse_restore_overlay(source, target)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        copy_dense_restore_overlay(source, target)
+    }
+}
+
+#[cfg(all(
+    not(target_os = "linux"),
+    any(test, all(target_arch = "x86_64", feature = "boot"))
+))]
+fn copy_dense_restore_overlay(
+    source: &mut std::fs::File,
+    target: &mut std::fs::File,
+) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    source.seek(SeekFrom::Start(0))?;
+    target.seek(SeekFrom::Start(0))?;
+    std::io::copy(source, target)?;
+    target.sync_all()
+}
+
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_arch = "x86_64", feature = "boot")
+))]
+fn validate_sparse_extent(offset: u64, data: u64, hole: u64, length: u64) -> std::io::Result<()> {
+    if data < offset || hole <= data || hole > length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid overlay data extent",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(test, all(target_arch = "x86_64", feature = "boot"))
+))]
+fn copy_sparse_restore_overlay(
+    source: &mut std::fs::File,
+    target: &mut std::fs::File,
+) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    let length = source.metadata()?.len();
+    target.set_len(length)?;
+
+    let mut offset = 0u64;
+    while offset < length {
+        let data = unsafe {
+            libc::lseek(
+                source.as_raw_fd(),
+                offset.try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "overlay offset too large",
+                    )
+                })?,
+                libc::SEEK_DATA,
+            )
+        };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+            ) {
+                target.set_len(0)?;
+                source.seek(SeekFrom::Start(0))?;
+                target.seek(SeekFrom::Start(0))?;
+                std::io::copy(source, target)?;
+                return target.sync_all();
+            }
+            return Err(error);
+        }
+        let data = u64::try_from(data).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "negative overlay data offset",
+            )
+        })?;
+        let hole = unsafe {
+            libc::lseek(
+                source.as_raw_fd(),
+                data.try_into().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "overlay offset too large",
+                    )
+                })?,
+                libc::SEEK_HOLE,
+            )
+        };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let hole = u64::try_from(hole).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "negative overlay hole offset",
+            )
+        })?;
+        validate_sparse_extent(offset, data, hole, length)?;
+
+        source.seek(SeekFrom::Start(data))?;
+        target.seek(SeekFrom::Start(data))?;
+        let mut remaining = hole.saturating_sub(data);
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("bounded copy length fits usize");
+            let read = source.read(&mut buffer[..wanted])?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "overlay data extent ended early",
+                ));
+            }
+            target.write_all(&buffer[..read])?;
+            remaining -= read as u64;
+        }
+        offset = hole;
+    }
+    target.sync_all()
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn select_restore_overlay_volume(
     volumes: &mut [crate::config::VolumeConfig],
 ) -> Option<&mut crate::config::VolumeConfig> {
+    let index = restore_overlay_volume_index(volumes)?;
+    volumes.get_mut(index)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn restore_overlay_volume_index(volumes: &[crate::config::VolumeConfig]) -> Option<usize> {
     // If the golden was already CoW, that volume is the rootfs upper layer we
     // must replace. Otherwise fall back to volume 0: configs attach rootfs first.
-    let idx = volumes
+    let index = volumes
         .iter()
         .position(|vol| vol.overlay.is_some())
         .unwrap_or(0);
-    volumes.get_mut(idx)
+    volumes.get(index).map(|_| index)
 }
 
 /// Write a snapshot file with CRC32 integrity.
@@ -1692,52 +2050,55 @@ pub(crate) fn write_snapshot_file(
 }
 
 fn write_scratch_snapshot_file(
-    path: &str,
+    owned_file: &OwnedScratchFile,
     state_blob: &[u8],
     mem_dump: &[u8],
     diff: bool,
 ) -> Result<()> {
-    write_snapshot_file_with_mode(
-        path,
-        state_blob,
-        mem_dump,
-        diff,
-        SnapshotCreateMode::CreateNewPrivate,
-    )
+    write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, diff)
 }
 
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 enum SnapshotCreateMode {
     Truncate,
-    CreateNewPrivate,
 }
 
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn open_snapshot_output(path: &str, mode: SnapshotCreateMode) -> Result<std::fs::File> {
     match mode {
         SnapshotCreateMode::Truncate => std::fs::File::create(path)
             .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}"))),
-        SnapshotCreateMode::CreateNewPrivate => {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-            }
-            options
-                .open(std::path::Path::new(path))
-                .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}")))
-        }
     }
 }
 
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn write_snapshot_file_with_mode(
     path: &str,
     state_blob: &[u8],
     mem_dump: &[u8],
     diff: bool,
     mode: SnapshotCreateMode,
+) -> Result<()> {
+    let file = open_snapshot_output(path, mode)?;
+    write_snapshot_to_file(&file, state_blob, mem_dump, diff)
+}
+
+fn write_snapshot_to_file(
+    mut file: &std::fs::File,
+    state_blob: &[u8],
+    mem_dump: &[u8],
+    diff: bool,
 ) -> Result<()> {
     use std::io::Write;
     const MAGIC: &[u8; 4] = b"VMSN";
@@ -1751,7 +2112,6 @@ fn write_snapshot_file_with_mode(
     let mem_len = u64::try_from(mem_dump.len())
         .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
 
-    let mut file = open_snapshot_output(path, mode)?;
     file.write_all(MAGIC)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.write_all(&VERSION.to_le_bytes())
@@ -1801,20 +2161,13 @@ fn write_diff_snapshot_file(
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn write_scratch_diff_snapshot_file(
-    path: &str,
+    owned_file: &OwnedScratchFile,
     parent: &str,
     state_blob: &[u8],
     mem: &[u8],
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
 ) -> Result<usize> {
-    write_diff_snapshot_file_with_mode(
-        path,
-        parent,
-        state_blob,
-        mem,
-        dirty,
-        SnapshotCreateMode::CreateNewPrivate,
-    )
+    write_diff_snapshot_to_file(owned_file.file(), parent, state_blob, mem, dirty)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -1826,13 +2179,24 @@ fn write_diff_snapshot_file_with_mode(
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
     mode: SnapshotCreateMode,
 ) -> Result<usize> {
+    let mut file = open_snapshot_output(path, mode)?;
+    write_diff_snapshot_to_file(&mut file, parent, state_blob, mem, dirty)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_diff_snapshot_to_file(
+    mut file: &std::fs::File,
+    parent: &str,
+    state_blob: &[u8],
+    mem: &[u8],
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+) -> Result<usize> {
     use std::io::Write;
     use vmm_snapshot::diff::build_diff;
     const MAGIC: &[u8; 4] = b"VMSD";
     const VERSION: u16 = 1;
 
     let diff = build_diff(mem, dirty, Vec::new());
-    let mut file = open_snapshot_output(path, mode)?;
     let mut wr = |b: &[u8]| -> Result<()> {
         file.write_all(b)
             .map_err(|e| VmmError::Snapshot(e.to_string()))
@@ -3205,6 +3569,42 @@ mod tests {
         assert!(c.status().is_err());
     }
 
+    #[cfg(not(feature = "boot"))]
+    #[test]
+    fn unacknowledged_snapshot_is_removed_when_vm_stops() {
+        let c = VmmController::new();
+        c.create(cfg()).unwrap();
+        let snapshot = c.snapshot(false).expect("create snapshot");
+        let path = PathBuf::from(&snapshot);
+
+        c.stop().expect("stop VM");
+
+        assert!(
+            !path.exists(),
+            "the VM must remove a snapshot until its ownership is explicitly released"
+        );
+    }
+
+    #[cfg(not(feature = "boot"))]
+    #[test]
+    fn exact_release_disarms_only_the_owned_snapshot() {
+        let c = VmmController::new();
+        c.create(cfg()).unwrap();
+        let snapshot = c.snapshot(false).expect("create snapshot");
+        let path = PathBuf::from(&snapshot);
+        let identity = OwnedScratchFile::identity_for(&path).expect("snapshot identity");
+
+        c.release_scratch(&snapshot, identity)
+            .expect("release the exact owned snapshot");
+        c.stop().expect("stop VM");
+
+        assert!(
+            path.exists(),
+            "a released snapshot must outlive its source VM"
+        );
+        std::fs::remove_file(path).expect("clean up released snapshot");
+    }
+
     #[test]
     fn restore_overlay_replaces_saved_golden_overlay() {
         let mut config = cfg();
@@ -3214,6 +3614,14 @@ mod tests {
             overlay: Some("/golden/rootfs.overlay".into()),
         }];
 
+        assert_eq!(
+            restore_overlay_seed(&config, Some("/clones/a.overlay"))
+                .expect("derive golden overlay seed"),
+            Some((
+                PathBuf::from("/golden/rootfs.overlay"),
+                PathBuf::from("/clones/a.overlay")
+            ))
+        );
         apply_restore_overlay(&mut config, Some("/clones/a.overlay".into())).unwrap();
 
         assert_eq!(config.volumes[0].path, "/base/rootfs.ext4");
@@ -3221,6 +3629,112 @@ mod tests {
             config.volumes[0].overlay.as_deref(),
             Some("/clones/a.overlay")
         );
+    }
+
+    #[test]
+    fn sparse_restore_overlay_rejects_an_empty_data_extent() {
+        let error = validate_sparse_extent(0, 4096, 4096, 8192)
+            .expect_err("SEEK_HOLE must advance beyond SEEK_DATA");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sparse_restore_overlay_rejects_a_backward_data_extent() {
+        let error = validate_sparse_extent(4096, 0, 4096, 8192)
+            .expect_err("SEEK_DATA must not move backwards from the current offset");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fresh_boot_exec_is_only_allowed_for_created_vms() {
+        assert!(VmmController::fresh_boot_exec_allowed(VmState::Created));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Running));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Paused));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Suspended));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Stopped));
+    }
+
+    #[test]
+    fn fresh_boot_timeout_rounds_up_to_a_full_second() {
+        assert_eq!(VmmController::fresh_boot_timeout_secs(0), 10);
+        assert_eq!(VmmController::fresh_boot_timeout_secs(1), 1);
+        assert_eq!(VmmController::fresh_boot_timeout_secs(1_000), 1);
+        assert_eq!(VmmController::fresh_boot_timeout_secs(1_001), 2);
+    }
+
+    #[test]
+    fn restore_overlay_seed_is_a_private_copy_of_the_golden_upper() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let golden = dir.join(format!("{unique}-golden.cow"));
+        let clone = dir.join(format!("{unique}-clone.cow"));
+        let cleanup = [golden.clone(), clone.clone()];
+        let golden_bytes = b"golden writable upper state";
+
+        std::fs::write(&golden, golden_bytes).expect("write golden upper");
+        seed_restore_overlay(&golden, &clone).expect("seed clone upper");
+
+        assert_eq!(
+            std::fs::read(&clone).expect("read clone upper"),
+            golden_bytes,
+            "a clone must start from the golden writable upper state"
+        );
+        #[cfg(unix)]
+        assert_ne!(
+            std::fs::metadata(&golden).expect("golden metadata").ino(),
+            std::fs::metadata(&clone).expect("clone metadata").ino(),
+            "the clone must not share the golden writable backing file"
+        );
+
+        std::fs::write(&clone, b"clone-private-state").expect("mutate clone upper");
+        assert_eq!(
+            std::fs::read(&golden).expect("reread golden upper"),
+            golden_bytes,
+            "clone writes must not modify the reusable golden upper state"
+        );
+
+        for path in cleanup {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn failed_restore_overlay_seed_preserves_a_preexisting_target() {
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let golden = dir.join(format!("{unique}-golden.cow"));
+        let clone = dir.join(format!("{unique}-clone.cow"));
+        let existing_bytes = b"another clone owns this overlay";
+        std::fs::write(&golden, b"golden state").expect("write golden upper");
+        std::fs::write(&clone, existing_bytes).expect("write existing clone upper");
+
+        seed_restore_overlay(&golden, &clone).expect_err("existing target must reject seeding");
+
+        assert_eq!(
+            std::fs::read(&clone).expect("existing clone overlay must remain"),
+            existing_bytes
+        );
+        let _ = std::fs::remove_file(golden);
+        let _ = std::fs::remove_file(clone);
     }
 
     #[test]

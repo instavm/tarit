@@ -1795,9 +1795,17 @@ mod tests {
             ssh_gateway_enabled: false,
             ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
             ssh_gateway_host_key_path: PathBuf::from("target/taritd-ops-test/ssh_host"),
+            share_listen: None,
+            share_domain: None,
+            share_token_key: None,
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 1_000,
+            share_idle_timeout_secs: 1,
         };
         let (store_tx, store_rx) = tokio::sync::mpsc::unbounded_channel();
         let scheduler = Arc::new(Scheduler::new(config.clone()));
+        let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let shares = crate::shares::ShareRepository::new(Arc::clone(&store), None);
         let supervisor = Arc::new(
             VmmSupervisor::new_with_live_vms(
                 config.clone(),
@@ -1810,7 +1818,8 @@ mod tests {
         (
             AppState {
                 config: config.clone(),
-                store: Arc::new(Mutex::new(Store::open(":memory:").unwrap())),
+                audit_outbox: Arc::new(crate::audit::LocalAuditOutbox::new(Arc::clone(&store))),
+                store,
                 exec_cache: Arc::new(RwLock::new(HashMap::new())),
                 vm_cache: Arc::new(RwLock::new(HashMap::new())),
                 store_tx,
@@ -1822,8 +1831,10 @@ mod tests {
                 supervisor,
                 scheduler,
                 peer: Arc::new(PeerClient::new("peer-secret".into())),
+                shares,
                 fleet: None,
                 metrics: Arc::new(Metrics::default()),
+                share_runtime: Arc::new(crate::share_gateway::ShareRuntime::default()),
             },
             store_rx,
         )

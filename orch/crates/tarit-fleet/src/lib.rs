@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use rustls::{ClientConfig, RootCertStore};
 use tarit_store::HostRecord;
-use tarit_types::{AuditEvent, UsageEvent, UsageSummary, VmRecord};
+use tarit_types::{AuditEvent, ShareRecord, ShareVisibility, UsageEvent, UsageSummary, VmRecord};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
@@ -18,6 +18,12 @@ pub enum FleetError {
     Pool(#[from] deadpool_postgres::PoolError),
     #[error("config: {0}")]
     Config(String),
+    #[error("not found")]
+    NotFound,
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error("invalid fleet share row: {0}")]
+    InvalidShareRow(String),
 }
 
 pub struct PostgresFleet {
@@ -177,6 +183,142 @@ impl PostgresFleet {
         client
             .execute("DELETE FROM fleet_vms WHERE id = $1", &[&id])
             .await?;
+        Ok(())
+    }
+
+    pub async fn insert_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let created_at = share.created_at.to_rfc3339();
+        let updated_at = share.updated_at.to_rfc3339();
+        client
+            .execute(
+                "INSERT INTO fleet_shares (
+                   id, slug, owner_key, vm_id, guest_port, visibility, token_version, revoked_at,
+                   created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                &[
+                    &share.id,
+                    &share.slug,
+                    &share.owner_key,
+                    &share.vm_id,
+                    &(i32::from(share.guest_port)),
+                    &share_visibility_as_str(share.visibility),
+                    &u64_to_sql_i64(share.token_version)?,
+                    &revoked_at,
+                    &created_at,
+                    &updated_at,
+                ],
+            )
+            .await
+            .map_err(fleet_error_from_postgres)?;
+        Ok(())
+    }
+
+    pub async fn get_share(&self, id: Uuid) -> Result<Option<ShareRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM fleet_shares WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        row.map(|row| row_to_share(&row)).transpose()
+    }
+
+    pub async fn get_share_by_slug(&self, slug: &str) -> Result<Option<ShareRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM fleet_shares WHERE slug = $1",
+                &[&slug],
+            )
+            .await?;
+        row.map(|row| row_to_share(&row)).transpose()
+    }
+
+    pub async fn list_shares(&self, owner_key: &str) -> Result<Vec<ShareRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM fleet_shares WHERE owner_key = $1 ORDER BY created_at DESC",
+                &[&owner_key],
+            )
+            .await?;
+        rows.iter().map(row_to_share).collect()
+    }
+
+    pub async fn update_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let updated_at = share.updated_at.to_rfc3339();
+        let updated = client
+            .execute(
+                "UPDATE fleet_shares SET
+                   slug = $2, vm_id = $3, guest_port = $4, visibility = $5, token_version = $6,
+                   revoked_at = $7, updated_at = $8
+                 WHERE id = $1",
+                &[
+                    &share.id,
+                    &share.slug,
+                    &share.vm_id,
+                    &(i32::from(share.guest_port)),
+                    &share_visibility_as_str(share.visibility),
+                    &u64_to_sql_i64(share.token_version)?,
+                    &revoked_at,
+                    &updated_at,
+                ],
+            )
+            .await
+            .map_err(fleet_error_from_postgres)?;
+        if updated == 0 {
+            return Err(FleetError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Update an active share only when it still has the version read by the
+    /// caller. This protects token rotation and terminal revocation from
+    /// concurrent writers across taritd nodes.
+    pub async fn update_share_if_current(
+        &self,
+        share: &ShareRecord,
+        expected_token_version: u64,
+    ) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let updated_at = share.updated_at.to_rfc3339();
+        let updated = client
+            .execute(
+                "UPDATE fleet_shares SET
+                   slug = $2, vm_id = $3, guest_port = $4, visibility = $5, token_version = $6,
+                   revoked_at = $7, updated_at = $8
+                  WHERE id = $1 AND token_version = $9 AND revoked_at IS NULL",
+                &[
+                    &share.id,
+                    &share.slug,
+                    &share.vm_id,
+                    &(i32::from(share.guest_port)),
+                    &share_visibility_as_str(share.visibility),
+                    &u64_to_sql_i64(share.token_version)?,
+                    &revoked_at,
+                    &updated_at,
+                    &u64_to_sql_i64(expected_token_version)?,
+                ],
+            )
+            .await
+            .map_err(fleet_error_from_postgres)?;
+        if updated == 0 {
+            return Err(FleetError::Conflict(
+                "share was modified or revoked concurrently".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -369,6 +511,20 @@ CREATE TABLE IF NOT EXISTS fleet_leader (
   leader_id TEXT NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fleet_shares (
+  id UUID PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  owner_key TEXT NOT NULL,
+  vm_id UUID NOT NULL,
+  guest_port INTEGER NOT NULL CHECK (guest_port BETWEEN 1 AND 65535),
+  visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
+  token_version BIGINT NOT NULL DEFAULT 0,
+  revoked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fleet_shares_owner ON fleet_shares (owner_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS fleet_shares_vm ON fleet_shares (vm_id);
 CREATE TABLE IF NOT EXISTS usage_events (
   id UUID PRIMARY KEY,
   api_key_id TEXT NOT NULL,
@@ -398,6 +554,75 @@ CREATE TABLE IF NOT EXISTS audit_events (
 CREATE INDEX IF NOT EXISTS audit_events_key_time ON audit_events (api_key_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_vm ON audit_events (vm_id);
 ";
+
+fn share_visibility_as_str(visibility: ShareVisibility) -> &'static str {
+    match visibility {
+        ShareVisibility::Public => "public",
+        ShareVisibility::Private => "private",
+    }
+}
+
+fn row_to_share(row: &tokio_postgres::Row) -> Result<ShareRecord, FleetError> {
+    let id: Uuid = share_column(row, 0, "id")?;
+    let slug: String = share_column(row, 1, "slug")?;
+    let owner_key: String = share_column(row, 2, "owner_key")?;
+    let vm_id: Uuid = share_column(row, 3, "vm_id")?;
+    let guest_port: i32 = share_column(row, 4, "guest_port")?;
+    let visibility: String = share_column(row, 5, "visibility")?;
+    let token_version: i64 = share_column(row, 6, "token_version")?;
+    let revoked_at: Option<String> = share_column(row, 7, "revoked_at")?;
+    let created_at: String = share_column(row, 8, "created_at")?;
+    let updated_at: String = share_column(row, 9, "updated_at")?;
+    Ok(ShareRecord {
+        id,
+        slug,
+        owner_key,
+        vm_id,
+        guest_port: u16::try_from(guest_port)
+            .map_err(|_| FleetError::InvalidShareRow("invalid guest_port".into()))?,
+        visibility: match visibility.as_str() {
+            "public" => ShareVisibility::Public,
+            "private" => ShareVisibility::Private,
+            _ => return Err(FleetError::InvalidShareRow("invalid visibility".into())),
+        },
+        token_version: u64::try_from(token_version)
+            .map_err(|_| FleetError::InvalidShareRow("invalid token_version".into()))?,
+        revoked_at: revoked_at
+            .as_deref()
+            .map(|value| parse_share_timestamp("revoked_at", value))
+            .transpose()?,
+        created_at: parse_share_timestamp("created_at", &created_at)?,
+        updated_at: parse_share_timestamp("updated_at", &updated_at)?,
+    })
+}
+
+fn share_column<T>(row: &tokio_postgres::Row, index: usize, name: &str) -> Result<T, FleetError>
+where
+    for<'a> T: tokio_postgres::types::FromSql<'a>,
+{
+    row.try_get(index)
+        .map_err(|error| FleetError::InvalidShareRow(format!("{name}: {error}")))
+}
+
+fn parse_share_timestamp(column: &str, value: &str) -> Result<DateTime<Utc>, FleetError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            FleetError::InvalidShareRow(format!("invalid {column} timestamp: {error}"))
+        })
+}
+
+fn u64_to_sql_i64(value: u64) -> Result<i64, FleetError> {
+    i64::try_from(value).map_err(|_| FleetError::Config("share token version is too large".into()))
+}
+
+fn fleet_error_from_postgres(error: tokio_postgres::Error) -> FleetError {
+    if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+        FleetError::Conflict(error.to_string())
+    } else {
+        FleetError::Postgres(error)
+    }
+}
 
 fn make_rustls_connector() -> Result<MakeRustlsConnect, FleetError> {
     let mut roots = RootCertStore::empty();
@@ -463,5 +688,248 @@ pub fn host_record_from_capacity(
         free_memory_mib,
         healthy: true,
         last_heartbeat: Utc::now(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tarit_types::ShareRecord;
+
+    fn test_share(slug: String, owner_key: &str) -> ShareRecord {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        ShareRecord {
+            id: Uuid::new_v4(),
+            slug,
+            owner_key: owner_key.into(),
+            vm_id: Uuid::new_v4(),
+            guest_port: 8080,
+            visibility: ShareVisibility::Private,
+            token_version: 2,
+            revoked_at: Some(chrono::DateTime::from_timestamp(1_700_000_001, 987_654_321).unwrap()),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn assert_share_eq(actual: &ShareRecord, expected: &ShareRecord) -> Result<(), FleetError> {
+        if actual.id == expected.id
+            && actual.slug == expected.slug
+            && actual.owner_key == expected.owner_key
+            && actual.vm_id == expected.vm_id
+            && actual.guest_port == expected.guest_port
+            && actual.visibility == expected.visibility
+            && actual.token_version == expected.token_version
+            && actual.revoked_at == expected.revoked_at
+            && actual.created_at == expected.created_at
+            && actual.updated_at == expected.updated_at
+        {
+            Ok(())
+        } else {
+            Err(FleetError::Config("share round-trip mismatch".into()))
+        }
+    }
+
+    async fn cleanup_test_shares(fleet: &PostgresFleet, ids: &[Uuid]) -> Result<(), FleetError> {
+        let client = fleet.pool.get().await?;
+        for id in ids {
+            client
+                .execute("DELETE FROM fleet_shares WHERE id = $1", &[id])
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fleet_schema_defines_share_constraints() {
+        assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_shares"));
+        assert!(FLEET_SCHEMA.contains("slug TEXT NOT NULL UNIQUE"));
+        assert!(FLEET_SCHEMA.contains("guest_port BETWEEN 1 AND 65535"));
+        assert!(FLEET_SCHEMA.contains("visibility IN ('public', 'private')"));
+        assert!(FLEET_SCHEMA
+            .contains("revoked_at TEXT,\n  created_at TEXT NOT NULL,\n  updated_at TEXT NOT NULL"));
+    }
+
+    #[allow(dead_code)]
+    fn share_persistence_api_is_available(fleet: &PostgresFleet, share: &ShareRecord) {
+        std::mem::drop(fleet.insert_share(share));
+        std::mem::drop(fleet.get_share(share.id));
+        std::mem::drop(fleet.get_share_by_slug(&share.slug));
+        std::mem::drop(fleet.list_shares(&share.owner_key));
+        std::mem::drop(fleet.update_share(share));
+        std::mem::drop(fleet.update_share_if_current(share, share.token_version));
+    }
+
+    #[tokio::test]
+    async fn share_compare_and_swap_uses_postgres_when_database_is_configured(
+    ) -> Result<(), FleetError> {
+        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+            eprintln!(
+                "skipping PostgreSQL share compare-and-swap test: TARIT_TEST_DATABASE_URL is absent"
+            );
+            return Ok(());
+        };
+        if database_url.is_empty() {
+            eprintln!(
+                "skipping PostgreSQL share compare-and-swap test: TARIT_TEST_DATABASE_URL is empty"
+            );
+            return Ok(());
+        }
+
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let suffix = Uuid::new_v4();
+        let mut share = test_share(format!("share-{suffix}-cas"), &format!("tenant-{suffix}"));
+        share.revoked_at = None;
+        let result = async {
+            fleet.insert_share(&share).await?;
+
+            let updated = ShareRecord {
+                guest_port: 9090,
+                token_version: share.token_version + 1,
+                updated_at: share.updated_at + chrono::Duration::seconds(1),
+                ..share.clone()
+            };
+            fleet
+                .update_share_if_current(&updated, share.token_version)
+                .await?;
+            assert_share_eq(
+                &fleet
+                    .get_share(share.id)
+                    .await?
+                    .ok_or_else(|| FleetError::Config("updated share is missing".into()))?,
+                &updated,
+            )?;
+
+            let stale = ShareRecord {
+                visibility: ShareVisibility::Public,
+                token_version: share.token_version + 1,
+                ..share.clone()
+            };
+            if !matches!(
+                fleet
+                    .update_share_if_current(&stale, share.token_version)
+                    .await,
+                Err(FleetError::Conflict(_))
+            ) {
+                return Err(FleetError::Config(
+                    "stale compare-and-swap share update did not conflict".into(),
+                ));
+            }
+
+            Ok::<(), FleetError>(())
+        }
+        .await;
+
+        result.and(cleanup_test_shares(&fleet, &[share.id]).await)
+    }
+
+    #[tokio::test]
+    async fn share_persistence_round_trip_matches_sqlite_when_database_is_configured(
+    ) -> Result<(), FleetError> {
+        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+            eprintln!(
+                "skipping PostgreSQL share integration test: TARIT_TEST_DATABASE_URL is absent"
+            );
+            return Ok(());
+        };
+        if database_url.is_empty() {
+            eprintln!(
+                "skipping PostgreSQL share integration test: TARIT_TEST_DATABASE_URL is empty"
+            );
+            return Ok(());
+        }
+
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let suffix = Uuid::new_v4();
+        let tenant_a = format!("tenant-a-{suffix}");
+        let tenant_b = format!("tenant-b-{suffix}");
+        let mut first = test_share(format!("share-{suffix}-first"), &tenant_a);
+        let mut second = test_share(format!("share-{suffix}-second"), &tenant_a);
+        second.created_at += chrono::Duration::seconds(1);
+        let other_tenant = test_share(format!("share-{suffix}-other"), &tenant_b);
+        let missing = test_share(format!("share-{suffix}-missing"), &tenant_a);
+        let ids = [first.id, second.id, other_tenant.id, missing.id];
+
+        let result = async {
+            fleet.insert_share(&first).await?;
+            fleet.insert_share(&second).await?;
+            fleet.insert_share(&other_tenant).await?;
+
+            assert_share_eq(
+                &fleet
+                    .get_share(first.id)
+                    .await?
+                    .ok_or_else(|| FleetError::Config("inserted share is missing".into()))?,
+                &first,
+            )?;
+            assert_share_eq(
+                &fleet
+                    .get_share_by_slug(&first.slug)
+                    .await?
+                    .ok_or_else(|| FleetError::Config("inserted slug is missing".into()))?,
+                &first,
+            )?;
+
+            let duplicate_slug = ShareRecord {
+                id: Uuid::new_v4(),
+                ..first.clone()
+            };
+            if !matches!(
+                fleet.insert_share(&duplicate_slug).await,
+                Err(FleetError::Conflict(_))
+            ) {
+                return Err(FleetError::Config(
+                    "duplicate share slug was accepted".into(),
+                ));
+            }
+
+            let listed = fleet.list_shares(&tenant_a).await?;
+            if listed.iter().map(|share| share.id).collect::<Vec<_>>() != vec![second.id, first.id]
+            {
+                return Err(FleetError::Config(
+                    "tenant shares were not listed newest-first".into(),
+                ));
+            }
+            if fleet
+                .list_shares(&tenant_b)
+                .await?
+                .iter()
+                .any(|share| share.id == first.id)
+            {
+                return Err(FleetError::Config(
+                    "tenant shares leaked across owners".into(),
+                ));
+            }
+
+            first.owner_key = tenant_b;
+            first.guest_port = 9090;
+            first.visibility = ShareVisibility::Public;
+            first.token_version += 1;
+            first.updated_at += chrono::Duration::seconds(1);
+            fleet.update_share(&first).await?;
+            let updated = fleet
+                .get_share(first.id)
+                .await?
+                .ok_or_else(|| FleetError::Config("updated share is missing".into()))?;
+            if updated.owner_key != tenant_a {
+                return Err(FleetError::Config("share owner was changed".into()));
+            }
+            first.owner_key = tenant_a;
+            assert_share_eq(&updated, &first)?;
+
+            if !matches!(
+                fleet.update_share(&missing).await,
+                Err(FleetError::NotFound)
+            ) {
+                return Err(FleetError::Config(
+                    "missing share update did not return not found".into(),
+                ));
+            }
+
+            Ok::<(), FleetError>(())
+        }
+        .await;
+
+        result.and(cleanup_test_shares(&fleet, &ids).await)
     }
 }

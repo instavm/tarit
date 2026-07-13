@@ -16,6 +16,7 @@ chrono = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 futures-util = { workspace = true }
+hmac = { workspace = true }
 ipnet = { workspace = true }
 tarit-fleet = { path = "../tarit-fleet" }
 tarit-store = { path = "../tarit-store" }
@@ -37,3 +38,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

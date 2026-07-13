@@ -18,6 +18,8 @@ This document describes the distributed design implemented in `crates/taritd` an
 | Fleet registry | `crates/tarit-fleet/src/lib.rs` | PostgreSQL membership, VM ownership, and autoscaler lease election. |
 | Image registry | `crates/tarit-store/src/lib.rs` + `crates/taritd/src/image.rs` | Node-local golden rootfs metadata, OCI build pipeline, and safe image GC. |
 | Autoscaler | `crates/taritd/src/autoscale.rs` | Leader-elected capacity loop with provider-command actuation. |
+| Share control API | `crates/taritd/src/api.rs` + `crates/taritd/src/shares.rs` | Tenant-authorized share lifecycle, token issuance, and durable share records. |
+| Share gateway | `crates/taritd/src/share_gateway.rs` | Separate listener that authorizes a share hostname and streams HTTP or WebSocket traffic to its VM guest port. |
 
 ## Runtime model
 
@@ -67,6 +69,73 @@ Owner resolution in cluster mode:
 5. If neither source knows the VM, return 404.
 
 Ownership writes are best effort. A successful local create or restore writes the local SQLite record and then calls `fleet.upsert_vm`. If that fleet write fails, the local VM still exists and a warning is logged. Operators should alert on fleet write failures because peer routing depends on the map.
+
+## Port-share gateway
+
+The port-share data plane is opt-in and binds a separate listener configured by
+`TARIT_SHARE_LISTEN`; the control listener remains responsible for the
+API-key-protected `/v1/shares` lifecycle API. A trusted Caddy or Envoy edge
+terminates public TLS and proxies only wildcard share hosts to that listener.
+The share listener is private to that edge: direct public access is unsupported
+and must be firewalled. Disabling only the share listener does not remove the
+control routes from the normal API listener. The edge must preserve the original
+`Host`, overwrite rather than append forwarding headers, pass WebSocket
+upgrades, and reject `/internal/v1/*` rather than forwarding it.
+
+For a request to `<slug>.<TARIT_SHARE_DOMAIN>`, the gateway requires exactly
+one valid Host header, derives the slug from the configured domain, and loads
+the active share record. Private shares require the
+`X-Tarit-Share-Token` header; public shares do not. The gateway does not
+accept a caller-selected upstream address or port. After authorization it
+resolves `share.vm_id` through the normal owner map. On the owner, it derives
+the target exclusively from the live VM network allocation plus the persisted
+`guest_port`.
+
+```text
+browser or client
+  |
+  | TLS, Host: <slug>.<share-domain>
+  v
+trusted Caddy or Envoy edge
+  |
+  | preserved Host and one X-Forwarded-Proto value
+  v
+Tarit share listener
+  |
+  | authorize slug and, for private shares, X-Tarit-Share-Token
+  | resolve VM owner
+  v
+owning Tarit node
+  |
+  | live guest network allocation + persisted guest_port
+  v
+guest service
+```
+
+If the owner is remote, Tarit forwards the already-authorized request only
+over its authenticated peer path; the public edge never exposes internal peer
+routes. The owner rechecks the authoritative share record and owner identity
+before deriving its guest target. This keeps public requests independent of
+peer addressing and prevents a share record or client header from selecting an
+arbitrary upstream.
+
+HTTP request and response bodies stream without full buffering. WebSocket
+handshakes, subprotocol negotiation, frames, ping/pong messages, and close
+frames are bridged while connection and idle limits are applied. Before traffic
+reaches the guest, Tarit removes hop-by-hop, `X-API-Key`,
+proxy-authentication, the private-share token, `X-Tarit-*`, and untrusted
+forwarding headers; it supplies its own forwarding metadata. It accepts only
+one exact lowercase `http` or `https` `X-Forwarded-Proto` value from the
+trusted edge; missing, repeated, comma-separated, or invalid values become
+`http`. Equivalent unsafe response headers are removed before they reach the
+client. Guest applications that need application credentials should use
+`Authorization` or another non-reserved header, not `X-API-Key`.
+
+The normal Prometheus `/metrics` output includes bounded share-gateway metrics:
+request totals by visibility and status class, authorization, owner-resolution,
+and target failures, ingress and egress bytes, plus active HTTP request and
+WebSocket gauges. It deliberately does not label metrics with share IDs,
+tokens, hostnames, or tenants.
 
 ## Request flow: any node to owner
 

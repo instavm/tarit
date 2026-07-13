@@ -61,6 +61,14 @@ fn vm_config() -> VmConfig {
     }
 }
 
+fn retain_snapshot(controller: &VmmController, path: &str) {
+    let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
+        .expect("snapshot identity");
+    controller
+        .release_scratch(path, identity)
+        .expect("transfer snapshot ownership");
+}
+
 #[test]
 #[ignore = "needs Linux+KVM + guest/bzImage"]
 fn comprehensive_all_features_and_edge_cases() {
@@ -101,6 +109,7 @@ fn comprehensive_all_features_and_edge_cases() {
     check!("snapshot created", snap_result.is_ok());
     let snap_path = snap_result.unwrap_or_default();
     if !snap_path.is_empty() {
+        retain_snapshot(&controller, &snap_path);
         let size = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
         check!("snapshot file non-empty", size > 0);
     }

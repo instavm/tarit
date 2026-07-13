@@ -1,27 +1,294 @@
 use crate::api::AppState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tarit_types::VmStatus;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    Arc,
+};
+use tarit_types::{ShareVisibility, VmStatus};
 
-#[derive(Debug, Default)]
+const SHARE_VISIBILITY_COUNT: usize = 3;
+const SHARE_STATUS_CLASS_COUNT: usize = 6;
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub(crate) enum ShareMetricVisibility {
+    Public = 0,
+    Private = 1,
+    Unknown = 2,
+}
+
+impl ShareMetricVisibility {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<ShareVisibility> for ShareMetricVisibility {
+    fn from(visibility: ShareVisibility) -> Self {
+        match visibility {
+            ShareVisibility::Public => Self::Public,
+            ShareVisibility::Private => Self::Private,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum ShareStatusClass {
+    Informational = 0,
+    Success = 1,
+    Redirect = 2,
+    ClientError = 3,
+    ServerError = 4,
+    Cancelled = 5,
+}
+
+impl ShareStatusClass {
+    fn from_status(status: u16) -> Self {
+        match status {
+            100..=199 => Self::Informational,
+            200..=299 => Self::Success,
+            300..=399 => Self::Redirect,
+            400..=499 => Self::ClientError,
+            _ => Self::ServerError,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Informational => "1xx",
+            Self::Success => "2xx",
+            Self::Redirect => "3xx",
+            Self::ClientError => "4xx",
+            Self::ServerError => "5xx",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Metrics {
     vm_create_total: AtomicU64,
     vm_create_errors_total: AtomicU64,
     exec_total: AtomicU64,
+    share_requests: [AtomicU64; SHARE_VISIBILITY_COUNT * SHARE_STATUS_CLASS_COUNT],
+    share_auth_failures_total: AtomicU64,
+    share_owner_failures_total: AtomicU64,
+    share_target_failures_total: AtomicU64,
+    share_bytes_in_total: AtomicU64,
+    share_bytes_out_total: AtomicU64,
+    active_share_http: AtomicU64,
+    active_share_websockets: AtomicU64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            vm_create_total: AtomicU64::new(0),
+            vm_create_errors_total: AtomicU64::new(0),
+            exec_total: AtomicU64::new(0),
+            share_requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            share_auth_failures_total: AtomicU64::new(0),
+            share_owner_failures_total: AtomicU64::new(0),
+            share_target_failures_total: AtomicU64::new(0),
+            share_bytes_in_total: AtomicU64::new(0),
+            share_bytes_out_total: AtomicU64::new(0),
+            active_share_http: AtomicU64::new(0),
+            active_share_websockets: AtomicU64::new(0),
+        }
+    }
+}
+
+pub(crate) struct ActiveShareHttp {
+    metrics: Arc<Metrics>,
+    visibility: AtomicU8,
+    finished: AtomicBool,
+}
+
+impl ActiveShareHttp {
+    pub(crate) fn set_visibility(&self, visibility: ShareMetricVisibility) {
+        self.visibility.store(visibility as u8, Ordering::Relaxed);
+    }
+
+    pub(crate) fn finish(&self, status: u16) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            self.metrics
+                .observe_share(self.visibility(), ShareStatusClass::from_status(status));
+        }
+    }
+
+    fn visibility(&self) -> ShareMetricVisibility {
+        match self.visibility.load(Ordering::Relaxed) {
+            value if value == ShareMetricVisibility::Public as u8 => ShareMetricVisibility::Public,
+            value if value == ShareMetricVisibility::Private as u8 => {
+                ShareMetricVisibility::Private
+            }
+            _ => ShareMetricVisibility::Unknown,
+        }
+    }
+}
+
+impl Drop for ActiveShareHttp {
+    fn drop(&mut self) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            self.metrics
+                .observe_share(self.visibility(), ShareStatusClass::Cancelled);
+        }
+        decrement_gauge(&self.metrics.active_share_http);
+    }
+}
+
+pub(crate) struct ActiveShareWebSocket {
+    metrics: Arc<Metrics>,
+}
+
+impl Drop for ActiveShareWebSocket {
+    fn drop(&mut self) {
+        decrement_gauge(&self.metrics.active_share_websockets);
+    }
 }
 
 impl Metrics {
     pub fn inc_vm_create_total(&self) {
-        self.vm_create_total.fetch_add(1, Ordering::Relaxed);
+        increment_counter(&self.vm_create_total, 1);
     }
 
     pub fn inc_vm_create_errors_total(&self) {
-        self.vm_create_errors_total.fetch_add(1, Ordering::Relaxed);
+        increment_counter(&self.vm_create_errors_total, 1);
     }
 
     pub fn inc_exec_total(&self) {
-        self.exec_total.fetch_add(1, Ordering::Relaxed);
+        increment_counter(&self.exec_total, 1);
+    }
+
+    pub(crate) fn track_share_http(self: &Arc<Self>) -> ActiveShareHttp {
+        increment_counter(&self.active_share_http, 1);
+        ActiveShareHttp {
+            metrics: Arc::clone(self),
+            visibility: AtomicU8::new(ShareMetricVisibility::Unknown as u8),
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn track_share_websocket(self: &Arc<Self>) -> ActiveShareWebSocket {
+        increment_counter(&self.active_share_websockets, 1);
+        ActiveShareWebSocket {
+            metrics: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn inc_share_auth_failures(&self) {
+        increment_counter(&self.share_auth_failures_total, 1);
+    }
+
+    pub(crate) fn inc_share_owner_failures(&self) {
+        increment_counter(&self.share_owner_failures_total, 1);
+    }
+
+    pub(crate) fn inc_share_target_failures(&self) {
+        increment_counter(&self.share_target_failures_total, 1);
+    }
+
+    pub(crate) fn add_share_bytes_in(&self, bytes: u64) {
+        increment_counter(&self.share_bytes_in_total, bytes);
+    }
+
+    pub(crate) fn add_share_bytes_out(&self, bytes: u64) {
+        increment_counter(&self.share_bytes_out_total, bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_share_websockets(&self) -> u64 {
+        self.active_share_websockets.load(Ordering::Relaxed)
+    }
+
+    fn observe_share(&self, visibility: ShareMetricVisibility, status: ShareStatusClass) {
+        let index = visibility as usize * SHARE_STATUS_CLASS_COUNT + status as usize;
+        increment_counter(&self.share_requests[index], 1);
+    }
+
+    pub(crate) fn render_share_metrics(&self) -> String {
+        let mut out = String::new();
+        metric_header(
+            &mut out,
+            "taritd_share_requests_total",
+            "counter",
+            "Share gateway requests by bounded visibility and response status class.",
+        );
+        for visibility in [
+            ShareMetricVisibility::Public,
+            ShareMetricVisibility::Private,
+            ShareMetricVisibility::Unknown,
+        ] {
+            for status in [
+                ShareStatusClass::Informational,
+                ShareStatusClass::Success,
+                ShareStatusClass::Redirect,
+                ShareStatusClass::ClientError,
+                ShareStatusClass::ServerError,
+                ShareStatusClass::Cancelled,
+            ] {
+                let index = visibility as usize * SHARE_STATUS_CLASS_COUNT + status as usize;
+                let _ = writeln!(
+                    out,
+                    "taritd_share_requests_total{{visibility=\"{}\",status_class=\"{}\"}} {}",
+                    visibility.label(),
+                    status.label(),
+                    self.share_requests[index].load(Ordering::Relaxed)
+                );
+            }
+        }
+        for (name, help, counter) in [
+            (
+                "taritd_share_auth_failures_total",
+                "Share gateway authorization failures.",
+                &self.share_auth_failures_total,
+            ),
+            (
+                "taritd_share_owner_failures_total",
+                "Share gateway owner resolution failures.",
+                &self.share_owner_failures_total,
+            ),
+            (
+                "taritd_share_target_failures_total",
+                "Share gateway upstream target failures.",
+                &self.share_target_failures_total,
+            ),
+            (
+                "taritd_share_bytes_in_total",
+                "Bytes read from share gateway clients.",
+                &self.share_bytes_in_total,
+            ),
+            (
+                "taritd_share_bytes_out_total",
+                "Bytes written to share gateway clients.",
+                &self.share_bytes_out_total,
+            ),
+        ] {
+            metric_header(&mut out, name, "counter", help);
+            let _ = writeln!(out, "{} {}", name, counter.load(Ordering::Relaxed));
+        }
+        for (name, help, gauge) in [
+            (
+                "taritd_share_active_http",
+                "In-flight share gateway HTTP requests.",
+                &self.active_share_http,
+            ),
+            (
+                "taritd_share_active_websockets",
+                "Active share gateway WebSocket bridges.",
+                &self.active_share_websockets,
+            ),
+        ] {
+            metric_header(&mut out, name, "gauge", help);
+            let _ = writeln!(out, "{} {}", name, gauge.load(Ordering::Relaxed));
+        }
+        out
     }
 
     fn vm_create_total(&self) -> u64 {
@@ -35,6 +302,18 @@ impl Metrics {
     fn exec_total(&self) -> u64 {
         self.exec_total.load(Ordering::Relaxed)
     }
+}
+
+fn increment_counter(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+fn decrement_gauge(gauge: &AtomicU64) {
+    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(1))
+    });
 }
 
 pub fn render_metrics(state: &AppState) -> String {
@@ -198,6 +477,8 @@ pub fn render_metrics(state: &AppState) -> String {
             );
         }
     }
+
+    out.push_str(&state.metrics.render_share_metrics());
 
     out
 }
@@ -417,6 +698,14 @@ mod tests {
             "taritd_exec_total",
             "taritd_vm_memory_rss_bytes",
             "taritd_vm_cpu_seconds_total",
+            "taritd_share_requests_total",
+            "taritd_share_auth_failures_total",
+            "taritd_share_owner_failures_total",
+            "taritd_share_target_failures_total",
+            "taritd_share_bytes_in_total",
+            "taritd_share_bytes_out_total",
+            "taritd_share_active_http",
+            "taritd_share_active_websockets",
         ] {
             assert!(body.contains(&format!("# HELP {metric} ")), "{metric} HELP");
             assert!(body.contains(&format!("# TYPE {metric} ")), "{metric} TYPE");
@@ -461,6 +750,75 @@ mod tests {
         assert_eq!(a.len(), 14, "h: plus 12 hex chars");
     }
 
+    #[test]
+    fn share_metrics_are_bounded_secret_safe_and_raii_balanced() {
+        let metrics = Arc::new(Metrics::default());
+
+        let request = metrics.track_share_http();
+        request.set_visibility(ShareMetricVisibility::Public);
+        request.finish(200);
+        drop(request);
+
+        let cancelled = metrics.track_share_http();
+        drop(cancelled);
+
+        let websocket = metrics.track_share_websocket();
+        drop(websocket);
+
+        metrics.inc_share_auth_failures();
+        metrics.inc_share_owner_failures();
+        metrics.inc_share_target_failures();
+        metrics.add_share_bytes_in(12);
+        metrics.add_share_bytes_out(34);
+
+        let rendered = metrics.render_share_metrics();
+
+        for metric in [
+            "taritd_share_requests_total",
+            "taritd_share_auth_failures_total",
+            "taritd_share_owner_failures_total",
+            "taritd_share_target_failures_total",
+            "taritd_share_bytes_in_total",
+            "taritd_share_bytes_out_total",
+            "taritd_share_active_http",
+            "taritd_share_active_websockets",
+        ] {
+            assert!(
+                rendered.contains(&format!("# HELP {metric} ")),
+                "{metric} HELP"
+            );
+            assert!(
+                rendered.contains(&format!("# TYPE {metric} ")),
+                "{metric} TYPE"
+            );
+        }
+
+        assert!(rendered
+            .contains("taritd_share_requests_total{visibility=\"public\",status_class=\"2xx\"} 1"));
+        assert!(rendered.contains(
+            "taritd_share_requests_total{visibility=\"unknown\",status_class=\"cancelled\"} 1"
+        ));
+        assert!(rendered.contains("taritd_share_bytes_in_total 12"));
+        assert!(rendered.contains("taritd_share_bytes_out_total 34"));
+        assert!(rendered.contains("taritd_share_active_http 0"));
+        assert!(rendered.contains("taritd_share_active_websockets 0"));
+
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("taritd_share_requests_total{"))
+                .count(),
+            18,
+            "the visibility/status dimensions must stay bounded"
+        );
+        for secret_or_identifier in ["calm-red-fox", "share-token", "tenant-a", "token=", "slug="] {
+            assert!(
+                !rendered.contains(secret_or_identifier),
+                "share metric output leaked {secret_or_identifier}"
+            );
+        }
+    }
+
     fn test_state() -> AppState {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -500,12 +858,20 @@ mod tests {
             ssh_gateway_enabled: false,
             ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
             ssh_gateway_host_key_path: PathBuf::from("target/taritd-metrics-test/ssh_host"),
+            share_listen: None,
+            share_domain: None,
+            share_token_key: None,
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 10_000,
+            share_idle_timeout_secs: 300,
         };
-        let store = Store::open(":memory:").unwrap();
+        let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
+        let shares = crate::shares::ShareRepository::new(Arc::clone(&store), None);
         let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
         AppState {
             config: config.clone(),
-            store: Arc::new(Mutex::new(store)),
+            audit_outbox: Arc::new(crate::audit::LocalAuditOutbox::new(Arc::clone(&store))),
+            store,
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
@@ -517,8 +883,10 @@ mod tests {
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),
             peer: Arc::new(PeerClient::new("peer-secret".into())),
+            shares,
             fleet: None,
             metrics: Arc::new(Metrics::default()),
+            share_runtime: Arc::new(crate::share_gateway::ShareRuntime::default()),
         }
     }
 }

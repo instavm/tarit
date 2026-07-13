@@ -2,6 +2,8 @@ use crate::config::{Config, WarmClass};
 use crate::net::{NetAlloc, NetProvisioner};
 use crate::scheduler::Scheduler;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,12 +14,32 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tarit_types::OrchError;
 use tarit_vmm_client::{
-    KernelConfig, MemoryConfig, NetConfig, VcpuConfig, VmConfig, VmmClient, VolumeConfig,
+    KernelConfig, MemoryConfig, NetConfig, ScratchIdentity, VcpuConfig, VmConfig, VmmClient,
+    VolumeConfig,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5";
+const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const GUEST_READY_EXEC_TIMEOUT: Duration = Duration::from_secs(1);
+const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn graceful_stop_vmm(socket_path: &Path) {
+    if socket_path.as_os_str().is_empty() || !socket_path.exists() {
+        return;
+    }
+
+    let _ = VmmClient::new(socket_path)
+        .with_request_timeout(TEARDOWN_STOP_TIMEOUT)
+        .stop();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessCheck {
+    Boot,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VmSpawnConfig {
@@ -88,10 +110,151 @@ struct RunningVm {
     net: Option<NetAlloc>,
 }
 
+#[derive(Default)]
+struct NetworkLeaseState {
+    active: usize,
+    pending_teardown: Option<NetAlloc>,
+    teardown_in_progress: bool,
+}
+
+impl NetworkLeaseState {
+    fn acquire(&mut self) {
+        self.active += 1;
+    }
+
+    fn defer_teardown(&mut self, allocation: NetAlloc) -> Option<NetAlloc> {
+        if self.active == 0 {
+            Some(allocation)
+        } else {
+            self.pending_teardown = Some(allocation);
+            None
+        }
+    }
+
+    fn release(&mut self) -> Option<NetAlloc> {
+        self.active = self.active.saturating_sub(1);
+        if self.active != 0 {
+            return None;
+        }
+        let teardown = self.pending_teardown.take();
+        self.teardown_in_progress = teardown.is_some();
+        teardown
+    }
+
+    fn teardown_in_progress(&self) -> bool {
+        self.teardown_in_progress
+    }
+
+    fn complete_teardown(&mut self) {
+        self.teardown_in_progress = false;
+    }
+}
+
+pub(crate) struct NetworkLease {
+    supervisor: Arc<VmmSupervisor>,
+    id: Uuid,
+    allocation: NetAlloc,
+}
+
+impl NetworkLease {
+    pub(crate) fn allocation(&self) -> &NetAlloc {
+        &self.allocation
+    }
+}
+
+impl Drop for NetworkLease {
+    fn drop(&mut self) {
+        self.supervisor.release_network_lease(self.id);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ManagedProcess {
     pid: u32,
     child: Arc<Mutex<Child>>,
+}
+
+/// A golden artifact claimed by the supervisor after the builder VMM releases
+/// its exact scratch token. The open descriptor protects it from VMM GC while
+/// it remains reusable.
+#[derive(Debug)]
+struct OwnedArtifact {
+    path: PathBuf,
+    identity: ScratchIdentity,
+    _file: File,
+}
+
+impl OwnedArtifact {
+    fn capture(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        Ok(Self {
+            identity: scratch_identity_from_metadata(&metadata),
+            path,
+            _file: file,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn identity(&self) -> ScratchIdentity {
+        self.identity.clone()
+    }
+
+    fn matches(&self, path: &Path, identity: &ScratchIdentity) -> bool {
+        self.path == path && &self.identity == identity
+    }
+
+    fn remove(&self) -> std::io::Result<bool> {
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if scratch_identity_from_metadata(&metadata) != self.identity {
+            return Ok(false);
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn scratch_identity_from_metadata(metadata: &std::fs::Metadata) -> ScratchIdentity {
+    let (created_secs, created_nanos) = metadata
+        .created()
+        .ok()
+        .and_then(|created| {
+            created
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| {
+                    i64::try_from(duration.as_secs())
+                        .ok()
+                        .map(|seconds| (Some(seconds), Some(duration.subsec_nanos())))
+                })
+        })
+        .unwrap_or((None, None));
+    ScratchIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        created_secs,
+        created_nanos,
+    }
 }
 
 impl ManagedProcess {
@@ -366,9 +529,54 @@ pub(crate) enum WarmClaimOutcome<T> {
     RetainedPublicationFailure(OrchError),
 }
 
+#[derive(Default)]
+pub(crate) struct VmAdmissionGate {
+    closed: AtomicBool,
+    operation: Mutex<()>,
+}
+
+impl VmAdmissionGate {
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _operation = self
+            .operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+
+    pub(crate) fn enter(&self) -> Result<std::sync::MutexGuard<'_, ()>, OrchError> {
+        let operation = self
+            .operation
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor admission lock poisoned".into()))?;
+        if self.is_closed() {
+            return Err(shutdown_error());
+        }
+        Ok(operation)
+    }
+
+    #[cfg(test)]
+    fn admit<T>(&self, operation: impl FnOnce() -> T) -> Result<T, OrchError> {
+        let _operation = self.enter()?;
+        Ok(operation())
+    }
+}
+
+fn shutdown_error() -> OrchError {
+    OrchError::Overloaded {
+        message: "taritd is shutting down".into(),
+        retry_after_secs: 1,
+    }
+}
+
 pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
+    network_leases: Mutex<HashMap<Uuid, NetworkLeaseState>>,
     booting: Mutex<HashMap<Uuid, BootingVm>>,
     /// Serializes VMM spawn registration with shutdown's boot cancellation sweep.
     ///
@@ -389,8 +597,10 @@ pub struct VmmSupervisor {
     #[cfg(test)]
     spawn_attachment_pause: Mutex<Option<SpawnAttachmentPause>>,
     scheduler: Arc<Scheduler>,
+    golden_artifacts: Mutex<Vec<OwnedArtifact>>,
     net: Option<NetProvisioner>,
     shutting_down: AtomicBool,
+    admission: Arc<VmAdmissionGate>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -527,6 +737,7 @@ impl VmmSupervisor {
         Ok(Self {
             config,
             running: Mutex::new(HashMap::new()),
+            network_leases: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
             boot_gate: AsyncMutex::new(()),
             warm: Mutex::new(VecDeque::new()),
@@ -535,8 +746,10 @@ impl VmmSupervisor {
             #[cfg(test)]
             spawn_attachment_pause: Mutex::new(None),
             scheduler,
+            golden_artifacts: Mutex::new(Vec::new()),
             net,
             shutting_down: AtomicBool::new(false),
+            admission: Arc::new(VmAdmissionGate::default()),
         })
     }
 
@@ -572,14 +785,25 @@ impl VmmSupervisor {
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::SeqCst)
+        self.shutting_down.load(Ordering::Acquire) || self.admission.is_closed()
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.admission.close();
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn admission_gate(&self) -> Arc<VmAdmissionGate> {
+        Arc::clone(&self.admission)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_is_closed(&self) -> bool {
+        self.admission.is_closed()
     }
 
     fn shutdown_error(&self) -> OrchError {
-        OrchError::Overloaded {
-            message: "taritd is shutting down".into(),
-            retry_after_secs: 1,
-        }
+        shutdown_error()
     }
 
     fn move_pid_to_refill_cgroup(&self, pid: u32) {
@@ -1569,22 +1793,37 @@ impl VmmSupervisor {
     /// p95 tail). Bounded; parks anyway on timeout so a wedged guest can't stall
     /// replenishment forever.
     fn await_ready(&self, socket: &Path, control: &BootControl) -> Result<(), OrchError> {
-        let client = VmmClient::new(socket);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if !boot_can_publish(control, self.is_shutting_down()) {
-                return Err(self.shutdown_error());
-            }
-            if client
-                .exec("true", 1000)
-                .map(|(code, _, _, _)| code == 0)
-                .unwrap_or(false)
-            {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok(())
+        wait_for_guest_ready(
+            readiness_timeout(ReadinessCheck::Boot),
+            || {
+                if boot_can_publish(control, self.is_shutting_down()) {
+                    Ok(())
+                } else {
+                    Err(self.shutdown_error())
+                }
+            },
+            |remaining| {
+                let request_timeout = readiness_request_timeout(remaining);
+                let exec_timeout_ms = readiness_exec_timeout_ms(request_timeout);
+                let client = VmmClient::new(socket)
+                    .with_connect_timeout(request_timeout)
+                    .with_request_timeout(request_timeout);
+                match client.exec("true", exec_timeout_ms) {
+                    Ok((0, _, _, _)) => Ok(true),
+                    Ok((code, _, _, _)) => {
+                        Err(format!("readiness command exited with status {code}"))
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            },
+        )
+        .map_err(|error| match error {
+            ReadinessWaitError::Cancelled(error) => error,
+            ReadinessWaitError::TimedOut(last) => OrchError::Vmm(format!(
+                "guest agent never became ready at {}: {last}",
+                socket.display()
+            )),
+        })
     }
 
     pub(crate) async fn spawn_warm(self: Arc<Self>, class: WarmClass) -> Result<(), OrchError> {
@@ -1771,14 +2010,37 @@ impl VmmSupervisor {
             }
         }
         .map_err(|error| self.cleanup_boot_failure(id, &booted.control, &booted.vm, error))?;
+        let mut artifacts = self.capture_golden_artifacts(
+            &snapshot_path,
+            overlay_path_for_config(id, &spec).as_deref(),
+        )?;
         if task.is_cancelled() {
-            let error = self.discard_booted_vm(booted);
-            if !self.has_retained_boot(id) {
-                task.mark_terminal_converged();
-            }
-            return Err(error);
+            cleanup_golden_artifacts(artifacts);
+            return Err(self.discard_booted_vm(booted));
         }
-
+        let client = VmmClient::new(&booted.vm.socket_path);
+        for artifact in &artifacts {
+            let path = artifact.path().display().to_string();
+            let identity = artifact.identity();
+            if let Err(error) = client.release_scratch(&path, identity) {
+                cleanup_golden_artifacts(artifacts);
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &booted.control,
+                    &booted.vm,
+                    OrchError::Vmm(format!("release golden scratch {path}: {error}")),
+                ));
+            }
+        }
+        let artifact_keys = artifacts
+            .iter()
+            .map(|artifact| (artifact.path.clone(), artifact.identity()))
+            .collect::<Vec<_>>();
+        self.remember_golden_artifacts(&mut artifacts)?;
+        if task.is_cancelled() {
+            cleanup_golden_artifacts(self.take_golden_artifacts(&artifact_keys));
+            return Err(self.discard_booted_vm(booted));
+        }
         self.finish_booted_vm(id, booted.control, &booted.vm)?;
         Ok(snapshot_path)
     }
@@ -1958,6 +2220,41 @@ impl VmmSupervisor {
             .unwrap_or(0)
     }
 
+    fn capture_golden_artifacts(
+        &self,
+        snapshot_path: &str,
+        overlay_path: Option<&str>,
+    ) -> Result<Vec<OwnedArtifact>, OrchError> {
+        let mut artifacts = vec![OwnedArtifact::capture(snapshot_path)
+            .map_err(|error| OrchError::Internal(format!("capture golden snapshot: {error}")))?];
+        if let Some(overlay_path) = overlay_path {
+            artifacts.push(OwnedArtifact::capture(overlay_path).map_err(|error| {
+                OrchError::Internal(format!("capture golden overlay: {error}"))
+            })?);
+        }
+        Ok(artifacts)
+    }
+
+    fn remember_golden_artifacts(
+        &self,
+        artifacts: &mut Vec<OwnedArtifact>,
+    ) -> Result<(), OrchError> {
+        let mut registered = self
+            .golden_artifacts
+            .lock()
+            .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?;
+        registered.append(artifacts);
+        Ok(())
+    }
+
+    fn take_golden_artifacts(&self, keys: &[(PathBuf, ScratchIdentity)]) -> Vec<OwnedArtifact> {
+        let mut registered = self.golden_artifacts.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("golden artifact lock poisoned during cancellation cleanup");
+            poisoned.into_inner()
+        });
+        take_matching_artifacts(&mut registered, keys)
+    }
+
     fn client_for(&self, id: Uuid) -> Result<VmmClient, OrchError> {
         let guard = self
             .running
@@ -2061,7 +2358,55 @@ impl VmmSupervisor {
 
     pub fn resume_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let client = self.client_for(id)?;
+        let _admission = self.admission.enter()?;
         client.resume().map_err(|e| OrchError::Vmm(e.to_string()))
+    }
+
+    #[allow(dead_code)]
+    pub fn network_allocation(&self, id: Uuid) -> Result<NetAlloc, OrchError> {
+        self.running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
+            .get(&id)
+            .and_then(|vm| vm.net.clone())
+            .ok_or_else(|| OrchError::Conflict(format!("vm {id} has no active network")))
+    }
+
+    pub(crate) fn acquire_network_lease(
+        self: &Arc<Self>,
+        id: Uuid,
+    ) -> Result<NetworkLease, OrchError> {
+        let mut leases = self
+            .network_leases
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor network lease lock poisoned".into()))?;
+        let allocation = self
+            .running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
+            .get(&id)
+            .and_then(|vm| vm.net.clone())
+            .ok_or_else(|| OrchError::Conflict(format!("vm {id} has no active network")))?;
+        leases.entry(id).or_default().acquire();
+        Ok(NetworkLease {
+            supervisor: Arc::clone(self),
+            id,
+            allocation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_network_allocation(&self, id: Uuid, allocation: NetAlloc) {
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        self.running.lock().unwrap().insert(
+            id,
+            RunningVm {
+                pid: process.pid,
+                socket_path: PathBuf::new(),
+                process,
+                net: Some(allocation),
+            },
+        );
     }
 
     /// Live VMM status (state/uptime/vcpus/mem/config/vcpu_alive) for a running VM.
@@ -2219,7 +2564,7 @@ impl VmmSupervisor {
         // before draining `running`/`booting` below.
         let owned_outcomes = self.wait_for_owned_tasks(owned_tasks);
         let booting = self.complete_cancelled_booting_tasks(booting);
-        let (running, warm) = {
+        let (running, warm, golden_artifacts) = {
             let mut running = self.running.lock().map_err(|_| {
                 Box::new(ShutdownFailure::from(OrchError::Internal(
                     "supervisor lock poisoned".into(),
@@ -2230,9 +2575,15 @@ impl VmmSupervisor {
                     "warm lock poisoned".into(),
                 )))
             })?;
+            let mut golden_artifacts = self.golden_artifacts.lock().map_err(|_| {
+                Box::new(ShutdownFailure::from(OrchError::Internal(
+                    "golden artifact lock poisoned".into(),
+                )))
+            })?;
             (
                 running.drain().collect::<Vec<_>>(),
                 warm.drain(..).collect::<Vec<_>>(),
+                golden_artifacts.drain(..).collect::<Vec<_>>(),
             )
         };
         let mut transitions = ShutdownTransitions::default();
@@ -2262,6 +2613,7 @@ impl VmmSupervisor {
         for (id, purpose, result) in booting {
             transitions.booting(id, purpose, result);
         }
+        cleanup_golden_artifacts(golden_artifacts);
 
         if !retained_running.is_empty() {
             match self.running.lock() {
@@ -2284,6 +2636,7 @@ impl VmmSupervisor {
 
     fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
         let mut failures = Vec::new();
+        graceful_stop_vmm(&vm.socket_path);
         if let Err(error) = vm.process.kill_wait() {
             failures.push(error.to_string());
         }
@@ -2294,14 +2647,78 @@ impl VmmSupervisor {
             failures.push(format!("remove VMM overlay: {error}"));
         }
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
-            if let Err(error) = p.teardown(a) {
-                failures.push(format!("teardown network allocation: {error}"));
+            match self.defer_network_teardown(id, a.clone()) {
+                Ok(Some(allocation)) => {
+                    if let Err(error) = p.teardown(&allocation) {
+                        failures.push(format!("teardown network allocation: {error}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => failures.push(format!("defer network teardown: {error}")),
             }
         }
         if failures.is_empty() {
             Ok(())
         } else {
             Err(OrchError::Internal(failures.join("; ")))
+        }
+    }
+
+    fn defer_network_teardown(
+        &self,
+        id: Uuid,
+        allocation: NetAlloc,
+    ) -> Result<Option<NetAlloc>, OrchError> {
+        let mut leases = self
+            .network_leases
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor network lease lock poisoned".into()))?;
+        let Some(lease) = leases.get_mut(&id) else {
+            return Ok(Some(allocation));
+        };
+        let teardown = lease.defer_teardown(allocation);
+        if lease.active == 0 && !lease.teardown_in_progress() {
+            leases.remove(&id);
+        }
+        Ok(teardown)
+    }
+
+    fn release_network_lease(&self, id: Uuid) {
+        let teardown = {
+            let Ok(mut leases) = self.network_leases.lock() else {
+                tracing::error!(%id, "network lease lock poisoned while releasing lease");
+                return;
+            };
+            let Some(lease) = leases.get_mut(&id) else {
+                return;
+            };
+            let teardown = lease.release();
+            if lease.active == 0 && !lease.teardown_in_progress() {
+                leases.remove(&id);
+            }
+            teardown
+        };
+        if let Some(allocation) = teardown {
+            if let Some(provisioner) = &self.net {
+                if let Err(error) = provisioner.teardown(&allocation) {
+                    tracing::error!(%id, %error, "failed deferred network teardown");
+                    return;
+                }
+            }
+            self.complete_network_teardown(id);
+        }
+    }
+
+    fn complete_network_teardown(&self, id: Uuid) {
+        let Ok(mut leases) = self.network_leases.lock() else {
+            return;
+        };
+        let Some(lease) = leases.get_mut(&id) else {
+            return;
+        };
+        lease.complete_teardown();
+        if lease.active == 0 {
+            leases.remove(&id);
         }
     }
 }
@@ -2342,6 +2759,105 @@ impl Drop for VmmSupervisor {
             );
         }
     }
+}
+
+fn cleanup_golden_artifacts(artifacts: impl IntoIterator<Item = OwnedArtifact>) {
+    for artifact in artifacts {
+        match artifact.remove() {
+            Ok(true) => {
+                tracing::info!(path = %artifact.path().display(), "removed golden artifact")
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                path = %artifact.path().display(),
+                "remove golden artifact failed: {error}"
+            ),
+        }
+    }
+}
+
+fn take_matching_artifacts(
+    artifacts: &mut Vec<OwnedArtifact>,
+    keys: &[(PathBuf, ScratchIdentity)],
+) -> Vec<OwnedArtifact> {
+    let mut removed = Vec::new();
+    let mut retained = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts.drain(..) {
+        if keys
+            .iter()
+            .any(|(path, identity)| artifact.matches(path, identity))
+        {
+            removed.push(artifact);
+        } else {
+            retained.push(artifact);
+        }
+    }
+    *artifacts = retained;
+    removed
+}
+
+fn readiness_timeout(check: ReadinessCheck) -> Duration {
+    match check {
+        ReadinessCheck::Boot => GUEST_READY_TIMEOUT,
+    }
+}
+
+fn readiness_exec_timeout_ms(remaining: Duration) -> u64 {
+    let timeout = remaining.min(GUEST_READY_EXEC_TIMEOUT);
+    u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+fn readiness_request_timeout(remaining: Duration) -> Duration {
+    remaining.min(GUEST_READY_EXEC_TIMEOUT)
+}
+
+fn readiness_poll_sleep(remaining: Duration) -> Duration {
+    remaining.min(GUEST_READY_POLL_INTERVAL)
+}
+
+#[derive(Debug)]
+enum ReadinessWaitError {
+    Cancelled(OrchError),
+    TimedOut(String),
+}
+
+fn wait_for_guest_ready<C, F>(
+    timeout: Duration,
+    mut ensure_active: C,
+    mut probe: F,
+) -> Result<(), ReadinessWaitError>
+where
+    C: FnMut() -> Result<(), OrchError>,
+    F: FnMut(Duration) -> Result<bool, String>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last = "guest agent returned no successful readiness response".to_string();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        ensure_active().map_err(ReadinessWaitError::Cancelled)?;
+        match probe(remaining) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                last = "guest agent readiness command did not succeed".to_string();
+            }
+            Err(error) => last = error,
+        }
+        ensure_active().map_err(ReadinessWaitError::Cancelled)?;
+        let sleep = readiness_poll_sleep(deadline.saturating_duration_since(Instant::now()));
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+    }
+
+    Err(ReadinessWaitError::TimedOut(format!(
+        "guest agent never became ready: {last}"
+    )))
 }
 
 #[cfg(target_os = "linux")]
@@ -2511,9 +3027,58 @@ fn overlay_path_for_config(id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, WarmPoolConfig};
+    use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
+    use std::io::{Read, Write};
     use std::sync::mpsc;
     use std::thread;
+
+    fn supervisor_config(root: &Path) -> Config {
+        Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
+                "test-key".into(),
+                "tenant-a".into(),
+                ApiRole::Admin,
+                0,
+            )])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: root.join("vmm-must-not-run"),
+            kernel: root.join("kernel"),
+            rootfs: root.join("rootfs"),
+            socket_dir: root.join("sockets"),
+            db_path: root.join("fleet.db"),
+            net_state_path: root.join("net-state.json"),
+            images_dir: root.join("images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: None,
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: root.join("ssh_host"),
+            share_listen: None,
+            share_domain: None,
+            share_token_key: None,
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 1_000,
+            share_idle_timeout_secs: 1,
+        }
+    }
 
     fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
         VmSpawnConfig {
@@ -2565,6 +3130,12 @@ mod tests {
             ssh_gateway_enabled: false,
             ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
             ssh_gateway_host_key_path: PathBuf::from("target/taritd-supervisor-test/ssh_host"),
+            share_listen: None,
+            share_domain: None,
+            share_token_key: None,
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 1_000,
+            share_idle_timeout_secs: 1,
         };
         Arc::new(VmmSupervisor::new(config))
     }
@@ -2575,6 +3146,180 @@ mod tests {
         assert!(validate_network_startup_mode(false, &["insta7".into()], 0).is_err());
         assert!(validate_network_startup_mode(false, &[], 1).is_err());
         assert!(validate_network_startup_mode(true, &["insta7".into()], 1).is_ok());
+    }
+
+    #[test]
+    fn shutdown_prevents_warm_refill_before_vmm_spawn() {
+        let root = PathBuf::from(format!(
+            "target/taritd-supervisor-shutdown-{}",
+            Uuid::new_v4()
+        ));
+        let config = supervisor_config(&root);
+        let class = config.warm_pool.classes[0].clone();
+        let supervisor = Arc::new(VmmSupervisor::new(config.clone()));
+        supervisor.begin_shutdown();
+
+        let error = test_runtime()
+            .block_on(Arc::clone(&supervisor).spawn_warm(class))
+            .unwrap_err();
+
+        assert!(matches!(error, OrchError::Overloaded { .. }));
+        assert!(
+            std::fs::read_dir(&config.socket_dir)
+                .unwrap()
+                .next()
+                .is_none(),
+            "shutdown must reject refill before it creates a VMM socket"
+        );
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn teardown_vm_stops_vmm_before_killing_process() {
+        let root = PathBuf::from(format!(
+            "target/taritd-supervisor-teardown-{}",
+            Uuid::new_v4()
+        ));
+        let socket_path = PathBuf::from(format!(
+            "target/taritd-teardown-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test VMM socket");
+        listener
+            .set_nonblocking(true)
+            .expect("make test VMM socket nonblocking");
+        let process = ManagedProcess::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn test VMM process"),
+        );
+        let process_for_liveness_check = process.clone();
+        let process_for_assertion = process.clone();
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<
+            Result<(tarit_vmm_client::ApiRequest, bool), String>,
+        >(1);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut length = [0; 4];
+                        stream.read_exact(&mut length).expect("read request length");
+                        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                        stream.read_exact(&mut body).expect("read request body");
+                        let request = serde_json::from_slice(&body).expect("decode request");
+                        let child_alive = process_for_liveness_check
+                            .child
+                            .lock()
+                            .expect("lock child")
+                            .try_wait()
+                            .expect("inspect child")
+                            .is_none();
+                        let response =
+                            serde_json::to_vec(&tarit_vmm_client::ApiResponse::Ok).unwrap();
+                        stream
+                            .write_all(&(response.len() as u32).to_be_bytes())
+                            .expect("write response length");
+                        stream.write_all(&response).expect("write response body");
+                        stream.flush().expect("flush response");
+                        request_tx
+                            .send(Ok((request, child_alive)))
+                            .expect("record request");
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            request_tx
+                                .send(Err("timed out waiting for VMM request".into()))
+                                .expect("record timeout");
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        request_tx
+                            .send(Err(error.to_string()))
+                            .expect("record accept error");
+                        return;
+                    }
+                }
+            }
+        });
+        let vm = RunningVm {
+            pid: process.pid,
+            socket_path: socket_path.clone(),
+            process,
+            net: None,
+        };
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+
+        supervisor.teardown_vm(Uuid::new_v4(), &vm).unwrap();
+
+        let (request, child_alive) = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("teardown must contact the VMM")
+            .expect("test VMM server must receive a request");
+        assert!(
+            matches!(request, tarit_vmm_client::ApiRequest::Stop),
+            "teardown must send Stop before killing the VMM, got {request:?}"
+        );
+        assert!(
+            child_alive,
+            "the VMM process must still be alive when it receives Stop"
+        );
+        server.join().expect("join test VMM server");
+        assert!(
+            process_for_assertion
+                .child
+                .lock()
+                .expect("lock child")
+                .try_wait()
+                .expect("inspect child")
+                .is_some(),
+            "teardown must reap the VMM process"
+        );
+
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admission_gate_rejects_refill_after_shutdown_between_planning_and_create() {
+        use std::sync::{Arc, Barrier};
+
+        let gate = Arc::new(VmAdmissionGate::default());
+        let planned = Arc::new(Barrier::new(2));
+        let release_create = Arc::new(Barrier::new(2));
+        let created = Arc::new(AtomicBool::new(false));
+        let worker_gate = Arc::clone(&gate);
+        let worker_planned = Arc::clone(&planned);
+        let worker_release = Arc::clone(&release_create);
+        let worker_created = Arc::clone(&created);
+
+        let refill = std::thread::spawn(move || {
+            worker_planned.wait();
+            worker_release.wait();
+            worker_gate
+                .admit(|| worker_created.store(true, Ordering::Release))
+                .unwrap_err()
+        });
+
+        planned.wait();
+        gate.close();
+        release_create.wait();
+
+        assert!(matches!(
+            refill.join().unwrap(),
+            OrchError::Overloaded { .. }
+        ));
+        assert!(
+            !created.load(Ordering::Acquire),
+            "a refill planned before shutdown must not create a VMM after admission closes"
+        );
     }
 
     #[test]
@@ -3221,6 +3966,26 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn network_lease_defers_teardown_until_final_release() {
+        let alloc = NetAlloc {
+            idx: 7,
+            vm_id: Uuid::nil(),
+            tap: "insta7".into(),
+            host_ip: "172.16.0.29".into(),
+            guest_ip: "172.16.0.30".into(),
+            prefix: 30,
+        };
+        let mut state = NetworkLeaseState::default();
+        state.acquire();
+
+        assert_eq!(state.defer_teardown(alloc.clone()), None);
+        assert_eq!(state.release(), Some(alloc));
+        assert!(state.teardown_in_progress());
+        state.complete_teardown();
+        assert!(!state.teardown_in_progress());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_cgroup_v2_self_path() {
@@ -3232,5 +3997,181 @@ mod tests {
             parse_self_cgroup("0::/\n"),
             Some(PathBuf::from("/sys/fs/cgroup"))
         );
+    }
+
+    #[test]
+    fn guest_readiness_gate_rejects_an_unresponsive_agent() {
+        let error = wait_for_guest_ready(Duration::ZERO, || Ok(()), |_| Ok(false))
+            .expect_err("an unresponsive guest must not pass the readiness gate");
+
+        assert!(matches!(
+            error,
+            ReadinessWaitError::TimedOut(message) if message.contains("guest agent never became ready")
+        ));
+    }
+
+    #[test]
+    fn guest_readiness_gate_accepts_a_successful_probe() {
+        let mut attempts = 0;
+
+        wait_for_guest_ready(
+            Duration::from_secs(1),
+            || Ok(()),
+            |_| {
+                attempts += 1;
+                Ok(true)
+            },
+        )
+        .expect("a successful guest-agent probe must pass the readiness gate");
+
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn guest_readiness_gate_stops_when_refill_is_cancelled_between_probes() {
+        let cancelled = AtomicBool::new(false);
+        let mut attempts = 0;
+
+        let error = wait_for_guest_ready(
+            Duration::from_secs(1),
+            || {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(shutdown_error());
+                }
+                Ok(())
+            },
+            |_| {
+                attempts += 1;
+                cancelled.store(true, Ordering::Release);
+                Ok(false)
+            },
+        )
+        .expect_err("a cancelled refill must stop waiting for guest readiness");
+
+        assert_eq!(
+            attempts, 1,
+            "cancellation must prevent another readiness probe"
+        );
+        assert!(matches!(
+            error,
+            ReadinessWaitError::Cancelled(OrchError::Overloaded { .. })
+        ));
+    }
+
+    #[test]
+    fn boot_readiness_uses_the_full_guest_ready_window() {
+        assert_eq!(
+            readiness_timeout(ReadinessCheck::Boot),
+            GUEST_READY_TIMEOUT,
+            "newly booted, refilled, and golden-builder VMs need the full readiness window"
+        );
+    }
+
+    #[test]
+    fn warm_handoff_exec_timeout_is_short_and_nonzero() {
+        assert_eq!(
+            readiness_exec_timeout_ms(Duration::from_secs(20)),
+            1_000,
+            "long boot readiness retains its existing per-exec timeout"
+        );
+        assert_eq!(
+            readiness_exec_timeout_ms(Duration::from_millis(200)),
+            200,
+            "a wedged parked VM must not use the long readiness probe timeout"
+        );
+        assert_eq!(readiness_exec_timeout_ms(Duration::ZERO), 1);
+    }
+
+    #[test]
+    fn readiness_request_timeout_is_capped_by_the_per_probe_limit() {
+        assert_eq!(
+            readiness_request_timeout(Duration::from_secs(20)),
+            GUEST_READY_EXEC_TIMEOUT
+        );
+        assert_eq!(
+            readiness_request_timeout(Duration::from_millis(200)),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn readiness_poll_sleep_never_exceeds_the_remaining_deadline() {
+        assert_eq!(
+            readiness_poll_sleep(Duration::from_millis(200)),
+            GUEST_READY_POLL_INTERVAL
+        );
+        assert_eq!(
+            readiness_poll_sleep(Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(readiness_poll_sleep(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn golden_artifact_cleanup_removes_snapshot_and_overlay() {
+        let dir = PathBuf::from(format!("target/golden-artifact-cleanup-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("golden.snap");
+        let overlay = dir.join("golden.overlay");
+        std::fs::write(&snapshot, b"snapshot").expect("write snapshot");
+        std::fs::write(&overlay, b"overlay").expect("write overlay");
+
+        let artifacts = [
+            OwnedArtifact::capture(&snapshot).expect("capture snapshot"),
+            OwnedArtifact::capture(&overlay).expect("capture overlay"),
+        ];
+        cleanup_golden_artifacts(artifacts);
+
+        assert!(!snapshot.exists(), "golden snapshot must be removed");
+        assert!(!overlay.exists(), "golden overlay must be removed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn golden_artifact_cleanup_preserves_replacements() {
+        let dir = PathBuf::from(format!(
+            "target/golden-artifact-replacement-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("vmm-snap-123-456.snap");
+        std::fs::write(&snapshot, b"owned snapshot").expect("write owned snapshot");
+        let artifact = OwnedArtifact::capture(&snapshot).expect("capture owned artifact");
+        std::fs::remove_file(&snapshot).expect("replace owned artifact");
+        std::fs::write(&snapshot, b"replacement").expect("write replacement");
+
+        cleanup_golden_artifacts([artifact]);
+
+        assert_eq!(
+            std::fs::read(&snapshot).expect("replacement survives cleanup"),
+            b"replacement"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn golden_cancellation_removes_registry_entry_and_preserves_replacement() {
+        let dir = PathBuf::from(format!(
+            "target/golden-artifact-cancellation-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("vmm-snap-123-456.snap");
+        std::fs::write(&snapshot, b"owned snapshot").expect("write owned snapshot");
+        let artifact = OwnedArtifact::capture(&snapshot).expect("capture golden artifact");
+        let key = (artifact.path.clone(), artifact.identity());
+        let mut registry = vec![artifact];
+
+        let cancelled = take_matching_artifacts(&mut registry, &[key]);
+        assert!(
+            registry.is_empty(),
+            "cancellation must remove the registry entry"
+        );
+        std::fs::remove_file(&snapshot).expect("replace the cancelled artifact");
+        std::fs::write(&snapshot, b"replacement").expect("write replacement");
+        cleanup_golden_artifacts(cancelled);
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"replacement");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

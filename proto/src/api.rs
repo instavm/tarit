@@ -17,6 +17,20 @@ pub struct VmSpec {
     pub config: VmConfig,
 }
 
+/// Stable Unix file identity used to transfer ownership of VMM scratch files.
+///
+/// The receiver must verify this identity before disarming cleanup; a path on
+/// its own is never proof that it still names the artifact originally created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchIdentity {
+    pub device: u64,
+    pub inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_nanos: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
@@ -27,6 +41,11 @@ pub enum ApiRequest {
     Resume,
     Snapshot {
         diff: bool,
+    },
+    /// Transfer one exact VMM-owned scratch file to the caller.
+    ReleaseScratch {
+        path: String,
+        identity: ScratchIdentity,
     },
     Restore {
         snapshot_path: String,
@@ -219,6 +238,28 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, ApiRequest::Snapshot { diff } if diff));
+    }
+
+    #[test]
+    fn request_release_scratch_round_trips_with_exact_identity() {
+        let r = ApiRequest::ReleaseScratch {
+            path: "/snapshots/vmm-snap-1-2.snap".into(),
+            identity: ScratchIdentity {
+                device: 1,
+                inode: 2,
+                created_secs: Some(3),
+                created_nanos: Some(4),
+            },
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: ApiRequest = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            ApiRequest::ReleaseScratch { path, identity }
+                if path == "/snapshots/vmm-snap-1-2.snap"
+                    && identity.device == 1
+                    && identity.inode == 2
+        ));
     }
 
     #[test]

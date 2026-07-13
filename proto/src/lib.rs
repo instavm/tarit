@@ -5,7 +5,7 @@ pub mod config;
 pub mod pty;
 pub mod state;
 
-pub use api::{ApiRequest, ApiResponse, VmSpec, MAX_API_FRAME_LEN};
+pub use api::{ApiRequest, ApiResponse, ScratchIdentity, VmSpec, MAX_API_FRAME_LEN};
 pub use config::{
     KernelConfig, MemoryConfig, NetConfig, PortForwardConfig, VcpuConfig, VmConfig, VolumeConfig,
 };

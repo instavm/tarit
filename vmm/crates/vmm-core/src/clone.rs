@@ -116,9 +116,6 @@ pub fn clone_fanout(
             }
             Err(e) => {
                 log::warn!("clone {}: failed: {e}", spec.id);
-                if let Some(overlay) = spec.overlay_path.as_deref() {
-                    let _ = std::fs::remove_file(overlay);
-                }
             }
         }
     }
