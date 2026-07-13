@@ -2,15 +2,40 @@
 //! snapshot, restore, exec, attach_pty, ssh_attempt, update_egress) is recorded
 //! as an `AuditEvent` attributed to the acting API key, buffered in the local
 //! outbox, and flushed to the primary store (Postgres) by the usage flusher so
-//! the primary DB is the one source of truth. Recording is fire-and-forget and
-//! never blocks or fails a request.
+//! the primary DB is the one source of truth. Most recording is fire-and-forget;
+//! lifecycle actions that require an audit trail use the synchronous durable
+//! outbox path below.
 
-use uuid::Uuid;
-
+use std::sync::{Arc, Mutex};
+use tarit_store::Store;
 use tarit_types::AuditEvent;
+use uuid::Uuid;
 
 use crate::api::{AppState, StoreWrite};
 use crate::config::ApiIdentity;
+
+/// Synchronous persistence boundary for audit events that must survive before a
+/// caller can mutate share state or receive a token.
+pub(crate) trait DurableAuditOutbox: Send + Sync {
+    fn enqueue(&self, event: &AuditEvent) -> Result<(), ()>;
+}
+
+pub(crate) struct LocalAuditOutbox {
+    store: Arc<Mutex<Store>>,
+}
+
+impl LocalAuditOutbox {
+    pub(crate) fn new(store: Arc<Mutex<Store>>) -> Self {
+        Self { store }
+    }
+}
+
+impl DurableAuditOutbox for LocalAuditOutbox {
+    fn enqueue(&self, event: &AuditEvent) -> Result<(), ()> {
+        let store = self.store.lock().map_err(|_| ())?;
+        store.enqueue_audit(event).map_err(|_| ())
+    }
+}
 
 /// Record an audited action for the acting key. `detail` is a small,
 /// secret-free string (e.g. a fingerprint, a rule count, or an error summary).
@@ -34,6 +59,31 @@ pub fn record(
         created_at: chrono::Utc::now(),
     };
     let _ = state.store_tx.send(StoreWrite::Audit(event));
+}
+
+/// Record an audit event synchronously in the durable local outbox. The fleet
+/// exporter delivers that outbox asynchronously, but callers that require an
+/// audit trail must not rely on a channel enqueue as evidence of persistence.
+pub(crate) fn record_required(
+    state: &AppState,
+    identity: &ApiIdentity,
+    action: &str,
+    vm_id: Option<Uuid>,
+    outcome: &str,
+    detail: Option<String>,
+) -> Result<(), ()> {
+    let event = AuditEvent {
+        id: Uuid::new_v4(),
+        api_key_id: identity.api_key_id.clone(),
+        owner_key: identity.tenant.clone(),
+        host_id: state.config.host_id.clone(),
+        vm_id,
+        action: action.to_string(),
+        outcome: outcome.to_string(),
+        detail,
+        created_at: chrono::Utc::now(),
+    };
+    state.audit_outbox.enqueue(&event)
 }
 
 /// Record an audit event from raw identity parts (used by the SSH gateway,
