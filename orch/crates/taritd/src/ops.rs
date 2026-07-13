@@ -1072,13 +1072,15 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
 
 pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchError> {
     let sup = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || sup.cancel_and_wait_all_owned_tasks())
-        .await
-        .map_err(|error| {
-            OrchError::Internal(format!("cancelled lifecycle wait join: {error}"))
-        })??;
+    let owned_task_failure =
+        match tokio::task::spawn_blocking(move || sup.cancel_and_wait_all_owned_tasks()).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(format!("cancelled lifecycle wait join: {error}")),
+        };
     let _terminal_gate = state.terminal_transition_gate.lock().await;
     let mut failures = retry_pending_lifecycle(state).await;
+    failures.extend(owned_task_failure);
     let sup = Arc::clone(&state.supervisor);
     let outcome = tokio::task::spawn_blocking(move || sup.stop_all())
         .await

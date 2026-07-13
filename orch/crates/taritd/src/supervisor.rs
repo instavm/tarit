@@ -768,9 +768,16 @@ impl VmmSupervisor {
     {
         let control = self.begin_owned_task(id, purpose)?;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let worker_control = Arc::clone(&control);
+        let worker = tokio::spawn(async move { operation(worker_control).await });
         let supervisor = Arc::clone(self);
         tokio::spawn(async move {
-            let result = operation(Arc::clone(&control)).await;
+            let result = match worker.await {
+                Ok(result) => result,
+                Err(error) => Err(OrchError::Internal(format!(
+                    "supervisor-owned lifecycle worker failed: {error}"
+                ))),
+            };
             let completion = match &result {
                 Ok(_) => Ok(()),
                 Err(_) if control.is_cancelled() && control.terminal_converged() => Ok(()),
@@ -1031,6 +1038,45 @@ impl VmmSupervisor {
                 ))),
             );
             error
+        }
+    }
+
+    fn cleanup_boot_join_failure(
+        &self,
+        id: Uuid,
+        context: &str,
+        join_error: tokio::task::JoinError,
+    ) -> OrchError {
+        let cause = OrchError::Internal(format!("{context}: {join_error}"));
+        let booting = self
+            .booting
+            .lock()
+            .ok()
+            .and_then(|booting| booting.get(&id).cloned());
+        let Some(booting) = booting else {
+            return cause;
+        };
+        booting.control.request_cancellation();
+        match self.retry_booting_cleanup(id, &booting) {
+            Ok(()) => {
+                self.complete_booting(id, &booting.control, Ok(()));
+                if booting.purpose == SpawnPurpose::Refill {
+                    self.release_reservation_after_cleanup(id);
+                }
+                cause
+            }
+            Err(cleanup_error) => {
+                self.complete_booting(
+                    id,
+                    &booting.control,
+                    Err(OrchError::Internal(format!(
+                        "{context}; cleanup retained resources: {cleanup_error}"
+                    ))),
+                );
+                OrchError::Internal(format!(
+                    "{cause}; cleanup retained booting VM {id} for retry: {cleanup_error}"
+                ))
+            }
         }
     }
 
@@ -1341,9 +1387,8 @@ impl VmmSupervisor {
 
         let process = ManagedProcess::new(child);
         let pid = process.pid;
-        // Do not expose cancellation completion between spawn and registry
-        // attachment: any cancellation must find the process in `booting`, or
-        // this worker must clean it before it signals completion.
+        // Attach cleanup ownership before observing cancellation. A cancelled
+        // boot must remain retryable if its first teardown attempt fails.
         #[cfg(test)]
         self.wait_after_spawn_before_registry_attachment();
         let attached = self
@@ -1354,15 +1399,18 @@ impl VmmSupervisor {
                 let booting_vm = booting.get_mut(&id).ok_or_else(|| {
                     OrchError::Internal(format!("boot registration disappeared for VM {id}"))
                 })?;
-                if !Arc::ptr_eq(&booting_vm.control, &ticket.control)
-                    || ticket.control.is_cancelled()
-                    || self.is_shutting_down()
-                {
-                    return Err(self.shutdown_error());
+                if !Arc::ptr_eq(&booting_vm.control, &ticket.control) {
+                    return Err(OrchError::Conflict(format!(
+                        "boot registration changed for VM {id}"
+                    )));
                 }
                 booting_vm.socket_path = socket_path.clone();
                 booting_vm.process = Some(process.clone());
-                Ok(())
+                if ticket.control.is_cancelled() || self.is_shutting_down() {
+                    Err(self.shutdown_error())
+                } else {
+                    Ok(())
+                }
             });
         drop(boot_gate);
         let vm = RunningVm {
@@ -1553,9 +1601,8 @@ impl VmmSupervisor {
         }
         let worker = Arc::clone(&self);
         let worker_spec = spec.clone();
-        let booted = tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec))
-            .await
-            .map_err(|error| OrchError::Internal(format!("warm boot task: {error}")));
+        let booted =
+            tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec)).await;
         let booted = match booted {
             Ok(Ok(booted)) => booted,
             Ok(Err(error)) => {
@@ -1564,7 +1611,9 @@ impl VmmSupervisor {
                 }
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(self.cleanup_boot_join_failure(id, "warm boot task", error));
+            }
         };
         if task.is_cancelled() {
             let error = self.discard_booted_vm(booted);
@@ -1576,10 +1625,21 @@ impl VmmSupervisor {
         let socket_path = booted.vm.socket_path.clone();
         let boot_control = Arc::clone(&booted.control);
         let worker = Arc::clone(&self);
-        let ready =
-            tokio::task::spawn_blocking(move || worker.await_ready(&socket_path, &boot_control))
-                .await
-                .map_err(|error| OrchError::Internal(format!("warm readiness task: {error}")))?;
+        let ready = match tokio::task::spawn_blocking(move || {
+            worker.await_ready(&socket_path, &boot_control)
+        })
+        .await
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &booted.control,
+                    &booted.vm,
+                    OrchError::Internal(format!("warm readiness task: {error}")),
+                ));
+            }
+        };
         if let Err(error) = ready {
             let error = self.cleanup_boot_failure(id, &booted.control, &booted.vm, error);
             if task.is_cancelled() && !self.has_retained_boot(id) {
@@ -1626,9 +1686,8 @@ impl VmmSupervisor {
         }
         let worker = Arc::clone(&self);
         let worker_spec = spec.clone();
-        let booted = tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec))
-            .await
-            .map_err(|error| OrchError::Internal(format!("golden boot task: {error}")));
+        let booted =
+            tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec)).await;
         let booted = match booted {
             Ok(Ok(booted)) => booted,
             Ok(Err(error)) => {
@@ -1637,7 +1696,9 @@ impl VmmSupervisor {
                 }
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(self.cleanup_boot_join_failure(id, "golden boot task", error));
+            }
         };
         if task.is_cancelled() {
             let error = self.discard_booted_vm(booted);
@@ -1649,10 +1710,21 @@ impl VmmSupervisor {
         let socket_path = booted.vm.socket_path.clone();
         let boot_control = Arc::clone(&booted.control);
         let worker = Arc::clone(&self);
-        let ready =
-            tokio::task::spawn_blocking(move || worker.await_ready(&socket_path, &boot_control))
-                .await
-                .map_err(|error| OrchError::Internal(format!("golden readiness task: {error}")))?;
+        let ready = match tokio::task::spawn_blocking(move || {
+            worker.await_ready(&socket_path, &boot_control)
+        })
+        .await
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &booted.control,
+                    &booted.vm,
+                    OrchError::Internal(format!("golden readiness task: {error}")),
+                ));
+            }
+        };
         if let Err(error) = ready {
             let error = self.cleanup_boot_failure(id, &booted.control, &booted.vm, error);
             if task.is_cancelled() && !self.has_retained_boot(id) {
@@ -1669,13 +1741,23 @@ impl VmmSupervisor {
             return Err(error);
         }
         let socket_path = booted.vm.socket_path.clone();
-        let snapshot_path = tokio::task::spawn_blocking(move || {
+        let snapshot_path = match tokio::task::spawn_blocking(move || {
             VmmClient::new(&socket_path)
                 .snapshot(false)
                 .map_err(|error| OrchError::Vmm(format!("snapshot golden: {error}")))
         })
         .await
-        .map_err(|error| OrchError::Internal(format!("golden snapshot task: {error}")))?
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &booted.control,
+                    &booted.vm,
+                    OrchError::Internal(format!("golden snapshot task: {error}")),
+                ));
+            }
+        }
         .map_err(|error| self.cleanup_boot_failure(id, &booted.control, &booted.vm, error))?;
         if task.is_cancelled() {
             let error = self.discard_booted_vm(booted);
@@ -1726,8 +1808,7 @@ impl VmmSupervisor {
         let booted = tokio::task::spawn_blocking(move || {
             worker.spawn_and_restore(ticket, &snapshot_path, overlay)
         })
-        .await
-        .map_err(|error| OrchError::Internal(format!("warm restore task: {error}")));
+        .await;
         let booted = match booted {
             Ok(Ok(booted)) => booted,
             Ok(Err(error)) => {
@@ -1736,7 +1817,9 @@ impl VmmSupervisor {
                 }
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(self.cleanup_boot_join_failure(id, "warm restore task", error));
+            }
         };
         if task.is_cancelled() {
             let error = self.discard_booted_vm(booted);
@@ -1748,12 +1831,21 @@ impl VmmSupervisor {
         let socket_path = booted.vm.socket_path.clone();
         let boot_control = Arc::clone(&booted.control);
         let worker = Arc::clone(&self);
-        let ready =
-            tokio::task::spawn_blocking(move || worker.await_ready(&socket_path, &boot_control))
-                .await
-                .map_err(|error| {
-                    OrchError::Internal(format!("warm restore readiness task: {error}"))
-                })?;
+        let ready = match tokio::task::spawn_blocking(move || {
+            worker.await_ready(&socket_path, &boot_control)
+        })
+        .await
+        {
+            Ok(ready) => ready,
+            Err(error) => {
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &booted.control,
+                    &booted.vm,
+                    OrchError::Internal(format!("warm restore readiness task: {error}")),
+                ));
+            }
+        };
         if let Err(error) = ready {
             let error = self.cleanup_boot_failure(id, &booted.control, &booted.vm, error);
             if task.is_cancelled() && !self.has_retained_boot(id) {
@@ -2640,6 +2732,28 @@ mod tests {
                 .expect("completed refill cleanup must not block stop-all");
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn owned_task_panic_completes_waiters_and_releases_registry_entry() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let result: Result<(), OrchError> = test_runtime().block_on({
+            let supervisor = Arc::clone(&supervisor);
+            async move {
+                supervisor
+                    .run_owned_task(id, SpawnPurpose::Refill, |_| async move {
+                        panic!("injected owned task panic");
+                    })
+                    .await
+            }
+        });
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("supervisor-owned lifecycle worker failed"));
+        assert!(!supervisor.has_owned_task(id));
     }
 
     #[test]

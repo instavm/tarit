@@ -537,6 +537,7 @@ tap_for_recorded_vm_from_listing() {
   local vm_id=$1 listing=$2 uplink=$3 chain line slot tap tag guest
   [ -n "$vm_id" ] && [ -n "$uplink" ] || return 1
   while IFS=$'\t' read -r chain line; do
+    [ "$chain" = post ] || continue
     [[ "$line" =~ comment\ \"taritd(-egress|-guard|-input|-recovery-quarantine|-egress-update-quarantine)?\ slot=([0-9]+)\ vm=$vm_id\ tap=(insta[0-9]+)\"\ \#\ handle\ [0-9]+$ ]] ||
       continue
     slot=${BASH_REMATCH[2]}
@@ -565,14 +566,22 @@ tap_for_recorded_vm() {
   tap_for_recorded_vm_from_listing "$vm_id" "$listing" "$uplink"
 }
 
-assert_fallback_tap_parser_rejects_comment_substrings() {
-  local vm_id=00000000-0000-0000-0000-000000000000 malicious
-  malicious="chain post {
+assert_fallback_tap_parser_rejects_non_allocation_rules() {
+  local vm_id=00000000-0000-0000-0000-000000000000 candidate
+  for candidate in \
+    "chain post {
     iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd operator note vm=$vm_id tap=insta7\" # handle 7
-  }"
-  if tap_for_recorded_vm_from_listing "$vm_id" "$malicious" eth0 >/dev/null; then
-    fail "fallback TAP parser accepted a comment substring instead of an exact allocation rule"
-  fi
+  }" \
+    "chain vm_egress {
+    iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$vm_id tap=insta7\" # handle 8
+  }" \
+    "chain vm_input {
+    iifname \"insta7\" drop comment \"taritd-recovery-quarantine slot=7 vm=$vm_id tap=insta7\" # handle 9
+  }"; do
+    if tap_for_recorded_vm_from_listing "$vm_id" "$candidate" eth0 >/dev/null; then
+      fail "fallback TAP parser accepted a non-allocation rule"
+    fi
+  done
 }
 
 cleanup_recorded_tap_policies() {
@@ -968,7 +977,7 @@ forged_source_drop_packets() {
 
 mkdir -p "$TARIT_SOCKET_DIR"
 : >"$TARIT_CONFIG"
-assert_fallback_tap_parser_rejects_comment_substrings
+assert_fallback_tap_parser_rejects_non_allocation_rules
 
 cp -f "$BASE_ROOTFS" "$ROOTFS"
 
