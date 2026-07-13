@@ -1120,11 +1120,15 @@ impl VmmController {
         }
 
         // Check if we have a running VM with a serial channel.
-        let serial_handle = {
+        let (serial_handle, state) = {
             let slot = self.lock();
-            slot.as_ref()
-                .and_then(|vm| vm.running.as_ref())
-                .map(|r| r.vcpu_thread.serial.clone())
+            let vm = slot
+                .as_ref()
+                .ok_or_else(|| VmmError::InvalidConfig("no VM (create first)".into()))?;
+            (
+                vm.running.as_ref().map(|r| r.vcpu_thread.serial.clone()),
+                vm.state,
+            )
         };
 
         if let Some(serial) = serial_handle {
@@ -1198,8 +1202,33 @@ impl VmmController {
             )));
         }
 
-        // Fallback: boot a fresh VM with the command in cmdline.
-        self.exec_fresh_boot(command, timeout_ms)
+        if Self::fresh_boot_exec_allowed(state) {
+            self.exec_fresh_boot(command, timeout_ms)
+        } else {
+            Err(VmmError::Kvm(format!(
+                "exec unavailable without a live guest channel while VM is {state:?}"
+            )))
+        }
+    }
+
+    #[cfg(any(
+        test,
+        all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+    ))]
+    fn fresh_boot_exec_allowed(state: VmState) -> bool {
+        state == VmState::Created
+    }
+
+    #[cfg(any(
+        test,
+        all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+    ))]
+    fn fresh_boot_timeout_secs(timeout_ms: u64) -> u64 {
+        if timeout_ms == 0 {
+            10
+        } else {
+            timeout_ms.div_ceil(1_000)
+        }
     }
 
     /// Fallback exec: boot a fresh VM with the command baked into cmdline.
@@ -1218,11 +1247,7 @@ impl VmmController {
         config.validate()?;
 
         let start = Instant::now();
-        let timeout_secs = if timeout_ms > 0 {
-            timeout_ms / 1000
-        } else {
-            10
-        };
+        let timeout_secs = Self::fresh_boot_timeout_secs(timeout_ms);
         std::env::set_var("VMM_BOOT_TIMEOUT", timeout_secs.to_string());
 
         let mem_size = config.memory.size_bytes()?;
@@ -1756,8 +1781,8 @@ fn copy_dense_restore_overlay(
     test,
     all(target_os = "linux", target_arch = "x86_64", feature = "boot")
 ))]
-fn validate_sparse_extent(data: u64, hole: u64, length: u64) -> std::io::Result<()> {
-    if hole <= data || hole > length {
+fn validate_sparse_extent(offset: u64, data: u64, hole: u64, length: u64) -> std::io::Result<()> {
+    if data < offset || hole <= data || hole > length {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid overlay data extent",
@@ -1838,7 +1863,7 @@ fn copy_sparse_restore_overlay(
                 "negative overlay hole offset",
             )
         })?;
-        validate_sparse_extent(data, hole, length)?;
+        validate_sparse_extent(offset, data, hole, length)?;
 
         source.seek(SeekFrom::Start(data))?;
         target.seek(SeekFrom::Start(data))?;
@@ -3453,10 +3478,35 @@ mod tests {
 
     #[test]
     fn sparse_restore_overlay_rejects_an_empty_data_extent() {
-        let error = validate_sparse_extent(4096, 4096, 8192)
+        let error = validate_sparse_extent(0, 4096, 4096, 8192)
             .expect_err("SEEK_HOLE must advance beyond SEEK_DATA");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sparse_restore_overlay_rejects_a_backward_data_extent() {
+        let error = validate_sparse_extent(4096, 0, 4096, 8192)
+            .expect_err("SEEK_DATA must not move backwards from the current offset");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fresh_boot_exec_is_only_allowed_for_created_vms() {
+        assert!(VmmController::fresh_boot_exec_allowed(VmState::Created));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Running));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Paused));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Suspended));
+        assert!(!VmmController::fresh_boot_exec_allowed(VmState::Stopped));
+    }
+
+    #[test]
+    fn fresh_boot_timeout_rounds_up_to_a_full_second() {
+        assert_eq!(VmmController::fresh_boot_timeout_secs(0), 10);
+        assert_eq!(VmmController::fresh_boot_timeout_secs(1), 1);
+        assert_eq!(VmmController::fresh_boot_timeout_secs(1_000), 1);
+        assert_eq!(VmmController::fresh_boot_timeout_secs(1_001), 2);
     }
 
     #[test]

@@ -554,9 +554,11 @@ impl VmmSupervisor {
     /// Block until the guest agent can actually run a command.
     fn await_ready(&self, socket: &Path, timeout: Duration) -> Result<(), OrchError> {
         wait_for_guest_ready(timeout, |remaining| {
-            let exec_timeout_ms = readiness_exec_timeout_ms(remaining);
-            let client =
-                VmmClient::new(socket).with_connect_timeout(Duration::from_millis(exec_timeout_ms));
+            let request_timeout = readiness_request_timeout(remaining);
+            let exec_timeout_ms = readiness_exec_timeout_ms(request_timeout);
+            let client = VmmClient::new(socket)
+                .with_connect_timeout(request_timeout)
+                .with_request_timeout(request_timeout);
             match client.exec("true", exec_timeout_ms) {
                 Ok((0, _, _, _)) => Ok(true),
                 Ok((code, _, _, _)) => Err(format!("readiness command exited with status {code}")),
@@ -1017,6 +1019,14 @@ fn readiness_exec_timeout_ms(remaining: Duration) -> u64 {
         .max(1)
 }
 
+fn readiness_request_timeout(remaining: Duration) -> Duration {
+    remaining.min(GUEST_READY_EXEC_TIMEOUT)
+}
+
+fn readiness_poll_sleep(remaining: Duration) -> Duration {
+    remaining.min(GUEST_READY_POLL_INTERVAL)
+}
+
 fn wait_for_guest_ready<F>(timeout: Duration, mut probe: F) -> Result<(), String>
 where
     F: FnMut(Duration) -> Result<bool, String>,
@@ -1036,7 +1046,10 @@ where
             }
             Err(error) => last = error,
         }
-        std::thread::sleep(GUEST_READY_POLL_INTERVAL);
+        let sleep = readiness_poll_sleep(deadline.saturating_duration_since(Instant::now()));
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
     }
 
     Err(format!("guest agent never became ready: {last}"))
@@ -1294,6 +1307,31 @@ mod tests {
             "a wedged parked VM must not use the long readiness probe timeout"
         );
         assert_eq!(readiness_exec_timeout_ms(Duration::ZERO), 1);
+    }
+
+    #[test]
+    fn readiness_request_timeout_is_capped_by_the_per_probe_limit() {
+        assert_eq!(
+            readiness_request_timeout(Duration::from_secs(20)),
+            GUEST_READY_EXEC_TIMEOUT
+        );
+        assert_eq!(
+            readiness_request_timeout(Duration::from_millis(200)),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn readiness_poll_sleep_never_exceeds_the_remaining_deadline() {
+        assert_eq!(
+            readiness_poll_sleep(Duration::from_millis(200)),
+            GUEST_READY_POLL_INTERVAL
+        );
+        assert_eq!(
+            readiness_poll_sleep(Duration::from_millis(5)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(readiness_poll_sleep(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]
