@@ -9,14 +9,13 @@
 //! accelerator, never a correctness dependency.
 
 use crate::config::Config;
-use crate::scheduler::Scheduler;
 use crate::supervisor::{VmSpawnConfig, VmmSupervisor};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Spawn the background replenishment loop. No-op unless the pool is enabled.
-pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc<Scheduler>) {
+pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config) {
     if !config.warm_pool.enabled {
         return;
     }
@@ -56,20 +55,10 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                         if let Some(path) = golden.get(&key).cloned() {
                             Some(path)
                         } else {
-                            if !scheduler.try_reserve() {
-                                continue;
-                            }
-                            let sup = Arc::clone(&sup);
                             let golden_sup = Arc::clone(&sup);
-                            let sched = Arc::clone(&scheduler);
                             let class = class.clone();
-                            match tokio::task::spawn_blocking(move || {
-                                golden_sup.create_golden(&class)
-                            })
-                            .await
-                            {
-                                Ok(Ok(path)) => {
-                                    sched.release();
+                            match golden_sup.create_golden(class).await {
+                                Ok(path) => {
                                     did_work = true;
                                     tracing::info!(
                                         vcpus = key.vcpus,
@@ -80,15 +69,8 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                                     );
                                     golden.insert(key, path);
                                 }
-                                Ok(Err(e)) => {
-                                    if !sup.is_shutting_down() {
-                                        sched.release();
-                                    }
-                                    tracing::warn!("warm golden create failed: {e}");
-                                }
                                 Err(e) => {
-                                    sched.release();
-                                    tracing::warn!("warm golden task failed: {e}");
+                                    tracing::warn!("warm golden create failed: {e}");
                                 }
                             }
                             None
@@ -112,19 +94,12 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                     let mut spawned = 0usize;
                     let mut set = tokio::task::JoinSet::new();
                     for _ in 0..to_spawn {
-                        if !scheduler.try_reserve() {
-                            break;
-                        }
                         spawned += 1;
                         let sup = Arc::clone(&sup);
-                        let sched = Arc::clone(&scheduler);
                         let class = class.clone();
                         let snapshot_path = snapshot_path.clone();
-                        set.spawn_blocking(move || {
-                            if let Err(e) = sup.spawn_warm_restore(&class, &snapshot_path) {
-                                if !sup.is_shutting_down() {
-                                    sched.release();
-                                }
+                        set.spawn(async move {
+                            if let Err(e) = sup.spawn_warm_restore(class, snapshot_path).await {
                                 tracing::warn!("warm restore spawn failed: {e}");
                             }
                         });
@@ -143,20 +118,12 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config, scheduler: Arc
                 let mut set = tokio::task::JoinSet::new();
                 loop {
                     while set.len() < conc && remaining > 0 {
-                        if !scheduler.try_reserve() {
-                            remaining = 0;
-                            break;
-                        }
                         remaining -= 1;
                         did_work = true;
                         let sup = Arc::clone(&sup);
-                        let sched = Arc::clone(&scheduler);
                         let class = class.clone();
-                        set.spawn_blocking(move || {
-                            if let Err(e) = sup.spawn_warm(&class) {
-                                if !sup.is_shutting_down() {
-                                    sched.release();
-                                }
+                        set.spawn(async move {
+                            if let Err(e) = sup.spawn_warm(class).await {
                                 tracing::warn!("warm spawn failed: {e}");
                             }
                         });

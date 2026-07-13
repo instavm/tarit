@@ -418,10 +418,23 @@ cleanup_tap_policy() {
         }
       fi
     done < <(awk -v tag="$tag" '
-          $0 ~ ("comment \"taritd(-egress|-guard|-input)? " tag "\"") &&
+          $0 ~ ("comment \"taritd(-egress|-guard|-input|-recovery-quarantine|-egress-update-quarantine)? " tag "\"") &&
           match($0, /# handle [0-9]+$/) {
             print substr($0, RSTART + 9, RLENGTH - 9)
           }' <<<"$listing")
+    listing=$(nft -a list chain ip taritd_nat "$chain") || {
+      echo "WARN: retained policy for $tap because $chain could not be re-listed" >&2
+      cleanup_failed=1
+      continue
+    }
+    if awk -v tag="$tag" '
+          $0 ~ ("comment \"taritd[^ ]* " tag "\"") {
+            found = 1
+          }
+          END { exit !found }' <<<"$listing"; then
+      echo "WARN: retained exact tagged $chain policy for $tap" >&2
+      cleanup_failed=1
+    fi
   done
   if ingress_table_exists "$slot"; then
     if ! assert_managed_ingress_table "$vm_id" "$tap"; then

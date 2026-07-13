@@ -126,17 +126,6 @@ pub async fn peer_rpc(state: &AppState, host_id: &str) -> Result<Option<String>,
     }
 }
 
-/// Record (or update) VM ownership in the fleet map. Non-gated callers retain
-/// the established best-effort behavior; user boot publication uses
-/// `record_ownership_required` below.
-pub async fn record_ownership(state: &AppState, vm: &VmRecord) {
-    if let Some(fleet) = &state.fleet {
-        if let Err(e) = fleet.upsert_vm(vm).await {
-            tracing::warn!(id = %vm.id, "fleet upsert_vm failed: {e}");
-        }
-    }
-}
-
 /// Commit user boot ownership while the boot/shutdown gate is held.
 pub async fn record_ownership_required(state: &AppState, vm: &VmRecord) -> Result<(), OrchError> {
     if let Some(fleet) = &state.fleet {

@@ -91,11 +91,16 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         })
         .map(|vm| vm.id)
         .collect::<Vec<_>>();
-    let supervisor = Arc::new(
-        VmmSupervisor::new_with_live_vms(config.clone(), live_vm_ids, &preflight_taps)
-            .context("initialize fail-closed network recovery")?,
-    );
     let scheduler = Arc::new(Scheduler::new(config.clone()));
+    let supervisor = Arc::new(
+        VmmSupervisor::new_with_live_vms(
+            config.clone(),
+            live_vm_ids,
+            &preflight_taps,
+            Arc::clone(&scheduler),
+        )
+        .context("initialize fail-closed network recovery")?,
+    );
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio
     // context panics on current tokio ("Cannot drop a runtime ... from within
@@ -196,11 +201,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     };
 
     // Start the warm-pool replenisher (no-op unless enabled in config/env).
-    warmpool::spawn_replenisher(
-        Arc::clone(&supervisor),
-        config.clone(),
-        Arc::clone(&scheduler),
-    );
+    warmpool::spawn_replenisher(Arc::clone(&supervisor), config.clone());
 
     let state = AppState {
         config: config.clone(),

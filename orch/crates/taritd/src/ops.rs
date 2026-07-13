@@ -86,7 +86,7 @@ async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<()
     })?
 }
 
-fn persist_running_record_blocking(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+async fn persist_running_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
     let (completion, persisted) = tokio::sync::oneshot::channel();
     state
         .store_tx
@@ -94,16 +94,15 @@ fn persist_running_record_blocking(state: &AppState, record: VmRecord) -> Result
         .map_err(|_| {
             OrchError::Internal("store writer unavailable during boot publication".into())
         })?;
-    persisted.blocking_recv().map_err(|_| {
+    persisted.await.map_err(|_| {
         OrchError::Internal("store writer dropped boot publication confirmation".into())
     })?
 }
 
-fn publish_running_record_blocking(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
-    let runtime = tokio::runtime::Handle::current();
-    runtime.block_on(cluster::record_ownership_required(state, &record))?;
-    if let Err(error) = persist_running_record_blocking(state, record.clone()) {
-        let cleanup = runtime.block_on(cluster::clear_ownership(state, record.id));
+async fn publish_running_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    cluster::record_ownership_required(state, &record).await?;
+    if let Err(error) = persist_running_record(state, record.clone()).await {
+        let cleanup = cluster::clear_ownership(state, record.id).await;
         return match cleanup {
             Ok(()) => Err(error),
             Err(cleanup) => Err(OrchError::Internal(format!(
@@ -152,7 +151,7 @@ async fn finish_pending_stop(state: &AppState, id: Uuid) -> Result<(), OrchError
     }
     commit_vm_record(state, pending.record)?;
     cluster::clear_ownership(state, id).await?;
-    state.scheduler.on_local_vm_stopped();
+    state.supervisor.release_reservation_after_terminal(id)?;
     state
         .pending_stops
         .lock()
@@ -178,11 +177,6 @@ async fn retry_pending_stops(state: &AppState) -> Vec<String> {
 }
 
 fn store_insert(state: &AppState, rec: &VmRecord) -> Result<(), OrchError> {
-    vm_put(state, rec);
-    Ok(())
-}
-
-fn store_update(state: &AppState, rec: &VmRecord) -> Result<(), OrchError> {
     vm_put(state, rec);
     Ok(())
 }
@@ -216,98 +210,94 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
     let warm_enabled = state.config.warm_pool.enabled && req.id.is_none();
 
     if warm_enabled {
-        let sup = Arc::clone(&state.supervisor);
-        let want = spawn_cfg.clone();
-        let taken = tokio::task::spawn_blocking(move || sup.take_warm(&want))
-            .await
-            .map_err(|e| OrchError::Internal(format!("join: {e}")))?;
-        if let Some((id, pid, socket_path)) = taken {
-            let record = running_record(
-                state,
-                &spawn_cfg,
-                id,
-                pid,
-                &socket_path,
-                req.owner_key.clone(),
-                req.api_key_id.clone(),
-                now,
-            );
-            store_insert(state, &record)?;
-            cluster::record_ownership(state, &record).await;
+        let publication_state = state.clone();
+        let publication_cfg = spawn_cfg.clone();
+        let owner_key = req.owner_key.clone();
+        let api_key_id = req.api_key_id.clone();
+        let taken = state
+            .supervisor
+            .take_warm_with_publication(&spawn_cfg, move |id, pid, socket_path| {
+                let record = running_record(
+                    &publication_state,
+                    &publication_cfg,
+                    id,
+                    pid,
+                    &socket_path,
+                    owner_key,
+                    api_key_id,
+                    now,
+                );
+                async move {
+                    publish_running_record(&publication_state, record.clone()).await?;
+                    Ok(record)
+                }
+            })
+            .await?;
+        if let Some(record) = taken {
+            let id = record.id;
             tracing::info!(id = %id, host = %state.config.host_id, "create: warm pool");
             return Ok(record);
         }
     }
 
-    if state.scheduler.try_reserve() {
-        let id = req.id.unwrap_or_else(Uuid::new_v4);
-        let mut record = VmRecord {
-            id,
-            host_id: state.config.host_id.clone(),
-            owner_key: req.owner_key.clone(),
-            api_key_id: req.api_key_id.clone(),
-            status: VmStatus::Creating,
-            memory_mib: spawn_cfg.memory_mib,
-            vcpus: spawn_cfg.vcpus,
-            kernel_path: spawn_cfg.kernel_path.display().to_string(),
-            rootfs_path: spawn_cfg
-                .rootfs_path
-                .as_ref()
-                .map(|p| p.display().to_string()),
-            cmdline: spawn_cfg.cmdline.clone(),
-            socket_path: None,
-            pid: None,
-            created_at: now,
-            updated_at: now,
-        };
-        store_insert(state, &record)?;
-
-        let sup = Arc::clone(&state.supervisor);
-        let cfg = spawn_cfg.clone();
-        let publication_state = state.clone();
-        let publication_record = record.clone();
-        let spawned = tokio::task::spawn_blocking(move || {
-            sup.spawn_vm_with_publication(id, cfg, move |pid, socket_path| {
-                let mut record = publication_record;
-                record.status = VmStatus::Running;
-                record.pid = Some(pid);
-                record.socket_path = Some(socket_path.display().to_string());
-                record.updated_at = Utc::now();
-                publish_running_record_blocking(&publication_state, record.clone())?;
-                Ok(record)
-            })
+    let id = req.id.unwrap_or_else(Uuid::new_v4);
+    let record = VmRecord {
+        id,
+        host_id: state.config.host_id.clone(),
+        owner_key: req.owner_key.clone(),
+        api_key_id: req.api_key_id.clone(),
+        status: VmStatus::Creating,
+        memory_mib: spawn_cfg.memory_mib,
+        vcpus: spawn_cfg.vcpus,
+        kernel_path: spawn_cfg.kernel_path.display().to_string(),
+        rootfs_path: spawn_cfg
+            .rootfs_path
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        cmdline: spawn_cfg.cmdline.clone(),
+        socket_path: None,
+        pid: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let creating_state = state.clone();
+    let creating_record = record.clone();
+    let ticket = state
+        .supervisor
+        .begin_boot(id, crate::supervisor::SpawnPurpose::Live, move || {
+            store_insert(&creating_state, &creating_record)
         })
-        .await;
-        return match spawned {
-            Ok(Ok(record)) => {
-                tracing::info!(id = %id, host = %state.config.host_id, "create: cold start");
+        .await
+        .map_err(|error| match error {
+            OrchError::Overloaded { .. } => overloaded(
+                "host at capacity",
+                retry_after_secs(state.config.admission_timeout_ms),
+            ),
+            error => error,
+        })?;
+    let sup = Arc::clone(&state.supervisor);
+    let cfg = spawn_cfg.clone();
+    let booted = tokio::task::spawn_blocking(move || sup.spawn_vm(ticket, cfg))
+        .await
+        .map_err(|error| OrchError::Internal(format!("create boot task: {error}")))??;
+    let publication_state = state.clone();
+    let publication_record = record.clone();
+    let record = state
+        .supervisor
+        .publish_running_with(booted, move |pid, socket_path| {
+            let mut record = publication_record;
+            record.status = VmStatus::Running;
+            record.pid = Some(pid);
+            record.socket_path = Some(socket_path.display().to_string());
+            record.updated_at = Utc::now();
+            async move {
+                publish_running_record(&publication_state, record.clone()).await?;
                 Ok(record)
             }
-            Ok(Err(e)) => {
-                if !state.supervisor.is_shutting_down() {
-                    record.status = VmStatus::Error;
-                    record.updated_at = Utc::now();
-                    let _ = store_update(state, &record);
-                    state.scheduler.release();
-                }
-                Err(e)
-            }
-            Err(e) => {
-                if !state.supervisor.is_shutting_down() {
-                    record.status = VmStatus::Error;
-                    record.updated_at = Utc::now();
-                    let _ = store_update(state, &record);
-                    state.scheduler.release();
-                }
-                Err(OrchError::Internal(format!("join: {e}")))
-            }
-        };
-    }
-
-    Err(overloaded(
-        "host at capacity",
-        retry_after_secs(state.config.admission_timeout_ms),
-    ))
+        })
+        .await?;
+    tracing::info!(id = %id, host = %state.config.host_id, "create: cold start");
+    Ok(record)
 }
 
 /// Restore a VM from a node-local snapshot file on THIS node. Reserves a slot,
@@ -322,15 +312,9 @@ pub async fn restore_local(
 ) -> Result<VmRecord, OrchError> {
     // R-006: authorize the snapshot before reserving a slot or touching the VMM.
     verify_snapshot_access(state, snapshot_path, owner_key.as_deref(), caller_is_admin)?;
-    if !state.scheduler.try_reserve() {
-        return Err(overloaded(
-            "host at capacity",
-            retry_after_secs(state.config.admission_timeout_ms),
-        ));
-    }
     let id = id.unwrap_or_else(Uuid::new_v4);
     let now = Utc::now();
-    let mut record = VmRecord {
+    let record = VmRecord {
         id,
         host_id: state.config.host_id.clone(),
         owner_key,
@@ -346,47 +330,44 @@ pub async fn restore_local(
         created_at: now,
         updated_at: now,
     };
-    store_insert(state, &record)?;
+    let creating_state = state.clone();
+    let creating_record = record.clone();
+    let ticket = state
+        .supervisor
+        .begin_boot(id, crate::supervisor::SpawnPurpose::Live, move || {
+            store_insert(&creating_state, &creating_record)
+        })
+        .await
+        .map_err(|error| match error {
+            OrchError::Overloaded { .. } => overloaded(
+                "host at capacity",
+                retry_after_secs(state.config.admission_timeout_ms),
+            ),
+            error => error,
+        })?;
     let path = snapshot_path.to_string();
     let sup = Arc::clone(&state.supervisor);
     let publication_state = state.clone();
     let publication_record = record.clone();
-    let spawned = tokio::task::spawn_blocking(move || {
-        sup.restore_vm_with_publication(id, &path, move |pid, socket_path| {
+    let booted = tokio::task::spawn_blocking(move || sup.restore_vm(ticket, path))
+        .await
+        .map_err(|error| OrchError::Internal(format!("restore boot task: {error}")))??;
+    let record = state
+        .supervisor
+        .publish_running_with(booted, move |pid, socket_path| {
             let mut record = publication_record;
             record.status = VmStatus::Running;
             record.pid = Some(pid);
             record.socket_path = Some(socket_path.display().to_string());
             record.updated_at = Utc::now();
-            publish_running_record_blocking(&publication_state, record.clone())?;
-            Ok(record)
+            async move {
+                publish_running_record(&publication_state, record.clone()).await?;
+                Ok(record)
+            }
         })
-    })
-    .await;
-    match spawned {
-        Ok(Ok(record)) => {
-            tracing::info!(id = %id, host = %state.config.host_id, "restore: from snapshot");
-            Ok(record)
-        }
-        Ok(Err(e)) => {
-            if !state.supervisor.is_shutting_down() {
-                record.status = VmStatus::Error;
-                record.updated_at = Utc::now();
-                let _ = store_update(state, &record);
-                state.scheduler.release();
-            }
-            Err(e)
-        }
-        Err(e) => {
-            if !state.supervisor.is_shutting_down() {
-                record.status = VmStatus::Error;
-                record.updated_at = Utc::now();
-                let _ = store_update(state, &record);
-                state.scheduler.release();
-            }
-            Err(OrchError::Internal(format!("join: {e}")))
-        }
-    }
+        .await?;
+    tracing::info!(id = %id, host = %state.config.host_id, "restore: from snapshot");
+    Ok(record)
 }
 
 pub async fn exec_local(
@@ -432,7 +413,10 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
         .map_err(|e| OrchError::Internal(format!("join: {e}")))?;
     let (summary, failure) = match outcome {
         Ok(summary) => (summary, None),
-        Err(failure) => (failure.summary, Some(failure.error)),
+        Err(failure) => {
+            let failure = *failure;
+            (failure.summary, Some(failure.error))
+        }
     };
 
     failures.extend(failure.into_iter().map(|error| error.to_string()));
@@ -465,8 +449,16 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
             ));
         }
     }
-    for _ in 0..summary.warm + summary.internal_booting {
-        state.scheduler.on_local_vm_stopped();
+    for id in summary
+        .warm_ids
+        .iter()
+        .chain(summary.internal_booting_ids.iter())
+    {
+        if let Err(error) = state.supervisor.release_reservation_after_terminal(*id) {
+            failures.push(format!(
+                "VM {id} shutdown cleanup retained scheduler reservation: {error}"
+            ));
+        }
     }
 
     if failures.is_empty() {
@@ -617,7 +609,7 @@ mod tests {
     fn ordinary_delete_writer_failure_keeps_a_retryable_transition_and_reservation() {
         let (state, mut writes) = test_state_with_durable_writer();
         let id = insert_running_vm(&state);
-        assert!(state.scheduler.try_reserve());
+        state.supervisor.reserve_existing_for_test(id);
         let runtime = test_runtime();
         runtime.block_on(async {
             let writer = tokio::spawn(async move {
@@ -647,7 +639,7 @@ mod tests {
     fn later_stop_retries_pending_persistence_without_releasing_early() {
         let (state, mut writes) = test_state_with_durable_writer();
         let id = insert_running_vm(&state);
-        assert!(state.scheduler.try_reserve());
+        state.supervisor.reserve_existing_for_test(id);
         let durable_attempts = Arc::new(AtomicUsize::new(0));
         let writer_attempts = Arc::clone(&durable_attempts);
         let runtime = test_runtime();
@@ -725,6 +717,16 @@ mod tests {
             ssh_gateway_host_key_path: PathBuf::from("target/taritd-ops-test/ssh_host"),
         };
         let (store_tx, store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let scheduler = Arc::new(Scheduler::new(config.clone()));
+        let supervisor = Arc::new(
+            VmmSupervisor::new_with_live_vms(
+                config.clone(),
+                std::iter::empty(),
+                &[],
+                Arc::clone(&scheduler),
+            )
+            .unwrap(),
+        );
         (
             AppState {
                 config: config.clone(),
@@ -735,8 +737,8 @@ mod tests {
                 pending_stops: Arc::new(Mutex::new(HashMap::new())),
                 terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
                 pty_registry: Arc::new(PtyRegistry::default()),
-                supervisor: Arc::new(VmmSupervisor::new(config.clone())),
-                scheduler: Arc::new(Scheduler::new(config)),
+                supervisor,
+                scheduler,
                 peer: Arc::new(PeerClient::new("peer-secret".into())),
                 fleet: None,
                 metrics: Arc::new(Metrics::default()),
