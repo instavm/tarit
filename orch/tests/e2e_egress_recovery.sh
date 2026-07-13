@@ -381,42 +381,68 @@ raise SystemExit(0 if tokens[index:] == ["}", "}"] else 1)
 ' "$slot" "$vm_id" "$tap" <<<"$listing"
 }
 
+guest_ip_for_slot() {
+  local slot=$1 base b2 b3
+  [ "$slot" -ge 0 ] 2>/dev/null && [ "$slot" -lt 16384 ] || return 1
+  base=$((slot * 4))
+  b2=$((base >> 8))
+  b3=$((base & 255))
+  printf '172.16.%s.%s\n' "$b2" "$((b3 + 2))"
+}
+
+cleanup_expected_uplink() {
+  ip route get "$EGRESS_TEST_IP" 2>/dev/null |
+    awk '/ dev / { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
 recognized_managed_cleanup_rule() {
-  local chain=$1 line=$2 tap=$3 tag=$4 rule ipv4='([0-9]{1,3}\.){3}[0-9]{1,3}'
+  local chain=$1 line=$2 tap=$3 tag=$4 guest=$5 uplink=$6 rule
   [[ "$line" =~ \#\ handle\ [0-9]+$ ]] || return 1
   rule=${line%% \# handle *}
   rule=$(normalize_nft_counter "$rule")
   case "$chain" in
     post)
-      [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ $ipv4\ oifname\ \"[^\"]+\"\ masquerade\ comment\ \"taritd\ $tag\"$ ]]
+      [[ "$rule" == "iifname \"$tap\" ip saddr $guest oifname \"$uplink\" masquerade comment \"taritd $tag\"" ]]
       ;;
     vm_egress)
-      [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ \!=\ $ipv4\ counter\ drop\ comment\ \"taritd-guard\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ $ipv4\ ip\ daddr\ 172\.16\.0\.0/16\ drop\ comment\ \"taritd-guard\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ $ipv4\ oifname\ \!=\ \"[^\"]+\"\ drop\ comment\ \"taritd-guard\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ $ipv4\ ct\ state\ established,related\ accept\ comment\ \"taritd-egress\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ $ipv4\ ip\ daddr\ $ipv4/32\ tcp\ dport\ [0-9]+\ accept\ comment\ \"taritd-egress\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ $ipv4\ drop\ comment\ \"taritd-egress\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ drop\ comment\ \"taritd-recovery-quarantine\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ drop\ comment\ \"taritd-egress-update-quarantine\ $tag\"$ ]]
+      [[ "$rule" == "iifname \"$tap\" ip saddr != $guest counter drop comment \"taritd-guard $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop comment \"taritd-guard $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ip saddr $guest oifname != \"$uplink\" drop comment \"taritd-guard $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ip saddr $guest ct state established,related accept comment \"taritd-egress $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ip saddr $guest drop comment \"taritd-egress $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-recovery-quarantine $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-egress-update-quarantine $tag\"" ]]
       ;;
     vm_input)
-      [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ saddr\ \!=\ $ipv4\ counter\ drop\ comment\ \"taritd-input\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ ct\ state\ established,related\ accept\ comment\ \"taritd-input\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ ip\ drop\ comment\ \"taritd-input\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ drop\ comment\ \"taritd-recovery-quarantine\ $tag\"$ ]] ||
-        [[ "$rule" =~ ^iifname\ \"$tap\"\ drop\ comment\ \"taritd-egress-update-quarantine\ $tag\"$ ]]
+      [[ "$rule" == "iifname \"$tap\" ip saddr != $guest counter drop comment \"taritd-input $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ct state established,related accept comment \"taritd-input $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ip drop comment \"taritd-input $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-recovery-quarantine $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-egress-update-quarantine $tag\"" ]]
       ;;
     *) return 1 ;;
   esac
 }
 
 cleanup_tap_policy() {
-  local vm_id=$1 tap=$2 slot chain handle line tag listing cleanup_failed=0 present_status
+  local vm_id=$1 tap=$2 slot chain handle line tag listing cleanup_failed=0 present_status guest uplink table tables
   [ -n "$vm_id" ] && [ -n "$tap" ] || return
   slot=${tap#insta}
   [ "$slot" != "$tap" ] && [ "$slot" -ge 0 ] 2>/dev/null || return
   tag="slot=$slot vm=$vm_id tap=$tap"
+  guest=$(guest_ip_for_slot "$slot") || {
+    echo "WARN: retained policy for $tap because its derived guest IP is invalid" >&2
+    return 1
+  }
+  uplink=$(cleanup_expected_uplink) || {
+    echo "WARN: retained policy for $tap because the expected uplink could not be derived" >&2
+    return 1
+  }
+  [ -n "$uplink" ] || {
+    echo "WARN: retained policy for $tap because the expected uplink is empty" >&2
+    return 1
+  }
   if tap_is_present "$tap"; then
     if ! ip link set "$tap" down >/dev/null 2>&1 ||
       ! ip link del "$tap" >/dev/null 2>&1; then
@@ -434,58 +460,76 @@ cleanup_tap_policy() {
       return 1
     fi
   fi
-  for chain in post vm_egress vm_input; do
-    listing=$(nft -a list chain ip taritd_nat "$chain") || {
-      echo "WARN: retained policy for $tap because $chain could not be listed" >&2
+  listing=$(nft -a list table ip taritd_nat) || {
+    echo "WARN: retained policy for $tap because taritd_nat could not be listed" >&2
+    return 1
+  }
+  while IFS=$'\t' read -r chain handle line; do
+    [ -n "$handle" ] || continue
+    if ! recognized_managed_cleanup_rule "$chain" "$line" "$tap" "$tag" "$guest" "$uplink"; then
+      echo "WARN: retained unrecognized exact tagged $chain policy for $tap" >&2
       cleanup_failed=1
       continue
-    }
-    while IFS=$'\t' read -r handle line; do
-      if [ -n "$handle" ]; then
-        if ! recognized_managed_cleanup_rule "$chain" "$line" "$tap" "$tag"; then
-          echo "WARN: retained unrecognized exact tagged $chain policy for $tap" >&2
-          cleanup_failed=1
-          continue
-        fi
-        nft delete rule ip taritd_nat "$chain" handle "$handle" >/dev/null 2>&1 || {
-            echo "WARN: could not remove exact $chain policy for $tap" >&2
-            cleanup_failed=1
-          }
-      fi
-    done < <(awk -v tag="$tag" '
-          index($0, tag) &&
-          match($0, /# handle [0-9]+$/) {
-            print substr($0, RSTART + 9, RLENGTH - 9) "\t" $0
-          }' <<<"$listing")
-    listing=$(nft -a list chain ip taritd_nat "$chain") || {
-      echo "WARN: retained policy for $tap because $chain could not be re-listed" >&2
-      cleanup_failed=1
-      continue
-    }
-    if awk -v tag="$tag" '
-          index($0, tag) {
-            found = 1
-          }
-          END { exit !found }' <<<"$listing"; then
-      echo "WARN: retained exact tagged $chain policy for $tap" >&2
-      cleanup_failed=1
     fi
-  done
-  if ingress_table_exists "$slot"; then
-    if ! assert_managed_ingress_table "$vm_id" "$tap"; then
-      echo "WARN: retained ingress table for $tap because its full managed shape did not validate" >&2
+    nft delete rule ip taritd_nat "$chain" handle "$handle" >/dev/null 2>&1 || {
+      echo "WARN: could not remove exact $chain policy for $tap" >&2
       cleanup_failed=1
-    elif ! nft delete table netdev "taritd_ingress_$slot" >/dev/null 2>&1; then
+    }
+  done < <(awk -v tag="$tag" '
+        /^[[:space:]]*chain[[:space:]]+[^[:space:]]+[[:space:]]*\{/ {
+          chain = $2
+        }
+        index($0, tag) && chain != "" && match($0, /# handle [0-9]+$/) {
+          print chain "\t" substr($0, RSTART + 9, RLENGTH - 9) "\t" $0
+        }' <<<"$listing")
+  listing=$(nft -a list table ip taritd_nat) || {
+    echo "WARN: retained policy for $tap because taritd_nat could not be re-listed" >&2
+    cleanup_failed=1
+  }
+  if grep -F -- "$tag" <<<"$listing" >/dev/null; then
+    echo "WARN: retained exact tagged taritd_nat policy for $tap" >&2
+    cleanup_failed=1
+  fi
+
+  tables=$(nft list tables netdev) || {
+    echo "WARN: retained ingress policy for $tap because netdev tables could not be listed" >&2
+    return 1
+  }
+  while IFS= read -r table; do
+    [ -n "$table" ] || continue
+    listing=$(nft -a list table netdev "$table") || {
+      echo "WARN: retained ingress policy for $tap because netdev table $table could not be listed" >&2
+      cleanup_failed=1
+      continue
+    }
+    if ! grep -F -- "$tag" <<<"$listing" >/dev/null; then
+      continue
+    fi
+    if [ "$table" != "taritd_ingress_$slot" ] ||
+      ! assert_managed_ingress_table "$vm_id" "$tap"; then
+      echo "WARN: retained netdev policy for $tap because its full managed shape did not validate" >&2
+      cleanup_failed=1
+      continue
+    fi
+    nft delete table netdev "$table" >/dev/null 2>&1 || {
       echo "WARN: could not remove exact ingress policy for $tap" >&2
       cleanup_failed=1
-    fi
-  else
-    present_status=$?
-    if [ "$present_status" -ne 1 ]; then
-      echo "WARN: retained ingress policy for $tap because its table could not be listed" >&2
+    }
+  done < <(awk '$1 == "table" && $2 == "netdev" { print $3 }' <<<"$tables")
+  tables=$(nft list tables netdev) || {
+    echo "WARN: retained ingress policy for $tap because netdev tables could not be re-listed" >&2
+    return 1
+  }
+  while IFS= read -r table; do
+    listing=$(nft -a list table netdev "$table") || {
+      cleanup_failed=1
+      continue
+    }
+    if grep -F -- "$tag" <<<"$listing" >/dev/null; then
+      echo "WARN: retained exact tagged netdev policy for $tap in $table" >&2
       cleanup_failed=1
     fi
-  fi
+  done < <(awk '$1 == "table" && $2 == "netdev" { print $3 }' <<<"$tables")
   return "$cleanup_failed"
 }
 

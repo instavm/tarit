@@ -12,15 +12,17 @@ use chrono::Utc;
 use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStatus};
 use uuid::Uuid;
 
-#[cfg(test)]
-use crate::api::LifecycleFault;
 use crate::api::{
     running_record, AppState, CreatingPhase, LifecycleState, PublicationPhase, StoreWrite,
     TerminalPhase,
 };
+#[cfg(test)]
+use crate::api::{LifecycleFault, LifecyclePause, LifecyclePauseControl};
 use crate::cluster;
 use crate::image;
-use crate::supervisor::{PublicationFailure, ShutdownSummary, VmSpawnConfig, VmmSupervisor};
+use crate::supervisor::{
+    PublicationFailure, ShutdownSummary, VmSpawnConfig, VmmSupervisor, WarmClaimOutcome,
+};
 
 fn vm_get(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
     state
@@ -130,6 +132,57 @@ fn set_lifecycle_state(
     Ok(())
 }
 
+/// Keeps cancellation of a request future from stranding an in-flight lifecycle
+/// behind an uncompleted boot waiter. It only records abandonment and wakes the
+/// synchronous teardown owner; it never performs async cleanup from `Drop`.
+struct LifecycleAbandonmentGuard {
+    state: AppState,
+    id: Arc<std::sync::Mutex<Option<Uuid>>>,
+    armed: bool,
+}
+
+impl LifecycleAbandonmentGuard {
+    fn new(state: &AppState, id: Option<Uuid>) -> Self {
+        Self {
+            state: state.clone(),
+            id: Arc::new(std::sync::Mutex::new(id)),
+            armed: true,
+        }
+    }
+
+    fn id_handle(&self) -> Arc<std::sync::Mutex<Option<Uuid>>> {
+        Arc::clone(&self.id)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LifecycleAbandonmentGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(id) = self.id.lock().ok().and_then(|id| *id) else {
+            return;
+        };
+        if let Ok(mut lifecycle) = self.state.lifecycle.lock() {
+            if let Some(current) = lifecycle.get(&id).cloned() {
+                match current {
+                    LifecycleState::Creating { record, .. }
+                    | LifecycleState::Publishing { record, .. }
+                    | LifecycleState::Running { record } => {
+                        lifecycle.insert(id, LifecycleState::Abandoned { record });
+                    }
+                    LifecycleState::Abandoned { .. } | LifecycleState::Terminal { .. } => {}
+                }
+            }
+        }
+        self.state.supervisor.abandon_lifecycle(id);
+    }
+}
+
 fn terminal_record(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecord, OrchError> {
     let mut record = lifecycle_state(state, id)?
         .map(|lifecycle| lifecycle.record().clone())
@@ -171,6 +224,62 @@ async fn register_creating_record(state: &AppState, record: VmRecord) -> Result<
     )
 }
 
+async fn register_warm_creating_record(
+    state: &AppState,
+    record: VmRecord,
+) -> Result<(), OrchError> {
+    let id = record.id;
+    let Err(error) = register_creating_record(state, record).await else {
+        return Ok(());
+    };
+
+    // A warm VM remains parked until all Creating ownership is durable and
+    // routable. Undo every partial user-visible registration on failure without
+    // releasing the warm reservation, so the exact warm VM remains reusable.
+    let rollback = async {
+        clear_lifecycle_ownership(state, id).await?;
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .delete_vm(id)
+            .map_err(crate::api::store_err)?;
+        state
+            .vm_cache
+            .write()
+            .map_err(|_| OrchError::Internal("vm cache".into()))?
+            .remove(&id);
+        state
+            .lifecycle
+            .lock()
+            .map_err(|_| OrchError::Internal("lifecycle state lock poisoned".into()))?
+            .remove(&id);
+        Ok::<(), OrchError>(())
+    }
+    .await;
+    match rollback {
+        Ok(()) => Err(error),
+        Err(rollback_error) => {
+            // The registry must retain the warm VM for terminal cleanup when an
+            // externally visible partial claim cannot be withdrawn.
+            if let Ok(mut lifecycle) = state.lifecycle.lock() {
+                if let Some(current) = lifecycle.get(&id).cloned() {
+                    lifecycle.insert(
+                        id,
+                        LifecycleState::Abandoned {
+                            record: current.record().clone(),
+                        },
+                    );
+                }
+            }
+            state.supervisor.abandon_lifecycle(id);
+            Err(OrchError::Internal(format!(
+                "{error}; warm Creating registration rollback retained lifecycle: {rollback_error}"
+            )))
+        }
+    }
+}
+
 async fn update_creating_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
     let id = record.id;
     commit_vm_record(state, record.clone())?;
@@ -200,6 +309,8 @@ async fn publish_running_record(
         },
     )
     .map_err(PublicationFailure)?;
+    #[cfg(test)]
+    wait_lifecycle_pause(state, LifecyclePause::Fleet).await;
     claim_lifecycle_ownership(state, &record)
         .await
         .map_err(PublicationFailure)?;
@@ -212,6 +323,8 @@ async fn publish_running_record(
         },
     )
     .map_err(PublicationFailure)?;
+    #[cfg(test)]
+    wait_lifecycle_pause(state, LifecyclePause::SQLite).await;
     persist_running_record(state, record.clone())
         .await
         .map_err(PublicationFailure)?;
@@ -224,6 +337,8 @@ async fn publish_running_record(
         },
     )
     .map_err(PublicationFailure)?;
+    #[cfg(test)]
+    wait_lifecycle_pause(state, LifecyclePause::Cache).await;
     commit_vm_record(state, record.clone()).map_err(PublicationFailure)?;
     set_lifecycle_state(
         state,
@@ -408,7 +523,9 @@ async fn retry_pending_lifecycle(state: &AppState) -> Vec<String> {
         let result = match lifecycle {
             LifecycleState::Publishing { .. } => finish_publication(state, id).await,
             LifecycleState::Terminal { .. } => finish_terminal_transition(state, id).await,
-            LifecycleState::Creating { .. } | LifecycleState::Running { .. } => continue,
+            LifecycleState::Creating { .. }
+            | LifecycleState::Running { .. }
+            | LifecycleState::Abandoned { .. } => continue,
         };
         if let Err(error) = result {
             failures.push(format!(
@@ -472,6 +589,7 @@ async fn fail_create_or_restore(
 pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmRecord, OrchError> {
     let now = Utc::now();
     let id = req.id.unwrap_or_else(Uuid::new_v4);
+    let mut abandonment = LifecycleAbandonmentGuard::new(state, Some(id));
     let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
     let warm_enabled = state.config.warm_pool.enabled && req.id.is_none() && req.image.is_none();
 
@@ -484,8 +602,7 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
         let registration_cfg = unverified_cfg.clone();
         let registration_owner = req.owner_key.clone();
         let registration_api_key = req.api_key_id.clone();
-        let registered_warm_id = Arc::new(std::sync::Mutex::new(None));
-        let registered_warm_id_for_callback = Arc::clone(&registered_warm_id);
+        let registration_abandoned_id = abandonment.id_handle();
         let taken = state
             .supervisor
             .take_warm_with_publication(
@@ -500,13 +617,12 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
                         registration_api_key,
                         now,
                     );
-                    let registered_warm_id = Arc::clone(&registered_warm_id_for_callback);
+                    let registration_abandoned_id = Arc::clone(&registration_abandoned_id);
                     async move {
-                        *registered_warm_id
-                            .lock()
-                            .map_err(|_| OrchError::Internal("warm registration lock".into()))? =
-                            Some(warm_id);
-                        register_creating_record(&registration_state, record).await
+                        *registration_abandoned_id.lock().map_err(|_| {
+                            OrchError::Internal("warm abandonment registration lock".into())
+                        })? = Some(warm_id);
+                        register_warm_creating_record(&registration_state, record).await
                     }
                 },
                 move |id, pid, socket_path| {
@@ -527,29 +643,23 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
                 },
             )
             .await;
-        let taken = match taken {
-            Ok(taken) => taken,
-            Err(error) => {
-                let failed_warm_id = *registered_warm_id
-                    .lock()
-                    .map_err(|_| OrchError::Internal("warm registration lock".into()))?;
-                if let Some(warm_id) = failed_warm_id {
-                    let _terminal_gate = state.terminal_transition_gate.lock().await;
-                    start_terminal_transition(state, warm_id, VmStatus::Error, false)?;
-                    if let Err(cleanup) = finish_terminal_transition(state, warm_id).await {
-                        return Err(OrchError::Internal(format!(
-                            "{error}; retained warm Creating lifecycle for terminal retry: {cleanup}"
-                        )));
-                    }
-                }
+        match taken? {
+            WarmClaimOutcome::Published(record) => {
+                mark_running(state, record.clone())?;
+                abandonment.disarm();
+                let id = record.id;
+                tracing::info!(id = %id, host = %state.config.host_id, "create: warm pool");
+                return Ok(record);
+            }
+            WarmClaimOutcome::NoMatch => {}
+            WarmClaimOutcome::PreRuntimeFailure(error) => {
+                abandonment.disarm();
                 return Err(error);
             }
-        };
-        if let Some(record) = taken {
-            mark_running(state, record.clone())?;
-            let id = record.id;
-            tracing::info!(id = %id, host = %state.config.host_id, "create: warm pool");
-            return Ok(record);
+            WarmClaimOutcome::RetainedPublicationFailure(error) => {
+                abandonment.disarm();
+                return Err(error);
+            }
         }
     }
 
@@ -633,7 +743,7 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
     };
     let publication_state = state.clone();
     let publication_record = record.clone();
-    let record = state
+    let record = match state
         .supervisor
         .publish_running_with(booted, move |pid, socket_path| {
             let mut record = publication_record;
@@ -646,8 +756,19 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
                 Ok(record)
             }
         })
-        .await?;
-    mark_running(state, record.clone())?;
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            abandonment.disarm();
+            return Err(error);
+        }
+    };
+    if let Err(error) = mark_running(state, record.clone()) {
+        abandonment.disarm();
+        return Err(error);
+    }
+    abandonment.disarm();
     tracing::info!(id = %id, host = %state.config.host_id, "create: cold start");
     Ok(record)
 }
@@ -663,6 +784,7 @@ pub async fn restore_local(
     caller_is_admin: bool,
 ) -> Result<VmRecord, OrchError> {
     let id = id.unwrap_or_else(Uuid::new_v4);
+    let mut abandonment = LifecycleAbandonmentGuard::new(state, Some(id));
     let now = Utc::now();
     let record = VmRecord {
         id,
@@ -730,7 +852,7 @@ pub async fn restore_local(
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
-    let record = state
+    let record = match state
         .supervisor
         .publish_running_with(booted, move |pid, socket_path| {
             let mut record = publication_record;
@@ -743,8 +865,19 @@ pub async fn restore_local(
                 Ok(record)
             }
         })
-        .await?;
-    mark_running(state, record.clone())?;
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            abandonment.disarm();
+            return Err(error);
+        }
+    };
+    if let Err(error) = mark_running(state, record.clone()) {
+        abandonment.disarm();
+        return Err(error);
+    }
+    abandonment.disarm();
     tracing::info!(id = %id, host = %state.config.host_id, "restore: from snapshot");
     Ok(record)
 }
@@ -769,7 +902,12 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
             return finish_terminal_transition(state, id).await
         }
         Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
-        Some(LifecycleState::Creating { .. } | LifecycleState::Running { .. }) | None => {}
+        Some(
+            LifecycleState::Creating { .. }
+            | LifecycleState::Running { .. }
+            | LifecycleState::Abandoned { .. },
+        )
+        | None => {}
     }
     // Bill the final runtime interval before teardown, while the VM record (and
     // its owning key) is still in the cache, then drop its watermark.
@@ -977,6 +1115,30 @@ fn inject_lifecycle_fault(state: &AppState, fault: LifecycleFault) {
 }
 
 #[cfg(test)]
+async fn wait_lifecycle_pause(state: &AppState, pause: LifecyclePause) {
+    let control = state
+        .lifecycle_pauses
+        .lock()
+        .ok()
+        .and_then(|pauses| pauses.get(&pause).cloned());
+    if let Some(control) = control {
+        control.entered.notify_one();
+        control.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn pause_lifecycle(state: &AppState, pause: LifecyclePause) -> LifecyclePauseControl {
+    let control = LifecyclePauseControl::default();
+    state
+        .lifecycle_pauses
+        .lock()
+        .unwrap()
+        .insert(pause, control.clone());
+    control
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
@@ -1132,6 +1294,369 @@ mod tests {
     }
 
     #[test]
+    fn warm_publication_failures_retain_the_live_vm_and_retry_ownership() {
+        let (state, writes) = test_state_with_durable_writer();
+        let writes = Arc::new(tokio::sync::Mutex::new(writes));
+        let warm_cfg = VmSpawnConfig {
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: PathBuf::from("kernel"),
+            rootfs_path: Some(PathBuf::from("rootfs")),
+            cmdline: "console=ttyS0".into(),
+            read_only: false,
+        };
+        let runtime = test_runtime();
+
+        runtime.block_on(async {
+            for (index, (fault, expected_phase)) in [
+                (
+                    LifecycleFault::FleetClaim,
+                    PublicationPhase::NeedFleetUpdate,
+                ),
+                (LifecycleFault::SQLite, PublicationPhase::FleetUpdated),
+                (
+                    LifecycleFault::CacheCommit,
+                    PublicationPhase::SQLitePersisted,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = Uuid::new_v4();
+                state
+                    .supervisor
+                    .seed_warm_for_test(id, warm_cfg.clone())
+                    .unwrap();
+                let record = running_record(
+                    &state,
+                    &warm_cfg,
+                    id,
+                    1,
+                    &PathBuf::from(format!("warm-publication-{id}.sock")),
+                    None,
+                    None,
+                    Utc::now(),
+                );
+                set_lifecycle_state(
+                    &state,
+                    id,
+                    LifecycleState::Creating {
+                        record: record.clone(),
+                        phase: CreatingPhase::FleetClaimed,
+                    },
+                )
+                .unwrap();
+                inject_lifecycle_fault(&state, fault);
+                let writer = if fault == LifecycleFault::CacheCommit {
+                    let writes = Arc::clone(&writes);
+                    Some(tokio::spawn(async move {
+                        let StoreWrite::VmDurable(_, completion) =
+                            writes.lock().await.recv().await.unwrap()
+                        else {
+                            panic!("warm publication must use durable SQLite");
+                        };
+                        completion.send(Ok(())).unwrap();
+                    }))
+                } else {
+                    None
+                };
+                let publication_state = state.clone();
+                let publication_record = record.clone();
+                let outcome = state
+                    .supervisor
+                    .take_warm_with_publication(
+                        &warm_cfg,
+                        |_| async { Ok(()) },
+                        move |_, _, _| async move {
+                            publish_running_record(&publication_state, publication_record).await?;
+                            Ok(())
+                        },
+                    )
+                    .await
+                    .unwrap();
+                if let Some(writer) = writer {
+                    writer.await.unwrap();
+                }
+
+                assert!(matches!(
+                    outcome,
+                    WarmClaimOutcome::RetainedPublicationFailure(_)
+                ));
+                assert!(state.supervisor.is_running(id));
+                assert_eq!(state.supervisor.warm_count(1, 256), 0);
+                assert_eq!(
+                    state.scheduler.local_capacity(1, 1).sandbox_count,
+                    index + 1
+                );
+                assert!(matches!(
+                    lifecycle_state(&state, id).unwrap(),
+                    Some(LifecycleState::Publishing { phase, .. }) if phase == expected_phase
+                ));
+            }
+        });
+        drop(runtime);
+        drop(state);
+    }
+
+    #[test]
+    fn aborting_warm_sqlite_publication_unblocks_delete_without_running_resurrection() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let warm_cfg = VmSpawnConfig {
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: PathBuf::from("kernel"),
+            rootfs_path: Some(PathBuf::from("rootfs")),
+            cmdline: "console=ttyS0".into(),
+            read_only: false,
+        };
+        let id = Uuid::new_v4();
+        state
+            .supervisor
+            .seed_warm_for_test(id, warm_cfg.clone())
+            .unwrap();
+        let record = running_record(
+            &state,
+            &warm_cfg,
+            id,
+            1,
+            &PathBuf::from(format!("warm-abandon-{id}.sock")),
+            None,
+            None,
+            Utc::now(),
+        );
+        let runtime = test_runtime();
+
+        runtime.block_on(async {
+            let task_state = state.clone();
+            let task_supervisor = Arc::clone(&state.supervisor);
+            let task_record = record.clone();
+            let task_cfg = warm_cfg.clone();
+            let publication = tokio::spawn(async move {
+                let _abandonment = LifecycleAbandonmentGuard::new(&task_state, Some(id));
+                let registration_state = task_state.clone();
+                let registration_record = task_record.clone();
+                let publication_state = task_state.clone();
+                task_supervisor
+                    .take_warm_with_publication(
+                        &task_cfg,
+                        move |_| async move {
+                            set_lifecycle_state(
+                                &registration_state,
+                                id,
+                                LifecycleState::Creating {
+                                    record: registration_record,
+                                    phase: CreatingPhase::FleetClaimed,
+                                },
+                            )
+                        },
+                        move |_, _, _| async move {
+                            publish_running_record(&publication_state, task_record).await?;
+                            Ok(())
+                        },
+                    )
+                    .await
+            });
+
+            let StoreWrite::VmDurable(_, publication_completion) = writes.recv().await.unwrap()
+            else {
+                panic!("warm publication must await durable SQLite");
+            };
+            publication.abort();
+            assert!(matches!(publication.await, Err(error) if error.is_cancelled()));
+            drop(publication_completion);
+
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Abandoned { .. })
+            ));
+            assert!(state.supervisor.is_running(id));
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+
+            let writer = tokio::spawn(async move {
+                let StoreWrite::VmDurable(_, completion) = writes.recv().await.unwrap() else {
+                    panic!("abandoned delete must durably persist its terminal record");
+                };
+                completion.send(Ok(())).unwrap();
+            });
+            stop_local(&state, id)
+                .await
+                .expect("DELETE must converge an abandoned publication");
+            writer.await.unwrap();
+
+            assert!(lifecycle_state(&state, id).unwrap().is_none());
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+            assert!(!state.supervisor.is_running(id));
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+        });
+        drop(runtime);
+        drop(state);
+    }
+
+    #[test]
+    fn aborting_warm_publication_at_every_boundary_leaves_terminal_cleanup_ownership() {
+        let runtime = test_runtime();
+        for pause in [
+            LifecyclePause::Fleet,
+            LifecyclePause::SQLite,
+            LifecyclePause::Cache,
+        ] {
+            let (state, writes) = test_state_with_durable_writer();
+            let writes = Arc::new(tokio::sync::Mutex::new(writes));
+            let warm_cfg = VmSpawnConfig {
+                memory_mib: 256,
+                vcpus: 1,
+                kernel_path: PathBuf::from("kernel"),
+                rootfs_path: Some(PathBuf::from("rootfs")),
+                cmdline: "console=ttyS0".into(),
+                read_only: false,
+            };
+            let id = Uuid::new_v4();
+            state
+                .supervisor
+                .seed_warm_for_test(id, warm_cfg.clone())
+                .unwrap();
+            let record = running_record(
+                &state,
+                &warm_cfg,
+                id,
+                1,
+                &PathBuf::from(format!("warm-abandon-boundary-{id}.sock")),
+                None,
+                None,
+                Utc::now(),
+            );
+            let control = pause_lifecycle(&state, pause);
+
+            runtime.block_on(async {
+                let task_state = state.clone();
+                let task_supervisor = Arc::clone(&state.supervisor);
+                let task_record = record.clone();
+                let task_cfg = warm_cfg.clone();
+                let publication = tokio::spawn(async move {
+                    let _abandonment = LifecycleAbandonmentGuard::new(&task_state, Some(id));
+                    let registration_state = task_state.clone();
+                    let registration_record = task_record.clone();
+                    let publication_state = task_state.clone();
+                    task_supervisor
+                        .take_warm_with_publication(
+                            &task_cfg,
+                            move |_| async move {
+                                set_lifecycle_state(
+                                    &registration_state,
+                                    id,
+                                    LifecycleState::Creating {
+                                        record: registration_record,
+                                        phase: CreatingPhase::FleetClaimed,
+                                    },
+                                )
+                            },
+                            move |_, _, _| async move {
+                                publish_running_record(&publication_state, task_record).await?;
+                                Ok(())
+                            },
+                        )
+                        .await
+                });
+
+                if pause == LifecyclePause::Cache {
+                    let StoreWrite::VmDurable(_, completion) =
+                        writes.lock().await.recv().await.unwrap()
+                    else {
+                        panic!("cache-boundary publication must persist before cache commit");
+                    };
+                    completion.send(Ok(())).unwrap();
+                }
+                control.entered.notified().await;
+                publication.abort();
+                assert!(matches!(publication.await, Err(error) if error.is_cancelled()));
+
+                assert!(matches!(
+                    lifecycle_state(&state, id).unwrap(),
+                    Some(LifecycleState::Abandoned { .. })
+                ));
+                assert!(state.supervisor.is_running(id));
+                assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+
+                let writer = {
+                    let writes = Arc::clone(&writes);
+                    tokio::spawn(async move {
+                        let StoreWrite::VmDurable(_, completion) =
+                            writes.lock().await.recv().await.unwrap()
+                        else {
+                            panic!("terminal cleanup must persist after every abandoned boundary");
+                        };
+                        completion.send(Ok(())).unwrap();
+                    })
+                };
+                stop_local(&state, id)
+                    .await
+                    .expect("DELETE must own abandoned publication cleanup");
+                writer.await.unwrap();
+            });
+
+            assert!(lifecycle_state(&state, id).unwrap().is_none());
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+            assert!(!state.supervisor.is_running(id));
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+            drop(state);
+        }
+        drop(runtime);
+    }
+
+    #[test]
+    fn stop_all_converges_an_abandoned_warm_publication_without_releasing_early() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let warm_cfg = VmSpawnConfig {
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: PathBuf::from("kernel"),
+            rootfs_path: Some(PathBuf::from("rootfs")),
+            cmdline: "console=ttyS0".into(),
+            read_only: false,
+        };
+        let id = Uuid::new_v4();
+        state
+            .supervisor
+            .seed_warm_for_test(id, warm_cfg.clone())
+            .unwrap();
+        let record = running_record(
+            &state,
+            &warm_cfg,
+            id,
+            1,
+            &PathBuf::from(format!("warm-stop-all-{id}.sock")),
+            None,
+            None,
+            Utc::now(),
+        );
+        set_lifecycle_state(&state, id, LifecycleState::Abandoned { record }).unwrap();
+        state.supervisor.abandon_lifecycle(id);
+        assert!(state.supervisor.is_running(id));
+        assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            let writer = tokio::spawn(async move {
+                let StoreWrite::VmDurable(_, completion) = writes.recv().await.unwrap() else {
+                    panic!("stop-all must durably persist the abandoned VM terminal record");
+                };
+                completion.send(Ok(())).unwrap();
+            });
+            stop_all_local(&state)
+                .await
+                .expect("stop-all must converge an abandoned warm VM");
+            writer.await.unwrap();
+        });
+
+        assert!(lifecycle_state(&state, id).unwrap().is_none());
+        assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+        assert!(!state.supervisor.is_running(id));
+        assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+        drop(runtime);
+        drop(state);
+    }
+
+    #[test]
     fn terminal_fleet_clear_failure_retains_the_creating_reservation_for_retry() {
         let (state, _) = test_state_with_durable_writer();
         let id = insert_running_vm(&state);
@@ -1247,6 +1772,7 @@ mod tests {
                 store_tx,
                 lifecycle: Arc::new(Mutex::new(HashMap::new())),
                 lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
                 terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
                 pty_registry: Arc::new(PtyRegistry::default()),
                 supervisor,

@@ -114,6 +114,12 @@ pub(crate) enum LifecycleState {
     Running {
         record: VmRecord,
     },
+    /// The request that owned this lifecycle was dropped while publication was
+    /// in flight. Resources stay registered until DELETE/stop-all performs the
+    /// normal terminal transition; Drop never starts asynchronous cleanup.
+    Abandoned {
+        record: VmRecord,
+    },
     Terminal {
         record: VmRecord,
         phase: TerminalPhase,
@@ -153,6 +159,7 @@ impl LifecycleState {
             Self::Creating { record, .. }
             | Self::Publishing { record, .. }
             | Self::Running { record }
+            | Self::Abandoned { record }
             | Self::Terminal { record, .. } => record,
         }
     }
@@ -165,6 +172,21 @@ pub(crate) enum LifecycleFault {
     FleetClaim,
     FleetClear,
     CacheCommit,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum LifecyclePause {
+    Fleet,
+    SQLite,
+    Cache,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct LifecyclePauseControl {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -187,6 +209,8 @@ pub struct AppState {
     pub(crate) lifecycle: Arc<Mutex<HashMap<Uuid, LifecycleState>>>,
     #[cfg(test)]
     pub(crate) lifecycle_faults: Arc<Mutex<Vec<LifecycleFault>>>,
+    #[cfg(test)]
+    pub(crate) lifecycle_pauses: Arc<Mutex<HashMap<LifecyclePause, LifecyclePauseControl>>>,
     /// Serializes terminal transition retries so a second stop cannot repeat
     /// destructive teardown while the first stop awaits durable persistence.
     /// When both are needed, this gate is acquired before the supervisor boot
@@ -1534,6 +1558,7 @@ mod tests {
             store_tx,
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
+            lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
             pty_registry: Arc::new(PtyRegistry::default()),
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),

@@ -242,6 +242,16 @@ pub(crate) struct BootedVm {
 /// the durable lifecycle state still owns.
 pub(crate) struct PublicationFailure(pub(crate) OrchError);
 
+/// The result of handing a warm VM to a user lifecycle. In particular, callers
+/// must not treat a retained publication failure like a pre-runtime claim
+/// failure: the former still owns a live VMM and its reservation.
+pub(crate) enum WarmClaimOutcome<T> {
+    NoMatch,
+    Published(T),
+    PreRuntimeFailure(OrchError),
+    RetainedPublicationFailure(OrchError),
+}
+
 pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
@@ -622,6 +632,34 @@ impl VmmSupervisor {
     pub(crate) fn reserve_existing_for_test(&self, id: Uuid) {
         assert!(self.scheduler.try_reserve());
         assert!(self.reservations.lock().unwrap().insert(id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_warm_for_test(
+        &self,
+        id: Uuid,
+        spec: VmSpawnConfig,
+    ) -> Result<(), OrchError> {
+        self.reserve_existing_for_test(id);
+        let process = ManagedProcess::new(
+            Command::new("true")
+                .spawn()
+                .map_err(|error| OrchError::Internal(format!("spawn warm test VMM: {error}")))?,
+        );
+        self.warm
+            .lock()
+            .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?
+            .push_back(WarmVm {
+                id,
+                vm: RunningVm {
+                    pid: process.pid,
+                    socket_path: PathBuf::from(format!("warm-test-{id}.sock")),
+                    process,
+                    net: None,
+                },
+                spec,
+            });
+        Ok(())
     }
 
     fn complete_booting(
@@ -1257,7 +1295,7 @@ impl VmmSupervisor {
         want: &VmSpawnConfig,
         register_lifecycle: R,
         publish_lifecycle: F,
-    ) -> Result<Option<T>, OrchError>
+    ) -> Result<WarmClaimOutcome<T>, OrchError>
     where
         T: Send,
         R: FnOnce(Uuid) -> RFut + Send,
@@ -1267,50 +1305,50 @@ impl VmmSupervisor {
     {
         let _gate = self.boot_gate.lock().await;
         if self.is_shutting_down() {
-            return Ok(None);
+            return Ok(WarmClaimOutcome::NoMatch);
+        }
+        let candidate_id = {
+            let warm = self
+                .warm
+                .lock()
+                .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
+            let Some(warm_vm) = warm.iter().find(|warm_vm| &warm_vm.spec == want) else {
+                return Ok(WarmClaimOutcome::NoMatch);
+            };
+            warm_vm.id
+        };
+        if let Err(error) = register_lifecycle(candidate_id).await {
+            return Ok(WarmClaimOutcome::PreRuntimeFailure(error));
         }
         let taken = {
             let mut warm = self
                 .warm
                 .lock()
                 .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
-            let Some(pos) = warm.iter().position(|warm_vm| &warm_vm.spec == want) else {
-                return Ok(None);
+            let Some(pos) = warm.iter().position(|warm_vm| warm_vm.id == candidate_id) else {
+                return Err(OrchError::Internal(format!(
+                    "registered warm VM {candidate_id} disappeared before transfer"
+                )));
             };
             warm.remove(pos).expect("warm position was selected")
         };
         let pid = taken.vm.pid;
         let socket = taken.vm.socket_path.clone();
-        if let Err(error) = register_lifecycle(taken.id).await {
-            self.warm
-                .lock()
-                .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?
-                .push_back(taken);
-            return Err(error);
-        }
         self.move_pid_to_default_cgroup(pid);
-        let published = match publish_lifecycle(taken.id, pid, socket).await {
-            Ok(published) => published,
-            Err(PublicationFailure(error)) => {
-                self.running
-                    .lock()
-                    .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
-                    .insert(taken.id, taken.vm);
-                return Err(error);
-            }
-        };
-        if self.is_shutting_down() {
-            self.warm
-                .lock()
-                .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?
-                .push_back(taken);
-            return Err(self.shutdown_error());
-        }
+        let WarmVm { id, vm, .. } = taken;
         self.running
             .lock()
-            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
-            .insert(taken.id, taken.vm);
-        Ok(Some(published))
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))
+            .map(|mut running| {
+                running.insert(id, vm);
+            })?;
+        let published = match publish_lifecycle(id, pid, socket).await {
+            Ok(published) => published,
+            Err(PublicationFailure(error)) => {
+                return Ok(WarmClaimOutcome::RetainedPublicationFailure(error));
+            }
+        };
+        Ok(WarmClaimOutcome::Published(published))
     }
 
     /// Number of warm VMs currently parked for the given class shape.
@@ -1525,6 +1563,46 @@ impl VmmSupervisor {
             .lock()
             .map(|booting| booting.contains_key(&id))
             .unwrap_or(true)
+    }
+
+    /// Notify synchronous shutdown paths that an async request abandoned its
+    /// lifecycle. This deliberately does not tear anything down: a DELETE or
+    /// stop-all owns the later, durable terminal transition.
+    pub(crate) fn abandon_lifecycle(&self, id: Uuid) {
+        if let Ok(booting) = self.booting.lock() {
+            if let Some(booting_vm) = booting.get(&id) {
+                booting_vm.control.request_cancellation();
+                booting_vm.control.complete(Err(OrchError::Internal(
+                    "request abandoned lifecycle publication".into(),
+                )));
+            }
+        }
+
+        // A warm claim can be abandoned while its Creating record is awaiting
+        // durable publication. Move that exact VM into the normal live registry
+        // so DELETE/stop-all sees and tears it down rather than losing it in warm.
+        let warm = self.warm.lock().ok().and_then(|mut warm| {
+            warm.iter()
+                .position(|warm_vm| warm_vm.id == id)
+                .and_then(|index| warm.remove(index))
+        });
+        if let Some(warm) = warm {
+            match self.running.lock() {
+                Ok(mut running) if !running.contains_key(&id) => {
+                    running.insert(id, warm.vm);
+                }
+                Ok(_) | Err(_) => {
+                    if let Ok(mut warm_queue) = self.warm.lock() {
+                        warm_queue.push_back(warm);
+                    } else {
+                        tracing::error!(
+                            %id,
+                            "abandoned warm lifecycle could not retain its warm registry entry"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn stop_all(&self) -> Result<ShutdownSummary, Box<ShutdownFailure>> {
@@ -2074,7 +2152,7 @@ mod tests {
         let (allow_publication_tx, allow_publication_rx) = mpsc::channel();
         let handoff_supervisor = Arc::clone(&supervisor);
         let handoff = thread::spawn(move || {
-            test_runtime()
+            match test_runtime()
                 .block_on(handoff_supervisor.take_warm_with_publication(
                     &spec,
                     |_| async { Ok(()) },
@@ -2085,7 +2163,10 @@ mod tests {
                     },
                 ))
                 .unwrap()
-                .unwrap()
+            {
+                WarmClaimOutcome::Published(id) => id,
+                _ => panic!("warm handoff must publish"),
+            }
         });
 
         publication_started_rx.recv().unwrap();
@@ -2106,6 +2187,66 @@ mod tests {
 
         assert_eq!(summary.running_ids, vec![id]);
         assert!(summary.warm_ids.is_empty());
+        assert!(!supervisor.is_running(id));
+    }
+
+    #[test]
+    fn warm_registration_failure_never_dequeues_the_unregistered_vm() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let spec = spawn_config(false, Some(PathBuf::from("/rootfs.ext4")));
+        let ticket = test_runtime()
+            .block_on(
+                supervisor
+                    .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) }),
+            )
+            .unwrap();
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        supervisor.complete_booting(id, &ticket.control, Ok(()));
+        supervisor.warm.lock().unwrap().push_back(WarmVm {
+            id,
+            vm: RunningVm {
+                pid: process.pid,
+                socket_path: PathBuf::from("warm-registration.sock"),
+                process,
+                net: None,
+            },
+            spec: spec.clone(),
+        });
+
+        let (registration_started_tx, registration_started_rx) = mpsc::channel();
+        let (finish_registration_tx, finish_registration_rx) = mpsc::channel();
+        let handoff_supervisor = Arc::clone(&supervisor);
+        let handoff = thread::spawn(move || {
+            test_runtime().block_on(handoff_supervisor.take_warm_with_publication(
+                &spec,
+                move |_| async move {
+                    registration_started_tx.send(()).unwrap();
+                    finish_registration_rx.recv().unwrap();
+                    Err(OrchError::Internal(
+                        "injected Creating registration failure".into(),
+                    ))
+                },
+                |_, _, _| async {
+                    Err::<Uuid, PublicationFailure>(PublicationFailure(OrchError::Internal(
+                        "unexpected warm publication".into(),
+                    )))
+                },
+            ))
+        });
+
+        registration_started_rx.recv().unwrap();
+        assert_eq!(
+            supervisor.warm_count(1, 256),
+            1,
+            "a selected warm VM must remain in the warm registry until Creating is registered"
+        );
+        finish_registration_tx.send(()).unwrap();
+        assert!(matches!(
+            handoff.join().unwrap().unwrap(),
+            WarmClaimOutcome::PreRuntimeFailure(_)
+        ));
+        assert_eq!(supervisor.warm_count(1, 256), 1);
         assert!(!supervisor.is_running(id));
     }
 
