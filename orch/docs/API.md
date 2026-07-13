@@ -217,6 +217,8 @@ Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`.
 ### SSH keys
 
 All SSH key records are scoped to the caller's tenant.
+RSA keys remain valid for guest authorized-key injection but cannot authenticate
+to the SSH gateway.
 
 `POST /v1/ssh-keys`
 
