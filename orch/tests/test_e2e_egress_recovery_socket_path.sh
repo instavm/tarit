@@ -9,6 +9,12 @@ HARNESS="$SCRIPT_DIR/e2e_egress_recovery.sh"
 
 "$HARNESS" --check-server-exit-race
 
+recorded_process_stat_body=$(sed -n '/^recorded_process_stat() {/,/^}/p' "$HARNESS")
+if grep -Eq 'SERVER_EXIT_RACE_PID|wait[[:space:]]' <<<"$recorded_process_stat_body"; then
+  echo "FAIL: recorded_process_stat contains process-exit test synchronization" >&2
+  exit 1
+fi
+
 if output=$(EGRESS_RECOVERY_RUN_ROOT="/root/.taritd/egress-recovery-runs/$(printf 'x%.0s' {1..80})" \
   "$HARNESS" --check-socket-path 2>&1); then
   echo "FAIL: overlong egress recovery VMM socket path was accepted" >&2

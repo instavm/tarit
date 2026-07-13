@@ -14,7 +14,6 @@ ROOTFS=
 SERVER_LOG=
 SERVER_PID=
 SERVER_START_TICKS=
-SERVER_EXIT_RACE_PID=
 SERVER_STOP_TIMEOUT_SECONDS=20
 LINUX_UNIX_SOCKET_PATH_LIMIT=108
 MAX_VMM_ID=00000000-0000-0000-0000-000000000000
@@ -151,11 +150,6 @@ run_dir_is_owned() {
 }
 
 recorded_process_stat() {
-  if [ "$SERVER_EXIT_RACE_PID" = "$1" ]; then
-    kill -TERM -- "$SERVER_PID"
-    wait "$SERVER_PID" || true
-    SERVER_EXIT_RACE_PID=
-  fi
   awk '{print $3, $22}' "/proc/$1/stat" 2>/dev/null
 }
 
@@ -188,18 +182,85 @@ recorded_process_exit_confirmed() {
 }
 
 check_server_exit_race() {
+  local child_pid status attempt
   [ -r /proc/self/stat ] || {
     echo "SKIP: server exit race check requires Linux procfs" >&2
     return 0
   }
+
+  SERVER_EXIT_RACE_CHILD_PID=
+  SERVER_EXIT_RACE_CHECK_PID=
+  SERVER_EXIT_RACE_DIR=$(mktemp -d "$SCRIPT_DIR/.egress-recovery-exit-race.XXXXXX") ||
+    return 1
+  SERVER_EXIT_RACE_READY_FILE="$SERVER_EXIT_RACE_DIR/stat-read-ready"
+  SERVER_EXIT_RACE_RELEASE_FILE="$SERVER_EXIT_RACE_DIR/stat-read-release"
+  trap check_server_exit_race_cleanup EXIT
+  trap 'exit 1' INT TERM
+
   sleep 30 &
-  SERVER_PID=$!
-  SERVER_START_TICKS=$(awk '{print $22}' "/proc/$SERVER_PID/stat")
-  SERVER_EXIT_RACE_PID=$SERVER_PID
-  if ! recorded_process_exit_confirmed "$SERVER_PID" "$SERVER_START_TICKS" ||
-    [ -e "/proc/$SERVER_PID" ]; then
+  SERVER_EXIT_RACE_CHILD_PID=$!
+  child_pid=$SERVER_EXIT_RACE_CHILD_PID
+  SERVER_START_TICKS=$(command awk '{print $22}' "/proc/$SERVER_EXIT_RACE_CHILD_PID/stat") ||
+    return 1
+
+  awk() {
+    if [ "$1" = "{print \$3, \$22}" ] &&
+      [ "${2:-}" = "/proc/$SERVER_EXIT_RACE_CHILD_PID/stat" ]; then
+      : > "$SERVER_EXIT_RACE_READY_FILE"
+      while [ ! -e "$SERVER_EXIT_RACE_RELEASE_FILE" ]; do
+        sleep 0.01
+      done
+      [ ! -e "/proc/$SERVER_EXIT_RACE_CHILD_PID/stat" ] || return 1
+    fi
+    command awk "$@"
+  }
+
+  recorded_process_exit_confirmed "$SERVER_EXIT_RACE_CHILD_PID" "$SERVER_START_TICKS" &
+  SERVER_EXIT_RACE_CHECK_PID=$!
+  for ((attempt = 0; attempt < 500; attempt++)); do
+    [ -e "$SERVER_EXIT_RACE_READY_FILE" ] && break
+    sleep 0.01
+  done
+  if [ ! -e "$SERVER_EXIT_RACE_READY_FILE" ]; then
+    echo "FAIL: process-exit race stat read did not start" >&2
+    return 1
+  fi
+
+  kill -TERM -- "$SERVER_EXIT_RACE_CHILD_PID"
+  wait "$SERVER_EXIT_RACE_CHILD_PID" 2>/dev/null || true
+  SERVER_EXIT_RACE_CHILD_PID=
+  : > "$SERVER_EXIT_RACE_RELEASE_FILE"
+  if wait "$SERVER_EXIT_RACE_CHECK_PID"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -ne 0 ] || [ -e "/proc/$child_pid" ]; then
     echo "FAIL: disappeared recorded child was not confirmed as exited" >&2
     return 1
+  fi
+
+  SERVER_EXIT_RACE_CHECK_PID=
+  check_server_exit_race_cleanup
+  trap - EXIT INT TERM
+}
+
+check_server_exit_race_cleanup() {
+  if [ -n "${SERVER_EXIT_RACE_CHILD_PID:-}" ]; then
+    kill -TERM -- "$SERVER_EXIT_RACE_CHILD_PID" 2>/dev/null || true
+    wait "$SERVER_EXIT_RACE_CHILD_PID" 2>/dev/null || true
+    SERVER_EXIT_RACE_CHILD_PID=
+  fi
+  if [ -n "${SERVER_EXIT_RACE_RELEASE_FILE:-}" ]; then
+    : > "$SERVER_EXIT_RACE_RELEASE_FILE"
+  fi
+  if [ -n "${SERVER_EXIT_RACE_CHECK_PID:-}" ]; then
+    wait "$SERVER_EXIT_RACE_CHECK_PID" 2>/dev/null || true
+    SERVER_EXIT_RACE_CHECK_PID=
+  fi
+  if [ -n "${SERVER_EXIT_RACE_DIR:-}" ]; then
+    rm -rf -- "$SERVER_EXIT_RACE_DIR"
+    SERVER_EXIT_RACE_DIR=
   fi
 }
 
