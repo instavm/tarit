@@ -54,16 +54,13 @@ pub(crate) async fn run(state: AppState) -> Result<()> {
 
 fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey> {
     if path.exists() {
-        let key = PrivateKey::read_openssh_file(path).with_context(|| {
-            format!(
-                "read SSH gateway host key {}: only Ed25519 OpenSSH private keys are supported; RSA host keys are not supported",
-                path.display()
-            )
-        })?;
+        let key = PrivateKey::read_openssh_file(path)
+            .with_context(|| format!("read SSH gateway host key {}", path.display()))?;
         if key.algorithm() != Algorithm::Ed25519 {
             anyhow::bail!(
-                "SSH gateway host key {} must use Ed25519; RSA host keys are not supported",
-                path.display()
+                "SSH gateway host key {} must use Ed25519; {} host keys are not supported",
+                path.display(),
+                key.algorithm()
             );
         }
         return Ok(key);
@@ -676,7 +673,7 @@ mod tests {
     use crate::scheduler::Scheduler;
     use crate::supervisor::VmmSupervisor;
     use chrono::Utc;
-    use russh::keys::HashAlg;
+    use russh::keys::{EcdsaCurve, HashAlg};
     use russh::server::Handler as _;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -685,8 +682,6 @@ mod tests {
 
     const ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g test@example";
     const ED25519_FINGERPRINT: &str = "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4";
-    const RSA_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCm9bEVScNevvQHZGzV9bBzwzbEaFSmK2QwY/t/FRS1MJMbaCrdfrY0aLpoN9f744JI5lvzilCHlnbCqcrKBmUeGtrVEDpyY6gAF8YfN8C6os/NOxTQHukjwlgHi01FjuiZyAnhxXnBrWE+ZXxIX1up13YC+DQhJBSPHaFuD3pdGUN/MCESh+enLcge0qSnBpAjdd2yxGn9sRs+6u1i7TOHvBBGmtoHFZIChbxJJyyFBquUHJOa5K+njQA5CLP1VX02qm/Efoy7WWuygKF2rHsbnkIzeWGvbv4tpW36412uRvj4/JAh2rSk1a1Dp57VCV4RGZCyB1jEhyB2qD4Q3YX5 tarit-test";
-
     #[test]
     fn parses_vm_id_username() {
         let vm_id = Uuid::new_v4();
@@ -755,18 +750,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_rsa_host_key_file_with_actionable_error() {
+    fn reports_host_key_parse_errors_without_algorithm_claims() {
         let dir = std::path::PathBuf::from("target")
             .join(format!("taritd-gateway-test-{}", Uuid::new_v4()));
         let path = dir.join("ssh_host");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, RSA_KEY).unwrap();
+        std::fs::write(&path, "not an OpenSSH private key").unwrap();
 
         let err = load_or_generate_host_key(&path).unwrap_err();
 
         let _ = std::fs::remove_dir_all(dir);
-        assert!(err.to_string().contains("Ed25519"), "{err:#}");
-        assert!(err.to_string().contains("RSA"), "{err:#}");
+        let message = err.to_string();
+        assert!(message.contains("read SSH gateway host key"), "{err:#}");
+        assert!(!message.contains("not supported"), "{err:#}");
+        assert!(!message.contains("RSA"), "{err:#}");
+    }
+
+    #[test]
+    fn reports_the_actual_unsupported_host_key_algorithm() {
+        let dir = std::path::PathBuf::from("target")
+            .join(format!("taritd-gateway-test-{}", Uuid::new_v4()));
+        let path = dir.join("ssh_host");
+        std::fs::create_dir_all(&dir).unwrap();
+        let algorithm = Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        };
+        let key = PrivateKey::random(&mut russh::keys::key::safe_rng(), algorithm.clone()).unwrap();
+        key.write_openssh_file(&path, russh::keys::ssh_key::LineEnding::LF)
+            .unwrap();
+
+        let err = load_or_generate_host_key(&path).unwrap_err();
+
+        let _ = std::fs::remove_dir_all(dir);
+        let message = err.to_string();
+        assert!(message.contains("must use Ed25519"), "{err:#}");
+        assert!(message.contains(&algorithm.to_string()), "{err:#}");
+        assert!(!message.contains("RSA"), "{err:#}");
     }
 
     fn test_state() -> AppState {
