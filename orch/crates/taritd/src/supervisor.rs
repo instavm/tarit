@@ -441,8 +441,9 @@ impl VmmSupervisor {
     /// guest's device/net config, so we do not re-provision host networking
     /// here (restore is used for the fast warm/resume path).
     pub fn restore_vm(&self, id: Uuid, snapshot_path: &str) -> Result<(u32, PathBuf), OrchError> {
-        let vm = self.spawn_and_restore(id, snapshot_path, None, SpawnPurpose::Live)?;
-        if let Err(e) = self.await_ready(&vm.socket_path) {
+        let purpose = SpawnPurpose::Live;
+        let vm = self.spawn_and_restore(id, snapshot_path, None, purpose)?;
+        if let Err(e) = self.await_restore_ready(&vm.socket_path, purpose) {
             self.teardown_vm(id, vm);
             return Err(e);
         }
@@ -558,6 +559,14 @@ impl VmmSupervisor {
         })
     }
 
+    fn await_restore_ready(&self, socket: &Path, purpose: SpawnPurpose) -> Result<(), OrchError> {
+        if restore_requires_guest_readiness(purpose) {
+            self.await_ready(socket)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn spawn_warm(&self, class: &WarmClass) -> Result<(), OrchError> {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
@@ -641,8 +650,9 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let overlay = overlay_path_for_config(id, &spec);
-        let vm = self.spawn_and_restore(id, snapshot_path, overlay, SpawnPurpose::Refill)?;
-        if let Err(e) = self.await_ready(&vm.socket_path) {
+        let purpose = SpawnPurpose::Refill;
+        let vm = self.spawn_and_restore(id, snapshot_path, overlay, purpose)?;
+        if let Err(e) = self.await_restore_ready(&vm.socket_path, purpose) {
             self.teardown_vm(id, vm);
             return Err(e);
         }
@@ -974,6 +984,10 @@ fn cleanup_golden_artifacts(paths: impl IntoIterator<Item = PathBuf>) {
     }
 }
 
+fn restore_requires_guest_readiness(purpose: SpawnPurpose) -> bool {
+    purpose == SpawnPurpose::Refill
+}
+
 fn wait_for_guest_ready<F>(timeout: Duration, mut probe: F) -> Result<(), String>
 where
     F: FnMut() -> Result<bool, String>,
@@ -1219,6 +1233,12 @@ mod tests {
         .expect("a successful guest-agent probe must pass the readiness gate");
 
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn only_warm_refill_restores_require_guest_agent_readiness() {
+        assert!(!restore_requires_guest_readiness(SpawnPurpose::Live));
+        assert!(restore_requires_guest_readiness(SpawnPurpose::Refill));
     }
 
     #[test]
