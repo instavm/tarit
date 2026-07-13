@@ -14,6 +14,7 @@ ROOTFS=
 SERVER_LOG=
 SERVER_PID=
 SERVER_START_TICKS=
+SERVER_EXIT_RACE_PID=
 SERVER_STOP_TIMEOUT_SECONDS=20
 LINUX_UNIX_SOCKET_PATH_LIMIT=108
 MAX_VMM_ID=00000000-0000-0000-0000-000000000000
@@ -149,6 +150,59 @@ run_dir_is_owned() {
     [ "$(stat -c '%u:%a' "$RUN_DIR")" = "0:700" ]
 }
 
+recorded_process_stat() {
+  if [ "$SERVER_EXIT_RACE_PID" = "$1" ]; then
+    kill -TERM -- "$SERVER_PID"
+    wait "$SERVER_PID" || true
+    SERVER_EXIT_RACE_PID=
+  fi
+  awk '{print $3, $22}' "/proc/$1/stat" 2>/dev/null
+}
+
+recorded_process_is_current() {
+  local pid=$1 start_ticks=$2 state current_ticks
+  [ -n "$pid" ] && [ -n "$start_ticks" ] &&
+    kill -0 "$pid" 2>/dev/null &&
+    read -r state current_ticks < <(recorded_process_stat "$pid") &&
+    [ "$current_ticks" = "$start_ticks" ]
+}
+
+recorded_process_exit_confirmed() {
+  local pid=$1 start_ticks=$2 state current_ticks
+  [ -n "$pid" ] && [ -n "$start_ticks" ] || return 2
+  [ -e "/proc/$pid" ] || return 0
+  if [ ! -r "/proc/$pid/stat" ]; then
+    [ -e "/proc/$pid" ] && return 2
+    return 0
+  fi
+  if ! read -r state current_ticks < <(recorded_process_stat "$pid"); then
+    [ -e "/proc/$pid" ] && return 2
+    return 0
+  fi
+  case "$state:$current_ticks" in
+    [A-Za-z]:[0-9]*) ;;
+    *) return 2 ;;
+  esac
+  [ "$current_ticks" != "$start_ticks" ] && return 0
+  [ "$state" = Z ]
+}
+
+check_server_exit_race() {
+  [ -r /proc/self/stat ] || {
+    echo "SKIP: server exit race check requires Linux procfs" >&2
+    return 0
+  }
+  sleep 30 &
+  SERVER_PID=$!
+  SERVER_START_TICKS=$(awk '{print $22}' "/proc/$SERVER_PID/stat")
+  SERVER_EXIT_RACE_PID=$SERVER_PID
+  if ! recorded_process_exit_confirmed "$SERVER_PID" "$SERVER_START_TICKS" ||
+    [ -e "/proc/$SERVER_PID" ]; then
+    echo "FAIL: disappeared recorded child was not confirmed as exited" >&2
+    return 1
+  fi
+}
+
 case "${1:-}" in
   --check-socket-path)
     assert_vmm_socket_path_fits "$RUN_ROOT/run-2147483647-4194304-32767"
@@ -158,6 +212,10 @@ case "${1:-}" in
     [ "$#" -eq 2 ] || fail "usage: $0 --check-run-root PATH"
     validate_run_root_path "$2"
     exit 0
+    ;;
+  --check-server-exit-race)
+    check_server_exit_race
+    exit $?
     ;;
 esac
 
@@ -223,11 +281,7 @@ export TARIT_CONFIG="$RUN_DIR/empty.toml"
 export TARIT_BASE_URL="http://127.0.0.1:8080"
 
 server_pid_is_current() {
-  [ -n "$SERVER_PID" ] &&
-    [ -n "$SERVER_START_TICKS" ] &&
-    kill -0 "$SERVER_PID" 2>/dev/null &&
-    [ -r "/proc/$SERVER_PID/stat" ] &&
-    [ "$(awk '{print $22}' "/proc/$SERVER_PID/stat")" = "$SERVER_START_TICKS" ]
+  recorded_process_is_current "$SERVER_PID" "$SERVER_START_TICKS"
 }
 
 server_listener_is_current() {
@@ -238,14 +292,7 @@ server_listener_is_current() {
 }
 
 server_exit_confirmed() {
-  local current_ticks state
-  [ -n "$SERVER_PID" ] && [ -n "$SERVER_START_TICKS" ] || return 2
-  [ -e "/proc/$SERVER_PID" ] || return 0
-  [ -r "/proc/$SERVER_PID/stat" ] || return 2
-  current_ticks=$(awk '{print $22}' "/proc/$SERVER_PID/stat") || return 2
-  [ "$current_ticks" != "$SERVER_START_TICKS" ] && return 0
-  state=$(awk '{print $3}' "/proc/$SERVER_PID/stat") || return 2
-  [ "$state" = Z ]
+  recorded_process_exit_confirmed "$SERVER_PID" "$SERVER_START_TICKS"
 }
 
 wait_for_server_exit() {
@@ -272,6 +319,11 @@ wait_for_server_exit() {
 
 reap_confirmed_server() {
   local wait_status
+  if [ -e "/proc/$SERVER_PID" ] && ! server_pid_is_current &&
+    [ -e "/proc/$SERVER_PID" ]; then
+    echo "WARN: could not verify recorded taritd PID $SERVER_PID identity before reap" >&2
+    return 1
+  fi
   if wait "$SERVER_PID" 2>/dev/null; then
     return 0
   fi
@@ -310,11 +362,19 @@ stop_taritd() {
   case "$status" in
     0) ;;
     1)
-      if ! server_pid_is_current; then
+      if server_pid_is_current; then
+        if ! kill -TERM -- "$SERVER_PID" 2>/dev/null; then
+          if server_exit_confirmed; then
+            status=0
+          else
+            echo "WARN: could not TERM recorded taritd PID $SERVER_PID" >&2
+            cleanup_failed=1
+          fi
+        fi
+      elif server_exit_confirmed; then
+        status=0
+      else
         echo "WARN: could not verify recorded taritd PID $SERVER_PID identity before TERM" >&2
-        cleanup_failed=1
-      elif ! kill -TERM -- "$SERVER_PID" 2>/dev/null; then
-        echo "WARN: could not TERM recorded taritd PID $SERVER_PID" >&2
         cleanup_failed=1
       fi
 
@@ -326,9 +386,15 @@ stop_taritd() {
       if [ "$status" -eq 1 ]; then
         if server_pid_is_current; then
           if ! kill -KILL -- "$SERVER_PID" 2>/dev/null; then
-            echo "WARN: could not KILL recorded taritd PID $SERVER_PID after TERM deadline" >&2
-            cleanup_failed=1
+            if server_exit_confirmed; then
+              status=0
+            else
+              echo "WARN: could not KILL recorded taritd PID $SERVER_PID after TERM deadline" >&2
+              cleanup_failed=1
+            fi
           fi
+        elif server_exit_confirmed; then
+          status=0
         else
           echo "WARN: could not verify recorded taritd PID $SERVER_PID identity before KILL" >&2
           cleanup_failed=1
@@ -376,7 +442,7 @@ delete_vm() {
 }
 
 cleanup_run_vmm_processes() {
-  local index pid start_ticks current_ticks cleanup_failed=0
+  local index pid start_ticks status cleanup_failed=0
   for index in "${!VMM_PIDS[@]}"; do
     pid=${VMM_PIDS[$index]:-}
     start_ticks=${VMM_START_TICKS[$index]:-}
@@ -385,33 +451,57 @@ cleanup_run_vmm_processes() {
       cleanup_failed=1
       continue
     fi
-    if [ ! -r "/proc/$pid/stat" ]; then
+    if recorded_process_exit_confirmed "$pid" "$start_ticks"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -eq 0 ]; then
       VMM_EXIT_CONFIRMED[$index]=1
       continue
     fi
-    current_ticks=$(awk '{print $22}' "/proc/$pid/stat") ||
-      { echo "WARN: could not read recorded VMM $pid start time" >&2; cleanup_failed=1; continue; }
-    if [ "$current_ticks" != "$start_ticks" ]; then
-      VMM_EXIT_CONFIRMED[$index]=1
-      continue
-    fi
-    if ! kill -TERM "$pid" 2>/dev/null; then
-      echo "WARN: could not TERM recorded VMM $pid" >&2
+    if [ "$status" -eq 2 ]; then
+      echo "WARN: could not observe recorded VMM $pid exit" >&2
       cleanup_failed=1
       continue
     fi
+    if ! recorded_process_is_current "$pid" "$start_ticks"; then
+      if recorded_process_exit_confirmed "$pid" "$start_ticks"; then
+        VMM_EXIT_CONFIRMED[$index]=1
+      else
+        echo "WARN: could not verify recorded VMM $pid identity before TERM" >&2
+        cleanup_failed=1
+      fi
+      continue
+    fi
+    if ! kill -TERM "$pid" 2>/dev/null; then
+      if recorded_process_exit_confirmed "$pid" "$start_ticks"; then
+        VMM_EXIT_CONFIRMED[$index]=1
+      else
+        echo "WARN: could not TERM recorded VMM $pid" >&2
+        cleanup_failed=1
+      fi
+      continue
+    fi
     for _ in $(seq 1 20); do
-      if [ ! -r "/proc/$pid/stat" ]; then
+      if recorded_process_exit_confirmed "$pid" "$start_ticks"; then
+        status=0
         break
       fi
-      current_ticks=$(awk '{print $22}' "/proc/$pid/stat") ||
-        { cleanup_failed=1; break; }
-      [ "$current_ticks" != "$start_ticks" ] && break
+      status=$?
+      [ "$status" -eq 2 ] && break
       sleep 1
     done
-    if [ -r "/proc/$pid/stat" ] &&
-      [ "$(awk '{print $22}' "/proc/$pid/stat")" = "$start_ticks" ]; then
+    if recorded_process_exit_confirmed "$pid" "$start_ticks"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -eq 1 ]; then
       echo "WARN: recorded VMM $pid did not exit after TERM" >&2
+      cleanup_failed=1
+    elif [ "$status" -eq 2 ]; then
+      echo "WARN: could not observe recorded VMM $pid exit" >&2
       cleanup_failed=1
     else
       VMM_EXIT_CONFIRMED[$index]=1

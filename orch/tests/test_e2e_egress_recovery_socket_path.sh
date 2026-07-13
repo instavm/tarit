@@ -7,6 +7,8 @@ HARNESS="$SCRIPT_DIR/e2e_egress_recovery.sh"
 
 "$HARNESS" --check-socket-path
 
+"$HARNESS" --check-server-exit-race
+
 if output=$(EGRESS_RECOVERY_RUN_ROOT="/root/.taritd/egress-recovery-runs/$(printf 'x%.0s' {1..80})" \
   "$HARNESS" --check-socket-path 2>&1); then
   echo "FAIL: overlong egress recovery VMM socket path was accepted" >&2
