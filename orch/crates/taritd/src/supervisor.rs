@@ -25,6 +25,16 @@ const GUEST_READY_EXEC_TIMEOUT: Duration = Duration::from_secs(1);
 const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn graceful_stop_vmm(socket_path: &Path) {
+    if socket_path.as_os_str().is_empty() || !socket_path.exists() {
+        return;
+    }
+
+    let _ = VmmClient::new(socket_path)
+        .with_request_timeout(TEARDOWN_STOP_TIMEOUT)
+        .stop();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadinessCheck {
     Boot,
@@ -586,12 +596,14 @@ impl VmmSupervisor {
 
         if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             return Err(e);
         }
 
         if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
             return Err(self.shutdown_error());
@@ -604,12 +616,14 @@ impl VmmSupervisor {
                 Ok(a) => Some(a),
                 Err(e @ OrchError::Overloaded { .. }) => {
                     self.untrack_booting(id);
+                    graceful_stop_vmm(&socket_path);
                     process.kill_wait();
                     let _ = std::fs::remove_file(&socket_path);
                     return Err(e);
                 }
                 Err(e) => {
                     self.untrack_booting(id);
+                    graceful_stop_vmm(&socket_path);
                     process.kill_wait();
                     let _ = std::fs::remove_file(&socket_path);
                     return Err(OrchError::Internal(format!("net provision: {e}")));
@@ -619,6 +633,7 @@ impl VmmSupervisor {
         };
         if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
@@ -637,6 +652,7 @@ impl VmmSupervisor {
         };
         if let Err(error) = create_result {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
@@ -778,11 +794,13 @@ impl VmmSupervisor {
 
         if let Err(e) = self.wait_for_socket(&socket_path, refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             return Err(e);
         }
         if self.refill_cancelled(refill_cancelled) {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
             return Err(self.shutdown_error());
@@ -797,6 +815,7 @@ impl VmmSupervisor {
         };
         if let Err(error) = restore_result {
             self.untrack_booting(id);
+            graceful_stop_vmm(&socket_path);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
             return Err(error);
@@ -1380,17 +1399,14 @@ impl VmmSupervisor {
         };
 
         for (id, vm) in running {
-            let client = VmmClient::new(&vm.socket_path);
-            let _ = client.stop();
             self.teardown_vm(id, vm);
             self.complete_stop(id);
         }
         for warm_vm in warm {
-            let client = VmmClient::new(&warm_vm.vm.socket_path);
-            let _ = client.stop();
             self.teardown_vm(warm_vm.id, warm_vm.vm);
         }
         for (_, vm) in booting {
+            graceful_stop_vmm(&vm.socket_path);
             vm.process.kill_wait();
             let _ = std::fs::remove_file(&vm.socket_path);
         }
@@ -1404,11 +1420,7 @@ impl VmmSupervisor {
     }
 
     fn teardown_vm_inner(&self, id: Uuid, vm: RunningVm) {
-        if !vm.socket_path.as_os_str().is_empty() {
-            let _ = VmmClient::new(&vm.socket_path)
-                .with_request_timeout(TEARDOWN_STOP_TIMEOUT)
-                .stop();
-        }
+        graceful_stop_vmm(&vm.socket_path);
         vm.process.kill_wait();
         let _ = std::fs::remove_file(&vm.socket_path);
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
@@ -1862,8 +1874,17 @@ mod tests {
         listener
             .set_nonblocking(true)
             .expect("make test VMM socket nonblocking");
-        let (request_tx, request_rx) =
-            std::sync::mpsc::sync_channel::<Result<tarit_vmm_client::ApiRequest, String>>(1);
+        let process = ManagedProcess::new(
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn test VMM process"),
+        );
+        let process_for_liveness_check = process.clone();
+        let process_for_assertion = process.clone();
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<
+            Result<(tarit_vmm_client::ApiRequest, bool), String>,
+        >(1);
         let server = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
@@ -1874,6 +1895,13 @@ mod tests {
                         let mut body = vec![0; u32::from_be_bytes(length) as usize];
                         stream.read_exact(&mut body).expect("read request body");
                         let request = serde_json::from_slice(&body).expect("decode request");
+                        let child_alive = process_for_liveness_check
+                            .child
+                            .lock()
+                            .expect("lock child")
+                            .try_wait()
+                            .expect("inspect child")
+                            .is_none();
                         let response =
                             serde_json::to_vec(&tarit_vmm_client::ApiResponse::Ok).unwrap();
                         stream
@@ -1881,7 +1909,9 @@ mod tests {
                             .expect("write response length");
                         stream.write_all(&response).expect("write response body");
                         stream.flush().expect("flush response");
-                        request_tx.send(Ok(request)).expect("record request");
+                        request_tx
+                            .send(Ok((request, child_alive)))
+                            .expect("record request");
                         return;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1902,13 +1932,6 @@ mod tests {
                 }
             }
         });
-        let process = ManagedProcess::new(
-            Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("spawn test VMM process"),
-        );
-        let process_for_assertion = process.clone();
         let vm = RunningVm {
             pid: process.pid,
             socket_path: socket_path.clone(),
@@ -1919,12 +1942,17 @@ mod tests {
 
         supervisor.teardown_vm(Uuid::new_v4(), vm);
 
-        let request = request_rx
+        let (request, child_alive) = request_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("teardown must contact the VMM");
+            .expect("teardown must contact the VMM")
+            .expect("test VMM server must receive a request");
         assert!(
-            matches!(request, Ok(tarit_vmm_client::ApiRequest::Stop)),
+            matches!(request, tarit_vmm_client::ApiRequest::Stop),
             "teardown must send Stop before killing the VMM, got {request:?}"
+        );
+        assert!(
+            child_alive,
+            "the VMM process must still be alive when it receives Stop"
         );
         server.join().expect("join test VMM server");
         assert!(
