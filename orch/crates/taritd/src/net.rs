@@ -207,34 +207,52 @@ impl NetProvisioner {
 
         let policy = self.egress_policy_for(&alloc)?;
         if let Err(e) = self.provision_host(&alloc, &policy) {
-            self.best_effort_delete(&alloc);
-            self.free_allocation_locked(&alloc);
+            if let Err(cleanup_error) = self.teardown_locked(&alloc) {
+                tracing::warn!(
+                    tap = %alloc.tap,
+                    vm_id = %alloc.vm_id,
+                    slot = alloc.idx,
+                    "net: retained failed provisioning allocation for fail-closed cleanup: {cleanup_error}"
+                );
+            }
             return Err(e);
         }
 
         Ok(alloc)
     }
 
-    /// Remove a VM's tap and nft rule(s), then free and persist the slot.
-    /// Idempotent and best-effort: every step is attempted and failures are logged.
+    /// Remove a VM's tap and exact nft rule(s), then free and persist the slot.
+    /// Idempotent and fail-closed: a slot remains owned until interface deletion
+    /// and exact policy cleanup are both confirmed.
     pub fn teardown(&self, alloc: &NetAlloc) {
-        if self
+        match self
             .network_transactions
             .run(|| self.teardown_locked(alloc))
-            .is_err()
         {
-            tracing::warn!(
-                tap = %alloc.tap,
-                vm_id = %alloc.vm_id,
-                slot = alloc.idx,
-                "net transaction lock poisoned while tearing down allocation"
-            );
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    tap = %alloc.tap,
+                    vm_id = %alloc.vm_id,
+                    slot = alloc.idx,
+                    "net: teardown retained allocation for retry: {error}"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tap = %alloc.tap,
+                    vm_id = %alloc.vm_id,
+                    slot = alloc.idx,
+                    "net transaction lock unavailable while tearing down allocation: {error}"
+                );
+            }
         }
     }
 
-    fn teardown_locked(&self, alloc: &NetAlloc) {
-        self.best_effort_delete(alloc);
-        self.free_allocation_locked(alloc);
+    fn teardown_locked(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.delete_tap_for_teardown(alloc)?;
+        self.delete_nft_rules_for_alloc(alloc)?;
+        self.free_allocation_locked(alloc)
     }
 
     /// Enforce a VM's egress allowlist on the host (R-005). The orchestrator
@@ -312,7 +330,14 @@ impl NetProvisioner {
             }
         };
         if let Some(alloc) = alloc {
-            self.teardown_locked(&alloc);
+            if let Err(error) = self.teardown_locked(&alloc) {
+                tracing::warn!(
+                    tap = %alloc.tap,
+                    vm_id = %alloc.vm_id,
+                    slot = alloc.idx,
+                    "net: VM-ID teardown retained allocation for retry: {error}"
+                );
+            }
         }
     }
 
@@ -687,7 +712,14 @@ impl NetProvisioner {
             "nft",
             &["-a", "list", "chain", "ip", NFT_TABLE, NFT_INPUT_CHAIN],
         )?;
-        validate_complete_effective_security_policies(&policies, &forward, &input)
+        let nat = command_stdout("nft", &["-a", "list", "chain", "ip", NFT_TABLE, NFT_CHAIN])?;
+        validate_complete_effective_security_policies(
+            &policies,
+            &self.uplink,
+            &nat,
+            &forward,
+            &input,
+        )
     }
 
     fn recovery_failure_after_cleanup(
@@ -739,8 +771,7 @@ impl NetProvisioner {
         }
         let ingress_table = ingress_table_name(alloc.idx);
         let ingress = command_stdout("nft", &["-a", "list", "table", "netdev", &ingress_table])?;
-        let ingress_tag = ingress_comment(alloc);
-        if ingress.matches(&ingress_tag).count() < 2 || !ingress.contains("policy drop") {
+        if !ingress_table_belongs_to_alloc(&ingress, alloc) {
             return Err(OrchError::Internal(format!(
                 "net: recovered tap {} ingress policy is incomplete",
                 alloc.tap
@@ -817,39 +848,46 @@ impl NetProvisioner {
         failures
     }
 
-    fn best_effort_delete(&self, alloc: &NetAlloc) {
-        let tap = tap_name(alloc.idx);
-        if let Err(e) = run("ip", &["link", "del", &tap]) {
-            tracing::warn!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: tap delete skipped/failed: {e}");
+    fn delete_tap_for_teardown(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        if strict_tap_is_absent(&alloc.tap)? {
+            return Ok(());
         }
-        match self.delete_nft_rules_for_alloc(alloc) {
-            Ok(deleted) if deleted > 0 => tracing::debug!(
-                tap = %alloc.tap,
-                vm_id = %alloc.vm_id,
-                slot = alloc.idx,
-                deleted,
-                "net: deleted per-VM nft rule(s)"
-            ),
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(tap = %alloc.tap, vm_id = %alloc.vm_id, slot = alloc.idx, "net: nft cleanup failed: {e}")
-            }
+        run("ip", &["link", "set", &alloc.tap, "down"]).map_err(|error| {
+            OrchError::Internal(format!(
+                "net: cannot contain TAP {} before teardown; retaining policy and slot: {error}",
+                alloc.tap
+            ))
+        })?;
+        run("ip", &["link", "del", &alloc.tap]).map_err(|error| {
+            OrchError::Internal(format!(
+                "net: cannot delete contained TAP {}; retaining policy and slot: {error}",
+                alloc.tap
+            ))
+        })?;
+        if strict_tap_is_absent(&alloc.tap)? {
+            Ok(())
+        } else {
+            Err(OrchError::Internal(format!(
+                "net: TAP {} remained present after deletion; retaining policy and slot",
+                alloc.tap
+            )))
         }
     }
 
-    fn free_allocation_locked(&self, alloc: &NetAlloc) {
-        match self.inner.lock() {
-            Ok(mut inner) => {
-                inner.free(alloc);
-                if let Err(e) = persist_allocator(&self.state_path, &inner) {
-                    tracing::warn!(vm_id = %alloc.vm_id, slot = alloc.idx, "net: failed to persist freed slot: {e}");
-                }
-            }
-
-            Err(_) => {
-                tracing::warn!(vm_id = %alloc.vm_id, slot = alloc.idx, "net allocator lock poisoned while freeing slot")
-            }
+    fn free_allocation_locked(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            OrchError::Internal("net allocator lock poisoned while freeing slot".into())
+        })?;
+        let original = inner.clone();
+        inner.free(alloc);
+        if let Err(error) = persist_allocator(&self.state_path, &inner) {
+            *inner = original;
+            return Err(OrchError::Internal(format!(
+                "net: failed to persist freed slot {}; retaining allocation ownership: {error}",
+                alloc.idx
+            )));
         }
+        Ok(())
     }
 
     fn require_active_allocation(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -980,7 +1018,7 @@ impl SweepReport {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SlotAllocator {
     free: BTreeSet<u32>,
     by_slot: BTreeMap<u32, Uuid>,
@@ -1748,6 +1786,10 @@ fn discover_strict_tap_names() -> Result<Vec<String>, OrchError> {
     strict_tap_names_from_link_json(&command_stdout("ip", &["-j", "link", "show"])?)
 }
 
+fn strict_tap_is_absent(tap: &str) -> Result<bool, OrchError> {
+    Ok(!discover_strict_tap_names()?.iter().any(|name| name == tap))
+}
+
 /// Quarantine pre-existing strict Tarit TAPs before any configuration, database,
 /// image, or VM discovery can fail. Repeating this is safe: lowering an already
 /// down TAP is idempotent.
@@ -1946,7 +1988,7 @@ fn delete_ingress_table_argv(slot: u32) -> Vec<String> {
     ]
 }
 
-fn ingress_table_belongs_to_alloc(listing: &str, alloc: &NetAlloc) -> bool {
+fn nft_listing_tokens(listing: &str) -> Option<Vec<String>> {
     let listing = listing
         .lines()
         .map(|line| {
@@ -1960,30 +2002,116 @@ fn ingress_table_belongs_to_alloc(listing: &str, alloc: &NetAlloc) -> bool {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let expected_comment = ingress_comment(alloc);
-    let expected_arp = format!("ether type arp accept comment \"{expected_comment}\"");
-    let expected_ip = format!("ether type ip accept comment \"{expected_comment}\"");
-    let expected_header = format!(
-        "type filter hook ingress device \"{}\" priority filter; policy drop",
-        alloc.tap
-    );
-    let Some((_, chain)) = listing.split_once(&format!("chain {NFT_INGRESS_CHAIN} {{")) else {
-        return false;
-    };
-    if !listing.contains(&format!("table netdev {}", ingress_table_name(alloc.idx)))
-        || listing.matches(&expected_arp).count() != 1
-        || listing.matches(&expected_ip).count() != 1
-        || !chain.contains(&expected_header)
-    {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in listing.chars() {
+        if quoted {
+            token.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+                tokens.push(std::mem::take(&mut token));
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                token.push(character);
+                quoted = true;
+            }
+            '{' | '}' | ';' => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                tokens.push(character.to_string());
+            }
+            character if character.is_whitespace() => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            _ => token.push(character),
+        }
+    }
+    if quoted {
+        None
+    } else {
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+        Some(tokens)
+    }
+}
+
+fn consume_nft_tokens(tokens: &[String], index: &mut usize, expected: &[String]) -> bool {
+    if tokens.get(*index..*index + expected.len()) != Some(expected) {
         return false;
     }
-    let remaining = chain
-        .replace(&expected_header, "")
-        .replace(&expected_arp, "")
-        .replace(&expected_ip, "");
-    remaining
-        .chars()
-        .all(|character| character.is_whitespace() || matches!(character, ';' | '}'))
+    *index += expected.len();
+    true
+}
+
+fn ingress_table_belongs_to_alloc(listing: &str, alloc: &NetAlloc) -> bool {
+    let Some(tokens) = nft_listing_tokens(listing) else {
+        return false;
+    };
+    let mut index = 0;
+    let comment = nft_quote(&ingress_comment(alloc));
+    let table = ingress_table_name(alloc.idx);
+    let device = nft_quote(&alloc.tap);
+    let required = [
+        vec!["table".into(), "netdev".into(), table, "{".into()],
+        vec!["chain".into(), NFT_INGRESS_CHAIN.into(), "{".into()],
+        vec![
+            "type".into(),
+            "filter".into(),
+            "hook".into(),
+            "ingress".into(),
+            "device".into(),
+            device,
+            "priority".into(),
+            "filter".into(),
+            ";".into(),
+            "policy".into(),
+            "drop".into(),
+            ";".into(),
+        ],
+        vec![
+            "ether".into(),
+            "type".into(),
+            "arp".into(),
+            "accept".into(),
+            "comment".into(),
+            comment.clone(),
+        ],
+        vec![
+            "ether".into(),
+            "type".into(),
+            "ip".into(),
+            "accept".into(),
+            "comment".into(),
+            comment,
+        ],
+    ];
+    for (rule_index, expected) in required.iter().enumerate() {
+        if !consume_nft_tokens(&tokens, &mut index, expected) {
+            return false;
+        }
+        if matches!(rule_index, 3 | 4) && tokens.get(index).is_some_and(|token| token == ";") {
+            index += 1;
+        }
+    }
+    tokens.get(index) == Some(&"}".to_string())
+        && tokens.get(index + 1) == Some(&"}".to_string())
+        && index + 2 == tokens.len()
 }
 
 fn delete_ingress_table_for_alloc(alloc: &NetAlloc) -> Result<usize, OrchError> {
@@ -2651,16 +2779,24 @@ fn validate_security_rule_order(
 
 fn validate_complete_effective_security_policies(
     allocations: &[(NetAlloc, EgressPolicy)],
+    uplink: &str,
+    nat: &str,
     forward: &str,
     input: &str,
 ) -> Result<(), OrchError> {
+    validate_taritd_nat_chain(nat)?;
     validate_taritd_security_chain(NFT_FWD_CHAIN, forward)?;
     validate_taritd_security_chain(NFT_INPUT_CHAIN, input)?;
     for (alloc, policy) in allocations {
-        validate_complete_forward_policy(alloc, policy, forward)?;
+        validate_complete_masquerade_policy(alloc, uplink, nat)?;
+        validate_complete_forward_policy(alloc, policy, uplink, forward)?;
         validate_complete_input_policy(alloc, input)?;
     }
-    for (chain, listing) in [(NFT_FWD_CHAIN, forward), (NFT_INPUT_CHAIN, input)] {
+    for (chain, listing) in [
+        (NFT_CHAIN, nat),
+        (NFT_FWD_CHAIN, forward),
+        (NFT_INPUT_CHAIN, input),
+    ] {
         for line in listing
             .lines()
             .map(str::trim)
@@ -2747,6 +2883,7 @@ fn exactly_one_rule(
 fn validate_complete_forward_policy(
     alloc: &NetAlloc,
     policy: &EgressPolicy,
+    uplink: &str,
     listing: &str,
 ) -> Result<(), OrchError> {
     let rules = allocation_rules(NFT_FWD_CHAIN, listing, alloc)?;
@@ -2775,7 +2912,8 @@ fn validate_complete_forward_policy(
                 let matches = rules
                     .iter()
                     .filter(|(_, actual_role, rule)| {
-                        *actual_role == role && valid_uplink_guard_rule(rule, &tap, &alloc.guest_ip)
+                        *actual_role == role
+                            && valid_uplink_guard_rule(rule, &tap, &alloc.guest_ip, uplink)
                     })
                     .map(|(index, _, _)| *index)
                     .collect::<Vec<_>>();
@@ -2888,6 +3026,35 @@ fn validate_complete_forward_policy(
     Ok(())
 }
 
+fn validate_complete_masquerade_policy(
+    alloc: &NetAlloc,
+    uplink: &str,
+    listing: &str,
+) -> Result<(), OrchError> {
+    let rules = listing
+        .lines()
+        .filter(|line| is_taritd_nft_rule_for_alloc(line, alloc))
+        .map(|line| {
+            security_chain_rule_text(line).ok_or_else(|| {
+                OrchError::Internal(format!(
+                    "net: refusing activation: malformed managed NAT rule for {}",
+                    alloc.tap
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_tap = nft_quote(&alloc.tap);
+    if rules.len() != 1
+        || !valid_masquerade_rule_for_uplink(&rules[0], &expected_tap, &alloc.guest_ip, uplink)
+    {
+        return Err(OrchError::Internal(format!(
+            "net: refusing activation: {} requires exactly one masquerade rule for uplink {uplink:?}",
+            alloc.tap
+        )));
+    }
+    Ok(())
+}
+
 fn validate_complete_input_policy(alloc: &NetAlloc, listing: &str) -> Result<(), OrchError> {
     let rules = allocation_rules(NFT_INPUT_CHAIN, listing, alloc)?;
     let tap = nft_quote(&alloc.tap);
@@ -2981,7 +3148,7 @@ fn valid_taritd_security_rule(
             Some(SecurityRuleRole::ForwardLateralGuard)
         }
         (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard)
-            if valid_uplink_guard_rule(rule, &tap, &alloc.guest_ip) =>
+            if valid_any_uplink_guard_rule(rule, &tap, &alloc.guest_ip) =>
         {
             Some(SecurityRuleRole::ForwardUplinkGuard)
         }
@@ -3021,7 +3188,7 @@ fn valid_taritd_security_rule(
     }
 }
 
-fn valid_uplink_guard_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
+fn valid_any_uplink_guard_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
     let words = rule.split_whitespace().collect::<Vec<_>>();
     matches!(
         words.as_slice(),
@@ -3032,6 +3199,14 @@ fn valid_uplink_guard_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
                 && uplink.ends_with('"')
                 && uplink.len() > 2
     )
+}
+
+fn valid_uplink_guard_rule(rule: &str, tap: &str, guest_ip: &str, uplink: &str) -> bool {
+    valid_any_uplink_guard_rule(rule, tap, guest_ip)
+        && rule
+            .split_whitespace()
+            .nth(7)
+            .is_some_and(|actual| actual == nft_quote(uplink))
 }
 
 fn valid_masquerade_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
@@ -3045,6 +3220,14 @@ fn valid_masquerade_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
                 && uplink.ends_with('"')
                 && uplink.len() > 2
     )
+}
+
+fn valid_masquerade_rule_for_uplink(rule: &str, tap: &str, guest_ip: &str, uplink: &str) -> bool {
+    valid_masquerade_rule(rule, tap, guest_ip)
+        && rule
+            .split_whitespace()
+            .nth(6)
+            .is_some_and(|actual| actual == nft_quote(uplink))
 }
 
 fn valid_egress_allow_rule(rule: &str, tap: &str, guest_ip: &str) -> bool {
@@ -3102,8 +3285,16 @@ mod tests {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
 
-    fn complete_policy_listings(alloc: &NetAlloc, policy: &EgressPolicy) -> (String, String) {
+    fn complete_policy_listings(
+        alloc: &NetAlloc,
+        policy: &EgressPolicy,
+    ) -> (String, String, String) {
         let tap = nft_quote(&alloc.tap);
+        let nat = format!(
+            "iifname {tap} ip saddr {} oifname \"eth0\" masquerade comment {} # handle 0",
+            alloc.guest_ip,
+            nft_quote(&nft_comment(alloc))
+        );
         let forward = [
             format!(
                 "iifname {tap} ip saddr != {} counter drop comment {} # handle 1",
@@ -3147,7 +3338,7 @@ mod tests {
             ),
         ]
         .join("\n");
-        (forward, input)
+        (nat, forward, input)
     }
 
     #[test]
@@ -3507,6 +3698,19 @@ esac
             ),
             &recovered,
         ));
+        let unknown_current_owner_shape = format!(
+            "iifname \"insta7\" ip saddr {} ip daddr 198.18.0.1 drop comment \"{}\"",
+            recovered.guest_ip,
+            egress_comment(&recovered)
+        );
+        assert!(is_stale_recovery_rule_for_alloc(
+            &unknown_current_owner_shape,
+            &recovered,
+        ));
+        assert!(
+            !is_recognized_taritd_rule(NFT_FWD_CHAIN, &unknown_current_owner_shape),
+            "unknown current-owner shapes must be retained so closed-chain validation blocks recovery"
+        );
     }
 
     #[test]
@@ -3793,10 +3997,24 @@ esac
             ),
             "  counter accept",
         );
+        let deceptive_type_filter_rule = owned.replace(
+            &format!(
+                "  ether type ip accept comment \"{}\"",
+                ingress_comment(&recovered)
+            ),
+            &format!(
+                "  meta l4proto type filter drop\n  ether type ip accept comment \"{}\"",
+                ingress_comment(&recovered)
+            ),
+        );
 
         assert!(ingress_table_belongs_to_alloc(&owned, &recovered));
         assert!(!ingress_table_belongs_to_alloc(&collision, &recovered));
         assert!(!ingress_table_belongs_to_alloc(&operator_rule, &recovered));
+        assert!(!ingress_table_belongs_to_alloc(
+            &deceptive_type_filter_rule,
+            &recovered
+        ));
     }
 
     #[test]
@@ -5361,6 +5579,9 @@ case "${0##*/}:$*" in
       *) echo "unexpected nft transaction: $script" >&2; exit 1 ;;
     esac
     ;;
+  "nft:-a list chain ip taritd_nat post")
+    echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 1"
+    ;;
   "nft:-a list chain ip taritd_nat vm_egress") forward_rules ;;
   "nft:-a list chain ip taritd_nat vm_input")
     echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 31"
@@ -5612,9 +5833,11 @@ esac
             allowlist: vec!["198.51.100.10:443".into(), "203.0.113.20:53/udp".into()],
             allow_existing: true,
         };
-        let (forward, input) = complete_policy_listings(&alloc, &policy);
+        let (nat, forward, input) = complete_policy_listings(&alloc, &policy);
         assert!(validate_complete_effective_security_policies(
             &[(alloc.clone(), policy.clone())],
+            "eth0",
+            &nat,
             &forward,
             &input,
         )
@@ -5653,6 +5876,8 @@ esac
             assert!(
                 validate_complete_effective_security_policies(
                     &[(alloc.clone(), policy.clone())],
+                    "eth0",
+                    &nat,
                     &candidate_forward,
                     &candidate_input,
                 )
@@ -5690,6 +5915,8 @@ esac
             assert!(
                 validate_complete_effective_security_policies(
                     &[(alloc.clone(), policy.clone())],
+                    "eth0",
+                    &nat,
                     &candidate_forward,
                     &candidate_input,
                 )
@@ -5740,6 +5967,8 @@ esac
             assert!(
                 validate_complete_effective_security_policies(
                     &[(alloc.clone(), policy.clone())],
+                    "eth0",
+                    &nat,
                     &candidate_forward,
                     &candidate_input,
                 )
@@ -5747,6 +5976,163 @@ esac
                 "reordered {chain} rule {marker:?} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn complete_policy_validation_rejects_wrong_provisioner_uplink() {
+        let alloc = NetAlloc::for_idx(7);
+        let policy = EgressPolicy {
+            allowlist: vec!["198.51.100.10:443".into()],
+            allow_existing: true,
+        };
+        let (nat, forward, input) = complete_policy_listings(&alloc, &policy);
+        let wrong_guard_uplink = forward.replace("oifname != \"eth0\"", "oifname != \"wlan0\"");
+
+        assert!(
+            validate_complete_effective_security_policies(
+                &[(alloc.clone(), policy.clone())],
+                "eth0",
+                &nat,
+                &wrong_guard_uplink,
+                &input,
+            )
+            .is_err(),
+            "a complete forward policy accepted a guard for the wrong uplink"
+        );
+        let wrong_nat_uplink = nat.replace("oifname \"eth0\"", "oifname \"wlan0\"");
+        assert!(
+            validate_complete_effective_security_policies(
+                &[(alloc, policy)],
+                "eth0",
+                &wrong_nat_uplink,
+                &forward,
+                &input,
+            )
+            .is_err(),
+            "a complete policy accepted masquerade for the wrong uplink"
+        );
+    }
+
+    #[test]
+    fn masquerade_validation_rejects_wrong_provisioner_uplink() {
+        let alloc = NetAlloc::for_idx(7);
+        let wrong_uplink = format!(
+            "iifname \"{}\" ip saddr {} oifname \"wlan0\" masquerade",
+            alloc.tap, alloc.guest_ip
+        );
+
+        assert!(
+            !valid_masquerade_rule_for_uplink(
+                &wrong_uplink,
+                &nft_quote(&alloc.tap),
+                &alloc.guest_ip,
+                "eth0",
+            ),
+            "a masquerade rule for the wrong uplink was accepted"
+        );
+    }
+
+    #[test]
+    fn teardown_link_delete_failure_retains_policy_and_slot() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-teardown-link-delete-failure-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:-j link show") echo '[{"ifname":"insta7"}]' ;;
+  "ip:link set insta7 down") ;;
+  "ip:link del insta7") echo "simulated link-delete failure" >&2; exit 1 ;;
+  "nft:-a list chain ip taritd_nat post") echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 1" ;;
+  "nft:-a list chain ip taritd_nat vm_egress") echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 2" ;;
+  "nft:-a list chain ip taritd_nat vm_input") echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 3" ;;
+  "nft:list tables netdev") echo "table netdev taritd_ingress_7" ;;
+  "nft:-a list table netdev taritd_ingress_7") cat <<EOF
+table netdev taritd_ingress_7 {
+ chain ingress {
+  type filter hook ingress device "insta7" priority filter; policy drop;
+  ether type arp accept comment "taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7"
+  ether type ip accept comment "taritd-ingress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7"
+ }
+}
+EOF
+  ;;
+esac
+"#;
+        for name in ["ip", "nft"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let mut allocator = SlotAllocator::empty();
+        let alloc = NetAlloc::for_slot(vm_id, 7).unwrap();
+        allocator.free.remove(&7);
+        allocator.by_slot.insert(7, vm_id);
+        allocator.by_vm.insert(vm_id, 7);
+        allocator
+            .egress_by_vm
+            .insert(vm_id, Some(EgressPolicy::default()));
+        persist_allocator(&state_path, &allocator).unwrap();
+        let provisioner = NetProvisioner {
+            inner: Mutex::new(allocator),
+            network_transactions: NetworkTransactionLock::default(),
+            state_path: state_path.clone(),
+            uplink: "eth0".into(),
+        };
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
+        provisioner.teardown(&alloc);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+        std::env::remove_var("TARIT_TEST_VM_ID");
+
+        let commands = std::fs::read_to_string(&log).unwrap();
+        assert!(provisioner.require_active_allocation(&alloc).is_ok());
+        assert!(std::fs::read_to_string(&state_path)
+            .unwrap()
+            .contains(&vm_id.to_string()));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(commands.contains("ip link set insta7 down"), "{commands}");
+        assert!(commands.contains("ip link del insta7"), "{commands}");
+        assert!(
+            !commands.contains("nft delete rule") && !commands.contains("nft delete table"),
+            "teardown removed policy after link deletion failed:\n{commands}"
+        );
     }
 
     #[test]
