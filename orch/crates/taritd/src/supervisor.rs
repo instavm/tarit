@@ -18,7 +18,15 @@ use uuid::Uuid;
 
 pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5";
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const WARM_HANDOFF_READY_TIMEOUT: Duration = Duration::from_millis(200);
+const GUEST_READY_EXEC_TIMEOUT: Duration = Duration::from_secs(1);
 const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessCheck {
+    Boot,
+    WarmHandoff,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VmSpawnConfig {
@@ -544,12 +552,16 @@ impl VmmSupervisor {
     /// Boot one warm-pool VM of `class` and park it in the warm queue. The boot
     /// happens without the warm lock held; only the final enqueue takes it.
     /// Block until the guest agent can actually run a command.
-    fn await_ready(&self, socket: &Path) -> Result<(), OrchError> {
-        let client = VmmClient::new(socket);
-        wait_for_guest_ready(GUEST_READY_TIMEOUT, || match client.exec("true", 1000) {
-            Ok((0, _, _, _)) => Ok(true),
-            Ok((code, _, _, _)) => Err(format!("readiness command exited with status {code}")),
-            Err(error) => Err(error.to_string()),
+    fn await_ready(&self, socket: &Path, timeout: Duration) -> Result<(), OrchError> {
+        wait_for_guest_ready(timeout, |remaining| {
+            let exec_timeout_ms = readiness_exec_timeout_ms(remaining);
+            let client =
+                VmmClient::new(socket).with_connect_timeout(Duration::from_millis(exec_timeout_ms));
+            match client.exec("true", exec_timeout_ms) {
+                Ok((0, _, _, _)) => Ok(true),
+                Ok((code, _, _, _)) => Err(format!("readiness command exited with status {code}")),
+                Err(error) => Err(error.to_string()),
+            }
         })
         .map_err(|last| {
             OrchError::Vmm(format!(
@@ -561,7 +573,7 @@ impl VmmSupervisor {
 
     fn await_restore_ready(&self, socket: &Path, purpose: SpawnPurpose) -> Result<(), OrchError> {
         if restore_requires_guest_readiness(purpose) {
-            self.await_ready(socket)
+            self.await_ready(socket, readiness_timeout(ReadinessCheck::Boot))
         } else {
             Ok(())
         }
@@ -571,7 +583,7 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
-        if let Err(e) = self.await_ready(&vm.socket_path) {
+        if let Err(e) = self.await_ready(&vm.socket_path, readiness_timeout(ReadinessCheck::Boot)) {
             self.teardown_vm(id, vm);
             return Err(e);
         }
@@ -602,7 +614,7 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
-        if let Err(e) = self.await_ready(&vm.socket_path) {
+        if let Err(e) = self.await_ready(&vm.socket_path, readiness_timeout(ReadinessCheck::Boot)) {
             self.teardown_vm(id, vm);
             return Err(e);
         }
@@ -689,7 +701,10 @@ impl VmmSupervisor {
                 let pos = warm.iter().position(|w| &w.spec == want)?;
                 warm.remove(pos)?
             };
-            if let Err(error) = self.await_ready(&taken.vm.socket_path) {
+            if let Err(error) = self.await_ready(
+                &taken.vm.socket_path,
+                readiness_timeout(ReadinessCheck::WarmHandoff),
+            ) {
                 tracing::warn!(id = %taken.id, error = %error, "discarding unready warm VM");
                 self.teardown_vm(taken.id, taken.vm);
                 continue;
@@ -988,15 +1003,33 @@ fn restore_requires_guest_readiness(purpose: SpawnPurpose) -> bool {
     purpose == SpawnPurpose::Refill
 }
 
+fn readiness_timeout(check: ReadinessCheck) -> Duration {
+    match check {
+        ReadinessCheck::Boot => GUEST_READY_TIMEOUT,
+        ReadinessCheck::WarmHandoff => WARM_HANDOFF_READY_TIMEOUT,
+    }
+}
+
+fn readiness_exec_timeout_ms(remaining: Duration) -> u64 {
+    let timeout = remaining.min(GUEST_READY_EXEC_TIMEOUT);
+    u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
 fn wait_for_guest_ready<F>(timeout: Duration, mut probe: F) -> Result<(), String>
 where
-    F: FnMut() -> Result<bool, String>,
+    F: FnMut(Duration) -> Result<bool, String>,
 {
     let deadline = Instant::now() + timeout;
     let mut last = "guest agent returned no successful readiness response".to_string();
 
     while Instant::now() < deadline {
-        match probe() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match probe(remaining) {
             Ok(true) => return Ok(()),
             Ok(false) => {
                 last = "guest agent readiness command did not succeed".to_string();
@@ -1216,7 +1249,7 @@ mod tests {
 
     #[test]
     fn guest_readiness_gate_rejects_an_unresponsive_agent() {
-        let error = wait_for_guest_ready(Duration::ZERO, || Ok(false))
+        let error = wait_for_guest_ready(Duration::ZERO, |_| Ok(false))
             .expect_err("an unresponsive guest must not pass the readiness gate");
 
         assert!(error.contains("guest agent never became ready"));
@@ -1226,13 +1259,41 @@ mod tests {
     fn guest_readiness_gate_accepts_a_successful_probe() {
         let mut attempts = 0;
 
-        wait_for_guest_ready(Duration::from_secs(1), || {
+        wait_for_guest_ready(Duration::from_secs(1), |_| {
             attempts += 1;
             Ok(true)
         })
         .expect("a successful guest-agent probe must pass the readiness gate");
 
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn boot_and_warm_handoff_use_their_respective_readiness_timeouts() {
+        assert_eq!(
+            readiness_timeout(ReadinessCheck::Boot),
+            GUEST_READY_TIMEOUT,
+            "newly booted, refilled, and golden-builder VMs need the full readiness window"
+        );
+        assert_eq!(
+            readiness_timeout(ReadinessCheck::WarmHandoff),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn warm_handoff_exec_timeout_is_short_and_nonzero() {
+        assert_eq!(
+            readiness_exec_timeout_ms(Duration::from_secs(20)),
+            1_000,
+            "long boot readiness retains its existing per-exec timeout"
+        );
+        assert_eq!(
+            readiness_exec_timeout_ms(Duration::from_millis(200)),
+            200,
+            "a wedged parked VM must not use the long readiness probe timeout"
+        );
+        assert_eq!(readiness_exec_timeout_ms(Duration::ZERO), 1);
     }
 
     #[test]

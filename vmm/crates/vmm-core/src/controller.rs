@@ -1752,6 +1752,20 @@ fn copy_dense_restore_overlay(
     target.sync_all()
 }
 
+#[cfg(any(
+    test,
+    all(target_os = "linux", target_arch = "x86_64", feature = "boot")
+))]
+fn validate_sparse_extent(data: u64, hole: u64, length: u64) -> std::io::Result<()> {
+    if hole <= data || hole > length {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid overlay data extent",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(
     target_os = "linux",
     any(test, all(target_arch = "x86_64", feature = "boot"))
@@ -1824,12 +1838,7 @@ fn copy_sparse_restore_overlay(
                 "negative overlay hole offset",
             )
         })?;
-        if hole < data || hole > length {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid overlay data extent",
-            ));
-        }
+        validate_sparse_extent(data, hole, length)?;
 
         source.seek(SeekFrom::Start(data))?;
         target.seek(SeekFrom::Start(data))?;
@@ -3440,6 +3449,14 @@ mod tests {
             config.volumes[0].overlay.as_deref(),
             Some("/clones/a.overlay")
         );
+    }
+
+    #[test]
+    fn sparse_restore_overlay_rejects_an_empty_data_extent() {
+        let error = validate_sparse_extent(4096, 4096, 8192)
+            .expect_err("SEEK_HOLE must advance beyond SEEK_DATA");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
