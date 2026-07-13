@@ -97,12 +97,74 @@ pub enum StoreWrite {
     Audit(AuditEvent),
 }
 
-/// A VM that has completed destructive teardown but whose terminal lifecycle
-/// commit still has to complete. It remains reserved and owned until removed.
-#[derive(Clone)]
-pub(crate) struct PendingStop {
-    pub(crate) record: VmRecord,
-    pub(crate) sqlite_persisted: bool,
+/// The only mutable lifecycle coordination record for a user VM. A record stays
+/// here until every durable/externally-visible step has acknowledged; this makes
+/// retry ownership explicit instead of inferring it from cache and supervisor
+/// side effects.
+#[derive(Clone, Debug)]
+pub(crate) enum LifecycleState {
+    Creating {
+        record: VmRecord,
+        phase: CreatingPhase,
+    },
+    Publishing {
+        record: VmRecord,
+        phase: PublicationPhase,
+    },
+    Running {
+        record: VmRecord,
+    },
+    Terminal {
+        record: VmRecord,
+        phase: TerminalPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreatingPhase {
+    CacheVisible,
+    SQLitePersisted,
+    FleetClaimed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationPhase {
+    NeedFleetUpdate,
+    FleetUpdated,
+    SQLitePersisted,
+    CacheVisible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalPhase {
+    PersistRecordAndRelease,
+    PersistRecordOnly,
+    ClearFleetOwnershipAndRelease,
+    ClearFleetOwnershipOnly,
+    CommitCacheAndRelease,
+    CommitCacheOnly,
+    ReleaseReservation,
+    Complete,
+}
+
+impl LifecycleState {
+    pub(crate) fn record(&self) -> &VmRecord {
+        match self {
+            Self::Creating { record, .. }
+            | Self::Publishing { record, .. }
+            | Self::Running { record }
+            | Self::Terminal { record, .. } => record,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleFault {
+    SQLite,
+    FleetClaim,
+    FleetClear,
+    CacheCommit,
 }
 
 #[derive(Clone)]
@@ -119,9 +181,12 @@ pub struct AppState {
     pub vm_cache: Arc<RwLock<HashMap<Uuid, VmRecord>>>,
     /// Channel to the background store writer (durability, write-behind).
     pub store_tx: tokio::sync::mpsc::UnboundedSender<StoreWrite>,
-    /// Terminal transitions retained after teardown until SQLite, fleet removal,
-    /// and scheduler release complete.
-    pub(crate) pending_stops: Arc<Mutex<HashMap<Uuid, PendingStop>>>,
+    /// Registered user lifecycle state. The supervisor boot gate establishes
+    /// Creating records before VMM work; this map then owns publication and
+    /// terminal retry progress until reservations can be released.
+    pub(crate) lifecycle: Arc<Mutex<HashMap<Uuid, LifecycleState>>>,
+    #[cfg(test)]
+    pub(crate) lifecycle_faults: Arc<Mutex<Vec<LifecycleFault>>>,
     /// Serializes terminal transition retries so a second stop cannot repeat
     /// destructive teardown while the first stop awaits durable persistence.
     /// When both are needed, this gate is acquired before the supervisor boot
@@ -1467,7 +1532,8 @@ mod tests {
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
-            pending_stops: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
             pty_registry: Arc::new(PtyRegistry::default()),
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),

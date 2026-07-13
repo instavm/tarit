@@ -182,15 +182,22 @@ Operational behavior:
 - Shutdown and user-boot publication share a boot gate. The global order is
   `terminal transition gate` → `boot gate` → `running`/`warm` → `booting`;
   shutdown releases the boot gate before its separate `running` → `warm`
-  teardown phase. Lifecycle publication never takes an earlier gate while
-  holding a later one. A user boot keeps its boot entry until its Running record
-  is durably written and fleet ownership is recorded. Terminal stop/delete
-  transitions retain a pending stopped record, ownership, and scheduler
-  reservation until SQLite acknowledgement completes; a later stop retries that
-  record without repeating teardown.
+  teardown phase. No synchronous supervisor lock is held across an await.
+  Create and restore first establish a boot entry, durable local `Creating`
+  record, and (when configured) routable fleet ownership while holding the boot
+  gate; only then may scheduler, image, or VMM work start.
+- A user lifecycle is explicitly `Creating` → `Publishing` → `Running` or a
+  terminal `Stopped`/`Error` transition. Publishing advances fleet ownership,
+  SQLite, cache visibility, and supervisor running ownership in order. A failed
+  step retains the VMM, network, reservation, and lifecycle state; a later
+  stop/delete/stop-all retries convergence before teardown. Terminal records
+  retain fleet ownership and capacity until SQLite, fleet clear, cache commit,
+  and reservation release each acknowledge.
 - Warm handout is possible only when the create request exactly matches a warm class shape and boot config.
 - If the pool drains, creates cold boot instead of failing.
-- Replenishment loops every 150 ms and limits concurrent warm spawns by `replenish_concurrency`.
+- Replenishment limits concurrent warm spawns by `replenish_concurrency`; it
+  sleeps for 150 ms after an at-capacity attempt, rather than spinning while
+  the host is overloaded.
 - Set `restore = true` on a warm class to cold-boot one golden VM, snapshot it, and replenish the rest of that shape by restoring clones.
 
 ## Networking

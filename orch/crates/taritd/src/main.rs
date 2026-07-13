@@ -209,7 +209,9 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         exec_cache: Arc::new(RwLock::new(HashMap::new())),
         vm_cache,
         store_tx,
-        pending_stops: Arc::new(Mutex::new(HashMap::new())),
+        lifecycle: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(test)]
+        lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
         terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
         pty_registry: Arc::new(pty::PtyRegistry::default()),
         supervisor: Arc::clone(&supervisor),

@@ -134,14 +134,16 @@ impl ManagedProcess {
 
 #[derive(Debug)]
 struct BootControl {
+    purpose: SpawnPurpose,
     cancelled: AtomicBool,
     cancellation: (Mutex<bool>, Condvar),
     completion: (Mutex<Option<Result<(), String>>>, Condvar),
 }
 
 impl BootControl {
-    fn new() -> Self {
+    fn new(purpose: SpawnPurpose) -> Self {
         Self {
+            purpose,
             cancelled: AtomicBool::new(false),
             cancellation: (Mutex::new(false), Condvar::new()),
             completion: (Mutex::new(None), Condvar::new()),
@@ -233,6 +235,12 @@ pub(crate) struct BootedVm {
     vm: RunningVm,
     control: Arc<BootControl>,
 }
+
+/// A lifecycle publisher may retain a fully booted VM when an external
+/// publication step has committed but the next one failed. The supervisor then
+/// transfers the VM into its running map instead of tearing down resources that
+/// the durable lifecycle state still owns.
+pub(crate) struct PublicationFailure(pub(crate) OrchError);
 
 pub struct VmmSupervisor {
     config: Config,
@@ -479,39 +487,21 @@ impl VmmSupervisor {
         }
     }
 
-    pub(crate) async fn begin_boot(
+    pub(crate) async fn begin_boot_with_registration<F, Fut>(
         &self,
         id: Uuid,
         purpose: SpawnPurpose,
-        on_registered: impl FnOnce() -> Result<(), OrchError>,
-    ) -> Result<BootTicket, OrchError> {
+        on_registered: F,
+    ) -> Result<BootTicket, OrchError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), OrchError>>,
+    {
         let _gate = self.boot_gate.lock().await;
         if self.is_shutting_down() {
             return Err(self.shutdown_error());
         }
-        if !self.scheduler.try_reserve() {
-            return Err(OrchError::Overloaded {
-                message: "host at capacity".into(),
-                retry_after_secs: 1,
-            });
-        }
-        let inserted_reservation = match self.reservations.lock() {
-            Ok(mut reservations) => reservations.insert(id),
-            Err(_) => {
-                self.scheduler.release();
-                return Err(OrchError::Internal(
-                    "supervisor reservation lock poisoned".into(),
-                ));
-            }
-        };
-        if !inserted_reservation {
-            self.scheduler.release();
-            return Err(OrchError::Conflict(format!(
-                "VM {id} already has a boot reservation"
-            )));
-        }
-
-        let control = Arc::new(BootControl::new());
+        let control = Arc::new(BootControl::new(purpose));
         let socket_path = self.socket_path_for(id);
         let registered = self
             .booting
@@ -528,14 +518,34 @@ impl VmmSupervisor {
                     },
                 );
             });
-        if let Err(error) = registered {
-            self.release_reservation_after_cleanup(id);
+        registered?;
+        if let Err(error) = on_registered().await {
+            self.complete_booting(id, &control, Ok(()));
             return Err(error);
         }
-        if let Err(error) = on_registered() {
+        if !self.scheduler.try_reserve() {
             self.complete_booting(id, &control, Ok(()));
-            self.release_reservation_after_cleanup(id);
-            return Err(error);
+            return Err(OrchError::Overloaded {
+                message: "host at capacity".into(),
+                retry_after_secs: 1,
+            });
+        }
+        let inserted_reservation = match self.reservations.lock() {
+            Ok(mut reservations) => reservations.insert(id),
+            Err(_) => {
+                self.scheduler.release();
+                self.complete_booting(id, &control, Ok(()));
+                return Err(OrchError::Internal(
+                    "supervisor reservation lock poisoned".into(),
+                ));
+            }
+        };
+        if !inserted_reservation {
+            self.scheduler.release();
+            self.complete_booting(id, &control, Ok(()));
+            return Err(OrchError::Conflict(format!(
+                "VM {id} already has a boot reservation"
+            )));
         }
         Ok(BootTicket {
             id,
@@ -552,7 +562,7 @@ impl VmmSupervisor {
         process: ManagedProcess,
         purpose: SpawnPurpose,
     ) -> Result<Arc<BootControl>, OrchError> {
-        let control = Arc::new(BootControl::new());
+        let control = Arc::new(BootControl::new(purpose));
         let mut booting = self
             .booting
             .lock()
@@ -590,6 +600,22 @@ impl VmmSupervisor {
             self.scheduler.release();
         }
         Ok(())
+    }
+
+    /// Complete a registered live boot that failed before any VMM work began.
+    /// The lifecycle owner performs the durable Error/Stopped transition and
+    /// releases its reservation afterwards, so this only removes the boot entry.
+    pub(crate) async fn abort_unstarted_boot(&self, ticket: &BootTicket) {
+        let _gate = self.boot_gate.lock().await;
+        let is_current = self
+            .booting
+            .lock()
+            .ok()
+            .and_then(|booting| booting.get(&ticket.id).cloned())
+            .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control));
+        if is_current {
+            self.complete_booting(ticket.id, &ticket.control, Ok(()));
+        }
     }
 
     #[cfg(test)]
@@ -640,7 +666,7 @@ impl VmmSupervisor {
         }
         if cleanup_failures.is_empty() {
             self.complete_booting(id, control, Ok(()));
-            if !control.is_cancelled() {
+            if control.purpose == SpawnPurpose::Refill {
                 self.release_reservation_after_cleanup(id);
             }
             cause
@@ -668,7 +694,7 @@ impl VmmSupervisor {
     where
         T: Send,
         F: FnOnce(u32, PathBuf) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<T, OrchError>> + Send,
+        Fut: std::future::Future<Output = Result<T, PublicationFailure>> + Send,
     {
         let BootedVm { id, vm, control } = booted;
         let pid = vm.pid;
@@ -696,23 +722,18 @@ impl VmmSupervisor {
             return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
         }
 
-        let published = match publish_lifecycle(pid, socket_path.clone()).await {
-            Ok(published) => published,
-            Err(error) => {
-                drop(gate);
-                return Err(self.cleanup_boot_failure(id, &control, &vm, error));
-            }
+        let (published, retained_error) = match publish_lifecycle(pid, socket_path.clone()).await {
+            Ok(published) => (Some(published), None),
+            Err(PublicationFailure(error)) => (None, Some(error)),
         };
 
         let mut running = match self.running.lock() {
             Ok(running) => running,
             Err(_) => {
                 drop(gate);
-                return Err(self.cleanup_boot_failure(
-                    id,
-                    &control,
-                    &vm,
-                    OrchError::Internal("supervisor lock poisoned".into()),
+                return Err(OrchError::Internal(
+                    "supervisor lock poisoned after lifecycle publication; boot retained for retry"
+                        .into(),
                 ));
             }
         };
@@ -721,11 +742,9 @@ impl VmmSupervisor {
             Err(_) => {
                 drop(running);
                 drop(gate);
-                return Err(self.cleanup_boot_failure(
-                    id,
-                    &control,
-                    &vm,
-                    OrchError::Internal("supervisor booting lock poisoned".into()),
+                return Err(OrchError::Internal(
+                    "supervisor booting lock poisoned after lifecycle publication; boot retained for retry"
+                        .into(),
                 ));
             }
         };
@@ -742,7 +761,10 @@ impl VmmSupervisor {
         booting.remove(&id);
         running.insert(id, vm);
         control.complete(Ok(()));
-        Ok(published)
+        match retained_error {
+            Some(error) => Err(error),
+            None => Ok(published.expect("successful publication has a result")),
+        }
     }
 
     async fn publish_warm(&self, booted: BootedVm, spec: VmSpawnConfig) -> Result<(), OrchError> {
@@ -798,7 +820,7 @@ impl VmmSupervisor {
         match self.teardown_vm(id, vm) {
             Ok(()) => {
                 self.complete_booting(id, &control, Ok(()));
-                if !control.is_cancelled() {
+                if control.purpose == SpawnPurpose::Refill {
                     self.release_reservation_after_cleanup(id);
                 }
                 Ok(())
@@ -950,7 +972,7 @@ impl VmmSupervisor {
             Err(error) => {
                 drop(boot_gate);
                 self.complete_booting(id, &ticket.control, Ok(()));
-                if !ticket.control.is_cancelled() {
+                if ticket.control.purpose == SpawnPurpose::Refill {
                     self.release_reservation_after_cleanup(id);
                 }
                 return Err(OrchError::Internal(format!("spawn vmm: {error}")));
@@ -1139,7 +1161,9 @@ impl VmmSupervisor {
     pub(crate) async fn spawn_warm(self: Arc<Self>, class: WarmClass) -> Result<(), OrchError> {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
-        let ticket = self.begin_boot(id, SpawnPurpose::Refill, || Ok(())).await?;
+        let ticket = self
+            .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) })
+            .await?;
         let worker = Arc::clone(&self);
         let worker_spec = spec.clone();
         let booted = tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec))
@@ -1162,7 +1186,9 @@ impl VmmSupervisor {
     ) -> Result<String, OrchError> {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
-        let ticket = self.begin_boot(id, SpawnPurpose::Refill, || Ok(())).await?;
+        let ticket = self
+            .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) })
+            .await?;
         let worker = Arc::clone(&self);
         let worker_spec = spec.clone();
         let booted = tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec))
@@ -1204,7 +1230,9 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
         let overlay = overlay_path_for_config(id, &spec);
-        let ticket = self.begin_boot(id, SpawnPurpose::Refill, || Ok(())).await?;
+        let ticket = self
+            .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) })
+            .await?;
         let worker = Arc::clone(&self);
         let booted = tokio::task::spawn_blocking(move || {
             worker.spawn_and_restore(ticket, &snapshot_path, overlay)
@@ -1224,15 +1252,18 @@ impl VmmSupervisor {
     /// Claim and publish a matching warm VM under the same lifecycle gate as a
     /// cold boot. A shutdown/delete either waits for this publication then tears
     /// it down, or wins before it starts; no write-behind warm visibility exists.
-    pub(crate) async fn take_warm_with_publication<T, F, Fut>(
+    pub(crate) async fn take_warm_with_publication<T, R, RFut, F, Fut>(
         &self,
         want: &VmSpawnConfig,
+        register_lifecycle: R,
         publish_lifecycle: F,
     ) -> Result<Option<T>, OrchError>
     where
         T: Send,
+        R: FnOnce(Uuid) -> RFut + Send,
+        RFut: std::future::Future<Output = Result<(), OrchError>> + Send,
         F: FnOnce(Uuid, u32, PathBuf) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<T, OrchError>> + Send,
+        Fut: std::future::Future<Output = Result<T, PublicationFailure>> + Send,
     {
         let _gate = self.boot_gate.lock().await;
         if self.is_shutting_down() {
@@ -1250,14 +1281,21 @@ impl VmmSupervisor {
         };
         let pid = taken.vm.pid;
         let socket = taken.vm.socket_path.clone();
+        if let Err(error) = register_lifecycle(taken.id).await {
+            self.warm
+                .lock()
+                .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?
+                .push_back(taken);
+            return Err(error);
+        }
         self.move_pid_to_default_cgroup(pid);
         let published = match publish_lifecycle(taken.id, pid, socket).await {
             Ok(published) => published,
-            Err(error) => {
-                self.warm
+            Err(PublicationFailure(error)) => {
+                self.running
                     .lock()
-                    .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?
-                    .push_back(taken);
+                    .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
+                    .insert(taken.id, taken.vm);
                 return Err(error);
             }
         };
@@ -1330,6 +1368,21 @@ impl VmmSupervisor {
             guard.remove(&id)
         };
         let Some(running) = running else {
+            let warm = {
+                let _gate = self.boot_gate.blocking_lock();
+                let mut warm = self
+                    .warm
+                    .lock()
+                    .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
+                warm.iter()
+                    .position(|warm_vm| warm_vm.id == id)
+                    .and_then(|index| warm.remove(index))
+            };
+            if let Some(warm) = warm {
+                let client = VmmClient::new(&warm.vm.socket_path);
+                let _ = client.stop();
+                return self.teardown_vm(id, &warm.vm);
+            }
             if let Some(net) = &self.net {
                 net.teardown_vm_id(id)?;
             }
@@ -1465,6 +1518,13 @@ impl VmmSupervisor {
             .lock()
             .map(|g| g.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    pub(crate) fn has_retained_boot(&self, id: Uuid) -> bool {
+        self.booting
+            .lock()
+            .map(|booting| booting.contains_key(&id))
+            .unwrap_or(true)
     }
 
     pub(crate) fn stop_all(&self) -> Result<ShutdownSummary, Box<ShutdownFailure>> {
@@ -1943,12 +2003,59 @@ mod tests {
     }
 
     #[test]
+    fn delete_waits_for_creating_claim_registered_under_lifecycle_gate() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let (claim_started_tx, claim_started_rx) = mpsc::channel();
+        let (allow_claim_tx, allow_claim_rx) = mpsc::channel();
+        let create_supervisor = Arc::clone(&supervisor);
+        let creator = thread::spawn(move || {
+            let ticket = test_runtime()
+                .block_on(create_supervisor.begin_boot_with_registration(
+                    id,
+                    SpawnPurpose::Live,
+                    move || async move {
+                        claim_started_tx.send(()).unwrap();
+                        allow_claim_rx.recv().unwrap();
+                        Ok(())
+                    },
+                ))
+                .expect("the Creating registration must establish a boot entry");
+            ticket.control.wait_for_cancellation();
+            create_supervisor.complete_booting(id, &ticket.control, Ok(()));
+        });
+
+        claim_started_rx.recv().unwrap();
+        let (delete_done_tx, delete_done_rx) = mpsc::channel();
+        let delete_supervisor = Arc::clone(&supervisor);
+        let deleter = thread::spawn(move || {
+            delete_done_tx.send(delete_supervisor.stop_vm(id)).unwrap();
+        });
+        assert!(
+            delete_done_rx.try_recv().is_err(),
+            "DELETE must not overtake the Creating ownership claim"
+        );
+
+        allow_claim_tx.send(()).unwrap();
+        delete_done_rx
+            .recv()
+            .unwrap()
+            .expect("DELETE must cancel and wait for the registered boot");
+        creator.join().unwrap();
+        deleter.join().unwrap();
+        assert!(!supervisor.is_running(id));
+    }
+
+    #[test]
     fn warm_handoff_and_stop_all_share_the_publication_gate() {
         let supervisor = test_supervisor();
         let id = Uuid::new_v4();
         let spec = spawn_config(false, Some(PathBuf::from("/rootfs.ext4")));
         let ticket = test_runtime()
-            .block_on(supervisor.begin_boot(id, SpawnPurpose::Refill, || Ok(())))
+            .block_on(
+                supervisor
+                    .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) }),
+            )
             .unwrap();
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         supervisor.complete_booting(id, &ticket.control, Ok(()));
@@ -1970,6 +2077,7 @@ mod tests {
             test_runtime()
                 .block_on(handoff_supervisor.take_warm_with_publication(
                     &spec,
+                    |_| async { Ok(()) },
                     move |vm_id, _, _| async move {
                         publication_started_tx.send(()).unwrap();
                         allow_publication_rx.recv().unwrap();
@@ -2006,7 +2114,10 @@ mod tests {
         let supervisor = test_supervisor();
         let id = Uuid::new_v4();
         let ticket = test_runtime()
-            .block_on(supervisor.begin_boot(id, SpawnPurpose::Refill, || Ok(())))
+            .block_on(
+                supervisor
+                    .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) }),
+            )
             .unwrap();
         let retained_socket = PathBuf::from(format!("target/taritd-supervisor-test/retained-{id}"));
         std::fs::create_dir_all(&retained_socket).unwrap();

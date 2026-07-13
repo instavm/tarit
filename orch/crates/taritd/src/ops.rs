@@ -12,20 +12,15 @@ use chrono::Utc;
 use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStatus};
 use uuid::Uuid;
 
-use crate::api::{running_record, AppState, PendingStop, StoreWrite};
+#[cfg(test)]
+use crate::api::LifecycleFault;
+use crate::api::{
+    running_record, AppState, CreatingPhase, LifecycleState, PublicationPhase, StoreWrite,
+    TerminalPhase,
+};
 use crate::cluster;
 use crate::image;
-use crate::supervisor::{ShutdownSummary, VmSpawnConfig, VmmSupervisor};
-
-/// Write a VM record: update the in-memory cache (read source of truth) and queue
-/// the SQLite persist on the background writer (write-behind), so the create/update
-/// hot path never blocks on the store mutex.
-fn vm_put(state: &AppState, rec: &VmRecord) {
-    if let Ok(mut c) = state.vm_cache.write() {
-        c.insert(rec.id, rec.clone());
-    }
-    let _ = state.store_tx.send(StoreWrite::Vm(rec.clone()));
-}
+use crate::supervisor::{PublicationFailure, ShutdownSummary, VmSpawnConfig, VmmSupervisor};
 
 fn vm_get(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
     state
@@ -53,20 +48,11 @@ fn vm_set_status(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecor
     Ok(rec)
 }
 
-fn stopped_record(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
-    let mut record = state
-        .vm_cache
-        .read()
-        .map_err(|_| OrchError::Internal("vm cache".into()))?
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found")))?;
-    record.status = VmStatus::Stopped;
-    record.updated_at = Utc::now();
-    Ok(record)
-}
-
 fn commit_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    #[cfg(test)]
+    if take_lifecycle_fault(state, LifecycleFault::CacheCommit) {
+        return Err(OrchError::Internal("injected cache commit failure".into()));
+    }
     state
         .vm_cache
         .write()
@@ -76,6 +62,10 @@ fn commit_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError>
 }
 
 async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    #[cfg(test)]
+    if take_lifecycle_fault(state, LifecycleFault::SQLite) {
+        return Err(OrchError::Internal("injected SQLite failure".into()));
+    }
     let (completion, persisted) = tokio::sync::oneshot::channel();
     state
         .store_tx
@@ -87,6 +77,10 @@ async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<()
 }
 
 async fn persist_running_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    #[cfg(test)]
+    if take_lifecycle_fault(state, LifecycleFault::SQLite) {
+        return Err(OrchError::Internal("injected SQLite failure".into()));
+    }
     let (completion, persisted) = tokio::sync::oneshot::channel();
     state
         .store_tx
@@ -99,96 +93,374 @@ async fn persist_running_record(state: &AppState, record: VmRecord) -> Result<()
     })?
 }
 
-async fn publish_running_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
-    cluster::record_ownership_required(state, &record).await?;
-    if let Err(error) = persist_running_record(state, record.clone()).await {
-        let cleanup = cluster::clear_ownership(state, record.id).await;
-        return match cleanup {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(OrchError::Internal(format!(
-                "{error}; fleet ownership rollback after failed boot publication: {cleanup}"
-            ))),
-        };
+async fn claim_lifecycle_ownership(state: &AppState, record: &VmRecord) -> Result<(), OrchError> {
+    #[cfg(test)]
+    if take_lifecycle_fault(state, LifecycleFault::FleetClaim) {
+        return Err(OrchError::Internal("injected fleet claim failure".into()));
     }
-    commit_vm_record(state, record)
+    cluster::record_ownership_required(state, record).await
 }
 
-fn retain_pending_stop(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+async fn clear_lifecycle_ownership(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    #[cfg(test)]
+    if take_lifecycle_fault(state, LifecycleFault::FleetClear) {
+        return Err(OrchError::Internal("injected fleet clear failure".into()));
+    }
+    cluster::clear_ownership(state, id).await
+}
+
+fn lifecycle_state(state: &AppState, id: Uuid) -> Result<Option<LifecycleState>, OrchError> {
     state
-        .pending_stops
+        .lifecycle
         .lock()
-        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
-        .entry(record.id)
-        .or_insert(PendingStop {
+        .map_err(|_| OrchError::Internal("lifecycle state lock poisoned".into()))
+        .map(|lifecycle| lifecycle.get(&id).cloned())
+}
+
+fn set_lifecycle_state(
+    state: &AppState,
+    id: Uuid,
+    lifecycle_state: LifecycleState,
+) -> Result<(), OrchError> {
+    state
+        .lifecycle
+        .lock()
+        .map_err(|_| OrchError::Internal("lifecycle state lock poisoned".into()))?
+        .insert(id, lifecycle_state);
+    Ok(())
+}
+
+fn terminal_record(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecord, OrchError> {
+    let mut record = lifecycle_state(state, id)?
+        .map(|lifecycle| lifecycle.record().clone())
+        .or_else(|| state.vm_cache.read().ok()?.get(&id).cloned())
+        .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found")))?;
+    record.status = status;
+    record.updated_at = Utc::now();
+    Ok(record)
+}
+
+async fn register_creating_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    let id = record.id;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Creating {
+            record: record.clone(),
+            phase: CreatingPhase::CacheVisible,
+        },
+    )?;
+    commit_vm_record(state, record.clone())?;
+    persist_running_record(state, record.clone()).await?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Creating {
+            record: record.clone(),
+            phase: CreatingPhase::SQLitePersisted,
+        },
+    )?;
+    claim_lifecycle_ownership(state, &record).await?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Creating {
             record,
-            sqlite_persisted: false,
-        });
-    Ok(())
+            phase: CreatingPhase::FleetClaimed,
+        },
+    )
 }
 
-async fn finish_pending_stop(state: &AppState, id: Uuid) -> Result<(), OrchError> {
-    let pending = state
-        .pending_stops
-        .lock()
-        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| {
-            OrchError::Internal(format!("missing pending stop transition for VM {id}"))
-        })?;
+async fn update_creating_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    let id = record.id;
+    commit_vm_record(state, record.clone())?;
+    persist_running_record(state, record.clone()).await?;
+    claim_lifecycle_ownership(state, &record).await?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Creating {
+            record,
+            phase: CreatingPhase::FleetClaimed,
+        },
+    )
+}
 
-    if !pending.sqlite_persisted {
-        persist_stopped_record(state, pending.record.clone()).await?;
-        state
-            .pending_stops
-            .lock()
-            .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
-            .get_mut(&id)
-            .ok_or_else(|| {
-                OrchError::Internal(format!("pending stop transition disappeared for VM {id}"))
-            })?
-            .sqlite_persisted = true;
+async fn publish_running_record(
+    state: &AppState,
+    record: VmRecord,
+) -> Result<(), PublicationFailure> {
+    let id = record.id;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Publishing {
+            record: record.clone(),
+            phase: PublicationPhase::NeedFleetUpdate,
+        },
+    )
+    .map_err(PublicationFailure)?;
+    claim_lifecycle_ownership(state, &record)
+        .await
+        .map_err(PublicationFailure)?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Publishing {
+            record: record.clone(),
+            phase: PublicationPhase::FleetUpdated,
+        },
+    )
+    .map_err(PublicationFailure)?;
+    persist_running_record(state, record.clone())
+        .await
+        .map_err(PublicationFailure)?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Publishing {
+            record: record.clone(),
+            phase: PublicationPhase::SQLitePersisted,
+        },
+    )
+    .map_err(PublicationFailure)?;
+    commit_vm_record(state, record.clone()).map_err(PublicationFailure)?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Publishing {
+            record,
+            phase: PublicationPhase::CacheVisible,
+        },
+    )
+    .map_err(PublicationFailure)
+}
+
+async fn finish_publication(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    loop {
+        let LifecycleState::Publishing { record, phase } = lifecycle_state(state, id)?
+            .ok_or_else(|| OrchError::NotFound(format!("vm {id} has no lifecycle state")))?
+        else {
+            return Ok(());
+        };
+        match phase {
+            PublicationPhase::NeedFleetUpdate => {
+                claim_lifecycle_ownership(state, &record).await?;
+                set_lifecycle_state(
+                    state,
+                    id,
+                    LifecycleState::Publishing {
+                        record,
+                        phase: PublicationPhase::FleetUpdated,
+                    },
+                )?;
+            }
+            PublicationPhase::FleetUpdated => {
+                persist_running_record(state, record.clone()).await?;
+                set_lifecycle_state(
+                    state,
+                    id,
+                    LifecycleState::Publishing {
+                        record,
+                        phase: PublicationPhase::SQLitePersisted,
+                    },
+                )?;
+            }
+            PublicationPhase::SQLitePersisted => {
+                commit_vm_record(state, record.clone())?;
+                set_lifecycle_state(
+                    state,
+                    id,
+                    LifecycleState::Publishing {
+                        record,
+                        phase: PublicationPhase::CacheVisible,
+                    },
+                )?;
+            }
+            PublicationPhase::CacheVisible => {
+                return set_lifecycle_state(state, id, LifecycleState::Running { record });
+            }
+        }
     }
-    commit_vm_record(state, pending.record)?;
-    cluster::clear_ownership(state, id).await?;
-    state.supervisor.release_reservation_after_terminal(id)?;
-    state
-        .pending_stops
-        .lock()
-        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
-        .remove(&id);
-    Ok(())
 }
 
-async fn retry_pending_stops(state: &AppState) -> Vec<String> {
-    let ids = match state.pending_stops.lock() {
-        Ok(pending) => pending.keys().copied().collect::<Vec<_>>(),
-        Err(_) => return vec!["pending stop transitions lock poisoned".into()],
+fn mark_running(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    set_lifecycle_state(state, record.id, LifecycleState::Running { record })
+}
+
+fn start_terminal_transition(
+    state: &AppState,
+    id: Uuid,
+    status: VmStatus,
+    release_reservation: bool,
+) -> Result<(), OrchError> {
+    let record = terminal_record(state, id, status)?;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Terminal {
+            record,
+            phase: if release_reservation {
+                TerminalPhase::PersistRecordAndRelease
+            } else {
+                TerminalPhase::PersistRecordOnly
+            },
+        },
+    )
+}
+
+async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    loop {
+        let LifecycleState::Terminal { record, phase } = lifecycle_state(state, id)?
+            .ok_or_else(|| OrchError::NotFound(format!("vm {id} has no terminal lifecycle")))?
+        else {
+            return Ok(());
+        };
+        match phase {
+            TerminalPhase::PersistRecordAndRelease | TerminalPhase::PersistRecordOnly => {
+                persist_stopped_record(state, record.clone()).await?;
+                set_lifecycle_state(
+                    state,
+                    id,
+                    LifecycleState::Terminal {
+                        record,
+                        phase: if phase == TerminalPhase::PersistRecordAndRelease {
+                            TerminalPhase::ClearFleetOwnershipAndRelease
+                        } else {
+                            TerminalPhase::ClearFleetOwnershipOnly
+                        },
+                    },
+                )?;
+            }
+            TerminalPhase::ClearFleetOwnershipAndRelease
+            | TerminalPhase::ClearFleetOwnershipOnly => {
+                clear_lifecycle_ownership(state, id).await?;
+                set_lifecycle_state(
+                    state,
+                    id,
+                    LifecycleState::Terminal {
+                        record,
+                        phase: if phase == TerminalPhase::ClearFleetOwnershipAndRelease {
+                            TerminalPhase::CommitCacheAndRelease
+                        } else {
+                            TerminalPhase::CommitCacheOnly
+                        },
+                    },
+                )?;
+            }
+            TerminalPhase::CommitCacheAndRelease | TerminalPhase::CommitCacheOnly => {
+                commit_vm_record(state, record.clone())?;
+                set_lifecycle_state(
+                    state,
+                    id,
+                    LifecycleState::Terminal {
+                        record,
+                        phase: if phase == TerminalPhase::CommitCacheAndRelease {
+                            TerminalPhase::ReleaseReservation
+                        } else {
+                            TerminalPhase::Complete
+                        },
+                    },
+                )?;
+            }
+            TerminalPhase::ReleaseReservation => {
+                state.supervisor.release_reservation_after_terminal(id)?;
+                set_lifecycle_state(
+                    state,
+                    id,
+                    LifecycleState::Terminal {
+                        record,
+                        phase: TerminalPhase::Complete,
+                    },
+                )?;
+            }
+            TerminalPhase::Complete => {
+                state
+                    .lifecycle
+                    .lock()
+                    .map_err(|_| OrchError::Internal("lifecycle state lock poisoned".into()))?
+                    .remove(&id);
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn finish_failed_boot(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
+    if let Some(LifecycleState::Creating { phase, .. }) = lifecycle_state(state, id)? {
+        tracing::debug!(?phase, %id, "finishing failed Creating lifecycle");
+    }
+    start_terminal_transition(state, id, VmStatus::Error, true)?;
+    finish_terminal_transition(state, id).await
+}
+
+async fn retry_pending_lifecycle(state: &AppState) -> Vec<String> {
+    let states = match state.lifecycle.lock() {
+        Ok(lifecycle) => lifecycle
+            .iter()
+            .map(|(id, lifecycle)| (*id, lifecycle.clone()))
+            .collect::<Vec<_>>(),
+        Err(_) => return vec!["lifecycle state lock poisoned".into()],
     };
     let mut failures = Vec::new();
-    for id in ids {
-        if let Err(error) = finish_pending_stop(state, id).await {
+    for (id, lifecycle) in states {
+        let result = match lifecycle {
+            LifecycleState::Publishing { .. } => finish_publication(state, id).await,
+            LifecycleState::Terminal { .. } => finish_terminal_transition(state, id).await,
+            LifecycleState::Creating { .. } | LifecycleState::Running { .. } => continue,
+        };
+        if let Err(error) = result {
             failures.push(format!(
-                "VM {id} retained stopped transition, ownership, and scheduler reservation: {error}"
+                "VM {id} retained lifecycle state for retry: {error}"
             ));
         }
     }
     failures
 }
 
-fn store_insert(state: &AppState, rec: &VmRecord) -> Result<(), OrchError> {
-    vm_put(state, rec);
-    Ok(())
+fn creating_record(
+    state: &AppState,
+    spawn_cfg: &VmSpawnConfig,
+    id: Uuid,
+    owner_key: Option<String>,
+    api_key_id: Option<String>,
+    now: chrono::DateTime<Utc>,
+) -> VmRecord {
+    VmRecord {
+        id,
+        host_id: state.config.host_id.clone(),
+        owner_key,
+        api_key_id,
+        status: VmStatus::Creating,
+        memory_mib: spawn_cfg.memory_mib,
+        vcpus: spawn_cfg.vcpus,
+        kernel_path: spawn_cfg.kernel_path.display().to_string(),
+        rootfs_path: spawn_cfg
+            .rootfs_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        cmdline: spawn_cfg.cmdline.clone(),
+        socket_path: None,
+        pid: None,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
-fn retry_after_secs(admission_timeout_ms: u64) -> u64 {
-    admission_timeout_ms.div_ceil(1000).max(1)
-}
-
-fn overloaded(message: impl Into<String>, retry_after_secs: u64) -> OrchError {
-    OrchError::Overloaded {
-        message: message.into(),
-        retry_after_secs,
+async fn fail_create_or_restore(
+    state: &AppState,
+    id: Uuid,
+    cause: OrchError,
+) -> Result<(), OrchError> {
+    if lifecycle_state(state, id)?.is_none() {
+        return Err(cause);
+    }
+    match finish_failed_boot(state, id).await {
+        Ok(()) => Err(cause),
+        Err(cleanup) => Err(OrchError::Internal(format!(
+            "{cause}; retained Creating lifecycle for terminal retry: {cleanup}"
+        ))),
     }
 }
 
@@ -198,88 +470,167 @@ fn overloaded(message: impl Into<String>, retry_after_secs: u64) -> OrchError {
 /// spill; the internal create just reports back so the placer tries another
 /// peer. Writes the local store and the fleet ownership map on success.
 pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmRecord, OrchError> {
-    let req = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| OrchError::Internal("store lock".into()))?;
-        image::resolve_request_image(&store, req)?
-    };
     let now = Utc::now();
-    let spawn_cfg = VmSpawnConfig::from_defaults(&state.config, &req);
-    let warm_enabled = state.config.warm_pool.enabled && req.id.is_none();
+    let id = req.id.unwrap_or_else(Uuid::new_v4);
+    let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
+    let warm_enabled = state.config.warm_pool.enabled && req.id.is_none() && req.image.is_none();
 
     if warm_enabled {
         let publication_state = state.clone();
-        let publication_cfg = spawn_cfg.clone();
+        let publication_cfg = unverified_cfg.clone();
         let owner_key = req.owner_key.clone();
         let api_key_id = req.api_key_id.clone();
+        let registration_state = state.clone();
+        let registration_cfg = unverified_cfg.clone();
+        let registration_owner = req.owner_key.clone();
+        let registration_api_key = req.api_key_id.clone();
+        let registered_warm_id = Arc::new(std::sync::Mutex::new(None));
+        let registered_warm_id_for_callback = Arc::clone(&registered_warm_id);
         let taken = state
             .supervisor
-            .take_warm_with_publication(&spawn_cfg, move |id, pid, socket_path| {
-                let record = running_record(
-                    &publication_state,
-                    &publication_cfg,
-                    id,
-                    pid,
-                    &socket_path,
-                    owner_key,
-                    api_key_id,
-                    now,
-                );
-                async move {
-                    publish_running_record(&publication_state, record.clone()).await?;
-                    Ok(record)
+            .take_warm_with_publication(
+                &unverified_cfg,
+                move |warm_id| {
+                    let registration_state = registration_state.clone();
+                    let record = creating_record(
+                        &registration_state,
+                        &registration_cfg,
+                        warm_id,
+                        registration_owner,
+                        registration_api_key,
+                        now,
+                    );
+                    let registered_warm_id = Arc::clone(&registered_warm_id_for_callback);
+                    async move {
+                        *registered_warm_id
+                            .lock()
+                            .map_err(|_| OrchError::Internal("warm registration lock".into()))? =
+                            Some(warm_id);
+                        register_creating_record(&registration_state, record).await
+                    }
+                },
+                move |id, pid, socket_path| {
+                    let record = running_record(
+                        &publication_state,
+                        &publication_cfg,
+                        id,
+                        pid,
+                        &socket_path,
+                        owner_key,
+                        api_key_id,
+                        now,
+                    );
+                    async move {
+                        publish_running_record(&publication_state, record.clone()).await?;
+                        Ok(record)
+                    }
+                },
+            )
+            .await;
+        let taken = match taken {
+            Ok(taken) => taken,
+            Err(error) => {
+                let failed_warm_id = *registered_warm_id
+                    .lock()
+                    .map_err(|_| OrchError::Internal("warm registration lock".into()))?;
+                if let Some(warm_id) = failed_warm_id {
+                    let _terminal_gate = state.terminal_transition_gate.lock().await;
+                    start_terminal_transition(state, warm_id, VmStatus::Error, false)?;
+                    if let Err(cleanup) = finish_terminal_transition(state, warm_id).await {
+                        return Err(OrchError::Internal(format!(
+                            "{error}; retained warm Creating lifecycle for terminal retry: {cleanup}"
+                        )));
+                    }
                 }
-            })
-            .await?;
+                return Err(error);
+            }
+        };
         if let Some(record) = taken {
+            mark_running(state, record.clone())?;
             let id = record.id;
             tracing::info!(id = %id, host = %state.config.host_id, "create: warm pool");
             return Ok(record);
         }
     }
 
-    let id = req.id.unwrap_or_else(Uuid::new_v4);
-    let record = VmRecord {
+    let initial_record = creating_record(
+        state,
+        &unverified_cfg,
         id,
-        host_id: state.config.host_id.clone(),
-        owner_key: req.owner_key.clone(),
-        api_key_id: req.api_key_id.clone(),
-        status: VmStatus::Creating,
-        memory_mib: spawn_cfg.memory_mib,
-        vcpus: spawn_cfg.vcpus,
-        kernel_path: spawn_cfg.kernel_path.display().to_string(),
-        rootfs_path: spawn_cfg
-            .rootfs_path
-            .as_ref()
-            .map(|p| p.display().to_string()),
-        cmdline: spawn_cfg.cmdline.clone(),
-        socket_path: None,
-        pid: None,
-        created_at: now,
-        updated_at: now,
-    };
+        req.owner_key.clone(),
+        req.api_key_id.clone(),
+        now,
+    );
     let creating_state = state.clone();
-    let creating_record = record.clone();
-    let ticket = state
-        .supervisor
-        .begin_boot(id, crate::supervisor::SpawnPurpose::Live, move || {
-            store_insert(&creating_state, &creating_record)
-        })
-        .await
-        .map_err(|error| match error {
-            OrchError::Overloaded { .. } => overloaded(
-                "host at capacity",
-                retry_after_secs(state.config.admission_timeout_ms),
-            ),
-            error => error,
-        })?;
+    let registration_record = initial_record.clone();
+    let ticket =
+        state
+            .supervisor
+            .begin_boot_with_registration(
+                id,
+                crate::supervisor::SpawnPurpose::Live,
+                move || async move {
+                    register_creating_record(&creating_state, registration_record).await
+                },
+            )
+            .await;
+    let ticket = match ticket {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+    };
+    let resolved_request = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock".into()))?;
+        image::resolve_request_image(&store, req)
+    };
+    let req = match resolved_request {
+        Ok(req) => req,
+        Err(error) => {
+            state.supervisor.abort_unstarted_boot(&ticket).await;
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+    };
+    let spawn_cfg = VmSpawnConfig::from_defaults(&state.config, &req);
+    let record = creating_record(
+        state,
+        &spawn_cfg,
+        id,
+        req.owner_key.clone(),
+        req.api_key_id.clone(),
+        now,
+    );
+    if let Err(error) = update_creating_record(state, record.clone()).await {
+        state.supervisor.abort_unstarted_boot(&ticket).await;
+        fail_create_or_restore(state, id, error).await?;
+        unreachable!("failed lifecycle helper always returns an error")
+    }
     let sup = Arc::clone(&state.supervisor);
     let cfg = spawn_cfg.clone();
-    let booted = tokio::task::spawn_blocking(move || sup.spawn_vm(ticket, cfg))
-        .await
-        .map_err(|error| OrchError::Internal(format!("create boot task: {error}")))??;
+    let booted = tokio::task::spawn_blocking(move || sup.spawn_vm(ticket, cfg)).await;
+    let booted = match booted {
+        Err(error) => {
+            let error = OrchError::Internal(format!("create boot task: {error}"));
+            if state.supervisor.has_retained_boot(id) {
+                return Err(error);
+            }
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+        Ok(Ok(booted)) => booted,
+        Ok(Err(error)) => {
+            if state.supervisor.has_retained_boot(id) {
+                return Err(error);
+            }
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+    };
     let publication_state = state.clone();
     let publication_record = record.clone();
     let record = state
@@ -296,6 +647,7 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
             }
         })
         .await?;
+    mark_running(state, record.clone())?;
     tracing::info!(id = %id, host = %state.config.host_id, "create: cold start");
     Ok(record)
 }
@@ -310,15 +662,13 @@ pub async fn restore_local(
     api_key_id: Option<String>,
     caller_is_admin: bool,
 ) -> Result<VmRecord, OrchError> {
-    // R-006: authorize the snapshot before reserving a slot or touching the VMM.
-    verify_snapshot_access(state, snapshot_path, owner_key.as_deref(), caller_is_admin)?;
     let id = id.unwrap_or_else(Uuid::new_v4);
     let now = Utc::now();
     let record = VmRecord {
         id,
         host_id: state.config.host_id.clone(),
-        owner_key,
-        api_key_id,
+        owner_key: owner_key.clone(),
+        api_key_id: api_key_id.clone(),
         status: VmStatus::Creating,
         memory_mib: 0,
         vcpus: 0,
@@ -334,24 +684,52 @@ pub async fn restore_local(
     let creating_record = record.clone();
     let ticket = state
         .supervisor
-        .begin_boot(id, crate::supervisor::SpawnPurpose::Live, move || {
-            store_insert(&creating_state, &creating_record)
-        })
-        .await
-        .map_err(|error| match error {
-            OrchError::Overloaded { .. } => overloaded(
-                "host at capacity",
-                retry_after_secs(state.config.admission_timeout_ms),
-            ),
-            error => error,
-        })?;
+        .begin_boot_with_registration(
+            id,
+            crate::supervisor::SpawnPurpose::Live,
+            move || async move { register_creating_record(&creating_state, creating_record).await },
+        )
+        .await;
+    let ticket = match ticket {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+    };
+    // Authorize after registration so a concurrent DELETE can route to this
+    // owner and cancel the exact Creating lifecycle before restore touches VMM
+    // state or the snapshot.
+    if let Err(error) =
+        verify_snapshot_access(state, snapshot_path, owner_key.as_deref(), caller_is_admin)
+    {
+        state.supervisor.abort_unstarted_boot(&ticket).await;
+        fail_create_or_restore(state, id, error).await?;
+        unreachable!("failed lifecycle helper always returns an error")
+    }
     let path = snapshot_path.to_string();
     let sup = Arc::clone(&state.supervisor);
     let publication_state = state.clone();
     let publication_record = record.clone();
-    let booted = tokio::task::spawn_blocking(move || sup.restore_vm(ticket, path))
-        .await
-        .map_err(|error| OrchError::Internal(format!("restore boot task: {error}")))??;
+    let booted = tokio::task::spawn_blocking(move || sup.restore_vm(ticket, path)).await;
+    let booted = match booted {
+        Err(error) => {
+            let error = OrchError::Internal(format!("restore boot task: {error}"));
+            if state.supervisor.has_retained_boot(id) {
+                return Err(error);
+            }
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+        Ok(Ok(booted)) => booted,
+        Ok(Err(error)) => {
+            if state.supervisor.has_retained_boot(id) {
+                return Err(error);
+            }
+            fail_create_or_restore(state, id, error).await?;
+            unreachable!("failed lifecycle helper always returns an error")
+        }
+    };
     let record = state
         .supervisor
         .publish_running_with(booted, move |pid, socket_path| {
@@ -366,6 +744,7 @@ pub async fn restore_local(
             }
         })
         .await?;
+    mark_running(state, record.clone())?;
     tracing::info!(id = %id, host = %state.config.host_id, "restore: from snapshot");
     Ok(record)
 }
@@ -385,13 +764,12 @@ pub async fn exec_local(
 
 pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     let _terminal_gate = state.terminal_transition_gate.lock().await;
-    if state
-        .pending_stops
-        .lock()
-        .map_err(|_| OrchError::Internal("pending stop transitions".into()))?
-        .contains_key(&id)
-    {
-        return finish_pending_stop(state, id).await;
+    match lifecycle_state(state, id)? {
+        Some(LifecycleState::Terminal { .. }) => {
+            return finish_terminal_transition(state, id).await
+        }
+        Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
+        Some(LifecycleState::Creating { .. } | LifecycleState::Running { .. }) | None => {}
     }
     // Bill the final runtime interval before teardown, while the VM record (and
     // its owning key) is still in the cache, then drop its watermark.
@@ -400,13 +778,13 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     tokio::task::spawn_blocking(move || sup.stop_vm(id))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
-    retain_pending_stop(state, stopped_record(state, id)?)?;
-    finish_pending_stop(state, id).await
+    start_terminal_transition(state, id, VmStatus::Stopped, true)?;
+    finish_terminal_transition(state, id).await
 }
 
 pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchError> {
     let _terminal_gate = state.terminal_transition_gate.lock().await;
-    let mut failures = retry_pending_stops(state).await;
+    let mut failures = retry_pending_lifecycle(state).await;
     let sup = Arc::clone(&state.supervisor);
     let outcome = tokio::task::spawn_blocking(move || sup.stop_all())
         .await
@@ -428,22 +806,13 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
         .collect::<Vec<_>>();
 
     for id in stopped_ids {
-        let record = match stopped_record(state, id) {
-            Ok(record) => record,
-            Err(error) => {
-                failures.push(format!(
-                    "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
-                ));
-                continue;
-            }
-        };
-        if let Err(error) = retain_pending_stop(state, record) {
+        if let Err(error) = start_terminal_transition(state, id, VmStatus::Stopped, true) {
             failures.push(format!(
                 "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
             ));
             continue;
         }
-        if let Err(error) = finish_pending_stop(state, id).await {
+        if let Err(error) = finish_terminal_transition(state, id).await {
             failures.push(format!(
                 "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
             ));
@@ -591,6 +960,23 @@ fn ensure_vm_can_receive_live_op(state: &AppState, id: Uuid) -> Result<(), OrchE
 }
 
 #[cfg(test)]
+fn take_lifecycle_fault(state: &AppState, fault: LifecycleFault) -> bool {
+    let Ok(mut faults) = state.lifecycle_faults.lock() else {
+        return false;
+    };
+    let Some(index) = faults.iter().position(|candidate| *candidate == fault) else {
+        return false;
+    };
+    faults.remove(index);
+    true
+}
+
+#[cfg(test)]
+fn inject_lifecycle_fault(state: &AppState, fault: LifecycleFault) {
+    state.lifecycle_faults.lock().unwrap().push(fault);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
@@ -627,7 +1013,10 @@ mod tests {
             writer.await.unwrap();
 
             assert!(error.to_string().contains("injected SQLite failure"));
-            assert!(state.pending_stops.lock().unwrap().contains_key(&id));
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Terminal { .. })
+            ));
             assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
             assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
         });
@@ -658,7 +1047,10 @@ mod tests {
             });
 
             assert!(stop_local(&state, id).await.is_err());
-            assert!(state.pending_stops.lock().unwrap().contains_key(&id));
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Terminal { .. })
+            ));
             assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
 
             stop_local(&state, id)
@@ -667,12 +1059,131 @@ mod tests {
             writer.await.unwrap();
 
             assert_eq!(durable_attempts.load(Ordering::SeqCst), 2);
-            assert!(!state.pending_stops.lock().unwrap().contains_key(&id));
+            assert!(lifecycle_state(&state, id).unwrap().is_none());
             assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
             assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
         });
         drop(runtime);
         drop(state);
+    }
+
+    #[test]
+    fn publication_boundary_failures_retain_running_ownership_and_reservation() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        state.supervisor.reserve_existing_for_test(id);
+        let running = vm_get(&state, id).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Creating {
+                record: running.clone(),
+                phase: CreatingPhase::FleetClaimed,
+            },
+        )
+        .unwrap();
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            inject_lifecycle_fault(&state, LifecycleFault::SQLite);
+            assert!(publish_running_record(&state, running.clone())
+                .await
+                .is_err());
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Publishing {
+                    phase: PublicationPhase::FleetUpdated,
+                    ..
+                })
+            ));
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+
+            inject_lifecycle_fault(&state, LifecycleFault::FleetClaim);
+            assert!(publish_running_record(&state, running.clone())
+                .await
+                .is_err());
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Publishing {
+                    phase: PublicationPhase::NeedFleetUpdate,
+                    ..
+                })
+            ));
+
+            let writer = tokio::spawn(async move {
+                let StoreWrite::VmDurable(_, completion) = writes.recv().await.unwrap() else {
+                    panic!("publication must use the durable SQLite writer");
+                };
+                completion.send(Ok(())).unwrap();
+            });
+            inject_lifecycle_fault(&state, LifecycleFault::CacheCommit);
+            assert!(publish_running_record(&state, running).await.is_err());
+            writer.await.unwrap();
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Publishing {
+                    phase: PublicationPhase::SQLitePersisted,
+                    ..
+                })
+            ));
+            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+        });
+        drop(runtime);
+        drop(state);
+    }
+
+    #[test]
+    fn terminal_fleet_clear_failure_retains_the_creating_reservation_for_retry() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        state.supervisor.reserve_existing_for_test(id);
+        let record = terminal_record(&state, id, VmStatus::Error).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Terminal {
+                record,
+                phase: TerminalPhase::ClearFleetOwnershipAndRelease,
+            },
+        )
+        .unwrap();
+        inject_lifecycle_fault(&state, LifecycleFault::FleetClear);
+
+        let error = test_runtime()
+            .block_on(finish_terminal_transition(&state, id))
+            .expect_err("a failed fleet clear must retain the terminal lifecycle");
+
+        assert!(error.to_string().contains("injected fleet clear failure"));
+        assert!(matches!(
+            lifecycle_state(&state, id).unwrap(),
+            Some(LifecycleState::Terminal {
+                phase: TerminalPhase::ClearFleetOwnershipAndRelease,
+                ..
+            })
+        ));
+        assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
+    }
+
+    #[test]
+    fn registered_creating_record_routes_delete_to_the_local_cluster_owner() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let mut creating = vm_get(&state, id).unwrap();
+        creating.status = VmStatus::Creating;
+        commit_vm_record(&state, creating.clone()).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Creating {
+                record: creating,
+                phase: CreatingPhase::FleetClaimed,
+            },
+        )
+        .unwrap();
+
+        let owner = test_runtime()
+            .block_on(cluster::resolve_owner(&state, id))
+            .expect("a registered Creating record must be routable for DELETE");
+        assert!(matches!(owner, cluster::Owner::Local));
     }
 
     fn test_state_with_durable_writer(
@@ -734,7 +1245,8 @@ mod tests {
                 exec_cache: Arc::new(RwLock::new(HashMap::new())),
                 vm_cache: Arc::new(RwLock::new(HashMap::new())),
                 store_tx,
-                pending_stops: Arc::new(Mutex::new(HashMap::new())),
+                lifecycle: Arc::new(Mutex::new(HashMap::new())),
+                lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
                 terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
                 pty_registry: Arc::new(PtyRegistry::default()),
                 supervisor,

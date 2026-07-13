@@ -13,12 +13,14 @@ use crate::supervisor::{VmSpawnConfig, VmmSupervisor};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tarit_types::OrchError;
 
 /// Spawn the background replenishment loop. No-op unless the pool is enabled.
 pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config) {
     if !config.warm_pool.enabled {
         return;
     }
+
     let classes = config.warm_pool.classes.clone();
     let conc = config.warm_pool.replenish_concurrency.max(1);
     tracing::info!(
@@ -36,6 +38,7 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config) {
     tokio::spawn(async move {
         loop {
             let mut did_work = false;
+            let mut capacity_blocked = false;
             for class in &classes {
                 let have = {
                     let sup = Arc::clone(&sup);
@@ -91,21 +94,25 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config) {
                         continue;
                     }
                     let to_spawn = need.min(conc);
-                    let mut spawned = 0usize;
                     let mut set = tokio::task::JoinSet::new();
                     for _ in 0..to_spawn {
-                        spawned += 1;
                         let sup = Arc::clone(&sup);
                         let class = class.clone();
                         let snapshot_path = snapshot_path.clone();
-                        set.spawn(async move {
-                            if let Err(e) = sup.spawn_warm_restore(class, snapshot_path).await {
-                                tracing::warn!("warm restore spawn failed: {e}");
-                            }
-                        });
+                        set.spawn(
+                            async move { sup.spawn_warm_restore(class, snapshot_path).await },
+                        );
                     }
-                    while set.join_next().await.is_some() {}
-                    did_work |= spawned > 0;
+                    while let Some(result) = set.join_next().await {
+                        match result {
+                            Ok(Ok(())) => did_work = true,
+                            Ok(Err(OrchError::Overloaded { .. })) => capacity_blocked = true,
+                            Ok(Err(error)) => {
+                                tracing::warn!("warm restore spawn failed: {error}")
+                            }
+                            Err(error) => tracing::warn!("warm restore task failed: {error}"),
+                        }
+                    }
                     continue;
                 }
                 // Continuous refill pipeline: keep up to `conc` cold boots in
@@ -119,25 +126,44 @@ pub fn spawn_replenisher(sup: Arc<VmmSupervisor>, config: Config) {
                 loop {
                     while set.len() < conc && remaining > 0 {
                         remaining -= 1;
-                        did_work = true;
                         let sup = Arc::clone(&sup);
                         let class = class.clone();
-                        set.spawn(async move {
-                            if let Err(e) = sup.spawn_warm(class).await {
-                                tracing::warn!("warm spawn failed: {e}");
-                            }
-                        });
+                        set.spawn(async move { sup.spawn_warm(class).await });
                     }
-                    if set.join_next().await.is_none() {
+                    let Some(result) = set.join_next().await else {
                         break;
+                    };
+                    match result {
+                        Ok(Ok(())) => did_work = true,
+                        Ok(Err(OrchError::Overloaded { .. })) => capacity_blocked = true,
+                        Ok(Err(error)) => tracing::warn!("warm spawn failed: {error}"),
+                        Err(error) => tracing::warn!("warm spawn task failed: {error}"),
                     }
                 }
             }
             // Idle only when the pool is full; under drain, loop immediately so
             // refill tracks the take rate instead of pausing 150ms every cycle.
-            if !did_work {
-                tokio::time::sleep(Duration::from_millis(150)).await;
+            if let Some(delay) = replenishment_delay(did_work, capacity_blocked) {
+                tokio::time::sleep(delay).await;
             }
         }
     });
+}
+
+fn replenishment_delay(did_work: bool, capacity_blocked: bool) -> Option<Duration> {
+    (!did_work || capacity_blocked).then_some(Duration::from_millis(150))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn at_capacity_replenishment_uses_the_bounded_idle_delay() {
+        assert_eq!(
+            replenishment_delay(true, true),
+            Some(Duration::from_millis(150)),
+            "an Overloaded refill attempt must not spin the replenishment loop"
+        );
+    }
 }
