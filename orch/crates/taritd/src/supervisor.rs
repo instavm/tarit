@@ -140,6 +140,120 @@ struct BootControl {
     completion: (Mutex<Option<Result<(), String>>>, Condvar),
 }
 
+/// Tracks a lifecycle worker independently of the API/refill future that waits
+/// for it. A worker remains enumerable until it has either completed its
+/// publication or compensation path; request cancellation only marks it.
+#[derive(Debug)]
+pub(crate) struct OwnedTaskControl {
+    cancelled: AtomicBool,
+    terminal_converged: AtomicBool,
+    cancellation: (Mutex<bool>, Condvar),
+    completion: (Mutex<Option<Result<(), String>>>, Condvar),
+}
+
+impl OwnedTaskControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            terminal_converged: AtomicBool::new(false),
+            cancellation: (Mutex::new(false), Condvar::new()),
+            completion: (Mutex::new(None), Condvar::new()),
+        }
+    }
+
+    fn request_cancellation(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(mut cancelled) = self.cancellation.0.lock() {
+            *cancelled = true;
+            self.cancellation.1.notify_all();
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_terminal_converged(&self) {
+        self.terminal_converged.store(true, Ordering::SeqCst);
+    }
+
+    fn terminal_converged(&self) -> bool {
+        self.terminal_converged.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn wait_for_cancellation(&self) {
+        let mut cancelled = self.cancellation.0.lock().unwrap();
+        while !*cancelled {
+            cancelled = self.cancellation.1.wait(cancelled).unwrap();
+        }
+    }
+
+    fn complete(&self, result: Result<(), OrchError>) {
+        let completion = result.map_err(|error| error.to_string());
+        if let Ok(mut completed) = self.completion.0.lock() {
+            if completed.is_none() {
+                *completed = Some(completion);
+                self.completion.1.notify_all();
+            }
+        }
+    }
+
+    fn wait_for_completion(&self) -> Result<(), OrchError> {
+        let mut completed = self
+            .completion
+            .0
+            .lock()
+            .map_err(|_| OrchError::Internal("owned task completion lock poisoned".into()))?;
+        while completed.is_none() {
+            completed =
+                self.completion.1.wait(completed).map_err(|_| {
+                    OrchError::Internal("owned task completion lock poisoned".into())
+                })?;
+        }
+        match completed.as_ref().expect("completion checked") {
+            Ok(()) => Ok(()),
+            Err(error) => Err(OrchError::Internal(error.clone())),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct SpawnAttachmentPause {
+    state: Arc<(Mutex<(bool, bool)>, Condvar)>,
+}
+
+#[cfg(test)]
+impl SpawnAttachmentPause {
+    fn entered(&self) -> bool {
+        self.state.0.lock().map(|state| state.0).unwrap_or(true)
+    }
+
+    fn wait_until_entered(&self) {
+        let mut state = self.state.0.lock().unwrap();
+        while !state.0 {
+            state = self.state.1.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        if let Ok(mut state) = self.state.0.lock() {
+            state.1 = true;
+            self.state.1.notify_all();
+        }
+    }
+
+    fn wait_after_spawn(&self) {
+        let mut state = self.state.0.lock().unwrap();
+        state.0 = true;
+        self.state.1.notify_all();
+        while !state.1 {
+            state = self.state.1.wait(state).unwrap();
+        }
+    }
+}
+
 impl BootControl {
     fn new(purpose: SpawnPurpose) -> Self {
         Self {
@@ -268,6 +382,12 @@ pub struct VmmSupervisor {
     /// Every entry is an acquired scheduler reservation. Entries transfer from
     /// booting to warm/running and are removed only after confirmed cleanup.
     reservations: Mutex<HashSet<Uuid>>,
+    /// Async lifecycle/refill workers are owned here rather than by the API or
+    /// replenisher future that awaits their result. Shutdown can therefore mark,
+    /// enumerate, and wait every worker before tearing resources down.
+    owned_tasks: Mutex<HashMap<Uuid, Arc<OwnedTaskControl>>>,
+    #[cfg(test)]
+    spawn_attachment_pause: Mutex<Option<SpawnAttachmentPause>>,
     scheduler: Arc<Scheduler>,
     net: Option<NetProvisioner>,
     shutting_down: AtomicBool,
@@ -411,6 +531,9 @@ impl VmmSupervisor {
             boot_gate: AsyncMutex::new(()),
             warm: Mutex::new(VecDeque::new()),
             reservations: Mutex::new(HashSet::new()),
+            owned_tasks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            spawn_attachment_pause: Mutex::new(None),
             scheduler,
             net,
             shutting_down: AtomicBool::new(false),
@@ -511,6 +634,7 @@ impl VmmSupervisor {
         if self.is_shutting_down() {
             return Err(self.shutdown_error());
         }
+
         let control = Arc::new(BootControl::new(purpose));
         let socket_path = self.socket_path_for(id);
         let registered = self
@@ -562,6 +686,192 @@ impl VmmSupervisor {
             control,
             purpose,
         })
+    }
+
+    /// Register an operation before spawning its async worker. The API/refill
+    /// caller only waits on a result channel; dropping that waiter never owns or
+    /// cancels the registered operation.
+    pub(crate) fn begin_owned_task(
+        &self,
+        id: Uuid,
+        _purpose: SpawnPurpose,
+    ) -> Result<Arc<OwnedTaskControl>, OrchError> {
+        if self.is_shutting_down() {
+            return Err(self.shutdown_error());
+        }
+        let mut tasks = self
+            .owned_tasks
+            .lock()
+            .map_err(|_| OrchError::Internal("owned task lock poisoned".into()))?;
+        if self.is_shutting_down() {
+            return Err(self.shutdown_error());
+        }
+        if tasks.contains_key(&id) {
+            return Err(OrchError::Conflict(format!(
+                "VM {id} already has a supervisor-owned lifecycle task"
+            )));
+        }
+        let control = Arc::new(OwnedTaskControl::new());
+        tasks.insert(id, Arc::clone(&control));
+        Ok(control)
+    }
+
+    pub(crate) fn finish_owned_task(
+        &self,
+        control: &Arc<OwnedTaskControl>,
+        result: Result<(), OrchError>,
+    ) {
+        control.complete(result);
+        if let Ok(mut tasks) = self.owned_tasks.lock() {
+            tasks.retain(|_, current| !Arc::ptr_eq(current, control));
+        }
+    }
+
+    fn bind_owned_task(&self, id: Uuid, control: &OwnedTaskControl) -> Result<(), OrchError> {
+        let mut tasks = self
+            .owned_tasks
+            .lock()
+            .map_err(|_| OrchError::Internal("owned task lock poisoned".into()))?;
+        let existing_key = tasks.iter().find_map(|(existing_id, current)| {
+            std::ptr::eq(Arc::as_ptr(current), control).then_some(*existing_id)
+        });
+        let Some(existing_key) = existing_key else {
+            // Unit-level supervisor tests may exercise warm transfer without an
+            // API-owned task. Production callers always register first.
+            return Ok(());
+        };
+        if existing_key == id {
+            return Ok(());
+        }
+        if tasks.contains_key(&id) {
+            return Err(OrchError::Conflict(format!(
+                "VM {id} already has a supervisor-owned lifecycle task"
+            )));
+        }
+        let control = tasks
+            .remove(&existing_key)
+            .expect("existing owned task key was checked");
+        tasks.insert(id, control);
+        Ok(())
+    }
+
+    pub(crate) async fn run_owned_task<T, F, Fut>(
+        self: &Arc<Self>,
+        id: Uuid,
+        purpose: SpawnPurpose,
+        operation: F,
+    ) -> Result<T, OrchError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<OwnedTaskControl>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, OrchError>> + Send + 'static,
+    {
+        let control = self.begin_owned_task(id, purpose)?;
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let supervisor = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = operation(Arc::clone(&control)).await;
+            let completion = match &result {
+                Ok(_) => Ok(()),
+                Err(_) if control.is_cancelled() && control.terminal_converged() => Ok(()),
+                Err(error) => Err(OrchError::Internal(error.to_string())),
+            };
+            supervisor.finish_owned_task(&control, completion);
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            OrchError::Internal("supervisor-owned lifecycle worker ended before reporting".into())
+        })?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_owned_task(&self, id: Uuid) -> bool {
+        self.owned_tasks
+            .lock()
+            .map(|tasks| tasks.contains_key(&id))
+            .unwrap_or(true)
+    }
+
+    fn request_boot_cancellation(&self, id: Uuid) {
+        if let Ok(booting) = self.booting.lock() {
+            if let Some(booting_vm) = booting.get(&id) {
+                booting_vm.control.request_cancellation();
+            }
+        }
+    }
+
+    pub(crate) fn cancel_and_wait_owned_task(&self, id: Uuid) -> Result<bool, OrchError> {
+        let control = self
+            .owned_tasks
+            .lock()
+            .map_err(|_| OrchError::Internal("owned task lock poisoned".into()))?
+            .get(&id)
+            .cloned();
+        let Some(control) = control else {
+            return Ok(false);
+        };
+        control.request_cancellation();
+        self.request_boot_cancellation(id);
+        control.wait_for_completion()?;
+        Ok(control.terminal_converged())
+    }
+
+    fn signal_owned_tasks(&self) -> Result<Vec<(Uuid, Arc<OwnedTaskControl>)>, OrchError> {
+        let tasks = self
+            .owned_tasks
+            .lock()
+            .map_err(|_| OrchError::Internal("owned task lock poisoned".into()))?
+            .iter()
+            .map(|(id, control)| (*id, Arc::clone(control)))
+            .collect::<Vec<_>>();
+        for (id, control) in &tasks {
+            control.request_cancellation();
+            self.request_boot_cancellation(*id);
+        }
+        Ok(tasks)
+    }
+
+    fn wait_for_owned_tasks(
+        &self,
+        tasks: Vec<(Uuid, Arc<OwnedTaskControl>)>,
+    ) -> Vec<Result<(), OrchError>> {
+        tasks
+            .into_iter()
+            .map(|(_, control)| control.wait_for_completion())
+            .collect()
+    }
+
+    pub(crate) fn cancel_and_wait_all_owned_tasks(&self) -> Result<(), OrchError> {
+        let outcomes = self.wait_for_owned_tasks(self.signal_owned_tasks()?);
+        let failures = outcomes
+            .into_iter()
+            .filter_map(Result::err)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(OrchError::Internal(failures.join("; ")))
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_spawn_before_registry_attachment_for_test(&self) -> SpawnAttachmentPause {
+        let pause = SpawnAttachmentPause::default();
+        *self.spawn_attachment_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    fn wait_after_spawn_before_registry_attachment(&self) {
+        let pause = self
+            .spawn_attachment_pause
+            .lock()
+            .ok()
+            .and_then(|pause| pause.clone());
+        if let Some(pause) = pause {
+            pause.wait_after_spawn();
+        }
     }
 
     #[cfg(test)]
@@ -722,6 +1032,18 @@ impl VmmSupervisor {
             );
             error
         }
+    }
+
+    /// The supervisor-owned lifecycle worker observed cancellation after the
+    /// synchronous boot completed but before publication transferred ownership.
+    /// Clean the attached VMM/network before allowing terminal compensation.
+    pub(crate) fn discard_booted_vm(&self, booted: BootedVm) -> OrchError {
+        self.cleanup_boot_failure(
+            booted.id,
+            &booted.control,
+            &booted.vm,
+            self.shutdown_error(),
+        )
     }
 
     pub(crate) async fn publish_running_with<T, F, Fut>(
@@ -1019,6 +1341,11 @@ impl VmmSupervisor {
 
         let process = ManagedProcess::new(child);
         let pid = process.pid;
+        // Do not expose cancellation completion between spawn and registry
+        // attachment: any cancellation must find the process in `booting`, or
+        // this worker must clean it before it signals completion.
+        #[cfg(test)]
+        self.wait_after_spawn_before_registry_attachment();
         let attached = self
             .booting
             .lock()
@@ -1181,38 +1508,90 @@ impl VmmSupervisor {
     /// burst blocks the caller for seconds on its first agent dial (the burst
     /// p95 tail). Bounded; parks anyway on timeout so a wedged guest can't stall
     /// replenishment forever.
-    fn await_ready(&self, socket: &Path) {
+    fn await_ready(&self, socket: &Path, control: &BootControl) -> Result<(), OrchError> {
         let client = VmmClient::new(socket);
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
+            if !boot_can_publish(control, self.is_shutting_down()) {
+                return Err(self.shutdown_error());
+            }
             if client
                 .exec("true", 1000)
                 .map(|(code, _, _, _)| code == 0)
                 .unwrap_or(false)
             {
-                return;
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        Ok(())
     }
 
     pub(crate) async fn spawn_warm(self: Arc<Self>, class: WarmClass) -> Result<(), OrchError> {
         let id = Uuid::new_v4();
+        let worker = Arc::clone(&self);
+        self.run_owned_task(id, SpawnPurpose::Refill, move |task| async move {
+            worker.spawn_warm_owned(id, class, &task).await
+        })
+        .await
+    }
+
+    async fn spawn_warm_owned(
+        self: Arc<Self>,
+        id: Uuid,
+        class: WarmClass,
+        task: &OwnedTaskControl,
+    ) -> Result<(), OrchError> {
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
         let ticket = self
             .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) })
             .await?;
+        if task.is_cancelled() {
+            self.abort_unstarted_boot(&ticket).await;
+            task.mark_terminal_converged();
+            return Err(self.shutdown_error());
+        }
         let worker = Arc::clone(&self);
         let worker_spec = spec.clone();
         let booted = tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec))
             .await
-            .map_err(|error| OrchError::Internal(format!("warm boot task: {error}")))??;
+            .map_err(|error| OrchError::Internal(format!("warm boot task: {error}")));
+        let booted = match booted {
+            Ok(Ok(booted)) => booted,
+            Ok(Err(error)) => {
+                if task.is_cancelled() && !self.has_retained_boot(id) {
+                    task.mark_terminal_converged();
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if task.is_cancelled() {
+            let error = self.discard_booted_vm(booted);
+            if !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
+        }
         let socket_path = booted.vm.socket_path.clone();
+        let boot_control = Arc::clone(&booted.control);
         let worker = Arc::clone(&self);
-        tokio::task::spawn_blocking(move || worker.await_ready(&socket_path))
-            .await
-            .map_err(|error| OrchError::Internal(format!("warm readiness task: {error}")))?;
-        self.publish_warm(booted, spec).await
+        let ready =
+            tokio::task::spawn_blocking(move || worker.await_ready(&socket_path, &boot_control))
+                .await
+                .map_err(|error| OrchError::Internal(format!("warm readiness task: {error}")))?;
+        if let Err(error) = ready {
+            let error = self.cleanup_boot_failure(id, &booted.control, &booted.vm, error);
+            if task.is_cancelled() && !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
+        }
+        let result = self.publish_warm(booted, spec).await;
+        if task.is_cancelled() && !self.has_retained_boot(id) {
+            task.mark_terminal_converged();
+        }
+        result
     }
 
     /// Cold-boot one VM for `class`, wait until it is ready, take a full golden
@@ -1223,27 +1602,71 @@ impl VmmSupervisor {
         class: WarmClass,
     ) -> Result<String, OrchError> {
         let id = Uuid::new_v4();
+        let worker = Arc::clone(&self);
+        self.run_owned_task(id, SpawnPurpose::Refill, move |task| async move {
+            worker.create_golden_owned(id, class, &task).await
+        })
+        .await
+    }
+
+    async fn create_golden_owned(
+        self: Arc<Self>,
+        id: Uuid,
+        class: WarmClass,
+        task: &OwnedTaskControl,
+    ) -> Result<String, OrchError> {
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
         let ticket = self
             .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) })
             .await?;
+        if task.is_cancelled() {
+            self.abort_unstarted_boot(&ticket).await;
+            task.mark_terminal_converged();
+            return Err(self.shutdown_error());
+        }
         let worker = Arc::clone(&self);
         let worker_spec = spec.clone();
         let booted = tokio::task::spawn_blocking(move || worker.boot_vm(ticket, &worker_spec))
             .await
-            .map_err(|error| OrchError::Internal(format!("golden boot task: {error}")))??;
+            .map_err(|error| OrchError::Internal(format!("golden boot task: {error}")));
+        let booted = match booted {
+            Ok(Ok(booted)) => booted,
+            Ok(Err(error)) => {
+                if task.is_cancelled() && !self.has_retained_boot(id) {
+                    task.mark_terminal_converged();
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if task.is_cancelled() {
+            let error = self.discard_booted_vm(booted);
+            if !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
+        }
         let socket_path = booted.vm.socket_path.clone();
+        let boot_control = Arc::clone(&booted.control);
         let worker = Arc::clone(&self);
-        tokio::task::spawn_blocking(move || worker.await_ready(&socket_path))
-            .await
-            .map_err(|error| OrchError::Internal(format!("golden readiness task: {error}")))?;
+        let ready =
+            tokio::task::spawn_blocking(move || worker.await_ready(&socket_path, &boot_control))
+                .await
+                .map_err(|error| OrchError::Internal(format!("golden readiness task: {error}")))?;
+        if let Err(error) = ready {
+            let error = self.cleanup_boot_failure(id, &booted.control, &booted.vm, error);
+            if task.is_cancelled() && !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
+        }
         if !boot_can_publish(&booted.control, self.is_shutting_down()) {
-            return Err(self.cleanup_boot_failure(
-                id,
-                &booted.control,
-                &booted.vm,
-                self.shutdown_error(),
-            ));
+            let error =
+                self.cleanup_boot_failure(id, &booted.control, &booted.vm, self.shutdown_error());
+            if task.is_cancelled() && !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
         }
         let socket_path = booted.vm.socket_path.clone();
         let snapshot_path = tokio::task::spawn_blocking(move || {
@@ -1254,6 +1677,13 @@ impl VmmSupervisor {
         .await
         .map_err(|error| OrchError::Internal(format!("golden snapshot task: {error}")))?
         .map_err(|error| self.cleanup_boot_failure(id, &booted.control, &booted.vm, error))?;
+        if task.is_cancelled() {
+            let error = self.discard_booted_vm(booted);
+            if !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
+        }
 
         self.finish_booted_vm(id, booted.control, &booted.vm)?;
         Ok(snapshot_path)
@@ -1266,25 +1696,76 @@ impl VmmSupervisor {
         snapshot_path: String,
     ) -> Result<(), OrchError> {
         let id = Uuid::new_v4();
+        let worker = Arc::clone(&self);
+        self.run_owned_task(id, SpawnPurpose::Refill, move |task| async move {
+            worker
+                .spawn_warm_restore_owned(id, class, snapshot_path, &task)
+                .await
+        })
+        .await
+    }
+
+    async fn spawn_warm_restore_owned(
+        self: Arc<Self>,
+        id: Uuid,
+        class: WarmClass,
+        snapshot_path: String,
+        task: &OwnedTaskControl,
+    ) -> Result<(), OrchError> {
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
         let overlay = overlay_path_for_config(id, &spec);
         let ticket = self
             .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) })
             .await?;
+        if task.is_cancelled() {
+            self.abort_unstarted_boot(&ticket).await;
+            task.mark_terminal_converged();
+            return Err(self.shutdown_error());
+        }
         let worker = Arc::clone(&self);
         let booted = tokio::task::spawn_blocking(move || {
             worker.spawn_and_restore(ticket, &snapshot_path, overlay)
         })
         .await
-        .map_err(|error| OrchError::Internal(format!("warm restore task: {error}")))??;
+        .map_err(|error| OrchError::Internal(format!("warm restore task: {error}")));
+        let booted = match booted {
+            Ok(Ok(booted)) => booted,
+            Ok(Err(error)) => {
+                if task.is_cancelled() && !self.has_retained_boot(id) {
+                    task.mark_terminal_converged();
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if task.is_cancelled() {
+            let error = self.discard_booted_vm(booted);
+            if !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
+        }
         let socket_path = booted.vm.socket_path.clone();
+        let boot_control = Arc::clone(&booted.control);
         let worker = Arc::clone(&self);
-        tokio::task::spawn_blocking(move || worker.await_ready(&socket_path))
-            .await
-            .map_err(|error| {
-                OrchError::Internal(format!("warm restore readiness task: {error}"))
-            })?;
-        self.publish_warm(booted, spec).await
+        let ready =
+            tokio::task::spawn_blocking(move || worker.await_ready(&socket_path, &boot_control))
+                .await
+                .map_err(|error| {
+                    OrchError::Internal(format!("warm restore readiness task: {error}"))
+                })?;
+        if let Err(error) = ready {
+            let error = self.cleanup_boot_failure(id, &booted.control, &booted.vm, error);
+            if task.is_cancelled() && !self.has_retained_boot(id) {
+                task.mark_terminal_converged();
+            }
+            return Err(error);
+        }
+        let result = self.publish_warm(booted, spec).await;
+        if task.is_cancelled() && !self.has_retained_boot(id) {
+            task.mark_terminal_converged();
+        }
+        result
     }
 
     /// Claim and publish a matching warm VM under the same lifecycle gate as a
@@ -1293,6 +1774,7 @@ impl VmmSupervisor {
     pub(crate) async fn take_warm_with_publication<T, R, RFut, F, Fut>(
         &self,
         want: &VmSpawnConfig,
+        task: &OwnedTaskControl,
         register_lifecycle: R,
         publish_lifecycle: F,
     ) -> Result<WarmClaimOutcome<T>, OrchError>
@@ -1304,7 +1786,7 @@ impl VmmSupervisor {
         Fut: std::future::Future<Output = Result<T, PublicationFailure>> + Send,
     {
         let _gate = self.boot_gate.lock().await;
-        if self.is_shutting_down() {
+        if self.is_shutting_down() || task.is_cancelled() {
             return Ok(WarmClaimOutcome::NoMatch);
         }
         let candidate_id = {
@@ -1317,8 +1799,12 @@ impl VmmSupervisor {
             };
             warm_vm.id
         };
+        self.bind_owned_task(candidate_id, task)?;
         if let Err(error) = register_lifecycle(candidate_id).await {
             return Ok(WarmClaimOutcome::PreRuntimeFailure(error));
+        }
+        if task.is_cancelled() {
+            return Ok(WarmClaimOutcome::PreRuntimeFailure(self.shutdown_error()));
         }
         let taken = {
             let mut warm = self
@@ -1348,6 +1834,11 @@ impl VmmSupervisor {
                 return Ok(WarmClaimOutcome::RetainedPublicationFailure(error));
             }
         };
+        if task.is_cancelled() {
+            return Ok(WarmClaimOutcome::RetainedPublicationFailure(
+                self.shutdown_error(),
+            ));
+        }
         Ok(WarmClaimOutcome::Published(published))
     }
 
@@ -1606,14 +2097,23 @@ impl VmmSupervisor {
     }
 
     pub(crate) fn stop_all(&self) -> Result<ShutdownSummary, Box<ShutdownFailure>> {
-        let booting = {
+        let (booting, owned_tasks) = {
             let _gate = self.boot_gate.blocking_lock();
             // This is the linearization point with user lifecycle publication:
             // after it, no boot can enter its durable Running publication.
             self.shutting_down.store(true, Ordering::SeqCst);
-            self.signal_booting_tasks()
-                .map_err(|error| Box::new(ShutdownFailure::from(error)))?
+            let booting = self
+                .signal_booting_tasks()
+                .map_err(|error| Box::new(ShutdownFailure::from(error)))?;
+            let owned_tasks = self
+                .signal_owned_tasks()
+                .map_err(|error| Box::new(ShutdownFailure::from(error)))?;
+            (booting, owned_tasks)
         };
+        // A caller may have been dropped, but its worker remains in
+        // `owned_tasks`. Wait until it has finished publication or compensation
+        // before draining `running`/`booting` below.
+        let owned_outcomes = self.wait_for_owned_tasks(owned_tasks);
         let booting = self.complete_cancelled_booting_tasks(booting);
         let (running, warm) = {
             let mut running = self.running.lock().map_err(|_| {
@@ -1632,6 +2132,13 @@ impl VmmSupervisor {
             )
         };
         let mut transitions = ShutdownTransitions::default();
+        for outcome in owned_outcomes {
+            if let Err(error) = outcome {
+                transitions.record_internal_failure(OrchError::Internal(format!(
+                    "supervisor-owned lifecycle worker retained work for retry: {error}"
+                )));
+            }
+        }
         let mut retained_running = Vec::new();
         for (id, vm) in running {
             let client = VmmClient::new(&vm.socket_path);
@@ -2061,6 +2568,167 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_between_spawn_and_registry_attachment_waits_for_cleanup() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let ticket = test_runtime()
+            .block_on(
+                supervisor
+                    .begin_boot_with_registration(id, SpawnPurpose::Live, || async { Ok(()) }),
+            )
+            .expect("boot registration must precede process spawn");
+        let control = Arc::clone(&ticket.control);
+        let pause = supervisor.pause_after_spawn_before_registry_attachment_for_test();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_supervisor = Arc::clone(&supervisor);
+        let worker = thread::spawn(move || {
+            done_tx
+                .send(worker_supervisor.spawn_server_for_boot(&ticket, None))
+                .unwrap();
+        });
+
+        pause.wait_until_entered();
+        control.request_cancellation();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "cancellation must not complete before the spawned process is attached"
+        );
+
+        pause.release();
+        assert!(
+            done_rx.recv().unwrap().is_err(),
+            "the attached cancelled process must be cleaned before completion"
+        );
+        assert!(control.wait_for_completion().is_ok());
+        assert!(!supervisor.has_retained_boot(id));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stop_all_enumerates_abandoned_cold_golden_and_restore_refill_workers() {
+        for refill_kind in ["cold golden", "snapshot restore"] {
+            let supervisor = test_supervisor();
+            let id = Uuid::new_v4();
+            let control = supervisor
+                .begin_owned_task(id, SpawnPurpose::Refill)
+                .expect("refill work must be supervisor-owned before its caller awaits it");
+            let worker_control = Arc::clone(&control);
+            let worker_supervisor = Arc::clone(&supervisor);
+            let (cleanup_started_tx, cleanup_started_rx) = mpsc::channel();
+            let (allow_cleanup_tx, allow_cleanup_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                worker_control.wait_for_cancellation();
+                cleanup_started_tx.send(()).unwrap();
+                allow_cleanup_rx.recv().unwrap();
+                worker_supervisor.finish_owned_task(&worker_control, Ok(()));
+            });
+
+            let stop_supervisor = Arc::clone(&supervisor);
+            let (done_tx, done_rx) = mpsc::channel();
+            let stopper = thread::spawn(move || done_tx.send(stop_supervisor.stop_all()).unwrap());
+            cleanup_started_rx.recv().unwrap();
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+                "stop-all must await the {refill_kind} worker after its caller is gone"
+            );
+
+            allow_cleanup_tx.send(()).unwrap();
+            stopper.join().unwrap();
+            done_rx
+                .recv()
+                .unwrap()
+                .expect("completed refill cleanup must not block stop-all");
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn aborting_cold_golden_refill_caller_leaves_a_supervised_cleanup_worker() {
+        let supervisor = test_supervisor();
+        let class = supervisor.config.warm_pool.classes[0].clone();
+        let pause = supervisor.pause_after_spawn_before_registry_attachment_for_test();
+        let caller_supervisor = Arc::clone(&supervisor);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let caller = runtime.spawn(async move { caller_supervisor.create_golden(class).await });
+        let wait_pause = pause.clone();
+        runtime.block_on(async move {
+            while !wait_pause.entered() {
+                tokio::task::yield_now().await;
+            }
+        });
+
+        pause.wait_until_entered();
+        caller.abort();
+        assert!(matches!(
+            runtime.block_on(caller),
+            Err(error) if error.is_cancelled()
+        ));
+
+        let stop_supervisor = Arc::clone(&supervisor);
+        let (done_tx, done_rx) = mpsc::channel();
+        let stopper = thread::spawn(move || done_tx.send(stop_supervisor.stop_all()).unwrap());
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "stop-all must enumerate the golden worker after its caller is aborted"
+        );
+        pause.release();
+        done_rx
+            .recv()
+            .unwrap()
+            .expect("the cancelled golden worker must finish cleanup");
+        stopper.join().unwrap();
+    }
+
+    #[test]
+    fn aborting_snapshot_restore_refill_caller_leaves_a_supervised_cleanup_worker() {
+        let supervisor = test_supervisor();
+        let class = supervisor.config.warm_pool.classes[0].clone();
+        let pause = supervisor.pause_after_spawn_before_registry_attachment_for_test();
+        let caller_supervisor = Arc::clone(&supervisor);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let caller = runtime.spawn(async move {
+            caller_supervisor
+                .spawn_warm_restore(class, "golden.snap".into())
+                .await
+        });
+        let wait_pause = pause.clone();
+        runtime.block_on(async move {
+            while !wait_pause.entered() {
+                tokio::task::yield_now().await;
+            }
+        });
+
+        pause.wait_until_entered();
+        caller.abort();
+        assert!(matches!(
+            runtime.block_on(caller),
+            Err(error) if error.is_cancelled()
+        ));
+
+        let stop_supervisor = Arc::clone(&supervisor);
+        let (done_tx, done_rx) = mpsc::channel();
+        let stopper = thread::spawn(move || done_tx.send(stop_supervisor.stop_all()).unwrap());
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "stop-all must enumerate the restore worker after its caller is aborted"
+        );
+        pause.release();
+        done_rx
+            .recv()
+            .unwrap()
+            .expect("the cancelled restore worker must finish cleanup");
+        stopper.join().unwrap();
+    }
+
+    #[test]
     fn stop_all_winning_after_create_vmm_setup_cannot_publish_lifecycle() {
         assert_stop_all_cancellation_blocks_live_publication();
     }
@@ -2151,10 +2819,12 @@ mod tests {
         let (publication_started_tx, publication_started_rx) = mpsc::channel();
         let (allow_publication_tx, allow_publication_rx) = mpsc::channel();
         let handoff_supervisor = Arc::clone(&supervisor);
+        let handoff_task = Arc::new(OwnedTaskControl::new());
         let handoff = thread::spawn(move || {
             match test_runtime()
                 .block_on(handoff_supervisor.take_warm_with_publication(
                     &spec,
+                    &handoff_task,
                     |_| async { Ok(()) },
                     move |vm_id, _, _| async move {
                         publication_started_tx.send(()).unwrap();
@@ -2217,9 +2887,11 @@ mod tests {
         let (registration_started_tx, registration_started_rx) = mpsc::channel();
         let (finish_registration_tx, finish_registration_rx) = mpsc::channel();
         let handoff_supervisor = Arc::clone(&supervisor);
+        let handoff_task = Arc::new(OwnedTaskControl::new());
         let handoff = thread::spawn(move || {
             test_runtime().block_on(handoff_supervisor.take_warm_with_publication(
                 &spec,
+                &handoff_task,
                 move |_| async move {
                     registration_started_tx.send(()).unwrap();
                     finish_registration_rx.recv().unwrap();

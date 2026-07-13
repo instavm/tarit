@@ -533,17 +533,46 @@ cleanup_tap_policy() {
   return "$cleanup_failed"
 }
 
+tap_for_recorded_vm_from_listing() {
+  local vm_id=$1 listing=$2 uplink=$3 chain line slot tap tag guest
+  [ -n "$vm_id" ] && [ -n "$uplink" ] || return 1
+  while IFS=$'\t' read -r chain line; do
+    [[ "$line" =~ comment\ \"taritd(-egress|-guard|-input|-recovery-quarantine|-egress-update-quarantine)?\ slot=([0-9]+)\ vm=$vm_id\ tap=(insta[0-9]+)\"\ \#\ handle\ [0-9]+$ ]] ||
+      continue
+    slot=${BASH_REMATCH[2]}
+    tap=${BASH_REMATCH[3]}
+    [ "$tap" = "insta$slot" ] || continue
+    tag="slot=$slot vm=$vm_id tap=$tap"
+    guest=$(guest_ip_for_slot "$slot") || continue
+    recognized_managed_cleanup_rule "$chain" "$line" "$tap" "$tag" "$guest" "$uplink" ||
+      continue
+    printf '%s\n' "$tap"
+    return 0
+  done < <(awk '
+    /^[[:space:]]*chain[[:space:]]+[^[:space:]]+[[:space:]]*\{/ {
+      chain = $2
+    }
+    chain != "" {
+      print chain "\t" $0
+    }' <<<"$listing")
+  return 1
+}
+
 tap_for_recorded_vm() {
-  local vm_id=$1
-  nft -a list table ip taritd_nat 2>/dev/null |
-    awk -v vm_id="$vm_id" '
-      index($0, "comment \"taritd") && index($0, "vm=" vm_id " tap=") {
-        match($0, /tap=insta[0-9]+"/)
-        if (RSTART) {
-          print substr($0, RSTART + 4, RLENGTH - 5)
-          exit
-        }
-      }'
+  local vm_id=$1 listing uplink
+  listing=$(nft -a list table ip taritd_nat 2>/dev/null) || return 1
+  uplink=$(cleanup_expected_uplink) || return 1
+  tap_for_recorded_vm_from_listing "$vm_id" "$listing" "$uplink"
+}
+
+assert_fallback_tap_parser_rejects_comment_substrings() {
+  local vm_id=00000000-0000-0000-0000-000000000000 malicious
+  malicious="chain post {
+    iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd operator note vm=$vm_id tap=insta7\" # handle 7
+  }"
+  if tap_for_recorded_vm_from_listing "$vm_id" "$malicious" eth0 >/dev/null; then
+    fail "fallback TAP parser accepted a comment substring instead of an exact allocation rule"
+  fi
 }
 
 cleanup_recorded_tap_policies() {
@@ -939,6 +968,8 @@ forged_source_drop_packets() {
 
 mkdir -p "$TARIT_SOCKET_DIR"
 : >"$TARIT_CONFIG"
+assert_fallback_tap_parser_rejects_comment_substrings
+
 cp -f "$BASE_ROOTFS" "$ROOTFS"
 
 start_taritd

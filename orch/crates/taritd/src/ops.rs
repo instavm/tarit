@@ -21,7 +21,8 @@ use crate::api::{LifecycleFault, LifecyclePause, LifecyclePauseControl};
 use crate::cluster;
 use crate::image;
 use crate::supervisor::{
-    PublicationFailure, ShutdownSummary, VmSpawnConfig, VmmSupervisor, WarmClaimOutcome,
+    OwnedTaskControl, PublicationFailure, ShutdownSummary, SpawnPurpose, VmSpawnConfig,
+    VmmSupervisor, WarmClaimOutcome,
 };
 
 fn vm_get(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
@@ -130,57 +131,6 @@ fn set_lifecycle_state(
         .map_err(|_| OrchError::Internal("lifecycle state lock poisoned".into()))?
         .insert(id, lifecycle_state);
     Ok(())
-}
-
-/// Keeps cancellation of a request future from stranding an in-flight lifecycle
-/// behind an uncompleted boot waiter. It only records abandonment and wakes the
-/// synchronous teardown owner; it never performs async cleanup from `Drop`.
-struct LifecycleAbandonmentGuard {
-    state: AppState,
-    id: Arc<std::sync::Mutex<Option<Uuid>>>,
-    armed: bool,
-}
-
-impl LifecycleAbandonmentGuard {
-    fn new(state: &AppState, id: Option<Uuid>) -> Self {
-        Self {
-            state: state.clone(),
-            id: Arc::new(std::sync::Mutex::new(id)),
-            armed: true,
-        }
-    }
-
-    fn id_handle(&self) -> Arc<std::sync::Mutex<Option<Uuid>>> {
-        Arc::clone(&self.id)
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for LifecycleAbandonmentGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let Some(id) = self.id.lock().ok().and_then(|id| *id) else {
-            return;
-        };
-        if let Ok(mut lifecycle) = self.state.lifecycle.lock() {
-            if let Some(current) = lifecycle.get(&id).cloned() {
-                match current {
-                    LifecycleState::Creating { record, .. }
-                    | LifecycleState::Publishing { record, .. }
-                    | LifecycleState::Running { record } => {
-                        lifecycle.insert(id, LifecycleState::Abandoned { record });
-                    }
-                    LifecycleState::Abandoned { .. } | LifecycleState::Terminal { .. } => {}
-                }
-            }
-        }
-        self.state.supervisor.abandon_lifecycle(id);
-    }
 }
 
 fn terminal_record(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecord, OrchError> {
@@ -581,19 +531,124 @@ async fn fail_create_or_restore(
     }
 }
 
+/// A DELETE/stop-all has marked a supervisor-owned lifecycle for cancellation.
+/// Publication is never cancelled mid-await: the owner reaches this point only
+/// after the current fleet/SQLite/cache operation has returned, then tears down
+/// and durably clears ownership in terminal order.
+async fn finish_cancelled_lifecycle<T>(
+    state: &AppState,
+    id: Uuid,
+    task: &OwnedTaskControl,
+    cause: OrchError,
+) -> Result<T, OrchError>
+where
+    T: Send,
+{
+    let sup = Arc::clone(&state.supervisor);
+    if let Err(error) = tokio::task::spawn_blocking(move || sup.stop_vm(id))
+        .await
+        .map_err(|error| {
+            OrchError::Internal(format!("cancelled lifecycle teardown join: {error}"))
+        })?
+    {
+        return Err(OrchError::Internal(format!(
+            "{cause}; cancelled lifecycle teardown retained resources: {error}"
+        )));
+    }
+
+    let terminal_result = match lifecycle_state(state, id)? {
+        None => Ok(()),
+        Some(LifecycleState::Terminal { .. }) => finish_terminal_transition(state, id)
+            .await
+            .map_err(|error| {
+                OrchError::Internal(format!(
+                    "{cause}; cancelled lifecycle terminal retry retained ownership: {error}"
+                ))
+            }),
+        Some(_) => {
+            start_terminal_transition(state, id, VmStatus::Stopped, true)?;
+            finish_terminal_transition(state, id)
+                .await
+                .map_err(|error| {
+                    OrchError::Internal(format!(
+                        "{cause}; cancelled lifecycle terminal transition retained ownership: {error}"
+                    ))
+                })
+        }
+    };
+    terminal_result?;
+    task.mark_terminal_converged();
+    Err(cause)
+}
+
+fn lifecycle_cancelled_error() -> OrchError {
+    OrchError::Overloaded {
+        message: "VM lifecycle cancelled by delete or shutdown".into(),
+        retry_after_secs: 1,
+    }
+}
+
+async fn cancel_unstarted_lifecycle<T>(
+    state: &AppState,
+    id: Uuid,
+    ticket: &crate::supervisor::BootTicket,
+    task: &OwnedTaskControl,
+    cause: OrchError,
+) -> Result<T, OrchError>
+where
+    T: Send,
+{
+    state.supervisor.abort_unstarted_boot(ticket).await;
+    finish_cancelled_lifecycle(state, id, task, cause).await
+}
+
+/// The caller awaits only this result channel. The worker is registered with
+/// the supervisor before spawning, so dropping an API or peer-RPC future cannot
+/// cancel an in-flight fleet, SQLite, cache, or VMM operation.
+async fn run_supervised_lifecycle<T, F, Fut>(
+    state: &AppState,
+    id: Uuid,
+    operation: F,
+) -> Result<T, OrchError>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<OwnedTaskControl>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, OrchError>> + Send + 'static,
+{
+    state
+        .supervisor
+        .run_owned_task(id, SpawnPurpose::Live, operation)
+        .await
+}
+
 /// Create a VM on THIS node exactly once: a warm-pool hand-out if available,
 /// else reserve a concurrency slot and cold-boot. Returns `Conflict` when the
 /// local host is at capacity — the caller (public create) orchestrates cluster
 /// spill; the internal create just reports back so the placer tries another
 /// peer. Writes the local store and the fleet ownership map on success.
 pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmRecord, OrchError> {
-    let now = Utc::now();
     let id = req.id.unwrap_or_else(Uuid::new_v4);
-    let mut abandonment = LifecycleAbandonmentGuard::new(state, Some(id));
+    let state = state.clone();
+    let req = req.clone();
+    let worker_state = state.clone();
+    run_supervised_lifecycle(&state, id, move |task| async move {
+        create_local_owned(&worker_state, &req, id, &task).await
+    })
+    .await
+}
+
+async fn create_local_owned(
+    state: &AppState,
+    req: &CreateVmRequest,
+    id: Uuid,
+    task: &OwnedTaskControl,
+) -> Result<VmRecord, OrchError> {
+    let now = Utc::now();
     let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
     let warm_enabled = state.config.warm_pool.enabled && req.id.is_none() && req.image.is_none();
 
     if warm_enabled {
+        let lifecycle_id = Arc::new(std::sync::Mutex::new(id));
         let publication_state = state.clone();
         let publication_cfg = unverified_cfg.clone();
         let owner_key = req.owner_key.clone();
@@ -602,11 +657,12 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
         let registration_cfg = unverified_cfg.clone();
         let registration_owner = req.owner_key.clone();
         let registration_api_key = req.api_key_id.clone();
-        let registration_abandoned_id = abandonment.id_handle();
+        let registration_lifecycle_id = Arc::clone(&lifecycle_id);
         let taken = state
             .supervisor
             .take_warm_with_publication(
                 &unverified_cfg,
+                task,
                 move |warm_id| {
                     let registration_state = registration_state.clone();
                     let record = creating_record(
@@ -617,11 +673,10 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
                         registration_api_key,
                         now,
                     );
-                    let registration_abandoned_id = Arc::clone(&registration_abandoned_id);
                     async move {
-                        *registration_abandoned_id.lock().map_err(|_| {
-                            OrchError::Internal("warm abandonment registration lock".into())
-                        })? = Some(warm_id);
+                        *registration_lifecycle_id.lock().map_err(|_| {
+                            OrchError::Internal("warm lifecycle id lock poisoned".into())
+                        })? = warm_id;
                         register_warm_creating_record(&registration_state, record).await
                     }
                 },
@@ -645,19 +700,37 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
             .await;
         match taken? {
             WarmClaimOutcome::Published(record) => {
+                if task.is_cancelled() {
+                    return finish_cancelled_lifecycle(
+                        state,
+                        record.id,
+                        task,
+                        lifecycle_cancelled_error(),
+                    )
+                    .await;
+                }
                 mark_running(state, record.clone())?;
-                abandonment.disarm();
                 let id = record.id;
                 tracing::info!(id = %id, host = %state.config.host_id, "create: warm pool");
                 return Ok(record);
             }
             WarmClaimOutcome::NoMatch => {}
             WarmClaimOutcome::PreRuntimeFailure(error) => {
-                abandonment.disarm();
+                if task.is_cancelled() {
+                    let lifecycle_id = *lifecycle_id.lock().map_err(|_| {
+                        OrchError::Internal("warm lifecycle id lock poisoned".into())
+                    })?;
+                    return finish_cancelled_lifecycle(state, lifecycle_id, task, error).await;
+                }
                 return Err(error);
             }
             WarmClaimOutcome::RetainedPublicationFailure(error) => {
-                abandonment.disarm();
+                if task.is_cancelled() {
+                    let lifecycle_id = *lifecycle_id.lock().map_err(|_| {
+                        OrchError::Internal("warm lifecycle id lock poisoned".into())
+                    })?;
+                    return finish_cancelled_lifecycle(state, lifecycle_id, task, error).await;
+                }
                 return Err(error);
             }
         }
@@ -691,6 +764,10 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
+    if task.is_cancelled() {
+        return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
+            .await;
+    }
     let resolved_request = {
         let store = state
             .store
@@ -720,12 +797,19 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
         fail_create_or_restore(state, id, error).await?;
         unreachable!("failed lifecycle helper always returns an error")
     }
+    if task.is_cancelled() {
+        return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
+            .await;
+    }
     let sup = Arc::clone(&state.supervisor);
     let cfg = spawn_cfg.clone();
     let booted = tokio::task::spawn_blocking(move || sup.spawn_vm(ticket, cfg)).await;
     let booted = match booted {
         Err(error) => {
             let error = OrchError::Internal(format!("create boot task: {error}"));
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
             if state.supervisor.has_retained_boot(id) {
                 return Err(error);
             }
@@ -734,6 +818,9 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
         }
         Ok(Ok(booted)) => booted,
         Ok(Err(error)) => {
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
             if state.supervisor.has_retained_boot(id) {
                 return Err(error);
             }
@@ -741,6 +828,10 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
+    if task.is_cancelled() {
+        let cause = state.supervisor.discard_booted_vm(booted);
+        return finish_cancelled_lifecycle(state, id, task, cause).await;
+    }
     let publication_state = state.clone();
     let publication_record = record.clone();
     let record = match state
@@ -760,15 +851,16 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
     {
         Ok(record) => record,
         Err(error) => {
-            abandonment.disarm();
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
             return Err(error);
         }
     };
-    if let Err(error) = mark_running(state, record.clone()) {
-        abandonment.disarm();
-        return Err(error);
+    if task.is_cancelled() {
+        return finish_cancelled_lifecycle(state, id, task, lifecycle_cancelled_error()).await;
     }
-    abandonment.disarm();
+    mark_running(state, record.clone())?;
     tracing::info!(id = %id, host = %state.config.host_id, "create: cold start");
     Ok(record)
 }
@@ -784,7 +876,33 @@ pub async fn restore_local(
     caller_is_admin: bool,
 ) -> Result<VmRecord, OrchError> {
     let id = id.unwrap_or_else(Uuid::new_v4);
-    let mut abandonment = LifecycleAbandonmentGuard::new(state, Some(id));
+    let state = state.clone();
+    let snapshot_path = snapshot_path.to_string();
+    let worker_state = state.clone();
+    run_supervised_lifecycle(&state, id, move |task| async move {
+        restore_local_owned(
+            &worker_state,
+            &snapshot_path,
+            id,
+            owner_key,
+            api_key_id,
+            caller_is_admin,
+            &task,
+        )
+        .await
+    })
+    .await
+}
+
+async fn restore_local_owned(
+    state: &AppState,
+    snapshot_path: &str,
+    id: Uuid,
+    owner_key: Option<String>,
+    api_key_id: Option<String>,
+    caller_is_admin: bool,
+    task: &OwnedTaskControl,
+) -> Result<VmRecord, OrchError> {
     let now = Utc::now();
     let record = VmRecord {
         id,
@@ -819,6 +937,10 @@ pub async fn restore_local(
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
+    if task.is_cancelled() {
+        return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
+            .await;
+    }
     // Authorize after registration so a concurrent DELETE can route to this
     // owner and cancel the exact Creating lifecycle before restore touches VMM
     // state or the snapshot.
@@ -829,6 +951,10 @@ pub async fn restore_local(
         fail_create_or_restore(state, id, error).await?;
         unreachable!("failed lifecycle helper always returns an error")
     }
+    if task.is_cancelled() {
+        return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
+            .await;
+    }
     let path = snapshot_path.to_string();
     let sup = Arc::clone(&state.supervisor);
     let publication_state = state.clone();
@@ -837,6 +963,9 @@ pub async fn restore_local(
     let booted = match booted {
         Err(error) => {
             let error = OrchError::Internal(format!("restore boot task: {error}"));
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
             if state.supervisor.has_retained_boot(id) {
                 return Err(error);
             }
@@ -845,6 +974,9 @@ pub async fn restore_local(
         }
         Ok(Ok(booted)) => booted,
         Ok(Err(error)) => {
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
             if state.supervisor.has_retained_boot(id) {
                 return Err(error);
             }
@@ -852,6 +984,10 @@ pub async fn restore_local(
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
+    if task.is_cancelled() {
+        let cause = state.supervisor.discard_booted_vm(booted);
+        return finish_cancelled_lifecycle(state, id, task, cause).await;
+    }
     let record = match state
         .supervisor
         .publish_running_with(booted, move |pid, socket_path| {
@@ -869,15 +1005,16 @@ pub async fn restore_local(
     {
         Ok(record) => record,
         Err(error) => {
-            abandonment.disarm();
+            if task.is_cancelled() {
+                return finish_cancelled_lifecycle(state, id, task, error).await;
+            }
             return Err(error);
         }
     };
-    if let Err(error) = mark_running(state, record.clone()) {
-        abandonment.disarm();
-        return Err(error);
+    if task.is_cancelled() {
+        return finish_cancelled_lifecycle(state, id, task, lifecycle_cancelled_error()).await;
     }
-    abandonment.disarm();
+    mark_running(state, record.clone())?;
     tracing::info!(id = %id, host = %state.config.host_id, "restore: from snapshot");
     Ok(record)
 }
@@ -896,6 +1033,19 @@ pub async fn exec_local(
 }
 
 pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    // Mark and await the supervisor-owned worker before taking the terminal
+    // gate. That worker finishes its current publication operation and either
+    // converges terminal state itself or hands a fully published VM to the
+    // ordinary delete path below.
+    let sup = Arc::clone(&state.supervisor);
+    let worker_converged = tokio::task::spawn_blocking(move || sup.cancel_and_wait_owned_task(id))
+        .await
+        .map_err(|error| {
+            OrchError::Internal(format!("cancelled lifecycle wait join: {error}"))
+        })??;
+    if worker_converged {
+        return Ok(());
+    }
     let _terminal_gate = state.terminal_transition_gate.lock().await;
     match lifecycle_state(state, id)? {
         Some(LifecycleState::Terminal { .. }) => {
@@ -921,6 +1071,12 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
 }
 
 pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchError> {
+    let sup = Arc::clone(&state.supervisor);
+    tokio::task::spawn_blocking(move || sup.cancel_and_wait_all_owned_tasks())
+        .await
+        .map_err(|error| {
+            OrchError::Internal(format!("cancelled lifecycle wait join: {error}"))
+        })??;
     let _terminal_gate = state.terminal_transition_gate.lock().await;
     let mut failures = retry_pending_lifecycle(state).await;
     let sup = Arc::clone(&state.supervisor);
@@ -1362,10 +1518,12 @@ mod tests {
                 };
                 let publication_state = state.clone();
                 let publication_record = record.clone();
+                let task = Arc::new(OwnedTaskControl::new());
                 let outcome = state
                     .supervisor
                     .take_warm_with_publication(
                         &warm_cfg,
+                        &task,
                         |_| async { Ok(()) },
                         move |_, _, _| async move {
                             publish_running_record(&publication_state, publication_record).await?;
@@ -1399,208 +1557,88 @@ mod tests {
     }
 
     #[test]
-    fn aborting_warm_sqlite_publication_unblocks_delete_without_running_resurrection() {
-        let (state, mut writes) = test_state_with_durable_writer();
-        let warm_cfg = VmSpawnConfig {
-            memory_mib: 256,
-            vcpus: 1,
-            kernel_path: PathBuf::from("kernel"),
-            rootfs_path: Some(PathBuf::from("rootfs")),
-            cmdline: "console=ttyS0".into(),
-            read_only: false,
-        };
+    fn aborted_request_with_delayed_fleet_publication_stays_owned_until_delete_converges() {
+        let (mut state, mut writes) = test_state_with_durable_writer();
+        state.config.warm_pool.enabled = true;
+        let warm_cfg = VmSpawnConfig::from_defaults(
+            &state.config,
+            &CreateVmRequest {
+                id: None,
+                owner_key: Some("test".into()),
+                api_key_id: None,
+                memory_mib: 256,
+                vcpus: 1,
+                kernel_path: None,
+                image: None,
+                rootfs_path: None,
+                cmdline: None,
+            },
+        );
         let id = Uuid::new_v4();
         state
             .supervisor
-            .seed_warm_for_test(id, warm_cfg.clone())
-            .unwrap();
-        let record = running_record(
-            &state,
-            &warm_cfg,
-            id,
-            1,
-            &PathBuf::from(format!("warm-abandon-{id}.sock")),
-            None,
-            None,
-            Utc::now(),
-        );
+            .seed_warm_for_test(id, warm_cfg)
+            .expect("a warm VM must be available for the lifecycle request");
+        let fleet_pause = pause_lifecycle(&state, LifecyclePause::Fleet);
         let runtime = test_runtime();
 
         runtime.block_on(async {
-            let task_state = state.clone();
-            let task_supervisor = Arc::clone(&state.supervisor);
-            let task_record = record.clone();
-            let task_cfg = warm_cfg.clone();
-            let publication = tokio::spawn(async move {
-                let _abandonment = LifecycleAbandonmentGuard::new(&task_state, Some(id));
-                let registration_state = task_state.clone();
-                let registration_record = task_record.clone();
-                let publication_state = task_state.clone();
-                task_supervisor
-                    .take_warm_with_publication(
-                        &task_cfg,
-                        move |_| async move {
-                            set_lifecycle_state(
-                                &registration_state,
-                                id,
-                                LifecycleState::Creating {
-                                    record: registration_record,
-                                    phase: CreatingPhase::FleetClaimed,
-                                },
-                            )
-                        },
-                        move |_, _, _| async move {
-                            publish_running_record(&publication_state, task_record).await?;
-                            Ok(())
-                        },
-                    )
-                    .await
-            });
-
-            let StoreWrite::VmDurable(_, publication_completion) = writes.recv().await.unwrap()
-            else {
-                panic!("warm publication must await durable SQLite");
-            };
-            publication.abort();
-            assert!(matches!(publication.await, Err(error) if error.is_cancelled()));
-            drop(publication_completion);
-
-            assert!(matches!(
-                lifecycle_state(&state, id).unwrap(),
-                Some(LifecycleState::Abandoned { .. })
-            ));
-            assert!(state.supervisor.is_running(id));
-            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
-
             let writer = tokio::spawn(async move {
-                let StoreWrite::VmDurable(_, completion) = writes.recv().await.unwrap() else {
-                    panic!("abandoned delete must durably persist its terminal record");
-                };
-                completion.send(Ok(())).unwrap();
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
             });
-            stop_local(&state, id)
+            let request_state = state.clone();
+            let request = tokio::spawn(async move {
+                create_local(
+                    &request_state,
+                    &CreateVmRequest {
+                        id: None,
+                        owner_key: Some("test".into()),
+                        api_key_id: None,
+                        memory_mib: 256,
+                        vcpus: 1,
+                        kernel_path: None,
+                        image: None,
+                        rootfs_path: None,
+                        cmdline: None,
+                    },
+                )
                 .await
-                .expect("DELETE must converge an abandoned publication");
-            writer.await.unwrap();
+            });
 
+            fleet_pause.entered.notified().await;
+            request.abort();
+            assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+            assert!(
+                state.supervisor.has_owned_task(id),
+                "dropping the API future must detach from the supervisor-owned publication"
+            );
+
+            let delete_state = state.clone();
+            let delete = tokio::spawn(async move { stop_local(&delete_state, id).await });
+            tokio::task::yield_now().await;
+            assert!(
+                !delete.is_finished(),
+                "DELETE must wait for the delayed fleet operation before terminal clear"
+            );
+            fleet_pause.release.notify_one();
+            delete
+                .await
+                .expect("DELETE task must finish")
+                .expect("DELETE must converge the owned lifecycle");
+
+            assert!(!state.supervisor.has_owned_task(id));
             assert!(lifecycle_state(&state, id).unwrap().is_none());
             assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
             assert!(!state.supervisor.is_running(id));
             assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+            writer.abort();
         });
         drop(runtime);
         drop(state);
-    }
-
-    #[test]
-    fn aborting_warm_publication_at_every_boundary_leaves_terminal_cleanup_ownership() {
-        let runtime = test_runtime();
-        for pause in [
-            LifecyclePause::Fleet,
-            LifecyclePause::SQLite,
-            LifecyclePause::Cache,
-        ] {
-            let (state, writes) = test_state_with_durable_writer();
-            let writes = Arc::new(tokio::sync::Mutex::new(writes));
-            let warm_cfg = VmSpawnConfig {
-                memory_mib: 256,
-                vcpus: 1,
-                kernel_path: PathBuf::from("kernel"),
-                rootfs_path: Some(PathBuf::from("rootfs")),
-                cmdline: "console=ttyS0".into(),
-                read_only: false,
-            };
-            let id = Uuid::new_v4();
-            state
-                .supervisor
-                .seed_warm_for_test(id, warm_cfg.clone())
-                .unwrap();
-            let record = running_record(
-                &state,
-                &warm_cfg,
-                id,
-                1,
-                &PathBuf::from(format!("warm-abandon-boundary-{id}.sock")),
-                None,
-                None,
-                Utc::now(),
-            );
-            let control = pause_lifecycle(&state, pause);
-
-            runtime.block_on(async {
-                let task_state = state.clone();
-                let task_supervisor = Arc::clone(&state.supervisor);
-                let task_record = record.clone();
-                let task_cfg = warm_cfg.clone();
-                let publication = tokio::spawn(async move {
-                    let _abandonment = LifecycleAbandonmentGuard::new(&task_state, Some(id));
-                    let registration_state = task_state.clone();
-                    let registration_record = task_record.clone();
-                    let publication_state = task_state.clone();
-                    task_supervisor
-                        .take_warm_with_publication(
-                            &task_cfg,
-                            move |_| async move {
-                                set_lifecycle_state(
-                                    &registration_state,
-                                    id,
-                                    LifecycleState::Creating {
-                                        record: registration_record,
-                                        phase: CreatingPhase::FleetClaimed,
-                                    },
-                                )
-                            },
-                            move |_, _, _| async move {
-                                publish_running_record(&publication_state, task_record).await?;
-                                Ok(())
-                            },
-                        )
-                        .await
-                });
-
-                if pause == LifecyclePause::Cache {
-                    let StoreWrite::VmDurable(_, completion) =
-                        writes.lock().await.recv().await.unwrap()
-                    else {
-                        panic!("cache-boundary publication must persist before cache commit");
-                    };
-                    completion.send(Ok(())).unwrap();
-                }
-                control.entered.notified().await;
-                publication.abort();
-                assert!(matches!(publication.await, Err(error) if error.is_cancelled()));
-
-                assert!(matches!(
-                    lifecycle_state(&state, id).unwrap(),
-                    Some(LifecycleState::Abandoned { .. })
-                ));
-                assert!(state.supervisor.is_running(id));
-                assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 1);
-
-                let writer = {
-                    let writes = Arc::clone(&writes);
-                    tokio::spawn(async move {
-                        let StoreWrite::VmDurable(_, completion) =
-                            writes.lock().await.recv().await.unwrap()
-                        else {
-                            panic!("terminal cleanup must persist after every abandoned boundary");
-                        };
-                        completion.send(Ok(())).unwrap();
-                    })
-                };
-                stop_local(&state, id)
-                    .await
-                    .expect("DELETE must own abandoned publication cleanup");
-                writer.await.unwrap();
-            });
-
-            assert!(lifecycle_state(&state, id).unwrap().is_none());
-            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
-            assert!(!state.supervisor.is_running(id));
-            assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
-            drop(state);
-        }
-        drop(runtime);
     }
 
     #[test]

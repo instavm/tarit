@@ -114,9 +114,9 @@ pub(crate) enum LifecycleState {
     Running {
         record: VmRecord,
     },
-    /// The request that owned this lifecycle was dropped while publication was
-    /// in flight. Resources stay registered until DELETE/stop-all performs the
-    /// normal terminal transition; Drop never starts asynchronous cleanup.
+    /// A legacy partial warm-registration rollback retained resources. Resources
+    /// stay registered until DELETE/stop-all performs the normal terminal
+    /// transition; request futures never own asynchronous lifecycle cleanup.
     Abandoned {
         record: VmRecord,
     },
