@@ -99,7 +99,7 @@ impl Replenisher {
 pub(crate) fn spawn_replenisher(
     sup: Arc<VmmSupervisor>,
     config: Config,
-    scheduler: Arc<Scheduler>,
+    _scheduler: Arc<Scheduler>,
     mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> Option<Replenisher> {
     if !config.warm_pool.enabled {
@@ -162,30 +162,21 @@ pub(crate) fn spawn_replenisher(
                             if let Some(path) = golden.get(&key).cloned() {
                                 Some(path)
                             } else {
-                                if !scheduler.try_reserve() {
-                                    continue;
-                                }
                                 let sup = Arc::clone(&sup);
-                                let sched = Arc::clone(&scheduler);
                                 let class = class.clone();
                                 let blocking_cancelled = Arc::clone(&worker_cancelled);
                                 match await_blocking(
                                     worker_children
                                         .spawn(move || {
-                                            let result =
-                                                if blocking_cancelled.load(Ordering::Acquire) {
-                                                    Err(tarit_types::OrchError::Overloaded {
-                                                        message: "taritd is shutting down".into(),
-                                                        retry_after_secs: 1,
-                                                    })
-                                                } else {
-                                                    sup.create_golden_cancellable(
-                                                        &class,
-                                                        &blocking_cancelled,
-                                                    )
-                                                };
-                                            sched.release();
-                                            result
+                                            if blocking_cancelled.load(Ordering::Acquire) {
+                                                Err(tarit_types::OrchError::Overloaded {
+                                                    message: "taritd is shutting down".into(),
+                                                    retry_after_secs: 1,
+                                                })
+                                            } else {
+                                                tokio::runtime::Handle::current()
+                                                    .block_on(sup.create_golden(class))
+                                            }
                                         })
                                         .await,
                                     &worker_cancelled,
@@ -248,12 +239,8 @@ pub(crate) fn spawn_replenisher(
                                 worker_cancelled.store(true, Ordering::Release);
                                 break;
                             }
-                            if !scheduler.try_reserve() {
-                                break;
-                            }
                             spawned += 1;
                             let sup = Arc::clone(&sup);
-                            let sched = Arc::clone(&scheduler);
                             let class = class.clone();
                             let snapshot_path = snapshot_path.clone();
                             let cancelled = Arc::clone(&worker_cancelled);
@@ -261,13 +248,9 @@ pub(crate) fn spawn_replenisher(
                                 worker_children
                                     .spawn(move || {
                                         if cancelled.load(Ordering::Acquire) {
-                                            sched.release();
-                                        } else if let Err(e) = sup.spawn_warm_restore_cancellable(
-                                            &class,
-                                            &snapshot_path,
-                                            &cancelled,
-                                        ) {
-                                            sched.release();
+                                        } else if let Err(e) = tokio::runtime::Handle::current()
+                                            .block_on(sup.spawn_warm_restore(class, snapshot_path))
+                                        {
                                             tracing::warn!("warm restore spawn failed: {e}");
                                         }
                                     })
@@ -293,25 +276,18 @@ pub(crate) fn spawn_replenisher(
                                 worker_cancelled.store(true, Ordering::Release);
                                 break;
                             }
-                            if !scheduler.try_reserve() {
-                                remaining = 0;
-                                break;
-                            }
                             remaining -= 1;
                             did_work = true;
                             let sup = Arc::clone(&sup);
-                            let sched = Arc::clone(&scheduler);
                             let class = class.clone();
                             let cancelled = Arc::clone(&worker_cancelled);
                             set.push(
                                 worker_children
                                     .spawn(move || {
                                         if cancelled.load(Ordering::Acquire) {
-                                            sched.release();
-                                        } else if let Err(e) =
-                                            sup.spawn_warm_cancellable(&class, &cancelled)
+                                        } else if let Err(e) = tokio::runtime::Handle::current()
+                                            .block_on(sup.spawn_warm(class))
                                         {
-                                            sched.release();
                                             tracing::warn!("warm spawn failed: {e}");
                                         }
                                     })

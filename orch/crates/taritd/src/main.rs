@@ -83,8 +83,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     if cli.runs_server() {
         init_tracing();
+        let preflight_taps = net::startup_preflight().context(
+            "contain pre-existing Tarit TAPs before configuration, database, image, or VM discovery",
+        )?;
         let config = Config::from_env().context("load config")?;
-        run_server(config).await
+        run_server(config, preflight_taps).await
     } else {
         cli::run_client(cli).await
     }
@@ -100,7 +103,7 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_server(mut config: Config) -> anyhow::Result<()> {
+async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::Result<()> {
     tracing::info!(
         listen = %config.listen,
         host_id = %config.host_id,
@@ -124,13 +127,9 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
 
     let store = Store::open(&config.db_path).context("open store")?;
     image::resolve_warm_pool_images(&mut config, &store).context("resolve warm-pool images")?;
-    let persisted_vms = match store.list_vms() {
-        Ok(vms) => vms,
-        Err(e) => {
-            tracing::warn!("failed to load persisted VMs during startup: {e}");
-            Vec::new()
-        }
-    };
+    let persisted_vms = store
+        .list_vms()
+        .context("load persisted VMs during startup")?;
     let live_vm_ids = persisted_vms
         .iter()
         .filter(|vm| {
@@ -139,11 +138,16 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         })
         .map(|vm| vm.id)
         .collect::<Vec<_>>();
-    let supervisor = Arc::new(VmmSupervisor::new_with_live_vms(
-        config.clone(),
-        live_vm_ids,
-    ));
     let scheduler = Arc::new(Scheduler::new(config.clone()));
+    let supervisor = Arc::new(
+        VmmSupervisor::new_with_live_vms(
+            config.clone(),
+            live_vm_ids,
+            &preflight_taps,
+            Arc::clone(&scheduler),
+        )
+        .context("initialize fail-closed network recovery")?,
+    );
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio
     // context panics on current tokio ("Cannot drop a runtime ... from within
@@ -229,6 +233,12 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
         exec_cache: Arc::new(RwLock::new(HashMap::new())),
         vm_cache,
         store_tx,
+        lifecycle: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(test)]
+        lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
+        #[cfg(test)]
+        lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
+        terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
         pty_registry: Arc::new(pty::PtyRegistry::default()),
         supervisor: Arc::clone(&supervisor),
         scheduler: scheduler.clone(),
@@ -253,10 +263,14 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
                 let Some(op) = op else {
                     break;
                 };
-                if let Ok(s) = store.lock() {
-                    match op {
+                match store.lock() {
+                    Ok(s) => match op {
                         api::StoreWrite::Vm(rec) => {
                             let _ = s.insert_vm(&rec);
+                        }
+                        api::StoreWrite::VmDurable(rec, completion) => {
+                            let result = s.insert_vm(&rec).map_err(api::store_err);
+                            let _ = completion.send(result);
                         }
                         api::StoreWrite::Exec(rec) => {
                             let _ = s.insert_execution(&rec);
@@ -266,6 +280,13 @@ async fn run_server(mut config: Config) -> anyhow::Result<()> {
                         }
                         api::StoreWrite::Audit(ev) => {
                             let _ = s.enqueue_audit(&ev);
+                        }
+                    },
+                    Err(_) => {
+                        if let api::StoreWrite::VmDurable(_, completion) = op {
+                            let _ = completion.send(Err(tarit_types::OrchError::Internal(
+                                "store lock poisoned during shutdown persistence".into(),
+                            )));
                         }
                     }
                 }
@@ -796,6 +817,7 @@ async fn shutdown_sweep(state: &AppState, reason: &'static str) -> anyhow::Resul
         running = summary.running,
         warm = summary.warm,
         booting = summary.booting,
+        internal_booting = summary.internal_booting,
         elapsed_ms = started.elapsed().as_millis(),
         "shutdown drain summary: reaped local VMs"
     );
@@ -898,7 +920,7 @@ mod tests {
         config.net_state_path = root.join("net-state.json");
         config.ssh_gateway_host_key_path = root.join("ssh-host");
 
-        let error = run_server(config).await.unwrap_err();
+        let error = run_server(config, Vec::new()).await.unwrap_err();
 
         assert!(error
             .to_string()
@@ -1420,6 +1442,10 @@ mod tests {
             exec_cache: Arc::new(RwLock::new(HashMap::new())),
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
+            lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
+            lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
+            terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
             pty_registry: Arc::new(pty::PtyRegistry::default()),
             supervisor: Arc::new(VmmSupervisor::new(config.clone())),
             scheduler: Arc::new(Scheduler::new(config)),

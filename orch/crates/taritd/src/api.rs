@@ -90,9 +90,107 @@ use tarit_types::{audit_action, audit_outcome};
 /// (vm_cache/exec_cache) are the source of truth for reads; SQLite lags them.
 pub enum StoreWrite {
     Vm(VmRecord),
+    /// A lifecycle transition that must reach SQLite before its resource
+    /// reservation or fleet ownership may be released.
+    VmDurable(
+        VmRecord,
+        tokio::sync::oneshot::Sender<Result<(), OrchError>>,
+    ),
     Exec(ExecutionRecord),
     Usage(UsageEvent),
     Audit(AuditEvent),
+}
+
+/// The only mutable lifecycle coordination record for a user VM. A record stays
+/// here until every durable/externally-visible step has acknowledged; this makes
+/// retry ownership explicit instead of inferring it from cache and supervisor
+/// side effects.
+#[derive(Clone, Debug)]
+pub(crate) enum LifecycleState {
+    Creating {
+        record: VmRecord,
+        phase: CreatingPhase,
+    },
+    Publishing {
+        record: VmRecord,
+        phase: PublicationPhase,
+    },
+    Running {
+        record: VmRecord,
+    },
+    /// A legacy partial warm-registration rollback retained resources. Resources
+    /// stay registered until DELETE/stop-all performs the normal terminal
+    /// transition; request futures never own asynchronous lifecycle cleanup.
+    Abandoned {
+        record: VmRecord,
+    },
+    Terminal {
+        record: VmRecord,
+        phase: TerminalPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreatingPhase {
+    CacheVisible,
+    SQLitePersisted,
+    FleetClaimed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicationPhase {
+    NeedFleetUpdate,
+    FleetUpdated,
+    SQLitePersisted,
+    CacheVisible,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalPhase {
+    PersistRecordAndRelease,
+    PersistRecordOnly,
+    ClearFleetOwnershipAndRelease,
+    ClearFleetOwnershipOnly,
+    CommitCacheAndRelease,
+    CommitCacheOnly,
+    ReleaseReservation,
+    Complete,
+}
+
+impl LifecycleState {
+    pub(crate) fn record(&self) -> &VmRecord {
+        match self {
+            Self::Creating { record, .. }
+            | Self::Publishing { record, .. }
+            | Self::Running { record }
+            | Self::Abandoned { record }
+            | Self::Terminal { record, .. } => record,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleFault {
+    SQLite,
+    FleetClaim,
+    FleetClear,
+    CacheCommit,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum LifecyclePause {
+    Fleet,
+    SQLite,
+    Cache,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct LifecyclePauseControl {
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -109,6 +207,19 @@ pub struct AppState {
     pub vm_cache: Arc<RwLock<HashMap<Uuid, VmRecord>>>,
     /// Channel to the background store writer (durability, write-behind).
     pub store_tx: tokio::sync::mpsc::UnboundedSender<StoreWrite>,
+    /// Registered user lifecycle state. The supervisor boot gate establishes
+    /// Creating records before VMM work; this map then owns publication and
+    /// terminal retry progress until reservations can be released.
+    pub(crate) lifecycle: Arc<Mutex<HashMap<Uuid, LifecycleState>>>,
+    #[cfg(test)]
+    pub(crate) lifecycle_faults: Arc<Mutex<Vec<LifecycleFault>>>,
+    #[cfg(test)]
+    pub(crate) lifecycle_pauses: Arc<Mutex<HashMap<LifecyclePause, LifecyclePauseControl>>>,
+    /// Serializes terminal transition retries so a second stop cannot repeat
+    /// destructive teardown while the first stop awaits durable persistence.
+    /// When both are needed, this gate is acquired before the supervisor boot
+    /// gate; boot publication never acquires this gate.
+    pub(crate) terminal_transition_gate: Arc<tokio::sync::Mutex<()>>,
     /// Durable audit outbox used by lifecycle operations that cannot rely on
     /// the best-effort background writer.
     pub(crate) audit_outbox: Arc<dyn audit::DurableAuditOutbox>,
@@ -2957,6 +3068,10 @@ mod tests {
                 exec_cache: Arc::new(RwLock::new(HashMap::new())),
                 vm_cache: Arc::new(RwLock::new(HashMap::new())),
                 store_tx,
+                lifecycle: Arc::new(Mutex::new(HashMap::new())),
+                lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
+                lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
+                terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
                 pty_registry: Arc::new(PtyRegistry::default()),
                 supervisor: Arc::new(VmmSupervisor::new(config.clone())),
                 scheduler: Arc::new(Scheduler::new(config)),

@@ -179,9 +179,25 @@ rootfs = "/var/lib/taritd/rootfs.ext4"
 Operational behavior:
 
 - Warm VMs reserve scheduler slots, so assigned plus warm VMs do not exceed `TARIT_MAX_VMS`.
+- Shutdown and user-boot publication share a boot gate. The global order is
+  `terminal transition gate` → `boot gate` → `running`/`warm` → `booting`;
+  shutdown releases the boot gate before its separate `running` → `warm`
+  teardown phase. No synchronous supervisor lock is held across an await.
+  Create and restore first establish a boot entry, durable local `Creating`
+  record, and (when configured) routable fleet ownership while holding the boot
+  gate; only then may scheduler, image, or VMM work start.
+- A user lifecycle is explicitly `Creating` → `Publishing` → `Running` or a
+  terminal `Stopped`/`Error` transition. Publishing advances fleet ownership,
+  SQLite, cache visibility, and supervisor running ownership in order. A failed
+  step retains the VMM, network, reservation, and lifecycle state; a later
+  stop/delete/stop-all retries convergence before teardown. Terminal records
+  retain fleet ownership and capacity until SQLite, fleet clear, cache commit,
+  and reservation release each acknowledge.
 - Warm handout is possible only when the create request exactly matches a warm class shape and boot config.
 - If the pool drains, creates cold boot instead of failing.
-- Replenishment loops every 150 ms and limits concurrent warm spawns by `replenish_concurrency`.
+- Replenishment limits concurrent warm spawns by `replenish_concurrency`; it
+  sleeps for 150 ms after an at-capacity attempt, rather than spinning while
+  the host is overloaded.
 - Set `restore = true` on a warm class to cold-boot one golden VM, snapshot it, and replenish the rest of that shape by restoring clones.
 
 ## Networking
@@ -196,14 +212,63 @@ When enabled, `taritd`:
 4. Allocates one reusable slot per VM from the 172.16.0.0/16 `/30` pool.
 5. Creates one tap per VM named `insta<N>` where `N` is the slot.
 6. Gives each VM a deterministic private `/30`: host `.1`, guest `.2`.
-7. Persists the slot map in `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers it on restart.
+7. Persists the slot map and each allocation's egress allowlist/default-deny policy in
+   version-2 `TARIT_NET_STATE` (default `<TARIT_DB>.net.json`) and recovers both on
+   restart. Version-1 state with any live allocation is rejected; only an empty or
+   entirely stale version-1 file is safely migrated.
 8. Adds a per-slot nftables masquerade rule tagged with an `taritd` comment.
-9. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
+9. Installs per-tap forward guards before bringing the tap up: guest traffic may
+   leave only through the detected uplink and cannot target the `172.16.0.0/16`
+   VM pool; established and related return traffic remains allowed.
+10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
-On startup, `taritd` reconciles the persisted map with live local VM records and
-runs an age-gated sweep for stale `insta<N>` taps and orphaned `taritd` nftables
-rules. Stop/delete teardown is idempotent and best-effort for tap deletion, nft
-cleanup, and slot freeing.
+Before loading configuration, opening a database, resolving images, or looking
+up VMs, `taritd` enumerates strict `insta<N>` names with structured `ip -j
+link` output and lowers them. A containment, VM-list, or recovery error is
+fatal: no supervisor or HTTP listener is published. Network-disabled startup
+is allowed only when that preflight found no Tarit TAP and there are no local
+live VM records requiring recovery. It then reconciles the persisted map with
+live local VM records, validates the
+required nft base-chain hooks, and atomically inserts top-of-chain forward and
+input drop quarantines for every recovered TAP. It removes Tarit-owned stale
+policy for all their slots and programs and verifies every netdev IPv4/ARP,
+source, VM-pool lateral, uplink, host-input, masquerade, and persisted egress
+policy while all TAPs remain contained.
+
+`taritd_nat` forward and input chains are closed Tarit ownership domains:
+every rule relevant to a recovered TAP must have a recognized Tarit comment and
+the exact managed rule shape. Operator or ambiguous rules are preserved but
+make recovery fail closed; no TAP is activated behind an earlier ambiguous
+accept. The completed allocator state is persisted before quarantines release
+using a mode-0600 temp file, write/flush/file sync, atomic rename, and parent
+directory sync.
+Live egress updates likewise install a top-of-chain quarantine, replace all
+egress rules in one nft transaction, verify the effective stateful-return,
+allow, and final default-deny ordering, durably persist, and only then release.
+Updates are serialized across the host-owned nft/state transaction.
+
+A containment or reconciliation failure cleans partial policy and keeps every
+TAP down or quarantined. If quarantine installation fails, `taritd` also
+best-effort lowers/deletes every strict Tarit TAP and disables IPv4 and IPv6
+forwarding before returning an aggregated fatal error. If link deletion and
+both forwarding disables all fail, no stronger in-process kernel invariant can
+be guaranteed; `taritd` remains unavailable and reports every failed
+containment action rather than claiming containment. Stop/delete teardown is
+retryable and fails the operation if the strict TAP cannot be contained and
+deleted, exact policy cleanup fails, or durable slot release is ambiguous.
+Tarit retains the allocation and policy for retry; operators must resolve the
+reported containment error before treating the VM or its network capacity as
+stopped/freed. After a post-rename state-directory sync failure, the running
+process refuses further provisioning until it is restarted and the persisted
+state is inspected/reconciled.
+
+Malformed or ambiguous `TARIT_NET_STATE` (an out-of-range slot, mismatched
+slot/TAP identity, duplicate slot, duplicate VM ID, or nil VM owner) is never
+pruned or rewritten. Startup first contains every strict Tarit TAP, then fails
+before nft recovery or slot release. Preserve the state file and resolve the
+duplicate/corrupt ownership with manual host inspection; do not reuse or delete
+the affected slot until its TAP is confirmed absent and its exact managed policy
+has been cleaned.
 
 Requirements:
 

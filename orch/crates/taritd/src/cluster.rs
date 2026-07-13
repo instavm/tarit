@@ -147,23 +147,25 @@ pub async fn peer_rpc(state: &AppState, host_id: &str) -> Result<Option<String>,
     }
 }
 
-/// Record (or update) VM ownership in the fleet map. Best-effort: a fleet write
-/// failure logs but does not fail the operation — the owner's local store stays
-/// authoritative and the next heartbeat/reconcile can repair the map.
-pub async fn record_ownership(state: &AppState, vm: &VmRecord) {
+/// Commit user boot ownership while the boot/shutdown gate is held.
+pub async fn record_ownership_required(state: &AppState, vm: &VmRecord) -> Result<(), OrchError> {
     if let Some(fleet) = &state.fleet {
-        if let Err(e) = fleet.upsert_vm(vm).await {
-            tracing::warn!(id = %vm.id, "fleet upsert_vm failed: {e}");
-        }
+        fleet
+            .upsert_vm(vm)
+            .await
+            .map_err(|e| OrchError::Internal(format!("fleet upsert_vm: {e}")))?;
     }
+    Ok(())
 }
 
 /// Remove VM ownership from the fleet map on stop/delete so the cluster stops
 /// routing to a dead sandbox.
-pub async fn clear_ownership(state: &AppState, id: Uuid) {
+pub async fn clear_ownership(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     if let Some(fleet) = &state.fleet {
-        if let Err(e) = fleet.delete_vm(id).await {
-            tracing::warn!(%id, "fleet delete_vm failed: {e}");
-        }
+        fleet
+            .delete_vm(id)
+            .await
+            .map_err(|e| OrchError::Internal(format!("fleet delete_vm: {e}")))?;
     }
+    Ok(())
 }
