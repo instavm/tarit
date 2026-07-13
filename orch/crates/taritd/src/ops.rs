@@ -53,6 +53,47 @@ fn vm_set_status(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecor
     Ok(rec)
 }
 
+fn stopped_record(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
+    let mut record = state
+        .vm_cache
+        .read()
+        .map_err(|_| OrchError::Internal("vm cache".into()))?
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found")))?;
+    record.status = VmStatus::Stopped;
+    record.updated_at = Utc::now();
+    Ok(record)
+}
+
+fn commit_stopped_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    state
+        .vm_cache
+        .write()
+        .map_err(|_| OrchError::Internal("vm cache".into()))?
+        .insert(record.id, record);
+    Ok(())
+}
+
+async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+    let (completion, persisted) = tokio::sync::oneshot::channel();
+    state
+        .store_tx
+        .send(StoreWrite::VmDurable(record, completion))
+        .map_err(|_| OrchError::Internal("store writer unavailable during shutdown".into()))?;
+    persisted.await.map_err(|_| {
+        OrchError::Internal("store writer dropped shutdown persistence confirmation".into())
+    })?
+}
+
+fn after_durable_persist(
+    persist: impl FnOnce() -> Result<(), OrchError>,
+    follow_up: impl FnOnce() -> Result<(), OrchError>,
+) -> Result<(), OrchError> {
+    persist()?;
+    follow_up()
+}
+
 fn store_insert(state: &AppState, rec: &VmRecord) -> Result<(), OrchError> {
     vm_put(state, rec);
     Ok(())
@@ -153,17 +194,21 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
                 Ok(record)
             }
             Ok(Err(e)) => {
-                record.status = VmStatus::Error;
-                record.updated_at = Utc::now();
-                let _ = store_update(state, &record);
-                state.scheduler.release();
+                if !state.supervisor.is_shutting_down() {
+                    record.status = VmStatus::Error;
+                    record.updated_at = Utc::now();
+                    let _ = store_update(state, &record);
+                    state.scheduler.release();
+                }
                 Err(e)
             }
             Err(e) => {
-                record.status = VmStatus::Error;
-                record.updated_at = Utc::now();
-                let _ = store_update(state, &record);
-                state.scheduler.release();
+                if !state.supervisor.is_shutting_down() {
+                    record.status = VmStatus::Error;
+                    record.updated_at = Utc::now();
+                    let _ = store_update(state, &record);
+                    state.scheduler.release();
+                }
                 Err(OrchError::Internal(format!("join: {e}")))
             }
         };
@@ -222,11 +267,15 @@ pub async fn restore_local(
             Ok(record)
         }
         Ok(Err(e)) => {
-            state.scheduler.release();
+            if !state.supervisor.is_shutting_down() {
+                state.scheduler.release();
+            }
             Err(e)
         }
         Err(e) => {
-            state.scheduler.release();
+            if !state.supervisor.is_shutting_down() {
+                state.scheduler.release();
+            }
             Err(OrchError::Internal(format!("join: {e}")))
         }
     }
@@ -269,32 +318,47 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
         Err(failure) => (failure.summary, Some(failure.error)),
     };
 
-    for _ in 0..summary.total() {
+    let mut failures = failure
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    let stopped_ids = summary
+        .running_ids
+        .iter()
+        .chain(summary.booting_ids.iter())
+        .copied()
+        .collect::<Vec<_>>();
+
+    for id in stopped_ids {
+        let record = match stopped_record(state, id) {
+            Ok(record) => record,
+            Err(error) => {
+                failures.push(format!(
+                    "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
+                ));
+                continue;
+            }
+        };
+        let persisted = persist_stopped_record(state, record.clone()).await;
+        if let Err(error) =
+            after_durable_persist(|| persisted, || commit_stopped_record(state, record))
+        {
+            failures.push(format!(
+                "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
+            ));
+            continue;
+        }
+        cluster::clear_ownership(state, id).await;
+        state.scheduler.on_local_vm_stopped();
+    }
+    for _ in 0..summary.warm {
         state.scheduler.on_local_vm_stopped();
     }
 
-    let mut stopped_records = Vec::new();
-    for id in &summary.running_ids {
-        match vm_set_status(state, *id, VmStatus::Stopped) {
-            Ok(rec) => stopped_records.push(rec),
-            Err(OrchError::NotFound(_)) => {}
-            Err(e) => tracing::warn!(%id, "shutdown status update failed: {e}"),
-        }
-    }
-    if !stopped_records.is_empty() {
-        if let Ok(store) = state.store.lock() {
-            for rec in &stopped_records {
-                let _ = store.insert_vm(rec);
-            }
-        }
-    }
-    for id in &summary.running_ids {
-        cluster::clear_ownership(state, *id).await;
-    }
-
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(summary),
+    if failures.is_empty() {
+        Ok(summary)
+    } else {
+        Err(OrchError::Internal(failures.join("; ")))
     }
 }
 
@@ -418,4 +482,51 @@ fn ensure_vm_can_receive_live_op(state: &AppState, id: Uuid) -> Result<(), OrchE
         return Err(OrchError::Conflict(format!("vm {id} is stopped")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn stopped_transition_persists_before_releasing_or_clearing_ownership() {
+        let events = RefCell::new(Vec::new());
+
+        let result = after_durable_persist(
+            || {
+                events.borrow_mut().push("persist");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().extend(["clear-ownership", "release"]);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            events.into_inner(),
+            vec!["persist", "clear-ownership", "release"]
+        );
+    }
+
+    #[test]
+    fn stopped_transition_retains_reservations_when_persistence_fails() {
+        let events = RefCell::new(Vec::new());
+
+        let result = after_durable_persist(
+            || {
+                events.borrow_mut().push("persist");
+                Err(OrchError::Internal("simulated store failure".into()))
+            },
+            || {
+                events.borrow_mut().extend(["clear-ownership", "release"]);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(OrchError::Internal(_))));
+        assert_eq!(events.into_inner(), vec!["persist"]);
+    }
 }

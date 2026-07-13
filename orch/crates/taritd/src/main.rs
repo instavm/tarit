@@ -142,10 +142,14 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             while let Some(op) = store_rx.recv().await {
-                if let Ok(s) = store.lock() {
-                    match op {
+                match store.lock() {
+                    Ok(s) => match op {
                         api::StoreWrite::Vm(rec) => {
                             let _ = s.insert_vm(&rec);
+                        }
+                        api::StoreWrite::VmDurable(rec, completion) => {
+                            let result = s.insert_vm(&rec).map_err(api::store_err);
+                            let _ = completion.send(result);
                         }
                         api::StoreWrite::Exec(rec) => {
                             let _ = s.insert_execution(&rec);
@@ -155,6 +159,13 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
                         }
                         api::StoreWrite::Audit(ev) => {
                             let _ = s.enqueue_audit(&ev);
+                        }
+                    },
+                    Err(_) => {
+                        if let api::StoreWrite::VmDurable(_, completion) = op {
+                            let _ = completion.send(Err(tarit_types::OrchError::Internal(
+                                "store lock poisoned during shutdown persistence".into(),
+                            )));
                         }
                     }
                 }

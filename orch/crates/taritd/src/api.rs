@@ -86,6 +86,12 @@ use tarit_types::{audit_action, audit_outcome};
 /// (vm_cache/exec_cache) are the source of truth for reads; SQLite lags them.
 pub enum StoreWrite {
     Vm(VmRecord),
+    /// A lifecycle transition that must reach SQLite before its resource
+    /// reservation or fleet ownership may be released.
+    VmDurable(
+        VmRecord,
+        tokio::sync::oneshot::Sender<Result<(), OrchError>>,
+    ),
     Exec(ExecutionRecord),
     Usage(UsageEvent),
     Audit(AuditEvent),

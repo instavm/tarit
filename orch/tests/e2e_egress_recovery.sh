@@ -20,6 +20,7 @@ ROOTFS="$RUN_DIR/rootfs.ext4"
 SERVER_LOG="$RUN_DIR/taritd.log"
 SERVER_PID=
 SERVER_START_TICKS=
+SERVER_STOP_TIMEOUT_SECONDS=20
 VM_A=
 VM_B=
 VM_C=
@@ -105,6 +106,52 @@ server_listener_is_current() {
       grep -F "pid=$SERVER_PID," >/dev/null
 }
 
+server_exit_confirmed() {
+  local current_ticks state
+  [ -n "$SERVER_PID" ] && [ -n "$SERVER_START_TICKS" ] || return 2
+  [ -e "/proc/$SERVER_PID" ] || return 0
+  [ -r "/proc/$SERVER_PID/stat" ] || return 2
+  current_ticks=$(awk '{print $22}' "/proc/$SERVER_PID/stat") || return 2
+  [ "$current_ticks" != "$SERVER_START_TICKS" ] && return 0
+  state=$(awk '{print $3}' "/proc/$SERVER_PID/stat") || return 2
+  [ "$state" = Z ]
+}
+
+wait_for_server_exit() {
+  local deadline=$((SECONDS + SERVER_STOP_TIMEOUT_SECONDS)) status
+  while ((SECONDS < deadline)); do
+    if server_exit_confirmed; then
+      status=0
+    else
+      status=$?
+    fi
+    [ "$status" -eq 0 ] && return 0
+    [ "$status" -eq 2 ] && return 2
+    sleep 1
+  done
+  if server_exit_confirmed; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 0 ] && return 0
+  [ "$status" -eq 2 ] && return 2
+  return 1
+}
+
+reap_confirmed_server() {
+  local wait_status
+  if wait "$SERVER_PID" 2>/dev/null; then
+    return 0
+  fi
+  wait_status=$?
+  if [ "$wait_status" -eq 127 ]; then
+    echo "WARN: could not reap recorded taritd PID $SERVER_PID" >&2
+    return 1
+  fi
+  return 0
+}
+
 start_taritd() {
   "$TARIT" serve >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
@@ -121,13 +168,70 @@ start_taritd() {
 }
 
 stop_taritd() {
-  [ -n "$SERVER_PID" ] || return
-  if server_pid_is_current; then
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
+  local status cleanup_failed=0
+  [ -n "$SERVER_PID" ] || return 0
+
+  if server_exit_confirmed; then
+    status=0
+  else
+    status=$?
+  fi
+  case "$status" in
+    0) ;;
+    1)
+      if ! server_pid_is_current; then
+        echo "WARN: could not verify recorded taritd PID $SERVER_PID identity before TERM" >&2
+        cleanup_failed=1
+      elif ! kill -TERM -- "$SERVER_PID" 2>/dev/null; then
+        echo "WARN: could not TERM recorded taritd PID $SERVER_PID" >&2
+        cleanup_failed=1
+      fi
+
+      if wait_for_server_exit; then
+        status=0
+      else
+        status=$?
+      fi
+      if [ "$status" -eq 1 ]; then
+        if server_pid_is_current; then
+          if ! kill -KILL -- "$SERVER_PID" 2>/dev/null; then
+            echo "WARN: could not KILL recorded taritd PID $SERVER_PID after TERM deadline" >&2
+            cleanup_failed=1
+          fi
+        else
+          echo "WARN: could not verify recorded taritd PID $SERVER_PID identity before KILL" >&2
+          cleanup_failed=1
+        fi
+        if wait_for_server_exit; then
+          status=0
+        else
+          status=$?
+        fi
+      fi
+      if [ "$status" -ne 0 ]; then
+        if [ "$status" -eq 2 ]; then
+          echo "WARN: could not observe recorded taritd PID $SERVER_PID exit" >&2
+        else
+          echo "WARN: recorded taritd PID $SERVER_PID did not exit after TERM/KILL deadline" >&2
+        fi
+        cleanup_failed=1
+      fi
+      ;;
+    *)
+      echo "WARN: could not observe recorded taritd PID $SERVER_PID before shutdown" >&2
+      cleanup_failed=1
+      ;;
+  esac
+
+  if server_exit_confirmed; then
+    reap_confirmed_server || cleanup_failed=1
+  else
+    echo "WARN: recorded taritd PID $SERVER_PID exit was not confirmed before reap" >&2
+    cleanup_failed=1
   fi
   SERVER_PID=
   SERVER_START_TICKS=
+  return "$cleanup_failed"
 }
 
 delete_vm() {

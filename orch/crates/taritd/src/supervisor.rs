@@ -6,13 +6,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::time::{Duration, Instant};
 use tarit_types::OrchError;
 use tarit_vmm_client::{
-    wait_for_socket, KernelConfig, MemoryConfig, NetConfig, VcpuConfig, VmConfig, VmmClient,
-    VolumeConfig,
+    KernelConfig, MemoryConfig, NetConfig, VcpuConfig, VmConfig, VmmClient, VolumeConfig,
 };
 use uuid::Uuid;
 
@@ -102,10 +101,97 @@ impl ManagedProcess {
         }
     }
 
-    fn kill_wait(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+    fn kill_wait(&self) -> Result<(), OrchError> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| OrchError::Internal("VMM child lock poisoned".into()))?;
+        if child
+            .try_wait()
+            .map_err(|error| OrchError::Internal(format!("check VMM exit: {error}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Err(error) = child.kill() {
+            if child
+                .try_wait()
+                .map_err(|check| OrchError::Internal(format!("check VMM exit: {check}")))?
+                .is_none()
+            {
+                return Err(OrchError::Internal(format!("kill VMM: {error}")));
+            }
+            return Ok(());
+        }
+        child
+            .wait()
+            .map(|_| ())
+            .map_err(|error| OrchError::Internal(format!("wait for VMM exit: {error}")))
+    }
+}
+
+#[derive(Debug)]
+struct BootControl {
+    cancelled: AtomicBool,
+    cancellation: (Mutex<bool>, Condvar),
+    completion: (Mutex<Option<Result<(), String>>>, Condvar),
+}
+
+impl BootControl {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            cancellation: (Mutex::new(false), Condvar::new()),
+            completion: (Mutex::new(None), Condvar::new()),
+        }
+    }
+
+    fn request_cancellation(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(mut cancelled) = self.cancellation.0.lock() {
+            *cancelled = true;
+            self.cancellation.1.notify_all();
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn wait_for_cancellation(&self) {
+        let mut cancelled = self.cancellation.0.lock().unwrap();
+        while !*cancelled {
+            cancelled = self.cancellation.1.wait(cancelled).unwrap();
+        }
+    }
+
+    fn complete(&self, result: Result<(), OrchError>) {
+        let completion = result.map_err(|error| error.to_string());
+        if let Ok(mut completed) = self.completion.0.lock() {
+            if completed.is_none() {
+                *completed = Some(completion);
+                self.completion.1.notify_all();
+            }
+        }
+    }
+
+    fn wait_for_completion(&self) -> Result<(), OrchError> {
+        let mut completed = self
+            .completion
+            .0
+            .lock()
+            .map_err(|_| OrchError::Internal("boot completion lock poisoned".into()))?;
+        while completed.is_none() {
+            completed = self
+                .completion
+                .1
+                .wait(completed)
+                .map_err(|_| OrchError::Internal("boot completion lock poisoned".into()))?;
+        }
+        match completed.as_ref().expect("completion checked") {
+            Ok(()) => Ok(()),
+            Err(error) => Err(OrchError::Internal(error.clone())),
         }
     }
 }
@@ -114,6 +200,7 @@ impl ManagedProcess {
 struct BootingVm {
     socket_path: PathBuf,
     process: ManagedProcess,
+    control: Arc<BootControl>,
 }
 
 /// A pre-booted VM held in the warm pool, ready to be assigned instantly.
@@ -134,6 +221,8 @@ pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
     booting: Mutex<HashMap<Uuid, BootingVm>>,
+    /// Serializes VMM spawn registration with shutdown's boot cancellation sweep.
+    boot_gate: Mutex<()>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
     net: Option<NetProvisioner>,
@@ -143,6 +232,7 @@ pub struct VmmSupervisor {
 #[derive(Debug, Default, Clone)]
 pub struct ShutdownSummary {
     pub running_ids: Vec<Uuid>,
+    pub booting_ids: Vec<Uuid>,
     pub running: usize,
     pub warm: usize,
     pub booting: usize,
@@ -207,8 +297,16 @@ impl ShutdownTransitions {
         }
     }
 
-    fn booting(&mut self) {
-        self.summary.booting += 1;
+    fn booting(&mut self, id: Uuid, result: Result<(), OrchError>) {
+        match result {
+            Ok(()) => {
+                self.summary.booting_ids.push(id);
+                self.summary.booting += 1;
+            }
+            Err(error) => self.failures.push(format!(
+                "booting VM {id} cleanup retained allocation for retry: {error}"
+            )),
+        }
     }
 
     fn record_internal_failure(&mut self, error: OrchError) {
@@ -253,6 +351,7 @@ impl VmmSupervisor {
             config,
             running: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
+            boot_gate: Mutex::new(()),
             warm: Mutex::new(VecDeque::new()),
             net,
             shutting_down: AtomicBool::new(false),
@@ -290,7 +389,7 @@ impl VmmSupervisor {
         args
     }
 
-    fn is_shutting_down(&self) -> bool {
+    pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
@@ -352,7 +451,8 @@ impl VmmSupervisor {
         id: Uuid,
         socket_path: PathBuf,
         process: ManagedProcess,
-    ) -> Result<(), OrchError> {
+    ) -> Result<Arc<BootControl>, OrchError> {
+        let control = Arc::new(BootControl::new());
         let mut booting = self
             .booting
             .lock()
@@ -362,14 +462,274 @@ impl VmmSupervisor {
             BootingVm {
                 socket_path,
                 process,
+                control: Arc::clone(&control),
             },
         );
+        Ok(control)
+    }
+
+    fn complete_booting(
+        &self,
+        id: Uuid,
+        control: &Arc<BootControl>,
+        result: Result<(), OrchError>,
+    ) {
+        if result.is_ok() {
+            if let Ok(mut booting) = self.booting.lock() {
+                if booting
+                    .get(&id)
+                    .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, control))
+                {
+                    booting.remove(&id);
+                }
+            }
+        }
+        control.complete(result);
+    }
+
+    fn cleanup_boot_failure(
+        &self,
+        id: Uuid,
+        control: &Arc<BootControl>,
+        vm: &RunningVm,
+        cause: OrchError,
+    ) -> OrchError {
+        let mut cleanup_failures = self
+            .teardown_vm(id, vm)
+            .err()
+            .map(|error| vec![error.to_string()])
+            .unwrap_or_default();
+        if vm.net.is_none() {
+            if let Some(net) = &self.net {
+                if let Err(error) = net.teardown_vm_id(id) {
+                    cleanup_failures.push(format!(
+                        "teardown partially provisioned network allocation: {error}"
+                    ));
+                }
+            }
+        }
+        if cleanup_failures.is_empty() {
+            self.complete_booting(id, control, Ok(()));
+            cause
+        } else {
+            let cleanup = cleanup_failures.join("; ");
+            let error = OrchError::Internal(format!(
+                "{cause}; shutdown cleanup retained booting VM {id} for retry: {cleanup}"
+            ));
+            self.complete_booting(
+                id,
+                control,
+                Err(OrchError::Internal(format!(
+                    "boot cleanup retained resources for retry: {cleanup}"
+                ))),
+            );
+            error
+        }
+    }
+
+    fn publish_running(
+        &self,
+        id: Uuid,
+        vm: RunningVm,
+        control: Arc<BootControl>,
+    ) -> Result<(u32, PathBuf), OrchError> {
+        let pid = vm.pid;
+        let socket_path = vm.socket_path.clone();
+        let mut running = match self.running.lock() {
+            Ok(running) => running,
+            Err(_) => {
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &control,
+                    &vm,
+                    OrchError::Internal("supervisor lock poisoned".into()),
+                ))
+            }
+        };
+        let mut booting = match self.booting.lock() {
+            Ok(booting) => booting,
+            Err(_) => {
+                drop(running);
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &control,
+                    &vm,
+                    OrchError::Internal("supervisor booting lock poisoned".into()),
+                ));
+            }
+        };
+        if !boot_can_publish(&control, self.is_shutting_down())
+            || !booting
+                .get(&id)
+                .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &control))
+        {
+            drop(booting);
+            drop(running);
+            return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
+        }
+        booting.remove(&id);
+        running.insert(id, vm);
+        control.complete(Ok(()));
+        Ok((pid, socket_path))
+    }
+
+    fn publish_warm(
+        &self,
+        id: Uuid,
+        vm: RunningVm,
+        spec: VmSpawnConfig,
+        control: Arc<BootControl>,
+    ) -> Result<(), OrchError> {
+        let mut warm = match self.warm.lock() {
+            Ok(warm) => warm,
+            Err(_) => {
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &control,
+                    &vm,
+                    OrchError::Internal("warm lock poisoned".into()),
+                ))
+            }
+        };
+        let mut booting = match self.booting.lock() {
+            Ok(booting) => booting,
+            Err(_) => {
+                drop(warm);
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &control,
+                    &vm,
+                    OrchError::Internal("supervisor booting lock poisoned".into()),
+                ));
+            }
+        };
+        if !boot_can_publish(&control, self.is_shutting_down())
+            || !booting
+                .get(&id)
+                .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &control))
+        {
+            drop(booting);
+            drop(warm);
+            return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
+        }
+        booting.remove(&id);
+        warm.push_back(WarmVm { id, vm, spec });
+        control.complete(Ok(()));
         Ok(())
     }
 
-    fn untrack_booting(&self, id: Uuid) {
-        if let Ok(mut booting) = self.booting.lock() {
-            booting.remove(&id);
+    fn finish_booted_vm(
+        &self,
+        id: Uuid,
+        control: Arc<BootControl>,
+        vm: &RunningVm,
+    ) -> Result<(), OrchError> {
+        match self.teardown_vm(id, vm) {
+            Ok(()) => {
+                self.complete_booting(id, &control, Ok(()));
+                Ok(())
+            }
+            Err(error) => {
+                self.complete_booting(
+                    id,
+                    &control,
+                    Err(OrchError::Internal(format!(
+                        "boot cleanup retained resources for retry: {error}"
+                    ))),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn wait_for_socket_or_cancellation(
+        &self,
+        socket_path: &Path,
+        control: &BootControl,
+    ) -> Result<(), OrchError> {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(30) {
+            if control.is_cancelled() || self.is_shutting_down() {
+                return Err(self.shutdown_error());
+            }
+            if socket_path.exists() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(OrchError::Vmm(format!(
+            "wait for socket: timed out waiting for {}",
+            socket_path.display()
+        )))
+    }
+
+    fn signal_booting_tasks(&self) -> Result<Vec<(Uuid, BootingVm)>, OrchError> {
+        let booting = self
+            .booting
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?
+            .iter()
+            .map(|(id, booting_vm)| (*id, booting_vm.clone()))
+            .collect::<Vec<_>>();
+        for (_, booting_vm) in &booting {
+            booting_vm.control.request_cancellation();
+        }
+        Ok(booting)
+    }
+
+    fn complete_cancelled_booting_tasks(
+        &self,
+        booting: Vec<(Uuid, BootingVm)>,
+    ) -> Vec<(Uuid, Result<(), OrchError>)> {
+        let outcomes = wait_for_booting_tasks(
+            booting
+                .iter()
+                .map(|(_, booting_vm)| Arc::clone(&booting_vm.control)),
+        );
+        booting
+            .into_iter()
+            .zip(outcomes)
+            .map(|((id, booting_vm), outcome)| {
+                let outcome = match outcome {
+                    Ok(()) => Ok(()),
+                    Err(completion_error) => {
+                        self.retry_booting_cleanup(id, &booting_vm)
+                            .map_err(|retry_error| {
+                                OrchError::Internal(format!(
+                                "{completion_error}; retrying boot cleanup failed: {retry_error}"
+                            ))
+                            })
+                    }
+                };
+                if outcome.is_ok() {
+                    self.complete_booting(id, &booting_vm.control, Ok(()));
+                }
+                (id, outcome)
+            })
+            .collect()
+    }
+
+    fn retry_booting_cleanup(&self, id: Uuid, booting_vm: &BootingVm) -> Result<(), OrchError> {
+        let vm = RunningVm {
+            pid: booting_vm.process.pid,
+            socket_path: booting_vm.socket_path.clone(),
+            process: booting_vm.process.clone(),
+            net: None,
+        };
+        let mut failures = self
+            .teardown_vm(id, &vm)
+            .err()
+            .map(|error| vec![error.to_string()])
+            .unwrap_or_default();
+        if let Some(net) = &self.net {
+            if let Err(error) = net.teardown_vm_id(id) {
+                failures.push(format!("teardown retained network allocation: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(OrchError::Internal(failures.join("; ")))
         }
     }
 
@@ -381,12 +741,19 @@ impl VmmSupervisor {
         id: Uuid,
         vm_config: &VmSpawnConfig,
         purpose: SpawnPurpose,
-    ) -> Result<RunningVm, OrchError> {
+    ) -> Result<(RunningVm, Arc<BootControl>), OrchError> {
         self.ensure_accepting_work()?;
         let socket_path = self.socket_path_for(id);
         let _ = std::fs::remove_file(&socket_path);
 
         let cgroup_args = self.cgroup_args(id, Some(vm_config.memory_mib));
+        let boot_gate = self
+            .boot_gate
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor boot gate lock poisoned".into()))?;
+        if self.is_shutting_down() {
+            return Err(self.shutdown_error());
+        }
         let child = Command::new(&self.config.vmm_bin)
             .arg("serve")
             .arg("--socket")
@@ -403,18 +770,31 @@ impl VmmSupervisor {
         if purpose == SpawnPurpose::Refill {
             self.move_pid_to_refill_cgroup(pid);
         }
-        self.track_booting(id, socket_path.clone(), process.clone())?;
+        let base_vm = RunningVm {
+            pid,
+            socket_path: socket_path.clone(),
+            process: process.clone(),
+            net: None,
+        };
+        let control = match self.track_booting(id, socket_path.clone(), process.clone()) {
+            Ok(control) => control,
+            Err(error) => {
+                drop(boot_gate);
+                return Err(match self.teardown_vm(id, &base_vm) {
+                    Ok(()) => error,
+                    Err(cleanup) => OrchError::Internal(format!(
+                        "{error}; boot registration cleanup retained resources for retry: {cleanup}"
+                    )),
+                });
+            }
+        };
+        drop(boot_gate);
 
-        if let Err(e) = wait_for_socket(&socket_path, Duration::from_secs(30)) {
-            self.untrack_booting(id);
-            process.kill_wait();
-            return Err(OrchError::Vmm(format!("wait for socket: {e}")));
+        if let Err(error) = self.wait_for_socket_or_cancellation(&socket_path, &control) {
+            return Err(self.cleanup_boot_failure(id, &control, &base_vm, error));
         }
-        if self.is_shutting_down() {
-            self.untrack_booting(id);
-            process.kill_wait();
-            let _ = std::fs::remove_file(&socket_path);
-            return Err(self.shutdown_error());
+        if !boot_can_publish(&control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(id, &control, &base_vm, self.shutdown_error()));
         }
 
         // Provision per-VM host networking (tap + /30 + NAT) if enabled. The
@@ -422,70 +802,41 @@ impl VmmSupervisor {
         let net_alloc = match &self.net {
             Some(p) => match p.provision(id) {
                 Ok(a) => Some(a),
-                Err(e @ OrchError::Overloaded { .. }) => {
-                    self.untrack_booting(id);
-                    process.kill_wait();
-                    let _ = std::fs::remove_file(&socket_path);
-                    return Err(e);
-                }
-                Err(e) => {
-                    self.untrack_booting(id);
-                    process.kill_wait();
-                    let _ = std::fs::remove_file(&socket_path);
-                    return Err(OrchError::Internal(format!("net provision: {e}")));
+                Err(error) => {
+                    let cause = match error {
+                        error @ OrchError::Overloaded { .. } => error,
+                        error => OrchError::Internal(format!("net provision: {error}")),
+                    };
+                    return Err(self.cleanup_boot_failure(id, &control, &base_vm, cause));
                 }
             },
             None => None,
         };
-        if self.is_shutting_down() {
-            self.untrack_booting(id);
-            process.kill_wait();
-            let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
-            if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
-                p.teardown(a).map_err(|cleanup| {
-                    OrchError::Internal(format!(
-                        "shutdown cancelled VM {id}, but network teardown retained its allocation for retry: {cleanup}"
-                    ))
-                })?;
-            }
-            return Err(self.shutdown_error());
-        }
-
-        let vmm_config = build_vmm_config(id, vm_config, net_alloc.as_ref());
-        let client = VmmClient::new(&socket_path);
-        if let Err(e) = client.create(vmm_config) {
-            self.untrack_booting(id);
-            process.kill_wait();
-            let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
-            if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
-                if let Err(cleanup) = p.teardown(a) {
-                    return Err(OrchError::Internal(format!(
-                        "create vm: {e}; network teardown retained its allocation for retry: {cleanup}"
-                    )));
-                }
-            }
-            return Err(OrchError::Vmm(format!("create vm: {e}")));
-        }
-        self.untrack_booting(id);
-        if self.is_shutting_down() {
-            let vm = RunningVm {
-                pid,
-                socket_path,
-                process,
-                net: net_alloc,
-            };
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-
-        Ok(RunningVm {
+        let vm = RunningVm {
             pid,
             socket_path,
             process,
             net: net_alloc,
-        })
+        };
+        if !boot_can_publish(&control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
+        }
+
+        let vmm_config = build_vmm_config(id, vm_config, vm.net.as_ref());
+        let client = VmmClient::new(&vm.socket_path);
+        if let Err(e) = client.create(vmm_config) {
+            return Err(self.cleanup_boot_failure(
+                id,
+                &control,
+                &vm,
+                OrchError::Vmm(format!("create vm: {e}")),
+            ));
+        }
+        if !boot_can_publish(&control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
+        }
+
+        Ok((vm, control))
     }
 
     pub fn spawn_vm(
@@ -493,24 +844,8 @@ impl VmmSupervisor {
         id: Uuid,
         vm_config: VmSpawnConfig,
     ) -> Result<(u32, PathBuf), OrchError> {
-        let vm = self.boot_vm(id, &vm_config, SpawnPurpose::Live)?;
-        let pid = vm.pid;
-        let socket_path = vm.socket_path.clone();
-        if self.is_shutting_down() {
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        let mut guard = self
-            .running
-            .lock()
-            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
-        if self.is_shutting_down() {
-            drop(guard);
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        guard.insert(id, vm);
-        Ok((pid, socket_path))
+        let (vm, control) = self.boot_vm(id, &vm_config, SpawnPurpose::Live)?;
+        self.publish_running(id, vm, control)
     }
 
     /// Restore a VM from a node-local snapshot file: spawn a fresh `vmm serve`,
@@ -518,24 +853,8 @@ impl VmmSupervisor {
     /// guest's device/net config, so we do not re-provision host networking
     /// here (restore is used for the fast warm/resume path).
     pub fn restore_vm(&self, id: Uuid, snapshot_path: &str) -> Result<(u32, PathBuf), OrchError> {
-        let vm = self.spawn_and_restore(id, snapshot_path, None, SpawnPurpose::Live)?;
-        let pid = vm.pid;
-        let socket_path = vm.socket_path.clone();
-        if self.is_shutting_down() {
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        let mut guard = self
-            .running
-            .lock()
-            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
-        if self.is_shutting_down() {
-            drop(guard);
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        guard.insert(id, vm);
-        Ok((pid, socket_path))
+        let (vm, control) = self.spawn_and_restore(id, snapshot_path, None, SpawnPurpose::Live)?;
+        self.publish_running(id, vm, control)
     }
 
     fn spawn_and_restore(
@@ -544,12 +863,19 @@ impl VmmSupervisor {
         snapshot_path: &str,
         overlay: Option<String>,
         purpose: SpawnPurpose,
-    ) -> Result<RunningVm, OrchError> {
+    ) -> Result<(RunningVm, Arc<BootControl>), OrchError> {
         self.ensure_accepting_work()?;
         let socket_path = self.socket_path_for(id);
         let _ = std::fs::remove_file(&socket_path);
 
         let cgroup_args = self.cgroup_args(id, None);
+        let boot_gate = self
+            .boot_gate
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor boot gate lock poisoned".into()))?;
+        if self.is_shutting_down() {
+            return Err(self.shutdown_error());
+        }
         let child = Command::new(&self.config.vmm_bin)
             .arg("serve")
             .arg("--socket")
@@ -565,52 +891,46 @@ impl VmmSupervisor {
         if purpose == SpawnPurpose::Refill {
             self.move_pid_to_refill_cgroup(pid);
         }
-        self.track_booting(id, socket_path.clone(), process.clone())?;
-
-        if let Err(e) = wait_for_socket(&socket_path, Duration::from_secs(30)) {
-            self.untrack_booting(id);
-            process.kill_wait();
-            return Err(OrchError::Vmm(format!("wait for socket: {e}")));
-        }
-        if self.is_shutting_down() {
-            self.untrack_booting(id);
-            process.kill_wait();
-            let _ = std::fs::remove_file(&socket_path);
-            if let Some(overlay) = overlay {
-                let _ = std::fs::remove_file(overlay);
-            }
-            return Err(self.shutdown_error());
-        }
-
-        let client = VmmClient::new(&socket_path);
-        if let Err(e) = client.restore(snapshot_path, overlay.clone()) {
-            self.untrack_booting(id);
-            process.kill_wait();
-            let _ = std::fs::remove_file(&socket_path);
-            if let Some(overlay) = overlay {
-                let _ = std::fs::remove_file(overlay);
-            }
-            return Err(OrchError::Vmm(format!("restore vm: {e}")));
-        }
-        self.untrack_booting(id);
-        if self.is_shutting_down() {
-            let vm = RunningVm {
-                pid,
-                socket_path: socket_path.clone(),
-                process,
-                net: None,
-            };
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-
         let vm = RunningVm {
             pid,
             socket_path: socket_path.clone(),
             process,
             net: None,
         };
-        Ok(vm)
+        let control = match self.track_booting(id, socket_path.clone(), vm.process.clone()) {
+            Ok(control) => control,
+            Err(error) => {
+                drop(boot_gate);
+                return Err(match self.teardown_vm(id, &vm) {
+                    Ok(()) => error,
+                    Err(cleanup) => OrchError::Internal(format!(
+                        "{error}; boot registration cleanup retained resources for retry: {cleanup}"
+                    )),
+                });
+            }
+        };
+        drop(boot_gate);
+
+        if let Err(error) = self.wait_for_socket_or_cancellation(&socket_path, &control) {
+            return Err(self.cleanup_boot_failure(id, &control, &vm, error));
+        }
+        if !boot_can_publish(&control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
+        }
+
+        let client = VmmClient::new(&socket_path);
+        if let Err(e) = client.restore(snapshot_path, overlay.clone()) {
+            return Err(self.cleanup_boot_failure(
+                id,
+                &control,
+                &vm,
+                OrchError::Vmm(format!("restore vm: {e}")),
+            ));
+        }
+        if !boot_can_publish(&control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
+        }
+        Ok((vm, control))
     }
 
     /// Boot one warm-pool VM of `class` and park it in the warm queue. The boot
@@ -638,26 +958,9 @@ impl VmmSupervisor {
     pub fn spawn_warm(&self, class: &WarmClass) -> Result<(), OrchError> {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
-        let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
+        let (vm, control) = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
         self.await_ready(&vm.socket_path);
-        if self.is_shutting_down() {
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        let mut warm = match self.warm.lock() {
-            Ok(warm) => warm,
-            Err(_) => {
-                self.teardown_vm(id, &vm)?;
-                return Err(OrchError::Internal("warm lock poisoned".into()));
-            }
-        };
-        if self.is_shutting_down() {
-            drop(warm);
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        warm.push_back(WarmVm { id, vm, spec });
-        Ok(())
+        self.publish_warm(id, vm, spec, control)
     }
 
     /// Cold-boot one VM for `class`, wait until it is ready, take a full golden
@@ -666,22 +969,25 @@ impl VmmSupervisor {
     pub fn create_golden(&self, class: &WarmClass) -> Result<String, OrchError> {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
-        let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
+        let (vm, control) = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
         self.await_ready(&vm.socket_path);
-        if self.is_shutting_down() {
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
+        if !boot_can_publish(&control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
         }
         let client = VmmClient::new(&vm.socket_path);
         let snapshot_path = match client.snapshot(false) {
             Ok(path) => path,
             Err(e) => {
-                self.teardown_vm(id, &vm)?;
-                return Err(OrchError::Vmm(format!("snapshot golden: {e}")));
+                return Err(self.cleanup_boot_failure(
+                    id,
+                    &control,
+                    &vm,
+                    OrchError::Vmm(format!("snapshot golden: {e}")),
+                ));
             }
         };
 
-        self.teardown_vm(id, &vm)?;
+        self.finish_booted_vm(id, control, &vm)?;
         Ok(snapshot_path)
     }
 
@@ -694,26 +1000,10 @@ impl VmmSupervisor {
         let id = Uuid::new_v4();
         let spec = VmSpawnConfig::from_warm_class(&self.config, class);
         let overlay = overlay_path_for_config(id, &spec);
-        let vm = self.spawn_and_restore(id, snapshot_path, overlay, SpawnPurpose::Refill)?;
+        let (vm, control) =
+            self.spawn_and_restore(id, snapshot_path, overlay, SpawnPurpose::Refill)?;
         self.await_ready(&vm.socket_path);
-        if self.is_shutting_down() {
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        let mut warm = match self.warm.lock() {
-            Ok(warm) => warm,
-            Err(_) => {
-                self.teardown_vm(id, &vm)?;
-                return Err(OrchError::Internal("warm lock poisoned".into()));
-            }
-        };
-        if self.is_shutting_down() {
-            drop(warm);
-            self.teardown_vm(id, &vm)?;
-            return Err(self.shutdown_error());
-        }
-        warm.push_back(WarmVm { id, vm, spec });
-        Ok(())
+        self.publish_warm(id, vm, spec, control)
     }
 
     /// Try to hand out a warm VM whose spec matches `want`, moving it into the
@@ -914,7 +1204,15 @@ impl VmmSupervisor {
 
     pub(crate) fn stop_all(&self) -> Result<ShutdownSummary, ShutdownFailure> {
         self.shutting_down.store(true, Ordering::SeqCst);
-        let (running, warm, booting) = {
+        let booting = {
+            let _gate = self
+                .boot_gate
+                .lock()
+                .map_err(|_| OrchError::Internal("supervisor boot gate lock poisoned".into()))?;
+            self.signal_booting_tasks().map_err(ShutdownFailure::from)?
+        };
+        let booting = self.complete_cancelled_booting_tasks(booting);
+        let (running, warm) = {
             let mut running = self
                 .running
                 .lock()
@@ -923,17 +1221,11 @@ impl VmmSupervisor {
                 .warm
                 .lock()
                 .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
-            let mut booting = self
-                .booting
-                .lock()
-                .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?;
             (
                 running.drain().collect::<Vec<_>>(),
                 warm.drain(..).collect::<Vec<_>>(),
-                booting.drain().collect::<Vec<_>>(),
             )
         };
-
         let mut transitions = ShutdownTransitions::default();
         let mut retained_running = Vec::new();
         for (id, vm) in running {
@@ -951,11 +1243,8 @@ impl VmmSupervisor {
                 retained_warm.push(warm_vm);
             }
         }
-        for (id, vm) in booting {
-            vm.process.kill_wait();
-            let _ = std::fs::remove_file(&vm.socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
-            transitions.booting();
+        for (id, result) in booting {
+            transitions.booting(id, result);
         }
 
         if !retained_running.is_empty() {
@@ -978,13 +1267,47 @@ impl VmmSupervisor {
     }
 
     fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
-        vm.process.kill_wait();
-        let _ = std::fs::remove_file(&vm.socket_path);
-        let _ = std::fs::remove_file(overlay_path_for(id));
-        if let (Some(p), Some(a)) = (&self.net, &vm.net) {
-            p.teardown(a)?;
+        let mut failures = Vec::new();
+        if let Err(error) = vm.process.kill_wait() {
+            failures.push(error.to_string());
         }
-        Ok(())
+        if let Err(error) = remove_file_if_present(&vm.socket_path) {
+            failures.push(format!("remove VMM socket: {error}"));
+        }
+        if let Err(error) = remove_file_if_present(Path::new(&overlay_path_for(id))) {
+            failures.push(format!("remove VMM overlay: {error}"));
+        }
+        if let (Some(p), Some(a)) = (&self.net, &vm.net) {
+            if let Err(error) = p.teardown(a) {
+                failures.push(format!("teardown network allocation: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(OrchError::Internal(failures.join("; ")))
+        }
+    }
+}
+
+fn wait_for_booting_tasks(
+    controls: impl IntoIterator<Item = Arc<BootControl>>,
+) -> Vec<Result<(), OrchError>> {
+    controls
+        .into_iter()
+        .map(|control| control.wait_for_completion())
+        .collect()
+}
+
+fn boot_can_publish(control: &BootControl, shutting_down: bool) -> bool {
+    !shutting_down && !control.is_cancelled()
+}
+
+fn remove_file_if_present(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1170,6 +1493,9 @@ fn overlay_path_for_config(id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, WarmPoolConfig};
+    use std::sync::mpsc;
+    use std::thread;
 
     fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
         VmSpawnConfig {
@@ -1180,6 +1506,49 @@ mod tests {
             cmdline: DEFAULT_CMDLINE.to_string(),
             read_only,
         }
+    }
+
+    fn test_supervisor() -> Arc<VmmSupervisor> {
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
+                "test-key".into(),
+                "test".into(),
+                ApiRole::Admin,
+                0,
+            )])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: PathBuf::from("true"),
+            kernel: PathBuf::from("kernel"),
+            rootfs: PathBuf::from("rootfs"),
+            socket_dir: PathBuf::from("target/taritd-supervisor-test/sockets"),
+            db_path: PathBuf::from("target/taritd-supervisor-test/fleet.db"),
+            net_state_path: PathBuf::from("target/taritd-supervisor-test/net-state.json"),
+            images_dir: PathBuf::from("target/taritd-supervisor-test/images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: None,
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: PathBuf::from("target/taritd-supervisor-test/ssh_host"),
+        };
+        Arc::new(VmmSupervisor::new(config))
     }
 
     #[test]
@@ -1231,7 +1600,7 @@ mod tests {
             ))
         ));
         assert!(transitions.warm(Uuid::new_v4(), Ok(())));
-        transitions.booting();
+        transitions.booting(Uuid::new_v4(), Ok(()));
 
         let failure = transitions
             .finish()
@@ -1241,6 +1610,50 @@ mod tests {
         assert_eq!(failure.summary.warm, 1);
         assert_eq!(failure.summary.booting, 1);
         assert!(failure.error.to_string().contains(&retained_id.to_string()));
+    }
+
+    #[test]
+    fn stop_all_waits_for_cancelled_provisioning_cleanup_before_transitioning_booting_vm() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        let control = supervisor
+            .track_booting(id, PathBuf::from("booting.sock"), process.clone())
+            .unwrap();
+        let task_control = Arc::clone(&control);
+        let (cleanup_started_tx, cleanup_started_rx) = mpsc::channel();
+        let (allow_cleanup_tx, allow_cleanup_rx) = mpsc::channel();
+        let task = thread::spawn(move || {
+            task_control.wait_for_cancellation();
+            cleanup_started_tx.send(()).unwrap();
+            allow_cleanup_rx.recv().unwrap();
+            process.kill_wait().unwrap();
+            task_control.complete(Ok(()));
+        });
+
+        let (stop_done_tx, stop_done_rx) = mpsc::channel();
+        let stop_supervisor = Arc::clone(&supervisor);
+        let stopper = thread::spawn(move || {
+            stop_done_tx.send(stop_supervisor.stop_all()).unwrap();
+        });
+
+        cleanup_started_rx.recv().unwrap();
+        assert!(stop_done_rx.try_recv().is_err());
+
+        allow_cleanup_tx.send(()).unwrap();
+        let summary = stop_done_rx.recv().unwrap().unwrap();
+        assert_eq!(summary.booting_ids, vec![id]);
+        assert_eq!(summary.booting, 1);
+        stopper.join().unwrap();
+        task.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_boot_cannot_publish_running_state() {
+        let control = BootControl::new();
+        control.request_cancellation();
+
+        assert!(!boot_can_publish(&control, false));
     }
 
     #[cfg(target_os = "linux")]
