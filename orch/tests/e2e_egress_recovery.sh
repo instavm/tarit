@@ -5,7 +5,8 @@ set -euo pipefail
 ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-RUN_ROOT="${EGRESS_RECOVERY_RUN_ROOT:-/run/taritd-egress-recovery}"
+TRUSTED_RUN_BASE=/run/taritd
+RUN_ROOT="${EGRESS_RECOVERY_RUN_ROOT:-$TRUSTED_RUN_BASE/egress-recovery}"
 LOCK_FILE=/run/lock/taritd-egress-recovery.lock
 RUN_DIR=
 RUN_DIR_CREATED=0
@@ -36,23 +37,97 @@ fail() {
 }
 
 assert_vmm_socket_path_fits() {
-  local run_dir=$1 socket_path
+  local run_dir=$1 socket_path socket_path_bytes
   socket_path="$run_dir/sockets/$MAX_VMM_ID.sock"
-  [ "${#socket_path}" -lt "$LINUX_UNIX_SOCKET_PATH_LIMIT" ] ||
-    fail "VMM socket path exceeds Linux sun_path limit (${#socket_path} >= $LINUX_UNIX_SOCKET_PATH_LIMIT): $socket_path"
+  socket_path_bytes=$(LC_ALL=C printf '%s' "$socket_path" | LC_ALL=C wc -c) ||
+    fail "could not measure VMM socket path length"
+  [ "$socket_path_bytes" -lt "$LINUX_UNIX_SOCKET_PATH_LIMIT" ] ||
+    fail "VMM socket path exceeds Linux sun_path limit (${socket_path_bytes} >= $LINUX_UNIX_SOCKET_PATH_LIMIT): $socket_path"
+}
+
+run_root_path_is_valid() {
+  local path=$1
+  case "$path" in
+    "$TRUSTED_RUN_BASE"/*)
+      case "$path" in
+        */ | *'//'* | *'/./'* | *'/../'* | */. | */..) return 1 ;;
+      esac
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+trusted_directory() {
+  local path=$1 file_type owner mode
+  [ -d "$path" ] && [ ! -L "$path" ] || return 1
+  IFS=: read -r file_type owner mode < <(stat -c '%F:%u:%a' -- "$path") || return 1
+  [ "$file_type" = directory ] &&
+    [ "$owner" = 0 ] &&
+    (( (8#$mode & 8#022) == 0 ))
+}
+
+run_root_ancestry_is_trusted() {
+  local run_root=$1 relative_path current part
+  local -a components
+
+  run_root_path_is_valid "$run_root" || return 1
+  trusted_directory / &&
+    trusted_directory /run &&
+    trusted_directory "$TRUSTED_RUN_BASE" || return 1
+
+  relative_path=${run_root#"$TRUSTED_RUN_BASE"/}
+  IFS=/ read -r -a components <<<"$relative_path"
+  current=$TRUSTED_RUN_BASE
+  for ((part = 0; part < ${#components[@]} - 1; part++)); do
+    current+="/${components[$part]}"
+    trusted_directory "$current" || return 1
+  done
+}
+
+validate_run_root_path() {
+  run_root_path_is_valid "$1" ||
+    fail "run root must be a normalized child of $TRUSTED_RUN_BASE: $1"
+}
+
+validate_run_root_ancestry() {
+  run_root_ancestry_is_trusted "$1" ||
+    fail "run root has untrusted ancestry: $1"
+}
+
+prepare_run_root() {
+  validate_run_root_path "$RUN_ROOT"
+  validate_run_root_ancestry "$RUN_ROOT"
+  if [ -e "$RUN_ROOT" ] || [ -L "$RUN_ROOT" ]; then
+    trusted_directory "$RUN_ROOT" ||
+      fail "run root is not a root-owned non-writable directory: $RUN_ROOT"
+  else
+    mkdir -m 0700 -- "$RUN_ROOT" || fail "could not create run root $RUN_ROOT"
+    trusted_directory "$RUN_ROOT" ||
+      fail "created run root is not a root-owned non-writable directory: $RUN_ROOT"
+  fi
 }
 
 run_dir_is_owned() {
   [ "$RUN_DIR_CREATED" -eq 1 ] &&
+    run_root_ancestry_is_trusted "$RUN_ROOT" &&
+    trusted_directory "$RUN_ROOT" &&
     [ -d "$RUN_DIR" ] &&
     [ ! -L "$RUN_DIR" ] &&
     [ "$(stat -c '%u:%a' "$RUN_DIR")" = "0:700" ]
 }
 
-if [ "${1:-}" = --check-socket-path ]; then
-  assert_vmm_socket_path_fits "$RUN_ROOT/run-2147483647-4194304-32767"
-  exit 0
-fi
+case "${1:-}" in
+  --check-socket-path)
+    assert_vmm_socket_path_fits "$RUN_ROOT/run-2147483647-4194304-32767"
+    exit 0
+    ;;
+  --check-run-root)
+    [ "$#" -eq 2 ] || fail "usage: $0 --check-run-root PATH"
+    validate_run_root_path "$2"
+    exit 0
+    ;;
+esac
 
 [ "$(id -u)" -eq 0 ] || { echo "FAIL: run as root"; exit 1; }
 [ "$(uname -s)" = Linux ] || { echo "FAIL: run on Linux"; exit 1; }
@@ -61,7 +136,7 @@ fi
 : "${EGRESS_TEST_IP:?set EGRESS_TEST_IP to a reachable external IPv4 TCP endpoint}"
 : "${EGRESS_TEST_PORT:?set EGRESS_TEST_PORT to its reachable TCP port}"
 
-for command in curl flock ip nft python3 readlink ss stat sysctl timeout; do
+for command in curl flock ip nft python3 readlink ss stat sysctl timeout wc; do
   command -v "$command" >/dev/null || fail "required host command is missing: $command"
 done
 [ -x "$TARIT" ] || fail "taritd binary is not executable: $TARIT"
@@ -86,12 +161,7 @@ IPV6_FORWARDING=$(sysctl -n net.ipv6.conf.all.forwarding) ||
 umask 077
 RUN_DIR="$RUN_ROOT/run-$(date +%s)-$$-$RANDOM"
 assert_vmm_socket_path_fits "$RUN_DIR"
-mkdir -p "$RUN_ROOT" || fail "could not create run root $RUN_ROOT"
-chown root:root "$RUN_ROOT" || fail "could not make run root root-owned: $RUN_ROOT"
-chmod 0700 "$RUN_ROOT" || fail "could not restrict run root permissions: $RUN_ROOT"
-[ ! -L "$RUN_ROOT" ] &&
-  [ "$(stat -c '%F:%u:%a' "$RUN_ROOT")" = "directory:0:700" ] ||
-  fail "run root is not a root-owned mode 0700 directory: $RUN_ROOT"
+prepare_run_root
 mkdir -p /run/lock
 touch "$LOCK_FILE"
 chown root:root "$LOCK_FILE"
