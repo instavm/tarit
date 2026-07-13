@@ -42,6 +42,31 @@ for run_root in /run /etc /run/taritd/../outside /run/taritd//double-slash; do
   fi
 done
 
+for run_root in \
+  $'/run/taritd/newline\nsuffix' \
+  $'/run/taritd/tab\tsuffix' \
+  $'/run/taritd/delete\177suffix'; do
+  if output=$("$HARNESS" --check-run-root "$run_root" 2>&1); then
+    echo "FAIL: control-character egress recovery run root was accepted" >&2
+    exit 1
+  fi
+  if ! grep -F "run root must not contain control characters" <<<"$output" >/dev/null; then
+    echo "FAIL: control-character run root was not rejected explicitly" >&2
+    exit 1
+  fi
+done
+
+if ! grep -F 'bootstrap_trusted_run_base()' "$HARNESS" >/dev/null ||
+  ! grep -F 'trusted_directory /run ||' "$HARNESS" >/dev/null ||
+  ! grep -F 'mkdir -m 0700 -- "$TRUSTED_RUN_BASE"' "$HARNESS" >/dev/null ||
+  ! grep -F 'chown root:root -- "$TRUSTED_RUN_BASE"' "$HARNESS" >/dev/null ||
+  ! grep -F 'chmod 0700 -- "$TRUSTED_RUN_BASE"' "$HARNESS" >/dev/null ||
+  ! grep -F 'private_root_directory "$TRUSTED_RUN_BASE"' "$HARNESS" >/dev/null ||
+  grep -E 'mkdir -p .*TRUSTED_RUN_BASE' "$HARNESS" >/dev/null; then
+  echo "FAIL: trusted /run/taritd base is not safely bootstrapped" >&2
+  exit 1
+fi
+
 if grep -E 'mkdir -p .*RUN_ROOT|chown .*RUN_ROOT|chmod .*RUN_ROOT' "$HARNESS" >/dev/null; then
   echo "FAIL: run root is mutated before its trust can be established" >&2
   exit 1

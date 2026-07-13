@@ -58,6 +58,10 @@ run_root_path_is_valid() {
   return 1
 }
 
+run_root_path_has_control_characters() {
+  [[ $1 == *[[:cntrl:]]* ]]
+}
+
 trusted_directory() {
   local path=$1 file_type owner mode
   [ -d "$path" ] && [ ! -L "$path" ] || return 1
@@ -67,6 +71,31 @@ trusted_directory() {
     (( (8#$mode & 8#022) == 0 ))
 }
 
+private_root_directory() {
+  trusted_directory "$1" &&
+    [ "$(stat -c '%u:%a' -- "$1")" = "0:700" ]
+}
+
+bootstrap_trusted_run_base() {
+  trusted_directory /run ||
+    fail "/run is not a root-owned non-writable directory"
+
+  if [ -e "$TRUSTED_RUN_BASE" ] || [ -L "$TRUSTED_RUN_BASE" ]; then
+    trusted_directory "$TRUSTED_RUN_BASE" ||
+      fail "trusted run base is not a root-owned non-writable directory: $TRUSTED_RUN_BASE"
+  else
+    mkdir -m 0700 -- "$TRUSTED_RUN_BASE" ||
+      fail "could not create trusted run base $TRUSTED_RUN_BASE"
+  fi
+
+  chown root:root -- "$TRUSTED_RUN_BASE" ||
+    fail "could not make trusted run base root-owned: $TRUSTED_RUN_BASE"
+  chmod 0700 -- "$TRUSTED_RUN_BASE" ||
+    fail "could not restrict trusted run base permissions: $TRUSTED_RUN_BASE"
+  private_root_directory "$TRUSTED_RUN_BASE" ||
+    fail "trusted run base is not a root-owned mode 0700 directory: $TRUSTED_RUN_BASE"
+}
+
 run_root_ancestry_is_trusted() {
   local run_root=$1 relative_path current part
   local -a components
@@ -74,7 +103,7 @@ run_root_ancestry_is_trusted() {
   run_root_path_is_valid "$run_root" || return 1
   trusted_directory / &&
     trusted_directory /run &&
-    trusted_directory "$TRUSTED_RUN_BASE" || return 1
+    private_root_directory "$TRUSTED_RUN_BASE" || return 1
 
   relative_path=${run_root#"$TRUSTED_RUN_BASE"/}
   IFS=/ read -r -a components <<<"$relative_path"
@@ -86,6 +115,8 @@ run_root_ancestry_is_trusted() {
 }
 
 validate_run_root_path() {
+  run_root_path_has_control_characters "$1" &&
+    fail "run root must not contain control characters"
   run_root_path_is_valid "$1" ||
     fail "run root must be a normalized child of $TRUSTED_RUN_BASE: $1"
 }
@@ -97,6 +128,7 @@ validate_run_root_ancestry() {
 
 prepare_run_root() {
   validate_run_root_path "$RUN_ROOT"
+  bootstrap_trusted_run_base
   validate_run_root_ancestry "$RUN_ROOT"
   if [ -e "$RUN_ROOT" ] || [ -L "$RUN_ROOT" ]; then
     trusted_directory "$RUN_ROOT" ||
