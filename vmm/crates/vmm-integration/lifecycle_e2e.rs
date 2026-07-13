@@ -31,6 +31,14 @@ fn vm_config() -> VmConfig {
     }
 }
 
+fn retain_snapshot(controller: &VmmController, path: &str) {
+    let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
+        .expect("snapshot identity");
+    controller
+        .release_scratch(path, identity)
+        .expect("transfer snapshot ownership");
+}
+
 #[test]
 #[ignore = "needs Linux+KVM + guest/bzImage"]
 fn e2e_boot_snapshot_restore() {
@@ -51,6 +59,7 @@ fn e2e_boot_snapshot_restore() {
     // 2. Snapshot.
     let t1 = Instant::now();
     let snap_path = controller.snapshot(false).expect("snapshot");
+    retain_snapshot(&controller, &snap_path);
     let snap_ms = t1.elapsed().as_millis();
     let snap_size = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
     eprintln!("Snapshot: {snap_ms}ms, {snap_size} bytes");
@@ -157,6 +166,7 @@ fn stability_soak_10_cycles() {
         let controller = VmmController::new();
         controller.create(vm_config()).expect("boot");
         let snap_path = controller.snapshot(false).expect("snapshot");
+        retain_snapshot(&controller, &snap_path);
         controller.restore(&snap_path, None).expect("restore");
         controller.stop().ok();
         let _ = std::fs::remove_file(&snap_path);

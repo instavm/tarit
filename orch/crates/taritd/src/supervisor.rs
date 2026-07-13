@@ -1,6 +1,8 @@
 use crate::config::{Config, WarmClass};
 use crate::net::{NetAlloc, NetProvisioner};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -11,8 +13,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tarit_types::OrchError;
 use tarit_vmm_client::{
-    wait_for_socket, KernelConfig, MemoryConfig, NetConfig, VcpuConfig, VmConfig, VmmClient,
-    VolumeConfig,
+    wait_for_socket, KernelConfig, MemoryConfig, NetConfig, ScratchIdentity, VcpuConfig, VmConfig,
+    VmmClient, VolumeConfig,
 };
 use uuid::Uuid;
 
@@ -176,6 +178,89 @@ struct ManagedProcess {
     child: Arc<Mutex<Child>>,
 }
 
+/// A golden artifact claimed by the supervisor after the builder VMM releases
+/// its exact scratch token. The open descriptor protects it from VMM GC while
+/// it remains reusable.
+#[derive(Debug)]
+struct OwnedArtifact {
+    path: PathBuf,
+    identity: ScratchIdentity,
+    _file: File,
+}
+
+impl OwnedArtifact {
+    fn capture(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        Ok(Self {
+            identity: scratch_identity_from_metadata(&metadata),
+            path,
+            _file: file,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn identity(&self) -> ScratchIdentity {
+        self.identity.clone()
+    }
+
+    fn matches(&self, path: &Path, identity: &ScratchIdentity) -> bool {
+        self.path == path && &self.identity == identity
+    }
+
+    fn remove(&self) -> std::io::Result<bool> {
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if scratch_identity_from_metadata(&metadata) != self.identity {
+            return Ok(false);
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn scratch_identity_from_metadata(metadata: &std::fs::Metadata) -> ScratchIdentity {
+    let (created_secs, created_nanos) = metadata
+        .created()
+        .ok()
+        .and_then(|created| {
+            created
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| {
+                    i64::try_from(duration.as_secs())
+                        .ok()
+                        .map(|seconds| (Some(seconds), Some(duration.subsec_nanos())))
+                })
+        })
+        .unwrap_or((None, None));
+    ScratchIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        created_secs,
+        created_nanos,
+    }
+}
+
 impl ManagedProcess {
     fn new(child: Child) -> Self {
         let pid = child.id();
@@ -265,7 +350,7 @@ pub struct VmmSupervisor {
     booting: Mutex<HashMap<Uuid, BootingVm>>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
-    golden_artifacts: Mutex<Vec<PathBuf>>,
+    golden_artifacts: Mutex<Vec<OwnedArtifact>>,
     net: Option<NetProvisioner>,
     shutting_down: AtomicBool,
     admission: Arc<VmAdmissionGate>,
@@ -535,7 +620,6 @@ impl VmmSupervisor {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
                 p.teardown(a);
             }
@@ -554,7 +638,6 @@ impl VmmSupervisor {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
                 p.teardown(a);
             }
@@ -701,9 +784,6 @@ impl VmmSupervisor {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            if let Some(overlay) = overlay {
-                let _ = std::fs::remove_file(overlay);
-            }
             return Err(self.shutdown_error());
         }
 
@@ -718,9 +798,6 @@ impl VmmSupervisor {
             self.untrack_booting(id);
             process.kill_wait();
             let _ = std::fs::remove_file(&socket_path);
-            if let Some(overlay) = overlay {
-                let _ = std::fs::remove_file(overlay);
-            }
             return Err(error);
         }
         self.untrack_booting(id);
@@ -863,7 +940,7 @@ impl VmmSupervisor {
         self.ensure_refill_active(cancelled)?;
         let snapshot_result = match self.admission.enter() {
             Ok(_admission) => client
-                .snapshot(false)
+                .snapshot_unreleased(false)
                 .map_err(|error| OrchError::Vmm(format!("snapshot golden: {error}"))),
             Err(error) => Err(error),
         };
@@ -875,25 +952,48 @@ impl VmmSupervisor {
             }
         };
 
-        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
-            self.teardown_vm(id, vm);
-            cleanup_golden_artifacts([PathBuf::from(&snapshot_path)]);
-            return Err(self.shutdown_error());
-        }
-        if let Err(e) = self.remember_golden_artifacts(
+        let mut artifacts = match self.capture_golden_artifacts(
             &snapshot_path,
             overlay_path_for_config(id, &spec).as_deref(),
         ) {
-            self.teardown_vm(id, vm);
-            cleanup_golden_artifacts([PathBuf::from(&snapshot_path)]);
-            return Err(e);
-        }
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                self.teardown_vm(id, vm);
+                return Err(error);
+            }
+        };
         if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
             self.teardown_vm(id, vm);
-            cleanup_golden_artifacts([PathBuf::from(&snapshot_path)]);
+            cleanup_golden_artifacts(artifacts);
             return Err(self.shutdown_error());
         }
-        self.teardown_vm_preserving_overlay(id, vm);
+        for artifact in &artifacts {
+            let path = artifact.path().display().to_string();
+            let identity = artifact.identity();
+            if let Err(error) = client.release_scratch(&path, identity) {
+                self.teardown_vm(id, vm);
+                cleanup_golden_artifacts(artifacts);
+                return Err(OrchError::Vmm(format!(
+                    "release golden scratch {path}: {error}"
+                )));
+            }
+        }
+        let artifact_keys = artifacts
+            .iter()
+            .map(|artifact| (artifact.path.clone(), artifact.identity()))
+            .collect::<Vec<_>>();
+        if let Err(error) = self.remember_golden_artifacts(cancelled, &mut artifacts) {
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts(artifacts);
+            return Err(error);
+        }
+        if cancelled.load(Ordering::Acquire) || self.is_shutting_down() {
+            let artifacts = self.take_golden_artifacts(&artifact_keys);
+            self.teardown_vm(id, vm);
+            cleanup_golden_artifacts(artifacts);
+            return Err(self.shutdown_error());
+        }
+        self.teardown_vm(id, vm);
         Ok(snapshot_path)
     }
 
@@ -995,22 +1095,42 @@ impl VmmSupervisor {
             .unwrap_or(0)
     }
 
-    fn remember_golden_artifacts(
+    fn capture_golden_artifacts(
         &self,
         snapshot_path: &str,
         overlay_path: Option<&str>,
+    ) -> Result<Vec<OwnedArtifact>, OrchError> {
+        let mut artifacts = vec![OwnedArtifact::capture(snapshot_path)
+            .map_err(|error| OrchError::Internal(format!("capture golden snapshot: {error}")))?];
+        if let Some(overlay_path) = overlay_path {
+            artifacts.push(OwnedArtifact::capture(overlay_path).map_err(|error| {
+                OrchError::Internal(format!("capture golden overlay: {error}"))
+            })?);
+        }
+        Ok(artifacts)
+    }
+
+    fn remember_golden_artifacts(
+        &self,
+        cancelled: &AtomicBool,
+        artifacts: &mut Vec<OwnedArtifact>,
     ) -> Result<(), OrchError> {
-        self.ensure_accepting_work()?;
-        let mut artifacts = self
+        self.ensure_refill_active(cancelled)?;
+        let mut registered = self
             .golden_artifacts
             .lock()
             .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?;
-        self.ensure_accepting_work()?;
-        artifacts.push(PathBuf::from(snapshot_path));
-        if let Some(overlay_path) = overlay_path {
-            artifacts.push(PathBuf::from(overlay_path));
-        }
+        self.ensure_refill_active(cancelled)?;
+        registered.append(artifacts);
         Ok(())
+    }
+
+    fn take_golden_artifacts(&self, keys: &[(PathBuf, ScratchIdentity)]) -> Vec<OwnedArtifact> {
+        let mut registered = self.golden_artifacts.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("golden artifact lock poisoned during cancellation cleanup");
+            poisoned.into_inner()
+        });
+        take_matching_artifacts(&mut registered, keys)
     }
 
     fn client_for(&self, id: Uuid) -> Result<VmmClient, OrchError> {
@@ -1271,10 +1391,9 @@ impl VmmSupervisor {
             let _ = client.stop();
             self.teardown_vm(warm_vm.id, warm_vm.vm);
         }
-        for (id, vm) in booting {
+        for (_, vm) in booting {
             vm.process.kill_wait();
             let _ = std::fs::remove_file(&vm.socket_path);
-            let _ = std::fs::remove_file(overlay_path_for(id));
         }
         cleanup_golden_artifacts(golden_artifacts);
 
@@ -1282,19 +1401,12 @@ impl VmmSupervisor {
     }
 
     fn teardown_vm(&self, id: Uuid, vm: RunningVm) {
-        self.teardown_vm_inner(id, vm, true);
+        self.teardown_vm_inner(id, vm);
     }
 
-    fn teardown_vm_preserving_overlay(&self, id: Uuid, vm: RunningVm) {
-        self.teardown_vm_inner(id, vm, false);
-    }
-
-    fn teardown_vm_inner(&self, id: Uuid, vm: RunningVm, remove_overlay: bool) {
+    fn teardown_vm_inner(&self, id: Uuid, vm: RunningVm) {
         vm.process.kill_wait();
         let _ = std::fs::remove_file(&vm.socket_path);
-        if remove_overlay {
-            let _ = std::fs::remove_file(overlay_path_for(id));
-        }
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
             if let Some(allocation) = self.defer_network_teardown(id, a.clone()) {
                 p.teardown(&allocation);
@@ -1384,10 +1496,39 @@ impl Drop for VmmSupervisor {
     }
 }
 
-fn cleanup_golden_artifacts(paths: impl IntoIterator<Item = PathBuf>) {
-    for path in paths {
-        let _ = std::fs::remove_file(path);
+fn cleanup_golden_artifacts(artifacts: impl IntoIterator<Item = OwnedArtifact>) {
+    for artifact in artifacts {
+        match artifact.remove() {
+            Ok(true) => {
+                tracing::info!(path = %artifact.path().display(), "removed golden artifact")
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                path = %artifact.path().display(),
+                "remove golden artifact failed: {error}"
+            ),
+        }
     }
+}
+
+fn take_matching_artifacts(
+    artifacts: &mut Vec<OwnedArtifact>,
+    keys: &[(PathBuf, ScratchIdentity)],
+) -> Vec<OwnedArtifact> {
+    let mut removed = Vec::new();
+    let mut retained = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts.drain(..) {
+        if keys
+            .iter()
+            .any(|(path, identity)| artifact.matches(path, identity))
+        {
+            removed.push(artifact);
+        } else {
+            retained.push(artifact);
+        }
+    }
+    *artifacts = retained;
+    removed
 }
 
 fn restore_requires_guest_readiness(purpose: SpawnPurpose) -> bool {
@@ -1929,10 +2070,62 @@ mod tests {
         std::fs::write(&snapshot, b"snapshot").expect("write snapshot");
         std::fs::write(&overlay, b"overlay").expect("write overlay");
 
-        cleanup_golden_artifacts([snapshot.clone(), overlay.clone()]);
+        let artifacts = [
+            OwnedArtifact::capture(&snapshot).expect("capture snapshot"),
+            OwnedArtifact::capture(&overlay).expect("capture overlay"),
+        ];
+        cleanup_golden_artifacts(artifacts);
 
         assert!(!snapshot.exists(), "golden snapshot must be removed");
         assert!(!overlay.exists(), "golden overlay must be removed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn golden_artifact_cleanup_preserves_replacements() {
+        let dir = PathBuf::from(format!(
+            "target/golden-artifact-replacement-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("vmm-snap-123-456.snap");
+        std::fs::write(&snapshot, b"owned snapshot").expect("write owned snapshot");
+        let artifact = OwnedArtifact::capture(&snapshot).expect("capture owned artifact");
+        std::fs::remove_file(&snapshot).expect("replace owned artifact");
+        std::fs::write(&snapshot, b"replacement").expect("write replacement");
+
+        cleanup_golden_artifacts([artifact]);
+
+        assert_eq!(
+            std::fs::read(&snapshot).expect("replacement survives cleanup"),
+            b"replacement"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn golden_cancellation_removes_registry_entry_and_preserves_replacement() {
+        let dir = PathBuf::from(format!(
+            "target/golden-artifact-cancellation-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test directory");
+        let snapshot = dir.join("vmm-snap-123-456.snap");
+        std::fs::write(&snapshot, b"owned snapshot").expect("write owned snapshot");
+        let artifact = OwnedArtifact::capture(&snapshot).expect("capture golden artifact");
+        let key = (artifact.path.clone(), artifact.identity());
+        let mut registry = vec![artifact];
+
+        let cancelled = take_matching_artifacts(&mut registry, &[key]);
+        assert!(
+            registry.is_empty(),
+            "cancellation must remove the registry entry"
+        );
+        std::fs::remove_file(&snapshot).expect("replace the cancelled artifact");
+        std::fs::write(&snapshot, b"replacement").expect("write replacement");
+        cleanup_golden_artifacts(cancelled);
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"replacement");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

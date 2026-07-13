@@ -4,6 +4,7 @@ pub use tarit_proto::*;
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -425,8 +426,30 @@ impl VmmClient {
     }
 
     pub fn snapshot(&self, diff: bool) -> Result<String, VmmError> {
+        let path = self.snapshot_unreleased(diff)?;
+        let identity = Self::scratch_identity(Path::new(&path))?;
+        self.release_scratch(&path, identity)?;
+        Ok(path)
+    }
+
+    /// Take a snapshot while the VMM retains cleanup ownership.
+    ///
+    /// Callers that need to transfer the artifact must capture its identity and
+    /// explicitly call `release_scratch` only after they hold local ownership.
+    pub fn snapshot_unreleased(&self, diff: bool) -> Result<String, VmmError> {
         match self.request_ok(&ApiRequest::Snapshot { diff })? {
             ApiResponse::Snapshot { path } => Ok(path),
+            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
+        }
+    }
+
+    /// Disarm VMM cleanup for exactly one scratch artifact it still owns.
+    pub fn release_scratch(&self, path: &str, identity: ScratchIdentity) -> Result<(), VmmError> {
+        match self.request_ok(&ApiRequest::ReleaseScratch {
+            path: path.to_string(),
+            identity,
+        })? {
+            ApiResponse::Ok => Ok(()),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
     }
@@ -462,6 +485,36 @@ impl VmmClient {
             ApiResponse::EgressUpdated { rules_applied } => Ok(rules_applied),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
+    }
+
+    fn scratch_identity(path: &Path) -> Result<ScratchIdentity, VmmError> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(VmmError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is not a regular scratch file", path.display()),
+            )));
+        }
+        let (created_secs, created_nanos) = metadata
+            .created()
+            .ok()
+            .and_then(|created| {
+                created
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| {
+                        i64::try_from(duration.as_secs())
+                            .ok()
+                            .map(|seconds| (Some(seconds), Some(duration.subsec_nanos())))
+                    })
+            })
+            .unwrap_or((None, None));
+        Ok(ScratchIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            created_secs,
+            created_nanos,
+        })
     }
 
     /// Fetch a health/info snapshot of the VM (state, uptime, vCPUs, etc.).

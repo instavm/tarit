@@ -473,9 +473,7 @@ fn main() -> Result<()> {
             netns,
             cgroup,
         } => serve(&cli.socket, jail, uid, gid, netns, cgroup),
-        Cmd::Snapshot { diff } => {
-            api_request(&cli.socket, &vmm_api::types::ApiRequest::Snapshot { diff })
-        }
+        Cmd::Snapshot { diff } => api_snapshot(&cli.socket, diff),
         Cmd::Create {
             kernel,
             cmdline,
@@ -1036,6 +1034,33 @@ fn apply_serve_cgroup(
     vmm_jailer::cgroups::apply_current_process(cgroup_path, limits)
         .map_err(|e| anyhow::anyhow!("cgroup apply: {e}"))?;
     log::info!("serve: cgroup applied: {cgroup_path}");
+    Ok(())
+}
+
+fn api_snapshot(socket: &str, diff: bool) -> Result<()> {
+    let request = vmm_api::types::ApiRequest::Snapshot { diff };
+    let body = serde_json::to_vec(&request)?;
+    let response = send_raw(socket, &body)?;
+    let response: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;
+    let path = match &response {
+        vmm_api::types::ApiResponse::Snapshot { path } => path,
+        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("snapshot failed: {msg}"),
+        other => anyhow::bail!("unexpected snapshot response: {other:?}"),
+    };
+    let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
+        .map_err(|error| anyhow::anyhow!("capture snapshot identity {path}: {error}"))?;
+    let release = vmm_api::types::ApiRequest::ReleaseScratch {
+        path: path.clone(),
+        identity,
+    };
+    let release = serde_json::to_vec(&release)?;
+    let release = send_raw(socket, &release)?;
+    match serde_json::from_slice::<vmm_api::types::ApiResponse>(&release)? {
+        vmm_api::types::ApiResponse::Ok => {}
+        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("release snapshot: {msg}"),
+        other => anyhow::bail!("unexpected release response: {other:?}"),
+    }
+    println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
 

@@ -107,6 +107,11 @@ fn restored_clones_get_private_rootfs_overlays() {
         .expect("golden must be command-ready before snapshot");
     assert_eq!(code, 0, "golden readiness command must succeed");
     let snap_path = golden.snapshot(false).expect("snapshot golden");
+    let snapshot_identity = vmm_core::gc::OwnedScratchFile::identity_for(Path::new(&snap_path))
+        .expect("snapshot identity");
+    golden
+        .release_scratch(&snap_path, snapshot_identity)
+        .expect("transfer golden snapshot ownership");
     artifacts.snapshots.push(PathBuf::from(&snap_path));
     golden.stop().ok();
     let original_golden_overlay =
