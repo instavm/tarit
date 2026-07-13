@@ -2488,14 +2488,12 @@ fn egress_comment(alloc: &NetAlloc) -> String {
 
 /// Parse one `cidr[:port[/proto]]` allowlist entry, mirroring the VMM grammar.
 /// Returns `(cidr, port, proto)` where `proto` is `None` for "any port/proto".
-/// Port zero is rejected.
+/// An explicitly specified port zero is rejected.
 fn parse_egress_entry(entry: &str) -> Result<(String, u16, Option<&'static str>), OrchError> {
     if entry.is_empty() {
         return Err(OrchError::BadRequest("empty egress rule".into()));
     }
-    if matches!(entry.parse::<IpAddr>(), Ok(IpAddr::V6(_)))
-        || matches!(entry.parse::<IpNet>(), Ok(IpNet::V6(_)))
-    {
+    if entry.contains(['[', ']']) || entry.matches(':').count() > 1 {
         return Err(OrchError::BadRequest(format!(
             "bad egress rule {entry:?}: IPv6 CIDRs are unsupported"
         )));
@@ -2538,13 +2536,7 @@ fn parse_egress_entry(entry: &str) -> Result<(String, u16, Option<&'static str>)
 
 fn parse_ipv4_egress_cidr(cidr: &str, entry: &str) -> Result<Ipv4Net, OrchError> {
     match cidr.parse::<IpAddr>() {
-        Ok(IpAddr::V4(addr)) => Ipv4Net::new(addr, 32)
-            .map(|cidr| cidr.trunc())
-            .map_err(|_| {
-                OrchError::BadRequest(format!(
-                    "bad egress rule {entry:?}: invalid IPv4 CIDR {cidr:?}"
-                ))
-            }),
+        Ok(IpAddr::V4(addr)) => Ok(Ipv4Net::from(addr)),
         Ok(IpAddr::V6(_)) => Err(OrchError::BadRequest(format!(
             "bad egress rule {entry:?}: IPv6 CIDRs are unsupported"
         ))),
@@ -4441,10 +4433,12 @@ esac
                 "invalid egress entry was accepted: {entry:?}"
             );
         }
-        assert!(matches!(
-            parse_egress_entry("2001:db8::/32").unwrap_err(),
-            OrchError::BadRequest(message) if message.contains("IPv6")
-        ));
+        for entry in ["2001:db8::/32", "2001:db8::/32:443", "[2001:db8::1]:443"] {
+            assert!(matches!(
+                parse_egress_entry(entry).unwrap_err(),
+                OrchError::BadRequest(message) if message.contains("IPv6")
+            ));
+        }
     }
 
     #[test]

@@ -691,10 +691,17 @@ record_vm_tap() {
 }
 
 tap_for_vm() {
-  local vm_id=$1 tap
+  local vm_id=$1 tap listing uplink
   for _ in $(seq 1 20); do
-    tap=$(nft -a list chain ip taritd_nat post |
-      sed -n "s/.*vm=$vm_id tap=\\([^\" ]*\\).*/\\1/p" | head -1)
+    listing=$(nft -a list table ip taritd_nat 2>/dev/null) || {
+      sleep 1
+      continue
+    }
+    uplink=$(cleanup_expected_uplink) || {
+      sleep 1
+      continue
+    }
+    tap=$(tap_for_recorded_vm_from_listing "$vm_id" "$listing" "$uplink" || true)
     [ -n "$tap" ] && { printf '%s\n' "$tap"; return; }
     sleep 1
   done
