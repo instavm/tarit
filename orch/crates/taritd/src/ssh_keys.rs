@@ -284,6 +284,7 @@ mod tests {
 
     const ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g test@example";
     const ED25519_FINGERPRINT: &str = "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4";
+    const RSA_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCm9bEVScNevvQHZGzV9bBzwzbEaFSmK2QwY/t/FRS1MJMbaCrdfrY0aLpoN9f744JI5lvzilCHlnbCqcrKBmUeGtrVEDpyY6gAF8YfN8C6os/NOxTQHukjwlgHi01FjuiZyAnhxXnBrWE+ZXxIX1up13YC+DQhJBSPHaFuD3pdGUN/MCESh+enLcge0qSnBpAjdd2yxGn9sRs+6u1i7TOHvBBGmtoHFZIChbxJJyyFBquUHJOa5K+njQA5CLP1VX02qm/Efoy7WWuygKF2rHsbnkIzeWGvbv4tpW36412uRvj4/JAh2rSk1a1Dp57VCV4RGZCyB1jEhyB2qD4Q3YX5 tarit-test";
 
     #[test]
     fn computes_openssh_sha256_fingerprint() {
@@ -294,6 +295,14 @@ mod tests {
             openssh_sha256_fingerprint(&parsed.blob),
             ED25519_FINGERPRINT
         );
+    }
+
+    #[test]
+    fn accepts_rsa_public_keys_for_guest_authorized_key_injection() {
+        let parsed = parse_openssh_public_key(RSA_KEY).unwrap();
+
+        assert_eq!(parsed.key_type, "ssh-rsa");
+        assert!(!parsed.blob.is_empty());
     }
 
     #[test]
