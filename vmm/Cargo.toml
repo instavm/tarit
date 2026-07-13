@@ -49,7 +49,7 @@ libc = "0.2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.29", features = ["sched", "process", "fs", "user", "mount", "signal"] }
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 crc32fast = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 
