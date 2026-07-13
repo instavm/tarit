@@ -1692,8 +1692,23 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<()> {
         return Ok(());
     }
 
-    copy_restore_overlay(source, target).map_err(|e| {
-        let _ = std::fs::remove_file(target);
+    let copy_result = (|| {
+        let mut source_file = std::fs::File::open(source)?;
+        let mut target_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)?;
+        let owned_target = OwnedScratchFile::remember(target);
+        let result = copy_restore_overlay(&mut source_file, &mut target_file);
+        drop(target_file);
+        drop(source_file);
+        if result.is_err() {
+            remove_owned_scratch_file(&owned_target);
+        }
+        result
+    })();
+
+    copy_result.map_err(|e| {
         VmmError::Snapshot(format!(
             "seed restore overlay {} -> {}: {e}",
             source.display(),
@@ -1706,7 +1721,10 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<()> {
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
-fn copy_restore_overlay(source: &Path, target: &Path) -> std::io::Result<()> {
+fn copy_restore_overlay(
+    source: &mut std::fs::File,
+    target: &mut std::fs::File,
+) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         copy_sparse_restore_overlay(source, target)
@@ -1722,17 +1740,15 @@ fn copy_restore_overlay(source: &Path, target: &Path) -> std::io::Result<()> {
     not(target_os = "linux"),
     any(test, all(target_arch = "x86_64", feature = "boot"))
 ))]
-fn copy_dense_restore_overlay(source: &Path, target: &Path) -> std::io::Result<()> {
+fn copy_dense_restore_overlay(
+    source: &mut std::fs::File,
+    target: &mut std::fs::File,
+) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom};
 
-    let mut source = std::fs::File::open(source)?;
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)?;
     source.seek(SeekFrom::Start(0))?;
     target.seek(SeekFrom::Start(0))?;
-    std::io::copy(&mut source, &mut target)?;
+    std::io::copy(source, target)?;
     target.sync_all()
 }
 
@@ -1740,15 +1756,13 @@ fn copy_dense_restore_overlay(source: &Path, target: &Path) -> std::io::Result<(
     target_os = "linux",
     any(test, all(target_arch = "x86_64", feature = "boot"))
 ))]
-fn copy_sparse_restore_overlay(source: &Path, target: &Path) -> std::io::Result<()> {
+fn copy_sparse_restore_overlay(
+    source: &mut std::fs::File,
+    target: &mut std::fs::File,
+) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
 
-    let mut source = std::fs::File::open(source)?;
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)?;
     let length = source.metadata()?.len();
     target.set_len(length)?;
 
@@ -1778,7 +1792,7 @@ fn copy_sparse_restore_overlay(source: &Path, target: &Path) -> std::io::Result<
                 target.set_len(0)?;
                 source.seek(SeekFrom::Start(0))?;
                 target.seek(SeekFrom::Start(0))?;
-                std::io::copy(&mut source, &mut target)?;
+                std::io::copy(source, target)?;
                 return target.sync_all();
             }
             return Err(error);
@@ -3472,6 +3486,33 @@ mod tests {
         for path in cleanup {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn failed_restore_overlay_seed_preserves_a_preexisting_target() {
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let golden = dir.join(format!("{unique}-golden.cow"));
+        let clone = dir.join(format!("{unique}-clone.cow"));
+        let existing_bytes = b"another clone owns this overlay";
+        std::fs::write(&golden, b"golden state").expect("write golden upper");
+        std::fs::write(&clone, existing_bytes).expect("write existing clone upper");
+
+        seed_restore_overlay(&golden, &clone).expect_err("existing target must reject seeding");
+
+        assert_eq!(
+            std::fs::read(&clone).expect("existing clone overlay must remain"),
+            existing_bytes
+        );
+        let _ = std::fs::remove_file(golden);
+        let _ = std::fs::remove_file(clone);
     }
 
     #[test]
