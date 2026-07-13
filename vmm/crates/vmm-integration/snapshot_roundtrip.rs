@@ -4,7 +4,7 @@
 #![cfg(test)]
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
 fn workspace_path(rel: &str) -> PathBuf {
