@@ -1,4 +1,6 @@
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -468,7 +470,7 @@ impl WarmPoolDraft {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
     pub api_keys: ApiKeyRegistry,
@@ -534,6 +536,14 @@ pub struct Config {
     pub ssh_gateway_enabled: bool,
     pub ssh_gateway_addr: SocketAddr,
     pub ssh_gateway_host_key_path: PathBuf,
+    /// Optional TCP listener for shared VM ports. When present, the normalized
+    /// domain and a 32-byte token key are required.
+    pub share_listen: Option<SocketAddr>,
+    pub share_domain: Option<String>,
+    pub share_token_key: Option<[u8; 32]>,
+    pub share_token_ttl_secs: u64,
+    pub share_connect_timeout_ms: u64,
+    pub share_idle_timeout_secs: u64,
 }
 
 impl Config {
@@ -650,6 +660,27 @@ impl Config {
             &env::var("TARIT_SSH_GATEWAY_HOST_KEY")
                 .unwrap_or_else(|_| "~/.taritd/ssh_host_ed25519".into()),
         );
+        let share_listen_raw = env::var("TARIT_SHARE_LISTEN").ok();
+        let share_domain_raw = env::var("TARIT_SHARE_DOMAIN").ok();
+        let share_token_key_raw = env::var("TARIT_SHARE_TOKEN_KEY").ok();
+        let share_token_ttl_secs_raw = env::var("TARIT_SHARE_TOKEN_TTL_SECS").ok();
+        let share_connect_timeout_ms_raw = env::var("TARIT_SHARE_CONNECT_TIMEOUT_MS").ok();
+        let share_idle_timeout_secs_raw = env::var("TARIT_SHARE_IDLE_TIMEOUT_SECS").ok();
+        let (
+            share_listen,
+            share_domain,
+            share_token_key,
+            share_token_ttl_secs,
+            share_connect_timeout_ms,
+            share_idle_timeout_secs,
+        ) = parse_share_config(
+            share_listen_raw.as_deref(),
+            share_domain_raw.as_deref(),
+            share_token_key_raw.as_deref(),
+            share_token_ttl_secs_raw.as_deref(),
+            share_connect_timeout_ms_raw.as_deref(),
+            share_idle_timeout_secs_raw.as_deref(),
+        )?;
 
         Ok(Self {
             listen,
@@ -683,8 +714,181 @@ impl Config {
             ssh_gateway_enabled,
             ssh_gateway_addr,
             ssh_gateway_host_key_path,
+            share_listen,
+            share_domain,
+            share_token_key,
+            share_token_ttl_secs,
+            share_connect_timeout_ms,
+            share_idle_timeout_secs,
         })
     }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("api_keys", &self.api_keys)
+            .field("host_id", &self.host_id)
+            .field("vmm_bin", &self.vmm_bin)
+            .field("kernel", &self.kernel)
+            .field("rootfs", &self.rootfs)
+            .field("socket_dir", &self.socket_dir)
+            .field("db_path", &self.db_path)
+            .field("net_state_path", &self.net_state_path)
+            .field("images_dir", &self.images_dir)
+            .field("max_vms", &self.max_vms)
+            .field("max_vcpus", &self.max_vcpus)
+            .field("max_memory_mib", &self.max_memory_mib)
+            .field("peer_secret", &"[REDACTED]")
+            .field(
+                "database_url",
+                &self.database_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("rpc_addr", &self.rpc_addr)
+            .field("enable_net", &self.enable_net)
+            .field("rootfs_read_only", &self.rootfs_read_only)
+            .field(
+                "metrics_expose_tenant_labels",
+                &self.metrics_expose_tenant_labels,
+            )
+            .field("vm_cgroup_parent", &self.vm_cgroup_parent)
+            .field("vm_cgroup_pids_max", &self.vm_cgroup_pids_max)
+            .field("warm_pool", &self.warm_pool)
+            .field("admission_timeout_ms", &self.admission_timeout_ms)
+            .field("reap_on_shutdown", &self.reap_on_shutdown)
+            .field("region", &self.region)
+            .field("zone", &self.zone)
+            .field("cloud", &self.cloud)
+            .field("autoscale", &self.autoscale)
+            .field("ssh_gateway_enabled", &self.ssh_gateway_enabled)
+            .field("ssh_gateway_addr", &self.ssh_gateway_addr)
+            .field("ssh_gateway_host_key_path", &self.ssh_gateway_host_key_path)
+            .field("share_listen", &self.share_listen)
+            .field("share_domain", &self.share_domain)
+            .field(
+                "share_token_key",
+                &self.share_token_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("share_token_ttl_secs", &self.share_token_ttl_secs)
+            .field("share_connect_timeout_ms", &self.share_connect_timeout_ms)
+            .field("share_idle_timeout_secs", &self.share_idle_timeout_secs)
+            .finish()
+    }
+}
+
+type ShareConfig = (
+    Option<SocketAddr>,
+    Option<String>,
+    Option<[u8; 32]>,
+    u64,
+    u64,
+    u64,
+);
+
+fn parse_share_config(
+    listen_raw: Option<&str>,
+    domain_raw: Option<&str>,
+    token_key_raw: Option<&str>,
+    token_ttl_secs_raw: Option<&str>,
+    connect_timeout_ms_raw: Option<&str>,
+    idle_timeout_secs_raw: Option<&str>,
+) -> Result<ShareConfig> {
+    let share_listen = listen_raw
+        .map(|raw| {
+            raw.parse::<SocketAddr>()
+                .context("TARIT_SHARE_LISTEN must be a valid socket address")
+        })
+        .transpose()?;
+    let share_domain = domain_raw.map(normalize_share_domain).transpose()?;
+    let share_token_key = token_key_raw.map(parse_share_token_key).transpose()?;
+
+    if share_listen.is_some() && share_domain.is_none() {
+        bail!("TARIT_SHARE_DOMAIN must be a normalized domain when TARIT_SHARE_LISTEN is enabled");
+    }
+    if share_listen.is_some() && share_token_key.is_none() {
+        bail!("TARIT_SHARE_TOKEN_KEY must decode to exactly 32 bytes when TARIT_SHARE_LISTEN is enabled");
+    }
+
+    let share_token_ttl_secs =
+        parse_positive_share_setting("TARIT_SHARE_TOKEN_TTL_SECS", token_ttl_secs_raw, 300)?;
+    validate_share_token_ttl(share_token_ttl_secs)?;
+
+    Ok((
+        share_listen,
+        share_domain,
+        share_token_key,
+        share_token_ttl_secs,
+        parse_positive_share_setting(
+            "TARIT_SHARE_CONNECT_TIMEOUT_MS",
+            connect_timeout_ms_raw,
+            10_000,
+        )?,
+        parse_positive_share_setting("TARIT_SHARE_IDLE_TIMEOUT_SECS", idle_timeout_secs_raw, 300)?,
+    ))
+}
+
+fn normalize_share_domain(raw: &str) -> Result<String> {
+    if raw.is_empty() || raw.trim() != raw {
+        bail!("TARIT_SHARE_DOMAIN must be a normalized domain");
+    }
+    let normalized = raw.strip_suffix('.').unwrap_or(raw).to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || normalized.parse::<std::net::IpAddr>().is_ok()
+    {
+        bail!("TARIT_SHARE_DOMAIN must be a normalized domain");
+    }
+    if normalized.split('.').any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }) {
+        bail!("TARIT_SHARE_DOMAIN must be a normalized domain");
+    }
+    Ok(normalized)
+}
+
+fn parse_share_token_key(raw: &str) -> Result<[u8; 32]> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| anyhow::anyhow!("TARIT_SHARE_TOKEN_KEY must be canonical base64url"))?;
+    if URL_SAFE_NO_PAD.encode(&decoded) != raw {
+        bail!("TARIT_SHARE_TOKEN_KEY must be canonical base64url");
+    }
+    decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("TARIT_SHARE_TOKEN_KEY must decode to exactly 32 bytes"))
+}
+
+fn parse_positive_share_setting(name: &str, raw: Option<&str>, default: u64) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a positive integer"))?;
+    if value == 0 {
+        bail!("{name} must be a positive integer");
+    }
+    Ok(value)
+}
+
+fn validate_share_token_ttl(ttl_secs: u64) -> Result<()> {
+    let ttl = i64::try_from(ttl_secs)
+        .context("TARIT_SHARE_TOKEN_TTL_SECS must fit token timestamp arithmetic")?;
+    let expiry = Utc::now()
+        .timestamp()
+        .checked_add(ttl)
+        .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0));
+    if expiry.is_none() {
+        bail!("TARIT_SHARE_TOKEN_TTL_SECS must fit token timestamp arithmetic");
+    }
+    Ok(())
 }
 
 fn load_peer_secret_for_mode(raw: Option<String>, cluster_mode: bool) -> Result<String> {
@@ -703,6 +907,59 @@ fn load_peer_secret_for_mode(raw: Option<String>, cluster_mode: bool) -> Result<
 #[cfg(test)]
 mod security_tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[test]
+    fn share_listener_requires_domain_and_exactly_32_key_bytes() {
+        let key = URL_SAFE_NO_PAD.encode([9u8; 32]);
+        assert!(
+            parse_share_config(Some("127.0.0.1:8443"), None, Some(&key), None, None, None,)
+                .is_err()
+        );
+        assert!(parse_share_config(
+            Some("127.0.0.1:8443"),
+            Some("shares.example.test"),
+            Some(&URL_SAFE_NO_PAD.encode([9u8; 31])),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn share_config_normalizes_domain_and_rejects_noncanonical_key() {
+        let key = URL_SAFE_NO_PAD.encode([9u8; 32]);
+        let config = parse_share_config(
+            Some("127.0.0.1:8443"),
+            Some("SHARES.Example.TEST."),
+            Some(&key),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.1.as_deref(), Some("shares.example.test"));
+        assert_eq!(config.2, Some([9u8; 32]));
+        assert!(parse_share_config(
+            Some("127.0.0.1:8443"),
+            Some("shares.example.test"),
+            Some(&format!("{key}=")),
+            None,
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn share_token_ttl_must_fit_token_timestamp_arithmetic() {
+        for ttl in [i64::MAX as u64, i64::MAX as u64 + 1] {
+            assert!(
+                parse_share_config(None, None, None, Some(&ttl.to_string()), None, None,).is_err()
+            );
+        }
+    }
 
     #[test]
     fn peer_secret_requires_explicit_strong_value_for_cluster() {

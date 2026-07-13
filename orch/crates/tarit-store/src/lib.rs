@@ -5,8 +5,8 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 use tarit_types::{
-    AuditEvent, ExecutionRecord, ExecutionStatus, SshKeyRecord, UsageEvent, UsageKind, VmRecord,
-    VmStatus,
+    AuditEvent, ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, SshKeyRecord,
+    UsageEvent, UsageKind, VmRecord, VmStatus,
 };
 use uuid::Uuid;
 
@@ -53,6 +53,9 @@ pub enum StoreError {
 
     #[error("not found")]
     NotFound,
+
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 pub struct Store {
@@ -171,8 +174,22 @@ impl Store {
                vm_id TEXT NOT NULL,
                created_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS shares (
+               id TEXT PRIMARY KEY NOT NULL,
+               slug TEXT NOT NULL UNIQUE,
+               owner_key TEXT NOT NULL,
+               vm_id TEXT NOT NULL,
+               guest_port INTEGER NOT NULL CHECK (guest_port BETWEEN 1 AND 65535),
+               visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
+               token_version INTEGER NOT NULL DEFAULT 0,
+               revoked_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS usage_outbox_unsent ON usage_outbox(sent);
-             CREATE INDEX IF NOT EXISTS audit_outbox_unsent ON audit_outbox(sent);",
+             CREATE INDEX IF NOT EXISTS audit_outbox_unsent ON audit_outbox(sent);
+             CREATE INDEX IF NOT EXISTS shares_owner ON shares(owner_key, created_at DESC);
+             CREATE INDEX IF NOT EXISTS shares_vm ON shares(vm_id);",
         )?;
         ensure_column(&conn, "vms", "owner_key", "TEXT")?;
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
@@ -252,6 +269,129 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn insert_share(&self, share: &ShareRecord) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO shares (
+               id, slug, owner_key, vm_id, guest_port, visibility, token_version, revoked_at,
+               created_at, updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    share.id.to_string(),
+                    share.slug,
+                    share.owner_key,
+                    share.vm_id.to_string(),
+                    i64::from(share.guest_port),
+                    share_visibility_as_str(share.visibility),
+                    u64_to_sql_i64(share.token_version)?,
+                    share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
+                    share.created_at.to_rfc3339(),
+                    share.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(share_error_from_sqlite)?;
+        Ok(())
+    }
+
+    pub fn get_share(&self, id: Uuid) -> Result<ShareRecord, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM shares WHERE id = ?1",
+                params![id.to_string()],
+                row_to_share,
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
+    }
+
+    pub fn get_share_by_slug(&self, slug: &str) -> Result<Option<ShareRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                        revoked_at, created_at, updated_at
+                 FROM shares WHERE slug = ?1",
+                params![slug],
+                row_to_share,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_shares(&self, owner_key: &str) -> Result<Vec<ShareRecord>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, slug, owner_key, vm_id, guest_port, visibility, token_version,
+                    revoked_at, created_at, updated_at
+             FROM shares WHERE owner_key = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![owner_key], row_to_share)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn update_share(&self, share: &ShareRecord) -> Result<(), StoreError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shares SET
+              slug = ?2, vm_id = ?3, guest_port = ?4, visibility = ?5, token_version = ?6,
+              revoked_at = ?7, updated_at = ?8
+             WHERE id = ?1",
+                params![
+                    share.id.to_string(),
+                    share.slug,
+                    share.vm_id.to_string(),
+                    i64::from(share.guest_port),
+                    share_visibility_as_str(share.visibility),
+                    u64_to_sql_i64(share.token_version)?,
+                    share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
+                    share.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(share_error_from_sqlite)?;
+        if updated == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Update an active share only when it still has the version read by the
+    /// caller. This protects token rotation and terminal revocation from
+    /// concurrent writers.
+    pub fn update_share_if_current(
+        &self,
+        share: &ShareRecord,
+        expected_token_version: u64,
+    ) -> Result<(), StoreError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shares SET
+               slug = ?2, vm_id = ?3, guest_port = ?4, visibility = ?5, token_version = ?6,
+               revoked_at = ?7, updated_at = ?8
+             WHERE id = ?1 AND token_version = ?9 AND revoked_at IS NULL",
+                params![
+                    share.id.to_string(),
+                    share.slug,
+                    share.vm_id.to_string(),
+                    i64::from(share.guest_port),
+                    share_visibility_as_str(share.visibility),
+                    u64_to_sql_i64(share.token_version)?,
+                    share.revoked_at.as_ref().map(|ts| ts.to_rfc3339()),
+                    share.updated_at.to_rfc3339(),
+                    u64_to_sql_i64(expected_token_version)?,
+                ],
+            )
+            .map_err(share_error_from_sqlite)?;
+        if updated == 0 {
+            return Err(StoreError::Conflict(
+                "share was modified or revoked concurrently".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn list_vms(&self) -> Result<Vec<VmRecord>, StoreError> {
@@ -801,6 +941,31 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<SnapshotRecord, rusqlite::
     })
 }
 
+fn row_to_share(row: &rusqlite::Row<'_>) -> Result<ShareRecord, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let vm_id: String = row.get(3)?;
+    let guest_port: i64 = row.get(4)?;
+    let visibility: String = row.get(5)?;
+    let token_version: i64 = row.get(6)?;
+    let revoked_at: Option<String> = row.get(7)?;
+    let created_at: String = row.get(8)?;
+    let updated_at: String = row.get(9)?;
+    Ok(ShareRecord {
+        id: parse_uuid_col(&id, 0)?,
+        slug: row.get(1)?,
+        owner_key: row.get(2)?,
+        vm_id: parse_uuid_col(&vm_id, 3)?,
+        guest_port: u16::try_from(guest_port)
+            .map_err(|_| invalid_integer_error(4, "invalid guest port"))?,
+        visibility: parse_share_visibility(&visibility, 5)?,
+        token_version: u64::try_from(token_version)
+            .map_err(|_| invalid_integer_error(6, "invalid token version"))?,
+        revoked_at: revoked_at.as_deref().map(parse_ts).transpose()?,
+        created_at: parse_ts(&created_at)?,
+        updated_at: parse_ts(&updated_at)?,
+    })
+}
+
 fn row_to_usage(row: &rusqlite::Row<'_>) -> Result<UsageEvent, rusqlite::Error> {
     let id: String = row.get(0)?;
     let vm_id: String = row.get(4)?;
@@ -868,6 +1033,56 @@ fn invalid_text_error(column: usize, message: String) -> rusqlite::Error {
     )
 }
 
+fn invalid_integer_error(column: usize, message: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Integer,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
+}
+
+fn share_visibility_as_str(visibility: ShareVisibility) -> &'static str {
+    match visibility {
+        ShareVisibility::Public => "public",
+        ShareVisibility::Private => "private",
+    }
+}
+
+fn parse_share_visibility(
+    visibility: &str,
+    column: usize,
+) -> Result<ShareVisibility, rusqlite::Error> {
+    match visibility {
+        "public" => Ok(ShareVisibility::Public),
+        "private" => Ok(ShareVisibility::Private),
+        _ => Err(invalid_text_error(
+            column,
+            format!("invalid share visibility: {visibility}"),
+        )),
+    }
+}
+
+fn u64_to_sql_i64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|e| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))
+}
+
+fn share_error_from_sqlite(error: rusqlite::Error) -> StoreError {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(db_error, _)
+            if db_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                || db_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+    ) {
+        StoreError::Conflict("share slug already exists".into())
+    } else {
+        StoreError::Sqlite(error)
+    }
+}
+
 fn parse_ts(s: &str) -> Result<DateTime<Utc>, rusqlite::Error> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
@@ -879,6 +1094,154 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tarit_types::{ShareRecord, ShareVisibility};
+
+    fn test_share(slug: &str, owner_key: &str) -> ShareRecord {
+        let now = Utc::now();
+        ShareRecord {
+            id: Uuid::new_v4(),
+            slug: slug.into(),
+            owner_key: owner_key.into(),
+            vm_id: Uuid::new_v4(),
+            guest_port: 8080,
+            visibility: ShareVisibility::Private,
+            token_version: 2,
+            revoked_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn assert_share_eq(actual: &ShareRecord, expected: &ShareRecord) {
+        assert_eq!(actual.id, expected.id);
+        assert_eq!(actual.slug, expected.slug);
+        assert_eq!(actual.owner_key, expected.owner_key);
+        assert_eq!(actual.vm_id, expected.vm_id);
+        assert_eq!(actual.guest_port, expected.guest_port);
+        assert_eq!(actual.visibility, expected.visibility);
+        assert_eq!(actual.token_version, expected.token_version);
+        assert_eq!(actual.revoked_at, expected.revoked_at);
+        assert_eq!(actual.created_at, expected.created_at);
+        assert_eq!(actual.updated_at, expected.updated_at);
+    }
+
+    #[test]
+    fn share_round_trips_and_slug_is_unique() {
+        let store = Store::open(":memory:").unwrap();
+        let share = test_share("calm-red-fox", "tenant-a");
+
+        store.insert_share(&share).unwrap();
+        assert_share_eq(&store.get_share(share.id).unwrap(), &share);
+        assert_share_eq(
+            &store.get_share_by_slug("calm-red-fox").unwrap().unwrap(),
+            &share,
+        );
+
+        let duplicate = ShareRecord {
+            id: Uuid::new_v4(),
+            ..share
+        };
+        assert!(matches!(
+            store.insert_share(&duplicate),
+            Err(StoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn share_slug_conflicts_do_not_change_other_sqlite_errors() {
+        let store = Store::open(":memory:").unwrap();
+        let share = test_share("conflicting-share", "tenant-a");
+        store.insert_share(&share).unwrap();
+
+        let duplicate_id = ShareRecord {
+            slug: "different-share".into(),
+            ..share.clone()
+        };
+        assert!(matches!(
+            store.insert_share(&duplicate_id),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let duplicate_slug = ShareRecord {
+            id: Uuid::new_v4(),
+            ..share.clone()
+        };
+        assert!(matches!(
+            store.insert_share(&duplicate_slug),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let invalid_port = ShareRecord {
+            id: Uuid::new_v4(),
+            slug: "invalid-port-share".into(),
+            guest_port: 0,
+            ..share.clone()
+        };
+        assert!(matches!(
+            store.insert_share(&invalid_port),
+            Err(StoreError::Sqlite(_))
+        ));
+
+        let key = SshKeyRecord {
+            id: Uuid::new_v4(),
+            owner_key: "tenant-a".into(),
+            fingerprint: "SHA256:conflict-test".into(),
+            public_key: "ssh-ed25519 AAAA conflict-test".into(),
+            key_type: "ssh-ed25519".into(),
+            created_at: Utc::now(),
+            is_active: true,
+        };
+        store.insert_ssh_key(&key).unwrap();
+        assert!(matches!(
+            store.insert_ssh_key(&key),
+            Err(StoreError::Sqlite(_))
+        ));
+    }
+
+    #[test]
+    fn share_listing_is_tenant_scoped_ordered_and_updatable() {
+        let store = Store::open(":memory:").unwrap();
+        let mut older = test_share("older-share", "tenant-a");
+        older.created_at -= chrono::Duration::seconds(1);
+        let mut newer = test_share("newer-share", "tenant-a");
+        newer.revoked_at = Some(Utc::now());
+        let other_tenant = test_share("other-tenant-share", "tenant-b");
+        store.insert_share(&older).unwrap();
+        store.insert_share(&newer).unwrap();
+        store.insert_share(&other_tenant).unwrap();
+
+        let shares = store.list_shares("tenant-a").unwrap();
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0].id, newer.id);
+        assert_eq!(shares[1].id, older.id);
+        assert_eq!(shares[0].revoked_at, newer.revoked_at);
+        assert!(store
+            .list_shares("tenant-b")
+            .unwrap()
+            .iter()
+            .all(|s| s.id != older.id));
+
+        newer.guest_port = 9090;
+        newer.visibility = ShareVisibility::Public;
+        newer.token_version += 1;
+        newer.updated_at = Utc::now();
+        newer.owner_key = "tenant-b".into();
+        store.update_share(&newer).unwrap();
+        let persisted = store.get_share(newer.id).unwrap();
+        assert_eq!(persisted.owner_key, "tenant-a");
+        newer.owner_key = "tenant-a".into();
+        assert_share_eq(&persisted, &newer);
+
+        assert!(matches!(
+            store.get_share(Uuid::new_v4()),
+            Err(StoreError::NotFound)
+        ));
+        assert!(store.get_share_by_slug("missing-share").unwrap().is_none());
+        assert!(matches!(
+            store.update_share(&test_share("missing-share", "tenant-a")),
+            Err(StoreError::NotFound)
+        ));
+    }
 
     #[test]
     fn snapshot_ownership_round_trips_and_replaces() {

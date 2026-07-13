@@ -27,6 +27,16 @@ fn vm_put(state: &AppState, rec: &VmRecord) {
     let _ = state.store_tx.send(StoreWrite::Vm(rec.clone()));
 }
 
+/// Put a record in the in-memory read cache without queuing it for durable
+/// write-behind. A cold create uses this while it is still deciding whether the
+/// supervisor can admit the boot; success or a real boot failure is persisted
+/// later by `store_update`.
+fn vm_cache_put(state: &AppState, rec: &VmRecord) {
+    if let Ok(mut c) = state.vm_cache.write() {
+        c.insert(rec.id, rec.clone());
+    }
+}
+
 fn vm_get(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
     state
         .vm_cache
@@ -51,6 +61,22 @@ fn vm_set_status(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecor
     };
     let _ = state.store_tx.send(StoreWrite::Vm(rec.clone()));
     Ok(rec)
+}
+
+/// Discard the in-memory provisional record when shutdown rejects a live boot.
+/// It was never queued for durable write-behind, so worker shutdown cannot leave
+/// a phantom `creating` record behind.
+fn vm_discard_shutdown_rejection(state: &AppState, id: Uuid) {
+    if let Ok(mut cache) = state.vm_cache.write() {
+        cache.remove(&id);
+    }
+}
+
+fn is_shutdown_rejection(error: &OrchError) -> bool {
+    matches!(
+        error,
+        OrchError::Overloaded { message, .. } if message == "taritd is shutting down"
+    )
 }
 
 fn store_insert(state: &AppState, rec: &VmRecord) -> Result<(), OrchError> {
@@ -136,7 +162,7 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
             created_at: now,
             updated_at: now,
         };
-        store_insert(state, &record)?;
+        vm_cache_put(state, &record);
 
         let sup = Arc::clone(&state.supervisor);
         let cfg = spawn_cfg.clone();
@@ -153,9 +179,13 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
                 Ok(record)
             }
             Ok(Err(e)) => {
-                record.status = VmStatus::Error;
-                record.updated_at = Utc::now();
-                let _ = store_update(state, &record);
+                if is_shutdown_rejection(&e) {
+                    vm_discard_shutdown_rejection(state, id);
+                } else {
+                    record.status = VmStatus::Error;
+                    record.updated_at = Utc::now();
+                    let _ = store_update(state, &record);
+                }
                 state.scheduler.release();
                 Err(e)
             }
