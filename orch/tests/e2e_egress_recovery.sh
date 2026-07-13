@@ -2,25 +2,20 @@
 # Validate fail-closed egress guards with two real guests on a Linux KVM host.
 set -euo pipefail
 
-[ "$(id -u)" -eq 0 ] || { echo "FAIL: run as root"; exit 1; }
-[ "$(uname -s)" = Linux ] || { echo "FAIL: run on Linux"; exit 1; }
-: "${BASE_ROOTFS:?set BASE_ROOTFS to a bootable guest rootfs}"
-: "${TARIT_KERNEL:?set TARIT_KERNEL to the guest kernel}"
-: "${EGRESS_TEST_IP:?set EGRESS_TEST_IP to a reachable external IPv4 TCP endpoint}"
-: "${EGRESS_TEST_PORT:?set EGRESS_TEST_PORT to its reachable TCP port}"
-
 ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
-TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-RUN_ROOT="$TARITD_HOME/egress-recovery-runs"
+RUN_ROOT="${EGRESS_RECOVERY_RUN_ROOT:-/run/taritd-egress-recovery}"
 LOCK_FILE=/run/lock/taritd-egress-recovery.lock
 RUN_DIR=
-ROOTFS="$RUN_DIR/rootfs.ext4"
-SERVER_LOG="$RUN_DIR/taritd.log"
+RUN_DIR_CREATED=0
+ROOTFS=
+SERVER_LOG=
 SERVER_PID=
 SERVER_START_TICKS=
 SERVER_STOP_TIMEOUT_SECONDS=20
+LINUX_UNIX_SOCKET_PATH_LIMIT=108
+MAX_VMM_ID=00000000-0000-0000-0000-000000000000
 VM_A=
 VM_B=
 VM_C=
@@ -39,6 +34,32 @@ fail() {
   echo "FAIL: $*" >&2
   exit 1
 }
+
+assert_vmm_socket_path_fits() {
+  local run_dir=$1 socket_path
+  socket_path="$run_dir/sockets/$MAX_VMM_ID.sock"
+  [ "${#socket_path}" -lt "$LINUX_UNIX_SOCKET_PATH_LIMIT" ] ||
+    fail "VMM socket path exceeds Linux sun_path limit (${#socket_path} >= $LINUX_UNIX_SOCKET_PATH_LIMIT): $socket_path"
+}
+
+run_dir_is_owned() {
+  [ "$RUN_DIR_CREATED" -eq 1 ] &&
+    [ -d "$RUN_DIR" ] &&
+    [ ! -L "$RUN_DIR" ] &&
+    [ "$(stat -c '%u:%a' "$RUN_DIR")" = "0:700" ]
+}
+
+if [ "${1:-}" = --check-socket-path ]; then
+  assert_vmm_socket_path_fits "$RUN_ROOT/run-2147483647-4194304-32767"
+  exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "FAIL: run as root"; exit 1; }
+[ "$(uname -s)" = Linux ] || { echo "FAIL: run on Linux"; exit 1; }
+: "${BASE_ROOTFS:?set BASE_ROOTFS to a bootable guest rootfs}"
+: "${TARIT_KERNEL:?set TARIT_KERNEL to the guest kernel}"
+: "${EGRESS_TEST_IP:?set EGRESS_TEST_IP to a reachable external IPv4 TCP endpoint}"
+: "${EGRESS_TEST_PORT:?set EGRESS_TEST_PORT to its reachable TCP port}"
 
 for command in curl flock ip nft python3 readlink ss stat sysctl timeout; do
   command -v "$command" >/dev/null || fail "required host command is missing: $command"
@@ -63,7 +84,14 @@ IPV6_FORWARDING=$(sysctl -n net.ipv6.conf.all.forwarding) ||
   fail "could not capture original IPv6 forwarding value"
 
 umask 077
-mkdir -p "$RUN_ROOT"
+RUN_DIR="$RUN_ROOT/run-$(date +%s)-$$-$RANDOM"
+assert_vmm_socket_path_fits "$RUN_DIR"
+mkdir -p "$RUN_ROOT" || fail "could not create run root $RUN_ROOT"
+chown root:root "$RUN_ROOT" || fail "could not make run root root-owned: $RUN_ROOT"
+chmod 0700 "$RUN_ROOT" || fail "could not restrict run root permissions: $RUN_ROOT"
+[ ! -L "$RUN_ROOT" ] &&
+  [ "$(stat -c '%F:%u:%a' "$RUN_ROOT")" = "directory:0:700" ] ||
+  fail "run root is not a root-owned mode 0700 directory: $RUN_ROOT"
 mkdir -p /run/lock
 touch "$LOCK_FILE"
 chown root:root "$LOCK_FILE"
@@ -72,8 +100,9 @@ chmod 0600 "$LOCK_FILE"
   fail "global lock is not root-owned mode 0600: $LOCK_FILE"
 exec 9>"$LOCK_FILE"
 flock -n 9 || fail "another egress recovery run already holds $LOCK_FILE"
-RUN_DIR="$RUN_ROOT/run-$(date +%s)-$$-$RANDOM"
-mkdir "$RUN_DIR" || fail "could not create run directory $RUN_DIR"
+mkdir -m 0700 "$RUN_DIR" || fail "could not create run directory $RUN_DIR"
+RUN_DIR_CREATED=1
+run_dir_is_owned || fail "run directory is not a root-owned mode 0700 directory: $RUN_DIR"
 ROOTFS="$RUN_DIR/rootfs.ext4"
 SERVER_LOG="$RUN_DIR/taritd.log"
 
@@ -630,8 +659,18 @@ cleanup() {
     echo "FAIL: fail-closed fallback cleanup retained unmanaged resources" >&2
     final_status=1
   else
-    [ -n "$RUN_DIR" ] && rm -rf -- "$RUN_DIR"
-    final_status=$original_status
+    if [ "$RUN_DIR_CREATED" -eq 1 ]; then
+      if run_dir_is_owned; then
+        if ! rm -rf -- "$RUN_DIR" || [ -e "$RUN_DIR" ]; then
+          echo "FAIL: could not remove run directory: $RUN_DIR" >&2
+          final_status=1
+        fi
+      else
+        echo "FAIL: retained run directory with unexpected ownership or permissions: $RUN_DIR" >&2
+        final_status=1
+      fi
+    fi
+    [ "${final_status:-}" = 1 ] || final_status=$original_status
   fi
   trap - EXIT
   exit "$final_status"
