@@ -774,9 +774,12 @@ impl VmmSupervisor {
         tokio::spawn(async move {
             let result = match worker.await {
                 Ok(result) => result,
-                Err(error) => Err(OrchError::Internal(format!(
-                    "supervisor-owned lifecycle worker failed: {error}"
-                ))),
+                Err(error) => Err(supervisor.cleanup_registered_boot_failure(
+                    id,
+                    OrchError::Internal(format!(
+                        "supervisor-owned lifecycle worker failed: {error}"
+                    )),
+                )),
             };
             let completion = match &result {
                 Ok(_) => Ok(()),
@@ -942,6 +945,9 @@ impl VmmSupervisor {
             .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control));
         if is_current {
             self.complete_booting(ticket.id, &ticket.control, Ok(()));
+            if ticket.purpose == SpawnPurpose::Refill {
+                self.release_reservation_after_cleanup(ticket.id);
+            }
         }
     }
 
@@ -1041,13 +1047,19 @@ impl VmmSupervisor {
         }
     }
 
-    fn cleanup_boot_join_failure(
+    pub(crate) fn cleanup_boot_join_failure(
         &self,
         id: Uuid,
         context: &str,
         join_error: tokio::task::JoinError,
     ) -> OrchError {
-        let cause = OrchError::Internal(format!("{context}: {join_error}"));
+        self.cleanup_registered_boot_failure(
+            id,
+            OrchError::Internal(format!("{context}: {join_error}")),
+        )
+    }
+
+    fn cleanup_registered_boot_failure(&self, id: Uuid, cause: OrchError) -> OrchError {
         let booting = self
             .booting
             .lock()
@@ -1070,7 +1082,7 @@ impl VmmSupervisor {
                     id,
                     &booting.control,
                     Err(OrchError::Internal(format!(
-                        "{context}; cleanup retained resources: {cleanup_error}"
+                        "{cause}; cleanup retained resources: {cleanup_error}"
                     ))),
                 );
                 OrchError::Internal(format!(
@@ -2754,6 +2766,24 @@ mod tests {
             .to_string()
             .contains("supervisor-owned lifecycle worker failed"));
         assert!(!supervisor.has_owned_task(id));
+    }
+
+    #[test]
+    fn aborting_unstarted_refill_releases_its_reservation() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let ticket = test_runtime()
+            .block_on(
+                supervisor
+                    .begin_boot_with_registration(id, SpawnPurpose::Refill, || async { Ok(()) }),
+            )
+            .unwrap();
+        assert!(supervisor.reservations.lock().unwrap().contains(&id));
+
+        test_runtime().block_on(supervisor.abort_unstarted_boot(&ticket));
+
+        assert!(!supervisor.reservations.lock().unwrap().contains(&id));
+        assert!(!supervisor.has_retained_boot(id));
     }
 
     #[test]

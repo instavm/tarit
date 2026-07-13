@@ -806,7 +806,9 @@ async fn create_local_owned(
     let booted = tokio::task::spawn_blocking(move || sup.spawn_vm(ticket, cfg)).await;
     let booted = match booted {
         Err(error) => {
-            let error = OrchError::Internal(format!("create boot task: {error}"));
+            let error = state
+                .supervisor
+                .cleanup_boot_join_failure(id, "create boot task", error);
             if task.is_cancelled() {
                 return finish_cancelled_lifecycle(state, id, task, error).await;
             }
@@ -962,7 +964,9 @@ async fn restore_local_owned(
     let booted = tokio::task::spawn_blocking(move || sup.restore_vm(ticket, path)).await;
     let booted = match booted {
         Err(error) => {
-            let error = OrchError::Internal(format!("restore boot task: {error}"));
+            let error = state
+                .supervisor
+                .cleanup_boot_join_failure(id, "restore boot task", error);
             if task.is_cancelled() {
                 return finish_cancelled_lifecycle(state, id, task, error).await;
             }
