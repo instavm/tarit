@@ -602,7 +602,12 @@ async fn parse_share_json<T: DeserializeOwned>(request: Request) -> Result<T, Sh
         .headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    if !content_type.is_some_and(|value| value.starts_with("application/json")) {
+    if !content_type.is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    }) {
         tracing::debug!("invalid share content type");
         return Err(fields);
     }
@@ -1735,6 +1740,34 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn share_request_json_content_type_accepts_case_insensitive_media_type() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "Application/JSON; charset=utf-8")
+            .body(Body::from(r#"{"guest_port":8080}"#))
+            .unwrap();
+        let rt = test_runtime();
+
+        let parsed = rt.block_on(parse_share_json::<serde_json::Value>(request));
+
+        assert_eq!(parsed.ok(), Some(serde_json::json!({"guest_port": 8080})));
+        drop(rt);
+    }
+
+    #[test]
+    fn share_request_json_content_type_rejects_near_prefix_media_type() {
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/jsonp; charset=utf-8")
+            .body(Body::from(r#"{"guest_port":8080}"#))
+            .unwrap();
+        let rt = test_runtime();
+
+        let parsed = rt.block_on(parse_share_json::<serde_json::Value>(request));
+
+        assert!(parsed.is_err());
+        drop(rt);
     }
 
     #[test]

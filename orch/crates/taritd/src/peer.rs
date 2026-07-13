@@ -630,6 +630,7 @@ impl PeerClient {
                     | "host"
                     | "forwarded"
                     | "x-real-ip"
+                    | "x-api-key"
                     | "x-peer-secret"
                     | "x-tarit-share-token"
             )
@@ -701,6 +702,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ApiRole;
 
     #[test]
     fn share_url_rejects_backslash_traversal() {
@@ -736,5 +738,24 @@ mod tests {
             .unwrap(),
             format!("http://owner.example/internal/v1/shares/{id}/nested/path?x=preserve")
         );
+    }
+
+    #[test]
+    fn share_request_sanitization_strips_client_api_key() {
+        let client = PeerClient::new("peer-secret".into());
+        let identity = ApiIdentity {
+            tenant: "tenant-a".into(),
+            role: ApiRole::User,
+            max_vms: None,
+            api_key_id: "key-id".into(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", HeaderValue::from_static("client-secret"));
+        headers.insert("accept", HeaderValue::from_static("text/plain"));
+
+        let sanitized = client.share_headers(&headers, &identity, "https").unwrap();
+
+        assert!(!sanitized.contains_key("x-api-key"));
+        assert_eq!(sanitized.get("accept").unwrap(), "text/plain");
     }
 }
