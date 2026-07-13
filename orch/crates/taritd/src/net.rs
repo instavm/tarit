@@ -15,7 +15,10 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use std::time::Duration;
 use tarit_types::OrchError;
 use uuid::Uuid;
@@ -40,6 +43,8 @@ const NET_STATE_VERSION: u32 = 2;
 const STALE_TAP_MIN_AGE: Duration = Duration::from_secs(30);
 static STATE_WRITE_SEQUENCE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static FAIL_NEXT_STATE_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
 
 /// A provisioned per-VM network: the tap name and the /30 addressing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +100,10 @@ pub struct NetProvisioner {
     network_transactions: NetworkTransactionLock,
     state_path: PathBuf,
     uplink: String,
+    /// A post-rename state-sync error leaves the on-disk ownership ambiguous.
+    /// Keep all current reservations and refuse further provisioning in this
+    /// process rather than risk reusing a slot after a failed free.
+    fail_closed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -129,7 +138,7 @@ impl NetProvisioner {
         let _ = startup_preflight()?;
         let uplink = default_uplink()?;
         let entries = load_state(&state_path, &live_vm_ids)?;
-        let (allocator, dropped) = SlotAllocator::from_entries(entries, &live_vm_ids);
+        let (allocator, dropped) = SlotAllocator::from_entries(entries);
         if dropped > 0 {
             tracing::warn!(
                 dropped,
@@ -141,14 +150,28 @@ impl NetProvisioner {
             network_transactions: NetworkTransactionLock::default(),
             state_path,
             uplink,
+            fail_closed: AtomicBool::new(false),
         };
-        let recovered_allocations = provisioner.recovered_allocations()?;
+        let all_allocations = provisioner.all_allocations()?;
+        let recovered_allocations = provisioner.allocations_for_vms(&live_vm_ids)?;
         if let Err(error) = ensure_host_networking() {
             return Err(provisioner.recovery_failure_after_emergency_isolation(
-                &recovered_allocations,
+                &all_allocations,
                 "initialize nft base policy",
                 error,
             ));
+        }
+        for alloc in all_allocations
+            .iter()
+            .filter(|alloc| !live_vm_ids.contains(&alloc.vm_id))
+        {
+            if let Err(error) = provisioner.teardown_locked(alloc) {
+                return Err(provisioner.recovery_failure_after_emergency_isolation(
+                    &all_allocations,
+                    "remove stale persisted network allocation before slot reuse",
+                    error,
+                ));
+            }
         }
         provisioner.reconcile_recovered_allocations(&recovered_allocations)?;
         if let Err(error) = (|| {
@@ -157,6 +180,7 @@ impl NetProvisioner {
                 .lock()
                 .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
             persist_allocator(&provisioner.state_path, &allocator)
+                .map_err(PersistenceError::into_orch)
         })() {
             return Err(provisioner.recovery_failure_after_cleanup(
                 &recovered_allocations,
@@ -195,24 +219,28 @@ impl NetProvisioner {
     }
 
     fn provision_locked(&self, vm_id: Uuid) -> Result<NetAlloc, OrchError> {
+        self.ensure_provisioning_available()?;
         let alloc = {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
             let alloc = inner.allocate(vm_id)?;
-            persist_allocator(&self.state_path, &inner)?;
+            if let Err(error) = persist_allocator(&self.state_path, &inner) {
+                return Err(self.persistence_failure("persist newly allocated network slot", error));
+            }
             alloc
         };
 
         let policy = self.egress_policy_for(&alloc)?;
+        self.prepare_slot_for_provision(&alloc)?;
         if let Err(e) = self.provision_host(&alloc, &policy) {
-            if let Err(cleanup_error) = self.teardown_locked(&alloc) {
+            if let Err(cleanup_error) = self.contain_failed_provision(&alloc) {
                 tracing::warn!(
                     tap = %alloc.tap,
                     vm_id = %alloc.vm_id,
                     slot = alloc.idx,
-                    "net: retained failed provisioning allocation for fail-closed cleanup: {cleanup_error}"
+                    "net: retained failed provisioning allocation after containment failure: {cleanup_error}"
                 );
             }
             return Err(e);
@@ -224,29 +252,9 @@ impl NetProvisioner {
     /// Remove a VM's tap and exact nft rule(s), then free and persist the slot.
     /// Idempotent and fail-closed: a slot remains owned until interface deletion
     /// and exact policy cleanup are both confirmed.
-    pub fn teardown(&self, alloc: &NetAlloc) {
-        match self
-            .network_transactions
-            .run(|| self.teardown_locked(alloc))
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    tap = %alloc.tap,
-                    vm_id = %alloc.vm_id,
-                    slot = alloc.idx,
-                    "net: teardown retained allocation for retry: {error}"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    tap = %alloc.tap,
-                    vm_id = %alloc.vm_id,
-                    slot = alloc.idx,
-                    "net transaction lock unavailable while tearing down allocation: {error}"
-                );
-            }
-        }
+    pub fn teardown(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.network_transactions
+            .run(|| self.teardown_locked(alloc))?
     }
 
     fn teardown_locked(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -307,44 +315,44 @@ impl NetProvisioner {
 
     /// Teardown by VM id from recovered persistent state. This covers restart
     /// cases where the supervisor no longer has a RunningVm/NetAlloc in memory.
-    pub fn teardown_vm_id(&self, vm_id: Uuid) {
-        if self
-            .network_transactions
-            .run(|| self.teardown_vm_id_locked(vm_id))
-            .is_err()
-        {
-            tracing::warn!(%vm_id, "net transaction lock poisoned while looking up VM teardown");
-        }
+    pub fn teardown_vm_id(&self, vm_id: Uuid) -> Result<(), OrchError> {
+        self.network_transactions
+            .run(|| self.teardown_vm_id_locked(vm_id))?
     }
 
-    fn teardown_vm_id_locked(&self, vm_id: Uuid) {
-        let alloc = match self.inner.lock() {
-            Ok(inner) => inner
-                .by_vm
-                .get(&vm_id)
-                .copied()
-                .and_then(|slot| NetAlloc::for_slot(vm_id, slot).ok()),
-            Err(_) => {
-                tracing::warn!(%vm_id, "net allocator lock poisoned while looking up VM teardown");
-                None
-            }
-        };
+    fn teardown_vm_id_locked(&self, vm_id: Uuid) -> Result<(), OrchError> {
+        let alloc = self
+            .inner
+            .lock()
+            .map_err(|_| {
+                OrchError::Internal(
+                    "net allocator lock poisoned while looking up VM teardown".into(),
+                )
+            })?
+            .by_vm
+            .get(&vm_id)
+            .copied()
+            .map(|slot| NetAlloc::for_slot(vm_id, slot))
+            .transpose()?;
         if let Some(alloc) = alloc {
-            if let Err(error) = self.teardown_locked(&alloc) {
-                tracing::warn!(
-                    tap = %alloc.tap,
-                    vm_id = %alloc.vm_id,
-                    slot = alloc.idx,
-                    "net: VM-ID teardown retained allocation for retry: {error}"
-                );
-            }
+            self.teardown_locked(&alloc)?;
         }
+        Ok(())
+    }
+
+    fn prepare_slot_for_provision(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.delete_tap_for_teardown(alloc).map_err(|error| {
+            OrchError::Internal(format!(
+                "net: cannot remove pre-existing strict TAP {} before provisioning; retaining slot and existing policy: {error}",
+                alloc.tap
+            ))
+        })?;
+        delete_ingress_table_for_slot(alloc.idx)?;
+        self.delete_nft_rules_for_slot(alloc.idx)?;
+        Ok(())
     }
 
     fn provision_host(&self, alloc: &NetAlloc, policy: &EgressPolicy) -> Result<(), OrchError> {
-        let tap = tap_name(alloc.idx);
-        let _ = run("ip", &["link", "del", &tap]);
-        self.delete_nft_rules_for_slot(alloc.idx)?;
         for argv in tap_provision_argv(alloc, &self.uplink) {
             run_argv(&argv)?;
         }
@@ -377,7 +385,7 @@ impl NetProvisioner {
         let previous = inner.replace_egress_policy(alloc, policy)?;
         if let Err(error) = persist_allocator(&self.state_path, &inner) {
             inner.egress_by_vm.insert(alloc.vm_id, previous);
-            return Err(error);
+            return Err(self.persistence_failure("persist egress policy update", error));
         }
         Ok(())
     }
@@ -485,7 +493,7 @@ impl NetProvisioner {
         Ok(())
     }
 
-    fn recovered_allocations(&self) -> Result<Vec<NetAlloc>, OrchError> {
+    fn all_allocations(&self) -> Result<Vec<NetAlloc>, OrchError> {
         self.inner
             .lock()
             .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?
@@ -493,6 +501,43 @@ impl NetProvisioner {
             .into_iter()
             .map(|(slot, vm_id)| NetAlloc::for_slot(vm_id, slot))
             .collect()
+    }
+
+    fn allocations_for_vms(&self, vm_ids: &HashSet<Uuid>) -> Result<Vec<NetAlloc>, OrchError> {
+        Ok(self
+            .all_allocations()?
+            .into_iter()
+            .filter(|alloc| vm_ids.contains(&alloc.vm_id))
+            .collect())
+    }
+
+    fn ensure_provisioning_available(&self) -> Result<(), OrchError> {
+        if self.fail_closed.load(Ordering::SeqCst) {
+            Err(OrchError::Internal(
+                "net: provisioning is fail-closed after an ambiguous durable-state write; restart only after inspecting and reconciling TARIT_NET_STATE"
+                    .into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn persistence_failure(&self, operation: &str, error: PersistenceError) -> OrchError {
+        if error.is_ambiguous() {
+            self.fail_closed.store(true, Ordering::SeqCst);
+            OrchError::Internal(format!(
+                "net: {operation}: {error}; current process is fail-closed and retains in-memory ownership because the renamed state may be durable"
+            ))
+        } else {
+            OrchError::Internal(format!("net: {operation}: {error}"))
+        }
+    }
+
+    fn contain_failed_provision(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.delete_tap_for_teardown(alloc)?;
+        delete_ingress_table_for_slot(alloc.idx)?;
+        self.delete_nft_rules_for_slot(alloc.idx)?;
+        Ok(())
     }
 
     fn reconcile_recovered_allocations(&self, allocations: &[NetAlloc]) -> Result<(), OrchError> {
@@ -882,10 +927,13 @@ impl NetProvisioner {
         inner.free(alloc);
         if let Err(error) = persist_allocator(&self.state_path, &inner) {
             *inner = original;
-            return Err(OrchError::Internal(format!(
-                "net: failed to persist freed slot {}; retaining allocation ownership: {error}",
-                alloc.idx
-            )));
+            return Err(self.persistence_failure(
+                &format!(
+                    "persist freed slot {}; retaining allocation ownership",
+                    alloc.idx
+                ),
+                error,
+            ));
         }
         Ok(())
     }
@@ -920,9 +968,8 @@ impl NetProvisioner {
         let mut report = SweepReport::default();
         for tap in stale_taps {
             if let Some(slot) = slot_from_tap(&tap.name) {
-                let removed = self.delete_nft_rules_for_slot(slot)?;
-                report.nft_rules_removed += removed;
-                if removed == 0 {
+                let policy_rules = self.count_nft_rules_for_slot(slot)?;
+                if policy_rules == 0 {
                     tracing::debug!(
                         tap = %tap.name,
                         slot,
@@ -930,12 +977,22 @@ impl NetProvisioner {
                     );
                     continue;
                 }
+                let orphan = NetAlloc::for_slot(Uuid::nil(), slot)?;
+                self.delete_tap_for_teardown(&orphan)?;
+                let removed = self.delete_nft_rules_for_slot(slot)?;
+                report.nft_rules_removed += removed;
+                if removed == 0 {
+                    return Err(OrchError::Internal(format!(
+                        "net: exact orphan policy for {} disappeared after TAP deletion; refusing slot reuse",
+                        tap.name
+                    )));
+                }
+                report.taps_removed += 1;
             }
-            run("ip", &["link", "del", &tap.name])?;
-            report.taps_removed += 1;
         }
 
-        report.nft_rules_removed += self.delete_orphan_nft_rules(&active)?;
+        let strict_taps = discover_strict_tap_names()?;
+        report.nft_rules_removed += self.delete_orphan_nft_rules(&active, &strict_taps)?;
         report.ingress_tables_removed += self.delete_orphan_ingress_tables(&active)?;
         Ok(report)
     }
@@ -984,11 +1041,32 @@ impl NetProvisioner {
         Ok(removed)
     }
 
-    fn delete_orphan_nft_rules(&self, active: &BTreeMap<u32, Uuid>) -> Result<usize, OrchError> {
+    fn count_nft_rules_for_slot(&self, slot: u32) -> Result<usize, OrchError> {
+        let mut count = 0;
+        for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
+            count += command_stdout("nft", &["-a", "list", "chain", "ip", NFT_TABLE, chain])?
+                .lines()
+                .filter(|line| {
+                    is_recognized_taritd_rule(chain, line)
+                        && is_taritd_nft_rule_for_slot(line, slot)
+                })
+                .count();
+        }
+        Ok(count)
+    }
+
+    fn delete_orphan_nft_rules(
+        &self,
+        active: &BTreeMap<u32, Uuid>,
+        strict_taps: &[String],
+    ) -> Result<usize, OrchError> {
         let mut removed = 0;
         for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
             removed += delete_nft_rules_in_chain(chain, |line| {
-                is_recognized_taritd_rule(chain, line) && is_orphan_taritd_nft_rule(line, active)
+                is_recognized_taritd_rule(chain, line)
+                    && is_orphan_taritd_nft_rule(line, active)
+                    && parse_taritd_nft_rule_tag(line)
+                        .is_some_and(|tag| !strict_taps.iter().any(|tap| tap == &tag.tap))
             })?;
         }
         Ok(removed)
@@ -1042,7 +1120,7 @@ impl SlotAllocator {
         }
     }
 
-    fn from_entries(entries: Vec<NetStateEntry>, live_vm_ids: &HashSet<Uuid>) -> (Self, usize) {
+    fn from_entries(entries: Vec<NetStateEntry>) -> (Self, usize) {
         let mut allocator = Self::empty();
         let mut dropped = 0;
         for NetStateEntry {
@@ -1052,8 +1130,7 @@ impl SlotAllocator {
             egress,
         } in entries
         {
-            if !live_vm_ids.contains(&vm_id)
-                || slot >= NET_POOL_SLOTS
+            if slot >= NET_POOL_SLOTS
                 || tap != tap_name(slot)
                 || allocator.by_slot.contains_key(&slot)
                 || allocator.by_vm.contains_key(&vm_id)
@@ -1232,22 +1309,58 @@ fn legacy_v1_reader_accepts_version(version: u32) -> Result<(), OrchError> {
     }
 }
 
-fn persist_allocator(path: &Path, allocator: &SlotAllocator) -> Result<(), OrchError> {
+#[derive(Debug)]
+enum PersistenceError {
+    NotCommitted(OrchError),
+    CommitAmbiguous(OrchError),
+}
+
+impl PersistenceError {
+    fn is_ambiguous(&self) -> bool {
+        matches!(self, Self::CommitAmbiguous(_))
+    }
+
+    fn into_orch(self) -> OrchError {
+        match self {
+            Self::NotCommitted(error) => error,
+            Self::CommitAmbiguous(error) => {
+                OrchError::Internal(format!("{error}; state commit is ambiguous after rename"))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PersistenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCommitted(error) => write!(formatter, "{error}"),
+            Self::CommitAmbiguous(error) => {
+                write!(formatter, "{error}; state commit is ambiguous after rename")
+            }
+        }
+    }
+}
+
+fn persist_allocator(path: &Path, allocator: &SlotAllocator) -> Result<(), PersistenceError> {
     persist_entries(path, allocator.entries())
 }
 
-fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), OrchError> {
+fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), PersistenceError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            OrchError::Internal(format!("create net state dir {}: {e}", parent.display()))
+            PersistenceError::NotCommitted(OrchError::Internal(format!(
+                "create net state dir {}: {e}",
+                parent.display()
+            )))
         })?;
     }
     let state = NetStateFile {
         version: NET_STATE_VERSION,
         allocations,
     };
-    let text = serde_json::to_string_pretty(&state)
-        .map_err(|e| OrchError::Internal(format!("encode net state: {e}")))?;
+    let text = serde_json::to_string_pretty(&state).map_err(|e| {
+        PersistenceError::NotCommitted(OrchError::Internal(format!("encode net state: {e}")))
+    })?;
     let (tmp, mut file) = {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = path
@@ -1275,18 +1388,17 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), O
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => {
-                    return Err(OrchError::Internal(format!(
-                        "create net state temp {}: {error}",
-                        candidate.display()
+                    return Err(PersistenceError::NotCommitted(OrchError::Internal(
+                        format!("create net state temp {}: {error}", candidate.display()),
                     )));
                 }
             }
         }
         created.ok_or_else(|| {
-            OrchError::Internal(format!(
+            PersistenceError::NotCommitted(OrchError::Internal(format!(
                 "create unique net state temp beside {}: exhausted retries",
                 path.display()
-            ))
+            )))
         })?
     };
     if let Err(error) = file
@@ -1295,30 +1407,37 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), O
         .and_then(|_| file.sync_all())
     {
         let _ = std::fs::remove_file(&tmp);
-        return Err(OrchError::Internal(format!(
-            "write durable net state {}: {error}",
-            tmp.display()
+        return Err(PersistenceError::NotCommitted(OrchError::Internal(
+            format!("write durable net state {}: {error}", tmp.display()),
         )));
     }
     drop(file);
     if let Err(error) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(OrchError::Internal(format!(
-            "replace net state {} with {}: {error}",
-            path.display(),
-            tmp.display()
+        return Err(PersistenceError::CommitAmbiguous(OrchError::Internal(
+            format!(
+                "replace net state {} with {}: {error}",
+                path.display(),
+                tmp.display()
+            ),
         )));
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| {
-            OrchError::Internal(format!(
-                "sync net state directory {}: {e}",
-                parent.display()
-            ))
-        })?;
+    sync_state_directory(parent).map_err(|e| {
+        PersistenceError::CommitAmbiguous(OrchError::Internal(format!(
+            "sync net state directory {}: {e}",
+            parent.display()
+        )))
+    })?;
     Ok(())
+}
+
+fn sync_state_directory(parent: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_STATE_DIRECTORY_SYNC.swap(false, Ordering::SeqCst) {
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
+    std::fs::File::open(parent).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(test)]
@@ -2128,6 +2247,40 @@ fn delete_ingress_table_for_alloc(alloc: &NetAlloc) -> Result<usize, OrchError> 
     }
     run_argv(&delete_ingress_table_argv(alloc.idx))?;
     Ok(1)
+}
+
+fn ingress_table_owner(listing: &str, slot: u32) -> Option<NetAlloc> {
+    let prefix = format!("taritd-ingress slot={slot} vm=");
+    let mut owners = listing
+        .lines()
+        .filter_map(|line| line.rsplit_once(" comment \""))
+        .filter_map(|(_, comment)| comment.split_once('"').map(|(comment, _)| comment))
+        .filter_map(|comment| {
+            let rest = comment.strip_prefix(&prefix)?;
+            let (vm_id, tap) = rest.split_once(" tap=")?;
+            (tap == tap_name(slot) && !vm_id.contains(char::is_whitespace))
+                .then(|| Uuid::parse_str(vm_id).ok())
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    (owners.len() == 1)
+        .then(|| owners.pop_first())
+        .flatten()
+        .and_then(|vm_id| NetAlloc::for_slot(vm_id, slot).ok())
+}
+
+fn delete_ingress_table_for_slot(slot: u32) -> Result<usize, OrchError> {
+    let table = ingress_table_name(slot);
+    if !ingress_table_names()?.iter().any(|name| name == &table) {
+        return Ok(0);
+    }
+    let listing = command_stdout("nft", &["-a", "list", "table", "netdev", &table])?;
+    let alloc = ingress_table_owner(&listing, slot).ok_or_else(|| {
+        OrchError::Internal(format!(
+            "net: refusing to delete ingress table {table}: exact managed owner is unknown"
+        ))
+    })?;
+    delete_ingress_table_for_alloc(&alloc)
 }
 
 fn nft_comment(alloc: &NetAlloc) -> String {
@@ -4324,11 +4477,11 @@ esac
                 egress: Some(EgressPolicy::default()),
             },
         ];
-        let (mut allocator, dropped) =
-            SlotAllocator::from_entries(entries, &HashSet::from([live_vm]));
+        let (mut allocator, dropped) = SlotAllocator::from_entries(entries);
 
-        assert_eq!(dropped, 2);
+        assert_eq!(dropped, 1);
         assert_eq!(allocator.by_vm.get(&live_vm), Some(&7));
+        assert_eq!(allocator.by_vm.get(&stale_vm), Some(&8));
         let alloc = allocator.allocate(Uuid::new_v4()).unwrap();
         assert_eq!(alloc.idx, 0);
     }
@@ -4336,15 +4489,12 @@ esac
     #[test]
     fn recovered_legacy_allocation_without_egress_state_fails_closed() {
         let vm_id = Uuid::new_v4();
-        let (allocator, dropped) = SlotAllocator::from_entries(
-            vec![NetStateEntry {
-                slot: 7,
-                vm_id,
-                tap: "insta7".into(),
-                egress: None,
-            }],
-            &HashSet::from([vm_id]),
-        );
+        let (allocator, dropped) = SlotAllocator::from_entries(vec![NetStateEntry {
+            slot: 7,
+            vm_id,
+            tap: "insta7".into(),
+            egress: None,
+        }]);
         let alloc = NetAlloc::for_slot(vm_id, 7).unwrap();
 
         assert_eq!(dropped, 0);
@@ -4774,6 +4924,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
         std::env::set_var(
@@ -5611,6 +5762,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
         std::env::set_var(
@@ -6099,6 +6251,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
             uplink: "eth0".into(),
+            fail_closed: AtomicBool::new(false),
         };
 
         let old_path = std::env::var_os("PATH");
@@ -6112,7 +6265,9 @@ esac
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
         std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
-        provisioner.teardown(&alloc);
+        let error = provisioner
+            .teardown(&alloc)
+            .expect_err("a failed TAP deletion must fail teardown for callers");
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -6122,6 +6277,10 @@ esac
         std::env::remove_var("TARIT_TEST_VM_ID");
 
         let commands = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            error.to_string().contains("cannot delete contained TAP"),
+            "{error}"
+        );
         assert!(provisioner.require_active_allocation(&alloc).is_ok());
         assert!(std::fs::read_to_string(&state_path)
             .unwrap()
@@ -6132,6 +6291,81 @@ esac
         assert!(
             !commands.contains("nft delete rule") && !commands.contains("nft delete table"),
             "teardown removed policy after link deletion failed:\n{commands}"
+        );
+    }
+
+    #[test]
+    fn provisioning_retains_old_policy_when_existing_tap_cannot_be_deleted() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-provision-existing-tap-failure-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:-j link show") echo '[{"ifname":"insta7"}]' ;;
+  "ip:link set insta7 down") ;;
+  "ip:link del insta7") echo "simulated link-delete failure" >&2; exit 1 ;;
+esac
+"#;
+        for name in ["ip", "nft"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+        let provisioner = NetProvisioner {
+            inner: Mutex::new(SlotAllocator::empty()),
+            network_transactions: NetworkTransactionLock::default(),
+            state_path: root.join("state.json"),
+            uplink: "eth0".into(),
+            fail_closed: AtomicBool::new(false),
+        };
+        let alloc = NetAlloc::for_slot(Uuid::new_v4(), 7).unwrap();
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        let error = provisioner
+            .prepare_slot_for_provision(&alloc)
+            .expect_err("a surviving strict TAP must abort provisioning");
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+
+        let commands = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(
+            error.to_string().contains("pre-existing strict TAP"),
+            "{error}"
+        );
+        assert!(
+            !commands.contains("nft "),
+            "old slot policy was touched before TAP deletion was confirmed:\n{commands}"
         );
     }
 
@@ -6186,6 +6420,58 @@ esac
         assert_eq!(reuse_rx.recv().unwrap(), released.idx);
         update.join().unwrap();
         release.join().unwrap();
+    }
+
+    #[test]
+    fn ambiguous_directory_sync_retains_slot_and_fails_closed_provisioning() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-state-directory-sync-failure-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let vm_id = Uuid::new_v4();
+        let mut allocator = SlotAllocator::empty();
+        let alloc = allocator.allocate(vm_id).unwrap();
+        persist_allocator(&state_path, &allocator).unwrap();
+        let provisioner = NetProvisioner {
+            inner: Mutex::new(allocator),
+            network_transactions: NetworkTransactionLock::default(),
+            state_path: state_path.clone(),
+            uplink: "eth0".into(),
+            fail_closed: AtomicBool::new(false),
+        };
+
+        FAIL_NEXT_STATE_DIRECTORY_SYNC.store(true, Ordering::SeqCst);
+        let error = provisioner
+            .free_allocation_locked(&alloc)
+            .expect_err("directory-sync ambiguity must retain the allocation");
+
+        assert!(
+            error.to_string().contains("fail-closed"),
+            "unexpected persistence error: {error}"
+        );
+        assert!(provisioner.require_active_allocation(&alloc).is_ok());
+        assert!(
+            !std::fs::read_to_string(&state_path)
+                .unwrap()
+                .contains(&vm_id.to_string()),
+            "the rename completed before the injected directory-sync failure"
+        );
+        assert!(matches!(
+            provisioner.provision(Uuid::new_v4()),
+            Err(OrchError::Internal(message)) if message.contains("fail-closed")
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

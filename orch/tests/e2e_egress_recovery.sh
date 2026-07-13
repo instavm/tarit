@@ -32,6 +32,7 @@ VM_IDS=()
 VM_TAPS=()
 VMM_PIDS=()
 VMM_START_TICKS=()
+VMM_EXIT_CONFIRMED=()
 
 fail() {
   echo "FAIL: $*" >&2
@@ -146,10 +147,16 @@ cleanup_run_vmm_processes() {
       cleanup_failed=1
       continue
     fi
-    [ -r "/proc/$pid/stat" ] || continue
+    if [ ! -r "/proc/$pid/stat" ]; then
+      VMM_EXIT_CONFIRMED[$index]=1
+      continue
+    fi
     current_ticks=$(awk '{print $22}' "/proc/$pid/stat") ||
       { echo "WARN: could not read recorded VMM $pid start time" >&2; cleanup_failed=1; continue; }
-    [ "$current_ticks" = "$start_ticks" ] || continue
+    if [ "$current_ticks" != "$start_ticks" ]; then
+      VMM_EXIT_CONFIRMED[$index]=1
+      continue
+    fi
     if ! kill -TERM "$pid" 2>/dev/null; then
       echo "WARN: could not TERM recorded VMM $pid" >&2
       cleanup_failed=1
@@ -168,6 +175,8 @@ cleanup_run_vmm_processes() {
       [ "$(awk '{print $22}' "/proc/$pid/stat")" = "$start_ticks" ]; then
       echo "WARN: recorded VMM $pid did not exit after TERM" >&2
       cleanup_failed=1
+    else
+      VMM_EXIT_CONFIRMED[$index]=1
     fi
   done
   return "$cleanup_failed"
@@ -339,10 +348,16 @@ tap_for_recorded_vm() {
 }
 
 cleanup_recorded_tap_policies() {
-  local index vm_id tap cleanup_failed=0
+  local index vm_id tap cleanup_failed=0 exited
   for index in "${!VM_IDS[@]}"; do
     vm_id=${VM_IDS[$index]:-}
     tap=${VM_TAPS[$index]:-}
+    exited=${VMM_EXIT_CONFIRMED[$index]:-0}
+    if [ "$exited" != 1 ]; then
+      echo "WARN: retained TAP policy for VM $vm_id because exact VMM exit was not confirmed" >&2
+      cleanup_failed=1
+      continue
+    fi
     [ -n "$tap" ] || tap=$(tap_for_recorded_vm "$vm_id")
     [ -n "$tap" ] && cleanup_tap_policy "$vm_id" "$tap" || cleanup_failed=1
   done
@@ -363,10 +378,16 @@ cleanup() {
   cleanup_recorded_tap_policies || cleanup_failed=1
   stop_taritd || cleanup_failed=1
   if [ -n "$IPV6_FORWARDING" ]; then
-    sysctl -qw "net.ipv6.conf.all.forwarding=$IPV6_FORWARDING" || true
+    sysctl -qw "net.ipv6.conf.all.forwarding=$IPV6_FORWARDING" || {
+      echo "WARN: could not restore IPv6 forwarding" >&2
+      cleanup_failed=1
+    }
   fi
   if [ -n "$IPV4_FORWARDING" ]; then
-    sysctl -qw "net.ipv4.ip_forward=$IPV4_FORWARDING" || true
+    sysctl -qw "net.ipv4.ip_forward=$IPV4_FORWARDING" || {
+      echo "WARN: could not restore IPv4 forwarding" >&2
+      cleanup_failed=1
+    }
   fi
   if [ "$cleanup_failed" -ne 0 ]; then
     echo "FAIL: fail-closed fallback cleanup retained unmanaged resources" >&2
@@ -414,6 +435,7 @@ record_vm_process() {
   esac
   VMM_PIDS+=("$pid")
   VMM_START_TICKS+=("$start_ticks")
+  VMM_EXIT_CONFIRMED+=(0)
   VM_TAPS+=("")
 }
 
@@ -730,11 +752,15 @@ record_vm_tap "$VM_A" "$TAP_A"
 record_vm_tap "$VM_B" "$TAP_B"
 GUEST_A=$(guest_ip_for_tap "$TAP_A")
 GUEST_B=$(guest_ip_for_tap "$TAP_B")
-UPLINK=$(ip route get "$EGRESS_TEST_IP" |
+UPLINK=$(ip route get 8.8.8.8 |
   awk '/ dev / {for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
-UPLINK_IP=$(ip route get "$EGRESS_TEST_IP" |
+UPLINK_IP=$(ip route get 8.8.8.8 |
   awk '/ src / {for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
 [ -n "$UPLINK" ] && [ -n "$UPLINK_IP" ] || fail "could not determine default uplink and source IP"
+TEST_UPLINK=$(ip route get "$EGRESS_TEST_IP" |
+  awk '/ dev / {for (i=1; i<=NF; i++) if ($i == "dev") {print $(i+1); exit}}')
+[ "$TEST_UPLINK" = "$UPLINK" ] ||
+  fail "external endpoint $EGRESS_TEST_IP routes via $TEST_UPLINK, expected production uplink $UPLINK"
 
 # These guest utilities are required for the behavioral checks; do not treat a
 # missing tool as a pass because that would skip the actual isolation gate.

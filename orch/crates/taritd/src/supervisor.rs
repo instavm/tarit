@@ -370,7 +370,11 @@ impl VmmSupervisor {
             let _ = std::fs::remove_file(&socket_path);
             let _ = std::fs::remove_file(overlay_path_for(id));
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
-                p.teardown(a);
+                p.teardown(a).map_err(|cleanup| {
+                    OrchError::Internal(format!(
+                        "shutdown cancelled VM {id}, but network teardown retained its allocation for retry: {cleanup}"
+                    ))
+                })?;
             }
             return Err(self.shutdown_error());
         }
@@ -383,7 +387,11 @@ impl VmmSupervisor {
             let _ = std::fs::remove_file(&socket_path);
             let _ = std::fs::remove_file(overlay_path_for(id));
             if let (Some(p), Some(a)) = (&self.net, &net_alloc) {
-                p.teardown(a);
+                if let Err(cleanup) = p.teardown(a) {
+                    return Err(OrchError::Internal(format!(
+                        "create vm: {e}; network teardown retained its allocation for retry: {cleanup}"
+                    )));
+                }
             }
             return Err(OrchError::Vmm(format!("create vm: {e}")));
         }
@@ -395,7 +403,7 @@ impl VmmSupervisor {
                 process,
                 net: net_alloc,
             };
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
 
@@ -416,7 +424,7 @@ impl VmmSupervisor {
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
         if self.is_shutting_down() {
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         let mut guard = self
@@ -425,7 +433,7 @@ impl VmmSupervisor {
             .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
         if self.is_shutting_down() {
             drop(guard);
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         guard.insert(id, vm);
@@ -441,7 +449,7 @@ impl VmmSupervisor {
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
         if self.is_shutting_down() {
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         let mut guard = self
@@ -450,7 +458,7 @@ impl VmmSupervisor {
             .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
         if self.is_shutting_down() {
             drop(guard);
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         guard.insert(id, vm);
@@ -519,7 +527,7 @@ impl VmmSupervisor {
                 process,
                 net: None,
             };
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
 
@@ -560,19 +568,19 @@ impl VmmSupervisor {
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
         self.await_ready(&vm.socket_path);
         if self.is_shutting_down() {
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         let mut warm = match self.warm.lock() {
             Ok(warm) => warm,
             Err(_) => {
-                self.teardown_vm(id, vm);
+                self.teardown_vm(id, &vm)?;
                 return Err(OrchError::Internal("warm lock poisoned".into()));
             }
         };
         if self.is_shutting_down() {
             drop(warm);
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         warm.push_back(WarmVm { id, vm, spec });
@@ -588,19 +596,19 @@ impl VmmSupervisor {
         let vm = self.boot_vm(id, &spec, SpawnPurpose::Refill)?;
         self.await_ready(&vm.socket_path);
         if self.is_shutting_down() {
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         let client = VmmClient::new(&vm.socket_path);
         let snapshot_path = match client.snapshot(false) {
             Ok(path) => path,
             Err(e) => {
-                self.teardown_vm(id, vm);
+                self.teardown_vm(id, &vm)?;
                 return Err(OrchError::Vmm(format!("snapshot golden: {e}")));
             }
         };
 
-        self.teardown_vm(id, vm);
+        self.teardown_vm(id, &vm)?;
         Ok(snapshot_path)
     }
 
@@ -616,19 +624,19 @@ impl VmmSupervisor {
         let vm = self.spawn_and_restore(id, snapshot_path, overlay, SpawnPurpose::Refill)?;
         self.await_ready(&vm.socket_path);
         if self.is_shutting_down() {
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         let mut warm = match self.warm.lock() {
             Ok(warm) => warm,
             Err(_) => {
-                self.teardown_vm(id, vm);
+                self.teardown_vm(id, &vm)?;
                 return Err(OrchError::Internal("warm lock poisoned".into()));
             }
         };
         if self.is_shutting_down() {
             drop(warm);
-            self.teardown_vm(id, vm);
+            self.teardown_vm(id, &vm)?;
             return Err(self.shutdown_error());
         }
         warm.push_back(WarmVm { id, vm, spec });
@@ -650,13 +658,23 @@ impl VmmSupervisor {
         let socket = taken.vm.socket_path.clone();
         self.move_pid_to_default_cgroup(pid);
         if self.is_shutting_down() {
-            self.teardown_vm(taken.id, taken.vm);
+            if let Err(error) = self.teardown_vm(taken.id, &taken.vm) {
+                if let Ok(mut warm) = self.warm.lock() {
+                    warm.push_back(taken);
+                }
+                tracing::error!(%error, "warm VM teardown failed during shutdown; retained for retry");
+            }
             return None;
         }
         let mut running = self.running.lock().ok()?;
         if self.is_shutting_down() {
             drop(running);
-            self.teardown_vm(taken.id, taken.vm);
+            if let Err(error) = self.teardown_vm(taken.id, &taken.vm) {
+                if let Ok(mut warm) = self.warm.lock() {
+                    warm.push_back(taken);
+                }
+                tracing::error!(%error, "warm VM teardown failed during shutdown; retained for retry");
+            }
             return None;
         }
         running.insert(taken.id, taken.vm);
@@ -701,14 +719,24 @@ impl VmmSupervisor {
         };
         let Some(running) = running else {
             if let Some(net) = &self.net {
-                net.teardown_vm_id(id);
+                net.teardown_vm_id(id)?;
             }
             return Ok(());
         };
 
         let client = VmmClient::new(&running.socket_path);
         let _ = client.stop();
-        self.teardown_vm(id, running);
+        if let Err(error) = self.teardown_vm(id, &running) {
+            self.running
+                .lock()
+                .map_err(|_| {
+                    OrchError::Internal(format!(
+                        "VM {id} teardown failed ({error}) and supervisor could not retain it for retry"
+                    ))
+                })?
+                .insert(id, running);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -843,15 +871,29 @@ impl VmmSupervisor {
             booting: booting.len(),
         };
 
+        let mut failures = Vec::new();
+        let mut retained_running = Vec::new();
         for (id, vm) in running {
             let client = VmmClient::new(&vm.socket_path);
             let _ = client.stop();
-            self.teardown_vm(id, vm);
+            if let Err(error) = self.teardown_vm(id, &vm) {
+                failures.push(format!(
+                    "VM {id} teardown retained allocation for retry: {error}"
+                ));
+                retained_running.push((id, vm));
+            }
         }
+        let mut retained_warm = Vec::new();
         for warm_vm in warm {
             let client = VmmClient::new(&warm_vm.vm.socket_path);
             let _ = client.stop();
-            self.teardown_vm(warm_vm.id, warm_vm.vm);
+            if let Err(error) = self.teardown_vm(warm_vm.id, &warm_vm.vm) {
+                failures.push(format!(
+                    "warm VM {} teardown retained allocation for retry: {error}",
+                    warm_vm.id
+                ));
+                retained_warm.push(warm_vm);
+            }
         }
         for (id, vm) in booting {
             vm.process.kill_wait();
@@ -859,16 +901,39 @@ impl VmmSupervisor {
             let _ = std::fs::remove_file(overlay_path_for(id));
         }
 
-        Ok(summary)
+        if !retained_running.is_empty() {
+            self.running
+                .lock()
+                .map_err(|_| {
+                    OrchError::Internal(
+                        "supervisor lock poisoned while retaining failed teardown".into(),
+                    )
+                })?
+                .extend(retained_running);
+        }
+        if !retained_warm.is_empty() {
+            self.warm
+                .lock()
+                .map_err(|_| {
+                    OrchError::Internal("warm lock poisoned while retaining failed teardown".into())
+                })?
+                .extend(retained_warm);
+        }
+        if failures.is_empty() {
+            Ok(summary)
+        } else {
+            Err(OrchError::Internal(failures.join("; ")))
+        }
     }
 
-    fn teardown_vm(&self, id: Uuid, vm: RunningVm) {
+    fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
         vm.process.kill_wait();
         let _ = std::fs::remove_file(&vm.socket_path);
         let _ = std::fs::remove_file(overlay_path_for(id));
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
-            p.teardown(a);
+            p.teardown(a)?;
         }
+        Ok(())
     }
 }
 

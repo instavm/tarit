@@ -238,7 +238,13 @@ forwarding before returning an aggregated fatal error. If link deletion and
 both forwarding disables all fail, no stronger in-process kernel invariant can
 be guaranteed; `taritd` remains unavailable and reports every failed
 containment action rather than claiming containment. Stop/delete teardown is
-idempotent and best-effort for tap deletion, nft cleanup, and slot freeing.
+retryable and fails the operation if the strict TAP cannot be contained and
+deleted, exact policy cleanup fails, or durable slot release is ambiguous.
+Tarit retains the allocation and policy for retry; operators must resolve the
+reported containment error before treating the VM or its network capacity as
+stopped/freed. After a post-rename state-directory sync failure, the running
+process refuses further provisioning until it is restarted and the persisted
+state is inspected/reconciled.
 
 Requirements:
 
