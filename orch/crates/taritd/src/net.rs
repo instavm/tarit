@@ -138,13 +138,7 @@ impl NetProvisioner {
         let _ = startup_preflight()?;
         let uplink = default_uplink()?;
         let entries = load_state(&state_path, &live_vm_ids)?;
-        let (allocator, dropped) = SlotAllocator::from_entries(entries);
-        if dropped > 0 {
-            tracing::warn!(
-                dropped,
-                "net: pruned stale allocation records during recovery"
-            );
-        }
+        let allocator = SlotAllocator::from_entries(entries)?;
         let provisioner = Self {
             inner: Mutex::new(allocator),
             network_transactions: NetworkTransactionLock::default(),
@@ -260,6 +254,7 @@ impl NetProvisioner {
     fn teardown_locked(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
         self.delete_tap_for_teardown(alloc)?;
         self.delete_nft_rules_for_alloc(alloc)?;
+        self.require_no_tagged_policy_residual(alloc)?;
         self.free_allocation_locked(alloc)
     }
 
@@ -1008,6 +1003,26 @@ impl NetProvisioner {
         Ok(removed)
     }
 
+    fn require_no_tagged_policy_residual(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let listing = command_stdout("nft", &["-a", "list", "table", "ip", NFT_TABLE])?;
+        if has_exact_allocation_tag(&listing, alloc) {
+            return Err(OrchError::Internal(format!(
+                "net: tagged policy remains for {} after exact cleanup; retaining allocation ownership",
+                alloc.tap
+            )));
+        }
+        for table in netdev_table_names()? {
+            let listing = command_stdout("nft", &["-a", "list", "table", "netdev", &table])?;
+            if has_exact_allocation_tag(&listing, alloc) {
+                return Err(OrchError::Internal(format!(
+                    "net: tagged netdev policy remains for {} after exact cleanup; retaining allocation ownership",
+                    alloc.tap
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn delete_recovery_rules_for_alloc(&self, alloc: &NetAlloc) -> Result<usize, OrchError> {
         let mut removed = 0;
         for chain in [NFT_CHAIN, NFT_FWD_CHAIN, NFT_INPUT_CHAIN] {
@@ -1120,30 +1135,22 @@ impl SlotAllocator {
         }
     }
 
-    fn from_entries(entries: Vec<NetStateEntry>) -> (Self, usize) {
+    fn from_entries(entries: Vec<NetStateEntry>) -> Result<Self, OrchError> {
+        validate_state_entries(&entries)?;
         let mut allocator = Self::empty();
-        let mut dropped = 0;
         for NetStateEntry {
             slot,
             vm_id,
-            tap,
+            tap: _,
             egress,
         } in entries
         {
-            if slot >= NET_POOL_SLOTS
-                || tap != tap_name(slot)
-                || allocator.by_slot.contains_key(&slot)
-                || allocator.by_vm.contains_key(&vm_id)
-            {
-                dropped += 1;
-                continue;
-            }
             allocator.free.remove(&slot);
             allocator.by_slot.insert(slot, vm_id);
             allocator.by_vm.insert(vm_id, slot);
             allocator.egress_by_vm.insert(vm_id, egress);
         }
-        (allocator, dropped)
+        Ok(allocator)
     }
 
     fn allocate(&mut self, vm_id: Uuid) -> Result<NetAlloc, OrchError> {
@@ -1275,6 +1282,7 @@ fn decode_net_state(
 ) -> Result<Vec<NetStateEntry>, OrchError> {
     let state = serde_json::from_str::<NetStateFile>(text)
         .map_err(|e| OrchError::Internal(format!("parse net state {}: {e}", path.display())))?;
+    validate_state_entries(&state.allocations)?;
     match state.version {
         NET_STATE_VERSION => Ok(state.allocations),
         1 => {
@@ -1296,6 +1304,44 @@ fn decode_net_state(
             path.display()
         ))),
     }
+}
+
+fn validate_state_entries(entries: &[NetStateEntry]) -> Result<(), OrchError> {
+    let mut slots = HashSet::new();
+    let mut vm_ids = HashSet::new();
+    for entry in entries {
+        if entry.slot >= NET_POOL_SLOTS {
+            return Err(OrchError::Internal(format!(
+                "net state has invalid slot {} outside the /30 pool",
+                entry.slot
+            )));
+        }
+        if entry.vm_id.is_nil() {
+            return Err(OrchError::Internal(
+                "net state has ambiguous nil VM ownership".into(),
+            ));
+        }
+        if entry.tap != tap_name(entry.slot) {
+            return Err(OrchError::Internal(format!(
+                "net state has contradictory identity: slot {} is not TAP {}",
+                entry.slot,
+                tap_name(entry.slot)
+            )));
+        }
+        if !slots.insert(entry.slot) {
+            return Err(OrchError::Internal(format!(
+                "net state has duplicate ownership of slot {}",
+                entry.slot
+            )));
+        }
+        if !vm_ids.insert(entry.vm_id) {
+            return Err(OrchError::Internal(format!(
+                "net state has duplicate ownership for VM {}",
+                entry.vm_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2072,6 +2118,13 @@ fn ingress_slot_from_table_name(table: &str) -> Option<u32> {
 }
 
 fn ingress_table_names() -> Result<Vec<String>, OrchError> {
+    Ok(netdev_table_names()?
+        .into_iter()
+        .filter(|table| ingress_slot_from_table_name(table).is_some())
+        .collect())
+}
+
+fn netdev_table_names() -> Result<Vec<String>, OrchError> {
     let listing = command_stdout("nft", &["list", "tables", "netdev"])?;
     Ok(listing
         .lines()
@@ -2082,7 +2135,6 @@ fn ingress_table_names() -> Result<Vec<String>, OrchError> {
                 _ => None,
             }
         })
-        .filter(|table| ingress_slot_from_table_name(table).is_some())
         .collect())
 }
 
@@ -2299,6 +2351,23 @@ fn ingress_comment(alloc: &NetAlloc) -> String {
         alloc.vm_id,
         tap_name(alloc.idx)
     )
+}
+
+fn has_exact_allocation_tag(listing: &str, alloc: &NetAlloc) -> bool {
+    let comments = [
+        nft_comment(alloc),
+        egress_comment(alloc),
+        guard_comment(alloc),
+        input_comment(alloc),
+        recovery_quarantine_comment(alloc),
+        egress_update_quarantine_comment(alloc),
+        ingress_comment(alloc),
+    ];
+    listing.lines().any(|line| {
+        comments
+            .iter()
+            .any(|comment| line.contains(&format!("comment \"{comment}\"")))
+    })
 }
 
 fn guard_comment(alloc: &NetAlloc) -> String {
@@ -4454,7 +4523,7 @@ esac
     }
 
     #[test]
-    fn allocator_recovers_only_live_valid_entries() {
+    fn allocator_recovers_valid_entries() {
         let live_vm = Uuid::new_v4();
         let stale_vm = Uuid::new_v4();
         let entries = vec![
@@ -4470,16 +4539,9 @@ esac
                 tap: "insta8".into(),
                 egress: Some(EgressPolicy::default()),
             },
-            NetStateEntry {
-                slot: NET_POOL_SLOTS,
-                vm_id: Uuid::new_v4(),
-                tap: format!("insta{NET_POOL_SLOTS}"),
-                egress: Some(EgressPolicy::default()),
-            },
         ];
-        let (mut allocator, dropped) = SlotAllocator::from_entries(entries);
+        let mut allocator = SlotAllocator::from_entries(entries).unwrap();
 
-        assert_eq!(dropped, 1);
         assert_eq!(allocator.by_vm.get(&live_vm), Some(&7));
         assert_eq!(allocator.by_vm.get(&stale_vm), Some(&8));
         let alloc = allocator.allocate(Uuid::new_v4()).unwrap();
@@ -4487,17 +4549,75 @@ esac
     }
 
     #[test]
+    fn persisted_state_rejects_ambiguous_ownership_instead_of_dropping_entries() {
+        let first_vm = Uuid::new_v4();
+        let second_vm = Uuid::new_v4();
+        let cases = [
+            (
+                "malformed slot",
+                format!(
+                    r#"{{"version":2,"allocations":[{{"slot":{NET_POOL_SLOTS},"vm_id":"{first_vm}","tap":"insta{NET_POOL_SLOTS}","egress":{{}}}}]}}"#
+                ),
+            ),
+            (
+                "contradictory tap identity",
+                format!(
+                    r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{first_vm}","tap":"insta8","egress":{{}}}}]}}"#
+                ),
+            ),
+            (
+                "duplicate VM",
+                format!(
+                    r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{first_vm}","tap":"insta7","egress":{{}}}},{{"slot":8,"vm_id":"{first_vm}","tap":"insta8","egress":{{}}}}]}}"#
+                ),
+            ),
+            (
+                "duplicate slot",
+                format!(
+                    r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{first_vm}","tap":"insta7","egress":{{}}}},{{"slot":7,"vm_id":"{second_vm}","tap":"insta7","egress":{{}}}}]}}"#
+                ),
+            ),
+        ];
+
+        for (name, state) in cases {
+            assert!(
+                decode_net_state(&state, Path::new("state.json"), &HashSet::new()).is_err(),
+                "{name} state was accepted"
+            );
+        }
+
+        let ambiguous_entries = vec![
+            NetStateEntry {
+                slot: 7,
+                vm_id: first_vm,
+                tap: "insta7".into(),
+                egress: Some(EgressPolicy::default()),
+            },
+            NetStateEntry {
+                slot: 8,
+                vm_id: first_vm,
+                tap: "insta8".into(),
+                egress: Some(EgressPolicy::default()),
+            },
+        ];
+        assert!(
+            SlotAllocator::from_entries(ambiguous_entries).is_err(),
+            "allocator silently dropped an ambiguous owner"
+        );
+    }
+
+    #[test]
     fn recovered_legacy_allocation_without_egress_state_fails_closed() {
         let vm_id = Uuid::new_v4();
-        let (allocator, dropped) = SlotAllocator::from_entries(vec![NetStateEntry {
+        let allocator = SlotAllocator::from_entries(vec![NetStateEntry {
             slot: 7,
             vm_id,
             tap: "insta7".into(),
             egress: None,
-        }]);
+        }])
+        .unwrap();
         let alloc = NetAlloc::for_slot(vm_id, 7).unwrap();
 
-        assert_eq!(dropped, 0);
         assert!(matches!(
             allocator.egress_policy_for(&alloc),
             Err(OrchError::Internal(message)) if message.contains("missing persisted egress policy")
@@ -5634,7 +5754,8 @@ esac
         let state_path = root.join("state.json");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(&state_path, "not JSON").unwrap();
+        let original_state = "not JSON";
+        std::fs::write(&state_path, original_state).unwrap();
         let command = r#"#!/bin/sh
 printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
 case "${0##*/}:$*" in
@@ -5662,7 +5783,7 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path, std::iter::empty());
+        let result = NetProvisioner::new(state_path.clone(), std::iter::empty());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5671,6 +5792,10 @@ esac
         std::env::remove_var("TARIT_TEST_COMMAND_LOG");
 
         let commands = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            original_state
+        );
         std::fs::remove_dir_all(&root).unwrap();
         assert!(result.is_err());
         assert!(
@@ -5679,6 +5804,85 @@ esac
             "{commands}"
         );
         assert!(!commands.contains("operator0"), "{commands}");
+    }
+
+    #[test]
+    fn duplicate_state_is_contained_and_not_rewritten_before_recovery() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let second_vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-duplicate-state-containment-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+        let original_state = format!(
+            r#"{{"version":2,"allocations":[{{"slot":7,"vm_id":"{vm_id}","tap":"insta7","egress":{{}}}},{{"slot":7,"vm_id":"{second_vm_id}","tap":"insta7","egress":{{}}}}]}}"#
+        );
+        std::fs::write(&state_path, &original_state).unwrap();
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:-j link show") echo '[{"ifname":"insta7"}]' ;;
+  "ip:link set insta7 down") ;;
+  "ip:route get 8.8.8.8") echo "8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2" ;;
+esac
+"#;
+        for name in ["ip", "nft", "sysctl"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        let result = NetProvisioner::new(state_path.clone(), [vm_id]);
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        std::env::remove_var("TARIT_TEST_COMMAND_LOG");
+
+        let commands = std::fs::read_to_string(&log).unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            original_state
+        );
+        assert!(
+            commands.find("ip link set insta7 down").unwrap()
+                < commands.find("ip route get 8.8.8.8").unwrap(),
+            "{commands}"
+        );
+        assert!(
+            !commands.contains("nft "),
+            "ambiguous state reached host policy recovery:\n{commands}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -6292,6 +6496,132 @@ esac
             !commands.contains("nft delete rule") && !commands.contains("nft delete table"),
             "teardown removed policy after link deletion failed:\n{commands}"
         );
+    }
+
+    #[test]
+    fn teardown_keeps_ownership_when_an_unknown_exact_tagged_rule_remains() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let vm_id = Uuid::new_v4();
+        let sequence = RECOVERY_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target")
+            .join(format!(
+                "net-teardown-unknown-residual-test-{}-{sequence}",
+                std::process::id()
+            ));
+        let bin = root.join("bin");
+        let log = root.join("commands.log");
+        let state_path = root.join("state.json");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&bin).unwrap();
+
+        let command = r#"#!/bin/sh
+printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_COMMAND_LOG"
+case "${0##*/}:$*" in
+  "ip:-j link show")
+    [ -e "$TARIT_TEST_STATE.tap-deleted" ] && echo '[]' || echo '[{"ifname":"insta7"}]'
+    ;;
+  "ip:link set insta7 down") ;;
+  "ip:link del insta7") touch "$TARIT_TEST_STATE.tap-deleted" ;;
+  "nft:-a list chain ip taritd_nat post")
+    echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname \"eth0\" masquerade comment \"taritd slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 1"
+    ;;
+  "nft:-a list chain ip taritd_nat vm_egress")
+    echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 2"
+    echo "iifname \"insta7\" ip saddr 172.16.0.30 tcp flags syn accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 55"
+    ;;
+  "nft:-a list chain ip taritd_nat vm_input")
+    echo "iifname \"insta7\" ip drop comment \"taritd-input slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 3"
+    ;;
+  "nft:list tables netdev") ;;
+  "nft:-a list table ip taritd_nat")
+    echo "table ip taritd_nat {"
+    echo " chain vm_egress {"
+    echo "  iifname \"insta7\" ip saddr 172.16.0.30 tcp flags syn accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 55"
+    echo " }"
+    echo "}"
+    ;;
+esac
+"#;
+        for name in ["ip", "nft"] {
+            let path = bin.join(name);
+            std::fs::write(&path, command).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+        }
+
+        let mut allocator = SlotAllocator::empty();
+        let alloc = NetAlloc::for_slot(vm_id, 7).unwrap();
+        allocator.free.remove(&7);
+        allocator.by_slot.insert(7, vm_id);
+        allocator.by_vm.insert(vm_id, 7);
+        allocator
+            .egress_by_vm
+            .insert(vm_id, Some(EgressPolicy::default()));
+        persist_allocator(&state_path, &allocator).unwrap();
+        let provisioner = NetProvisioner {
+            inner: Mutex::new(allocator),
+            network_transactions: NetworkTransactionLock::default(),
+            state_path: state_path.clone(),
+            uplink: "eth0".into(),
+            fail_closed: AtomicBool::new(false),
+        };
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                old_path.as_deref().unwrap_or_default().to_string_lossy()
+            ),
+        );
+        std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
+        std::env::set_var("TARIT_TEST_STATE", root.join("fake-state"));
+        std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
+        let error = provisioner
+            .teardown(&alloc)
+            .expect_err("an unknown tagged residual must retain ownership");
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        for variable in [
+            "TARIT_TEST_COMMAND_LOG",
+            "TARIT_TEST_STATE",
+            "TARIT_TEST_VM_ID",
+        ] {
+            std::env::remove_var(variable);
+        }
+
+        let commands = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            error.to_string().contains("tagged policy remains"),
+            "{error}"
+        );
+        assert!(provisioner.require_active_allocation(&alloc).is_ok());
+        assert!(std::fs::read_to_string(&state_path)
+            .unwrap()
+            .contains(&vm_id.to_string()));
+        assert!(
+            commands.contains("nft delete rule ip taritd_nat post handle 1")
+                && commands.contains("nft delete rule ip taritd_nat vm_egress handle 2")
+                && commands.contains("nft delete rule ip taritd_nat vm_input handle 3"),
+            "exact tagged policy was not cleaned first:\n{commands}"
+        );
+        assert!(
+            !commands.contains("handle 55"),
+            "unknown tagged policy was deleted automatically:\n{commands}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

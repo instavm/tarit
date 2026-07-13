@@ -246,6 +246,14 @@ stopped/freed. After a post-rename state-directory sync failure, the running
 process refuses further provisioning until it is restarted and the persisted
 state is inspected/reconciled.
 
+Malformed or ambiguous `TARIT_NET_STATE` (an out-of-range slot, mismatched
+slot/TAP identity, duplicate slot, duplicate VM ID, or nil VM owner) is never
+pruned or rewritten. Startup first contains every strict Tarit TAP, then fails
+before nft recovery or slot release. Preserve the state file and resolve the
+duplicate/corrupt ownership with manual host inspection; do not reuse or delete
+the affected slot until its TAP is confirmed absent and its exact managed policy
+has been cleaned.
+
 Requirements:
 
 - Linux `ip`, `nft`, and `sysctl` commands available.

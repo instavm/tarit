@@ -261,9 +261,13 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
 
 pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchError> {
     let sup = Arc::clone(&state.supervisor);
-    let summary = tokio::task::spawn_blocking(move || sup.stop_all())
+    let outcome = tokio::task::spawn_blocking(move || sup.stop_all())
         .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+        .map_err(|e| OrchError::Internal(format!("join: {e}")))?;
+    let (summary, failure) = match outcome {
+        Ok(summary) => (summary, None),
+        Err(failure) => (failure.summary, Some(failure.error)),
+    };
 
     for _ in 0..summary.total() {
         state.scheduler.on_local_vm_stopped();
@@ -288,7 +292,10 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
         cluster::clear_ownership(state, *id).await;
     }
 
-    Ok(summary)
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(summary),
+    }
 }
 
 pub async fn pause_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {

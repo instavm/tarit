@@ -372,7 +372,7 @@ delete_recorded_vms() {
 }
 
 cleanup() {
-  local original_status=$? cleanup_failed=0
+  local original_status=$? cleanup_failed=0 final_status
   delete_recorded_vms || true
   cleanup_run_vmm_processes || cleanup_failed=1
   cleanup_recorded_tap_policies || cleanup_failed=1
@@ -391,10 +391,13 @@ cleanup() {
   fi
   if [ "$cleanup_failed" -ne 0 ]; then
     echo "FAIL: fail-closed fallback cleanup retained unmanaged resources" >&2
-    return 1
+    final_status=1
+  else
+    [ -n "$RUN_DIR" ] && rm -rf -- "$RUN_DIR"
+    final_status=$original_status
   fi
-  [ -n "$RUN_DIR" ] && rm -rf -- "$RUN_DIR"
-  return "$original_status"
+  trap - EXIT
+  exit "$final_status"
 }
 trap cleanup EXIT
 

@@ -154,6 +154,79 @@ impl ShutdownSummary {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ShutdownFailure {
+    pub(crate) summary: ShutdownSummary,
+    pub(crate) error: OrchError,
+}
+
+impl From<OrchError> for ShutdownFailure {
+    fn from(error: OrchError) -> Self {
+        Self {
+            summary: ShutdownSummary::default(),
+            error,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ShutdownTransitions {
+    summary: ShutdownSummary,
+    failures: Vec<String>,
+}
+
+impl ShutdownTransitions {
+    fn running(&mut self, id: Uuid, result: Result<(), OrchError>) -> bool {
+        match result {
+            Ok(()) => {
+                self.summary.running_ids.push(id);
+                self.summary.running += 1;
+                true
+            }
+            Err(error) => {
+                self.failures.push(format!(
+                    "VM {id} teardown retained allocation for retry: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    fn warm(&mut self, id: Uuid, result: Result<(), OrchError>) -> bool {
+        match result {
+            Ok(()) => {
+                self.summary.warm += 1;
+                true
+            }
+            Err(error) => {
+                self.failures.push(format!(
+                    "warm VM {id} teardown retained allocation for retry: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    fn booting(&mut self) {
+        self.summary.booting += 1;
+    }
+
+    fn record_internal_failure(&mut self, error: OrchError) {
+        self.failures.push(error.to_string());
+    }
+
+    fn finish(self) -> Result<ShutdownSummary, ShutdownFailure> {
+        if self.failures.is_empty() {
+            Ok(self.summary)
+        } else {
+            Err(ShutdownFailure {
+                summary: self.summary,
+                error: OrchError::Internal(self.failures.join("; ")),
+            })
+        }
+    }
+}
+
 impl VmmSupervisor {
     #[cfg(test)]
     pub fn new(config: Config) -> Self {
@@ -839,47 +912,34 @@ impl VmmSupervisor {
             .unwrap_or(false)
     }
 
-    pub fn stop_all(&self) -> Result<ShutdownSummary, OrchError> {
+    pub(crate) fn stop_all(&self) -> Result<ShutdownSummary, ShutdownFailure> {
         self.shutting_down.store(true, Ordering::SeqCst);
-        let running = {
-            let mut guard = self
+        let (running, warm, booting) = {
+            let mut running = self
                 .running
                 .lock()
                 .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
-            guard.drain().collect::<Vec<_>>()
-        };
-        let warm = {
-            let mut guard = self
+            let mut warm = self
                 .warm
                 .lock()
                 .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
-            guard.drain(..).collect::<Vec<_>>()
-        };
-        let booting = {
-            let mut guard = self
+            let mut booting = self
                 .booting
                 .lock()
                 .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?;
-            guard.drain().collect::<Vec<_>>()
+            (
+                running.drain().collect::<Vec<_>>(),
+                warm.drain(..).collect::<Vec<_>>(),
+                booting.drain().collect::<Vec<_>>(),
+            )
         };
 
-        let running_ids = running.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let summary = ShutdownSummary {
-            running_ids,
-            running: running.len(),
-            warm: warm.len(),
-            booting: booting.len(),
-        };
-
-        let mut failures = Vec::new();
+        let mut transitions = ShutdownTransitions::default();
         let mut retained_running = Vec::new();
         for (id, vm) in running {
             let client = VmmClient::new(&vm.socket_path);
             let _ = client.stop();
-            if let Err(error) = self.teardown_vm(id, &vm) {
-                failures.push(format!(
-                    "VM {id} teardown retained allocation for retry: {error}"
-                ));
+            if !transitions.running(id, self.teardown_vm(id, &vm)) {
                 retained_running.push((id, vm));
             }
         }
@@ -887,11 +947,7 @@ impl VmmSupervisor {
         for warm_vm in warm {
             let client = VmmClient::new(&warm_vm.vm.socket_path);
             let _ = client.stop();
-            if let Err(error) = self.teardown_vm(warm_vm.id, &warm_vm.vm) {
-                failures.push(format!(
-                    "warm VM {} teardown retained allocation for retry: {error}",
-                    warm_vm.id
-                ));
+            if !transitions.warm(warm_vm.id, self.teardown_vm(warm_vm.id, &warm_vm.vm)) {
                 retained_warm.push(warm_vm);
             }
         }
@@ -899,31 +955,26 @@ impl VmmSupervisor {
             vm.process.kill_wait();
             let _ = std::fs::remove_file(&vm.socket_path);
             let _ = std::fs::remove_file(overlay_path_for(id));
+            transitions.booting();
         }
 
         if !retained_running.is_empty() {
-            self.running
-                .lock()
-                .map_err(|_| {
-                    OrchError::Internal(
-                        "supervisor lock poisoned while retaining failed teardown".into(),
-                    )
-                })?
-                .extend(retained_running);
+            match self.running.lock() {
+                Ok(mut running) => running.extend(retained_running),
+                Err(_) => transitions.record_internal_failure(OrchError::Internal(
+                    "supervisor lock poisoned while retaining failed teardown".into(),
+                )),
+            }
         }
         if !retained_warm.is_empty() {
-            self.warm
-                .lock()
-                .map_err(|_| {
-                    OrchError::Internal("warm lock poisoned while retaining failed teardown".into())
-                })?
-                .extend(retained_warm);
+            match self.warm.lock() {
+                Ok(mut warm) => warm.extend(retained_warm),
+                Err(_) => transitions.record_internal_failure(OrchError::Internal(
+                    "warm lock poisoned while retaining failed teardown".into(),
+                )),
+            }
         }
-        if failures.is_empty() {
-            Ok(summary)
-        } else {
-            Err(OrchError::Internal(failures.join("; ")))
-        }
+        transitions.finish()
     }
 
     fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
@@ -1164,6 +1215,32 @@ mod tests {
             None
         );
         assert_eq!(overlay_path_for_config(id, &spawn_config(true, None)), None);
+    }
+
+    #[test]
+    fn stop_all_commits_successful_transitions_before_returning_mixed_failure() {
+        let stopped_id = Uuid::new_v4();
+        let retained_id = Uuid::new_v4();
+        let mut transitions = ShutdownTransitions::default();
+
+        assert!(transitions.running(stopped_id, Ok(())));
+        assert!(!transitions.running(
+            retained_id,
+            Err(OrchError::Internal(
+                "simulated retained network allocation".into()
+            ))
+        ));
+        assert!(transitions.warm(Uuid::new_v4(), Ok(())));
+        transitions.booting();
+
+        let failure = transitions
+            .finish()
+            .expect_err("a retained VM must make stop_all fail after successes commit");
+        assert_eq!(failure.summary.running_ids, vec![stopped_id]);
+        assert_eq!(failure.summary.running, 1);
+        assert_eq!(failure.summary.warm, 1);
+        assert_eq!(failure.summary.booting, 1);
+        assert!(failure.error.to_string().contains(&retained_id.to_string()));
     }
 
     #[cfg(target_os = "linux")]
