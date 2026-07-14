@@ -19,6 +19,7 @@ chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hmac = "0.12"
+hickory-resolver = "0.24.4"
 # MIT OR Apache-2.0 licensed — validated IP network parser
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
 idna = "1"
