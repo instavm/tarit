@@ -76,7 +76,10 @@ pub fn server_config(resolver: Arc<CertResolver>) -> Arc<rustls::ServerConfig> {
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Offer HTTP/1.1 only. The share gateway routes on the Host header, builds
+    // origin-form upstream URIs, and upgrades WebSocket shares via
+    // Connection: Upgrade, none of which HTTP/2 provides.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Arc::new(config)
 }
 
@@ -226,6 +229,17 @@ mod tests {
             vec![certificate.cert.der().clone()],
             signing_key,
         ))
+    }
+
+    #[test]
+    fn server_config_offers_http11_only() {
+        let resolver = CertResolver::new();
+        resolver.install(CertStore::from_wildcard(
+            "shares.example.com",
+            self_signed_wildcard(),
+        ));
+        let config = server_config(resolver);
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
     #[tokio::test]
