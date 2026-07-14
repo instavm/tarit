@@ -501,11 +501,11 @@ pub struct Config {
     /// journal-recovery corruption; writes go to the agent's tmpfs mounts.
     /// Env TARIT_ROOTFS_READONLY. Off by default (rw, single-owner rootfs).
     pub rootfs_read_only: bool,
-    /// Expose raw tenant names as labels on the unauthenticated `/metrics`
-    /// endpoint. Off by default: tenant labels are replaced with a stable short
-    /// hash so scraping cannot enumerate tenant identities. Only enable this
-    /// when `/metrics` is bound to a trusted private network. Env
-    /// TARIT_METRICS_EXPOSE_TENANT_LABELS.
+    /// Expose raw tenant names and VM ids as labels on the unauthenticated
+    /// `/metrics` endpoint. Off by default: tenant and vm_id labels are replaced
+    /// with a stable short hash so scraping cannot enumerate tenant or VM
+    /// identities. Only enable this when `/metrics` is bound to a trusted
+    /// private network. Env TARIT_METRICS_EXPOSE_TENANT_LABELS.
     pub metrics_expose_tenant_labels: bool,
     /// Parent cgroup v2 path under which taritd places a per-VM cgroup for each
     /// `vmm serve` child (memory + PID limits), e.g. `/sys/fs/cgroup/tarit`.

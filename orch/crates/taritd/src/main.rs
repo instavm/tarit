@@ -1008,7 +1008,9 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(control_response.status(), StatusCode::UNAUTHORIZED);
+            // A share-style request pointed at the control listener hits the
+            // control router's not-found fallback, not a share handler.
+            assert_eq!(control_response.status(), StatusCode::NOT_FOUND);
 
             let share_response = share_test
                 .oneshot(

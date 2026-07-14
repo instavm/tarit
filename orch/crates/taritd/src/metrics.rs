@@ -357,7 +357,7 @@ pub fn render_metrics(state: &AppState) -> String {
         let label = if expose_tenant {
             tenant
         } else {
-            hashed_tenant_label(&tenant)
+            hashed_label(&tenant)
         };
         let _ = writeln!(
             out,
@@ -451,20 +451,25 @@ pub fn render_metrics(state: &AppState) -> String {
         &mut out,
         "taritd_vm_memory_rss_bytes",
         "gauge",
-        "Host RSS bytes for currently-running local VMM processes.",
+        "Host RSS bytes for currently-running local VMM processes. The vm_id label is a stable hash unless TARIT_METRICS_EXPOSE_TENANT_LABELS=1.",
     );
     metric_header(
         &mut out,
         "taritd_vm_cpu_seconds_total",
         "counter",
-        "Host CPU seconds consumed by currently-running local VMM processes.",
+        "Host CPU seconds consumed by currently-running local VMM processes. The vm_id label is a stable hash unless TARIT_METRICS_EXPOSE_TENANT_LABELS=1.",
     );
     for (vm_id, pid) in running_local_vms(state) {
+        let vm_label = if expose_tenant {
+            vm_id.clone()
+        } else {
+            hashed_label(&vm_id)
+        };
         if let Some(rss_bytes) = proc_rss_bytes(pid) {
             let _ = writeln!(
                 out,
                 "taritd_vm_memory_rss_bytes{{vm_id=\"{}\"}} {}",
-                escape_label_value(&vm_id),
+                escape_label_value(&vm_label),
                 rss_bytes
             );
         }
@@ -472,7 +477,7 @@ pub fn render_metrics(state: &AppState) -> String {
             let _ = writeln!(
                 out,
                 "taritd_vm_cpu_seconds_total{{vm_id=\"{}\"}} {:.2}",
-                escape_label_value(&vm_id),
+                escape_label_value(&vm_label),
                 cpu_seconds
             );
         }
@@ -508,12 +513,13 @@ fn vm_status_counts(state: &AppState) -> Vec<(&'static str, usize)> {
     counts.into_iter().collect()
 }
 
-/// Stable, non-reversible label for a tenant, so the unauthenticated `/metrics`
-/// endpoint does not enumerate tenant names. 48 bits of SHA-256 is enough to
-/// keep distinct tenants distinct on a dashboard without revealing identity.
-fn hashed_tenant_label(tenant: &str) -> String {
+/// Stable, non-reversible label for a confidential identifier (tenant key or VM
+/// id), so the unauthenticated `/metrics` endpoint does not enumerate them. 48
+/// bits of SHA-256 keep distinct values distinct on a dashboard without
+/// revealing identity.
+fn hashed_label(value: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(tenant.as_bytes());
+    let digest = Sha256::digest(value.as_bytes());
     let mut s = String::from("h:");
     for b in digest.iter().take(6) {
         let _ = write!(s, "{b:02x}");
@@ -739,15 +745,23 @@ mod tests {
     }
 
     #[test]
-    fn hashed_tenant_label_is_stable_and_opaque() {
-        let a = hashed_tenant_label("tenant-a");
-        let b = hashed_tenant_label("tenant-a");
-        let c = hashed_tenant_label("tenant-b");
-        assert_eq!(a, b, "hash is stable for a tenant");
-        assert_ne!(a, c, "different tenants map to different labels");
+    fn hashed_label_is_stable_and_opaque() {
+        let a = hashed_label("tenant-a");
+        let b = hashed_label("tenant-a");
+        let c = hashed_label("tenant-b");
+        assert_eq!(a, b, "hash is stable for a value");
+        assert_ne!(a, c, "different values map to different labels");
         assert!(a.starts_with("h:"));
         assert!(!a.contains("tenant-a"));
         assert_eq!(a.len(), 14, "h: plus 12 hex chars");
+
+        let vm = "0949fd9e-2084-4155-b5a7-ca0bfb54b920";
+        let hashed_vm = hashed_label(vm);
+        assert!(hashed_vm.starts_with("h:"));
+        assert!(
+            !hashed_vm.contains(vm),
+            "raw VM id must not survive hashing"
+        );
     }
 
     #[test]

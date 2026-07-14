@@ -394,8 +394,19 @@ pub fn router(state: AppState) -> Router {
             get(crate::pty::connect_ws),
         )
         .merge(protected)
+        .fallback(not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorBody {
+            error: "not found".into(),
+        }),
+    )
+        .into_response()
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -1899,6 +1910,42 @@ mod tests {
         drop(rt);
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn unknown_route_returns_404_without_auth() {
+        let app = router(test_state());
+        let rt = test_runtime();
+
+        // An unauthenticated request to an unknown path (e.g. a share host
+        // pointed at the control listener) must not be dispatched and must not
+        // require a credential to receive a not-found answer.
+        let unknown = rt
+            .block_on(
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::HOST, "some-share.shares.example.test")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        // A known protected route without a credential still requires auth.
+        let protected = rt
+            .block_on(
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri("/v1/vms")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+        drop(rt);
     }
 
     #[test]

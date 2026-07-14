@@ -110,6 +110,9 @@ Response `200`:
 
 No authentication. Returns Prometheus text exposition metrics for the local `taritd` process.
 Includes `taritd_tenant_vms{tenant="..."}` for local active VM counts by tenant.
+The `tenant` and per-VM `vm_id` labels are a stable short hash by default so
+scraping cannot enumerate tenant or VM identities; set
+`TARIT_METRICS_EXPOSE_TENANT_LABELS=1` to expose raw values on a trusted network.
 
 Response `200`: `text/plain; version=0.0.4`.
 
