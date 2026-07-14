@@ -29,6 +29,7 @@ TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
 PSQL_BIN="${PSQL_BIN:-psql}"
 ACME_E2E_WITH_VM="${ACME_E2E_WITH_VM:-1}"
 ACME_E2E_KEEP="${ACME_E2E_KEEP:-0}"
+ACME_E2E_BEST_EFFORT_VM="${ACME_E2E_BEST_EFFORT_VM:-0}"
 ACME_E2E_TIMEOUT_SECS="${ACME_E2E_TIMEOUT_SECS:-180}"
 ACME_E2E_GUEST_PORT="${ACME_E2E_GUEST_PORT:-43127}"
 ACME_E2E_EDGE_SLUG="${ACME_E2E_EDGE_SLUG:-edge}"
@@ -1130,15 +1131,15 @@ https_share_is_ready_on() {
 run_layer_b() {
   if [[ "$ACME_E2E_WITH_VM" == "0" ]]; then
     log "SKIP: Layer B disabled by ACME_E2E_WITH_VM=0"
-    return 0
+    return 2
   fi
   if [[ ! -e /dev/kvm || ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     log "SKIP: Layer B requires an accessible /dev/kvm"
-    return 0
+    return 2
   fi
   if [[ ! -x "$VMM_BIN" || ! -r "$KERNEL" || ! -r "$ROOTFS" ]]; then
     log "SKIP: Layer B assets are unavailable (VMM=$VMM_BIN KERNEL=$KERNEL ROOTFS=$ROOTFS)"
-    return 0
+    return 2
   fi
 
   log "== Layer B: real KVM HTTPS share =="
@@ -1233,6 +1234,8 @@ preflight() {
     die "ACME_E2E_WITH_VM must be 0 or 1"
   [[ "$ACME_E2E_KEEP" == "0" || "$ACME_E2E_KEEP" == "1" ]] ||
     die "ACME_E2E_KEEP must be 0 or 1"
+  [[ "$ACME_E2E_BEST_EFFORT_VM" == "0" || "$ACME_E2E_BEST_EFFORT_VM" == "1" ]] ||
+    die "ACME_E2E_BEST_EFFORT_VM must be 0 or 1"
   [[ "$ACME_E2E_TIMEOUT_SECS" =~ ^[1-9][0-9]*$ ]] ||
     die "ACME_E2E_TIMEOUT_SECS must be a positive integer"
   if ! [[ "$ACME_E2E_GUEST_PORT" =~ ^[0-9]+$ ]] ||
@@ -1356,10 +1359,24 @@ main() {
   [[ "$(certificate_generation)" == "$GENERATION_AFTER_ISSUE" ]] ||
     die "restarting node A created a new ACME certificate generation"
 
-  if ! run_layer_b; then
-    log "SKIP: Layer B could not complete; Layer A remains authoritative"
-    dump_logs "Layer B skipped"
-  fi
+  local layer_b_rc=0
+  run_layer_b || layer_b_rc=$?
+  case "$layer_b_rc" in
+    0)
+      log "Layer B passed: real KVM HTTPS share reachable through both nodes"
+      ;;
+    2)
+      log "SKIP: Layer B prerequisites unavailable; Layer A remains authoritative"
+      ;;
+    *)
+      dump_logs "Layer B failed"
+      if [[ "$ACME_E2E_BEST_EFFORT_VM" == "1" ]]; then
+        log "SKIP: Layer B execution failed; ACME_E2E_BEST_EFFORT_VM=1 keeps Layer A authoritative"
+      else
+        die "Layer B execution failed"
+      fi
+      ;;
+  esac
 
   ACME_RC=0
   RESULT_PRINTED=1
