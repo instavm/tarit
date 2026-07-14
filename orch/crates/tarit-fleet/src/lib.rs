@@ -1437,7 +1437,9 @@ mod tests {
             failed.next_attempt_at = Some(Utc::now() + chrono::Duration::seconds(3_600));
             failed.updated_at = Utc::now();
             if !fleet.save_acme_job(&failed, claimed.fence).await? {
-                return Err(FleetError::Config("failed ACME job save was rejected".into()));
+                return Err(FleetError::Config(
+                    "failed ACME job save was rejected".into(),
+                ));
             }
 
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1456,7 +1458,9 @@ mod tests {
             ready.next_attempt_at = Some(Utc::now() - chrono::Duration::seconds(10));
             ready.updated_at = Utc::now();
             if !fleet.save_acme_job(&ready, failed.fence).await? {
-                return Err(FleetError::Config("ready ACME job save was rejected".into()));
+                return Err(FleetError::Config(
+                    "ready ACME job save was rejected".into(),
+                ));
             }
 
             if fleet
