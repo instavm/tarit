@@ -20,13 +20,14 @@ mod share_gateway;
 mod shares;
 mod ssh_keys;
 mod supervisor;
+mod tls;
 mod usage;
 mod warmpool;
 
 use anyhow::Context;
 use api::{router, AppState};
 use clap::Parser;
-use config::Config;
+use config::{AcmeDnsProvider, Config};
 use peer::PeerClient;
 use scheduler::Scheduler;
 use std::collections::HashMap;
@@ -45,6 +46,8 @@ use tarit_fleet::PostgresFleet;
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const ACME_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const ACME_LEASE: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 struct ShutdownCoordinator {
@@ -106,6 +109,7 @@ fn init_tracing() {
 }
 
 async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing::info!(
         listen = %config.listen,
         host_id = %config.host_id,
@@ -118,6 +122,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     let ServerListeners {
         control,
         share,
+        share_tls,
         ssh,
     } = bind_server_listeners(&config).await?;
 
@@ -273,6 +278,69 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         metrics: Arc::new(metrics::Metrics::default()),
         share_runtime: Arc::clone(&share_runtime),
     };
+    let (app, share_app) = server_routers(state.clone());
+    let (acme_worker_handle, tls_server_handle) = if config.acme_enabled {
+        let fleet = state.fleet.clone().ok_or_else(|| {
+            anyhow::anyhow!("ACME requires TARIT_DATABASE_URL and a connected Postgres fleet")
+        })?;
+        let database_url = config.database_url.clone().ok_or_else(|| {
+            anyhow::anyhow!("ACME requires TARIT_DATABASE_URL and a connected Postgres fleet")
+        })?;
+        let acme_cfg = config.acme().expect("acme() is Some when acme_enabled");
+        let resolver = crate::acme::resolver::CertResolver::new();
+        let dns: Arc<dyn crate::acme::dns::DnsProvider> = match acme_cfg.provider {
+            AcmeDnsProvider::Cloudflare => {
+                let zone_id = config.acme_cloudflare_zone_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "TARIT_ACME_CLOUDFLARE_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
+                    )
+                })?;
+                let token = config.acme_cloudflare_api_token.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "TARIT_ACME_CLOUDFLARE_API_TOKEN must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
+                    )
+                })?;
+                Arc::new(crate::acme::dns::CloudflareDns::new(token, zone_id))
+            }
+            AcmeDnsProvider::Route53 => {
+                let zone_id = config.acme_route53_zone_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "TARIT_ACME_ROUTE53_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is route53"
+                    )
+                })?;
+                Arc::new(crate::acme::dns::Route53Dns::from_env(zone_id).await?)
+            }
+        };
+        let worker = crate::acme::manager::AcmeWorker::new(
+            fleet,
+            resolver.clone(),
+            dns,
+            acme_cfg,
+            database_url,
+            config.host_id.clone(),
+            ACME_RECONCILE_INTERVAL,
+            ACME_LEASE,
+        );
+        if let Err(error) = worker.refresh_cache_once().await {
+            tracing::warn!(
+                %error,
+                "initial ACME cache refresh failed; TLS will serve once a certificate is issued"
+            );
+        }
+
+        let acme_worker_handle = tokio::spawn(worker.run(shutdown_rx.clone()));
+        let tls_cfg = crate::tls::server_config(resolver.clone());
+        let tls_server_handle = share_tls.map(|listener| {
+            crate::tls::spawn_tls_server(listener, tls_cfg, share_app.clone(), shutdown_rx.clone())
+        });
+        (Some(acme_worker_handle), tls_server_handle)
+    } else {
+        if let Some(listener) = share_tls {
+            tracing::warn!("share TLS listener configured while ACME is disabled; not serving TLS");
+            drop(listener);
+        }
+        (None, None)
+    };
 
     // Start every background worker only after all listener binds succeeded.
     let store_writer = {
@@ -349,12 +417,13 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
             Some(usage_meter),
             outbox_flusher,
             Some(shutdown_signal_task),
+            acme_worker_handle,
+            tls_server_handle,
         ],
         warm_pool,
         autoscaler,
     );
 
-    let (app, share_app) = server_routers(state.clone());
     tracing::info!("control listener listening on http://{}", config.listen);
     if let Some(share_addr) = config.share_listen {
         tracing::info!("share listener listening on http://{}", share_addr);
@@ -391,11 +460,20 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
 struct ServerListeners {
     control: tokio::net::TcpListener,
     share: Option<tokio::net::TcpListener>,
+    share_tls: Option<tokio::net::TcpListener>,
     ssh: Option<tokio::net::TcpListener>,
 }
 
 async fn bind_server_listeners(config: &Config) -> anyhow::Result<ServerListeners> {
     let (control, share) = bind_http_listeners(config.listen, config.share_listen).await?;
+    let share_tls = match config.share_tls_listen {
+        Some(share_tls_addr) => Some(
+            tokio::net::TcpListener::bind(share_tls_addr)
+                .await
+                .with_context(|| format!("bind share TLS {share_tls_addr}"))?,
+        ),
+        None => None,
+    };
     let ssh = match config.ssh_gateway_enabled {
         true => Some(
             tokio::net::TcpListener::bind(config.ssh_gateway_addr)
@@ -407,6 +485,7 @@ async fn bind_server_listeners(config: &Config) -> anyhow::Result<ServerListener
     Ok(ServerListeners {
         control,
         share,
+        share_tls,
         ssh,
     })
 }

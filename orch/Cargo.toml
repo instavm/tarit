@@ -23,7 +23,7 @@ futures-util = "0.3"
 hmac = "0.12"
 hickory-resolver = "0.24.4"
 # MIT OR Apache-2.0 licensed — validated IP network parser
-hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 idna = "1"
 instant-acme = "0.8"
 ipnet = "2"

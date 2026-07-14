@@ -959,6 +959,14 @@ fn parse_acme_config(
             "TARIT_ACME_CLOUDFLARE_API_TOKEN must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
         );
     }
+    if dns_provider == AcmeDnsProvider::Cloudflare && cloudflare_zone_id.is_none() {
+        bail!(
+            "TARIT_ACME_CLOUDFLARE_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
+        );
+    }
+    if dns_provider == AcmeDnsProvider::Route53 && route53_zone_id.is_none() {
+        bail!("TARIT_ACME_ROUTE53_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is route53");
+    }
 
     Ok(ParsedAcmeConfig {
         enabled,
@@ -1155,7 +1163,7 @@ mod security_tests {
     }
 
     #[test]
-    fn acme_requires_domain_provider_kek_and_tls_listen() {
+    fn acme_requires_domain_provider_kek_tls_listen_and_provider_zone() {
         let kek = hex::encode([7u8; 32]);
         assert!(parse_acme_config(
             true, None, None, None, None, None, None, None, None, None, None,
@@ -1177,7 +1185,7 @@ mod security_tests {
         )
         .is_err());
 
-        let acme = parse_acme_config(
+        let cloudflare_without_zone = parse_acme_config(
             true,
             Some("postgres://tarit.example/tarit"),
             Some("shares.example.com"),
@@ -1189,8 +1197,44 @@ mod security_tests {
             None,
             None,
             Some(&kek),
+        );
+        assert_eq!(
+            cloudflare_without_zone.err().unwrap().to_string(),
+            "TARIT_ACME_CLOUDFLARE_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
+        );
+
+        let route53_without_zone = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("route53"),
+            None,
+            None,
+            None,
+            Some(&kek),
+        );
+        assert_eq!(
+            route53_without_zone.err().unwrap().to_string(),
+            "TARIT_ACME_ROUTE53_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is route53"
+        );
+
+        let acme = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            Some("zone-id"),
+            None,
+            Some(&kek),
         )
-        .expect("valid acme config");
+        .expect("valid ACME config");
         assert_eq!(acme.share_tls_listen, Some("0.0.0.0:8443".parse().unwrap()));
 
         let config = acme_test_config(true);
