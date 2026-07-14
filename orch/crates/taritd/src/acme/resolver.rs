@@ -40,7 +40,9 @@ impl CertStore {
         }
 
         let (base_domain, key) = self.wildcard.as_ref()?;
-        let label = sni.strip_suffix(&format!(".{base_domain}"))?;
+        let label = sni
+            .strip_suffix(base_domain)
+            .and_then(|prefix| prefix.strip_suffix('.'))?;
 
         (!label.is_empty() && !label.contains('.')).then(|| Arc::clone(key))
     }
