@@ -173,13 +173,16 @@ path_is_not_mountpoint() {
   local label="$2"
   local mount_status=0
 
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
   if mountpoint -q -- "$path"; then
     fail "$label must not be a mountpoint"
     return 1
   else
     mount_status=$?
   fi
-  [[ "$mount_status" == "1" || "$mount_status" == "32" ]] || {
+  [[ "$mount_status" == "1" ]] || {
     fail "could not determine whether $label is a mountpoint"
     return 1
   }
