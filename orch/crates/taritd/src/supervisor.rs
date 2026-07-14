@@ -3,6 +3,8 @@ use crate::net::{NetAlloc, NetProvisioner};
 use crate::scheduler::Scheduler;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -12,7 +14,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
 };
 use std::time::{Duration, Instant};
-use tarit_types::OrchError;
+use tarit_types::{OrchError, VmRecord, VmStatus};
 use tarit_vmm_client::{
     KernelConfig, MemoryConfig, NetConfig, ScratchIdentity, VcpuConfig, VmConfig, VmmClient,
     VolumeConfig,
@@ -34,6 +36,52 @@ fn graceful_stop_vmm(socket_path: &Path) {
     let _ = VmmClient::new(socket_path)
         .with_request_timeout(TEARDOWN_STOP_TIMEOUT)
         .stop();
+}
+
+/// Confirm that `pid` is a live VMM process that owns `socket_path`, guarding
+/// re-adoption against PID reuse. taritd launches every VMM with
+/// `serve --socket <socket_path>`, so the socket path must appear verbatim in
+/// the process command line; a recycled PID running something else will not
+/// match and is refused rather than adopted.
+fn verify_live_vmm(pid: u32, socket_path: &Path) -> Result<(), String> {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return Err(format!("VMM PID {pid} is not alive"));
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_err(|error| format!("read /proc/{pid}/cmdline: {error}"))?;
+    let owns_socket = cmdline
+        .split(|byte| *byte == 0)
+        .any(|arg| arg == socket_path.as_os_str().as_bytes());
+    if !owns_socket {
+        return Err(format!(
+            "PID {pid} does not own control socket {}; refusing to adopt a reused PID",
+            socket_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Pin the exact process instance behind `pid` with a pidfd. Once taritd holds
+/// this descriptor the kernel keeps the PID from being recycled, so a later
+/// SIGKILL through the pidfd can never land on an unrelated process that reused
+/// the number. Re-adoption runs only on Linux hosts; the non-Linux stub exists
+/// so the crate still builds on developer machines.
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as std::os::fd::RawFd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pidfd_open(_pid: u32) -> std::io::Result<OwnedFd> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "pidfd requires Linux",
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,7 +219,16 @@ impl Drop for NetworkLease {
 #[derive(Debug, Clone)]
 struct ManagedProcess {
     pid: u32,
-    child: Arc<Mutex<Child>>,
+    handle: ProcessHandle,
+}
+
+/// How the supervisor can terminate a VMM. A freshly spawned VMM is a child of
+/// this process and is reaped through its `Child` handle. A VMM re-adopted after
+/// a taritd restart was reparented to init, so taritd can only signal it by PID.
+#[derive(Debug, Clone)]
+enum ProcessHandle {
+    Owned(Arc<Mutex<Child>>),
+    Adopted(Arc<OwnedFd>),
 }
 
 /// A golden artifact claimed by the supervisor after the builder VMM releases
@@ -262,13 +319,37 @@ impl ManagedProcess {
         let pid = child.id();
         Self {
             pid,
-            child: Arc::new(Mutex::new(child)),
+            handle: ProcessHandle::Owned(Arc::new(Mutex::new(child))),
+        }
+    }
+
+    /// Track a VMM that survived a taritd restart. taritd is no longer its
+    /// parent, so it is identified and signalled through a pidfd that pins the
+    /// exact process instance rather than through a `Child` handle.
+    fn adopted(pid: u32, pidfd: OwnedFd) -> Self {
+        Self {
+            pid,
+            handle: ProcessHandle::Adopted(Arc::new(pidfd)),
+        }
+    }
+
+    #[cfg(test)]
+    fn owned_child(&self) -> &Arc<Mutex<Child>> {
+        match &self.handle {
+            ProcessHandle::Owned(child) => child,
+            ProcessHandle::Adopted(_) => panic!("adopted process has no owned child handle"),
         }
     }
 
     fn kill_wait(&self) -> Result<(), OrchError> {
-        let mut child = self
-            .child
+        match &self.handle {
+            ProcessHandle::Owned(child) => Self::kill_wait_owned(child),
+            ProcessHandle::Adopted(pidfd) => self.kill_wait_adopted(pidfd),
+        }
+    }
+
+    fn kill_wait_owned(child: &Arc<Mutex<Child>>) -> Result<(), OrchError> {
+        let mut child = child
             .lock()
             .map_err(|_| OrchError::Internal("VMM child lock poisoned".into()))?;
         if child
@@ -292,6 +373,95 @@ impl ManagedProcess {
             .wait()
             .map(|_| ())
             .map_err(|error| OrchError::Internal(format!("wait for VMM exit: {error}")))
+    }
+
+    /// Terminate a re-adopted VMM through its pidfd. Signalling the pidfd targets
+    /// the exact pinned process, so SIGKILL can never hit a PID that was recycled
+    /// after adoption. taritd is not the parent, so it polls the pidfd for exit
+    /// notification instead of reaping. A process that already exited counts as
+    /// terminated.
+    #[cfg(target_os = "linux")]
+    fn kill_wait_adopted(&self, pidfd: &OwnedFd) -> Result<(), OrchError> {
+        use std::os::fd::AsRawFd;
+        let fd = pidfd.as_raw_fd();
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                libc::SIGKILL,
+                std::ptr::null_mut::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(OrchError::Internal(format!(
+                "kill adopted VMM {}: {error}",
+                self.pid
+            )));
+        }
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(OrchError::Internal(format!(
+                    "adopted VMM {} did not exit after SIGKILL",
+                    self.pid
+                )));
+            }
+            let timeout_ms = remaining.as_millis().min(1000) as libc::c_int;
+            let rc = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(OrchError::Internal(format!(
+                    "await adopted VMM {} exit: {error}",
+                    self.pid
+                )));
+            }
+            if rc > 0 && (poll_fd.revents & libc::POLLIN) != 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn kill_wait_adopted(&self, _pidfd: &OwnedFd) -> Result<(), OrchError> {
+        let pid = self.pid as libc::pid_t;
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return Ok(());
+        }
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(OrchError::Internal(format!(
+                "kill adopted VMM {pid}: {error}"
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(OrchError::Internal(format!(
+                    "adopted VMM {pid} did not exit after SIGKILL"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -2255,6 +2425,116 @@ impl VmmSupervisor {
         take_matching_artifacts(&mut registered, keys)
     }
 
+    /// Re-adopt VMs that were left running when this taritd instance restarted
+    /// (reap disabled). `NetProvisioner` recovery already reconciled their
+    /// network policy; this restores the control-plane handle so exec, pause,
+    /// snapshot, and delete work again. VMs whose VMM process is gone or does
+    /// not match the persisted socket (PID reuse), whose control socket is
+    /// missing, or whose network allocation cannot be recovered are torn down
+    /// and their ids returned so the caller can mark them terminal. The API must
+    /// never report an uncontrollable VM as running.
+    pub async fn readopt_running_vms(&self, records: &[VmRecord]) -> Vec<Uuid> {
+        let mut failed = Vec::new();
+        for record in records {
+            match self.readopt_one(record).await {
+                Ok(true) => {
+                    tracing::info!(vm = %record.id, pid = record.pid.unwrap_or(0),
+                        "re-adopted running VM after restart");
+                }
+                Ok(false) => {}
+                Err(reason) => {
+                    tracing::warn!(vm = %record.id, reason = %reason,
+                        "cannot re-adopt VM after restart; tearing down its network and marking it failed");
+                    if let Some(net) = &self.net {
+                        if let Err(error) = net.teardown_vm_id(record.id) {
+                            tracing::error!(vm = %record.id, %error,
+                                "failed to tear down network for unadoptable VM");
+                        }
+                    }
+                    failed.push(record.id);
+                }
+            }
+        }
+        failed
+    }
+
+    /// Attempt to re-adopt a single persisted VM. Returns `Ok(true)` on success,
+    /// `Ok(false)` when the record is not a locally running VM (nothing to do),
+    /// and `Err` when the VM existed here but can no longer be controlled. When a
+    /// VMM is positively identified as ours but cannot be managed, it is
+    /// terminated through its pinned pidfd so no unmanaged VMM is left running.
+    async fn readopt_one(&self, record: &VmRecord) -> Result<bool, String> {
+        if record.host_id != self.config.host_id
+            || !matches!(record.status, VmStatus::Running | VmStatus::Paused)
+        {
+            return Ok(false);
+        }
+        let pid = record.pid.ok_or("persisted VM has no PID")?;
+        let socket_path = PathBuf::from(
+            record
+                .socket_path
+                .clone()
+                .ok_or("persisted VM has no control socket path")?,
+        );
+        // Pin the process before any /proc inspection so the PID cannot be
+        // recycled between verification and adoption. If the process is already
+        // gone there is nothing to adopt.
+        let pidfd =
+            pidfd_open(pid).map_err(|error| format!("pin VMM {pid} for adoption: {error}"))?;
+        // Confirm identity while pinned. A failure here means the process is not
+        // our VMM (or is already gone), so it must not be signalled.
+        verify_live_vmm(pid, &socket_path)?;
+        let process = ManagedProcess::adopted(pid, pidfd);
+        // Identity is confirmed. Any failure below leaves a live, taritd-owned
+        // VMM that the control plane cannot manage, so terminate it through the
+        // pinned pidfd before marking the VM terminal.
+        let recovered: Result<Option<NetAlloc>, String> = 'recover: {
+            if !socket_path.exists() {
+                break 'recover Err(format!(
+                    "control socket {} is absent",
+                    socket_path.display()
+                ));
+            }
+            match &self.net {
+                None => Ok(None),
+                Some(provisioner) => match provisioner.allocation_for_vm(record.id) {
+                    Err(error) => Err(error.to_string()),
+                    Ok(None) => {
+                        Err("network is enabled but the VM has no recovered allocation".to_string())
+                    }
+                    Ok(Some(alloc)) => Ok(Some(alloc)),
+                },
+            }
+        };
+        let net = match recovered {
+            Ok(net) => net,
+            Err(reason) => {
+                if let Err(error) = process.kill_wait() {
+                    tracing::error!(vm = %record.id, %error,
+                        "failed to terminate unadoptable VMM after adoption failed");
+                }
+                return Err(reason);
+            }
+        };
+        let vm = RunningVm {
+            pid,
+            socket_path,
+            process,
+            net,
+        };
+        let _gate = self.boot_gate.lock().await;
+        self.reservations
+            .lock()
+            .map_err(|_| "supervisor reservation lock poisoned".to_string())?
+            .insert(record.id);
+        self.scheduler.on_local_vm_started();
+        self.running
+            .lock()
+            .map_err(|_| "supervisor running lock poisoned".to_string())?
+            .insert(record.id, vm);
+        Ok(true)
+    }
+
     fn client_for(&self, id: Uuid) -> Result<VmmClient, OrchError> {
         let guard = self
             .running
@@ -3032,6 +3312,92 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_live_vmm_accepts_process_owning_the_socket() {
+        let socket = std::env::temp_dir().join(format!("tarit-adopt-{}.sock", Uuid::new_v4()));
+        // A shell that stays alive and carries the socket path in its argv, the
+        // way taritd launches `vmm serve --socket <path>`. `read` is a builtin,
+        // so the shell does not exec-optimize into another program (which would
+        // drop the socket from argv), and it blocks on the piped stdin we keep
+        // open, so the process stays alive until we kill it.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg(&socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn stand-in VMM");
+        // /proc/<pid>/cmdline can read empty for a brief window right after exec
+        // under parallel-test load, so retry until the argv is published.
+        let mut result = Err(String::from("verify not attempted"));
+        for _ in 0..200 {
+            result = verify_live_vmm(child.id(), &socket);
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            result.is_ok(),
+            "owner process must be adoptable: {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_live_vmm_rejects_pid_that_does_not_own_the_socket() {
+        let socket = std::env::temp_dir().join(format!("tarit-adopt-{}.sock", Uuid::new_v4()));
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unrelated process");
+        let result = verify_live_vmm(child.id(), &socket);
+        let _ = child.kill();
+        let _ = child.wait();
+        let error = result.expect_err("a reused PID must not be adopted");
+        assert!(error.contains("does not own"), "unexpected error: {error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_live_vmm_rejects_dead_pid() {
+        let mut child = Command::new("true")
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        child.wait().expect("reap short-lived process");
+        let socket = std::env::temp_dir().join("tarit-adopt-dead.sock");
+        let error = verify_live_vmm(pid, &socket).expect_err("dead PID must not be adopted");
+        assert!(error.contains("not alive"), "unexpected error: {error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_wait_adopted_treats_absent_pid_as_terminated() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        let pidfd = pidfd_open(pid).expect("pin child with pidfd");
+        child.kill().expect("kill child");
+        child.wait().expect("reap short-lived process");
+        // The process is gone, so signalling the pinned pidfd reports ESRCH and
+        // terminating the adopted handle is a no-op.
+        ManagedProcess::adopted(pid, pidfd)
+            .kill_wait()
+            .expect("terminating an already-exited adopted VMM must succeed");
+    }
+
     fn supervisor_config(root: &Path) -> Config {
         Config {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -3213,7 +3579,7 @@ mod tests {
                         stream.read_exact(&mut body).expect("read request body");
                         let request = serde_json::from_slice(&body).expect("decode request");
                         let child_alive = process_for_liveness_check
-                            .child
+                            .owned_child()
                             .lock()
                             .expect("lock child")
                             .try_wait()
@@ -3274,7 +3640,7 @@ mod tests {
         server.join().expect("join test VMM server");
         assert!(
             process_for_assertion
-                .child
+                .owned_child()
                 .lock()
                 .expect("lock child")
                 .try_wait()

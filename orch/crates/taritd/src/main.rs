@@ -148,6 +148,26 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         )
         .context("initialize fail-closed network recovery")?,
     );
+
+    // Re-adopt VMs that survived this restart so the control plane can manage
+    // them again. Their network policy was reconciled during supervisor
+    // construction; this restores the exec/pause/snapshot/delete path. VMs that
+    // can no longer be controlled (dead or reused PID, missing socket, or
+    // missing network allocation) are marked terminal so the API never reports
+    // an uncontrollable VM as running. Persisting that terminal state is
+    // mandatory: if it fails, startup aborts rather than serve stale durable
+    // Running/Paused records for VMs that no longer exist.
+    let unadoptable: std::collections::HashSet<Uuid> = {
+        let ids = supervisor.readopt_running_vms(&persisted_vms).await;
+        for id in &ids {
+            store
+                .update_vm_status(*id, VmStatus::Error)
+                .map_err(|error| {
+                    anyhow::anyhow!("persist terminal status for unadoptable VM {id}: {error}")
+                })?;
+        }
+        ids.into_iter().collect()
+    };
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio
     // context panics on current tokio ("Cannot drop a runtime ... from within
@@ -185,7 +205,10 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         Arc::new(RwLock::new(HashMap::new()));
     {
         let mut c = vm_cache.write().unwrap();
-        for vm in persisted_vms {
+        for mut vm in persisted_vms {
+            if unadoptable.contains(&vm.id) {
+                vm.status = VmStatus::Error;
+            }
             c.insert(vm.id, vm);
         }
     }
