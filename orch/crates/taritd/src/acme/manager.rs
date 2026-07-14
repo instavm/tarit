@@ -314,6 +314,7 @@ impl AcmeWorker {
     async fn record_failure(&self, job: &AcmeJob, error: ManagerError) {
         let mut updated = job.clone();
         updated.state = AcmeJobState::Failed;
+        updated.order_url = None;
         updated.attempt = updated.attempt.saturating_add(1);
         let attempt = u32::try_from(job.attempt).unwrap_or(u32::MAX);
         let retry_seconds = i64::try_from(backoff_after(attempt).as_secs()).unwrap_or(3_600);
