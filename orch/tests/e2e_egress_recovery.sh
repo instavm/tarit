@@ -335,6 +335,7 @@ export TARIT_ROOTFS="$ROOTFS"
 export TARIT_ROOTFS_READONLY="0"
 export TARIT_ENABLE_NET="1"
 export TARIT_MAX_VMS="2"
+export TARIT_REAP_ON_SHUTDOWN="0"
 export TARIT_SOCKET_DIR="$RUN_DIR/sockets"
 export TARIT_DB="$RUN_DIR/fleet.db"
 export TARIT_NET_STATE="$RUN_DIR/net.json"
@@ -691,7 +692,7 @@ recognized_managed_cleanup_rule() {
         [[ "$rule" == "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop comment \"taritd-guard $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" ip saddr $guest oifname != \"$uplink\" drop comment \"taritd-guard $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" ip saddr $guest ct state established,related accept comment \"taritd-egress $tag\"" ]] ||
-        [[ "$rule" == "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress $tag\"" ]] ||
+        [[ "$rule" == "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" ip saddr $guest drop comment \"taritd-egress $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-recovery-quarantine $tag\"" ]] ||
         [[ "$rule" == "iifname \"$tap\" drop comment \"taritd-egress-update-quarantine $tag\"" ]]
@@ -1011,16 +1012,23 @@ guest_ip_for_tap() {
 
 run_guest() {
   local vm_id=$1 command=$2 reply
-  reply=$("$TARIT" --json exec "$vm_id" "$command") ||
-    fail "guest command could not be executed for $vm_id: $command"
+  # The CLI exits with the guest command's exit code, so a nonzero guest
+  # status makes the command substitution return nonzero even though the
+  # command ran. Capture the JSON record regardless and derive the guest
+  # status from it; only a missing or unparseable record means the command
+  # could not be executed.
+  reply=$("$TARIT" --json exec "$vm_id" "$command") || true
   GUEST_STATUS=$(printf '%s' "$reply" | python3 -c '
 import json, sys
-record = json.load(sys.stdin)
+try:
+    record = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit("no execution record returned")
 status = record.get("exit_code")
 if status is None:
     raise SystemExit("missing guest exit code: " + json.dumps(record))
 print(status)
-')
+') || fail "guest command could not be executed for $vm_id: $command"
 }
 
 expect_guest_success() {
@@ -1159,7 +1167,7 @@ assert_closed_tarit_chain_for_tap() {
       "vm_egress:iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop:taritd-guard slot=${tap#insta} vm=$vm_id tap=$tap"|\
       "vm_egress:iifname \"$tap\" ip saddr $guest oifname != \"$uplink\" drop:taritd-guard slot=${tap#insta} vm=$vm_id tap=$tap"|\
       "vm_egress:iifname \"$tap\" ip saddr $guest ct state established,related accept:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
-      "vm_egress:iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
+      "vm_egress:iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP tcp dport $EGRESS_TEST_PORT accept:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
       "vm_egress:iifname \"$tap\" ip saddr $guest drop:taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap"|\
       "vm_input:iifname \"$tap\" ip saddr != $guest counter drop:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap"|\
       "vm_input:iifname \"$tap\" ct state established,related accept:taritd-input slot=${tap#insta} vm=$vm_id tap=$tap"|\
@@ -1192,7 +1200,7 @@ assert_egress_rule_order() {
     "iifname \"$tap\" ip saddr $guest ct state established,related accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
     <<<"$listing" | head -1 | cut -d: -f1)
   allow=$(grep -nF \
-    "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
+    "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
     <<<"$listing" | head -1 | cut -d: -f1)
   deny=$(grep -nF \
     "iifname \"$tap\" ip saddr $guest drop comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"" \
@@ -1204,7 +1212,7 @@ assert_egress_rule_order() {
     [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest ip daddr 172.16.0.0/16 drop")" = 1 ] &&
     [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest oifname !=")" = 1 ] &&
     [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest ct state established,related accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] &&
-    [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP/32 tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] &&
+    [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest ip daddr $EGRESS_TEST_IP tcp dport $EGRESS_TEST_PORT accept comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] &&
     [ "$(count_rule "$listing" "iifname \"$tap\" ip saddr $guest drop comment \"taritd-egress slot=${tap#insta} vm=$vm_id tap=$tap\"")" = 1 ] ||
     fail "duplicate required egress policy rule for $tap"
   [ "$source" -lt "$stateful" ] && [ "$lateral" -lt "$stateful" ] &&
@@ -1398,7 +1406,7 @@ STALE_VM_A=$(cat /proc/sys/kernel/random/uuid) ||
   fail "restart sentinel identity unexpectedly matches the current VM"
 nft add rule ip taritd_nat vm_egress \
   iifname "$TAP_A" ip saddr "$GUEST_A" drop \
-  comment "taritd-egress slot=${TAP_A#insta} vm=$STALE_VM_A tap=$TAP_A"
+  comment "\"taritd-egress slot=${TAP_A#insta} vm=$STALE_VM_A tap=$TAP_A\""
 
 stop_taritd
 start_taritd

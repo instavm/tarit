@@ -2523,7 +2523,7 @@ fn parse_egress_entry(entry: &str) -> Result<(String, u16, Option<&'static str>)
         Some((cidr, rest)) => (cidr, Some(rest)),
         None => (entry, None),
     };
-    let cidr = parse_ipv4_egress_cidr(cidr, entry)?.to_string();
+    let cidr = nft_ipv4_daddr(parse_ipv4_egress_cidr(cidr, entry)?);
     let Some(port_proto) = port_proto else {
         return Ok((cidr, 0, None));
     };
@@ -2565,6 +2565,18 @@ fn parse_ipv4_egress_cidr(cidr: &str, entry: &str) -> Result<Ipv4Net, OrchError>
                 "bad egress rule {entry:?}: invalid IPv4 CIDR {cidr:?}"
             ))),
         },
+    }
+}
+
+/// Render an IPv4 network the way nft canonicalizes it on `list`, so generated
+/// rule text matches the kernel's stored form during activation verification.
+/// nft prints a /32 host address without its prefix length, so emit the bare
+/// address for /32 and keep the prefix for shorter masks.
+fn nft_ipv4_daddr(net: Ipv4Net) -> String {
+    if net.prefix_len() == 32 {
+        net.addr().to_string()
+    } else {
+        net.to_string()
     }
 }
 
@@ -4427,7 +4439,7 @@ esac
                     "172.16.0.2",
                     "ip",
                     "daddr",
-                    "198.51.100.10/32",
+                    "198.51.100.10",
                     "tcp",
                     "dport",
                     "443",
@@ -4463,11 +4475,11 @@ esac
         );
         assert_eq!(
             parse_egress_entry("1.2.3.4:443").unwrap(),
-            ("1.2.3.4/32".to_string(), 443, Some("tcp"))
+            ("1.2.3.4".to_string(), 443, Some("tcp"))
         );
         assert_eq!(
             parse_egress_entry("8.8.8.8:53/udp").unwrap(),
-            ("8.8.8.8/32".to_string(), 53, Some("udp"))
+            ("8.8.8.8".to_string(), 53, Some("udp"))
         );
         assert!(parse_egress_entry("").is_err());
         assert!(parse_egress_entry(":443").is_err());
@@ -4535,9 +4547,7 @@ esac
             .any(|w| w == ["ip", "daddr", "192.0.2.0/24"]));
 
         let host = compile_host_egress_rule(&alloc, "192.0.2.42", "\"c\"").unwrap();
-        assert!(host
-            .windows(3)
-            .any(|w| w == ["ip", "daddr", "192.0.2.42/32"]));
+        assert!(host.windows(3).any(|w| w == ["ip", "daddr", "192.0.2.42"]));
     }
 
     #[test]
@@ -4846,7 +4856,7 @@ case "${0##*/}:$*" in
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 13"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 14"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 15"
-      echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10/32 tcp dport 443 accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 16"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10 tcp dport 443 accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 16"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 17"
     fi
     ;;
@@ -4986,7 +4996,7 @@ esac
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept",
-            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10/32 tcp dport 443 accept",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10 tcp dport 443 accept",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 drop",
             "nft add rule ip taritd_nat vm_input iifname \"insta7\" ip saddr != 172.16.0.30 counter drop",
             "nft add rule ip taritd_nat vm_input iifname \"insta7\" ct state established,related accept",
@@ -5676,7 +5686,7 @@ esac
                 "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"{}\" # handle 42\n",
                 "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"{}\" # handle 43\n",
                 "iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept comment \"{}\" # handle 44\n",
-                "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10/32 tcp dport 443 accept comment \"{}\" # handle 45\n",
+                "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10 tcp dport 443 accept comment \"{}\" # handle 45\n",
                 "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"{}\" # handle 46\n",
             ),
             guard_comment(&alloc),
@@ -5746,7 +5756,7 @@ esac
             .unwrap();
         let stateful = script.find("ct state established,related accept").unwrap();
         let allow = script
-            .find("ip daddr 198.51.100.10/32 tcp dport 443 accept")
+            .find("ip daddr 198.51.100.10 tcp dport 443 accept")
             .unwrap();
         let deny = script
             .rfind("iifname \"insta7\" ip saddr 172.16.0.30 drop")
@@ -5967,7 +5977,7 @@ forward_rules() {
   echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 13"
   if [ -e "$TARIT_TEST_STATE.replaced" ]; then
     echo "iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 21"
-    echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10/32 tcp dport 443 accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 22"
+    echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10 tcp dport 443 accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 22"
     echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 23"
   else
     echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 55"
@@ -6074,10 +6084,10 @@ esac
                     .find("ct state established,related accept")
                     .unwrap()
                     < replacement
-                        .find("ip daddr 198.51.100.10/32 tcp dport 443 accept")
+                        .find("ip daddr 198.51.100.10 tcp dport 443 accept")
                         .unwrap()
                 && replacement
-                    .find("ip daddr 198.51.100.10/32 tcp dport 443 accept")
+                    .find("ip daddr 198.51.100.10 tcp dport 443 accept")
                     .unwrap()
                     < replacement
                         .rfind("iifname \"insta7\" ip saddr 172.16.0.30 drop")
@@ -6257,8 +6267,8 @@ esac
             ("forward", "ip daddr 172.16.0.0/16 drop"),
             ("forward", "oifname != \"eth0\" drop"),
             ("forward", "ct state established,related accept"),
-            ("forward", "ip daddr 198.51.100.10/32 tcp dport 443 accept"),
-            ("forward", "ip daddr 203.0.113.20/32 udp dport 53 accept"),
+            ("forward", "ip daddr 198.51.100.10 tcp dport 443 accept"),
+            ("forward", "ip daddr 203.0.113.20 udp dport 53 accept"),
             ("forward", "ip saddr 172.16.0.30 drop"),
             ("input", "ip saddr != 172.16.0.30 counter drop"),
             ("input", "ct state established,related accept"),
@@ -6300,8 +6310,8 @@ esac
             ("forward", "ip daddr 172.16.0.0/16 drop"),
             ("forward", "oifname != \"eth0\" drop"),
             ("forward", "ct state established,related accept"),
-            ("forward", "ip daddr 198.51.100.10/32 tcp dport 443 accept"),
-            ("forward", "ip daddr 203.0.113.20/32 udp dport 53 accept"),
+            ("forward", "ip daddr 198.51.100.10 tcp dport 443 accept"),
+            ("forward", "ip daddr 203.0.113.20 udp dport 53 accept"),
             ("forward", "ip saddr 172.16.0.30 drop"),
             ("input", "ip saddr != 172.16.0.30 counter drop"),
             ("input", "ct state established,related accept"),
@@ -6341,12 +6351,12 @@ esac
             ("forward", "ct state established,related accept", false),
             (
                 "forward",
-                "ip daddr 198.51.100.10/32 tcp dport 443 accept",
+                "ip daddr 198.51.100.10 tcp dport 443 accept",
                 false,
             ),
             (
                 "forward",
-                "ip daddr 203.0.113.20/32 udp dport 53 accept",
+                "ip daddr 203.0.113.20 udp dport 53 accept",
                 false,
             ),
             ("forward", "ip saddr 172.16.0.30 drop", false),
