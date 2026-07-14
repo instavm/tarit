@@ -1,3 +1,5 @@
+#[allow(dead_code)] // Consumed by the ACME runtime added in subsequent tasks.
+mod acme;
 mod api;
 mod audit;
 mod autoscale;

@@ -4019,6 +4019,7 @@ dependencies = [
  "instant-acme",
  "ipnet",
  "libc",
+ "rand 0.9.5",
  "rcgen",
  "reqwest",
  "russh",

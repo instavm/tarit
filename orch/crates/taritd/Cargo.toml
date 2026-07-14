@@ -27,6 +27,7 @@ idna = { workspace = true }
 instant-acme = { workspace = true }
 ipnet = { workspace = true }
 rcgen = { workspace = true }
+rand = "0.9"
 tarit-fleet = { path = "../tarit-fleet" }
 tarit-store = { path = "../tarit-store" }
 tarit-types = { path = "../tarit-types" }
