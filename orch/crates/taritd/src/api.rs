@@ -3056,6 +3056,15 @@ mod tests {
             share_token_ttl_secs: 300,
             share_connect_timeout_ms: 10_000,
             share_idle_timeout_secs: 300,
+            acme_enabled: false,
+            acme_directory_url: "https://acme-v02.api.letsencrypt.org/directory".into(),
+            acme_contact_email: None,
+            acme_dns_provider: None,
+            acme_cloudflare_api_token: None,
+            acme_cloudflare_zone_id: None,
+            acme_route53_zone_id: None,
+            acme_kek: None,
+            share_tls_listen: None,
         };
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = ShareRepository::new(Arc::clone(&store), None);
