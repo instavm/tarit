@@ -506,6 +506,23 @@ impl NetProvisioner {
             .collect())
     }
 
+    /// Return the recovered network allocation for a single VM, if one is
+    /// persisted. Used when re-adopting VMs after a taritd restart so the
+    /// supervisor can attach the recovered TAP/IP to the running VM handle.
+    pub fn allocation_for_vm(&self, vm_id: Uuid) -> Result<Option<NetAlloc>, OrchError> {
+        let slot = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?
+            .by_vm
+            .get(&vm_id)
+            .copied();
+        match slot {
+            Some(slot) => Ok(Some(NetAlloc::for_slot(vm_id, slot)?)),
+            None => Ok(None),
+        }
+    }
+
     fn ensure_provisioning_available(&self) -> Result<(), OrchError> {
         if self.fail_closed.load(Ordering::SeqCst) {
             Err(OrchError::Internal(
