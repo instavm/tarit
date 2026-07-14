@@ -1118,9 +1118,7 @@ fn require_share_token_key(
     token_key: Option<[u8; 32]>,
 ) -> Result<()> {
     if (plaintext_listen.is_some() || tls_listen.is_some()) && token_key.is_none() {
-        bail!(
-            "TARIT_SHARE_TOKEN_KEY must decode to exactly 32 bytes when a share listener is enabled"
-        );
+        bail!("TARIT_SHARE_TOKEN_KEY is required when a share listener is enabled");
     }
     Ok(())
 }
