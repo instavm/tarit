@@ -2,8 +2,10 @@ use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use hickory_resolver::{
-    config::{NameServerConfigGroup, ResolverConfig, ResolverOpts},
-    TokioAsyncResolver,
+    config::{NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts},
+    net::runtime::TokioRuntimeProvider,
+    proto::rr::RData,
+    TokioResolver,
 };
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -108,7 +110,7 @@ pub enum DnsError {
     #[error("Route53 change was not found")]
     Route53ChangeNotFound,
     #[error("DNS lookup failed")]
-    Lookup(#[source] hickory_resolver::error::ResolveError),
+    Lookup(#[source] hickory_resolver::net::NetError),
     #[error("DNS propagation timed out for {fqdn}")]
     PropagationTimeout { fqdn: String },
 }
@@ -128,16 +130,23 @@ pub trait TxtResolver: Send + Sync {
 struct HickoryTxtResolver;
 
 impl HickoryTxtResolver {
-    fn bootstrap_resolver() -> TokioAsyncResolver {
-        TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
-            TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())
-        })
+    fn bootstrap_resolver() -> TokioResolver {
+        TokioResolver::builder_tokio()
+            .and_then(|builder| builder.build())
+            .unwrap_or_else(|_| {
+                TokioResolver::builder_with_config(
+                    ResolverConfig::default(),
+                    TokioRuntimeProvider::default(),
+                )
+                .build()
+                .expect("default resolver configuration is always valid")
+            })
     }
 
     async fn authoritative_resolver(
-        bootstrap: &TokioAsyncResolver,
+        bootstrap: &TokioResolver,
         fqdn: &str,
-    ) -> Option<TokioAsyncResolver> {
+    ) -> Option<TokioResolver> {
         let mut candidate = fqdn.trim_end_matches('.');
 
         for _ in 0..MAX_AUTHORITATIVE_NS_LOOKUPS {
@@ -146,8 +155,14 @@ impl HickoryTxtResolver {
             }
 
             if let Ok(nameservers) = bootstrap.ns_lookup(candidate).await {
-                let nameservers: Vec<String> =
-                    nameservers.iter().map(ToString::to_string).collect();
+                let nameservers: Vec<String> = nameservers
+                    .answers()
+                    .iter()
+                    .filter_map(|record| match &record.data {
+                        RData::NS(ns) => Some(ns.0.to_string()),
+                        _ => None,
+                    })
+                    .collect();
                 if !nameservers.is_empty() {
                     let mut addresses = Vec::new();
                     for nameserver in nameservers {
@@ -160,7 +175,13 @@ impl HickoryTxtResolver {
 
                     if !addresses.is_empty() {
                         let (config, options) = authoritative_resolver_configuration(&addresses);
-                        return Some(TokioAsyncResolver::tokio(config, options));
+                        return TokioResolver::builder_with_config(
+                            config,
+                            TokioRuntimeProvider::default(),
+                        )
+                        .with_options(options)
+                        .build()
+                        .ok();
                     }
 
                     return None;
@@ -178,14 +199,18 @@ impl HickoryTxtResolver {
 }
 
 fn authoritative_resolver_configuration(ips: &[IpAddr]) -> (ResolverConfig, ResolverOpts) {
-    let config = ResolverConfig::from_parts(
-        None,
-        vec![],
-        NameServerConfigGroup::from_ips_clear(ips, 53, false),
-    );
+    let name_servers = ips
+        .iter()
+        .map(|ip| {
+            let mut server = NameServerConfig::udp_and_tcp(*ip);
+            server.trust_negative_responses = false;
+            server
+        })
+        .collect();
+    let config = ResolverConfig::from_parts(None, vec![], name_servers);
     let mut options = ResolverOpts::default();
     options.cache_size = 0;
-    options.use_hosts_file = false;
+    options.use_hosts_file = ResolveHosts::Never;
     options.recursion_desired = false;
 
     (config, options)
@@ -206,10 +231,14 @@ impl TxtResolver for HickoryTxtResolver {
         .map_err(DnsError::Lookup)?;
 
         Ok(lookup
+            .answers()
             .iter()
-            .map(|record| {
-                record
-                    .txt_data()
+            .filter_map(|record| match &record.data {
+                RData::TXT(txt) => Some(txt),
+                _ => None,
+            })
+            .map(|txt| {
+                txt.txt_data
                     .iter()
                     .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                     .collect()
@@ -736,21 +765,23 @@ mod tests {
             authoritative_resolver_configuration(&[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
 
         assert_eq!(options.cache_size, 0);
-        assert!(!options.use_hosts_file);
+        assert!(matches!(
+            options.use_hosts_file,
+            hickory_resolver::config::ResolveHosts::Never
+        ));
         assert!(!options.recursion_desired);
-        assert_eq!(config.name_servers().len(), 2);
-        assert!(config
-            .name_servers()
+        assert_eq!(config.name_servers().len(), 1);
+        let server = &config.name_servers()[0];
+        assert!(!server.trust_negative_responses);
+        assert!(server
+            .connections
             .iter()
-            .any(|server| server.protocol == hickory_resolver::config::Protocol::Udp));
-        assert!(config
-            .name_servers()
+            .any(|conn| conn.protocol == hickory_resolver::config::ProtocolConfig::Udp));
+        assert!(server
+            .connections
             .iter()
-            .any(|server| server.protocol == hickory_resolver::config::Protocol::Tcp));
-        assert!(config
-            .name_servers()
-            .iter()
-            .all(|server| server.socket_addr.port() == 53));
+            .any(|conn| conn.protocol == hickory_resolver::config::ProtocolConfig::Tcp));
+        assert!(server.connections.iter().all(|conn| conn.port == 53));
     }
 
     #[test]

@@ -1,5 +1,4 @@
 use std::{
-    io::BufReader,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -9,7 +8,11 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rand::{rng, Rng};
-use rustls::{crypto::ring::sign::any_supported_type, sign::CertifiedKey};
+use rustls::{
+    crypto::ring::sign::any_supported_type,
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+    sign::CertifiedKey,
+};
 use tarit_fleet::{AcmeJob, AcmeJobState, CertRecord, FleetError, PostgresFleet};
 use tokio::{
     sync::{oneshot, watch},
@@ -377,18 +380,14 @@ fn certified_key_from_pem(
     cert_pem: &str,
     key_pem: &[u8],
 ) -> Result<Arc<CertifiedKey>, ManagerError> {
-    let mut certificate_reader = BufReader::new(cert_pem.as_bytes());
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+    let certificates = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ManagerError::Pem)?;
     if certificates.is_empty() {
         return Err(ManagerError::Pem);
     }
 
-    let mut key_reader = BufReader::new(key_pem);
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|_| ManagerError::Pem)?
-        .ok_or(ManagerError::Pem)?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|_| ManagerError::Pem)?;
     let signing_key = any_supported_type(&key).map_err(ManagerError::PrivateKey)?;
     Ok(Arc::new(CertifiedKey::new(certificates, signing_key)))
 }

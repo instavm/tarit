@@ -30,7 +30,6 @@ ipnet = { workspace = true }
 rcgen = { workspace = true }
 rand = "0.9"
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 tarit-fleet = { path = "../tarit-fleet" }
 tarit-store = { path = "../tarit-store" }
 tarit-types = { path = "../tarit-types" }
@@ -52,8 +51,6 @@ uuid = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
-aws-smithy-runtime = { workspace = true }
-aws-smithy-types = { workspace = true }
 hex = "0.4"
 tower = { version = "0.5", features = ["util"] }
 
