@@ -173,8 +173,8 @@ database, so every node serves the same certificate. Account and certificate
 private keys are envelope-encrypted at rest with `TARIT_ACME_KEK`; the database
 never holds plaintext key material. A single node holds a fenced job lease at a
 time, so exactly one node issues or renews while the others load the result from
-the fleet and refresh when notified. Renewal is automatic, ARI-aware when the CA
-advertises it, and otherwise begins at one third of the certificate lifetime.
+the fleet and refresh when notified. Renewal is automatic and begins once two
+thirds of the certificate lifetime has elapsed.
 
 Binding `TARIT_SHARE_TLS_LISTEN` to port 443 requires the `CAP_NET_BIND_SERVICE`
 capability or running as root. A high, firewalled port behind a load balancer
