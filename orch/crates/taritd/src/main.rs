@@ -300,7 +300,14 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
                         "TARIT_ACME_CLOUDFLARE_API_TOKEN must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
                     )
                 })?;
-                Arc::new(crate::acme::dns::CloudflareDns::new(token, zone_id))
+                match &config.acme_cloudflare_api_base {
+                    Some(api_base) => Arc::new(crate::acme::dns::CloudflareDns::with_base(
+                        token,
+                        zone_id,
+                        api_base.clone(),
+                    )),
+                    None => Arc::new(crate::acme::dns::CloudflareDns::new(token, zone_id)),
+                }
             }
             AcmeDnsProvider::Route53 => {
                 let zone_id = config.acme_route53_zone_id.clone().ok_or_else(|| {
@@ -1537,6 +1544,7 @@ mod tests {
             acme_dns_provider: None,
             acme_cloudflare_api_token: None,
             acme_cloudflare_zone_id: None,
+            acme_cloudflare_api_base: None,
             acme_route53_zone_id: None,
             acme_kek: None,
             share_tls_listen: None,

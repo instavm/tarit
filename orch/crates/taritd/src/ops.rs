@@ -1807,6 +1807,7 @@ mod tests {
             acme_dns_provider: None,
             acme_cloudflare_api_token: None,
             acme_cloudflare_zone_id: None,
+            acme_cloudflare_api_base: None,
             acme_route53_zone_id: None,
             acme_kek: None,
             share_tls_listen: None,

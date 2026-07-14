@@ -597,6 +597,7 @@ pub struct Config {
     pub acme_dns_provider: Option<AcmeDnsProvider>,
     pub acme_cloudflare_api_token: Option<String>,
     pub acme_cloudflare_zone_id: Option<String>,
+    pub acme_cloudflare_api_base: Option<String>,
     pub acme_route53_zone_id: Option<String>,
     pub acme_kek: Option<[u8; 32]>,
     pub share_tls_listen: Option<SocketAddr>,
@@ -748,6 +749,7 @@ impl Config {
             env::var("TARIT_ACME_DNS_PROVIDER").ok().as_deref(),
             env::var("TARIT_ACME_CLOUDFLARE_API_TOKEN").ok().as_deref(),
             env::var("TARIT_ACME_CLOUDFLARE_ZONE_ID").ok().as_deref(),
+            env::var("TARIT_ACME_CLOUDFLARE_API_BASE").ok().as_deref(),
             env::var("TARIT_ACME_ROUTE53_ZONE_ID").ok().as_deref(),
             env::var("TARIT_ACME_KEK").ok().as_deref(),
         )?;
@@ -796,6 +798,7 @@ impl Config {
             acme_dns_provider: acme_config.dns_provider,
             acme_cloudflare_api_token: acme_config.cloudflare_api_token,
             acme_cloudflare_zone_id: acme_config.cloudflare_zone_id,
+            acme_cloudflare_api_base: acme_config.cloudflare_api_base,
             acme_route53_zone_id: acme_config.route53_zone_id,
             acme_kek: acme_config.kek,
             share_tls_listen: acme_config.share_tls_listen,
@@ -879,6 +882,7 @@ impl fmt::Debug for Config {
                     .map(|_| "[REDACTED]"),
             )
             .field("acme_cloudflare_zone_id", &self.acme_cloudflare_zone_id)
+            .field("acme_cloudflare_api_base", &self.acme_cloudflare_api_base)
             .field("acme_route53_zone_id", &self.acme_route53_zone_id)
             .field("acme_kek", &self.acme_kek.as_ref().map(|_| "[REDACTED]"))
             .field("share_tls_listen", &self.share_tls_listen)
@@ -895,6 +899,7 @@ struct ParsedAcmeConfig {
     dns_provider: Option<AcmeDnsProvider>,
     cloudflare_api_token: Option<String>,
     cloudflare_zone_id: Option<String>,
+    cloudflare_api_base: Option<String>,
     route53_zone_id: Option<String>,
     kek: Option<[u8; 32]>,
     share_tls_listen: Option<SocketAddr>,
@@ -911,6 +916,7 @@ fn parse_acme_config(
     dns_provider_raw: Option<&str>,
     cloudflare_api_token_raw: Option<&str>,
     cloudflare_zone_id_raw: Option<&str>,
+    cloudflare_api_base_raw: Option<&str>,
     route53_zone_id_raw: Option<&str>,
     kek_raw: Option<&str>,
 ) -> Result<ParsedAcmeConfig> {
@@ -926,6 +932,7 @@ fn parse_acme_config(
             dns_provider: None,
             cloudflare_api_token: cloudflare_api_token_raw.map(str::to_string),
             cloudflare_zone_id: cloudflare_zone_id_raw.map(str::to_string),
+            cloudflare_api_base: cloudflare_api_base_raw.map(str::to_string),
             route53_zone_id: route53_zone_id_raw.map(str::to_string),
             kek: None,
             share_tls_listen: None,
@@ -947,6 +954,9 @@ fn parse_acme_config(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
     let cloudflare_zone_id = cloudflare_zone_id_raw
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let cloudflare_api_base = cloudflare_api_base_raw
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
     let route53_zone_id = route53_zone_id_raw
@@ -975,6 +985,7 @@ fn parse_acme_config(
         dns_provider: Some(dns_provider),
         cloudflare_api_token,
         cloudflare_zone_id,
+        cloudflare_api_base,
         route53_zone_id,
         kek: Some(kek),
         share_tls_listen: Some(share_tls_listen),
@@ -1166,7 +1177,7 @@ mod security_tests {
     fn acme_requires_domain_provider_kek_tls_listen_and_provider_zone() {
         let kek = hex::encode([7u8; 32]);
         assert!(parse_acme_config(
-            true, None, None, None, None, None, None, None, None, None, None,
+            true, None, None, None, None, None, None, None, None, None, None, None,
         )
         .is_err());
         let short_kek = hex::encode([7u8; 31]);
@@ -1179,6 +1190,7 @@ mod security_tests {
             Some("ops@example.com"),
             Some("cloudflare"),
             Some("tok"),
+            None,
             None,
             None,
             Some(&short_kek),
@@ -1196,6 +1208,7 @@ mod security_tests {
             Some("tok"),
             None,
             None,
+            None,
             Some(&kek),
         );
         assert_eq!(
@@ -1211,6 +1224,7 @@ mod security_tests {
             Some("https://acme.example/dir"),
             Some("ops@example.com"),
             Some("route53"),
+            None,
             None,
             None,
             None,
@@ -1232,6 +1246,7 @@ mod security_tests {
             Some("tok"),
             Some("zone-id"),
             None,
+            None,
             Some(&kek),
         )
         .expect("valid ACME config");
@@ -1242,6 +1257,47 @@ mod security_tests {
             config.acme().expect("acme view present").identifier(),
             "*.shares.example.com"
         );
+    }
+
+    #[test]
+    fn acme_config_accepts_optional_cloudflare_api_base() {
+        let kek = hex::encode([7u8; 32]);
+        let with_api_base = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            Some("zone-id"),
+            Some("http://127.0.0.1:9999"),
+            None,
+            Some(&kek),
+        )
+        .expect("valid ACME config with Cloudflare API base");
+        assert_eq!(
+            with_api_base.cloudflare_api_base.as_deref(),
+            Some("http://127.0.0.1:9999")
+        );
+
+        let without_api_base = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            Some("zone-id"),
+            None,
+            None,
+            Some(&kek),
+        )
+        .expect("valid ACME config without Cloudflare API base");
+        assert_eq!(without_api_base.cloudflare_api_base, None);
     }
 
     #[test]
@@ -1362,6 +1418,7 @@ mod security_tests {
             acme_dns_provider: acme_enabled.then_some(AcmeDnsProvider::Cloudflare),
             acme_cloudflare_api_token: acme_enabled.then(|| "tok".into()),
             acme_cloudflare_zone_id: None,
+            acme_cloudflare_api_base: None,
             acme_route53_zone_id: None,
             acme_kek: acme_enabled.then_some([7; 32]),
             share_tls_listen: acme_enabled.then(|| "127.0.0.1:8443".parse().unwrap()),
