@@ -674,7 +674,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
         let slug = share_slug_from_headers(request.headers(), domain)?;
         let tls = request.extensions().get::<crate::tls::TlsInfo>();
         let host = format!("{slug}.{domain}");
-        if !host_matches_sni(&host, tls.and_then(|info| info.sni.as_deref())) {
+        if !sni_authorizes_host(&host, tls) {
             return Err(GatewayError::Misdirected);
         }
         let forwarding = TrustedForwarding {
@@ -1328,10 +1328,13 @@ fn forwarded_scheme(
     }
 }
 
-fn host_matches_sni(host: &str, sni: Option<&str>) -> bool {
-    match sni {
+fn sni_authorizes_host(host: &str, tls: Option<&crate::tls::TlsInfo>) -> bool {
+    match tls {
         None => true,
-        Some(sni) => host.eq_ignore_ascii_case(sni),
+        Some(info) => info
+            .sni
+            .as_deref()
+            .is_some_and(|sni| host.eq_ignore_ascii_case(sni)),
     }
 }
 
@@ -1831,8 +1834,8 @@ fn upstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
 #[cfg(test)]
 mod tests {
     use super::{
-        forwarded_scheme, host_matches_sni, meter_response_body, proxy_http_to_target,
-        proxy_websocket_to_target, router as gateway_router, share_slug, ActiveBridgeTask,
+        forwarded_scheme, meter_response_body, proxy_http_to_target, proxy_websocket_to_target,
+        router as gateway_router, share_slug, sni_authorizes_host, ActiveBridgeTask,
         BridgeTaskTracker, ForwardedScheme, ShareRuntime, TrackedBridgeTasks, TrustedForwarding,
         UpstreamTarget, WebSocketTargetRequest,
     };
@@ -1923,20 +1926,22 @@ mod tests {
     }
 
     #[test]
-    fn host_matches_sni_enforces_an_sni_when_present() {
-        assert!(host_matches_sni(
+    fn tls_shares_require_a_matching_sni() {
+        let matching = crate::tls::TlsInfo {
+            sni: Some("a.shares.example.com".into()),
+        };
+        let mismatched = crate::tls::TlsInfo {
+            sni: Some("b.shares.example.com".into()),
+        };
+        let missing = crate::tls::TlsInfo { sni: None };
+        assert!(sni_authorizes_host("a.shares.example.com", None));
+        assert!(sni_authorizes_host("a.shares.example.com", Some(&matching)));
+        assert!(sni_authorizes_host("A.Shares.Example.Com", Some(&matching)));
+        assert!(!sni_authorizes_host(
             "a.shares.example.com",
-            Some("a.shares.example.com")
+            Some(&mismatched)
         ));
-        assert!(!host_matches_sni(
-            "b.shares.example.com",
-            Some("a.shares.example.com")
-        ));
-        assert!(host_matches_sni("a.shares.example.com", None));
-        assert!(host_matches_sni(
-            "A.Shares.Example.Com",
-            Some("a.shares.example.com")
-        ));
+        assert!(!sni_authorizes_host("a.shares.example.com", Some(&missing)));
     }
 
     struct ChatProtocol;
