@@ -28,6 +28,7 @@ instant-acme = { workspace = true }
 ipnet = { workspace = true }
 rcgen = { workspace = true }
 rand = "0.9"
+rustls = { workspace = true }
 tarit-fleet = { path = "../tarit-fleet" }
 tarit-store = { path = "../tarit-store" }
 tarit-types = { path = "../tarit-types" }
