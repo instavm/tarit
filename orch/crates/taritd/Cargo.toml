@@ -48,6 +48,7 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 aws-smithy-runtime = { workspace = true }

@@ -39,6 +39,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+x509-parser = "0.18"
 # MIT OR Apache-2.0 licensed — peer HTTP + Postgres fleet sync
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
