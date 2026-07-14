@@ -438,7 +438,9 @@ impl ManagedProcess {
     #[cfg(not(target_os = "linux"))]
     fn kill_wait_adopted(&self, _pidfd: &OwnedFd) -> Result<(), OrchError> {
         let pid = self.pid as libc::pid_t;
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        if unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
             return Ok(());
         }
         if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
@@ -452,7 +454,9 @@ impl ManagedProcess {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if unsafe { libc::kill(pid, 0) } != 0 {
+            if unsafe { libc::kill(pid, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -2473,7 +2477,7 @@ impl VmmSupervisor {
         let socket_path = PathBuf::from(
             record
                 .socket_path
-                .clone()
+                .as_deref()
                 .ok_or("persisted VM has no control socket path")?,
         );
         // Pin the process before any /proc inspection so the PID cannot be
