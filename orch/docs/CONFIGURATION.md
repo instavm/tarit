@@ -191,7 +191,7 @@ that preserves SNI is also supported.
 | `TARIT_ACME_CLOUDFLARE_ZONE_ID` | string | unset | Cloudflare zone id that holds `${TARIT_SHARE_DOMAIN}`. Required when the provider is `cloudflare`. |
 | `TARIT_ACME_CLOUDFLARE_API_BASE` | URL | Cloudflare API base | Optional override of the Cloudflare API base URL, for a Cloudflare-API-compatible proxy or a test harness. Leave unset in production. |
 | `TARIT_ACME_ROUTE53_ZONE_ID` | string | unset | Route 53 hosted-zone id that holds `${TARIT_SHARE_DOMAIN}`. Required when the provider is `route53`. Route 53 credentials come from the standard AWS environment and role chain. |
-| `TARIT_ACME_KEK` | canonical base64url or hex | unset | 32-byte key-encryption key that envelope-encrypts stored ACME account and certificate private keys. Required when ACME is enabled. Keep it out of source control and rotate it through the deployment secret mechanism. |
+| `TARIT_ACME_KEK` | hex | unset | 32-byte key-encryption key as 64 hexadecimal characters that envelope-encrypts stored ACME account and certificate private keys. Required when ACME is enabled. Keep it out of source control and rotate it through the deployment secret mechanism. |
 
 Startup validation (only when `TARIT_ACME_ENABLED` is true):
 
@@ -199,7 +199,7 @@ Startup validation (only when `TARIT_ACME_ENABLED` is true):
   `TARIT_ACME_DIRECTORY_URL`, `TARIT_ACME_CONTACT_EMAIL`,
   `TARIT_ACME_DNS_PROVIDER`, and `TARIT_ACME_KEK` must all be set.
 - `TARIT_SHARE_TLS_LISTEN` must parse as a socket address.
-- `TARIT_ACME_KEK` must be canonical base64url or hex and decode to exactly 32
+- `TARIT_ACME_KEK` must be 64 hexadecimal characters and decode to exactly 32
   bytes.
 - Provider `cloudflare` also requires `TARIT_ACME_CLOUDFLARE_API_TOKEN` and
   `TARIT_ACME_CLOUDFLARE_ZONE_ID`. Provider `route53` also requires
