@@ -453,6 +453,12 @@ impl PostgresFleet {
         identifier: &str,
         fence: i64,
     ) -> Result<bool, FleetError> {
+        if certificate.domain != identifier {
+            return Err(FleetError::Conflict(format!(
+                "certificate domain {} does not match fenced identifier {identifier}",
+                certificate.domain
+            )));
+        }
         let sans = serialize_json(&certificate.sans, "sans")?;
         let mut client = self.pool.get().await?;
         let transaction = client.transaction().await?;
@@ -598,6 +604,7 @@ impl PostgresFleet {
                  ) VALUES ($1,$2,'pending',1,$3,now() + $4::text::interval,0,NULL,now())
                  ON CONFLICT (identifier) DO UPDATE SET
                    fence = fleet_acme_jobs.fence + 1,
+                   state = EXCLUDED.state,
                    lease_holder = EXCLUDED.lease_holder,
                    lease_expires_at = now() + $4::text::interval,
                    updated_at = now()
