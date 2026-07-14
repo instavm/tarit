@@ -135,6 +135,12 @@ gateway. The gateway listener requires `TARIT_SHARE_LISTEN`,
 API listener. See [CONFIGURATION.md](CONFIGURATION.md) and
 `deploy/Caddyfile.shares.example`.
 
+Tarit can also terminate share HTTPS in process with an automatically issued and
+renewed wildcard certificate for `*.<TARIT_SHARE_DOMAIN>`, so shares are served
+at `https://<slug>.<TARIT_SHARE_DOMAIN>` without an external TLS edge. This is
+off by default. See the [Wildcard TLS (ACME)](CONFIGURATION.md#wildcard-tls-acme)
+configuration section.
+
 `ShareRecord`:
 
 ```json
