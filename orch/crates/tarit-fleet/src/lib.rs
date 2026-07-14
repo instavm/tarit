@@ -37,7 +37,19 @@ pub struct PostgresFleet {
     pool: Pool,
 }
 
+pub struct CertRefreshListener {
+    _client: tokio_postgres::Client,
+    receiver: tokio::sync::mpsc::Receiver<()>,
+}
+
+impl CertRefreshListener {
+    pub async fn recv(&mut self) -> Option<()> {
+        self.receiver.recv().await
+    }
+}
+
 const FLEET_SCHEMA_LOCK_KEY: i64 = 0x5441_5249_5446_4C54;
+const CERT_REFRESH_LISTEN_COMMAND: &str = "LISTEN tarit_cert_refresh";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertRecord {
@@ -104,6 +116,34 @@ impl PostgresFleet {
             .await?;
         ddl.commit().await?;
         Ok(Self { pool })
+    }
+
+    pub async fn cert_refresh_listener(
+        database_url: &str,
+    ) -> Result<CertRefreshListener, FleetError> {
+        let (client, mut connection) =
+            tokio_postgres::connect(database_url, make_rustls_connector()?).await?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            loop {
+                match std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+                    Some(Ok(tokio_postgres::AsyncMessage::Notification(notification)))
+                        if notification.channel() == "tarit_cert_refresh" =>
+                    {
+                        let _ = sender.try_send(());
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        });
+
+        client.batch_execute(CERT_REFRESH_LISTEN_COMMAND).await?;
+        Ok(CertRefreshListener {
+            _client: client,
+            receiver,
+        })
     }
 
     pub async fn upsert_host(&self, host: &HostRecord) -> Result<(), FleetError> {
@@ -562,6 +602,8 @@ impl PostgresFleet {
                    lease_expires_at = now() + $4::text::interval,
                    updated_at = now()
                  WHERE fleet_acme_jobs.lease_expires_at < now()
+                   AND (fleet_acme_jobs.next_attempt_at IS NULL
+                        OR fleet_acme_jobs.next_attempt_at <= now())
                  RETURNING id, identifier, state, fence, order_url, challenge,
                            provider_change_ids, attempt, next_attempt_at, last_error, updated_at",
                 &[&Uuid::new_v4(), &identifier, &holder, &lease],
@@ -1261,6 +1303,11 @@ mod tests {
         assert!(FLEET_SCHEMA.contains("fence BIGINT"));
     }
 
+    #[test]
+    fn cert_refresh_listener_uses_expected_channel() {
+        assert_eq!(CERT_REFRESH_LISTEN_COMMAND, "LISTEN tarit_cert_refresh");
+    }
+
     #[tokio::test]
     async fn fleet_connect_is_concurrent_safe_when_database_is_configured() -> Result<(), FleetError>
     {
@@ -1363,6 +1410,69 @@ mod tests {
         .await;
 
         result.and(cleanup_test_shares(&fleet, &[share.id]).await)
+    }
+
+    #[tokio::test]
+    async fn acme_job_claim_respects_backoff_next_attempt_at() -> Result<(), FleetError> {
+        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+            eprintln!("skipping PostgreSQL ACME backoff test: TARIT_TEST_DATABASE_URL is absent");
+            return Ok(());
+        };
+        if database_url.is_empty() {
+            eprintln!("skipping PostgreSQL ACME backoff test: TARIT_TEST_DATABASE_URL is empty");
+            return Ok(());
+        }
+
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let identifier = format!("*.backofftest-{}.example.com", Uuid::new_v4());
+        let result = async {
+            let claimed = fleet
+                .claim_acme_job(&identifier, "node-a", Duration::from_millis(200))
+                .await?
+                .ok_or_else(|| FleetError::Config("initial ACME job claim was denied".into()))?;
+
+            let mut failed = claimed.clone();
+            failed.state = AcmeJobState::Failed;
+            failed.attempt = 1;
+            failed.next_attempt_at = Some(Utc::now() + chrono::Duration::seconds(3_600));
+            failed.updated_at = Utc::now();
+            if !fleet.save_acme_job(&failed, claimed.fence).await? {
+                return Err(FleetError::Config("failed ACME job save was rejected".into()));
+            }
+
+            tokio::time::sleep(Duration::from_millis(400)).await;
+
+            if fleet
+                .claim_acme_job(&identifier, "node-b", Duration::from_millis(200))
+                .await?
+                .is_some()
+            {
+                return Err(FleetError::Config(
+                    "expired-lease ACME job was reclaimed before its backoff elapsed".into(),
+                ));
+            }
+
+            let mut ready = failed.clone();
+            ready.next_attempt_at = Some(Utc::now() - chrono::Duration::seconds(10));
+            ready.updated_at = Utc::now();
+            if !fleet.save_acme_job(&ready, failed.fence).await? {
+                return Err(FleetError::Config("ready ACME job save was rejected".into()));
+            }
+
+            if fleet
+                .claim_acme_job(&identifier, "node-b", Duration::from_millis(200))
+                .await?
+                .is_none()
+            {
+                return Err(FleetError::Config(
+                    "ACME job was not reclaimable after its backoff elapsed".into(),
+                ));
+            }
+            Ok(())
+        }
+        .await;
+
+        result.and(cleanup_acme_job(&fleet, &identifier).await)
     }
 
     #[tokio::test]

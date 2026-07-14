@@ -45,6 +45,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 webpki-roots = "0.26"
 deadpool-postgres = "0.14"
