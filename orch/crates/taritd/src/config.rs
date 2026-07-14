@@ -753,6 +753,7 @@ impl Config {
             env::var("TARIT_ACME_ROUTE53_ZONE_ID").ok().as_deref(),
             env::var("TARIT_ACME_KEK").ok().as_deref(),
         )?;
+        require_share_token_key(share_listen, acme_config.share_tls_listen, share_token_key)?;
 
         Ok(Self {
             listen,
@@ -1111,6 +1112,19 @@ fn parse_share_token_key(raw: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("TARIT_SHARE_TOKEN_KEY must decode to exactly 32 bytes"))
 }
 
+fn require_share_token_key(
+    plaintext_listen: Option<SocketAddr>,
+    tls_listen: Option<SocketAddr>,
+    token_key: Option<[u8; 32]>,
+) -> Result<()> {
+    if (plaintext_listen.is_some() || tls_listen.is_some()) && token_key.is_none() {
+        bail!(
+            "TARIT_SHARE_TOKEN_KEY must decode to exactly 32 bytes when a share listener is enabled"
+        );
+    }
+    Ok(())
+}
+
 fn parse_positive_share_setting(name: &str, raw: Option<&str>, default: u64) -> Result<u64> {
     let Some(raw) = raw else {
         return Ok(default);
@@ -1332,6 +1346,15 @@ mod security_tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn share_token_key_required_for_https_only_listener() {
+        let listen: std::net::SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        assert!(require_share_token_key(None, Some(listen), None).is_err());
+        assert!(require_share_token_key(Some(listen), None, None).is_err());
+        assert!(require_share_token_key(None, Some(listen), Some([7u8; 32])).is_ok());
+        assert!(require_share_token_key(None, None, None).is_ok());
     }
 
     #[test]
