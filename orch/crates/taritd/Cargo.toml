@@ -50,6 +50,8 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+aws-smithy-runtime = { workspace = true }
+aws-smithy-types = { workspace = true }
 hex = "0.4"
 tower = { version = "0.5", features = ["util"] }
 
