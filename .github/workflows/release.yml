@@ -131,5 +131,11 @@ jobs:
             dist/taritd
             dist/vmm
             dist/SHA256SUMS
-          generate_release_notes: true
           fail_on_unmatched_files: true
+          body: |
+            Static x86_64 Linux (musl) binaries, built from ${{ github.ref_name }}.
+
+            - `taritd` — orchestrator daemon
+            - `vmm` — microVM manager
+
+            Verify with `sha256sum -c SHA256SUMS`. Booting microVMs requires Linux with `/dev/kvm`.
