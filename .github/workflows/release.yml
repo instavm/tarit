@@ -4,8 +4,8 @@ name: Release
 # the microVM manager (vmm), then publishes them as a GitHub Release.
 #
 # Triggered by pushing a version tag (e.g. `v0.1.0`). A manual `workflow_dispatch`
-# run builds and uploads the binaries as workflow artifacts WITHOUT creating a
-# Release, so the build can be validated before cutting a real tag.
+# run only builds and uploads the binaries as workflow artifacts; it never
+# creates a Release, so the build can be validated before cutting a real tag.
 
 on:
   push:
@@ -13,8 +13,10 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Least privilege by default: the build job needs no write access. The release
+# job elevates to `contents: write` for itself only.
 permissions:
-  contents: write # required to create the Release and upload assets
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,6 +29,8 @@ jobs:
   build:
     name: Build musl binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -42,8 +46,11 @@ jobs:
         with:
           version: 0.13.0
 
+      # Prebuilt binary — avoids compiling cargo-zigbuild from source each run.
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Cache cargo build (orch)
         uses: Swatinem/rust-cache@v2
@@ -82,8 +89,23 @@ jobs:
           name: linux-x86_64-musl
           path: dist/
 
+  release:
+    name: Publish GitHub Release
+    needs: build
+    # Only real tag pushes publish a Release; manual dispatch (even against a
+    # tag ref) stops after the build job above.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to create the Release and upload assets
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64-musl
+          path: dist
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
