@@ -173,6 +173,9 @@ path_is_not_mountpoint() {
   local label="$2"
   local mount_status=0
 
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
   if mountpoint -q -- "$path"; then
     fail "$label must not be a mountpoint"
     return 1
@@ -2679,6 +2682,7 @@ assert_metric_secrecy() {
     grep -Fq -- "$value" "$metrics_file" &&
       fail "share metrics on node $node leaked a confidential share, tenant, token, or VM identifier"
   done
+  return 0
 }
 
 assert_metrics_for_node() {
@@ -2830,8 +2834,8 @@ start_local_postgres() {
   verify_postgres_data_dir_access || return 1
   run_as_pg_user "$INITDB_BIN" -D "$PG_DATA_DIR" \
     --auth=trust --no-locale --encoding=UTF8 --username=tarit_e2e \
-    >"$PG_DATA_DIR/initdb.log" 2>&1 || {
-    fail "isolated PostgreSQL initialization failed; inspect $PG_DATA_DIR/initdb.log"
+    >"$RUN_DIR/postgres-initdb.log" 2>&1 || {
+    fail "isolated PostgreSQL initialization failed; inspect $RUN_DIR/postgres-initdb.log"
     return 1
   }
   PG_SERVER_START_ATTEMPTED=1
@@ -2939,7 +2943,7 @@ write_caddy_config() {
   CADDY_CA_KEY="$CADDY_STORAGE_ROOT/pki/authorities/local/root.key"
   cat >"$CADDY_CONFIG" <<CADDY
 {
-  auto_https off
+  auto_https disable_redirects
   admin off
   skip_install_trust
   storage file_system "$CADDY_STORAGE_ROOT"
@@ -2958,10 +2962,6 @@ https://$EDGE_HOST:$CADDY_PORT {
       header_up -X-API-Key
       header_up -Proxy-Authorization
       header_up -X-Peer-Secret
-      header_up -Forwarded
-      header_up -X-Forwarded-For
-      header_up -X-Forwarded-Host
-      header_up -X-Forwarded-Proto
       header_up -X-Real-IP
       header_up Host {host}
       header_up X-Forwarded-For {remote_host}

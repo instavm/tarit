@@ -64,19 +64,33 @@ fn commit_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError>
     Ok(())
 }
 
+/// The writer stops at the shutdown signal, but terminal transitions in the
+/// drain/sweep window must still land durably.
 async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
     #[cfg(test)]
     if take_lifecycle_fault(state, LifecycleFault::SQLite) {
         return Err(OrchError::Internal("injected SQLite failure".into()));
     }
     let (completion, persisted) = tokio::sync::oneshot::channel();
-    state
+    match state
         .store_tx
         .send(StoreWrite::VmDurable(record, completion))
-        .map_err(|_| OrchError::Internal("store writer unavailable during shutdown".into()))?;
-    persisted.await.map_err(|_| {
-        OrchError::Internal("store writer dropped shutdown persistence confirmation".into())
-    })?
+    {
+        Ok(()) => persisted.await.map_err(|_| {
+            OrchError::Internal("store writer dropped shutdown persistence confirmation".into())
+        })?,
+        Err(error) => {
+            let StoreWrite::VmDurable(record, _) = error.0 else {
+                unreachable!("only durable VM writes are sent here");
+            };
+            state
+                .store
+                .lock()
+                .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+                .insert_vm(&record)
+                .map_err(crate::api::store_err)
+        }
+    }
 }
 
 async fn persist_running_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
@@ -110,6 +124,58 @@ async fn clear_lifecycle_ownership(state: &AppState, id: Uuid) -> Result<(), Orc
         return Err(OrchError::Internal("injected fleet clear failure".into()));
     }
     cluster::clear_ownership(state, id).await
+}
+
+fn is_shutdown_rejection(cause: &OrchError) -> bool {
+    matches!(
+        cause,
+        OrchError::Overloaded { message, .. } if message == "taritd is shutting down"
+    )
+}
+
+/// An in-flight create/restore rejected because taritd is shutting down was
+/// never acknowledged to the client, so it must leave no trace and surface the
+/// original 429 shutdown cause. Tear down any VMM the boot started, then drive
+/// the phased terminal transition (which releases the boot reservation, clears
+/// fleet ownership, and is retried by the shutdown sweep on failure), and
+/// finally erase the terminal tombstone the transition would otherwise leave.
+async fn rollback_shutdown_rejected_lifecycle(
+    state: &AppState,
+    id: Uuid,
+    task: Option<&OwnedTaskControl>,
+    cause: OrchError,
+) -> Result<(), OrchError> {
+    let sup = Arc::clone(&state.supervisor);
+    if let Err(teardown) = tokio::task::spawn_blocking(move || sup.stop_vm(id))
+        .await
+        .map_err(|error| OrchError::Internal(format!("shutdown rollback teardown join: {error}")))?
+    {
+        return Err(OrchError::Internal(format!(
+            "{cause}; shutdown rollback retained VMM resources: {teardown}"
+        )));
+    }
+
+    if let Err(cleanup) = finish_failed_boot(state, id).await {
+        return Err(OrchError::Internal(format!(
+            "{cause}; shutdown rollback retained lifecycle for terminal retry: {cleanup}"
+        )));
+    }
+
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .delete_vm(id)
+        .map_err(crate::api::store_err)?;
+    state
+        .vm_cache
+        .write()
+        .map_err(|_| OrchError::Internal("vm cache".into()))?
+        .remove(&id);
+    if let Some(task) = task {
+        task.mark_terminal_converged();
+    }
+    Err(cause)
 }
 
 fn lifecycle_state(state: &AppState, id: Uuid) -> Result<Option<LifecycleState>, OrchError> {
@@ -523,6 +589,9 @@ async fn fail_create_or_restore(
     if lifecycle_state(state, id)?.is_none() {
         return Err(cause);
     }
+    if is_shutdown_rejection(&cause) {
+        return rollback_shutdown_rejected_lifecycle(state, id, None, cause).await;
+    }
     match finish_failed_boot(state, id).await {
         Ok(()) => Err(cause),
         Err(cleanup) => Err(OrchError::Internal(format!(
@@ -853,6 +922,10 @@ async fn create_local_owned(
     {
         Ok(record) => record,
         Err(error) => {
+            if is_shutdown_rejection(&error) {
+                rollback_shutdown_rejected_lifecycle(state, id, Some(task), error).await?;
+                unreachable!("shutdown lifecycle rollback always returns an error")
+            }
             if task.is_cancelled() {
                 return finish_cancelled_lifecycle(state, id, task, error).await;
             }
@@ -1009,6 +1082,10 @@ async fn restore_local_owned(
     {
         Ok(record) => record,
         Err(error) => {
+            if is_shutdown_rejection(&error) {
+                rollback_shutdown_rejected_lifecycle(state, id, Some(task), error).await?;
+                unreachable!("shutdown lifecycle rollback always returns an error")
+            }
             if task.is_cancelled() {
                 return finish_cancelled_lifecycle(state, id, task, error).await;
             }
@@ -1314,6 +1391,78 @@ mod tests {
     use std::sync::Arc;
     use std::sync::{Mutex, RwLock};
     use tarit_store::Store;
+
+    #[test]
+    fn shutdown_rejection_is_identified_precisely() {
+        assert!(is_shutdown_rejection(&OrchError::Overloaded {
+            message: "taritd is shutting down".into(),
+            retry_after_secs: 1,
+        }));
+        assert!(!is_shutdown_rejection(&OrchError::Overloaded {
+            message: "cluster at capacity".into(),
+            retry_after_secs: 1,
+        }));
+        assert!(!is_shutdown_rejection(&OrchError::Internal(
+            "store unavailable".into()
+        )));
+    }
+
+    #[test]
+    fn stopped_record_persists_directly_after_store_writer_stops() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        let mut record = vm_get(&state, id).unwrap();
+        record.status = VmStatus::Stopped;
+
+        test_runtime()
+            .block_on(persist_stopped_record(&state, record))
+            .expect("a stopped record must persist after the store writer stops");
+
+        let persisted = state.store.lock().unwrap().get_vm(id).unwrap();
+        assert_eq!(persisted.status, VmStatus::Stopped);
+    }
+
+    #[test]
+    fn shutdown_rejection_releases_its_boot_reservation() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        let mut record = vm_get(&state, id).unwrap();
+        record.status = VmStatus::Creating;
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        commit_vm_record(&state, record.clone()).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Creating {
+                record,
+                phase: CreatingPhase::FleetClaimed,
+            },
+        )
+        .unwrap();
+        state.supervisor.reserve_existing_for_test(id);
+
+        let error = test_runtime()
+            .block_on(fail_create_or_restore(
+                &state,
+                id,
+                OrchError::Overloaded {
+                    message: "taritd is shutting down".into(),
+                    retry_after_secs: 1,
+                },
+            ))
+            .expect_err("shutdown rejection must be returned to the unacknowledged request");
+
+        assert!(matches!(
+            error,
+            OrchError::Overloaded { message, .. } if message == "taritd is shutting down"
+        ));
+        assert!(state.store.lock().unwrap().get_vm(id).is_err());
+        assert!(state.vm_cache.read().unwrap().get(&id).is_none());
+        assert!(lifecycle_state(&state, id).unwrap().is_none());
+        assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+    }
 
     #[test]
     fn ordinary_delete_writer_failure_keeps_a_retryable_transition_and_reservation() {

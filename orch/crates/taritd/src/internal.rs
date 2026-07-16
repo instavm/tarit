@@ -46,6 +46,26 @@ struct ReplayCache {
 use crate::config::{ApiIdentity, ApiRole};
 use crate::ops;
 
+#[derive(serde::Serialize)]
+struct InternalVmRecord {
+    #[serde(flatten)]
+    record: VmRecord,
+    owner_key: Option<String>,
+    api_key_id: Option<String>,
+}
+
+impl From<VmRecord> for InternalVmRecord {
+    fn from(record: VmRecord) -> Self {
+        let owner_key = record.owner_key.clone();
+        let api_key_id = record.api_key_id.clone();
+        Self {
+            record,
+            owner_key,
+            api_key_id,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct InternalExecBody {
     pub command: String,
@@ -304,7 +324,7 @@ async fn internal_create(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
     Json(mut req): Json<CreateVmRequest>,
-) -> Result<(StatusCode, Json<VmRecord>), ApiError> {
+) -> Result<(StatusCode, Json<InternalVmRecord>), ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|i| &i.0))?;
     // Bind the created VM to the authenticated caller. Admins may create on
     // behalf of another tenant (owner_key carried in the request); everyone
@@ -328,14 +348,14 @@ async fn internal_create(
         req.api_key_id = Some(identity.api_key_id.clone());
     }
     let rec = ops::create_local(&state, &req).await?;
-    Ok((StatusCode::CREATED, Json(rec)))
+    Ok((StatusCode::CREATED, Json(rec.into())))
 }
 
 async fn internal_restore(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
     Json(req): Json<RestoreRequest>,
-) -> Result<(StatusCode, Json<VmRecord>), ApiError> {
+) -> Result<(StatusCode, Json<InternalVmRecord>), ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|i| &i.0))?;
     let rec = ops::restore_local(
         &state,
@@ -346,7 +366,7 @@ async fn internal_restore(
         identity.is_admin(),
     )
     .await?;
-    Ok((StatusCode::CREATED, Json(rec)))
+    Ok((StatusCode::CREATED, Json(rec.into())))
 }
 
 async fn internal_exec(
@@ -380,11 +400,11 @@ async fn internal_get(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<VmRecord>, ApiError> {
+) -> Result<Json<InternalVmRecord>, ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|i| &i.0))?;
     let vm = ops::get_local(&state, id)?;
     ensure_vm_access(identity, &vm)?;
-    Ok(Json(vm))
+    Ok(Json(vm.into()))
 }
 
 async fn internal_status(
@@ -400,18 +420,18 @@ async fn internal_pause(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<VmRecord>, ApiError> {
+) -> Result<Json<InternalVmRecord>, ApiError> {
     enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
-    Ok(Json(ops::pause_local(&state, id).await?))
+    Ok(Json(ops::pause_local(&state, id).await?.into()))
 }
 
 async fn internal_resume(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<VmRecord>, ApiError> {
+) -> Result<Json<InternalVmRecord>, ApiError> {
     enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
-    Ok(Json(ops::resume_local(&state, id).await?))
+    Ok(Json(ops::resume_local(&state, id).await?.into()))
 }
 
 async fn internal_snapshot(
@@ -436,4 +456,49 @@ async fn internal_egress(
     enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
     let rules = ops::egress_local(&state, id, body.allowlist, body.allow_existing).await?;
     Ok(Json(serde_json::json!({ "rules_applied": rules })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tarit_types::VmStatus;
+
+    fn sample_record() -> VmRecord {
+        VmRecord {
+            id: Uuid::new_v4(),
+            host_id: "node-a".into(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: Some("key-1".into()),
+            status: VmStatus::Running,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "/tmp/vmlinux".into(),
+            rootfs_path: Some("/tmp/rootfs.ext4".into()),
+            cmdline: "console=ttyS0".into(),
+            socket_path: Some("/run/taritd/vm.sock".into()),
+            pid: Some(42),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn internal_record_transmits_owner_key_to_peers() {
+        let record = sample_record();
+        let value = serde_json::to_value(InternalVmRecord::from(record.clone())).unwrap();
+        assert_eq!(value["owner_key"], serde_json::json!("tenant-a"));
+        assert_eq!(value["api_key_id"], serde_json::json!("key-1"));
+
+        let decoded: VmRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.owner_key.as_deref(), Some("tenant-a"));
+        assert_eq!(decoded.api_key_id.as_deref(), Some("key-1"));
+    }
+
+    #[test]
+    fn public_record_still_hides_owner_key() {
+        let value = serde_json::to_value(sample_record()).unwrap();
+        assert!(value.get("owner_key").is_none());
+        assert!(value.get("api_key_id").is_none());
+    }
 }
