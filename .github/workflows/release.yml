@@ -83,6 +83,25 @@ jobs:
           sha256sum taritd vmm > SHA256SUMS
           cat SHA256SUMS
 
+      # Smoke-test the exact artifacts we are about to publish (they run natively
+      # on the x86_64 runner). Kept to checks that need no host environment:
+      # both `--version`/`--help` exit before any KVM or TAP/netlink setup, so
+      # they are reliable here. Actually booting a VM or starting a taritd node
+      # needs /dev/kvm + CAP_NET_ADMIN and belongs on a self-hosted KVM host.
+      - name: Smoke-test binaries
+        run: |
+          set -euo pipefail
+          cd dist
+          for bin in taritd vmm; do
+            echo "== $bin =="
+            file "$bin"
+            file "$bin" | grep -q "statically linked"
+          done
+          ./vmm --version
+          ./vmm --help > /dev/null
+          ./taritd --version
+          ./taritd --help > /dev/null
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
