@@ -1,0 +1,94 @@
+name: Release
+
+# Builds static (musl) x86_64 Linux binaries for the orchestrator (taritd) and
+# the microVM manager (vmm), then publishes them as a GitHub Release.
+#
+# Triggered by pushing a version tag (e.g. `v0.1.0`). A manual `workflow_dispatch`
+# run builds and uploads the binaries as workflow artifacts WITHOUT creating a
+# Release, so the build can be validated before cutting a real tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the Release and upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    name: Build musl binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # zig provides a complete cross sysroot, which lets the C dependencies in
+      # the tree (aws-lc-rs via russh, etc.) build cleanly for the musl target.
+      - name: Install zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Cache cargo build (orch)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: orch
+          key: release-orch
+
+      - name: Build taritd (orchestrator)
+        working-directory: orch
+        run: cargo zigbuild --release --locked --target "$TARGET" -p taritd
+
+      - name: Cache cargo build (vmm)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vmm
+          key: release-vmm
+
+      - name: Build vmm (microVM manager, with KVM boot path)
+        working-directory: vmm
+        run: cargo zigbuild --release --locked --target "$TARGET" -p vmm --features boot
+
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "orch/target/$TARGET/release/taritd" dist/taritd
+          cp "vmm/target/$TARGET/release/vmm" dist/vmm
+          strip dist/taritd dist/vmm
+          cd dist
+          sha256sum taritd vmm > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-musl
+          path: dist/
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/taritd
+            dist/vmm
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
