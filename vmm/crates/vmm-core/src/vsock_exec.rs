@@ -29,12 +29,50 @@ const EXEC_ACC_TAIL_CAP: usize = 64 * 1024;
 pub struct VsockExecChannel {
     stream: Arc<Mutex<Option<UnixStream>>>,
     stop: Arc<AtomicBool>,
-    /// Set after a failed exec exchange: the vsock data path isn't working for
-    /// this VM, so skip it and use serial (avoids a per-exec timeout + the
-    /// guest agent reconnect thrash that dropping the stream would cause).
-    disabled: Arc<AtomicBool>,
     pump_wake: Option<EventFd>,
     handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Why a vsock exec did not return a result. The split matters because exec is
+/// not replay-safe: once the command line reached the guest, re-sending it on
+/// another channel risks running it twice.
+#[derive(Debug)]
+pub enum VsockExecError {
+    /// The command line was not delivered (the trailing newline never reached
+    /// the guest, whose agent discards partial lines on disconnect). Retrying
+    /// on serial is safe.
+    NotDelivered(String),
+    /// The command was (or may have been) delivered but the exchange did not
+    /// complete. The guest may still run it; do not re-send.
+    Ambiguous(String),
+}
+
+impl std::fmt::Display for VsockExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotDelivered(e) => write!(f, "not delivered: {e}"),
+            Self::Ambiguous(e) => write!(f, "ambiguous after dispatch: {e}"),
+        }
+    }
+}
+
+/// Internal result of one exec exchange; tells `exec` whether the stream is
+/// still framed correctly or must be dropped so the agent re-dials.
+enum RunExecOutcome {
+    /// Clean completion up to `VMM_EXEC_EXIT=`; the stream stays usable.
+    Completed((i32, String, u64)),
+    /// Deadline passed. When `started`, the guest acknowledged the command and
+    /// its exit marker will arrive on a stream we are abandoning.
+    TimedOut {
+        started: bool,
+        output: String,
+        duration_ms: u64,
+    },
+    /// The write failed, so the newline-terminated command line never fully
+    /// reached the guest.
+    WriteFailed(String),
+    /// Read-side failure after the command was delivered.
+    TransportFailed(String),
 }
 
 impl VsockExecChannel {
@@ -99,7 +137,6 @@ impl VsockExecChannel {
         Ok(Arc::new(Self {
             stream,
             stop,
-            disabled: Arc::new(AtomicBool::new(false)),
             pump_wake,
             handle: Mutex::new(Some(handle)),
         }))
@@ -113,25 +150,43 @@ impl VsockExecChannel {
             .is_some()
     }
 
-    /// Run `command` over vsock. Returns `None` when no guest connection exists
-    /// or the channel has been disabled after a prior failure (caller falls back
-    /// to serial); `Some(Ok(..))` on success; `Some(Err(..))` on a failure, after
-    /// which the channel disables itself so later execs go straight to serial.
+    /// Run `command` over vsock. Returns `None` when no guest connection
+    /// exists (caller falls back to serial); `Some(Ok(..))` on completion —
+    /// including a guest-side timeout, reported as exit `-1` with partial
+    /// output to match serial semantics; `Some(Err(..))` on a transport
+    /// failure, with [`VsockExecError`] saying whether a serial retry is safe.
+    ///
+    /// Any outcome other than clean completion leaves the stream desynced
+    /// (late reply bytes could corrupt the next exec), so it is dropped and
+    /// the guest agent re-dials; execs in the interim use serial.
     pub fn exec(
         &self,
         command: &str,
         timeout: Duration,
-    ) -> Option<Result<(i32, String, u64), String>> {
-        if self.disabled.load(Ordering::Relaxed) {
-            return None;
-        }
+    ) -> Option<Result<(i32, String, u64), VsockExecError>> {
         let mut guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         let stream = guard.as_mut()?;
-        let result = { run_exec(stream, command, timeout, self.pump_wake.as_ref()) };
-        if result.is_err() {
-            // Keep the stream (dropping it would make the agent reconnect and
-            // we'd retry+fail every exec); just stop using vsock for this VM.
-            self.disabled.store(true, Ordering::Relaxed);
+        let outcome = run_exec(stream, command, timeout, self.pump_wake.as_ref());
+        let (result, stream_intact) = match outcome {
+            RunExecOutcome::Completed(r) => (Ok(r), true),
+            RunExecOutcome::TimedOut {
+                started: true,
+                output,
+                duration_ms,
+            } => (Ok((-1, output, duration_ms)), false),
+            RunExecOutcome::TimedOut { started: false, .. } => (
+                Err(VsockExecError::Ambiguous(
+                    "timed out before the guest acknowledged the command".into(),
+                )),
+                false,
+            ),
+            RunExecOutcome::WriteFailed(e) => (Err(VsockExecError::NotDelivered(e)), false),
+            RunExecOutcome::TransportFailed(e) => (Err(VsockExecError::Ambiguous(e)), false),
+        };
+        if !stream_intact {
+            // Drop the connection: the agent sees EOF/EPIPE (possibly after it
+            // finishes the in-flight command) and re-dials a fresh stream.
+            *guard = None;
         }
         Some(result)
     }
@@ -152,13 +207,15 @@ fn run_exec(
     command: &str,
     timeout: Duration,
     pump_wake: Option<&EventFd>,
-) -> Result<(i32, String, u64), String> {
+) -> RunExecOutcome {
     let start = Instant::now();
     let msg = format!("VMM_EXEC:{command}\n");
-    stream
+    if let Err(e) = stream
         .write_all(msg.as_bytes())
         .and_then(|_| stream.flush())
-        .map_err(|e| format!("vsock exec write: {e}"))?;
+    {
+        return RunExecOutcome::WriteFailed(format!("vsock exec write: {e}"));
+    }
     if let Some(evt) = pump_wake {
         let _ = evt.write(1);
     }
@@ -171,13 +228,13 @@ fn run_exec(
 
     while start.elapsed() < timeout {
         match stream.read(&mut buf) {
-            Ok(0) => return Err("vsock exec: peer closed".into()),
+            Ok(0) => return RunExecOutcome::TransportFailed("vsock exec: peer closed".into()),
             Ok(n) => acc.extend_from_slice(&buf[..n]),
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 continue
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(format!("vsock exec read: {e}")),
+            Err(e) => return RunExecOutcome::TransportFailed(format!("vsock exec read: {e}")),
         }
         while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
             let mut line: Vec<u8> = acc.drain(..=pos).collect();
@@ -196,7 +253,11 @@ fn run_exec(
             if let Some(code) = s.strip_prefix("VMM_EXEC_EXIT=") {
                 let exit_code: i32 = code.trim().parse().unwrap_or(0);
                 let output_str = finish_exec_output(output, truncated);
-                return Ok((exit_code, output_str, start.elapsed().as_millis() as u64));
+                return RunExecOutcome::Completed((
+                    exit_code,
+                    output_str,
+                    start.elapsed().as_millis() as u64,
+                ));
             }
             if started {
                 append_exec_output(&mut output, &line, &mut truncated);
@@ -205,7 +266,11 @@ fn run_exec(
         }
         trim_exec_accumulator(&mut acc, started, &mut output, &mut truncated);
     }
-    Err("vsock exec: timed out".into())
+    RunExecOutcome::TimedOut {
+        started,
+        output: finish_exec_output(output, truncated),
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
 }
 
 fn append_exec_output(output: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {

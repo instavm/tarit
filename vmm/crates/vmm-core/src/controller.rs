@@ -1228,10 +1228,12 @@ impl VmmController {
         // a dedicated framed stream, so exec never desyncs against ttyS0 console
         // output the way serial does under concurrent IRQ load (validated: 25/25
         // rapid execs + multi-line output clean over vsock). Falls back to serial
-        // when the guest hasn't dialed vsock (older agent / no device) or on any
-        // vsock error. Opt out with VMM_VSOCK_EXEC=0. Clone the Arc and drop the
-        // controller lock before the (blocking) exec so other API calls aren't
-        // stalled.
+        // only when the guest hasn't dialed vsock (older agent / no device) or
+        // when the command provably never reached the guest — exec is not
+        // replay-safe, so anything ambiguous is surfaced as an error instead of
+        // being re-sent on serial where it could run twice. Opt out with
+        // VMM_VSOCK_EXEC=0. Clone the Arc and drop the controller lock before
+        // the (blocking) exec so other API calls aren't stalled.
         if std::env::var("VMM_VSOCK_EXEC").as_deref() != Ok("0") {
             let vsock_channel = {
                 let slot = self.lock();
@@ -1245,8 +1247,11 @@ impl VmmController {
                         log::info!("exec '{command}' via vsock → exit={}", r.0);
                         return Ok(r);
                     }
-                    Some(Err(e)) => {
-                        log::warn!("vsock exec failed ({e}); falling back to serial");
+                    Some(Err(crate::vsock_exec::VsockExecError::NotDelivered(e))) => {
+                        log::warn!("vsock exec not delivered ({e}); falling back to serial");
+                    }
+                    Some(Err(e @ crate::vsock_exec::VsockExecError::Ambiguous(_))) => {
+                        return Err(VmmError::Device(format!("vsock exec failed: {e}")));
                     }
                     None => {} // no guest connection / disabled → serial
                 }
