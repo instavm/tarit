@@ -2906,6 +2906,15 @@ impl VmmSupervisor {
         take_matching_artifacts(&mut registered, keys)
     }
 
+    fn owns_golden_artifact(&self, path: &Path) -> Result<bool, OrchError> {
+        Ok(self
+            .golden_artifacts
+            .lock()
+            .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?
+            .iter()
+            .any(|artifact| artifact.path() == path))
+    }
+
     /// Re-adopt VMs that were left running when this taritd instance restarted
     /// (reap disabled). `NetProvisioner` recovery already reconciled their
     /// network policy; this restores the control-plane handle so exec, pause,
@@ -3717,8 +3726,16 @@ impl VmmSupervisor {
         if let Err(error) = remove_file_if_present(&vm.socket_path) {
             failures.push(format!("remove VMM socket: {error}"));
         }
-        if let Err(error) = remove_file_if_present(Path::new(&self.overlay_path_for(id))) {
-            failures.push(format!("remove VMM overlay: {error}"));
+        // The golden registry owns a golden source VM's overlay: warm restores
+        // seed every clone from it, so tearing down that VM must not delete it.
+        match self.owns_golden_artifact(Path::new(&self.overlay_path_for(id))) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(error) = remove_file_if_present(Path::new(&self.overlay_path_for(id))) {
+                    failures.push(format!("remove VMM overlay: {error}"));
+                }
+            }
+            Err(error) => failures.push(error.to_string()),
         }
         // The exact child can only be empty after the process is confirmed
         // dead. Removing only this UUID-derived child preserves the
@@ -5219,6 +5236,39 @@ mod tests {
         assert!(matches!(result, Err(OrchError::Internal(_))));
         assert!(!supervisor.scheduler.is_reserved(id));
         assert!(!supervisor.has_retained_boot(id));
+    }
+
+    #[test]
+    fn teardown_preserves_a_remembered_golden_overlay() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let overlay = PathBuf::from(supervisor.overlay_path_for(id));
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&overlay, b"golden upper").unwrap();
+        let mut artifacts = vec![OwnedArtifact::capture(&overlay).unwrap()];
+        supervisor
+            .remember_golden_artifacts(&mut artifacts)
+            .unwrap();
+
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        let vm = RunningVm::new(process.pid, PathBuf::new(), process, None);
+        supervisor.teardown_vm(id, &vm).unwrap();
+        assert!(
+            overlay.exists(),
+            "warm restores seed from the golden overlay; tearing down its source VM must not delete it"
+        );
+        std::fs::remove_file(&overlay).unwrap();
+
+        let other = Uuid::new_v4();
+        let scratch = PathBuf::from(supervisor.overlay_path_for(other));
+        std::fs::write(&scratch, b"private upper").unwrap();
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        let vm = RunningVm::new(process.pid, PathBuf::new(), process, None);
+        supervisor.teardown_vm(other, &vm).unwrap();
+        assert!(
+            !scratch.exists(),
+            "a non-golden overlay is removed on teardown"
+        );
     }
 
     #[test]
