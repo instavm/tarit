@@ -36,6 +36,15 @@ const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// 5-second per-read stream timeout of a plain client, which a multi-GiB
 /// guest cannot meet.
 const LIFECYCLE_OP_TIMEOUT: Duration = Duration::from_secs(600);
+/// Margin on top of the guest-side exec timeout for VMM scheduling and
+/// response marshalling. The plain client's 5s per-read socket timeout is
+/// shorter than most exec budgets, so exec must use a deadline client sized
+/// to the command's own timeout.
+const EXEC_OP_MARGIN: Duration = Duration::from_secs(10);
+/// Status is a fast RPC, but under host CPU contention the VMM can hold the
+/// response past the plain client's 5s per-read timeout. Give it a modest
+/// real deadline instead of surfacing EAGAIN as a 500.
+const STATUS_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const NORMAL_CGROUP_CPU_WEIGHT: u64 = 100;
 
 fn graceful_stop_vmm(socket_path: &Path) {
@@ -2392,7 +2401,9 @@ impl VmmSupervisor {
             return Ok(booted);
         };
         let command = restored_network_rebind_command(net);
-        let client = VmmClient::new(&booted.vm.socket_path);
+        // Deadline must outlive the 5s guest budget (see exec_vm).
+        let client = VmmClient::new(&booted.vm.socket_path)
+            .with_request_timeout(Duration::from_secs(5) + EXEC_OP_MARGIN);
         match client.exec(&command, 5_000) {
             Ok((0, _, _, _)) => Ok(booted),
             Ok((status, _, stderr, _)) => Err(self.cleanup_boot_failure(
@@ -3389,7 +3400,7 @@ impl VmmSupervisor {
 
     /// Live VMM status (state/uptime/vcpus/mem/config/vcpu_alive) for a running VM.
     pub fn status_vm(&self, id: Uuid) -> Result<tarit_vmm_client::VmStatus, OrchError> {
-        let client = self.client_for(id)?;
+        let client = self.client_for(id)?.with_request_timeout(STATUS_OP_TIMEOUT);
         client.status().map_err(|e| OrchError::Vmm(e.to_string()))
     }
 
@@ -3399,7 +3410,12 @@ impl VmmSupervisor {
         command: &str,
         timeout_ms: u64,
     ) -> Result<(i32, String, String, u64), OrchError> {
-        let client = self.client_for(id)?;
+        // The guest is allowed to run for the full `timeout_ms`; the transport
+        // deadline must outlive it or long commands fail with a spurious
+        // socket timeout (EAGAIN) while the guest is still working.
+        let client = self
+            .client_for(id)?
+            .with_request_timeout(Duration::from_millis(timeout_ms) + EXEC_OP_MARGIN);
         // An exec request is not replay-safe: a lost response may mean the
         // guest accepted and ran the command. Send it exactly once and surface
         // an ambiguous transport failure to the caller. Readiness retries use
