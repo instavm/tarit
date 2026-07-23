@@ -236,6 +236,53 @@ impl FromStr for ApiRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcmeDnsProvider {
+    Cloudflare,
+    Route53,
+}
+
+impl FromStr for AcmeDnsProvider {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        match raw {
+            "cloudflare" => Ok(Self::Cloudflare),
+            "route53" => Ok(Self::Route53),
+            _ => bail!("TARIT_ACME_DNS_PROVIDER must be 'cloudflare' or 'route53'"),
+        }
+    }
+}
+
+#[allow(dead_code)] // Consumed by the ACME runtime added in subsequent tasks.
+#[derive(Clone)]
+pub struct AcmeConfig {
+    pub identifier: String,
+    pub directory_url: String,
+    pub contact: String,
+    pub provider: AcmeDnsProvider,
+    pub kek: [u8; 32],
+}
+
+#[allow(dead_code)]
+impl AcmeConfig {
+    pub fn identifier(&self) -> &str {
+        &self.identifier
+    }
+}
+
+impl fmt::Debug for AcmeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcmeConfig")
+            .field("identifier", &self.identifier)
+            .field("directory_url", &self.directory_url)
+            .field("contact", &self.contact)
+            .field("provider", &self.provider)
+            .field("kek", &format_args!("[REDACTED; {} bytes]", self.kek.len()))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiIdentity {
     pub tenant: String,
@@ -544,6 +591,16 @@ pub struct Config {
     pub share_token_ttl_secs: u64,
     pub share_connect_timeout_ms: u64,
     pub share_idle_timeout_secs: u64,
+    pub acme_enabled: bool,
+    pub acme_directory_url: String,
+    pub acme_contact_email: Option<String>,
+    pub acme_dns_provider: Option<AcmeDnsProvider>,
+    pub acme_cloudflare_api_token: Option<String>,
+    pub acme_cloudflare_zone_id: Option<String>,
+    pub acme_cloudflare_api_base: Option<String>,
+    pub acme_route53_zone_id: Option<String>,
+    pub acme_kek: Option<[u8; 32]>,
+    pub share_tls_listen: Option<SocketAddr>,
 }
 
 impl Config {
@@ -681,6 +738,22 @@ impl Config {
             share_connect_timeout_ms_raw.as_deref(),
             share_idle_timeout_secs_raw.as_deref(),
         )?;
+        let acme_enabled = env_bool("TARIT_ACME_ENABLED", false);
+        let acme_config = parse_acme_config(
+            acme_enabled,
+            database_url.as_deref(),
+            share_domain.as_deref(),
+            env::var("TARIT_SHARE_TLS_LISTEN").ok().as_deref(),
+            env::var("TARIT_ACME_DIRECTORY_URL").ok().as_deref(),
+            env::var("TARIT_ACME_CONTACT_EMAIL").ok().as_deref(),
+            env::var("TARIT_ACME_DNS_PROVIDER").ok().as_deref(),
+            env::var("TARIT_ACME_CLOUDFLARE_API_TOKEN").ok().as_deref(),
+            env::var("TARIT_ACME_CLOUDFLARE_ZONE_ID").ok().as_deref(),
+            env::var("TARIT_ACME_CLOUDFLARE_API_BASE").ok().as_deref(),
+            env::var("TARIT_ACME_ROUTE53_ZONE_ID").ok().as_deref(),
+            env::var("TARIT_ACME_KEK").ok().as_deref(),
+        )?;
+        require_share_token_key(share_listen, acme_config.share_tls_listen, share_token_key)?;
 
         Ok(Self {
             listen,
@@ -720,6 +793,31 @@ impl Config {
             share_token_ttl_secs,
             share_connect_timeout_ms,
             share_idle_timeout_secs,
+            acme_enabled: acme_config.enabled,
+            acme_directory_url: acme_config.directory_url,
+            acme_contact_email: acme_config.contact_email,
+            acme_dns_provider: acme_config.dns_provider,
+            acme_cloudflare_api_token: acme_config.cloudflare_api_token,
+            acme_cloudflare_zone_id: acme_config.cloudflare_zone_id,
+            acme_cloudflare_api_base: acme_config.cloudflare_api_base,
+            acme_route53_zone_id: acme_config.route53_zone_id,
+            acme_kek: acme_config.kek,
+            share_tls_listen: acme_config.share_tls_listen,
+        })
+    }
+
+    #[allow(dead_code)] // Consumed by the ACME runtime added in subsequent tasks.
+    pub fn acme(&self) -> Option<AcmeConfig> {
+        if !self.acme_enabled {
+            return None;
+        }
+
+        Some(AcmeConfig {
+            identifier: format!("*.{}", self.share_domain.as_ref()?),
+            directory_url: self.acme_directory_url.clone(),
+            contact: self.acme_contact_email.clone()?,
+            provider: self.acme_dns_provider?,
+            kek: self.acme_kek?,
         })
     }
 }
@@ -773,7 +871,156 @@ impl fmt::Debug for Config {
             .field("share_token_ttl_secs", &self.share_token_ttl_secs)
             .field("share_connect_timeout_ms", &self.share_connect_timeout_ms)
             .field("share_idle_timeout_secs", &self.share_idle_timeout_secs)
+            .field("acme_enabled", &self.acme_enabled)
+            .field("acme_directory_url", &self.acme_directory_url)
+            .field("acme_contact_email", &self.acme_contact_email)
+            .field("acme_dns_provider", &self.acme_dns_provider)
+            .field(
+                "acme_cloudflare_api_token",
+                &self
+                    .acme_cloudflare_api_token
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
+            .field("acme_cloudflare_zone_id", &self.acme_cloudflare_zone_id)
+            .field("acme_cloudflare_api_base", &self.acme_cloudflare_api_base)
+            .field("acme_route53_zone_id", &self.acme_route53_zone_id)
+            .field("acme_kek", &self.acme_kek.as_ref().map(|_| "[REDACTED]"))
+            .field("share_tls_listen", &self.share_tls_listen)
             .finish()
+    }
+}
+
+const DEFAULT_ACME_DIRECTORY_URL: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+struct ParsedAcmeConfig {
+    enabled: bool,
+    directory_url: String,
+    contact_email: Option<String>,
+    dns_provider: Option<AcmeDnsProvider>,
+    cloudflare_api_token: Option<String>,
+    cloudflare_zone_id: Option<String>,
+    cloudflare_api_base: Option<String>,
+    route53_zone_id: Option<String>,
+    kek: Option<[u8; 32]>,
+    share_tls_listen: Option<SocketAddr>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_acme_config(
+    enabled: bool,
+    database_url: Option<&str>,
+    share_domain: Option<&str>,
+    share_tls_listen_raw: Option<&str>,
+    directory_url_raw: Option<&str>,
+    contact_email_raw: Option<&str>,
+    dns_provider_raw: Option<&str>,
+    cloudflare_api_token_raw: Option<&str>,
+    cloudflare_zone_id_raw: Option<&str>,
+    cloudflare_api_base_raw: Option<&str>,
+    route53_zone_id_raw: Option<&str>,
+    kek_raw: Option<&str>,
+) -> Result<ParsedAcmeConfig> {
+    let directory_url = directory_url_raw
+        .unwrap_or(DEFAULT_ACME_DIRECTORY_URL)
+        .to_string();
+
+    if !enabled {
+        return Ok(ParsedAcmeConfig {
+            enabled,
+            directory_url,
+            contact_email: contact_email_raw.map(str::to_string),
+            dns_provider: None,
+            cloudflare_api_token: cloudflare_api_token_raw.map(str::to_string),
+            cloudflare_zone_id: cloudflare_zone_id_raw.map(str::to_string),
+            cloudflare_api_base: cloudflare_api_base_raw.map(str::to_string),
+            route53_zone_id: route53_zone_id_raw.map(str::to_string),
+            kek: None,
+            share_tls_listen: None,
+        });
+    }
+
+    required_acme_value("TARIT_DATABASE_URL", database_url)?;
+    required_acme_value("TARIT_SHARE_DOMAIN", share_domain)?;
+    let share_tls_listen = required_acme_value("TARIT_SHARE_TLS_LISTEN", share_tls_listen_raw)?
+        .parse::<SocketAddr>()
+        .context("TARIT_SHARE_TLS_LISTEN must be a valid socket address")?;
+    let directory_url =
+        required_acme_value("TARIT_ACME_DIRECTORY_URL", Some(&directory_url))?.to_string();
+    let contact_email =
+        required_acme_value("TARIT_ACME_CONTACT_EMAIL", contact_email_raw)?.to_string();
+    let dns_provider = required_acme_value("TARIT_ACME_DNS_PROVIDER", dns_provider_raw)?
+        .parse::<AcmeDnsProvider>()?;
+    let cloudflare_api_token = cloudflare_api_token_raw
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let cloudflare_zone_id = cloudflare_zone_id_raw
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let cloudflare_api_base = cloudflare_api_base_raw
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let route53_zone_id = route53_zone_id_raw
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    let kek = parse_acme_kek(required_acme_value("TARIT_ACME_KEK", kek_raw)?)?;
+
+    if dns_provider == AcmeDnsProvider::Cloudflare && cloudflare_api_token.is_none() {
+        bail!(
+            "TARIT_ACME_CLOUDFLARE_API_TOKEN must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
+        );
+    }
+    if dns_provider == AcmeDnsProvider::Cloudflare && cloudflare_zone_id.is_none() {
+        bail!(
+            "TARIT_ACME_CLOUDFLARE_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
+        );
+    }
+    if dns_provider == AcmeDnsProvider::Route53 && route53_zone_id.is_none() {
+        bail!("TARIT_ACME_ROUTE53_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is route53");
+    }
+
+    Ok(ParsedAcmeConfig {
+        enabled,
+        directory_url,
+        contact_email: Some(contact_email),
+        dns_provider: Some(dns_provider),
+        cloudflare_api_token,
+        cloudflare_zone_id,
+        cloudflare_api_base,
+        route53_zone_id,
+        kek: Some(kek),
+        share_tls_listen: Some(share_tls_listen),
+    })
+}
+
+fn required_acme_value<'a>(name: &str, value: Option<&'a str>) -> Result<&'a str> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{name} must be set when TARIT_ACME_ENABLED is enabled"))
+}
+
+fn parse_acme_kek(raw: &str) -> Result<[u8; 32]> {
+    if raw.len() != 64 {
+        bail!("TARIT_ACME_KEK must decode to exactly 32 bytes");
+    }
+
+    let mut kek = [0u8; 32];
+    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+        let high = decode_hex_nibble(pair[0])
+            .ok_or_else(|| anyhow::anyhow!("TARIT_ACME_KEK must be hexadecimal"))?;
+        let low = decode_hex_nibble(pair[1])
+            .ok_or_else(|| anyhow::anyhow!("TARIT_ACME_KEK must be hexadecimal"))?;
+        kek[index] = (high << 4) | low;
+    }
+    Ok(kek)
+}
+
+fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -865,6 +1112,17 @@ fn parse_share_token_key(raw: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("TARIT_SHARE_TOKEN_KEY must decode to exactly 32 bytes"))
 }
 
+fn require_share_token_key(
+    plaintext_listen: Option<SocketAddr>,
+    tls_listen: Option<SocketAddr>,
+    token_key: Option<[u8; 32]>,
+) -> Result<()> {
+    if (plaintext_listen.is_some() || tls_listen.is_some()) && token_key.is_none() {
+        bail!("TARIT_SHARE_TOKEN_KEY is required when a share listener is enabled");
+    }
+    Ok(())
+}
+
 fn parse_positive_share_setting(name: &str, raw: Option<&str>, default: u64) -> Result<u64> {
     let Some(raw) = raw else {
         return Ok(default);
@@ -928,6 +1186,142 @@ mod security_tests {
     }
 
     #[test]
+    fn acme_requires_domain_provider_kek_tls_listen_and_provider_zone() {
+        let kek = hex::encode([7u8; 32]);
+        assert!(parse_acme_config(
+            true, None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .is_err());
+        let short_kek = hex::encode([7u8; 31]);
+        assert!(parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            None,
+            None,
+            None,
+            Some(&short_kek),
+        )
+        .is_err());
+
+        let cloudflare_without_zone = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            None,
+            None,
+            None,
+            Some(&kek),
+        );
+        assert_eq!(
+            cloudflare_without_zone.err().unwrap().to_string(),
+            "TARIT_ACME_CLOUDFLARE_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is cloudflare"
+        );
+
+        let route53_without_zone = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("route53"),
+            None,
+            None,
+            None,
+            None,
+            Some(&kek),
+        );
+        assert_eq!(
+            route53_without_zone.err().unwrap().to_string(),
+            "TARIT_ACME_ROUTE53_ZONE_ID must be set when TARIT_ACME_DNS_PROVIDER is route53"
+        );
+
+        let acme = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            Some("zone-id"),
+            None,
+            None,
+            Some(&kek),
+        )
+        .expect("valid ACME config");
+        assert_eq!(acme.share_tls_listen, Some("0.0.0.0:8443".parse().unwrap()));
+
+        let config = acme_test_config(true);
+        assert_eq!(
+            config.acme().expect("acme view present").identifier(),
+            "*.shares.example.com"
+        );
+    }
+
+    #[test]
+    fn acme_config_accepts_optional_cloudflare_api_base() {
+        let kek = hex::encode([7u8; 32]);
+        let with_api_base = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            Some("zone-id"),
+            Some("http://127.0.0.1:9999"),
+            None,
+            Some(&kek),
+        )
+        .expect("valid ACME config with Cloudflare API base");
+        assert_eq!(
+            with_api_base.cloudflare_api_base.as_deref(),
+            Some("http://127.0.0.1:9999")
+        );
+
+        let without_api_base = parse_acme_config(
+            true,
+            Some("postgres://tarit.example/tarit"),
+            Some("shares.example.com"),
+            Some("0.0.0.0:8443"),
+            Some("https://acme.example/dir"),
+            Some("ops@example.com"),
+            Some("cloudflare"),
+            Some("tok"),
+            Some("zone-id"),
+            None,
+            None,
+            Some(&kek),
+        )
+        .expect("valid ACME config without Cloudflare API base");
+        assert_eq!(without_api_base.cloudflare_api_base, None);
+    }
+
+    #[test]
+    fn acme_disabled_leaves_plain_http_config_unchanged() {
+        let config = acme_test_config(false);
+
+        assert!(!config.acme_enabled);
+        assert!(config.acme().is_none());
+        assert!(config.share_tls_listen.is_none());
+    }
+
+    #[test]
     fn share_config_normalizes_domain_and_rejects_noncanonical_key() {
         let key = URL_SAFE_NO_PAD.encode([9u8; 32]);
         let config = parse_share_config(
@@ -950,6 +1344,15 @@ mod security_tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn share_token_key_required_for_https_only_listener() {
+        let listen: std::net::SocketAddr = "127.0.0.1:8443".parse().unwrap();
+        assert!(require_share_token_key(None, Some(listen), None).is_err());
+        assert!(require_share_token_key(Some(listen), None, None).is_err());
+        assert!(require_share_token_key(None, Some(listen), Some([7u8; 32])).is_ok());
+        assert!(require_share_token_key(None, None, None).is_ok());
     }
 
     #[test]
@@ -983,6 +1386,64 @@ mod security_tests {
         assert_ne!(a, b);
         assert!(a.len() >= 32);
         assert!(b.len() >= 32);
+    }
+
+    fn acme_test_config(acme_enabled: bool) -> Config {
+        Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
+                "test-key".into(),
+                "tenant-a".into(),
+                ApiRole::Admin,
+                0,
+            )])
+            .unwrap(),
+            host_id: "test-host".into(),
+            vmm_bin: PathBuf::from("target/taritd-config-test/vmm"),
+            kernel: PathBuf::from("target/taritd-config-test/kernel"),
+            rootfs: PathBuf::from("target/taritd-config-test/rootfs"),
+            socket_dir: PathBuf::from("target/taritd-config-test/sockets"),
+            db_path: PathBuf::from("target/taritd-config-test/fleet.db"),
+            net_state_path: PathBuf::from("target/taritd-config-test/net-state.json"),
+            images_dir: PathBuf::from("target/taritd-config-test/images"),
+            max_vms: 4,
+            max_vcpus: 4,
+            max_memory_mib: 1024,
+            peer_secret: "peer-secret".into(),
+            database_url: acme_enabled.then(|| "postgres://tarit.example/tarit".into()),
+            rpc_addr: "http://127.0.0.1:0".into(),
+            enable_net: false,
+            rootfs_read_only: false,
+            metrics_expose_tenant_labels: false,
+            vm_cgroup_parent: None,
+            vm_cgroup_pids_max: 1024,
+            warm_pool: WarmPoolConfig::default(),
+            admission_timeout_ms: 1,
+            reap_on_shutdown: true,
+            region: "local".into(),
+            zone: "local".into(),
+            cloud: "onprem".into(),
+            autoscale: AutoscaleConfig::default(),
+            ssh_gateway_enabled: false,
+            ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
+            ssh_gateway_host_key_path: PathBuf::from("target/taritd-config-test/ssh_host"),
+            share_listen: Some("127.0.0.1:0".parse().unwrap()),
+            share_domain: Some("shares.example.com".into()),
+            share_token_key: Some([7; 32]),
+            share_token_ttl_secs: 300,
+            share_connect_timeout_ms: 1_000,
+            share_idle_timeout_secs: 1,
+            acme_enabled,
+            acme_directory_url: "https://acme.example/dir".into(),
+            acme_contact_email: acme_enabled.then(|| "ops@example.com".into()),
+            acme_dns_provider: acme_enabled.then_some(AcmeDnsProvider::Cloudflare),
+            acme_cloudflare_api_token: acme_enabled.then(|| "tok".into()),
+            acme_cloudflare_zone_id: None,
+            acme_cloudflare_api_base: None,
+            acme_route53_zone_id: None,
+            acme_kek: acme_enabled.then_some([7; 32]),
+            share_tls_listen: acme_enabled.then(|| "127.0.0.1:8443".parse().unwrap()),
+        }
     }
 }
 

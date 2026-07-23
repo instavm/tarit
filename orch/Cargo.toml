@@ -8,24 +8,36 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
+arc-swap = "1"
 anyhow = "1"
+async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "ws"] }
+aws-config = "1"
+aws-sdk-route53 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 base64 = "0.22"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hmac = "0.12"
+hickory-resolver = "0.26"
 # MIT OR Apache-2.0 licensed — validated IP network parser
+hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
+idna = "1"
+instant-acme = "0.8"
 ipnet = "2"
+rcgen = "0.14"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+x509-parser = "0.18"
 # MIT OR Apache-2.0 licensed — peer HTTP + Postgres fleet sync
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }

@@ -13,6 +13,7 @@ tarit-types = { path = "../tarit-types" }
 serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
 rustls = { workspace = true }

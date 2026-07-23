@@ -600,6 +600,7 @@ pub(crate) enum GatewayError {
     Unauthorized,
     NotFound,
     Unavailable,
+    Misdirected,
 }
 
 impl From<OrchError> for GatewayError {
@@ -623,6 +624,7 @@ impl IntoResponse for GatewayError {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found"),
             Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "share unavailable"),
+            Self::Misdirected => (StatusCode::MISDIRECTED_REQUEST, "misdirected request"),
         };
         (
             status,
@@ -670,14 +672,19 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(peer)| *peer);
         let slug = share_slug_from_headers(request.headers(), domain)?;
+        let tls = request.extensions().get::<crate::tls::TlsInfo>();
+        let host = format!("{slug}.{domain}");
+        if !sni_authorizes_host(&host, tls) {
+            return Err(GatewayError::Misdirected);
+        }
+        let forwarding = TrustedForwarding {
+            peer,
+            host,
+            scheme: forwarded_scheme(tls, request.headers()),
+        };
         let token = share_token(request.headers())?;
         let share = shares::authorize_gateway(&state, &slug, token.as_deref()).await?;
         active_request.set_visibility(ShareMetricVisibility::from(share.visibility));
-        let forwarding = TrustedForwarding {
-            peer,
-            host: format!("{slug}.{domain}"),
-            scheme: trusted_forwarded_scheme(request.headers()),
-        };
         let (mut parts, body) = request.into_parts();
         let owner = resolve_share_owner(&state, share.vm_id)
             .await
@@ -1311,6 +1318,26 @@ fn trusted_forwarded_scheme(headers: &axum::http::HeaderMap) -> ForwardedScheme 
     }
 }
 
+fn forwarded_scheme(
+    tls: Option<&crate::tls::TlsInfo>,
+    headers: &axum::http::HeaderMap,
+) -> ForwardedScheme {
+    match tls {
+        Some(_) => ForwardedScheme::Https,
+        None => trusted_forwarded_scheme(headers),
+    }
+}
+
+fn sni_authorizes_host(host: &str, tls: Option<&crate::tls::TlsInfo>) -> bool {
+    match tls {
+        None => true,
+        Some(info) => info
+            .sni
+            .as_deref()
+            .is_some_and(|sni| host.eq_ignore_ascii_case(sni)),
+    }
+}
+
 fn should_strip_request_header(
     name: &HeaderName,
     connection_headers: &HashSet<HeaderName>,
@@ -1807,10 +1834,10 @@ fn upstream_message(message: TungsteniteMessage) -> Option<AxumMessage> {
 #[cfg(test)]
 mod tests {
     use super::{
-        meter_response_body, proxy_http_to_target, proxy_websocket_to_target,
-        router as gateway_router, share_slug, ActiveBridgeTask, BridgeTaskTracker, ForwardedScheme,
-        ShareRuntime, TrackedBridgeTasks, TrustedForwarding, UpstreamTarget,
-        WebSocketTargetRequest,
+        forwarded_scheme, meter_response_body, proxy_http_to_target, proxy_websocket_to_target,
+        router as gateway_router, share_slug, sni_authorizes_host, ActiveBridgeTask,
+        BridgeTaskTracker, ForwardedScheme, ShareRuntime, TrackedBridgeTasks, TrustedForwarding,
+        UpstreamTarget, WebSocketTargetRequest,
     };
     use axum::{
         body::{Body, Bytes},
@@ -1873,6 +1900,49 @@ mod tests {
     const SHARE_HOST: &str = "calm-red-fox.shares.example.com";
     type HeaderCapture = Arc<Mutex<Option<oneshot::Sender<(HeaderMap, Uri)>>>>;
     type UploadCapture = Arc<Mutex<Option<oneshot::Sender<(Uri, usize)>>>>;
+
+    #[test]
+    fn forwarded_scheme_prefers_the_tls_session_over_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+
+        let scheme = forwarded_scheme(
+            Some(&crate::tls::TlsInfo {
+                sni: Some("a.shares.example.com".into()),
+            }),
+            &headers,
+        );
+
+        assert_eq!(scheme.as_str(), "https");
+    }
+
+    #[test]
+    fn forwarded_scheme_uses_forwarded_headers_without_tls() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        assert_eq!(forwarded_scheme(None, &headers).as_str(), "https");
+        assert_eq!(forwarded_scheme(None, &HeaderMap::new()).as_str(), "http");
+    }
+
+    #[test]
+    fn tls_shares_require_a_matching_sni() {
+        let matching = crate::tls::TlsInfo {
+            sni: Some("a.shares.example.com".into()),
+        };
+        let mismatched = crate::tls::TlsInfo {
+            sni: Some("b.shares.example.com".into()),
+        };
+        let missing = crate::tls::TlsInfo { sni: None };
+        assert!(sni_authorizes_host("a.shares.example.com", None));
+        assert!(sni_authorizes_host("a.shares.example.com", Some(&matching)));
+        assert!(sni_authorizes_host("A.Shares.Example.Com", Some(&matching)));
+        assert!(!sni_authorizes_host(
+            "a.shares.example.com",
+            Some(&mismatched)
+        ));
+        assert!(!sni_authorizes_host("a.shares.example.com", Some(&missing)));
+    }
 
     struct ChatProtocol;
 
@@ -2526,6 +2596,59 @@ mod tests {
                 "host=calm-red-fox.shares.example.com;proto=http"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn gateway_router_uses_tls_scheme_when_sni_matches_host() {
+        let (upstream, received) = spawn_inspecting_http_upstream().await;
+        let state = gateway_test_state();
+        let share = install_gateway_share(&state, upstream, ShareVisibility::Private).await;
+        let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
+            .issue(&share, Utc::now())
+            .unwrap();
+        let mut request = Request::builder()
+            .uri("/inspect")
+            .header(HOST, SHARE_HOST)
+            .header("x-forwarded-proto", "http")
+            .header("x-tarit-share-token", token)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(crate::tls::TlsInfo {
+            sni: Some(SHARE_HOST.into()),
+        });
+
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (headers, _) = received.await.unwrap();
+        assert_eq!(headers.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(
+            headers.get(FORWARDED).unwrap(),
+            "host=calm-red-fox.shares.example.com;proto=https"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_router_rejects_tls_sni_mismatching_share_host() {
+        let (upstream, _received) = spawn_inspecting_http_upstream().await;
+        let state = gateway_test_state();
+        let share = install_gateway_share(&state, upstream, ShareVisibility::Private).await;
+        let token = ShareTokenSigner::new([7; 32], Duration::from_secs(300))
+            .issue(&share, Utc::now())
+            .unwrap();
+        let mut request = Request::builder()
+            .uri("/inspect")
+            .header(HOST, SHARE_HOST)
+            .header("x-tarit-share-token", token)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(crate::tls::TlsInfo {
+            sni: Some("different-slug.shares.example.com".into()),
+        });
+
+        let response = gateway_router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
     }
 
     #[tokio::test]
@@ -3526,6 +3649,16 @@ mod tests {
             share_token_ttl_secs: 300,
             share_connect_timeout_ms: 1_000,
             share_idle_timeout_secs: 1,
+            acme_enabled: false,
+            acme_directory_url: "https://acme-v02.api.letsencrypt.org/directory".into(),
+            acme_contact_email: None,
+            acme_dns_provider: None,
+            acme_cloudflare_api_token: None,
+            acme_cloudflare_zone_id: None,
+            acme_cloudflare_api_base: None,
+            acme_route53_zone_id: None,
+            acme_kek: None,
+            share_tls_listen: None,
         };
         let store = Arc::new(Mutex::new(tarit_store::Store::open(":memory:").unwrap()));
         let shares = ShareRepository::new(Arc::clone(&store), None);

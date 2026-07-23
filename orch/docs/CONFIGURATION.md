@@ -98,12 +98,17 @@ The `TARIT_CONFIG` TOML schema does not define an `[autoscale]` table. Configure
 ## Port shares
 
 Port-share guest traffic is disabled unless `TARIT_SHARE_LISTEN` is set. The
-share listener is distinct from `TARIT_LISTEN`: it is private to a trusted
-Caddy or Envoy edge, and direct public access is unsupported and must be
-firewalled. Disabling only this listener does not disable the `/v1/shares`
-control routes on `TARIT_LISTEN`. The edge must terminate public TLS, preserve
-the incoming `Host`, support WebSocket upgrades, and never route
-`/internal/v1/*` from the public edge.
+`TARIT_SHARE_LISTEN` listener is distinct from `TARIT_LISTEN`: it is a plaintext
+guest data plane, private to a trusted Caddy or Envoy edge, and direct public
+access is unsupported and must be firewalled. Disabling only this listener does
+not disable the `/v1/shares` control routes on `TARIT_LISTEN`. The edge must
+terminate public TLS, preserve the incoming `Host`, support WebSocket upgrades,
+and never route `/internal/v1/*` from the public edge.
+
+Tarit can also terminate TLS itself with automatic wildcard certificates instead
+of an external edge. See [Wildcard TLS (ACME)](#wildcard-tls-acme) below. The
+in-process HTTPS listener (`TARIT_SHARE_TLS_LISTEN`) and the plaintext
+`TARIT_SHARE_LISTEN` edge are independent and may run together or separately.
 
 The edge must overwrite—not append—`Forwarded` and `X-Forwarded-*` headers.
 Tarit accepts one
@@ -144,6 +149,61 @@ Use a wildcard DNS record and a wildcard certificate for
 certificate and key paths through environment variables, so no DNS-provider
 credential is embedded in the example. The share listener is a guest data
 plane; do not send it `/v1/*`, `/internal/v1/*`, or control-plane credentials.
+To have Tarit obtain and renew the wildcard certificate itself instead of
+supplying it to an edge, use the ACME listener described next.
+
+## Wildcard TLS (ACME)
+
+Tarit can terminate share HTTPS in process and keep a wildcard certificate for
+`*.${TARIT_SHARE_DOMAIN}` current on its own, so shares are reachable at
+`https://<slug>.<domain>` without an external TLS edge. This path is off by
+default; when it is disabled, the plaintext `TARIT_SHARE_LISTEN` behavior is
+unchanged.
+
+The certificate is issued through the ACME DNS-01 challenge, which is the only
+challenge type that can authorize a wildcard name. Tarit publishes the
+`_acme-challenge.<domain>` TXT record through the configured DNS provider, waits
+for it to be visible on the zone's authoritative nameservers, and then finalizes
+one order for the single identifier `*.${TARIT_SHARE_DOMAIN}`. HTTP-01 and
+TLS-ALPN-01 are not used.
+
+Issuance runs in cluster mode only (`TARIT_DATABASE_URL` set). The certificate,
+its private key, and the ACME account key are stored in the shared fleet
+database, so every node serves the same certificate. Account and certificate
+private keys are envelope-encrypted at rest with `TARIT_ACME_KEK`; the database
+never holds plaintext key material. A single node holds a fenced job lease at a
+time, so exactly one node issues or renews while the others load the result from
+the fleet and refresh when notified. Renewal is automatic and begins once two
+thirds of the certificate lifetime has elapsed.
+
+Binding `TARIT_SHARE_TLS_LISTEN` to port 443 requires the `CAP_NET_BIND_SERVICE`
+capability or running as root. A high, firewalled port behind a load balancer
+that preserves SNI is also supported.
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_ACME_ENABLED` | boolean | `false` | Master switch for in-process wildcard TLS. When false, no ACME work runs and no TLS listener binds. |
+| `TARIT_SHARE_TLS_LISTEN` | socket address | unset | Bind address for the in-process HTTPS share listener. Required when ACME is enabled. |
+| `TARIT_ACME_DIRECTORY_URL` | URL | `https://acme-v02.api.letsencrypt.org/directory` | ACME directory endpoint. Point at a staging or test directory for non-production issuance. |
+| `TARIT_ACME_CONTACT_EMAIL` | email | unset | Account contact address registered with the CA. Required when ACME is enabled. |
+| `TARIT_ACME_DNS_PROVIDER` | `cloudflare` or `route53` | unset | DNS provider used to write the DNS-01 TXT record. Required when ACME is enabled. |
+| `TARIT_ACME_CLOUDFLARE_API_TOKEN` | string | unset | Cloudflare API token scoped to edit the zone's DNS records. Required when the provider is `cloudflare`. Keep it out of source control. |
+| `TARIT_ACME_CLOUDFLARE_ZONE_ID` | string | unset | Cloudflare zone id that holds `${TARIT_SHARE_DOMAIN}`. Required when the provider is `cloudflare`. |
+| `TARIT_ACME_CLOUDFLARE_API_BASE` | URL | Cloudflare API base | Optional override of the Cloudflare API base URL, for a Cloudflare-API-compatible proxy or a test harness. Leave unset in production. |
+| `TARIT_ACME_ROUTE53_ZONE_ID` | string | unset | Route 53 hosted-zone id that holds `${TARIT_SHARE_DOMAIN}`. Required when the provider is `route53`. Route 53 credentials come from the standard AWS environment and role chain. |
+| `TARIT_ACME_KEK` | hex | unset | 32-byte key-encryption key as 64 hexadecimal characters that envelope-encrypts stored ACME account and certificate private keys. Required when ACME is enabled. Keep it out of source control and rotate it through the deployment secret mechanism. |
+
+Startup validation (only when `TARIT_ACME_ENABLED` is true):
+
+- `TARIT_DATABASE_URL`, `TARIT_SHARE_DOMAIN`, `TARIT_SHARE_TLS_LISTEN`,
+  `TARIT_ACME_DIRECTORY_URL`, `TARIT_ACME_CONTACT_EMAIL`,
+  `TARIT_ACME_DNS_PROVIDER`, and `TARIT_ACME_KEK` must all be set.
+- `TARIT_SHARE_TLS_LISTEN` must parse as a socket address.
+- `TARIT_ACME_KEK` must be 64 hexadecimal characters and decode to exactly 32
+  bytes.
+- Provider `cloudflare` also requires `TARIT_ACME_CLOUDFLARE_API_TOKEN` and
+  `TARIT_ACME_CLOUDFLARE_ZONE_ID`. Provider `route53` also requires
+  `TARIT_ACME_ROUTE53_ZONE_ID`.
 
 ## Usage stats and audit trail
 
