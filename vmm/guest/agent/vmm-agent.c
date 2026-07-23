@@ -714,6 +714,11 @@ static void handle_pty_client(int fd) {
         if (chosen == NULL || chosen[0] == '\0') {
             chosen = (access("/bin/bash", X_OK) == 0) ? "/bin/bash" : "/bin/sh";
         }
+        if (shell != NULL && shell[0] != '\0' && strpbrk(shell, " \t;|&<>()$`\"'*?[]{}~#\\") != NULL) {
+            /* Command line, not a bare program path: run via sh -c. */
+            execl("/bin/sh", "sh", "-c", shell, (char *)NULL);
+            _exit(127);
+        }
         execlp(chosen, chosen, (char *)NULL);
         execl("/bin/sh", "sh", (char *)NULL);
         _exit(127);

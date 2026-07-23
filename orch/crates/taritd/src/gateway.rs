@@ -376,12 +376,13 @@ impl server::Handler for GatewayHandler {
 
     async fn channel_eof(
         &mut self,
-        channel: ChannelId,
+        _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.get_mut(&channel) {
-            state.writer = None;
-        }
+        // Keep the VMM writer open: dropping it half-closes the UDS, which the
+        // VMM relay escalates to a full PTY teardown. Command mode (`ssh vm
+        // "cmd"`) sends EOF right after exec, before any output has returned.
+        // The stream is reclaimed on channel_close or PTY exit.
         Ok(())
     }
 
