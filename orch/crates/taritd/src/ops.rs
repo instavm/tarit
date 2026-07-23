@@ -2101,6 +2101,24 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn exec_against_suspended_vm_is_a_conflict() {
+        let (state, _rx) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        state.vm_cache.write().unwrap().get_mut(&id).unwrap().status = VmStatus::Suspended;
+        state
+            .supervisor
+            .install_test_control_runtime(id, PathBuf::from("unused.sock"));
+
+        let error = test_runtime()
+            .block_on(exec_local(&state, id, "true".into(), 100))
+            .expect_err("exec against a suspended VM must be rejected");
+
+        assert!(matches!(error, OrchError::Conflict(_)));
+        assert!(error.to_string().contains("suspended"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn failed_live_transition_is_rolled_back_and_fenced_at_revision_n_plus_two() {
         let (state, _) = test_state_with_durable_writer();
         let id = insert_running_vm(&state);

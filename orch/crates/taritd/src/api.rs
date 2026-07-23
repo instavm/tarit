@@ -1961,6 +1961,9 @@ async fn execute_impl(
             created_at: now,
             updated_at: Utc::now(),
         },
+        // Precondition rejections (e.g. exec against a suspended VM) are API
+        // errors, not execution outcomes: no command ran, so no record.
+        Err(e @ OrchError::Conflict(_)) => return Err(e.into()),
         Err(e) => ExecutionRecord {
             id: exec_id,
             vm_id,
