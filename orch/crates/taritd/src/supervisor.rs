@@ -1389,10 +1389,10 @@ impl VmmSupervisor {
                 );
             });
         registered?;
-        if let Err(error) = on_registered().await {
-            self.complete_booting(id, &control, Ok(()));
-            return Err(error);
-        }
+        // Reserve capacity before the durable registration so capacity
+        // rejections leave no durable trace: the admission loop retries the
+        // same id, and a leftover Error tombstone from a rejected attempt
+        // would make the re-registration fail with an incarnation conflict.
         if let Err(error) = self.scheduler.try_reserve(id, shape) {
             self.complete_booting(id, &control, Ok(()));
             return Err(match error {
@@ -1409,6 +1409,11 @@ impl VmmSupervisor {
                     retry_after_secs: 1,
                 },
             });
+        }
+        if let Err(error) = on_registered().await {
+            self.scheduler.release(id);
+            self.complete_booting(id, &control, Ok(()));
+            return Err(error);
         }
         Ok(BootTicket {
             id,
@@ -5156,6 +5161,47 @@ mod tests {
 
         test_runtime().block_on(supervisor.abort_unstarted_boot(&ticket));
 
+        assert!(!supervisor.scheduler.is_reserved(id));
+        assert!(!supervisor.has_retained_boot(id));
+    }
+
+    #[test]
+    fn capacity_rejection_never_runs_durable_registration() {
+        let supervisor = test_supervisor();
+        for _ in 0..supervisor.config.max_vms {
+            supervisor.reserve_existing_for_test(Uuid::new_v4());
+        }
+        let id = Uuid::new_v4();
+        let registered = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&registered);
+        let result = test_runtime().block_on(supervisor.begin_boot_with_registration(
+            id,
+            SpawnPurpose::Live,
+            ResourceShape::new(1, 1),
+            move || async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        assert!(matches!(result, Err(OrchError::Overloaded { .. })));
+        assert!(
+            !registered.load(Ordering::SeqCst),
+            "capacity rejection must leave no durable trace so admission retries the same id"
+        );
+        assert!(!supervisor.has_retained_boot(id));
+    }
+
+    #[test]
+    fn registration_failure_releases_capacity_reservation() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let result = test_runtime().block_on(supervisor.begin_boot_with_registration(
+            id,
+            SpawnPurpose::Live,
+            ResourceShape::new(1, 1),
+            || async { Err(OrchError::Internal("registration failed".into())) },
+        ));
+        assert!(matches!(result, Err(OrchError::Internal(_))));
         assert!(!supervisor.scheduler.is_reserved(id));
         assert!(!supervisor.has_retained_boot(id));
     }
