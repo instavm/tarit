@@ -29,6 +29,11 @@ mod tests {
             .join("../../target/test-work")
             .join(format!("{name}-{}-{unique}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
+        // Overlay validation rejects group/world-writable directories; pin the
+        // mode so the test does not depend on the host umask.
+        let mut perms = fs::metadata(&dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&dir, perms).unwrap();
         dir
     }
 
