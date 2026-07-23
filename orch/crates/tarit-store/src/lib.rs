@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 use tarit_types::{
     AuditEvent, ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, SshKeyRecord,
-    UsageEvent, UsageKind, VmRecord, VmStatus,
+    UsageEvent, UsageKind, VmRecord, VmStartupPath, VmStatus,
 };
 use uuid::Uuid;
 
@@ -39,10 +39,22 @@ pub struct ImageRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRecord {
     pub path: String,
+    /// Snapshot-owned copy of the VM's private CoW overlay. This must never
+    /// point at the live VM overlay: deleting the source VM must not invalidate
+    /// a snapshot, and separate restores must not share a writable upper.
+    pub overlay_path: Option<String>,
     pub host_id: String,
     pub owner_key: Option<String>,
     pub api_key_id: Option<String>,
     pub vm_id: Uuid,
+    /// Resource shape and boot inputs captured with the snapshot ownership row.
+    /// These are optional only for rows created before the metadata migration;
+    /// production restore must fail closed when they are absent.
+    pub memory_mib: Option<u64>,
+    pub vcpus: Option<u8>,
+    pub kernel_path: Option<String>,
+    pub rootfs_path: Option<String>,
+    pub cmdline: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -60,6 +72,13 @@ pub enum StoreError {
 
 pub struct Store {
     conn: Connection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmQuotaReservationOutcome {
+    Reserved,
+    QuotaExceeded,
+    IdConflict,
 }
 
 impl Store {
@@ -84,6 +103,8 @@ impl Store {
                owner_key TEXT,
                api_key_id TEXT,
                status TEXT NOT NULL,
+               revision INTEGER NOT NULL DEFAULT 1,
+               startup_path TEXT,
                memory_mib INTEGER NOT NULL,
                vcpus INTEGER NOT NULL,
                kernel_path TEXT NOT NULL,
@@ -168,11 +189,22 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS snapshots (
                path TEXT PRIMARY KEY NOT NULL,
+               overlay_path TEXT,
                host_id TEXT NOT NULL,
                owner_key TEXT,
                api_key_id TEXT,
                vm_id TEXT NOT NULL,
+               memory_mib INTEGER,
+               vcpus INTEGER,
+               kernel_path TEXT,
+               rootfs_path TEXT,
+               cmdline TEXT,
                created_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS vm_quota_reservations (
+               id TEXT PRIMARY KEY NOT NULL,
+               owner_key TEXT NOT NULL,
+               expires_at TEXT NOT NULL
              );
              CREATE TABLE IF NOT EXISTS shares (
                id TEXT PRIMARY KEY NOT NULL,
@@ -189,10 +221,20 @@ impl Store {
              CREATE INDEX IF NOT EXISTS usage_outbox_unsent ON usage_outbox(sent);
              CREATE INDEX IF NOT EXISTS audit_outbox_unsent ON audit_outbox(sent);
              CREATE INDEX IF NOT EXISTS shares_owner ON shares(owner_key, created_at DESC);
-             CREATE INDEX IF NOT EXISTS shares_vm ON shares(vm_id);",
+             CREATE INDEX IF NOT EXISTS shares_vm ON shares(vm_id);
+             CREATE INDEX IF NOT EXISTS vm_quota_reservations_owner_expiry
+               ON vm_quota_reservations(owner_key, expires_at);",
         )?;
         ensure_column(&conn, "vms", "owner_key", "TEXT")?;
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
+        ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
+        ensure_column(&conn, "vms", "startup_path", "TEXT")?;
+        ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
+        ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
+        ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
+        ensure_column(&conn, "snapshots", "kernel_path", "TEXT")?;
+        ensure_column(&conn, "snapshots", "rootfs_path", "TEXT")?;
+        ensure_column(&conn, "snapshots", "cmdline", "TEXT")?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint_active ON ssh_keys (fingerprint, is_active)",
             [],
@@ -201,17 +243,36 @@ impl Store {
     }
 
     pub fn insert_vm(&self, vm: &VmRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO vms (
-              id, host_id, owner_key, api_key_id, status, memory_mib, vcpus, kernel_path, rootfs_path,
-               cmdline, socket_path, pid, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        let changed = self.conn.execute(
+            "INSERT INTO vms (
+              id, host_id, owner_key, api_key_id, status, revision, startup_path, memory_mib,
+              vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid, created_at, updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(id) DO UPDATE SET
+               owner_key = excluded.owner_key,
+               api_key_id = excluded.api_key_id,
+               status = excluded.status,
+               revision = excluded.revision,
+               startup_path = excluded.startup_path,
+               memory_mib = excluded.memory_mib,
+               vcpus = excluded.vcpus,
+               kernel_path = excluded.kernel_path,
+               rootfs_path = excluded.rootfs_path,
+               cmdline = excluded.cmdline,
+               socket_path = excluded.socket_path,
+               pid = excluded.pid,
+               updated_at = excluded.updated_at
+             WHERE vms.host_id = excluded.host_id
+               AND vms.created_at = excluded.created_at
+               AND vms.revision < excluded.revision",
             params![
                 vm.id.to_string(),
                 vm.host_id,
                 vm.owner_key,
                 vm.api_key_id,
                 vm.status.as_str(),
+                u64_to_sql_i64(vm.revision)?,
+                vm.startup_path.map(VmStartupPath::as_str),
                 vm.memory_mib,
                 vm.vcpus,
                 vm.kernel_path,
@@ -223,14 +284,32 @@ impl Store {
                 vm.updated_at.to_rfc3339(),
             ],
         )?;
+        if changed == 0 {
+            let current = self.get_vm(vm.id)?;
+            if current.host_id != vm.host_id || current.created_at != vm.created_at {
+                return Err(StoreError::Conflict(format!(
+                    "VM {} belongs to another resource incarnation",
+                    vm.id
+                )));
+            }
+            if current.revision == vm.revision && current != *vm {
+                return Err(StoreError::Conflict(format!(
+                    "VM {} has two different records at revision {}",
+                    vm.id, vm.revision
+                )));
+            }
+            // A strictly newer durable record already won. Treat the delayed
+            // write as an idempotent no-op instead of regressing it.
+        }
         Ok(())
     }
 
     pub fn get_vm(&self, id: Uuid) -> Result<VmRecord, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, host_id, owner_key, api_key_id, status, memory_mib, vcpus, kernel_path, rootfs_path,
-                        cmdline, socket_path, pid, created_at, updated_at
+                "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
+                        memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
+                        created_at, updated_at
                  FROM vms WHERE id = ?1",
                 params![id.to_string()],
                 row_to_vm,
@@ -244,14 +323,21 @@ impl Store {
     pub fn insert_snapshot(&self, snap: &SnapshotRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO snapshots (
-               path, host_id, owner_key, api_key_id, vm_id, created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6)",
+               path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+               kernel_path, rootfs_path, cmdline, created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![
                 snap.path,
+                snap.overlay_path,
                 snap.host_id,
                 snap.owner_key,
                 snap.api_key_id,
                 snap.vm_id.to_string(),
+                snap.memory_mib,
+                snap.vcpus,
+                snap.kernel_path,
+                snap.rootfs_path,
+                snap.cmdline,
                 snap.created_at.to_rfc3339(),
             ],
         )?;
@@ -262,7 +348,8 @@ impl Store {
     pub fn get_snapshot(&self, path: &str) -> Result<Option<SnapshotRecord>, StoreError> {
         self.conn
             .query_row(
-                "SELECT path, host_id, owner_key, api_key_id, vm_id, created_at
+                "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+                        kernel_path, rootfs_path, cmdline, created_at
                  FROM snapshots WHERE path = ?1",
                 params![path],
                 row_to_snapshot,
@@ -396,8 +483,9 @@ impl Store {
 
     pub fn list_vms(&self) -> Result<Vec<VmRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, host_id, owner_key, api_key_id, status, memory_mib, vcpus, kernel_path, rootfs_path,
-                    cmdline, socket_path, pid, created_at, updated_at
+            "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
+                    memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
+                    created_at, updated_at
              FROM vms ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
@@ -405,19 +493,95 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Atomically reserve one tenant VM slot in single-host mode. Active VM rows
+    /// and unexpired reservations are counted in one SQLite transaction, so a
+    /// concurrent create burst cannot pass a check-then-create quota race.
+    pub fn reserve_vm_quota(
+        &self,
+        owner_key: &str,
+        id: Uuid,
+        max_vms: usize,
+        expires_at: DateTime<Utc>,
+    ) -> Result<VmQuotaReservationOutcome, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "DELETE FROM vm_quota_reservations WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        let existing_owner = tx
+            .query_row(
+                "SELECT owner_key FROM vm_quota_reservations WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_owner) = existing_owner {
+            tx.commit()?;
+            let _ = existing_owner;
+            return Ok(VmQuotaReservationOutcome::IdConflict);
+        }
+        let already_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM vms WHERE id = ?1)",
+            params![id.to_string()],
+            |row| row.get(0),
+        )?;
+        if already_exists {
+            tx.commit()?;
+            return Ok(VmQuotaReservationOutcome::IdConflict);
+        }
+        let active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM (
+               SELECT id FROM vms
+                WHERE owner_key = ?1 AND status IN ('creating','running','paused','suspended')
+               UNION
+               SELECT id FROM vm_quota_reservations
+                WHERE owner_key = ?1 AND expires_at > ?2
+             )",
+            params![owner_key, now],
+            |row| row.get(0),
+        )?;
+        if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
+            tx.commit()?;
+            return Ok(VmQuotaReservationOutcome::QuotaExceeded);
+        }
+        tx.execute(
+            "INSERT INTO vm_quota_reservations (id, owner_key, expires_at)
+             VALUES (?1,?2,?3)",
+            params![id.to_string(), owner_key, expires_at.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(VmQuotaReservationOutcome::Reserved)
+    }
+
+    pub fn release_vm_quota(&self, owner_key: &str, id: Uuid) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM vm_quota_reservations WHERE id = ?1 AND owner_key = ?2",
+            params![id.to_string(), owner_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn healthcheck(&self) -> Result<(), StoreError> {
+        self.conn.query_row("SELECT 1", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     pub fn update_vm(&self, vm: &VmRecord) -> Result<(), StoreError> {
         let n = self.conn.execute(
             "UPDATE vms SET
-               host_id = ?2, owner_key = ?3, api_key_id = ?4, status = ?5, memory_mib = ?6, vcpus = ?7,
-               kernel_path = ?8, rootfs_path = ?9, cmdline = ?10,
-               socket_path = ?11, pid = ?12, updated_at = ?13
-             WHERE id = ?1",
+               host_id = ?2, owner_key = ?3, api_key_id = ?4, status = ?5, revision = ?6,
+               startup_path = ?7, memory_mib = ?8, vcpus = ?9, kernel_path = ?10,
+               rootfs_path = ?11, cmdline = ?12, socket_path = ?13, pid = ?14, updated_at = ?15
+             WHERE id = ?1 AND revision < ?6",
             params![
                 vm.id.to_string(),
                 vm.host_id,
                 vm.owner_key,
                 vm.api_key_id,
                 vm.status.as_str(),
+                u64_to_sql_i64(vm.revision)?,
+                vm.startup_path.map(VmStartupPath::as_str),
                 vm.memory_mib,
                 vm.vcpus,
                 vm.kernel_path,
@@ -429,7 +593,27 @@ impl Store {
             ],
         )?;
         if n == 0 {
-            return Err(StoreError::NotFound);
+            match self.get_vm(vm.id) {
+                Ok(current)
+                    if current.host_id != vm.host_id || current.created_at != vm.created_at =>
+                {
+                    return Err(StoreError::Conflict(format!(
+                        "VM {} belongs to another resource incarnation",
+                        vm.id
+                    )))
+                }
+                Ok(current) if current.revision == vm.revision && current != *vm => {
+                    return Err(StoreError::Conflict(format!(
+                        "VM {} has two different records at revision {}",
+                        vm.id, vm.revision
+                    )))
+                }
+                // Exact retry or a delayed transition after a newer revision
+                // already committed. Neither may regress durable state.
+                Ok(_) => return Ok(()),
+                Err(StoreError::NotFound) => return Err(StoreError::NotFound),
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -437,7 +621,7 @@ impl Store {
     pub fn update_vm_status(&self, id: Uuid, status: VmStatus) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
         let n = self.conn.execute(
-            "UPDATE vms SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            "UPDATE vms SET status = ?2, revision = revision + 1, updated_at = ?3 WHERE id = ?1",
             params![id.to_string(), status.as_str(), now],
         )?;
         if n == 0 {
@@ -820,21 +1004,27 @@ impl Store {
 fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
     let id: String = row.get(0)?;
     let status: String = row.get(4)?;
-    let created_at: String = row.get(12)?;
-    let updated_at: String = row.get(13)?;
+    let revision_i64: i64 = row.get(5)?;
+    let revision = u64::try_from(revision_i64)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, revision_i64))?;
+    let startup_path: Option<String> = row.get(6)?;
+    let created_at: String = row.get(14)?;
+    let updated_at: String = row.get(15)?;
     Ok(VmRecord {
         id: parse_uuid_col(&id, 0)?,
         host_id: row.get(1)?,
         owner_key: row.get(2)?,
         api_key_id: row.get(3)?,
         status: VmStatus::parse(&status).unwrap_or(VmStatus::Error),
-        memory_mib: row.get(5)?,
-        vcpus: row.get(6)?,
-        kernel_path: row.get(7)?,
-        rootfs_path: row.get(8)?,
-        cmdline: row.get(9)?,
-        socket_path: row.get(10)?,
-        pid: row.get(11)?,
+        revision,
+        startup_path: startup_path.as_deref().and_then(VmStartupPath::parse),
+        memory_mib: row.get(7)?,
+        vcpus: row.get(8)?,
+        kernel_path: row.get(9)?,
+        rootfs_path: row.get(10)?,
+        cmdline: row.get(11)?,
+        socket_path: row.get(12)?,
+        pid: row.get(13)?,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
     })
@@ -929,14 +1119,20 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> Result<ImageRecord, rusqlite::Error>
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<SnapshotRecord, rusqlite::Error> {
-    let vm_id: String = row.get(4)?;
-    let created_at: String = row.get(5)?;
+    let vm_id: String = row.get(5)?;
+    let created_at: String = row.get(11)?;
     Ok(SnapshotRecord {
         path: row.get(0)?,
-        host_id: row.get(1)?,
-        owner_key: row.get(2)?,
-        api_key_id: row.get(3)?,
-        vm_id: parse_uuid_col(&vm_id, 4)?,
+        overlay_path: row.get(1)?,
+        host_id: row.get(2)?,
+        owner_key: row.get(3)?,
+        api_key_id: row.get(4)?,
+        vm_id: parse_uuid_col(&vm_id, 5)?,
+        memory_mib: row.get(6)?,
+        vcpus: row.get(7)?,
+        kernel_path: row.get(8)?,
+        rootfs_path: row.get(9)?,
+        cmdline: row.get(10)?,
         created_at: parse_ts(&created_at)?,
     })
 }
@@ -1249,10 +1445,16 @@ mod tests {
         let vm_id = Uuid::new_v4();
         let snap = SnapshotRecord {
             path: "/run/tarit/snap-1.snap".into(),
+            overlay_path: Some("/run/tarit/snap-1.cow".into()),
             host_id: "node0".into(),
             owner_key: Some("tenant-a".into()),
             api_key_id: Some("key-1".into()),
             vm_id,
+            memory_mib: Some(512),
+            vcpus: Some(2),
+            kernel_path: Some("/opt/tarit/vmlinux".into()),
+            rootfs_path: Some("/opt/tarit/rootfs.ext4".into()),
+            cmdline: Some("console=ttyS0".into()),
             created_at: Utc::now(),
         };
         store.insert_snapshot(&snap).unwrap();
@@ -1271,6 +1473,49 @@ mod tests {
         assert_eq!(
             store.get_snapshot(&snap.path).unwrap().unwrap().owner_key,
             Some("tenant-b".into())
+        );
+    }
+
+    #[test]
+    fn quota_reservation_distinguishes_limit_from_id_conflict_and_expires() {
+        let store = Store::open(":memory:").unwrap();
+        let owner = "tenant-a";
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let expiry = Utc::now() + chrono::Duration::minutes(1);
+
+        assert_eq!(
+            store.reserve_vm_quota(owner, first, 1, expiry).unwrap(),
+            VmQuotaReservationOutcome::Reserved
+        );
+        assert_eq!(
+            store.reserve_vm_quota(owner, first, 1, expiry).unwrap(),
+            VmQuotaReservationOutcome::IdConflict
+        );
+        assert_eq!(
+            store.reserve_vm_quota(owner, second, 1, expiry).unwrap(),
+            VmQuotaReservationOutcome::QuotaExceeded
+        );
+
+        store.release_vm_quota(owner, first).unwrap();
+        assert_eq!(
+            store.reserve_vm_quota(owner, second, 1, expiry).unwrap(),
+            VmQuotaReservationOutcome::Reserved
+        );
+        store.release_vm_quota(owner, second).unwrap();
+
+        let expired = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(
+            store
+                .reserve_vm_quota(owner, Uuid::new_v4(), 1, expired)
+                .unwrap(),
+            VmQuotaReservationOutcome::Reserved
+        );
+        assert_eq!(
+            store
+                .reserve_vm_quota(owner, Uuid::new_v4(), 1, expiry)
+                .unwrap(),
+            VmQuotaReservationOutcome::Reserved
         );
     }
 
@@ -1438,6 +1683,8 @@ mod tests {
             owner_key: Some("owner-a".into()),
             api_key_id: Some("api-key-a".into()),
             status: VmStatus::Running,
+            revision: 1,
+            startup_path: Some(VmStartupPath::Cold),
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "vmlinux".into(),
@@ -1457,10 +1704,24 @@ mod tests {
 
         let mut updated = vm.clone();
         updated.api_key_id = Some("api-key-b".into());
+        updated.revision += 1;
+        updated.updated_at += chrono::Duration::milliseconds(1);
         store.update_vm(&updated).unwrap();
         assert_eq!(
             store.list_vms().unwrap()[0].api_key_id,
             Some("api-key-b".into())
         );
+
+        let mut conflicting_retry = updated.clone();
+        conflicting_retry.cmdline = "different".into();
+        assert!(matches!(
+            store.update_vm(&conflicting_retry),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let mut stale = vm.clone();
+        stale.status = VmStatus::Paused;
+        store.update_vm(&stale).unwrap();
+        assert_eq!(store.get_vm(vm.id).unwrap(), updated);
     }
 }

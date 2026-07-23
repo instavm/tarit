@@ -76,6 +76,8 @@ pub struct Metrics {
     vm_create_total: AtomicU64,
     vm_create_errors_total: AtomicU64,
     exec_total: AtomicU64,
+    store_enqueue_failures_total: AtomicU64,
+    store_write_failures_total: AtomicU64,
     share_requests: [AtomicU64; SHARE_VISIBILITY_COUNT * SHARE_STATUS_CLASS_COUNT],
     share_auth_failures_total: AtomicU64,
     share_owner_failures_total: AtomicU64,
@@ -92,6 +94,8 @@ impl Default for Metrics {
             vm_create_total: AtomicU64::new(0),
             vm_create_errors_total: AtomicU64::new(0),
             exec_total: AtomicU64::new(0),
+            store_enqueue_failures_total: AtomicU64::new(0),
+            store_write_failures_total: AtomicU64::new(0),
             share_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             share_auth_failures_total: AtomicU64::new(0),
             share_owner_failures_total: AtomicU64::new(0),
@@ -164,6 +168,14 @@ impl Metrics {
 
     pub fn inc_exec_total(&self) {
         increment_counter(&self.exec_total, 1);
+    }
+
+    pub(crate) fn inc_store_enqueue_failure(&self) {
+        increment_counter(&self.store_enqueue_failures_total, 1);
+    }
+
+    pub(crate) fn inc_store_write_failure(&self) {
+        increment_counter(&self.store_write_failures_total, 1);
     }
 
     pub(crate) fn track_share_http(self: &Arc<Self>) -> ActiveShareHttp {
@@ -447,6 +459,86 @@ pub fn render_metrics(state: &AppState) -> String {
         "Public exec requests accepted by this taritd.",
     );
     let _ = writeln!(out, "taritd_exec_total {}", state.metrics.exec_total());
+    metric_header(
+        &mut out,
+        "taritd_store_enqueue_failures_total",
+        "counter",
+        "Writes that encountered a full or closed bounded persistence queue.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_enqueue_failures_total {}",
+        state
+            .metrics
+            .store_enqueue_failures_total
+            .load(Ordering::Relaxed)
+    );
+    metric_header(
+        &mut out,
+        "taritd_store_write_failures_total",
+        "counter",
+        "SQLite persistence operations that failed in the background writer.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_write_failures_total {}",
+        state
+            .metrics
+            .store_write_failures_total
+            .load(Ordering::Relaxed)
+    );
+    metric_header(
+        &mut out,
+        "taritd_store_queue_available",
+        "gauge",
+        "Currently available slots in the bounded persistence queue.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_queue_available {}",
+        state.store_tx.capacity()
+    );
+
+    let pty = state.pty_registry.connection_stats();
+    metric_header(
+        &mut out,
+        "taritd_pty_active_connections",
+        "gauge",
+        "Active guest PTY WebSocket connections.",
+    );
+    let _ = writeln!(out, "taritd_pty_active_connections {}", pty.active);
+    metric_header(
+        &mut out,
+        "taritd_pty_connection_limit",
+        "gauge",
+        "Configured active PTY connection limit by bounded admission scope.",
+    );
+    for (scope, limit) in [
+        ("global", pty.limit_global),
+        ("tenant", pty.limit_per_tenant),
+        ("vm", pty.limit_per_vm),
+    ] {
+        let _ = writeln!(
+            out,
+            "taritd_pty_connection_limit{{scope=\"{scope}\"}} {limit}"
+        );
+    }
+    metric_header(
+        &mut out,
+        "taritd_pty_admission_rejections_total",
+        "counter",
+        "PTY WebSocket admissions rejected by bounded capacity scope.",
+    );
+    for (scope, rejected) in [
+        ("global", pty.rejected_global),
+        ("tenant", pty.rejected_tenant),
+        ("vm", pty.rejected_vm),
+    ] {
+        let _ = writeln!(
+            out,
+            "taritd_pty_admission_rejections_total{{scope=\"{scope}\"}} {rejected}"
+        );
+    }
 
     metric_header(
         &mut out,
@@ -499,6 +591,7 @@ fn vm_status_counts(state: &AppState) -> Vec<(&'static str, usize)> {
         VmStatus::Creating,
         VmStatus::Running,
         VmStatus::Paused,
+        VmStatus::Suspended,
         VmStatus::Stopped,
         VmStatus::Error,
     ];
@@ -538,7 +631,7 @@ fn tenant_vm_counts(state: &AppState) -> Vec<(String, usize)> {
         for vm in cache.values() {
             if matches!(
                 vm.status,
-                VmStatus::Creating | VmStatus::Running | VmStatus::Paused
+                VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
             ) {
                 let tenant = vm.owner_key.as_deref().unwrap_or("unknown");
                 *counts.entry(tenant.to_string()).or_default() += 1;
@@ -682,6 +775,8 @@ mod tests {
                 owner_key: Some("tenant-a".into()),
                 api_key_id: None,
                 status: VmStatus::Running,
+                revision: 1,
+                startup_path: None,
                 memory_mib: 256,
                 vcpus: 1,
                 kernel_path: "kernel".into(),
@@ -707,6 +802,9 @@ mod tests {
             "taritd_vm_create_total",
             "taritd_vm_create_errors_total",
             "taritd_exec_total",
+            "taritd_pty_active_connections",
+            "taritd_pty_connection_limit",
+            "taritd_pty_admission_rejections_total",
             "taritd_vm_memory_rss_bytes",
             "taritd_vm_cpu_seconds_total",
             "taritd_share_requests_total",
@@ -724,8 +822,8 @@ mod tests {
 
         assert!(body.contains("taritd_up 1\n"));
         assert!(body.contains("taritd_vms{status=\"running\"} 1\n"));
-        // Tenant labels are hashed by default so the unauthenticated /metrics
-        // endpoint does not leak raw tenant names (R-012).
+        // Tenant labels are hashed by default so metrics do not expose raw
+        // tenant names to any scraper granted metrics access (R-012).
         assert!(
             !body.contains("tenant=\"tenant-a\""),
             "raw tenant name must not appear when labels are not exposed"
@@ -741,6 +839,11 @@ mod tests {
         assert!(body.contains("taritd_vm_create_total 1\n"));
         assert!(body.contains("taritd_vm_create_errors_total 1\n"));
         assert!(body.contains("taritd_exec_total 1\n"));
+        assert!(body.contains("taritd_pty_active_connections 0\n"));
+        assert!(body.contains("taritd_pty_connection_limit{scope=\"global\"} 1024\n"));
+        assert!(body.contains("taritd_pty_connection_limit{scope=\"tenant\"} 128\n"));
+        assert!(body.contains("taritd_pty_connection_limit{scope=\"vm\"} 16\n"));
+        assert!(body.contains("taritd_pty_admission_rejections_total{scope=\"tenant\"} 0\n"));
 
         for line in body.lines().filter(|line| !line.starts_with('#')) {
             let (sample, value) = line.rsplit_once(' ').expect("sample has value");
@@ -866,9 +969,14 @@ mod tests {
             peer_secret: "peer-secret".into(),
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
@@ -890,7 +998,7 @@ mod tests {
         };
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = crate::shares::ShareRepository::new(Arc::clone(&store), None);
-        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, _store_rx) = tokio::sync::mpsc::channel(128);
         AppState {
             config: config.clone(),
             audit_outbox: Arc::new(crate::audit::LocalAuditOutbox::new(Arc::clone(&store))),

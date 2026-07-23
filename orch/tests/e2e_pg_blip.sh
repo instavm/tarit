@@ -26,6 +26,7 @@ start(){ local i=$1 nd="$DIR/n$i"; mkdir -p "$nd/sockets"
   ( export TARIT_API_KEY=$API TARIT_PEER_SECRET=$PEER \
       TARIT_DATABASE_URL="$TARIT_DATABASE_URL" TARIT_RDS_CA_FILE="$CA" \
       TARIT_LISTEN=127.0.0.1:${P[$i]} TARIT_RPC_ADDR=http://127.0.0.1:${P[$i]} \
+      TARIT_ALLOW_INSECURE_PEER_HTTP=1 \
       TARIT_HOST_ID=${H[$i]} TARIT_SOCKET_DIR="$nd/sockets" TARIT_DB="$nd/i.sqlite" \
       TARIT_VMM_BIN="$VMM_BIN" TARIT_KERNEL=/tmp/vmlinux.microvm \
       TARIT_ROOTFS=/tmp/vsock-rootfs.ext4 TARIT_CONFIG="$nd/none.toml" TARIT_WARM_POOL=0 \

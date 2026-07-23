@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::{
     env, io::Write as _, net::SocketAddr, path::PathBuf, process::Command as ProcessCommand,
 };
-use tarit_types::{ExecutionRecord, VmRecord};
+use tarit_types::{ExecutionRecord, PublicVmRecord};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
@@ -85,6 +85,8 @@ pub enum VmCommand {
     Delete(VmIdArgs),
     #[command(about = "Pause a VM")]
     Pause(VmIdArgs),
+    #[command(about = "Suspend a VM and reclaim its resident guest memory")]
+    Suspend(VmIdArgs),
     #[command(about = "Resume a VM")]
     Resume(VmIdArgs),
     #[command(about = "Snapshot a VM")]
@@ -380,6 +382,7 @@ async fn vm(client: &ClientConfig, command: VmCommand) -> Result<()> {
         VmCommand::Get(args) => vm_get(client, args.id).await,
         VmCommand::Delete(args) => vm_delete(client, args.id).await,
         VmCommand::Pause(args) => vm_action(client, args.id, "pause").await,
+        VmCommand::Suspend(args) => vm_action(client, args.id, "suspend").await,
         VmCommand::Resume(args) => vm_action(client, args.id, "resume").await,
         VmCommand::Snapshot(args) => vm_snapshot(client, args).await,
     }
@@ -402,7 +405,7 @@ async fn vm_create(client: &ClientConfig, args: VmCreateArgs) -> Result<()> {
     if let Some(image) = args.image {
         body.insert("image".into(), json!(image));
     }
-    let (raw, vm): (String, VmRecord) = client
+    let (raw, vm): (String, PublicVmRecord) = client
         .json(Method::POST, "/v1/vms", Some(Value::Object(body)))
         .await?;
     if client.json {
@@ -510,7 +513,8 @@ fn image_gc(args: ImageGcArgs, json_output: bool) -> Result<()> {
 }
 
 async fn vm_list(client: &ClientConfig) -> Result<()> {
-    let (raw, vms): (String, Vec<VmRecord>) = client.json(Method::GET, "/v1/vms", None).await?;
+    let (raw, vms): (String, Vec<PublicVmRecord>) =
+        client.json(Method::GET, "/v1/vms", None).await?;
     if client.json {
         print_json(&raw);
     } else {
@@ -529,7 +533,7 @@ async fn vm_list(client: &ClientConfig) -> Result<()> {
 }
 
 async fn vm_get(client: &ClientConfig, id: Uuid) -> Result<()> {
-    let (raw, vm): (String, VmRecord) = client
+    let (raw, vm): (String, PublicVmRecord) = client
         .json(Method::GET, &format!("/v1/vms/{id}"), None)
         .await?;
     if client.json {
@@ -553,7 +557,7 @@ async fn vm_delete(client: &ClientConfig, id: Uuid) -> Result<()> {
 }
 
 async fn vm_action(client: &ClientConfig, id: Uuid, action: &str) -> Result<()> {
-    let (raw, vm): (String, VmRecord) = client
+    let (raw, vm): (String, PublicVmRecord) = client
         .json(
             Method::POST,
             &format!("/v1/vms/{id}/{action}"),
@@ -587,7 +591,7 @@ async fn vm_snapshot(client: &ClientConfig, args: VmSnapshotArgs) -> Result<()> 
 }
 
 async fn restore(client: &ClientConfig, args: RestoreArgs) -> Result<()> {
-    let (raw, vm): (String, VmRecord) = client
+    let (raw, vm): (String, PublicVmRecord) = client
         .json(
             Method::POST,
             "/v1/restore",
@@ -825,18 +829,14 @@ fn ssh_gateway_addr() -> (String, u16) {
     ("127.0.0.1".into(), 2222)
 }
 
-fn print_vm(vm: &VmRecord) {
+fn print_vm(vm: &PublicVmRecord) {
     println!("id: {}", vm.id);
     println!("status: {}", vm.status.as_str());
-    println!("host: {}", vm.host_id);
     println!("vcpus: {}", vm.vcpus);
     println!("memory_mib: {}", vm.memory_mib);
-    println!("kernel: {}", vm.kernel_path);
-    if let Some(rootfs) = &vm.rootfs_path {
-        println!("rootfs: {rootfs}");
-    }
-    if let Some(pid) = vm.pid {
-        println!("pid: {pid}");
+    println!("revision: {}", vm.revision);
+    if let Some(startup_path) = vm.startup_path {
+        println!("startup_path: {}", startup_path.as_str());
     }
 }
 

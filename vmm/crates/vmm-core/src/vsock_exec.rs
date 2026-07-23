@@ -126,9 +126,7 @@ impl VsockExecChannel {
             return None;
         }
         let mut guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(stream) = guard.as_mut() else {
-            return None;
-        };
+        let stream = guard.as_mut()?;
         let result = { run_exec(stream, command, timeout, self.pump_wake.as_ref()) };
         if result.is_err() {
             // Keep the stream (dropping it would make the agent reconnect and

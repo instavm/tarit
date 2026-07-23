@@ -21,15 +21,15 @@ jobs:
       matrix:
         workspace: [proto, vmm, orch]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: ${{ matrix.workspace }}
 
@@ -55,8 +55,20 @@ jobs:
         run: >-
           cargo check --workspace --all-targets
           --features vmm-core/kvm
+          --features vmm-core/boot
           --features vmm-memory-backend/kvm
           --features vmm-integration/kvm
+
+      - name: Lint KVM/Linux code paths
+        if: matrix.workspace == 'vmm'
+        working-directory: ${{ matrix.workspace }}
+        run: >-
+          cargo clippy --workspace --all-targets
+          --features vmm-core/kvm
+          --features vmm-core/boot
+          --features vmm-memory-backend/kvm
+          --features vmm-integration/kvm
+          -- -D warnings
 
 # The full KVM integration suite
 # (cargo test --workspace --features kvm -- --include-ignored) requires a Linux

@@ -37,17 +37,35 @@ shared guest memory. KVM provides the CPU and memory boundary. On top of that th
 host applies defense in depth, in two tiers:
 
 - Enforced on the standard orchestrated path: restrictive Unix-socket
-  permissions with `SO_PEERCRED` checks on the VMM control socket, a seccomp
-  allowlist on the VMM I/O worker threads, an nftables egress allowlist applied
-  on the host for any VM that sets an egress policy, and per-VM cgroup v2 memory
-  and PID limits when a parent cgroup is configured (`TARIT_VM_CGROUP_PARENT`).
+  permissions with `SO_PEERCRED` checks, fail-closed seccomp on vCPU and selected
+  I/O worker threads, an nftables egress allowlist for VMs that set an egress
+  policy, and per-VM cgroup v2 limits when a parent cgroup is configured. The
+  coordinator thread is not seccomp-confined.
 - Available as an opt-in hardened mode (`vmm serve --jail`): chroot, privilege
   drop to an unprivileged uid/gid, mount and network namespaces, and cgroup
   placement. This mode fails closed if a required confinement step cannot be
   applied.
 
+The standard `taritd` launch path does not yet stage and start every VMM through
+that jail. Production mode therefore remains disabled for hostile multi-tenant
+workloads until unique per-VM uid/gid jails, private staged assets, namespaces,
+and mandatory resource controls are wired end to end. KVM and the worker-thread
+filters are important boundaries, but they are not a categorical guarantee that
+a compromised guest cannot affect the host.
+
+The evidence and remaining release blockers are tracked in
+[PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
+
 Snapshot and migration streams are treated as untrusted input when they can
-originate off-node.
+originate off-node. Raw snapshot restore validates the current CRC-based format,
+which detects corruption but is not cryptographic authenticity, and full restore
+currently scans the memory payload before arming lazy paging. Production use of
+off-node artifacts therefore requires trusted storage or an external
+authenticated artifact layer. End-to-end fs-verity sealing, trusted measurement
+metadata, and restore propagation are still required before that scan can be
+safely skipped. Networked restore is not production-ready until the resumed
+guest also rebinds its IP, routes, gateway, and DNS; replacing only the host TAP
+is insufficient.
 
 **Client to control plane (the orchestrator, `orch/`).** `taritd` exposes an HTTP
 API and drives one VMM per microVM over a Unix-domain socket. It is responsible

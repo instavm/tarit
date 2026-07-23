@@ -418,6 +418,15 @@ impl VmmClient {
         }
     }
 
+    /// Pause vCPUs and release resident guest RAM into the VMM's private lazy
+    /// suspend image. This is distinct from `pause`, which retains RAM.
+    pub fn suspend(&self) -> Result<(), VmmError> {
+        match self.request_ok(&ApiRequest::Suspend)? {
+            ApiResponse::Ok => Ok(()),
+            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
+        }
+    }
+
     pub fn resume(&self) -> Result<(), VmmError> {
         match self.request_ok(&ApiRequest::Resume)? {
             ApiResponse::Ok => Ok(()),
@@ -544,9 +553,22 @@ impl VmmClient {
     /// Restore a VM from a snapshot file into this (freshly spawned) `vmm serve`
     /// process, resuming it to a running state.
     pub fn restore(&self, snapshot_path: &str, overlay: Option<String>) -> Result<(), VmmError> {
+        self.restore_with_network_override(snapshot_path, overlay, None)
+    }
+
+    /// Restore while replacing every host-network binding saved in the
+    /// snapshot. Orchestrators must use this with `Some`, including an empty
+    /// vector, so a restore can never silently reuse a stale tap or guest IP.
+    pub fn restore_with_network_override(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net: Option<Vec<NetConfig>>,
+    ) -> Result<(), VmmError> {
         match self.request_ok(&ApiRequest::Restore {
             snapshot_path: snapshot_path.to_string(),
             overlay,
+            net,
         })? {
             ApiResponse::Restored | ApiResponse::Ok => Ok(()),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
@@ -698,6 +720,7 @@ mod tests {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),
             overlay: None,
+            net: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -714,9 +737,11 @@ mod tests {
             ApiRequest::Restore {
                 snapshot_path,
                 overlay,
+                net,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
                 assert_eq!(overlay, None);
+                assert!(net.is_none());
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -727,6 +752,7 @@ mod tests {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),
             overlay: Some("/overlays/clone.cow".into()),
+            net: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -744,9 +770,11 @@ mod tests {
             ApiRequest::Restore {
                 snapshot_path,
                 overlay,
+                net,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
                 assert_eq!(overlay, Some("/overlays/clone.cow".into()));
+                assert!(net.is_none());
             }
             other => panic!("unexpected request: {other:?}"),
         }

@@ -52,7 +52,7 @@ mod auth {
 use auth::require_api_key;
 use axum::{
     body::to_bytes,
-    extract::{Extension, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
@@ -61,12 +61,13 @@ use axum::{
 };
 use chrono::Utc;
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use tarit_store::Store;
 use tarit_types::{
     AuditEvent, CreateShareRequest, CreateVmRequest, EgressUpdateRequest, ErrorBody,
-    ExecuteRequest, ExecutionRecord, ExecutionStatus, HealthResponse, OrchError, ShareRecord,
+    ExecuteRequest, ExecutionRecord, ExecutionStatus, OrchError, PublicVmRecord, ShareRecord,
     ShareTokenResponse, ShareVisibility, SnapshotRequest, UpdateShareRequest, UsageEvent,
     UsageSummary, VmRecord, VmStatus,
 };
@@ -85,11 +86,11 @@ use std::time::{Duration, Instant};
 use tarit_types::RestoreRequest;
 use tarit_types::{audit_action, audit_outcome};
 
-/// A durability write applied asynchronously by the background store writer, so
-/// no request ever blocks on the single SQLite connection. The in-memory caches
-/// (vm_cache/exec_cache) are the source of truth for reads; SQLite lags them.
+/// A durability write applied by the bounded background store writer. VM
+/// lifecycle transitions use the acknowledged variant because reservations and
+/// fleet ownership must not advance ahead of SQLite durability. Execution and
+/// outbox writes retain their bounded write-behind behavior.
 pub enum StoreWrite {
-    Vm(VmRecord),
     /// A lifecycle transition that must reach SQLite before its resource
     /// reservation or fleet ownership may be released.
     VmDurable(
@@ -116,6 +117,12 @@ pub(crate) enum LifecycleState {
         phase: PublicationPhase,
     },
     Running {
+        record: VmRecord,
+    },
+    /// A live VMM transition could not be rolled back or observed. The record
+    /// stays registered so the lifecycle sweeper retries VMM observation and
+    /// fences the observed state through fleet, SQLite and cache.
+    Reconciling {
         record: VmRecord,
     },
     /// A legacy partial warm-registration rollback retained resources. Resources
@@ -163,6 +170,7 @@ impl LifecycleState {
             Self::Creating { record, .. }
             | Self::Publishing { record, .. }
             | Self::Running { record }
+            | Self::Reconciling { record }
             | Self::Abandoned { record }
             | Self::Terminal { record, .. } => record,
         }
@@ -201,12 +209,12 @@ pub struct AppState {
     /// client's 15ms status polling scale to a 200-wide burst without serializing
     /// every poll on the single SQLite connection mutex.
     pub exec_cache: Arc<RwLock<HashMap<Uuid, ExecutionRecord>>>,
-    /// In-memory VM records (read source of truth). Writes go here synchronously
-    /// and to SQLite asynchronously via store_tx, keeping create/delete off the
-    /// store mutex on the hot path.
+    /// In-memory VM records used for fast reads after lifecycle publication.
+    /// Lifecycle writes reach SQLite through an acknowledged store operation
+    /// before this cache becomes externally visible.
     pub vm_cache: Arc<RwLock<HashMap<Uuid, VmRecord>>>,
     /// Channel to the background store writer (durability, write-behind).
-    pub store_tx: tokio::sync::mpsc::UnboundedSender<StoreWrite>,
+    pub store_tx: tokio::sync::mpsc::Sender<StoreWrite>,
     /// Registered user lifecycle state. The supervisor boot gate establishes
     /// Creating records before VMM work; this map then owns publication and
     /// terminal retry progress until reservations can be released.
@@ -235,6 +243,87 @@ pub struct AppState {
     pub(crate) share_runtime: Arc<crate::share_gateway::ShareRuntime>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ApiTrafficLimits {
+    concurrency: Arc<tokio::sync::Semaphore>,
+    rate: Arc<Mutex<TokenBucket>>,
+    requests_per_second: u64,
+    timeout: Duration,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl ApiTrafficLimits {
+    pub(crate) fn new(config: &Config) -> Self {
+        Self {
+            concurrency: Arc::new(tokio::sync::Semaphore::new(config.api_max_in_flight)),
+            rate: Arc::new(Mutex::new(TokenBucket {
+                tokens: config.api_requests_per_second as f64,
+                updated_at: Instant::now(),
+            })),
+            requests_per_second: config.api_requests_per_second,
+            timeout: Duration::from_millis(config.api_request_timeout_ms),
+        }
+    }
+
+    fn take_rate_token(&self) -> bool {
+        let Ok(mut bucket) = self.rate.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        let replenished = bucket.tokens
+            + now.duration_since(bucket.updated_at).as_secs_f64() * self.requests_per_second as f64;
+        bucket.tokens = replenished.min(self.requests_per_second as f64);
+        bucket.updated_at = now;
+        if bucket.tokens < 1.0 {
+            false
+        } else {
+            bucket.tokens -= 1.0;
+            true
+        }
+    }
+}
+
+pub(crate) async fn enforce_api_traffic(
+    State(limits): State<ApiTrafficLimits>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    if !limits.take_rate_token() {
+        return overloaded_response("API rate limit exceeded");
+    }
+    let Ok(_permit) = Arc::clone(&limits.concurrency).try_acquire_owned() else {
+        return overloaded_response("API concurrency limit exceeded");
+    };
+    match tokio::time::timeout(limits.timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(ErrorBody {
+                error: "API request deadline exceeded".into(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn overloaded_response(message: &str) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ErrorBody {
+            error: message.to_string(),
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
 pub struct ApiError(pub OrchError);
 
 impl From<OrchError> for ApiError {
@@ -250,6 +339,9 @@ impl IntoResponse for ApiError {
             OrchError::Overloaded { message, .. } if message == "taritd is shutting down" => {
                 message.clone()
             }
+            OrchError::Unavailable(_) => "service unavailable".into(),
+            OrchError::Internal(_) => "internal error".into(),
+            OrchError::Vmm(_) => "VM operation failed".into(),
             _ => err.to_string(),
         };
         let status =
@@ -261,6 +353,29 @@ impl IntoResponse for ApiError {
             }
         }
         response
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PublicVmRuntimeStatus {
+    state: String,
+    uptime_ms: u64,
+    vcpus: u8,
+    mem_mib: u64,
+    vcpu_alive: bool,
+}
+
+fn public_vm_runtime_status(status: serde_json::Value) -> Result<PublicVmRuntimeStatus, OrchError> {
+    serde_json::from_value(status)
+        .map_err(|_| OrchError::Internal("invalid VMM status response".into()))
+}
+
+fn public_operation_error(error: &OrchError) -> String {
+    match error {
+        OrchError::Unavailable(_) => "service unavailable".into(),
+        OrchError::Internal(_) => "internal error".into(),
+        OrchError::Vmm(_) => "VM operation failed".into(),
+        _ => error.to_string(),
     }
 }
 
@@ -278,7 +393,7 @@ enum ShareApiError {
 impl ShareApiError {
     fn from_service(error: OrchError) -> Self {
         match error {
-            OrchError::BadRequest(error) => {
+            OrchError::BadRequest(error) | OrchError::Unprocessable(error) => {
                 tracing::debug!(%error, "share request rejected");
                 Self::BadRequest
             }
@@ -298,7 +413,10 @@ impl ShareApiError {
                 tracing::debug!(%error, "share request forbidden");
                 Self::Forbidden
             }
-            error @ (OrchError::Internal(_) | OrchError::Vmm(_) | OrchError::Overloaded { .. }) => {
+            error @ (OrchError::Unavailable(_)
+            | OrchError::Internal(_)
+            | OrchError::Vmm(_)
+            | OrchError::Overloaded { .. }) => {
                 tracing::warn!(error = %error, "share service unavailable");
                 Self::ServiceUnavailable
             }
@@ -337,6 +455,8 @@ impl IntoResponse for ShareApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    let traffic_limits = ApiTrafficLimits::new(&state.config);
+    let max_body_bytes = state.config.api_max_body_bytes;
     let protected = Router::new()
         .route("/v1/vms", post(create_vm).get(list_vms))
         .route("/v1/vms/{id}", get(get_vm).delete(delete_vm))
@@ -354,6 +474,7 @@ pub fn router(state: AppState) -> Router {
             post(crate::pty::resize_session),
         )
         .route("/v1/vms/{id}/pause", post(pause_vm))
+        .route("/v1/vms/{id}/suspend", post(suspend_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
         .route("/v1/vms/{id}/snapshot", post(snapshot_vm))
         .route("/v1/restore", post(restore_vm))
@@ -378,22 +499,34 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/cluster", get(cluster_status))
         .route("/v1/usage", get(usage_stats))
         .route("/v1/audit", get(audit_log))
+        .route("/metrics", get(metrics_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
         ))
-        .with_state(state.clone());
-
-    Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics_handler))
-        .route("/openapi.yaml", get(openapi::spec))
-        .route("/docs", get(openapi::docs))
+        .layer(DefaultBodyLimit::max(max_body_bytes));
+    let admitted = protected
         .route(
             "/v1/vms/{id}/pty/{pty_id}/connect",
             get(crate::pty::connect_ws),
         )
-        .merge(protected)
+        // Keep the global admission guard outside authentication. Invalid
+        // API credentials and invalid PTY connect tokens still consume bounded
+        // concurrency and rate capacity, preventing authentication floods from
+        // bypassing backpressure.
+        .layer(middleware::from_fn_with_state(
+            traffic_limits,
+            enforce_api_traffic,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/livez", get(livez))
+        .route("/startupz", get(startupz))
+        .route("/readyz", get(readyz))
+        .route("/openapi.yaml", get(openapi::spec))
+        .route("/docs", get(openapi::docs))
+        .merge(admitted)
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -409,8 +542,103 @@ async fn not_found() -> Response {
         .into_response()
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse::default())
+async fn health(State(state): State<AppState>) -> Response {
+    live_health(&state)
+}
+
+async fn livez(State(state): State<AppState>) -> Response {
+    live_health(&state)
+}
+
+async fn startupz(State(state): State<AppState>) -> Response {
+    let mut checks = BTreeMap::new();
+    checks.insert("configuration", "ok");
+    checks.insert("local_store", local_store_health(&state));
+    checks.insert(
+        "persistence_queue",
+        if state.store_tx.is_closed() {
+            "closed"
+        } else {
+            "ok"
+        },
+    );
+    health_response(checks)
+}
+
+async fn readyz(State(state): State<AppState>) -> Response {
+    let mut checks = BTreeMap::new();
+    checks.insert("local_store", local_store_health(&state));
+    checks.insert(
+        "persistence_queue",
+        if state.store_tx.is_closed() {
+            "closed"
+        } else if state.store_tx.capacity() == 0 {
+            "saturated"
+        } else {
+            "ok"
+        },
+    );
+    let admission = state.supervisor.admission_gate();
+    checks.insert(
+        "admission",
+        if admission.enter().is_ok() {
+            "ok"
+        } else {
+            "closed"
+        },
+    );
+    if let Some(fleet) = &state.fleet {
+        let fleet_status =
+            match tokio::time::timeout(Duration::from_secs(2), fleet.healthcheck()).await {
+                Ok(Ok(())) => "ok",
+                Ok(Err(_)) => "error",
+                Err(_) => "timeout",
+            };
+        checks.insert("fleet_store", fleet_status);
+    }
+    health_response(checks)
+}
+
+fn live_health(state: &AppState) -> Response {
+    let mut checks = BTreeMap::new();
+    checks.insert(
+        "persistence_worker",
+        if state.store_tx.is_closed() {
+            "closed"
+        } else {
+            "ok"
+        },
+    );
+    health_response(checks)
+}
+
+fn local_store_health(state: &AppState) -> &'static str {
+    match state.store.try_lock() {
+        Ok(store) if store.healthcheck().is_ok() => "ok",
+        Ok(_) => "error",
+        // A held mutex means the writer is actively using the single SQLite
+        // connection, not that it is unhealthy. Avoid readiness flapping under
+        // normal write load.
+        Err(std::sync::TryLockError::WouldBlock) => "ok",
+        Err(std::sync::TryLockError::Poisoned(_)) => "poisoned",
+    }
+}
+
+fn health_response(checks: BTreeMap<&'static str, &'static str>) -> Response {
+    let healthy = checks.values().all(|status| *status == "ok");
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if healthy { "ok" } else { "unhealthy" },
+            "checks": checks,
+        })),
+    )
+        .into_response()
 }
 
 async fn create_share(
@@ -824,19 +1052,23 @@ fn record_share_audit(
         .map_err(|_| ShareApiError::audit_unavailable(action))
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> Response {
-    (
+async fn metrics_handler(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> Result<Response, ApiError> {
+    require_admin(&identity)?;
+    Ok((
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         crate::metrics::render_metrics(&state),
     )
-        .into_response()
+        .into_response())
 }
 
 async fn create_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Json(req): Json<CreateVmRequest>,
-) -> Result<(StatusCode, Json<VmRecord>), ApiError> {
+) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
     let result = create_vm_impl(&state, &identity, req).await;
     match &result {
         Ok((_, Json(rec))) => {
@@ -869,22 +1101,35 @@ async fn create_vm_impl(
     state: &AppState,
     identity: &ApiIdentity,
     mut req: CreateVmRequest,
-) -> Result<(StatusCode, Json<VmRecord>), ApiError> {
+) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
     ensure_create_admission_open(state)?;
     req.owner_key = Some(identity.tenant.clone());
     req.api_key_id = Some(identity.api_key_id.clone());
+    let id = *req.id.get_or_insert_with(Uuid::new_v4);
     enforce_create_path_policy(identity, &req)?;
-    if let Some(id) = req.id {
-        match cluster::resolve_owner(state, id).await {
-            Ok(_) => {
-                return Err(OrchError::Conflict(format!("vm {id} already exists")).into());
-            }
-            Err(OrchError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
+    match cluster::resolve_owner(state, id).await {
+        Ok(_) => {
+            return Err(OrchError::Conflict(format!("vm {id} already exists")).into());
+        }
+        Err(OrchError::NotFound(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let reserved = reserve_vm_quota(state, identity, id).await?;
+    let result = create_vm_after_quota(state, identity, req).await;
+    if reserved {
+        if let Err(error) = release_vm_quota(state, identity, id).await {
+            tracing::warn!(vm = %id, tenant = %identity.tenant, %error,
+                "failed to release create quota reservation; TTL cleanup will retry implicitly");
         }
     }
-    enforce_vm_quota(state, identity).await?;
+    result
+}
 
+async fn create_vm_after_quota(
+    state: &AppState,
+    identity: &ApiIdentity,
+    req: CreateVmRequest,
+) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
     // Cluster admission: place locally (warm/cold) if this node has room; else
     // spill to ANY peer that has capacity (exhaustive). Only if the WHOLE
     // cluster is full do we wait for a slot to free, and only after the
@@ -893,14 +1138,14 @@ async fn create_vm_impl(
     let deadline = Instant::now() + Duration::from_millis(state.config.admission_timeout_ms);
     loop {
         let last_overloaded = match ops::create_local(state, &req).await {
-            Ok(record) => return Ok((StatusCode::CREATED, Json(record))),
+            Ok(record) => return Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record)))),
             Err(OrchError::Overloaded { message, .. }) => message, // local full — try the rest of the fleet
             Err(e) => return Err(e.into()),
         };
 
         if state.fleet.is_some() {
             if let Some(record) = place_on_peer(state, &req, identity).await? {
-                return Ok((StatusCode::CREATED, Json(record)));
+                return Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record))));
             }
         }
 
@@ -1007,12 +1252,33 @@ async fn restore_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Json(mut req): Json<RestoreRequest>,
-) -> Result<(StatusCode, Json<VmRecord>), ApiError> {
+) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
     req.owner_key = Some(identity.tenant.clone());
     req.api_key_id = Some(identity.api_key_id.clone());
-    enforce_vm_quota(&state, &identity).await?;
+    let id = *req.id.get_or_insert_with(Uuid::new_v4);
+    match cluster::resolve_owner(&state, id).await {
+        Ok(_) => return Err(OrchError::Conflict(format!("vm {id} already exists")).into()),
+        Err(OrchError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let reserved = reserve_vm_quota(&state, &identity, id).await?;
+    let result = restore_vm_after_quota(&state, &identity, req).await;
+    if reserved {
+        if let Err(error) = release_vm_quota(&state, &identity, id).await {
+            tracing::warn!(vm = %id, tenant = %identity.tenant, %error,
+                "failed to release restore quota reservation; TTL cleanup will retry implicitly");
+        }
+    }
+    result
+}
+
+async fn restore_vm_after_quota(
+    state: &AppState,
+    identity: &ApiIdentity,
+    req: RestoreRequest,
+) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
     let on_peer = match &req.host_id {
-        Some(h) if *h != state.config.host_id => cluster::peer_rpc(&state, h).await?,
+        Some(h) if *h != state.config.host_id => cluster::peer_rpc(state, h).await?,
         _ => None,
     };
     let record = match on_peer {
@@ -1026,7 +1292,7 @@ async fn restore_vm(
         }
         None => {
             ops::restore_local(
-                &state,
+                state,
                 &req.snapshot_path,
                 req.id,
                 req.owner_key,
@@ -1037,14 +1303,14 @@ async fn restore_vm(
         }
     };
     audit::record(
-        &state,
-        &identity,
+        state,
+        identity,
         audit_action::RESTORE,
         Some(record.id),
         audit_outcome::OK,
         None,
     );
-    Ok((StatusCode::CREATED, Json(record)))
+    Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record))))
 }
 
 /// Build a `VmRecord` for an already-running VM (warm-pool hand-out).
@@ -1065,6 +1331,8 @@ pub(crate) fn running_record(
         owner_key,
         api_key_id,
         status: VmStatus::Running,
+        revision: 1,
+        startup_path: None,
         memory_mib: spawn_cfg.memory_mib,
         vcpus: spawn_cfg.vcpus,
         kernel_path: spawn_cfg.kernel_path.display().to_string(),
@@ -1102,6 +1370,7 @@ fn require_admin(identity: &ApiIdentity) -> Result<(), OrchError> {
     }
 }
 
+#[cfg(test)]
 async fn enforce_vm_quota(state: &AppState, identity: &ApiIdentity) -> Result<(), OrchError> {
     let Some(max_vms) = identity.max_vms else {
         return Ok(());
@@ -1116,6 +1385,82 @@ async fn enforce_vm_quota(state: &AppState, identity: &ApiIdentity) -> Result<()
     Ok(())
 }
 
+/// Reserve quota before placement, rather than merely counting active rows.
+/// The reservation id is the VM id carried through local and peer placement, so
+/// exactly one slot is consumed for the whole admission loop.
+async fn reserve_vm_quota(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> Result<bool, OrchError> {
+    let Some(max_vms) = identity.max_vms else {
+        return Ok(false);
+    };
+    let ttl_ms = state
+        .config
+        .admission_timeout_ms
+        .saturating_add(5 * 60 * 1_000)
+        .min(i64::MAX as u64) as i64;
+    let expires_at = Utc::now() + chrono::Duration::milliseconds(ttl_ms);
+    if let Some(fleet) = &state.fleet {
+        return match fleet
+            .reserve_vm_quota(&identity.tenant, id, max_vms, expires_at)
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(tarit_fleet::FleetError::QuotaExceeded { .. }) => {
+                Err(OrchError::Forbidden(format!(
+                    "tenant {} VM quota exceeded: max_vms {max_vms}",
+                    identity.tenant
+                )))
+            }
+            Err(tarit_fleet::FleetError::Conflict(message)) => Err(OrchError::Conflict(message)),
+            Err(error) => Err(OrchError::Internal(format!(
+                "reserve fleet tenant quota: {error}"
+            ))),
+        };
+    }
+    let outcome = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .reserve_vm_quota(&identity.tenant, id, max_vms, expires_at)
+        .map_err(store_err)?;
+    match outcome {
+        tarit_store::VmQuotaReservationOutcome::Reserved => Ok(true),
+        tarit_store::VmQuotaReservationOutcome::QuotaExceeded => {
+            Err(OrchError::Forbidden(format!(
+                "tenant {} VM quota exceeded: max_vms {max_vms}",
+                identity.tenant
+            )))
+        }
+        tarit_store::VmQuotaReservationOutcome::IdConflict => Err(OrchError::Conflict(format!(
+            "VM {id} already exists or is being created"
+        ))),
+    }
+}
+
+async fn release_vm_quota(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> Result<(), OrchError> {
+    if let Some(fleet) = &state.fleet {
+        fleet
+            .release_vm_quota(&identity.tenant, id)
+            .await
+            .map_err(|error| OrchError::Internal(format!("release fleet tenant quota: {error}")))
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .release_vm_quota(&identity.tenant, id)
+            .map_err(store_err)
+    }
+}
+
+#[cfg(test)]
 async fn tenant_active_vm_count(state: &AppState, tenant: &str) -> Result<usize, OrchError> {
     if let Some(fleet) = &state.fleet {
         return fleet
@@ -1126,6 +1471,7 @@ async fn tenant_active_vm_count(state: &AppState, tenant: &str) -> Result<usize,
     Ok(tenant_active_vm_count_local(state, tenant))
 }
 
+#[cfg(test)]
 fn tenant_active_vm_count_local(state: &AppState, tenant: &str) -> usize {
     state
         .vm_cache
@@ -1140,24 +1486,40 @@ fn tenant_active_vm_count_local(state: &AppState, tenant: &str) -> usize {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn is_active_vm_status(status: VmStatus) -> bool {
     matches!(
         status,
-        VmStatus::Creating | VmStatus::Running | VmStatus::Paused
+        VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
     )
 }
 
 async fn list_vms(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-) -> Result<Json<Vec<VmRecord>>, ApiError> {
+) -> Result<Json<Vec<PublicVmRecord>>, ApiError> {
+    if let Some(fleet) = &state.fleet {
+        let owner_filter = (!identity.is_admin()).then_some(identity.tenant.as_str());
+        let vms = fleet
+            .list_vms(owner_filter)
+            .await
+            .map_err(|error| OrchError::Internal(format!("fleet VM list: {error}")))?;
+        return Ok(Json(
+            vms.into_iter()
+                .filter(|vm| vm.status != VmStatus::Stopped)
+                .map(PublicVmRecord::from)
+                .collect(),
+        ));
+    }
     let vms = state
         .vm_cache
         .read()
         .map(|c| {
             c.values()
-                .filter(|vm| identity_can_access_vm(&identity, vm))
-                .cloned()
+                .filter(|vm| {
+                    vm.status != VmStatus::Stopped && identity_can_access_vm(&identity, vm)
+                })
+                .map(PublicVmRecord::from)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1168,44 +1530,44 @@ async fn get_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
-) -> Result<Json<VmRecord>, ApiError> {
+) -> Result<Json<PublicVmRecord>, ApiError> {
     match cluster::resolve_owner(&state, id).await? {
         Owner::Local => {
             let vm = ops::get_local(&state, id)?;
             ensure_vm_access(&identity, &vm)?;
-            Ok(Json(vm))
+            Ok(Json(PublicVmRecord::from(vm)))
         }
         Owner::Remote(rpc) => {
             let peer = Arc::clone(&state.peer);
             let vm = tokio::task::spawn_blocking(move || peer.get_remote(&rpc, id, &identity))
                 .await
                 .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
-            Ok(Json(vm))
+            Ok(Json(PublicVmRecord::from(vm)))
         }
     }
 }
 
-/// Live VMM status (state/uptime/vcpus/mem/config/vcpu_alive), routed to the
-/// owning node. Distinct from `GET /v1/vms/{id}`, which returns the stored record.
+/// Sanitized live status routed to the owning node. Host paths and device
+/// configuration remain private to the VMM/control-plane boundary.
 async fn vm_status(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    match cluster::resolve_owner(&state, id).await? {
+) -> Result<Json<PublicVmRuntimeStatus>, ApiError> {
+    let status = match cluster::resolve_owner(&state, id).await? {
         Owner::Local => {
             let vm = ops::get_local(&state, id)?;
             ensure_vm_access(&identity, &vm)?;
-            Ok(Json(ops::status_local(&state, id).await?))
+            ops::status_local(&state, id).await?
         }
         Owner::Remote(rpc) => {
             let peer = Arc::clone(&state.peer);
-            let v = tokio::task::spawn_blocking(move || peer.status_remote(&rpc, id, &identity))
+            tokio::task::spawn_blocking(move || peer.status_remote(&rpc, id, &identity))
                 .await
-                .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
-            Ok(Json(v))
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??
         }
-    }
+    };
+    Ok(Json(public_vm_runtime_status(status)?))
 }
 
 async fn delete_vm(
@@ -1242,7 +1604,7 @@ async fn pause_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
-) -> Result<Json<VmRecord>, ApiError> {
+) -> Result<Json<PublicVmRecord>, ApiError> {
     let vm = match cluster::resolve_owner(&state, id).await? {
         Owner::Local => {
             let vm = ops::get_local(&state, id)?;
@@ -1265,14 +1627,44 @@ async fn pause_vm(
         audit_outcome::OK,
         None,
     );
-    Ok(Json(vm))
+    Ok(Json(PublicVmRecord::from(vm)))
+}
+
+async fn suspend_vm(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PublicVmRecord>, ApiError> {
+    let vm = match cluster::resolve_owner(&state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(&state, id)?;
+            ensure_vm_access(&identity, &vm)?;
+            ops::suspend_local(&state, id).await?
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.suspend_remote(&rpc, id, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+        }
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::SUSPEND,
+        Some(id),
+        audit_outcome::OK,
+        None,
+    );
+    Ok(Json(PublicVmRecord::from(vm)))
 }
 
 async fn resume_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
-) -> Result<Json<VmRecord>, ApiError> {
+) -> Result<Json<PublicVmRecord>, ApiError> {
     let vm = match cluster::resolve_owner(&state, id).await? {
         Owner::Local => {
             let vm = ops::get_local(&state, id)?;
@@ -1295,7 +1687,7 @@ async fn resume_vm(
         audit_outcome::OK,
         None,
     );
-    Ok(Json(vm))
+    Ok(Json(PublicVmRecord::from(vm)))
 }
 
 async fn snapshot_vm(
@@ -1394,13 +1786,9 @@ async fn execute_async_impl(
         updated_at: now,
     };
 
-    // Serve status polls from the in-memory cache; persist to SQLite off the
-    // response path (in the exec task below), so a 200-wide burst's create+exec
-    // does not serialize on the single store connection.
-    if let Ok(mut c) = state.exec_cache.write() {
-        c.insert(exec_id, record.clone());
-    }
-    let initial_record = record.clone();
+    // Persist Pending before returning 202. In fleet mode this makes operation
+    // polling stateless across API nodes; local SQLite remains a recovery cache.
+    persist_exec(&state, &record, &identity).await?;
 
     let state2 = state.clone();
     let command = req.command;
@@ -1408,8 +1796,11 @@ async fn execute_async_impl(
     let vm_id = req.vm_id;
 
     tokio::spawn(async move {
-        let _ = state2.store_tx.send(StoreWrite::Exec(initial_record));
-        let _ = update_exec_status(&state2, exec_id, ExecutionStatus::Running, None);
+        if let Err(error) =
+            update_exec_status(&state2, &identity, exec_id, ExecutionStatus::Running, None).await
+        {
+            tracing::error!(execution = %exec_id, %error, "persist running execution state");
+        }
 
         let result = match owner {
             Owner::Local => ops::exec_local(&state2, vm_id, command.clone(), timeout_ms).await,
@@ -1444,7 +1835,9 @@ async fn execute_async_impl(
                     created_at: now,
                     updated_at: Utc::now(),
                 };
-                persist_exec(&state2, &rec);
+                if let Err(error) = persist_exec(&state2, &rec, &identity).await {
+                    tracing::error!(execution = %exec_id, %error, "persist completed execution state");
+                }
                 usage::meter_exec(
                     &state2,
                     &identity.api_key_id,
@@ -1470,12 +1863,18 @@ async fn execute_async_impl(
                     audit_outcome::ERROR,
                     Some(e.to_string()),
                 );
-                let _ = update_exec_status(
+                if let Err(persist_error) = update_exec_status(
                     &state2,
+                    &identity,
                     exec_id,
                     ExecutionStatus::Failed,
-                    Some(e.to_string()),
-                );
+                    Some(public_operation_error(&e)),
+                )
+                .await
+                {
+                    tracing::error!(execution = %exec_id, %persist_error,
+                        "persist failed execution state");
+                }
             }
         }
     });
@@ -1553,15 +1952,12 @@ async fn execute_impl(
             stdout: None,
             stderr: None,
             duration_ms: None,
-            error: Some(e.to_string()),
+            error: Some(public_operation_error(&e)),
             created_at: now,
             updated_at: Utc::now(),
         },
     };
-    if let Ok(mut c) = state.exec_cache.write() {
-        c.insert(exec_id, rec.clone());
-    }
-    let _ = state.store_tx.send(StoreWrite::Exec(rec.clone()));
+    persist_exec(state, &rec, identity).await?;
     if matches!(rec.status, ExecutionStatus::Completed) {
         usage::meter_exec(
             state,
@@ -1596,6 +1992,20 @@ async fn get_execution(
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ExecutionRecord>, ApiError> {
+    if let Some(fleet) = &state.fleet {
+        let global = fleet
+            .get_execution(id)
+            .await
+            .map_err(|error| OrchError::Internal(format!("fleet execution lookup: {error}")))?
+            .ok_or_else(|| OrchError::NotFound(format!("execution {id} not found")))?;
+        if !identity.is_admin() && global.owner_key != identity.tenant {
+            return Err(OrchError::Forbidden("execution belongs to another tenant".into()).into());
+        }
+        if let Ok(mut cache) = state.exec_cache.write() {
+            cache.insert(id, global.record.clone());
+        }
+        return Ok(Json(global.record));
+    }
     let rec = if let Some(rec) = state
         .exec_cache
         .read()
@@ -1778,17 +2188,48 @@ pub(crate) fn store_err(e: tarit_store::StoreError) -> OrchError {
     }
 }
 
-/// Write an execution record through to both the in-memory cache (the read path
-/// for status polls) and the SQLite store (durability).
-fn persist_exec(state: &AppState, rec: &ExecutionRecord) {
+/// Write an execution record through to the global operation store, local
+/// in-memory cache, and bounded SQLite write-behind queue. Queue saturation uses
+/// a synchronous SQLite fallback: overload may add latency, but never silently
+/// loses terminal operation state.
+async fn persist_exec(
+    state: &AppState,
+    rec: &ExecutionRecord,
+    identity: &ApiIdentity,
+) -> Result<(), OrchError> {
+    if let Some(fleet) = &state.fleet {
+        fleet
+            .upsert_execution(
+                rec,
+                &identity.tenant,
+                &identity.api_key_id,
+                &state.config.host_id,
+            )
+            .await
+            .map_err(|error| {
+                OrchError::Internal(format!("persist global execution state: {error}"))
+            })?;
+    }
     if let Ok(mut c) = state.exec_cache.write() {
         c.insert(rec.id, rec.clone());
     }
-    let _ = state.store_tx.send(StoreWrite::Exec(rec.clone()));
+    if let Err(error) = state.store_tx.try_send(StoreWrite::Exec(rec.clone())) {
+        state.metrics.inc_store_enqueue_failure();
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .insert_execution(rec)
+            .map_err(store_err)?;
+        tracing::warn!(execution = %rec.id, %error,
+            "bounded persistence queue unavailable; wrote execution synchronously");
+    }
+    Ok(())
 }
 
-fn update_exec_status(
+async fn update_exec_status(
     state: &AppState,
+    identity: &ApiIdentity,
     id: Uuid,
     status: ExecutionStatus,
     error: Option<String>,
@@ -1811,8 +2252,7 @@ fn update_exec_status(
     rec.status = status;
     rec.error = error;
     rec.updated_at = Utc::now();
-    persist_exec(state, &rec);
-    Ok(())
+    persist_exec(state, &rec, identity).await
 }
 
 #[cfg(test)]
@@ -1972,9 +2412,25 @@ mod tests {
         let body = rt
             .block_on(to_bytes(user_response.into_body(), usize::MAX))
             .unwrap();
-        let user_vms: Vec<VmRecord> = serde_json::from_slice(&body).unwrap();
+        let user_vms: Vec<PublicVmRecord> = serde_json::from_slice(&body).unwrap();
         assert_eq!(user_vms.len(), 1);
         assert_eq!(user_vms[0].id, tenant_a_id);
+        let user_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for internal_field in [
+            "host_id",
+            "owner_key",
+            "api_key_id",
+            "kernel_path",
+            "rootfs_path",
+            "cmdline",
+            "socket_path",
+            "pid",
+        ] {
+            assert!(
+                user_json[0].get(internal_field).is_none(),
+                "public VM response leaked {internal_field}"
+            );
+        }
 
         let admin_response = rt
             .block_on(
@@ -1991,9 +2447,143 @@ mod tests {
         let body = rt
             .block_on(to_bytes(admin_response.into_body(), usize::MAX))
             .unwrap();
-        let admin_vms: Vec<VmRecord> = serde_json::from_slice(&body).unwrap();
+        let admin_vms: Vec<PublicVmRecord> = serde_json::from_slice(&body).unwrap();
         assert_eq!(admin_vms.len(), 2);
         drop(rt);
+    }
+
+    #[test]
+    fn unauthorized_requests_are_subject_to_global_rate_limit() {
+        let mut state = test_state();
+        state.config.api_requests_per_second = 1;
+        let app = router(state);
+        let rt = test_runtime();
+
+        let first = rt
+            .block_on(
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri("/v1/vms")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+
+        let second = rt
+            .block_on(
+                app.oneshot(
+                    Request::builder()
+                        .uri("/v1/vms")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(rt);
+    }
+
+    #[test]
+    fn invalid_pty_connect_tokens_are_subject_to_global_rate_limit() {
+        let mut state = test_state();
+        state.config.api_requests_per_second = 1;
+        let app = router(state);
+        let rt = test_runtime();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await });
+            let uri = format!(
+                "ws://{address}/v1/vms/{}/pty/{}/connect?token=invalid",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            );
+            let first = tokio_tungstenite::connect_async(&uri)
+                .await
+                .expect_err("invalid PTY token must reject the WebSocket handshake");
+            let tokio_tungstenite::tungstenite::Error::Http(first) = first else {
+                panic!("expected an HTTP handshake rejection");
+            };
+            assert_eq!(first.status().as_u16(), StatusCode::UNAUTHORIZED.as_u16());
+
+            let second = tokio_tungstenite::connect_async(&uri)
+                .await
+                .expect_err("second invalid PTY token must be rate limited");
+            let tokio_tungstenite::tungstenite::Error::Http(second) = second else {
+                panic!("expected an HTTP rate-limit response");
+            };
+            assert_eq!(
+                second.status().as_u16(),
+                StatusCode::TOO_MANY_REQUESTS.as_u16()
+            );
+            server.abort();
+        });
+        drop(rt);
+    }
+
+    #[test]
+    fn public_runtime_status_drops_vmm_configuration() {
+        let status = public_vm_runtime_status(serde_json::json!({
+            "state": "running",
+            "uptime_ms": 10,
+            "vcpus": 1,
+            "mem_mib": 256,
+            "volumes": 1,
+            "nets": 1,
+            "kernel": "/srv/tarit/private/vmlinux",
+            "vcpu_alive": true
+        }))
+        .unwrap();
+        let value = serde_json::to_value(status).unwrap();
+        assert!(value.get("kernel").is_none());
+        assert!(value.get("volumes").is_none());
+        assert!(value.get("nets").is_none());
+    }
+
+    #[test]
+    fn public_errors_hide_internal_paths_and_peer_addresses() {
+        let rt = test_runtime();
+        let internal = ApiError(OrchError::Internal(
+            "peer https://node.internal /srv/tarit/vm.sock".into(),
+        ))
+        .into_response();
+        let value = rt.block_on(response_json(internal));
+        assert_eq!(value["error"], "internal error");
+
+        let unavailable = ApiError(OrchError::Unavailable(
+            "owner host node-private is stale".into(),
+        ))
+        .into_response();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let value = rt.block_on(response_json(unavailable));
+        assert_eq!(value["error"], "service unavailable");
+    }
+
+    #[test]
+    fn stopped_vms_are_deleted_from_public_list_semantics() {
+        let state = test_state();
+        insert_vm(&state, Uuid::new_v4(), "tenant-a", VmStatus::Stopped);
+        let app = router(state);
+        let rt = test_runtime();
+        let response = rt
+            .block_on(
+                app.oneshot(
+                    Request::builder()
+                        .uri("/v1/vms")
+                        .header("X-API-Key", "tenant-a-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = rt
+            .block_on(to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let vms: Vec<PublicVmRecord> = serde_json::from_slice(&body).unwrap();
+        assert!(vms.is_empty());
     }
 
     #[test]
@@ -2055,12 +2645,15 @@ mod tests {
             rt.block_on(response_json(response)),
             serde_json::json!({"error": "taritd is shutting down"})
         );
-        while let Ok(write) = writes.try_recv() {
-            assert!(
-                !matches!(write, StoreWrite::Vm(_)),
-                "shutdown rejection must not enqueue a provisional VM record"
-            );
-        }
+        let StoreWrite::Audit(event) = writes
+            .try_recv()
+            .expect("the rejected create must emit one audit event")
+        else {
+            panic!("shutdown rejection emitted a non-audit store write");
+        };
+        assert_eq!(event.action, audit_action::CREATE);
+        assert_eq!(event.outcome, audit_outcome::ERROR);
+        assert!(writes.try_recv().is_err());
         drop(rt);
     }
 
@@ -3059,7 +3652,7 @@ mod tests {
         test_state_with_audit().0
     }
 
-    fn test_state_with_audit() -> (AppState, tokio::sync::mpsc::UnboundedReceiver<StoreWrite>) {
+    fn test_state_with_audit() -> (AppState, tokio::sync::mpsc::Receiver<StoreWrite>) {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             api_keys: ApiKeyRegistry::from_plaintext_entries(vec![
@@ -3082,9 +3675,14 @@ mod tests {
             peer_secret: "peer-secret".into(),
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
@@ -3106,7 +3704,7 @@ mod tests {
         };
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = ShareRepository::new(Arc::clone(&store), None);
-        let (store_tx, store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, store_rx) = tokio::sync::mpsc::channel(128);
         (
             AppState {
                 config: config.clone(),
@@ -3141,25 +3739,26 @@ mod tests {
 
     fn insert_vm(state: &AppState, id: Uuid, tenant: &str, status: VmStatus) {
         let now = Utc::now();
-        state.vm_cache.write().unwrap().insert(
+        let record = VmRecord {
             id,
-            VmRecord {
-                id,
-                host_id: state.config.host_id.clone(),
-                owner_key: Some(tenant.into()),
-                api_key_id: None,
-                status,
-                memory_mib: 256,
-                vcpus: 1,
-                kernel_path: "kernel".into(),
-                rootfs_path: None,
-                cmdline: "console=ttyS0".into(),
-                socket_path: None,
-                pid: None,
-                created_at: now,
-                updated_at: now,
-            },
-        );
+            host_id: state.config.host_id.clone(),
+            owner_key: Some(tenant.into()),
+            api_key_id: None,
+            status,
+            revision: 1,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: None,
+            cmdline: "console=ttyS0".into(),
+            socket_path: None,
+            pid: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
     }
 
     async fn request_json(

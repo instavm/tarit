@@ -14,6 +14,7 @@ pub enum VmStatus {
     Creating,
     Running,
     Paused,
+    Suspended,
     Stopped,
     Error,
 }
@@ -24,6 +25,7 @@ impl VmStatus {
             Self::Creating => "creating",
             Self::Running => "running",
             Self::Paused => "paused",
+            Self::Suspended => "suspended",
             Self::Stopped => "stopped",
             Self::Error => "error",
         }
@@ -34,6 +36,7 @@ impl VmStatus {
             "creating" => Some(Self::Creating),
             "running" => Some(Self::Running),
             "paused" => Some(Self::Paused),
+            "suspended" => Some(Self::Suspended),
             "stopped" => Some(Self::Stopped),
             "error" => Some(Self::Error),
             _ => None,
@@ -41,8 +44,39 @@ impl VmStatus {
     }
 }
 
+/// Definitive path used to bring a VM to its initial running state.
+///
+/// This is recorded at the actual lifecycle branch, rather than inferred by a
+/// client, so performance tooling can prove which path it measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VmStartupPath {
+    Cold,
+    Warm,
+    SnapshotRestore,
+}
+
+impl VmStartupPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cold => "cold",
+            Self::Warm => "warm",
+            Self::SnapshotRestore => "snapshot_restore",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cold" => Some(Self::Cold),
+            "warm" => Some(Self::Warm),
+            "snapshot_restore" => Some(Self::SnapshotRestore),
+            _ => None,
+        }
+    }
+}
+
 /// Persistent record of a VM managed by taritd.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRecord {
     pub id: Uuid,
     pub host_id: String,
@@ -51,6 +85,14 @@ pub struct VmRecord {
     #[serde(default, skip_serializing)]
     pub api_key_id: Option<String>,
     pub status: VmStatus,
+    /// Monotonic control-plane revision used to reject stale asynchronous
+    /// persistence and fleet updates for this VM incarnation.
+    #[serde(default = "default_vm_revision")]
+    pub revision: u64,
+    /// Actual boot path used for this VM. `None` is retained for records
+    /// created by versions predating launch provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_path: Option<VmStartupPath>,
     pub memory_mib: u64,
     pub vcpus: u8,
     pub kernel_path: String,
@@ -60,6 +102,50 @@ pub struct VmRecord {
     pub pid: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+const fn default_vm_revision() -> u64 {
+    1
+}
+
+/// Public control-plane view of a VM.
+///
+/// Process identifiers, Unix sockets, host filesystem paths, boot arguments,
+/// tenant ownership metadata, and the physical host id are deliberately kept
+/// out of this type. They are implementation details used by persistence and
+/// authenticated peer RPC, not part of the tenant API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicVmRecord {
+    pub id: Uuid,
+    pub status: VmStatus,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_path: Option<VmStartupPath>,
+    pub memory_mib: u64,
+    pub vcpus: u8,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&VmRecord> for PublicVmRecord {
+    fn from(record: &VmRecord) -> Self {
+        Self {
+            id: record.id,
+            status: record.status,
+            revision: record.revision,
+            startup_path: record.startup_path,
+            memory_mib: record.memory_mib,
+            vcpus: record.vcpus,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+impl From<VmRecord> for PublicVmRecord {
+    fn from(record: VmRecord) -> Self {
+        Self::from(&record)
+    }
 }
 
 /// Whether a shared VM port is public or requires a valid private-share token.
@@ -320,6 +406,7 @@ pub mod audit_action {
     pub const CREATE: &str = "create";
     pub const DELETE: &str = "delete";
     pub const PAUSE: &str = "pause";
+    pub const SUSPEND: &str = "suspend";
     pub const RESUME: &str = "resume";
     pub const SNAPSHOT: &str = "snapshot";
     pub const RESTORE: &str = "restore";
@@ -410,6 +497,9 @@ pub enum OrchError {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    #[error("unprocessable: {0}")]
+    Unprocessable(String),
+
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -425,6 +515,9 @@ pub enum OrchError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    #[error("unavailable: {0}")]
+    Unavailable(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 
@@ -437,10 +530,12 @@ impl OrchError {
         match self {
             Self::NotFound(_) => 404,
             Self::BadRequest(_) => 400,
+            Self::Unprocessable(_) => 422,
             Self::Conflict(_) => 409,
             Self::Overloaded { .. } => 429,
             Self::Unauthorized => 401,
             Self::Forbidden(_) => 403,
+            Self::Unavailable(_) => 503,
             Self::Internal(_) | Self::Vmm(_) => 500,
         }
     }
@@ -520,5 +615,41 @@ mod tests {
         assert_eq!(audit_action::UPDATE_SHARE, "update_share");
         assert_eq!(audit_action::REVOKE_SHARE, "revoke_share");
         assert_eq!(audit_action::ISSUE_SHARE_TOKEN, "issue_share_token");
+    }
+
+    #[test]
+    fn public_vm_record_contains_no_host_runtime_details() {
+        let now = Utc::now();
+        let internal = VmRecord {
+            id: Uuid::new_v4(),
+            host_id: "node-private".into(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: Some("key-id".into()),
+            status: VmStatus::Running,
+            revision: 2,
+            startup_path: Some(VmStartupPath::Cold),
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "/srv/private/vmlinux".into(),
+            rootfs_path: Some("/srv/private/rootfs".into()),
+            cmdline: "console=ttyS0 secret=detail".into(),
+            socket_path: Some("/run/private/vm.sock".into()),
+            pid: Some(42),
+            created_at: now,
+            updated_at: now,
+        };
+        let value = serde_json::to_value(PublicVmRecord::from(internal)).unwrap();
+        for field in [
+            "host_id",
+            "owner_key",
+            "api_key_id",
+            "kernel_path",
+            "rootfs_path",
+            "cmdline",
+            "socket_path",
+            "pid",
+        ] {
+            assert!(value.get(field).is_none(), "public record leaked {field}");
+        }
     }
 }

@@ -306,6 +306,7 @@ start_cluster() {
       export TARIT_DATABASE_URL="$DATABASE_URL"
       export TARIT_LISTEN="127.0.0.1:$((BASE_PORT+i))"
       export TARIT_RPC_ADDR="${URLS[$i]}"
+      export TARIT_ALLOW_INSECURE_PEER_HTTP=1
       export TARIT_HOST_ID="${HOST_IDS[$i]}"
       export TARIT_SOCKET_DIR="$node_dir/sockets"
       export TARIT_DB="$node_dir/taritd.sqlite"

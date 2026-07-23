@@ -107,8 +107,7 @@ impl VcpuThread {
             // are unrestricted, makes glibc cache the result so the steady-state
             // run loop never needs openat.
             {
-                let mut warm: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
-                warm.resize(8 * 1024 * 1024, 0);
+                let mut warm = vec![0; 8 * 1024 * 1024];
                 warm[0] = 1;
                 warm[8 * 1024 * 1024 - 1] = 1;
                 std::hint::black_box(&warm);

@@ -19,7 +19,9 @@ export TARIT_LISTEN="127.0.0.1:8080"
 export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
 export TARIT_KERNEL="/tmp/vmlinux.microvm"
 export TARIT_ROOTFS="$ROOTFS"
-export TARIT_ROOTFS_READONLY="1"
+# The shared host base is always immutable through per-VM CoW. Keep the guest
+# root writable so the isolation assertions below exercise each private layer.
+export TARIT_ROOTFS_READONLY="0"
 export TARIT_ENABLE_NET="0"
 export TARIT_MAX_VMS="8"
 export TARIT_SOCKET_DIR="${TARIT_SOCKET_DIR:-$TARITD_HOME/sockets}"

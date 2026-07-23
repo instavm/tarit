@@ -31,29 +31,31 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: x86_64-unknown-linux-musl
 
       # zig provides a complete cross sysroot, which lets the C dependencies in
       # the tree (aws-lc-rs via russh, etc.) build cleanly for the musl target.
       - name: Install zig
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
         with:
           version: 0.13.0
 
       # Prebuilt binary — avoids compiling cargo-zigbuild from source each run.
       - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
         with:
           tool: cargo-zigbuild
 
       - name: Cache cargo build (orch)
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: orch
           key: release-orch
@@ -63,7 +65,7 @@ jobs:
         run: cargo zigbuild --release --locked --target "$TARGET" -p taritd
 
       - name: Cache cargo build (vmm)
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: vmm
           key: release-vmm
@@ -72,15 +74,33 @@ jobs:
         working-directory: vmm
         run: cargo zigbuild --release --locked --target "$TARGET" -p vmm --features boot
 
+      - name: Build guest agent
+        working-directory: vmm/guest/agent
+        run: make
+
       - name: Stage artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
           cp "orch/target/$TARGET/release/taritd" dist/taritd
           cp "vmm/target/$TARGET/release/vmm" dist/vmm
-          strip dist/taritd dist/vmm
+          cp "vmm/guest/agent/vmm-agent" dist/vmm-agent
+          strip dist/taritd dist/vmm dist/vmm-agent
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/tarit.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
           cd dist
-          sha256sum taritd vmm > SHA256SUMS
+          sha256sum taritd vmm vmm-agent tarit.spdx.json > SHA256SUMS
           cat SHA256SUMS
 
       # Smoke-test the exact artifacts we are about to publish (they run natively
@@ -92,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          for bin in taritd vmm; do
+          for bin in taritd vmm vmm-agent; do
             echo "== $bin =="
             file "$bin"
             file "$bin" | grep -q "statically linked"
@@ -102,8 +122,13 @@ jobs:
           ./taritd --version
           ./taritd --help > /dev/null
 
+      - name: Attest release artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: dist/*
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-x86_64-musl
           path: dist/
@@ -119,17 +144,19 @@ jobs:
       contents: write # required to create the Release and upload assets
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: linux-x86_64-musl
           path: dist
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/taritd
             dist/vmm
+            dist/vmm-agent
+            dist/tarit.spdx.json
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           body: |
@@ -137,5 +164,7 @@ jobs:
 
             - `taritd` — orchestrator daemon
             - `vmm` — microVM manager
+            - `vmm-agent` — static guest exec/PTY agent for image creation
+            - `tarit.spdx.json` — SPDX software bill of materials
 
             Verify with `sha256sum -c SHA256SUMS`. Booting microVMs requires Linux with `/dev/kvm`.

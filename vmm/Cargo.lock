@@ -812,6 +812,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tarit-proto",
+ "tempfile",
  "thiserror 1.0.69",
  "vm-memory 0.18.0",
  "vmm-devices",

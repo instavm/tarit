@@ -110,11 +110,21 @@ export RUST_LOG='taritd=info,tower_http=info'
 
 Each node must differ:
 
+The `:8443` origins below assume a private TLS proxy that denies every route
+except `/internal/v1/*` and forwards those requests to the node's HTTP listener
+on `:8080`. The proxy must support WebSocket upgrades and preserve method, path,
+query, body, and `X-Tarit-*` headers exactly because `taritd` validates them as
+part of the request HMAC. Its certificate SAN must match the advertised
+hostname and chain to the WebPKI roots built into the Rustls clients; a custom
+peer CA cannot currently be configured. For an isolated development cluster
+without a compatible proxy, use the private `http://...:8080` origin and set
+`TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
+
 | Node | Required differences |
 | --- | --- |
-| A | `TARIT_HOST_ID=node-a`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=http://10.0.1.10:8080`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-a/sockets`, `TARIT_DB=$HOME/.taritd/node-a/fleet.db` |
-| B | `TARIT_HOST_ID=node-b`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=http://10.0.1.11:8080`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-b/sockets`, `TARIT_DB=$HOME/.taritd/node-b/fleet.db` |
-| C | `TARIT_HOST_ID=node-c`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=http://10.0.1.12:8080`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-c/sockets`, `TARIT_DB=$HOME/.taritd/node-c/fleet.db` |
+| A | `TARIT_HOST_ID=node-a`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-a.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-a/sockets`, `TARIT_DB=$HOME/.taritd/node-a/fleet.db` |
+| B | `TARIT_HOST_ID=node-b`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-b.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-b/sockets`, `TARIT_DB=$HOME/.taritd/node-b/fleet.db` |
+| C | `TARIT_HOST_ID=node-c`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-c.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-c/sockets`, `TARIT_DB=$HOME/.taritd/node-c/fleet.db` |
 
 Start `./target/release/taritd` on each node. Within one heartbeat interval, every node should show in:
 
@@ -145,7 +155,8 @@ Recommended public routing:
 
 The current binary mounts public and internal routes on the same listener. In production, isolate internal access with network policy, security groups, firewall rules, or a sidecar/proxy that blocks `/internal/v1/*` from public networks.
 
-Execution polling caveat: `POST /v1/execute_async` creates the execution record on whichever API node accepted the request. `GET /v1/executions/{id}` is not forwarded through the fleet. If clients use an external load balancer, enable stickiness for execution polling or have the client poll the same node.
+In fleet mode, asynchronous execution records are stored in PostgreSQL, so
+`GET /v1/executions/{id}` can be polled through any healthy API node.
 
 ## Warm pool operations
 
@@ -278,7 +289,7 @@ Requirements:
 
 ## Rootfs mode
 
-`TARIT_ROOTFS_READONLY=true` makes `taritd` attach the rootfs as read-only and rewrites the common `root=/dev/vda rw` fragment to `root=/dev/vda ro`. Use this when many VMs share one immutable base image. If false, a rootfs should be single-owner or otherwise safely cloned, because writable sharing can corrupt filesystems.
+Every rootfs base is opened immutably and attached through a private per-VM CoW overlay, so guests never share writable filesystem state. `TARIT_ROOTFS_READONLY=true` additionally requests read-only guest mount semantics by rewriting the common `root=/dev/vda rw` fragment to `root=/dev/vda ro`.
 
 ## PostgreSQL and RDS
 
@@ -326,12 +337,13 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 - Use a long random `TARIT_PEER_SECRET` for peers and rotate it with a coordinated restart.
 - Do not expose `/internal/v1/*` publicly.
 - Use TLS for public clients, usually at the load balancer.
-- Prefer mTLS for peer traffic in production. Peer auth uses a shared header secret; add mTLS at the network or proxy layer when required.
+- Peer requests use a replay-protected HMAC; the shared key is never transmitted.
+- A separate internal listener with mandatory mTLS and host-session fencing is still required before hostile multi-tenant production use.
 - Keep `TARIT_RPC_ADDR` values private and stable.
 - Use PostgreSQL TLS and CA validation where available.
 - Restrict VMM, kernel, rootfs, socket, and SQLite paths to trusted local directories.
 - If `TARIT_ENABLE_NET=true`, audit nftables and host forwarding policy.
-- Avoid writable rootfs sharing. Use `TARIT_ROOTFS_READONLY=true` for shared base images.
+- Keep base images immutable; taritd always places guest writes in a private per-VM CoW overlay.
 
 ## Troubleshooting
 

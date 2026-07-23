@@ -22,6 +22,11 @@ pub struct RunContext {
     pub vcpus: u8,
     pub provider: String,
     pub results_dir: PathBuf,
+    pub startup_path: args::StartupPath,
+    pub max_median_ms: Option<u64>,
+    pub max_p95_ms: Option<u64>,
+    pub max_p99_ms: Option<u64>,
+    pub min_success_percent: Option<f64>,
 }
 
 impl RunContext {
@@ -40,6 +45,11 @@ impl RunContext {
             vcpus: args.vcpus,
             provider: args.provider.clone(),
             results_dir: args.results_dir.clone(),
+            startup_path: args.startup_path,
+            max_median_ms: args.max_median_ms,
+            max_p95_ms: args.max_p95_ms,
+            max_p99_ms: args.max_p99_ms,
+            min_success_percent: args.min_success_percent,
         }
     }
 }
@@ -148,6 +158,35 @@ impl ModeOutcome {
         self
     }
 
+    pub fn verify_performance(&self, ctx: &RunContext) -> Result<()> {
+        let result = self.to_result(&ctx.provider);
+        let success_percent = result.success_rate * 100.0;
+        if let Some(minimum) = ctx.min_success_percent {
+            if success_percent + f64::EPSILON < minimum {
+                anyhow::bail!(
+                    "{} success rate {:.1}% is below the {:.1}% gate",
+                    self.mode.as_str(),
+                    success_percent,
+                    minimum
+                );
+            }
+        }
+
+        let Some(stats) = result.summary.tti_ms else {
+            if ctx.max_median_ms.is_some() || ctx.max_p95_ms.is_some() || ctx.max_p99_ms.is_some() {
+                anyhow::bail!(
+                    "{} has no successful samples for latency gates",
+                    self.mode.as_str()
+                );
+            }
+            return Ok(());
+        };
+
+        verify_latency_gate(self.mode, "median", stats.median, ctx.max_median_ms)?;
+        verify_latency_gate(self.mode, "p95", stats.p95, ctx.max_p95_ms)?;
+        verify_latency_gate(self.mode, "p99", stats.p99, ctx.max_p99_ms)
+    }
+
     fn to_result(&self, provider: &str) -> BenchmarkResult {
         let successful = self
             .iterations
@@ -244,6 +283,15 @@ struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     concurrency: Option<usize>,
     timeout_ms: u64,
+    startup_path: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_median_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_p95_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_p99_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_success_percent: Option<f64>,
 }
 
 impl Config {
@@ -253,11 +301,21 @@ impl Config {
                 iterations: Some(ctx.iterations),
                 concurrency: None,
                 timeout_ms: ctx.timeout_ms,
+                startup_path: ctx.startup_path.as_str(),
+                max_median_ms: ctx.max_median_ms,
+                max_p95_ms: ctx.max_p95_ms,
+                max_p99_ms: ctx.max_p99_ms,
+                min_success_percent: ctx.min_success_percent,
             },
             args::Mode::Staggered | args::Mode::Burst => Self {
                 iterations: None,
                 concurrency: Some(ctx.concurrency),
                 timeout_ms: ctx.timeout_ms,
+                startup_path: ctx.startup_path.as_str(),
+                max_median_ms: ctx.max_median_ms,
+                max_p95_ms: ctx.max_p95_ms,
+                max_p99_ms: ctx.max_p99_ms,
+                min_success_percent: ctx.min_success_percent,
             },
             args::Mode::All => unreachable!("all is not written as a benchmark mode"),
         }
@@ -297,4 +355,84 @@ fn display_stat(value: Option<u64>) -> String {
 
 fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
+}
+
+fn verify_latency_gate(
+    mode: args::Mode,
+    metric: &str,
+    actual_ms: u64,
+    maximum_ms: Option<u64>,
+) -> Result<()> {
+    if let Some(maximum_ms) = maximum_ms {
+        if actual_ms > maximum_ms {
+            anyhow::bail!(
+                "{} {} {}ms exceeds the {}ms gate",
+                mode.as_str(),
+                metric,
+                actual_ms,
+                maximum_ms
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> RunContext {
+        RunContext {
+            iterations: 2,
+            concurrency: 2,
+            stagger_delay: Duration::from_millis(1),
+            timeout: Duration::from_secs(1),
+            timeout_ms: 1_000,
+            poll_interval: Duration::from_millis(1),
+            command: "true".into(),
+            rootfs: None,
+            kernel_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            provider: "test".into(),
+            results_dir: PathBuf::from("target/bench-test"),
+            startup_path: args::StartupPath::Warm,
+            max_median_ms: Some(20),
+            max_p95_ms: Some(20),
+            max_p99_ms: Some(20),
+            min_success_percent: Some(100.0),
+        }
+    }
+
+    #[test]
+    fn performance_gate_accepts_run_within_limits() {
+        let outcome = ModeOutcome::new(
+            args::Mode::Sequential,
+            vec![IterationResult::success(10), IterationResult::success(20)],
+        );
+        assert!(outcome.verify_performance(&context()).is_ok());
+    }
+
+    #[test]
+    fn performance_gate_rejects_latency_regression() {
+        let outcome = ModeOutcome::new(
+            args::Mode::Sequential,
+            vec![IterationResult::success(10), IterationResult::success(30)],
+        );
+        let error = outcome.verify_performance(&context()).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn performance_gate_rejects_success_regression() {
+        let outcome = ModeOutcome::new(
+            args::Mode::Sequential,
+            vec![
+                IterationResult::success(10),
+                IterationResult::failure("failed".into()),
+            ],
+        );
+        let error = outcome.verify_performance(&context()).unwrap_err();
+        assert!(error.to_string().contains("success rate"));
+    }
 }

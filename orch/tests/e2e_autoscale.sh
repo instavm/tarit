@@ -25,6 +25,7 @@ for p in $(pgrep -f 'target/release/taritd' 2>/dev/null); do kill "$p" 2>/dev/nu
 ( export TARIT_API_KEY=askey TARIT_PEER_SECRET=as-peer-secret-long-enough-000 \
     TARIT_DATABASE_URL="$TARIT_DATABASE_URL" TARIT_RDS_CA_FILE="$CA" \
     TARIT_LISTEN=127.0.0.1:19050 TARIT_RPC_ADDR=http://127.0.0.1:19050 TARIT_HOST_ID=$RID-n1 \
+    TARIT_ALLOW_INSECURE_PEER_HTTP=1 \
     TARIT_SOCKET_DIR="$DIR/sockets" TARIT_DB="$DIR/i.sqlite" TARIT_CONFIG="$DIR/none.toml" \
     TARIT_VMM_BIN="$VMM_BIN" TARIT_KERNEL=/tmp/vmlinux.microvm \
     TARIT_ROOTFS=/tmp/vsock-rootfs.ext4 TARIT_WARM_POOL=0 TARIT_MAX_VMS=2 \

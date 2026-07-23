@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum ThreadKind {
     Vcpu,
     Device,
+    Vsock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +96,6 @@ impl SeccompProfile {
                 "recvmsg".into(),
                 "sendmsg".into(),
                 "eventfd2".into(),
-                "ioctl".into(),
                 "futex".into(),
                 "close".into(),
                 "dup".into(),
@@ -119,16 +119,22 @@ impl SeccompProfile {
                 "gettid".into(),
                 "getpid".into(),
                 "clock_gettime".into(),
-                // The vsock transport can lazily connect a configured Unix
-                // socket listener in response to a guest REQUEST. Keep the
-                // profile conservative but complete for that current code path.
-                "socket".into(),
-                "connect".into(),
-                "fcntl".into(),
-                "getsockopt".into(),
-                "setsockopt".into(),
             ],
         }
+    }
+
+    /// Device profile for the virtio-vsock pump. Unlike the network data
+    /// plane, this thread must lazily create host Unix streams. Its `socket`
+    /// syscall is argument-filtered to AF_UNIX/SOCK_STREAM at compile time.
+    pub fn vsock() -> Self {
+        let mut profile = Self::device();
+        profile.kind = ThreadKind::Vsock;
+        profile.allow.extend(
+            ["socket", "connect", "fcntl", "getsockopt", "setsockopt"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        profile
     }
 }
 
@@ -145,7 +151,7 @@ impl SeccompProfile {
 
         for name in &self.allow {
             let nr = self.syscall_nr(name)?;
-            rules.insert(nr, vec![]);
+            rules.insert(nr, self.rules_for_syscall(name)?);
         }
 
         let filter: BpfProgram = SeccompFilter::new(
@@ -167,10 +173,55 @@ impl SeccompProfile {
             match self.kind {
                 ThreadKind::Vcpu => "vCPU",
                 ThreadKind::Device => "device",
+                ThreadKind::Vsock => "vsock",
             },
             self.allow.len()
         );
         Ok(())
+    }
+
+    fn rules_for_syscall(&self, name: &str) -> Result<Vec<seccompiler::SeccompRule>, String> {
+        use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+
+        let conditions = match (self.kind, name) {
+            // Linux ioctl request numbers encode the subsystem in bits 8..15.
+            // The vCPU owns only its VcpuFd, so allowing KVM-family requests is
+            // sufficient for KVM_RUN and the KVM_GET/SET state used by pause,
+            // snapshot, and restore, while rejecting arbitrary host ioctls.
+            (ThreadKind::Vcpu, "ioctl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(0xff00),
+                0xae00,
+            )
+            .map_err(|e| format!("ioctl condition: {e}"))?],
+            // Rust may OR CLOEXEC/NONBLOCK into the socket type, so mask only
+            // the low socket-type nibble and separately require AF_UNIX and
+            // protocol 0. This prevents the guest-facing pump from creating
+            // Internet sockets even if it is compromised.
+            (ThreadKind::Vsock, "socket") => vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(|e| format!("socket domain condition: {e}"))?,
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(0xf),
+                    libc::SOCK_STREAM as u64,
+                )
+                .map_err(|e| format!("socket type condition: {e}"))?,
+                SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0)
+                    .map_err(|e| format!("socket protocol condition: {e}"))?,
+            ],
+            _ => return Ok(Vec::new()),
+        };
+        Ok(vec![
+            SeccompRule::new(conditions).map_err(|e| format!("seccomp rule: {e}"))?
+        ])
     }
 
     fn syscall_nr(&self, name: &str) -> Result<i64, String> {
@@ -258,6 +309,41 @@ mod tests {
     }
 
     #[test]
+    fn vsock_profile_is_the_only_device_profile_with_socket_creation() {
+        let device = SeccompProfile::device();
+        let vsock = SeccompProfile::vsock();
+        assert_eq!(vsock.kind, ThreadKind::Vsock);
+        assert!(!device.allow.contains(&"socket".to_string()));
+        assert!(!device.allow.contains(&"connect".to_string()));
+        assert!(!device.allow.contains(&"ioctl".to_string()));
+        assert!(vsock.allow.contains(&"socket".to_string()));
+        assert!(vsock.allow.contains(&"connect".to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sensitive_syscalls_compile_to_argument_filtered_rules() {
+        assert_eq!(
+            SeccompProfile::vcpu()
+                .rules_for_syscall("ioctl")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SeccompProfile::vsock()
+                .rules_for_syscall("socket")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(SeccompProfile::device()
+            .rules_for_syscall("read")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn thread_kind_eq() {
         assert_eq!(ThreadKind::Vcpu, ThreadKind::Vcpu);
         assert_ne!(ThreadKind::Vcpu, ThreadKind::Device);
@@ -303,7 +389,6 @@ mod tests {
             "recvmsg",
             "sendmsg",
             "eventfd2",
-            "ioctl",
             "futex",
             "close",
             "dup",

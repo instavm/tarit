@@ -20,13 +20,16 @@ use serde::{Deserialize, Serialize};
 pub struct VmmSeccompProfiles {
     pub vcpu: SeccompProfile,
     pub device: SeccompProfile,
+    #[serde(default = "SeccompProfile::vsock")]
+    pub vsock: SeccompProfile,
 }
 
 impl VmmSeccompProfiles {
     /// The minimal, conservative profile set for a microVM VMM.
     ///
     /// vCPU thread: the KVM_RUN path — ioctls, futex, signal return.
-    /// Device thread: epoll, read/write on fds, eventfd, ioctl.
+    /// Device thread: epoll, read/write on pre-opened fds, and eventfd.
+    /// Vsock thread: the device profile plus AF_UNIX stream creation.
     ///
     /// Both threads share a small common set (rt_sigprocmask, sched_yield,
     /// futex, clock_gettime, rt_sigreturn, exit, exit_group). Production
@@ -36,6 +39,7 @@ impl VmmSeccompProfiles {
         Self {
             vcpu: SeccompProfile::vcpu(),
             device: SeccompProfile::device(),
+            vsock: SeccompProfile::vsock(),
         }
     }
 
@@ -44,6 +48,7 @@ impl VmmSeccompProfiles {
         match kind {
             ThreadKind::Vcpu => &self.vcpu,
             ThreadKind::Device => &self.device,
+            ThreadKind::Vsock => &self.vsock,
         }
     }
 }
@@ -142,6 +147,7 @@ mod tests {
         let p = VmmSeccompProfiles::minimal();
         assert_eq!(p.for_thread(ThreadKind::Vcpu).kind, ThreadKind::Vcpu);
         assert_eq!(p.for_thread(ThreadKind::Device).kind, ThreadKind::Device);
+        assert_eq!(p.for_thread(ThreadKind::Vsock).kind, ThreadKind::Vsock);
     }
 
     #[test]
