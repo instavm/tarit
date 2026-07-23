@@ -1775,7 +1775,17 @@ where
     let operation_supervisor = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || op(&operation_supervisor, id))
         .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+        .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+        .map_err(|error| {
+            tracing::warn!(
+                vm = %id,
+                from = current.status.as_str(),
+                to = new_status.as_str(),
+                %error,
+                "VMM lifecycle operation failed"
+            );
+            error
+        })?;
     match vm_set_status(state, id, new_status).await {
         Ok(record) => Ok(record),
         Err(persist_error) => {

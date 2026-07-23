@@ -30,6 +30,12 @@ const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SOCKET_WAIT_INITIAL: Duration = Duration::from_millis(1);
 const SOCKET_WAIT_MAX: Duration = Duration::from_millis(4);
 const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound for VMM ops that copy guest RAM (suspend, snapshot) or fault it
+/// back in (a suspend right after resume). These are silent on the socket for
+/// the whole copy, so they get a generous request deadline instead of the
+/// 5-second per-read stream timeout of a plain client, which a multi-GiB
+/// guest cannot meet.
+const LIFECYCLE_OP_TIMEOUT: Duration = Duration::from_secs(600);
 const NORMAL_CGROUP_CPU_WEIGHT: u64 = 100;
 
 fn graceful_stop_vmm(socket_path: &Path) {
@@ -2618,6 +2624,7 @@ impl VmmSupervisor {
         let socket_path = booted.vm.socket_path.clone();
         let snapshot_path = match tokio::task::spawn_blocking(move || {
             VmmClient::new(&socket_path)
+                .with_request_timeout(LIFECYCLE_OP_TIMEOUT)
                 .snapshot_unreleased(false)
                 .map_err(|error| OrchError::Vmm(format!("snapshot golden: {error}")))
         })
@@ -3126,6 +3133,14 @@ impl VmmSupervisor {
         Ok(client)
     }
 
+    /// Client for lifecycle transitions and snapshots, whose RAM-sized work
+    /// keeps the socket silent far past the plain client's 5s read timeout.
+    fn lifecycle_client_for(&self, id: Uuid) -> Result<VmmClient, OrchError> {
+        Ok(self
+            .client_for(id)?
+            .with_request_timeout(LIFECYCLE_OP_TIMEOUT))
+    }
+
     /// Return the operation gate owned by this exact live runtime. Gates are
     /// not kept in a separate UUID map: removing the `RunningVm` drops the
     /// supervisor's reference, so churn cannot grow an unbounded registry.
@@ -3223,19 +3238,19 @@ impl VmmSupervisor {
     }
 
     pub fn pause_vm(&self, id: Uuid) -> Result<(), OrchError> {
-        let client = self.client_for(id)?;
+        let client = self.lifecycle_client_for(id)?;
         client.pause().map_err(|e| OrchError::Vmm(e.to_string()))
     }
 
     pub fn suspend_vm(&self, id: Uuid) -> Result<(), OrchError> {
-        let client = self.client_for(id)?;
+        let client = self.lifecycle_client_for(id)?;
         client
             .suspend()
             .map_err(|error| OrchError::Vmm(error.to_string()))
     }
 
     pub fn resume_vm(&self, id: Uuid) -> Result<(), OrchError> {
-        let client = self.client_for(id)?;
+        let client = self.lifecycle_client_for(id)?;
         let _admission = self.admission.enter()?;
         let state_before = client
             .status()
@@ -3385,7 +3400,7 @@ impl VmmSupervisor {
         resume_after: bool,
         has_overlay: bool,
     ) -> Result<SnapshotBundle, OrchError> {
-        let client = self.client_for(id)?;
+        let client = self.lifecycle_client_for(id)?;
         if resume_after {
             // Pause is synchronous: it returns only after every vCPU has left
             // KVM_RUN and completed its current MMIO handler. The pause window
