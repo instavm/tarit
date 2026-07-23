@@ -363,6 +363,14 @@ impl IntoResponse for ApiError {
             OrchError::Vmm(_) => "VM operation failed".into(),
             _ => err.to_string(),
         };
+        // The response body hides internal detail; keep the full cause
+        // observable server-side or failures become undiagnosable.
+        if matches!(
+            &err,
+            OrchError::Unavailable(_) | OrchError::Internal(_) | OrchError::Vmm(_)
+        ) {
+            tracing::error!(error = %err, "request failed");
+        }
         let status =
             StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response = (status, Json(ErrorBody { error })).into_response();
