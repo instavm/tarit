@@ -141,7 +141,36 @@ impl Serial {
         let _ = self.inner.lock().unwrap().write(offset, val);
     }
 
+    /// Enqueue `bytes` + `'\n'` into the emulated UART RX FIFO, waiting for
+    /// the guest to drain it as needed — the FIFO holds only 64 bytes, so a
+    /// longer command silently truncates without this. Returns `false` if the
+    /// guest did not consume everything before `deadline` (vCPU stalled, IRQs
+    /// not being serviced); the input line may then be partially delivered.
+    pub fn send_within(&self, bytes: &[u8], deadline: std::time::Instant) -> bool {
+        let mut pending = Vec::with_capacity(bytes.len() + 1);
+        pending.extend_from_slice(bytes);
+        pending.push(b'\n');
+        let mut off = 0;
+        loop {
+            {
+                let mut serial = self.inner.lock().unwrap();
+                if let Ok(n) = serial.enqueue_raw_bytes(&pending[off..]) {
+                    off += n;
+                }
+            }
+            if off == pending.len() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     pub fn send(&self, bytes: &[u8]) {
+        // Best-effort single-shot enqueue; prefer `send_within` for payloads
+        // that may exceed the 64-byte UART FIFO.
         let mut serial = self.inner.lock().unwrap();
         let _ = serial.enqueue_raw_bytes(bytes);
         let _ = serial.enqueue_raw_bytes(b"\n");
@@ -224,6 +253,47 @@ mod tests {
         let state = serial.save();
 
         serial.restore(state);
+    }
+
+    #[test]
+    fn send_within_delivers_past_the_64_byte_fifo() {
+        // The UART RX FIFO holds 64 bytes; a payload longer than that needs
+        // the guest to drain in between. Simulate the guest reading the data
+        // register from another thread.
+        let serial = std::sync::Arc::new(Serial::new(test_eventfd()));
+        let payload = vec![b'a'; 200];
+        let reader = {
+            let serial = std::sync::Arc::clone(&serial);
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while got.last() != Some(&b'\n') {
+                    // LSR bit 0 = data ready.
+                    if serial.read(5) & 1 != 0 {
+                        got.push(serial.read(0));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                got
+            })
+        };
+        let ok = serial.send_within(
+            &payload,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert!(ok, "send_within should complete while the guest drains");
+        let mut expected = payload.clone();
+        expected.push(b'\n');
+        assert_eq!(reader.join().unwrap(), expected);
+    }
+
+    #[test]
+    fn send_within_reports_a_stalled_guest() {
+        let serial = Serial::new(test_eventfd());
+        let payload = vec![b'a'; 200];
+        // Nothing drains the FIFO: only the first 64 bytes fit.
+        let ok = serial.send_within(&payload, std::time::Instant::now());
+        assert!(!ok, "no reader → delivery must report failure");
     }
 
     #[test]

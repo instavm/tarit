@@ -1251,6 +1251,7 @@ impl VmmController {
                         log::warn!("vsock exec not delivered ({e}); falling back to serial");
                     }
                     Some(Err(e @ crate::vsock_exec::VsockExecError::Ambiguous(_))) => {
+                        log::warn!("vsock exec '{command}' failed: {e}");
                         return Err(VmmError::Device(format!("vsock exec failed: {e}")));
                     }
                     None => {} // no guest connection / disabled → serial
@@ -1276,9 +1277,35 @@ impl VmmController {
             // response.
             let _ = serial.drain_output();
 
-            // Real exec: send command to the running VM's serial port.
-            let cmd = format!("VMM_EXEC:{command}");
-            serial.send(cmd.as_bytes());
+            // Tag the exec with a nonce echoed by the guest shell before the
+            // command runs. A previously timed-out exec keeps running in the
+            // guest and emits VMM_EXEC_START/VMM_EXEC_EXIT= markers later;
+            // without the nonce those stale markers get attributed to this
+            // exec (bogus instant completions with the wrong exit code) and
+            // this exec's own markers to the next one, cascading. The leading
+            // '\n' terminates any partially delivered stale line; the agent
+            // ignores empty lines.
+            static EXEC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = format!(
+                "VMM_EXEC_NONCE={}_{:x}",
+                std::process::id(),
+                EXEC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            // Run the user command in its own `sh -c` so the nonce echo cannot
+            // be swallowed by a parse error in the command itself; exit code
+            // and output semantics are unchanged.
+            let quoted = command.replace('\'', "'\\''");
+            let cmd = format!("\nVMM_EXEC:echo {nonce}; sh -c '{quoted}'");
+
+            // The emulated UART RX FIFO holds 64 bytes; a one-shot enqueue
+            // silently truncates longer commands (the un-terminated fragment
+            // then splices with the next exec's bytes). Feed the FIFO as the
+            // guest drains it, bounded by the exec deadline.
+            if !serial.send_within(cmd.as_bytes(), start + timeout) {
+                let err = "exec: guest did not accept the command (serial input stalled)";
+                log::warn!("{err}");
+                return Err(VmmError::Kvm(err.into()));
+            }
 
             // Wait for VMM_EXEC_START, then capture until VMM_EXEC_EXIT=.
             //
@@ -1291,7 +1318,9 @@ impl VmmController {
             let mut acc: Vec<u8> = Vec::new();
             let mut output = Vec::new();
             let mut truncated = false;
-            let mut started = false;
+            // Only lines after our nonce belong to this exec; anything before
+            // it (including EXIT markers) is leftovers from an earlier exec.
+            let mut confirmed = false;
 
             while start.elapsed() < timeout {
                 // Poll the serial output buffer frequently while an exec is in
@@ -1312,30 +1341,41 @@ impl VmmController {
                     }
                     let line_str = String::from_utf8_lossy(&line);
                     if line_str == "VMM_EXEC_START" {
-                        started = true;
+                        continue;
+                    }
+                    if line_str == nonce {
+                        confirmed = true;
                         continue;
                     }
                     if let Some(code) = line_str.strip_prefix("VMM_EXEC_EXIT=") {
+                        if !confirmed {
+                            log::warn!(
+                                "exec: ignoring stale completion (exit={}) from an earlier timed-out exec",
+                                code.trim()
+                            );
+                            continue;
+                        }
                         let exit_code: i32 = code.trim().parse().unwrap_or(0);
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let output_str = finish_exec_output(output, truncated);
                         log::info!("exec: '{command}' → exit={exit_code} {duration_ms}ms");
                         return Ok((exit_code, output_str, duration_ms));
                     }
-                    if started {
+                    if confirmed {
                         append_exec_output(&mut output, &line, &mut truncated);
                         append_exec_output(&mut output, b"\n", &mut truncated);
                     }
                 }
-                trim_exec_accumulator(&mut acc, started, &mut output, &mut truncated);
+                trim_exec_accumulator(&mut acc, confirmed, &mut output, &mut truncated);
             }
 
             let duration_ms = start.elapsed().as_millis() as u64;
             let output_str = finish_exec_output(output, truncated);
-            if started {
+            if confirmed {
                 log::warn!("exec: timed out after {duration_ms}ms");
                 return Ok((-1, output_str, duration_ms));
             }
+            log::warn!("exec: '{command}' got no response from guest agent after {duration_ms}ms");
             return Err(VmmError::Kvm(format!(
                 "exec timed out after {timeout:?} — no response from guest agent"
             )));
