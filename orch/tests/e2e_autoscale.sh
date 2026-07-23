@@ -22,7 +22,7 @@ PROVIDER_CMD="printf '%s\n' \"\$1\" >> $DECISIONS"
 : > "$DECISIONS"
 
 for p in $(pgrep -f 'target/release/taritd' 2>/dev/null); do kill "$p" 2>/dev/null; done; sleep 2
-( export TARIT_API_KEY=askey TARIT_PEER_SECRET=as-peer-secret-long-enough-000 \
+( export TARIT_API_KEY=askey TARIT_PEER_SECRET=autoscale-peer-secret-long-enough-000 \
     TARIT_DATABASE_URL="$TARIT_DATABASE_URL" TARIT_RDS_CA_FILE="$CA" \
     TARIT_LISTEN=127.0.0.1:19050 TARIT_RPC_ADDR=http://127.0.0.1:19050 TARIT_HOST_ID=$RID-n1 \
     TARIT_ALLOW_INSECURE_PEER_HTTP=1 \

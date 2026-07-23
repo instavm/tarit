@@ -139,6 +139,12 @@ other_node_index() {
   done
 }
 
+# Public API responses hide placement; ask the authoritative fleet store.
+fleet_owner_of() {
+  local vm_id="$1"
+  psql "$DATABASE_URL" -qAtc "select host_id from fleet_vms where id = '$vm_id'"
+}
+
 wait_for_http() {
   local idx="$1" deadline=$((SECONDS + 45))
   while (( SECONDS < deadline )); do
@@ -341,7 +347,7 @@ case_infra_auth() {
 }
 
 case_lifecycle_state_machine() {
-  local vm_id full_snap diff_snap
+  local vm_id full_snap
   create_vm 0 '{"memory_mib":256,"vcpus":1}'
   vm_id="$CREATED_ID"
   wait_running_ready 0 "$vm_id"
@@ -367,18 +373,16 @@ case_lifecycle_state_machine() {
   full_snap="$(json_get "$LAST_BODY" 'data["path"]')"
   echo "$full_snap" >"$RUN_DIR/full_snapshot_path"
   echo "$(json_get "$LAST_BODY" 'data["host_id"]')" >"$RUN_DIR/full_snapshot_host"
+  # Diff snapshots are fail-closed until durable parent-chain relocation ships.
   api 0 POST "/v1/vms/$vm_id/snapshot" '{"diff":true}' 60
-  expect_code 200
-  json_assert "$LAST_BODY" 'bool(data.get("path"))'
-  diff_snap="$(json_get "$LAST_BODY" 'data["path"]')"
-  [[ -n "$diff_snap" ]]
+  expect_code 422
   api 0 DELETE "/v1/vms/$vm_id" '' 20
   expect_code 204
   api 0 GET "/v1/vms/$vm_id/status" '' 10
   expect_code_in "404 409"
+  # Deleted VMs leave the authoritative fleet view; cluster reads fail closed.
   api 0 GET "/v1/vms/$vm_id" '' 10
-  expect_code 200
-  json_assert "$LAST_BODY" 'data["status"] == "stopped"'
+  expect_code 404
 }
 
 case_restore_from_snapshot() {
@@ -454,9 +458,11 @@ case_invalid_transitions_errors() {
   wait_running_ready 0 "$dup"
   api 1 POST /v1/vms "$(printf '{"id":"%s","memory_mib":256,"vcpus":1}' "$dup")" 20
   expect_code 409
+  # Egress is fail-closed: without orchestrator-provisioned networking the
+  # API refuses rather than reporting a policy it did not apply.
   api 0 PATCH "/v1/egress/vm/$dup" '{"allowlist":["10.0.0.0/8:443/tcp"],"allow_existing":true}' 20
-  expect_code 200
-  json_assert "$LAST_BODY" '"rules_applied" in data'
+  expect_code 400
+  json_assert "$LAST_BODY" '"TARIT_ENABLE_NET" in data.get("error", "")'
   api 0 DELETE "/v1/vms/$dup" '' 20
   expect_code 204
 }
@@ -492,13 +498,14 @@ case_cross_node_routing() {
   wait_running_ready 0 "$filler2"
   create_vm 0 '{"memory_mib":256,"vcpus":1}'
   target="$CREATED_ID"
-  owner="$(json_get "$CREATED_BODY" 'data["host_id"]')"
+  # Public VM records hide host placement; the fleet store is authoritative.
+  owner="$(fleet_owner_of "$target")"
   [[ "$owner" != "${HOST_IDS[0]}" ]] || { echo "target landed on entry node, expected peer" >&2; return 1; }
   owner_idx="$(node_index_for_host "$owner")"
   route_idx="$(other_node_index "$owner")"
   api "$route_idx" GET "/v1/vms/$target"
   expect_code 200
-  json_assert "$LAST_BODY" 'data["id"] == "'"$target"'" and data["host_id"] == "'"$owner"'"'
+  json_assert "$LAST_BODY" 'data["id"] == "'"$target"'"'
   wait_running_ready "$route_idx" "$target"
   exec_expect "$route_idx" "$target" 'echo routed-exec' 'routed-exec'
   api "$route_idx" POST "/v1/vms/$target/pause" '{}'
@@ -510,9 +517,9 @@ case_cross_node_routing() {
   api "$route_idx" POST "/v1/vms/$target/snapshot" '{"diff":false}' 60
   expect_code 200
   json_assert "$LAST_BODY" 'bool(data.get("path")) and data.get("host_id") == "'"$owner"'"'
+  # Remote egress is equally fail-closed when the owner has no provisioned net.
   api "$route_idx" PATCH "/v1/egress/vm/$target" '{"allowlist":["192.168.0.0/16:443/tcp"],"allow_existing":true}' 20
-  expect_code 200
-  json_assert "$LAST_BODY" '"rules_applied" in data'
+  expect_code 400
 
   api "$owner_idx" POST "/v1/vms/$target/snapshot" '{"diff":false}' 60
   expect_code 200
@@ -521,7 +528,8 @@ case_cross_node_routing() {
   expect_code 201
   restored="$(json_get "$LAST_BODY" 'data["id"]')"
   record_vm "$restored"
-  json_assert "$LAST_BODY" 'data["host_id"] == "'"$owner"'" and data["status"] == "running"'
+  json_assert "$LAST_BODY" 'data["status"] == "running"'
+  [[ "$(fleet_owner_of "$restored")" == "$owner" ]] || { echo "restored VM not owned by $owner" >&2; return 1; }
   wait_running_ready "$route_idx" "$restored"
   exec_expect "$route_idx" "$restored" 'echo routed-restore' 'routed-restore'
   api "$route_idx" DELETE "/v1/vms/$restored" '' 20
@@ -539,8 +547,9 @@ case_peer_security() {
   missing="$(uuid)"
   noauth 0 GET "/internal/v1/vms/$missing"
   expect_code 401
+  # Bare shared-secret peer requests are rejected; peers must sign requests.
   peer 0 GET "/internal/v1/vms/$missing"
-  expect_code 404
+  expect_code 401
 }
 
 main() {

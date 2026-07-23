@@ -578,6 +578,12 @@ impl PeerClient {
             if status.as_u16() == 404 {
                 return Err(OrchError::NotFound(format!("peer {what}: {body}")));
             }
+            if status.as_u16() == 400 {
+                return Err(OrchError::BadRequest(format!("peer {what}: {body}")));
+            }
+            if status.as_u16() == 422 {
+                return Err(OrchError::Unprocessable(format!("peer {what}: {body}")));
+            }
             if status.as_u16() == 403 {
                 return Err(OrchError::Forbidden(format!("peer {what}: {body}")));
             }

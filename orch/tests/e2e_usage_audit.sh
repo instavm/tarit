@@ -36,7 +36,7 @@ for p in $(pgrep -f 'target/release/taritd' 2>/dev/null); do kill "$p" 2>/dev/nu
 # clean this key's rows from prior runs
 psql "$TARIT_DATABASE_URL" -qAtc "delete from usage_events where api_key_id='$KEY_ID'; delete from audit_events where api_key_id='$KEY_ID';" >/dev/null 2>&1 || true
 
-TARIT_API_KEY="$KEY" TARIT_PEER_SECRET="usage-peer-secret-long-000" \
+TARIT_API_KEY="$KEY" TARIT_PEER_SECRET="usage-peer-secret-long-enough-000" \
 TARIT_DATABASE_URL="$TARIT_DATABASE_URL" TARIT_RDS_CA_FILE="$CA" \
 TARIT_LISTEN="127.0.0.1:$PORT" TARIT_RPC_ADDR="http://127.0.0.1:$PORT" TARIT_HOST_ID="usage-n1" \
 TARIT_ALLOW_INSECURE_PEER_HTTP=1 \
