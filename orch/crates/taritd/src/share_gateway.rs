@@ -63,6 +63,9 @@ type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
 const MAX_PENDING_BRIDGE_COMMANDS: usize = 256;
 const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
+/// Minimum time the closing direction of a WebSocket bridge gets to finish
+/// its close handshake, independent of how short the idle timeout is.
+const WEBSOCKET_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 struct PendingUpgradeState {
     accepting: bool,
@@ -1590,12 +1593,16 @@ async fn bridge_websocket(
         client_close_rx,
     ));
 
+    // Give the surviving direction a real chance to deliver its Close frame:
+    // with a very short idle timeout, a loaded scheduler can otherwise cancel
+    // the peer mid-handshake and the client observes a bare TCP reset.
+    let close_grace = idle_timeout.max(WEBSOCKET_CLOSE_GRACE);
     tokio::select! {
         _ = &mut client_to_upstream => {
-            let _ = time::timeout(idle_timeout, &mut upstream_to_client).await;
+            let _ = time::timeout(close_grace, &mut upstream_to_client).await;
         }
         _ = &mut upstream_to_client => {
-            let _ = time::timeout(idle_timeout, &mut client_to_upstream).await;
+            let _ = time::timeout(close_grace, &mut client_to_upstream).await;
         }
     }
 }
@@ -1695,6 +1702,10 @@ async fn forward_upstream_to_client(
             }
             changed = client_close_rx.changed() => {
                 if changed.is_err() {
+                    // The client-to-upstream direction is gone (idle timeout or
+                    // client EOF). Complete the close handshake toward the
+                    // client instead of dropping the TCP stream mid-protocol.
+                    let _ = time::timeout(idle_timeout, sink.send(AxumMessage::Close(None))).await;
                     return;
                 }
                 if *client_close_rx.borrow_and_update() {
