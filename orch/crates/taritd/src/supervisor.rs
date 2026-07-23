@@ -2293,6 +2293,13 @@ impl VmmSupervisor {
         {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &base_vm, error));
         }
+        // Same readiness boundary as boot_vm: restore-based refills must run at
+        // refill CPU weight or warm replenishment competes with leased VMs.
+        if ticket.purpose == SpawnPurpose::Refill {
+            if let Err(error) = self.configure_refill_cgroup(id, base_vm.pid) {
+                return Err(self.cleanup_boot_failure(id, &ticket.control, &base_vm, error));
+            }
+        }
         if !boot_can_publish(&ticket.control, self.is_shutting_down()) {
             return Err(self.cleanup_boot_failure(
                 id,
