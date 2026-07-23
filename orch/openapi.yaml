@@ -18,31 +18,27 @@ components:
   schemas:
     VmRecord:
       type: object
-      description: Stored orchestrator record for a VM.
-      required: [id, host_id, status, memory_mib, vcpus, kernel_path, cmdline, created_at, updated_at]
+      description: Tenant-safe VM record. Host identity, filesystem paths, VMM socket, process id, boot arguments, and ownership metadata are never exposed.
+      required: [id, status, revision, memory_mib, vcpus, created_at, updated_at]
       properties:
         id:
           type: string
           format: uuid
-        host_id:
-          type: string
         status:
           type: string
-          enum: [creating, running, paused, stopped, error]
+          enum: [creating, running, paused, suspended, stopped, error]
+        revision:
+          type: integer
+          format: uint64
+          minimum: 1
+        startup_path:
+          type: string
+          enum: [cold, warm, snapshot_restore]
+          description: Definitive lifecycle branch used to start this VM. Absent only on legacy records.
         memory_mib:
           type: integer
         vcpus:
           type: integer
-        kernel_path:
-          type: string
-        rootfs_path:
-          type: ["string", "null"]
-        cmdline:
-          type: string
-        socket_path:
-          type: ["string", "null"]
-        pid:
-          type: ["integer", "null"]
         created_at:
           type: string
           format: date-time
@@ -195,7 +191,7 @@ components:
           format: uuid
         action:
           type: string
-          enum: [create, delete, pause, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token]
+          enum: [create, delete, pause, suspend, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token]
         outcome:
           type: string
           enum: [attempt, ok, denied, error]
@@ -322,8 +318,7 @@ paths:
   /metrics:
     get:
       summary: Prometheus operational metrics
-      description: Includes taritd_tenant_vms{tenant="..."} active local VM usage by tenant.
-      security: []
+      description: Admin-only Prometheus metrics. Tenant and VM labels are hashed unless explicitly configured otherwise. PTY metrics expose active connections, configured global/tenant/VM limits, and bounded-scope admission rejection counters without tenant or VM identifiers.
       responses:
         "200":
           description: Metrics in Prometheus text exposition format
@@ -331,10 +326,14 @@ paths:
             text/plain; version=0.0.4:
               schema:
                 type: string
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: API key is not an admin key
   /v1/vms:
     get:
       summary: List sandboxes
-      description: User keys only list their tenant's VMs; admin keys list all visible local VM records.
+      description: User keys list their tenant's live or recoverable VMs; admin keys list all such records. Successfully deleted VMs are not returned.
       responses:
         "200":
           description: VM list
@@ -381,7 +380,7 @@ paths:
   /v1/vms/{id}:
     get:
       summary: Get sandbox
-      description: Returns the stored orchestrator VM record if visible to the caller's tenant, or to an admin key.
+      description: Returns a tenant-safe stored VM record. Host ids, paths, boot arguments, VMM sockets, and process ids are intentionally omitted.
       parameters:
         - name: id
           in: path
@@ -402,6 +401,8 @@ paths:
           description: VM belongs to a different tenant
         "404":
           description: VM not found
+        "503":
+          description: Owning host is unhealthy, stale, or unavailable
     delete:
       summary: Stop and remove sandbox
       description: User keys can delete only their tenant's VMs; admin keys can delete any VM.
@@ -424,7 +425,7 @@ paths:
   /v1/vms/{id}/status:
     get:
       summary: Get live sandbox status
-      description: Queries the owning VMM over its Unix socket for live runtime status; unlike GET /v1/vms/{id}, this is not the stored orchestrator record. User keys can access only their tenant's VMs.
+      description: Queries the owning VMM for a sanitized live runtime status. Host paths and device configuration remain internal. User keys can access only their tenant's VMs.
       parameters:
         - name: id
           in: path
@@ -444,9 +445,6 @@ paths:
                   - uptime_ms
                   - vcpus
                   - mem_mib
-                  - volumes
-                  - nets
-                  - kernel
                   - vcpu_alive
                 properties:
                   state:
@@ -461,14 +459,6 @@ paths:
                   mem_mib:
                     type: integer
                     format: uint64
-                  volumes:
-                    type: integer
-                    minimum: 0
-                  nets:
-                    type: integer
-                    minimum: 0
-                  kernel:
-                    type: string
                   vcpu_alive:
                     type: boolean
         "401":
@@ -479,10 +469,12 @@ paths:
           description: VM not found
         "409":
           description: VM is stopped
+        "503":
+          description: Owning host is unhealthy, stale, or unavailable
   /v1/vms/{id}/pty/sessions:
     post:
       summary: Create PTY session
-      description: Registers an interactive PTY session for the VM. PTY routes operate on the VM's owning node only; on a non-owner node they return 409. Attach to the session over the WebSocket connect route.
+      description: Registers an interactive PTY session for the VM. Tokens are one-time and expire after five minutes. At most 32 pending sessions may exist per VM. PTY routes operate on the VM's owning node only; on a non-owner node they return 409.
       parameters:
         - name: id
           in: path
@@ -536,6 +528,8 @@ paths:
           description: VM not found
         "409":
           description: VM is owned by another node; connect to the owner
+        "429":
+          description: Pending or active PTY capacity is exhausted
     get:
       summary: List PTY sessions
       description: Lists PTY sessions registered for the VM on this node.
@@ -683,7 +677,7 @@ paths:
   /v1/vms/{id}/pty/{pty_id}/connect:
     get:
       summary: Attach to PTY session (WebSocket)
-      description: Upgrades to a WebSocket bridged to the guest PTY. Authenticates with the `token` query parameter carrying the one-time `connect_token` from the create-session response, not the X-API-Key header. Tokens expire after 5 minutes or on first successful connect. Binary messages carry raw PTY bytes; text messages are JSON controls (client-to-server `{"type":"resize","cols":N,"rows":N}`, server-to-client `{"type":"exit","exit_code":N}`). A bad, missing, expired, reused, or unknown token closes the socket with code 4401.
+      description: Upgrades to a WebSocket bridged to the guest PTY. Authenticates with the `token` query parameter carrying the one-time `connect_token` from the create-session response, not the X-API-Key header. Tokens expire after 5 minutes or on first successful connect. Global, authenticated-tenant, and VM active-connection limits are reserved before upgrade; a capacity rejection does not consume a valid token. Binary messages carry raw PTY bytes; text messages are JSON controls (client-to-server `{"type":"resize","cols":N,"rows":N}`, server-to-client `{"type":"exit","exit_code":N}`).
       security: []
       parameters:
         - name: id
@@ -707,6 +701,10 @@ paths:
       responses:
         "101":
           description: Switching protocols to WebSocket
+        "401":
+          description: Connect token is missing, invalid, expired, reused, or unknown
+        "429":
+          description: Global, tenant, or VM active PTY capacity is exhausted; a valid token remains usable for retry
   /v1/vms/{id}/pause:
     post:
       summary: Pause sandbox
@@ -759,6 +757,32 @@ paths:
           description: VM not found
         "409":
           description: VM is stopped
+  /v1/vms/{id}/suspend:
+    post:
+      summary: Suspend sandbox
+      description: Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause operations.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Suspended VM record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRecord"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+        "404":
+          description: VM not found
+        "409":
+          description: VM is not running
   /v1/vms/{id}/snapshot:
     post:
       summary: Snapshot sandbox
@@ -780,7 +804,7 @@ paths:
                 diff:
                   type: boolean
                   default: false
-                  description: Write a diff (dirty pages only) snapshot instead of a full one.
+                  description: Must be false. Incremental orchestrator snapshots are disabled until durable parent-chain relocation is available.
       responses:
         "200":
           description: Snapshot path and host_id
@@ -800,6 +824,8 @@ paths:
           description: VM belongs to a different tenant
         "404":
           description: VM not found
+        "422":
+          description: Incremental snapshots are disabled; retry with `diff=false`.
         "409":
           description: VM is stopped
   /v1/restore:

@@ -807,9 +807,14 @@ mod tests {
             peer_secret: "peer-secret".into(),
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
@@ -831,7 +836,7 @@ mod tests {
         };
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = crate::shares::ShareRepository::new(Arc::clone(&store), None);
-        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, _store_rx) = tokio::sync::mpsc::channel(128);
         AppState {
             config: config.clone(),
             audit_outbox: Arc::new(crate::audit::LocalAuditOutbox::new(Arc::clone(&store))),

@@ -43,7 +43,9 @@ export TARIT_MAX_VMS=4
 "$TARIT" serve >/tmp/taritd-life1.log 2>&1 & IP=$!
 sleep 4
 VM=$("$TARIT" --json vm create --vcpus 1 --memory-mib 512)
-CHILD=$(echo "$VM" | py pid); SOCK=$(echo "$VM" | py socket_path)
+VM_ID=$(echo "$VM" | py id)
+SOCK="$TARIT_SOCKET_DIR/$VM_ID.sock"
+CHILD=$(pgrep -f -- "vmm serve --socket $SOCK" | head -n 1 || true)
 echo "  child vmm serve pid=$CHILD socket=$SOCK"
 sleep 3
 echo "  sending SIGTERM to taritd ($IP)"

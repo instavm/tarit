@@ -595,7 +595,7 @@ impl KvmVm {
                             // system reset. The kernel does this on panic with
                             // reboot=k. Stop immediately instead of waiting for
                             // the watchdog timeout.
-                            if port == 0x64 && data.iter().any(|&b| b == 0xfe) {
+                            if port == 0x64 && data.contains(&0xfe) {
                                 log::info!("i8042 reset (port 0x64, 0xFE) — guest rebooting");
                                 cancel_timer();
                                 return Ok(());

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStatus};
+use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStartupPath, VmStatus};
 use uuid::Uuid;
 
 use crate::api::{
@@ -25,6 +25,9 @@ use crate::supervisor::{
     VmmSupervisor, WarmClaimOutcome,
 };
 
+const LIVE_CONTROL_STATUSES: &[VmStatus] =
+    &[VmStatus::Running, VmStatus::Paused, VmStatus::Suspended];
+
 fn vm_get(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
     state
         .vm_cache
@@ -34,21 +37,210 @@ fn vm_get(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
         .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found")))
 }
 
-fn vm_set_status(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecord, OrchError> {
+async fn vm_set_status(
+    state: &AppState,
+    id: Uuid,
+    status: VmStatus,
+) -> Result<VmRecord, OrchError> {
     let rec = {
-        let mut c = state
+        let c = state
             .vm_cache
-            .write()
+            .read()
             .map_err(|_| OrchError::Internal("vm cache".into()))?;
-        let r = c
-            .get_mut(&id)
+        let mut r = c
+            .get(&id)
+            .cloned()
             .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found")))?;
         r.status = status;
+        r.revision = r
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| OrchError::Internal(format!("VM {id} revision exhausted")))?;
         r.updated_at = Utc::now();
-        r.clone()
+        r
     };
-    let _ = state.store_tx.send(StoreWrite::Vm(rec.clone()));
+    // Match boot publication ordering: global ownership first, then durable
+    // local state, and only then the read cache. A retry at the same revision
+    // is idempotent in both stores; stale queued records cannot overwrite it.
+    claim_lifecycle_ownership(state, &rec).await?;
+    #[cfg(test)]
+    if take_lifecycle_fault(state, LifecycleFault::SQLite) {
+        return Err(OrchError::Internal("injected SQLite failure".into()));
+    }
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .insert_vm(&rec)
+        .map_err(crate::api::store_err)?;
+    commit_vm_record(state, rec.clone())?;
+    refresh_running_lifecycle(state, &rec)?;
     Ok(rec)
+}
+
+/// Keep the `Running` lifecycle record aligned with the newest committed
+/// revision so terminal transitions never derive from a stale record. Other
+/// lifecycle phases own their records and are left untouched.
+fn refresh_running_lifecycle(state: &AppState, record: &VmRecord) -> Result<(), OrchError> {
+    let mut lifecycle = state
+        .lifecycle
+        .lock()
+        .map_err(|_| OrchError::Internal("lifecycle state lock poisoned".into()))?;
+    if let Some(current @ LifecycleState::Running { .. }) = lifecycle.get_mut(&record.id) {
+        *current = LifecycleState::Running {
+            record: record.clone(),
+        };
+    }
+    Ok(())
+}
+
+/// Fence a failed live transition with a newer record for the state restored in
+/// the VMM. Revision N+2 supersedes both the prior N record and any partially
+/// published target at N+1, so a later retry cannot be rejected by fleet
+/// fencing after the VMM rollback succeeded.
+async fn compensate_vm_status(
+    state: &AppState,
+    prior: &VmRecord,
+    observed_status: VmStatus,
+) -> Result<VmRecord, OrchError> {
+    let mut compensation = prior.clone();
+    compensation.status = observed_status;
+    compensation.revision = prior
+        .revision
+        .checked_add(2)
+        .ok_or_else(|| OrchError::Internal(format!("VM {} revision exhausted", prior.id)))?;
+    compensation.updated_at = Utc::now();
+    claim_lifecycle_ownership(state, &compensation).await?;
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .insert_vm(&compensation)
+        .map_err(crate::api::store_err)?;
+    commit_vm_record(state, compensation.clone())?;
+    refresh_running_lifecycle(state, &compensation)?;
+    Ok(compensation)
+}
+
+fn control_status(status: tarit_vmm_client::VmState) -> Result<VmStatus, OrchError> {
+    match status {
+        tarit_vmm_client::VmState::Running => Ok(VmStatus::Running),
+        tarit_vmm_client::VmState::Paused => Ok(VmStatus::Paused),
+        tarit_vmm_client::VmState::Suspended => Ok(VmStatus::Suspended),
+        tarit_vmm_client::VmState::Created | tarit_vmm_client::VmState::Stopped => {
+            Err(OrchError::Internal(format!(
+                "VMM reported non-live state {status:?} during lifecycle reconciliation"
+            )))
+        }
+    }
+}
+
+async fn observe_and_compensate_vm_status(
+    state: &AppState,
+    prior: &VmRecord,
+) -> Result<VmRecord, OrchError> {
+    let supervisor = Arc::clone(&state.supervisor);
+    let id = prior.id;
+    let observed = tokio::task::spawn_blocking(move || supervisor.status_vm(id))
+        .await
+        .map_err(|error| OrchError::Internal(format!("status reconciliation join: {error}")))??;
+    compensate_vm_status(state, prior, control_status(observed.state)?).await
+}
+
+async fn reconcile_snapshot_pause_failure(
+    state: &AppState,
+    prior: &VmRecord,
+    primary: OrchError,
+) -> OrchError {
+    if prior.status != VmStatus::Running {
+        return primary;
+    }
+    let supervisor = Arc::clone(&state.supervisor);
+    let id = prior.id;
+    let observed = tokio::task::spawn_blocking(move || supervisor.status_vm(id)).await;
+    let observed = match observed {
+        Ok(Ok(status)) => match control_status(status.state) {
+            Ok(status) => status,
+            Err(error) => {
+                return retain_snapshot_reconciliation(
+                    state,
+                    prior,
+                    primary,
+                    format!("snapshot pause reconciliation rejected VMM state: {error}"),
+                );
+            }
+        },
+        Ok(Err(error)) => {
+            return retain_snapshot_reconciliation(
+                state,
+                prior,
+                primary,
+                format!("VMM state could not be observed: {error}"),
+            );
+        }
+        Err(error) => {
+            return retain_snapshot_reconciliation(
+                state,
+                prior,
+                primary,
+                format!("VMM status task failed: {error}"),
+            );
+        }
+    };
+    if observed == VmStatus::Running {
+        return primary;
+    }
+    match compensate_vm_status(state, prior, observed).await {
+        Ok(record) => {
+            if let Err(error) = set_lifecycle_state(
+                state,
+                prior.id,
+                LifecycleState::Running {
+                    record: record.clone(),
+                },
+            ) {
+                return OrchError::Internal(format!(
+                    "{primary}; VM was fenced {} at revision {} but stable lifecycle publication failed: {error}",
+                    observed.as_str(),
+                    record.revision
+                ));
+            }
+            OrchError::Internal(format!(
+                "{primary}; VM was fenced {} after snapshot compensation",
+                observed.as_str()
+            ))
+        }
+        Err(compensation) => retain_snapshot_reconciliation(
+            state,
+            prior,
+            primary,
+            format!(
+                "observed VM state {} but durable fencing failed: {compensation}",
+                observed.as_str()
+            ),
+        ),
+    }
+}
+
+fn retain_snapshot_reconciliation(
+    state: &AppState,
+    prior: &VmRecord,
+    primary: OrchError,
+    detail: String,
+) -> OrchError {
+    let retained = set_lifecycle_state(
+        state,
+        prior.id,
+        LifecycleState::Reconciling {
+            record: prior.clone(),
+        },
+    )
+    .err()
+    .map(|error| format!("; retaining reconciliation failed: {error}"))
+    .unwrap_or_default();
+    OrchError::Internal(format!(
+        "{primary}; {detail}; VMM state remains unknown and retryable{retained}"
+    ))
 }
 
 fn commit_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
@@ -56,11 +248,17 @@ fn commit_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError>
     if take_lifecycle_fault(state, LifecycleFault::CacheCommit) {
         return Err(OrchError::Internal("injected cache commit failure".into()));
     }
-    state
+    let mut cache = state
         .vm_cache
         .write()
-        .map_err(|_| OrchError::Internal("vm cache".into()))?
-        .insert(record.id, record);
+        .map_err(|_| OrchError::Internal("vm cache".into()))?;
+    if cache
+        .get(&record.id)
+        .is_some_and(|current| current.revision > record.revision)
+    {
+        return Ok(());
+    }
+    cache.insert(record.id, record);
     Ok(())
 }
 
@@ -72,23 +270,33 @@ async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<()
         return Err(OrchError::Internal("injected SQLite failure".into()));
     }
     let (completion, persisted) = tokio::sync::oneshot::channel();
+    let fallback = record.clone();
+    let direct_insert = |record: &VmRecord| {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .insert_vm(record)
+            .map_err(crate::api::store_err)
+    };
     match state
         .store_tx
         .send(StoreWrite::VmDurable(record, completion))
+        .await
     {
-        Ok(()) => persisted.await.map_err(|_| {
-            OrchError::Internal("store writer dropped shutdown persistence confirmation".into())
-        })?,
+        // The writer can accept the send and still exit on the shutdown signal
+        // before draining it. A dropped confirmation therefore falls back to
+        // the direct durable write, which is idempotent if the writer already
+        // committed the record.
+        Ok(()) => match persisted.await {
+            Ok(result) => result,
+            Err(_) => direct_insert(&fallback),
+        },
         Err(error) => {
             let StoreWrite::VmDurable(record, _) = error.0 else {
                 unreachable!("only durable VM writes are sent here");
             };
-            state
-                .store
-                .lock()
-                .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-                .insert_vm(&record)
-                .map_err(crate::api::store_err)
+            direct_insert(&record)
         }
     }
 }
@@ -102,6 +310,7 @@ async fn persist_running_record(state: &AppState, record: VmRecord) -> Result<()
     state
         .store_tx
         .send(StoreWrite::VmDurable(record, completion))
+        .await
         .map_err(|_| {
             OrchError::Internal("store writer unavailable during boot publication".into())
         })?;
@@ -200,11 +409,23 @@ fn set_lifecycle_state(
 }
 
 fn terminal_record(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecord, OrchError> {
-    let mut record = lifecycle_state(state, id)?
-        .map(|lifecycle| lifecycle.record().clone())
-        .or_else(|| state.vm_cache.read().ok()?.get(&id).cloned())
-        .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found")))?;
+    // Base the terminal write on the newest committed record. The lifecycle
+    // record can trail the cache when live transitions or partially failed
+    // creations advanced the durable revision, and reusing that stale revision
+    // would collide with the already-committed record in SQLite.
+    let lifecycle = lifecycle_state(state, id)?.map(|lifecycle| lifecycle.record().clone());
+    let cached = state.vm_cache.read().ok().and_then(|c| c.get(&id).cloned());
+    let mut record = match (lifecycle, cached) {
+        (Some(lifecycle), Some(cached)) if cached.revision > lifecycle.revision => cached,
+        (Some(lifecycle), _) => lifecycle,
+        (None, Some(cached)) => cached,
+        (None, None) => return Err(OrchError::NotFound(format!("vm {id} not found"))),
+    };
     record.status = status;
+    record.revision = record
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| OrchError::Internal(format!("VM {id} revision exhausted")))?;
     record.updated_at = Utc::now();
     Ok(record)
 }
@@ -296,8 +517,19 @@ async fn register_warm_creating_record(
     }
 }
 
-async fn update_creating_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+async fn update_creating_record(state: &AppState, mut record: VmRecord) -> Result<(), OrchError> {
     let id = record.id;
+    if let Some(current) = state
+        .vm_cache
+        .read()
+        .map_err(|_| OrchError::Internal("vm cache".into()))?
+        .get(&id)
+    {
+        record.revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| OrchError::Internal(format!("VM {id} revision exhausted")))?;
+    }
     commit_vm_record(state, record.clone())?;
     persist_running_record(state, record.clone()).await?;
     claim_lifecycle_ownership(state, &record).await?;
@@ -313,9 +545,19 @@ async fn update_creating_record(state: &AppState, record: VmRecord) -> Result<()
 
 async fn publish_running_record(
     state: &AppState,
-    record: VmRecord,
+    mut record: VmRecord,
 ) -> Result<(), PublicationFailure> {
     let id = record.id;
+    if let Some(current) = state
+        .vm_cache
+        .read()
+        .map_err(|_| PublicationFailure(OrchError::Internal("vm cache".into())))?
+        .get(&id)
+    {
+        record.revision = current.revision.checked_add(1).ok_or_else(|| {
+            PublicationFailure(OrchError::Internal(format!("VM {id} revision exhausted")))
+        })?;
+    }
     set_lifecycle_state(
         state,
         id,
@@ -539,6 +781,41 @@ async fn retry_pending_lifecycle(state: &AppState) -> Vec<String> {
         let result = match lifecycle {
             LifecycleState::Publishing { .. } => finish_publication(state, id).await,
             LifecycleState::Terminal { .. } => finish_terminal_transition(state, id).await,
+            LifecycleState::Reconciling { .. } => {
+                let gate = match state.supervisor.operation_gate(id) {
+                    Ok(gate) => gate,
+                    Err(OrchError::NotFound(_))
+                        if !matches!(
+                            lifecycle_state(state, id),
+                            Ok(Some(LifecycleState::Reconciling { .. }))
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "VM {id} retained lifecycle state for retry: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                let _operation = gate.lock_owned().await;
+                let record = match lifecycle_state(state, id) {
+                    Ok(Some(LifecycleState::Reconciling { record })) => record,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        failures.push(format!(
+                            "VM {id} retained lifecycle state for retry: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                observe_and_compensate_vm_status(state, &record)
+                    .await
+                    .and_then(|record| {
+                        set_lifecycle_state(state, id, LifecycleState::Running { record })
+                    })
+            }
             LifecycleState::Creating { .. }
             | LifecycleState::Running { .. }
             | LifecycleState::Abandoned { .. } => continue,
@@ -566,6 +843,8 @@ fn creating_record(
         owner_key,
         api_key_id,
         status: VmStatus::Creating,
+        revision: 1,
+        startup_path: None,
         memory_mib: spawn_cfg.memory_mib,
         vcpus: spawn_cfg.vcpus,
         kernel_path: spawn_cfg.kernel_path.display().to_string(),
@@ -734,7 +1013,7 @@ async fn create_local_owned(
                 task,
                 move |warm_id| {
                     let registration_state = registration_state.clone();
-                    let record = creating_record(
+                    let mut record = creating_record(
                         &registration_state,
                         &registration_cfg,
                         warm_id,
@@ -742,6 +1021,7 @@ async fn create_local_owned(
                         registration_api_key,
                         now,
                     );
+                    record.startup_path = Some(VmStartupPath::Warm);
                     async move {
                         *registration_lifecycle_id.lock().map_err(|_| {
                             OrchError::Internal("warm lifecycle id lock poisoned".into())
@@ -750,7 +1030,7 @@ async fn create_local_owned(
                     }
                 },
                 move |id, pid, socket_path| {
-                    let record = running_record(
+                    let mut record = running_record(
                         &publication_state,
                         &publication_cfg,
                         id,
@@ -760,6 +1040,7 @@ async fn create_local_owned(
                         api_key_id,
                         now,
                     );
+                    record.startup_path = Some(VmStartupPath::Warm);
                     async move {
                         publish_running_record(&publication_state, record.clone()).await?;
                         Ok(record)
@@ -805,7 +1086,7 @@ async fn create_local_owned(
         }
     }
 
-    let initial_record = creating_record(
+    let mut initial_record = creating_record(
         state,
         &unverified_cfg,
         id,
@@ -813,6 +1094,7 @@ async fn create_local_owned(
         req.api_key_id.clone(),
         now,
     );
+    initial_record.startup_path = Some(VmStartupPath::Cold);
     let creating_state = state.clone();
     let registration_record = initial_record.clone();
     let ticket =
@@ -821,6 +1103,7 @@ async fn create_local_owned(
             .begin_boot_with_registration(
                 id,
                 crate::supervisor::SpawnPurpose::Live,
+                unverified_cfg.resource_shape(),
                 move || async move {
                     register_creating_record(&creating_state, registration_record).await
                 },
@@ -853,7 +1136,7 @@ async fn create_local_owned(
         }
     };
     let spawn_cfg = VmSpawnConfig::from_defaults(&state.config, &req);
-    let record = creating_record(
+    let mut record = creating_record(
         state,
         &spawn_cfg,
         id,
@@ -861,6 +1144,7 @@ async fn create_local_owned(
         req.api_key_id.clone(),
         now,
     );
+    record.startup_path = Some(VmStartupPath::Cold);
     if let Err(error) = update_creating_record(state, record.clone()).await {
         state.supervisor.abort_unstarted_boot(&ticket).await;
         fail_create_or_restore(state, id, error).await?;
@@ -910,6 +1194,7 @@ async fn create_local_owned(
         .publish_running_with(booted, move |pid, socket_path| {
             let mut record = publication_record;
             record.status = VmStatus::Running;
+            record.startup_path = Some(VmStartupPath::Cold);
             record.pid = Some(pid);
             record.socket_path = Some(socket_path.display().to_string());
             record.updated_at = Utc::now();
@@ -978,6 +1263,45 @@ async fn restore_local_owned(
     caller_is_admin: bool,
     task: &OwnedTaskControl,
 ) -> Result<VmRecord, OrchError> {
+    let snapshot =
+        verify_snapshot_access(state, snapshot_path, owner_key.as_deref(), caller_is_admin)?;
+    let memory_mib = snapshot.memory_mib.ok_or_else(|| {
+        OrchError::BadRequest("snapshot is missing resource metadata; create a new snapshot".into())
+    })?;
+    let vcpus = snapshot.vcpus.ok_or_else(|| {
+        OrchError::BadRequest("snapshot is missing resource metadata; create a new snapshot".into())
+    })?;
+    let kernel_path = snapshot.kernel_path.ok_or_else(|| {
+        OrchError::BadRequest("snapshot is missing boot metadata; create a new snapshot".into())
+    })?;
+    let cmdline = snapshot.cmdline.ok_or_else(|| {
+        OrchError::BadRequest("snapshot is missing boot metadata; create a new snapshot".into())
+    })?;
+    let snapshot_overlay_path = match (
+        snapshot.rootfs_path.as_ref(),
+        snapshot.overlay_path.as_ref(),
+    ) {
+        (Some(_), Some(path)) => Some(path.clone()),
+        (Some(_), None) => {
+            return Err(OrchError::BadRequest(
+                "snapshot is missing its disk artifact; create a new snapshot".into(),
+            ));
+        }
+        (None, None) => None,
+        (None, Some(_)) => {
+            return Err(OrchError::BadRequest(
+                "rootfs-less snapshot has unexpected disk metadata".into(),
+            ));
+        }
+    };
+    let restore_config = VmSpawnConfig {
+        memory_mib,
+        vcpus,
+        kernel_path: kernel_path.clone().into(),
+        rootfs_path: snapshot.rootfs_path.clone().map(Into::into),
+        cmdline: cmdline.clone(),
+        read_only: true,
+    };
     let now = Utc::now();
     let record = VmRecord {
         id,
@@ -985,11 +1309,13 @@ async fn restore_local_owned(
         owner_key: owner_key.clone(),
         api_key_id: api_key_id.clone(),
         status: VmStatus::Creating,
-        memory_mib: 0,
-        vcpus: 0,
-        kernel_path: "(restored)".into(),
-        rootfs_path: None,
-        cmdline: "(restored)".into(),
+        revision: 1,
+        startup_path: Some(VmStartupPath::SnapshotRestore),
+        memory_mib,
+        vcpus,
+        kernel_path,
+        rootfs_path: snapshot.rootfs_path,
+        cmdline,
         socket_path: None,
         pid: None,
         created_at: now,
@@ -1002,6 +1328,7 @@ async fn restore_local_owned(
         .begin_boot_with_registration(
             id,
             crate::supervisor::SpawnPurpose::Live,
+            restore_config.resource_shape(),
             move || async move { register_creating_record(&creating_state, creating_record).await },
         )
         .await;
@@ -1016,25 +1343,19 @@ async fn restore_local_owned(
         return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
             .await;
     }
-    // Authorize after registration so a concurrent DELETE can route to this
-    // owner and cancel the exact Creating lifecycle before restore touches VMM
-    // state or the snapshot.
-    if let Err(error) =
-        verify_snapshot_access(state, snapshot_path, owner_key.as_deref(), caller_is_admin)
-    {
-        state.supervisor.abort_unstarted_boot(&ticket).await;
-        fail_create_or_restore(state, id, error).await?;
-        unreachable!("failed lifecycle helper always returns an error")
-    }
     if task.is_cancelled() {
         return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
             .await;
     }
     let path = snapshot_path.to_string();
     let sup = Arc::clone(&state.supervisor);
+    let restore_shape = restore_config.resource_shape();
     let publication_state = state.clone();
     let publication_record = record.clone();
-    let booted = tokio::task::spawn_blocking(move || sup.restore_vm(ticket, path)).await;
+    let booted = tokio::task::spawn_blocking(move || {
+        sup.restore_vm(ticket, path, snapshot_overlay_path, restore_shape)
+    })
+    .await;
     let booted = match booted {
         Err(error) => {
             let error = state
@@ -1106,7 +1427,9 @@ pub async fn exec_local(
     command: String,
     timeout_ms: u64,
 ) -> Result<(i32, String, String, u64), OrchError> {
-    ensure_vm_can_receive_live_op(state, vm_id)?;
+    let gate = state.supervisor.operation_gate(vm_id)?;
+    let _operation = gate.lock_owned().await;
+    ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
     let sup = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms))
         .await
@@ -1127,6 +1450,15 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     if worker_converged {
         return Ok(());
     }
+    let operation_gate = match state.supervisor.operation_gate(id) {
+        Ok(gate) => Some(gate),
+        Err(OrchError::NotFound(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let _operation = match operation_gate {
+        Some(gate) => Some(gate.lock_owned().await),
+        None => None,
+    };
     let _terminal_gate = state.terminal_transition_gate.lock().await;
     match lifecycle_state(state, id)? {
         Some(LifecycleState::Terminal { .. }) => {
@@ -1136,9 +1468,13 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         Some(
             LifecycleState::Creating { .. }
             | LifecycleState::Running { .. }
+            | LifecycleState::Reconciling { .. }
             | LifecycleState::Abandoned { .. },
         )
         | None => {}
+    }
+    if vm_get(state, id).is_ok_and(|record| record.status == VmStatus::Stopped) {
+        return Ok(());
     }
     // Bill the final runtime interval before teardown, while the VM record (and
     // its owning key) is still in the cache, then drop its watermark.
@@ -1149,6 +1485,51 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await
+}
+
+/// Detect and persist unexpected VMM exits using one shared bounded scan.
+/// Runtime cleanup and scheduler release have already happened synchronously;
+/// this converges durable/cache/fleet state without touching the dead process.
+pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<String> {
+    let mut failures = retry_pending_lifecycle(state).await;
+    let supervisor = Arc::clone(&state.supervisor);
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        supervisor.scan_for_exited_processes();
+    })
+    .await
+    {
+        failures.push(format!("VMM exit scan task failed: {error}"));
+        return failures;
+    }
+    let exits = state.supervisor.take_unexpected_exits();
+    if exits.is_empty() {
+        return failures;
+    }
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
+    for exit in exits {
+        if let Some(cleanup_error) = &exit.cleanup_error {
+            tracing::error!(vm = %exit.id, pid = exit.pid, %cleanup_error, "dead VMM left resources requiring operator reconciliation");
+        }
+        let result = async {
+            if matches!(
+                lifecycle_state(state, exit.id)?,
+                Some(LifecycleState::Publishing { .. })
+            ) {
+                finish_publication(state, exit.id).await?;
+            }
+            crate::usage::meter_vm_final(state, exit.id);
+            start_terminal_transition(state, exit.id, VmStatus::Error, false)?;
+            finish_terminal_transition(state, exit.id).await
+        }
+        .await;
+        if let Err(error) = result {
+            failures.push(format!(
+                "VM {} exited ({}) but durable reconciliation failed: {error}",
+                exit.id, exit.status
+            ));
+        }
+    }
+    failures
 }
 
 pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchError> {
@@ -1218,35 +1599,88 @@ pub async fn pause_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchErr
     vm_op(state, id, |sup, id| sup.pause_vm(id), VmStatus::Paused).await
 }
 
+pub async fn suspend_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
+    vm_op(
+        state,
+        id,
+        |supervisor, id| supervisor.suspend_vm(id),
+        VmStatus::Suspended,
+    )
+    .await
+}
+
 pub async fn resume_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
     vm_op(state, id, |sup, id| sup.resume_vm(id), VmStatus::Running).await
 }
 
 pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<String, OrchError> {
-    ensure_vm_can_receive_live_op(state, id)?;
+    if diff {
+        return Err(OrchError::Unprocessable(
+            "incremental orchestrator snapshots are disabled until durable parent-chain relocation is available; request a full snapshot with diff=false"
+                .into(),
+        ));
+    }
+    let gate = state.supervisor.operation_gate(id)?;
+    let _operation = gate.lock_owned().await;
+    let vm = ensure_vm_status(
+        state,
+        id,
+        "snapshot",
+        &[VmStatus::Running, VmStatus::Paused],
+    )?;
+    let resume_after = vm.status == VmStatus::Running;
+    let has_overlay = vm.rootfs_path.is_some();
     let sup = Arc::clone(&state.supervisor);
-    let path = tokio::task::spawn_blocking(move || sup.snapshot_vm(id, diff))
-        .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    let bundle = tokio::task::spawn_blocking(move || {
+        sup.snapshot_bundle_vm(id, diff, resume_after, has_overlay)
+    })
+    .await;
+    let bundle = match bundle {
+        Ok(Ok(bundle)) => bundle,
+        Ok(Err(error)) => {
+            return Err(reconcile_snapshot_pause_failure(state, &vm, error).await);
+        }
+        Err(error) => {
+            return Err(reconcile_snapshot_pause_failure(
+                state,
+                &vm,
+                OrchError::Internal(format!("snapshot task failed: {error}")),
+            )
+            .await);
+        }
+    };
     // R-006: record who owns this snapshot file so a later restore can verify
     // tenant access before the path is handed to the VMM. Fail closed if the
     // record cannot be written, so we never create a snapshot that only an
     // admin could restore.
-    let vm = vm_get(state, id)?;
     let record = tarit_store::SnapshotRecord {
-        path: path.clone(),
+        path: bundle.snapshot_path().to_string(),
+        overlay_path: bundle.overlay_path().map(str::to_string),
         host_id: state.config.host_id.clone(),
         owner_key: vm.owner_key.clone(),
         api_key_id: vm.api_key_id.clone(),
         vm_id: id,
+        memory_mib: Some(vm.memory_mib),
+        vcpus: Some(vm.vcpus),
+        kernel_path: Some(vm.kernel_path.clone()),
+        rootfs_path: vm.rootfs_path.clone(),
+        cmdline: Some(vm.cmdline.clone()),
         created_at: Utc::now(),
     };
-    state
+    let insert = state
         .store
         .lock()
         .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-        .insert_snapshot(&record)
-        .map_err(crate::api::store_err)?;
+        .insert_snapshot(&record);
+    if let Err(error) = insert {
+        // SnapshotBundle's exact-inode cleanup runs before the operation gate
+        // is released, so a failed ownership write cannot leave a restorable
+        // but unowned RAM/disk pair.
+        drop(bundle);
+        return Err(crate::api::store_err(error));
+    }
+    let path = record.path;
+    bundle.persist();
     Ok(path)
 }
 
@@ -1255,30 +1689,29 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
 /// A snapshot is a first-class owned record. A non-admin caller may only
 /// restore a snapshot their own tenant created; an unknown path (no ownership
 /// record) is refused so a tenant cannot point restore at an arbitrary host
-/// file or another tenant's snapshot. Admins may restore any path, including
-/// raw operator-supplied paths that have no record.
+/// file or another tenant's snapshot. Admins bypass tenant ownership but still
+/// require a registered manifest: resource admission and cgroups must be sized
+/// before any untrusted snapshot state is restored.
 fn verify_snapshot_access(
     state: &AppState,
     snapshot_path: &str,
     caller_owner: Option<&str>,
     caller_is_admin: bool,
-) -> Result<(), OrchError> {
+) -> Result<tarit_store::SnapshotRecord, OrchError> {
     let snapshot = state
         .store
         .lock()
         .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
         .get_snapshot(snapshot_path)
         .map_err(crate::api::store_err)?;
-    if caller_is_admin {
-        return Ok(());
-    }
     match snapshot {
-        Some(rec) if caller_owner.is_some() && rec.owner_key.as_deref() == caller_owner => Ok(()),
+        Some(rec) if caller_is_admin => Ok(rec),
+        Some(rec) if caller_owner.is_some() && rec.owner_key.as_deref() == caller_owner => Ok(rec),
         Some(_) => Err(OrchError::Forbidden(
             "snapshot belongs to another tenant".into(),
         )),
-        None => Err(OrchError::Forbidden(
-            "unknown snapshot; restore requires a snapshot created by your tenant".into(),
+        None => Err(OrchError::BadRequest(
+            "unknown snapshot or missing manifest; restore requires a registered snapshot".into(),
         )),
     }
 }
@@ -1289,7 +1722,9 @@ pub async fn egress_local(
     allowlist: Vec<String>,
     allow_existing: bool,
 ) -> Result<usize, OrchError> {
-    ensure_vm_can_receive_live_op(state, id)?;
+    let gate = state.supervisor.operation_gate(id)?;
+    let _operation = gate.lock_owned().await;
+    ensure_vm_status(state, id, "update egress for", LIVE_CONTROL_STATUSES)?;
     let sup = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || sup.update_egress(id, allowlist, allow_existing))
         .await
@@ -1297,13 +1732,23 @@ pub async fn egress_local(
 }
 
 pub fn get_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
+    if matches!(
+        lifecycle_state(state, id)?,
+        Some(LifecycleState::Reconciling { .. })
+    ) {
+        return Err(OrchError::Unavailable(format!(
+            "vm {id} lifecycle reconciliation is pending"
+        )));
+    }
     vm_get(state, id)
 }
 
 /// Live VMM status for a locally-owned VM (state/uptime/vcpus/mem/vcpu_alive),
 /// queried from the `vmm serve` process over its UDS.
 pub async fn status_local(state: &AppState, id: Uuid) -> Result<serde_json::Value, OrchError> {
-    ensure_vm_can_receive_live_op(state, id)?;
+    let gate = state.supervisor.operation_gate(id)?;
+    let _operation = gate.lock_owned().await;
+    ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
     let sup = Arc::clone(&state.supervisor);
     let status = tokio::task::spawn_blocking(move || sup.status_vm(id))
         .await
@@ -1320,20 +1765,190 @@ async fn vm_op<F>(
 where
     F: FnOnce(&VmmSupervisor, Uuid) -> Result<(), OrchError> + Send + 'static,
 {
-    ensure_vm_can_receive_live_op(state, id)?;
-    let sup = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || op(&sup, id))
+    let gate = state.supervisor.operation_gate(id)?;
+    let _operation = gate.lock_owned().await;
+    let current = get_local(state, id)?;
+    match validate_live_transition(id, current.status, new_status)? {
+        TransitionDecision::Noop => return Ok(current),
+        TransitionDecision::Apply => {}
+    }
+    let operation_supervisor = Arc::clone(&state.supervisor);
+    tokio::task::spawn_blocking(move || op(&operation_supervisor, id))
         .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
-    vm_set_status(state, id, new_status)
+        .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+        .map_err(|error| {
+            tracing::warn!(
+                vm = %id,
+                from = current.status.as_str(),
+                to = new_status.as_str(),
+                %error,
+                "VMM lifecycle operation failed"
+            );
+            error
+        })?;
+    match vm_set_status(state, id, new_status).await {
+        Ok(record) => Ok(record),
+        Err(persist_error) => {
+            let rollback_supervisor = Arc::clone(&state.supervisor);
+            let prior_status = current.status;
+            let rollback = tokio::task::spawn_blocking(move || {
+                rollback_vmm_transition(&rollback_supervisor, id, prior_status, new_status)
+            })
+            .await
+            .map_err(|error| OrchError::Internal(format!("rollback join: {error}")))?;
+            match rollback {
+                Ok(()) => {
+                    match compensate_vm_status(state, &current, prior_status).await {
+                        Ok(compensation) => {
+                            tracing::warn!(
+                                vm = %id,
+                                from = prior_status.as_str(),
+                                to = new_status.as_str(),
+                                revision = compensation.revision,
+                                %persist_error,
+                                "rolled back VMM and fenced the failed lifecycle transition"
+                            );
+                            Err(persist_error)
+                        }
+                        Err(compensation_error) => Err(OrchError::Internal(format!(
+                            "persist VM {id} transition {} -> {} failed: {persist_error}; VMM rollback to {} succeeded but revision-N+2 control-plane compensation failed: {compensation_error}",
+                            prior_status.as_str(),
+                            new_status.as_str(),
+                            prior_status.as_str()
+                        ))),
+                    }
+                }
+                Err(rollback_error) => {
+                    match observe_and_compensate_vm_status(state, &current).await {
+                        Ok(observed) => {
+                            let _ = set_lifecycle_state(
+                                state,
+                                id,
+                                LifecycleState::Running {
+                                    record: observed.clone(),
+                                },
+                            );
+                            Err(OrchError::Internal(format!(
+                                "persist VM {id} transition {} -> {} failed: {persist_error}; rollback to {} failed: {rollback_error}; fenced observed VMM state {} at revision {}",
+                                prior_status.as_str(),
+                                new_status.as_str(),
+                                prior_status.as_str(),
+                                observed.status.as_str(),
+                                observed.revision
+                            )))
+                        }
+                        Err(reconcile_error) => {
+                            let retain_error = set_lifecycle_state(
+                                state,
+                                id,
+                                LifecycleState::Reconciling {
+                                    record: current.clone(),
+                                },
+                            )
+                            .err()
+                            .map(|error| format!("; retaining reconciliation failed: {error}"))
+                            .unwrap_or_default();
+                            Err(OrchError::Internal(format!(
+                                "persist VM {id} transition {} -> {} failed: {persist_error}; rollback to {} failed: {rollback_error}; observing/fencing the VMM failed and remains retryable: {reconcile_error}{retain_error}",
+                                prior_status.as_str(),
+                                new_status.as_str(),
+                                prior_status.as_str()
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn ensure_vm_can_receive_live_op(state: &AppState, id: Uuid) -> Result<(), OrchError> {
-    let record = get_local(state, id)?;
-    if record.status == VmStatus::Stopped {
-        return Err(OrchError::Conflict(format!("vm {id} is stopped")));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitionDecision {
+    Noop,
+    Apply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackPlan {
+    Resume,
+    Pause,
+    Suspend,
+    ResumeThenPause,
+}
+
+fn rollback_plan(prior: VmStatus, target: VmStatus) -> Option<RollbackPlan> {
+    match (prior, target) {
+        (VmStatus::Running, VmStatus::Paused | VmStatus::Suspended) => Some(RollbackPlan::Resume),
+        (VmStatus::Paused, VmStatus::Running) => Some(RollbackPlan::Pause),
+        (VmStatus::Paused, VmStatus::Suspended) => Some(RollbackPlan::ResumeThenPause),
+        (VmStatus::Suspended, VmStatus::Running) => Some(RollbackPlan::Suspend),
+        _ => None,
     }
-    Ok(())
+}
+
+fn rollback_vmm_transition(
+    supervisor: &VmmSupervisor,
+    id: Uuid,
+    prior: VmStatus,
+    target: VmStatus,
+) -> Result<(), OrchError> {
+    match rollback_plan(prior, target).ok_or_else(|| {
+        OrchError::Internal(format!(
+            "no rollback plan for VM {id} transition {} -> {}",
+            prior.as_str(),
+            target.as_str()
+        ))
+    })? {
+        RollbackPlan::Resume => supervisor.resume_vm(id),
+        RollbackPlan::Pause => supervisor.pause_vm(id),
+        RollbackPlan::Suspend => supervisor.suspend_vm(id),
+        RollbackPlan::ResumeThenPause => {
+            supervisor.resume_vm(id)?;
+            supervisor.pause_vm(id)
+        }
+    }
+}
+
+fn validate_live_transition(
+    id: Uuid,
+    current: VmStatus,
+    target: VmStatus,
+) -> Result<TransitionDecision, OrchError> {
+    if current == target {
+        return Ok(TransitionDecision::Noop);
+    }
+    let allowed = match target {
+        VmStatus::Paused => matches!(current, VmStatus::Running),
+        VmStatus::Suspended => matches!(current, VmStatus::Running | VmStatus::Paused),
+        VmStatus::Running => matches!(current, VmStatus::Paused | VmStatus::Suspended),
+        _ => false,
+    };
+    if allowed {
+        Ok(TransitionDecision::Apply)
+    } else {
+        Err(OrchError::Conflict(format!(
+            "cannot transition vm {id} from {} to {}",
+            current.as_str(),
+            target.as_str()
+        )))
+    }
+}
+
+fn ensure_vm_status(
+    state: &AppState,
+    id: Uuid,
+    operation: &str,
+    allowed: &[VmStatus],
+) -> Result<VmRecord, OrchError> {
+    let record = get_local(state, id)?;
+    if allowed.contains(&record.status) {
+        Ok(record)
+    } else {
+        Err(OrchError::Conflict(format!(
+            "cannot {operation} vm {id} while it is {}",
+            record.status.as_str()
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -1386,11 +2001,541 @@ mod tests {
     use crate::pty::PtyRegistry;
     use crate::scheduler::Scheduler;
     use std::collections::HashMap;
+    #[cfg(target_os = "linux")]
+    use std::io::{Read, Write};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::{Mutex, RwLock};
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
     use tarit_store::Store;
+
+    #[test]
+    fn live_transition_validation_is_idempotent_and_rejects_wrong_states() {
+        let id = Uuid::new_v4();
+        for status in [VmStatus::Running, VmStatus::Paused, VmStatus::Suspended] {
+            assert_eq!(
+                validate_live_transition(id, status, status).unwrap(),
+                TransitionDecision::Noop
+            );
+        }
+        for (from, to) in [
+            (VmStatus::Running, VmStatus::Paused),
+            (VmStatus::Running, VmStatus::Suspended),
+            (VmStatus::Paused, VmStatus::Suspended),
+            (VmStatus::Paused, VmStatus::Running),
+            (VmStatus::Suspended, VmStatus::Running),
+        ] {
+            assert_eq!(
+                validate_live_transition(id, from, to).unwrap(),
+                TransitionDecision::Apply
+            );
+        }
+        for invalid in [VmStatus::Creating, VmStatus::Stopped, VmStatus::Error] {
+            assert!(validate_live_transition(id, invalid, VmStatus::Paused).is_err());
+            assert!(validate_live_transition(id, invalid, VmStatus::Suspended).is_err());
+            assert!(validate_live_transition(id, invalid, VmStatus::Running).is_err());
+        }
+        assert!(
+            validate_live_transition(id, VmStatus::Suspended, VmStatus::Paused).is_err(),
+            "suspended RAM must be rehydrated via resume before pause"
+        );
+    }
+
+    #[test]
+    fn incremental_orchestrator_snapshot_is_rejected_before_vmm_lookup() {
+        let (state, _) = test_state_with_durable_writer();
+        let error = test_runtime()
+            .block_on(snapshot_local(&state, Uuid::new_v4(), true))
+            .expect_err("diff snapshots must fail before runtime lookup");
+        assert!(matches!(error, OrchError::Unprocessable(_)));
+        assert_eq!(error.http_status(), 422);
+        assert!(error.to_string().contains("diff=false"));
+    }
+
+    #[test]
+    fn live_status_and_egress_state_gate_excludes_terminal_or_unpublished_vms() {
+        assert_eq!(
+            LIVE_CONTROL_STATUSES,
+            &[VmStatus::Running, VmStatus::Paused, VmStatus::Suspended]
+        );
+        for status in [VmStatus::Creating, VmStatus::Stopped, VmStatus::Error] {
+            assert!(!LIVE_CONTROL_STATUSES.contains(&status));
+        }
+    }
+
+    #[test]
+    fn vmm_observation_maps_only_controllable_live_states() {
+        assert_eq!(
+            control_status(tarit_vmm_client::VmState::Running).unwrap(),
+            VmStatus::Running
+        );
+        assert_eq!(
+            control_status(tarit_vmm_client::VmState::Paused).unwrap(),
+            VmStatus::Paused
+        );
+        assert_eq!(
+            control_status(tarit_vmm_client::VmState::Suspended).unwrap(),
+            VmStatus::Suspended
+        );
+        assert!(control_status(tarit_vmm_client::VmState::Created).is_err());
+        assert!(control_status(tarit_vmm_client::VmState::Stopped).is_err());
+    }
+
+    #[test]
+    fn every_live_transition_has_an_exact_vmm_rollback_plan() {
+        assert_eq!(
+            rollback_plan(VmStatus::Running, VmStatus::Paused),
+            Some(RollbackPlan::Resume)
+        );
+        assert_eq!(
+            rollback_plan(VmStatus::Running, VmStatus::Suspended),
+            Some(RollbackPlan::Resume)
+        );
+        assert_eq!(
+            rollback_plan(VmStatus::Paused, VmStatus::Running),
+            Some(RollbackPlan::Pause)
+        );
+        assert_eq!(
+            rollback_plan(VmStatus::Paused, VmStatus::Suspended),
+            Some(RollbackPlan::ResumeThenPause)
+        );
+        assert_eq!(
+            rollback_plan(VmStatus::Suspended, VmStatus::Running),
+            Some(RollbackPlan::Suspend)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_against_suspended_vm_is_a_conflict() {
+        let (state, _rx) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        state.vm_cache.write().unwrap().get_mut(&id).unwrap().status = VmStatus::Suspended;
+        state
+            .supervisor
+            .install_test_control_runtime(id, PathBuf::from("unused.sock"));
+
+        let error = test_runtime()
+            .block_on(exec_local(&state, id, "true".into(), 100))
+            .expect_err("exec against a suspended VM must be rejected");
+
+        assert!(matches!(error, OrchError::Conflict(_)));
+        assert!(error.to_string().contains("suspended"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_live_transition_is_rolled_back_and_fenced_at_revision_n_plus_two() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let initial = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+
+        let socket = PathBuf::from(format!("/tmp/taritd-{}-{id}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            let response = match &request {
+                tarit_vmm_client::ApiRequest::Status => {
+                    tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                        state: tarit_vmm_client::VmState::Paused,
+                        uptime_ms: 1,
+                        vcpus: 1,
+                        mem_mib: 256,
+                        volumes: 0,
+                        nets: 0,
+                        kernel: "kernel".into(),
+                        vcpu_alive: true,
+                    })
+                }
+                tarit_vmm_client::ApiRequest::Exec { .. } => tarit_vmm_client::ApiResponse::Exec {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                },
+                _ => tarit_vmm_client::ApiResponse::Ok,
+            };
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+            let stopped = matches!(request, tarit_vmm_client::ApiRequest::Stop);
+            requests_tx.send(request).unwrap();
+            if stopped {
+                break;
+            }
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(id, socket.clone());
+        inject_lifecycle_fault(&state, LifecycleFault::SQLite);
+
+        let error = test_runtime()
+            .block_on(pause_local(&state, id))
+            .expect_err("injected local persistence failure must fail the request");
+        assert!(error.to_string().contains("injected SQLite failure"));
+
+        let cached = vm_get(&state, id).unwrap();
+        let durable = state.store.lock().unwrap().get_vm(id).unwrap();
+        assert_eq!(cached.status, VmStatus::Running);
+        assert_eq!(durable.status, VmStatus::Running);
+        assert_eq!(cached.revision, initial.revision + 2);
+        assert_eq!(durable.revision, initial.revision + 2);
+
+        state.supervisor.stop_vm(id).unwrap();
+        server.join().unwrap();
+        let requests = requests_rx.into_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                tarit_vmm_client::ApiRequest::Pause,
+                tarit_vmm_client::ApiRequest::Status,
+                tarit_vmm_client::ApiRequest::Resume,
+                tarit_vmm_client::ApiRequest::Exec { .. },
+                tarit_vmm_client::ApiRequest::Stop
+            ]
+        ));
+        assert!(!socket.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_snapshot_resume_is_observed_and_fenced_paused() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let initial = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+
+        let socket = PathBuf::from(format!(
+            "/tmp/taritd-snapshot-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            let response = match &request {
+                tarit_vmm_client::ApiRequest::Snapshot { .. } => {
+                    tarit_vmm_client::ApiResponse::Err {
+                        msg: "injected snapshot failure".into(),
+                    }
+                }
+                tarit_vmm_client::ApiRequest::Resume => tarit_vmm_client::ApiResponse::Err {
+                    msg: "injected resume failure".into(),
+                },
+                tarit_vmm_client::ApiRequest::Status => {
+                    tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                        state: tarit_vmm_client::VmState::Paused,
+                        uptime_ms: 1,
+                        vcpus: 1,
+                        mem_mib: 256,
+                        volumes: 0,
+                        nets: 0,
+                        kernel: "kernel".into(),
+                        vcpu_alive: true,
+                    })
+                }
+                _ => tarit_vmm_client::ApiResponse::Ok,
+            };
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+            let stopped = matches!(request, tarit_vmm_client::ApiRequest::Stop);
+            requests_tx.send(request).unwrap();
+            if stopped {
+                break;
+            }
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(id, socket.clone());
+
+        let error = test_runtime()
+            .block_on(snapshot_local(&state, id, false))
+            .expect_err("snapshot and resume failures must not leave a running record");
+        assert!(error.to_string().contains("fenced paused"));
+
+        let cached = vm_get(&state, id).unwrap();
+        let durable = state.store.lock().unwrap().get_vm(id).unwrap();
+        assert_eq!(cached.status, VmStatus::Paused);
+        assert_eq!(durable.status, VmStatus::Paused);
+        assert_eq!(cached.revision, initial.revision + 2);
+        assert_eq!(durable.revision, initial.revision + 2);
+
+        state.supervisor.stop_vm(id).unwrap();
+        server.join().unwrap();
+        let requests = requests_rx.into_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                tarit_vmm_client::ApiRequest::Pause,
+                tarit_vmm_client::ApiRequest::Snapshot { .. },
+                tarit_vmm_client::ApiRequest::Resume,
+                tarit_vmm_client::ApiRequest::Status,
+                tarit_vmm_client::ApiRequest::Stop
+            ]
+        ));
+        assert!(!socket.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unobservable_snapshot_state_stays_reconciling_until_retry_converges() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let initial = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+
+        let socket = PathBuf::from(format!(
+            "/tmp/taritd-snapshot-reconcile-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut status_requests = 0;
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut length = [0_u8; 4];
+                stream.read_exact(&mut length).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+                let response = match &request {
+                    tarit_vmm_client::ApiRequest::Snapshot { .. } => {
+                        tarit_vmm_client::ApiResponse::Err {
+                            msg: "injected snapshot failure".into(),
+                        }
+                    }
+                    tarit_vmm_client::ApiRequest::Resume => tarit_vmm_client::ApiResponse::Err {
+                        msg: "injected resume failure".into(),
+                    },
+                    tarit_vmm_client::ApiRequest::Status => {
+                        status_requests += 1;
+                        if status_requests == 1 {
+                            tarit_vmm_client::ApiResponse::Err {
+                                msg: "injected status outage".into(),
+                            }
+                        } else {
+                            tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                                state: tarit_vmm_client::VmState::Paused,
+                                uptime_ms: 1,
+                                vcpus: 1,
+                                mem_mib: 256,
+                                volumes: 0,
+                                nets: 0,
+                                kernel: "kernel".into(),
+                                vcpu_alive: true,
+                            })
+                        }
+                    }
+                    _ => tarit_vmm_client::ApiResponse::Ok,
+                };
+                let encoded = serde_json::to_vec(&response).unwrap();
+                stream
+                    .write_all(&(encoded.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&encoded).unwrap();
+                stream.flush().unwrap();
+                let stopped = matches!(request, tarit_vmm_client::ApiRequest::Stop);
+                requests_tx.send(request).unwrap();
+                if stopped {
+                    break;
+                }
+            }
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(id, socket.clone());
+
+        let runtime = test_runtime();
+        let error = runtime
+            .block_on(snapshot_local(&state, id, false))
+            .expect_err("unobservable compensation must retain reconciliation");
+        assert!(error.to_string().contains("remains unknown and retryable"));
+        assert!(matches!(
+            lifecycle_state(&state, id).unwrap(),
+            Some(LifecycleState::Reconciling { .. })
+        ));
+        assert!(matches!(
+            get_local(&state, id),
+            Err(OrchError::Unavailable(_))
+        ));
+        assert!(matches!(
+            runtime.block_on(exec_local(&state, id, "true".into(), 100)),
+            Err(OrchError::Unavailable(_))
+        ));
+        assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+        assert_eq!(
+            state.store.lock().unwrap().get_vm(id).unwrap().status,
+            VmStatus::Running
+        );
+
+        let initial_requests = (0..4)
+            .map(|_| requests_rx.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            initial_requests.as_slice(),
+            [
+                tarit_vmm_client::ApiRequest::Pause,
+                tarit_vmm_client::ApiRequest::Snapshot { .. },
+                tarit_vmm_client::ApiRequest::Resume,
+                tarit_vmm_client::ApiRequest::Status
+            ]
+        ));
+        let gate = state.supervisor.operation_gate(id).unwrap();
+        runtime.block_on(async {
+            let held_operation = gate.lock_owned().await;
+            let retry_state = state.clone();
+            let retry =
+                tokio::spawn(async move { reconcile_unexpected_vmm_exits(&retry_state).await });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                requests_rx.try_recv().is_err(),
+                "periodic status/fencing must wait for the runtime operation gate"
+            );
+            drop(held_operation);
+            assert!(
+                retry.await.unwrap().is_empty(),
+                "periodic reconciliation must observe and durably fence the VMM"
+            );
+        });
+        let cached = vm_get(&state, id).unwrap();
+        let durable = state.store.lock().unwrap().get_vm(id).unwrap();
+        assert_eq!(cached.status, VmStatus::Paused);
+        assert_eq!(durable.status, VmStatus::Paused);
+        assert_eq!(cached.revision, initial.revision + 2);
+        assert_eq!(durable.revision, initial.revision + 2);
+        assert!(matches!(
+            lifecycle_state(&state, id).unwrap(),
+            Some(LifecycleState::Running { record }) if record.status == VmStatus::Paused
+        ));
+
+        state.supervisor.stop_vm(id).unwrap();
+        server.join().unwrap();
+        let requests = requests_rx.into_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                tarit_vmm_client::ApiRequest::Status,
+                tarit_vmm_client::ApiRequest::Stop
+            ]
+        ));
+        assert!(!socket.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_snapshot_resumes_before_ram_scratch_handoff() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let initial = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+        let scratch = PathBuf::from(format!(
+            "/tmp/vmm-snap-{}-{}.snap",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut scratch_file = options.open(&scratch).unwrap();
+        scratch_file.write_all(b"immutable RAM image").unwrap();
+        scratch_file.sync_all().unwrap();
+        drop(scratch_file);
+
+        let socket = PathBuf::from(format!(
+            "/tmp/taritd-snapshot-order-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let server_scratch = scratch.display().to_string();
+        let server = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            let response = match &request {
+                tarit_vmm_client::ApiRequest::Snapshot { .. } => {
+                    tarit_vmm_client::ApiResponse::Snapshot {
+                        path: server_scratch.clone(),
+                    }
+                }
+                _ => tarit_vmm_client::ApiResponse::Ok,
+            };
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+            let stopped = matches!(request, tarit_vmm_client::ApiRequest::Stop);
+            requests_tx.send(request).unwrap();
+            if stopped {
+                break;
+            }
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(id, socket.clone());
+
+        let durable = test_runtime()
+            .block_on(snapshot_local(&state, id, false))
+            .expect("full snapshot succeeds");
+        assert_ne!(durable, scratch.display().to_string());
+        assert!(durable.contains("/snapshots/bundle-"));
+        assert_eq!(std::fs::read(&durable).unwrap(), b"immutable RAM image");
+        assert!(!scratch.exists(), "released VMM scratch must be removed");
+
+        state.supervisor.stop_vm(id).unwrap();
+        server.join().unwrap();
+        let requests = requests_rx.into_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                tarit_vmm_client::ApiRequest::Pause,
+                tarit_vmm_client::ApiRequest::Snapshot { .. },
+                tarit_vmm_client::ApiRequest::Resume,
+                tarit_vmm_client::ApiRequest::ReleaseScratch { .. },
+                tarit_vmm_client::ApiRequest::Stop
+            ]
+        ));
+        std::fs::remove_file(durable).unwrap();
+        assert!(!socket.exists());
+    }
 
     #[test]
     fn shutdown_rejection_is_identified_precisely() {
@@ -1904,8 +3049,7 @@ mod tests {
         assert!(matches!(owner, cluster::Owner::Local));
     }
 
-    fn test_state_with_durable_writer(
-    ) -> (AppState, tokio::sync::mpsc::UnboundedReceiver<StoreWrite>) {
+    fn test_state_with_durable_writer() -> (AppState, tokio::sync::mpsc::Receiver<StoreWrite>) {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             api_keys: ApiKeyRegistry::from_plaintext_entries(vec![(
@@ -1929,9 +3073,14 @@ mod tests {
             peer_secret: "peer-secret".into(),
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
@@ -1951,7 +3100,7 @@ mod tests {
             share_connect_timeout_ms: 1_000,
             share_idle_timeout_secs: 1,
         };
-        let (store_tx, store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, store_rx) = tokio::sync::mpsc::channel(128);
         let scheduler = Arc::new(Scheduler::new(config.clone()));
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = crate::shares::ShareRepository::new(Arc::clone(&store), None);
@@ -2000,6 +3149,8 @@ mod tests {
                 owner_key: Some("test".into()),
                 api_key_id: None,
                 status: VmStatus::Running,
+                revision: 1,
+                startup_path: None,
                 memory_mib: 256,
                 vcpus: 1,
                 kernel_path: "kernel".into(),

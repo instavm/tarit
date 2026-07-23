@@ -49,16 +49,36 @@ pub struct LocalImageConfig {
     pub images_dir: PathBuf,
 }
 
-/// Derive the guest agent binary path from the vmm binary path. `vmm_bin` is
-/// typically `<vmm-checkout>/target/<profile>/vmm`; the agent lives at
-/// `<vmm-checkout>/guest/agent/vmm-agent`.
+/// Find the guest agent next to either a source build or an installed Tarit
+/// prefix. Packaged installations place it in `libexec/tarit`, because it runs
+/// in guests and is not a host command.
 fn default_vmm_agent(vmm_bin: &Path) -> PathBuf {
-    vmm_bin
+    let source_build = vmm_bin
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
-        .map(|root| root.join("guest/agent/vmm-agent"))
-        .unwrap_or_else(|| PathBuf::from("guest/agent/vmm-agent"))
+        .map(|root| root.join("guest/agent/vmm-agent"));
+    if let Some(path) = source_build.as_ref().filter(|path| path.is_file()) {
+        return path.clone();
+    }
+
+    let installed = vmm_bin
+        .parent()
+        .and_then(|bin| bin.parent())
+        .map(|prefix| prefix.join("libexec/tarit/vmm-agent"));
+    if let Some(path) = installed.as_ref().filter(|path| path.is_file()) {
+        return path.clone();
+    }
+
+    [
+        PathBuf::from("/usr/local/libexec/tarit/vmm-agent"),
+        PathBuf::from("/usr/libexec/tarit/vmm-agent"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .or(installed)
+    .or(source_build)
+    .unwrap_or_else(|| PathBuf::from("guest/agent/vmm-agent"))
 }
 
 impl LocalImageConfig {
@@ -316,7 +336,7 @@ fn protected_paths(store: &Store) -> Result<HashSet<String>> {
     for vm in store.list_vms().context("list VMs for image GC")? {
         if matches!(
             vm.status,
-            VmStatus::Creating | VmStatus::Running | VmStatus::Paused
+            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
         ) {
             if let Some(rootfs) = vm.rootfs_path {
                 protected.insert(rootfs);
@@ -445,6 +465,33 @@ fn remove_registered_file(images_dir: &Path, rootfs_path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_agent_is_derived_from_vmm_prefix() {
+        assert_eq!(
+            default_vmm_agent(Path::new("/opt/tarit/bin/vmm")),
+            PathBuf::from("/opt/tarit/libexec/tarit/vmm-agent")
+        );
+    }
+
+    #[test]
+    fn source_build_agent_wins_when_present() {
+        let root = std::env::temp_dir().join(format!(
+            "tarit-image-agent-path-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let vmm = root.join("vmm/target/release/vmm");
+        let agent = root.join("vmm/guest/agent/vmm-agent");
+        std::fs::create_dir_all(vmm.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        std::fs::write(&vmm, []).unwrap();
+        std::fs::write(&agent, []).unwrap();
+
+        assert_eq!(default_vmm_agent(&vmm), agent);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn image(name: &str, tag: &str, path: &str, created_at: DateTime<Utc>) -> ImageRecord {
         ImageRecord {

@@ -24,7 +24,7 @@ jobs:
       matrix:
         workspace: [proto, vmm, orch]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Checks advisories, licenses, bans, and sources against the root
       # deny.toml for each cargo workspace.
@@ -48,18 +48,18 @@ jobs:
       # Needed by scorecard-action to publish results.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
       - name: Run scorecard
-        uses: ossf/scorecard-action@v2.4.3
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
         with:
           results_file: scorecard.sarif
           results_format: sarif
           publish_results: true
 
       - name: Upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
         with:
           sarif_file: scorecard.sarif

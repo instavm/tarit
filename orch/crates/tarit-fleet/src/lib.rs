@@ -6,7 +6,10 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use rustls::{ClientConfig, RootCertStore};
 use tarit_store::HostRecord;
-use tarit_types::{AuditEvent, ShareRecord, ShareVisibility, UsageEvent, UsageSummary, VmRecord};
+use tarit_types::{
+    AuditEvent, ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, UsageEvent,
+    UsageSummary, VmRecord, VmStartupPath, VmStatus,
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
@@ -22,12 +25,22 @@ pub enum FleetError {
     NotFound,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("tenant {owner_key} VM quota exceeded (max {max_vms})")]
+    QuotaExceeded { owner_key: String, max_vms: usize },
     #[error("invalid fleet share row: {0}")]
     InvalidShareRow(String),
 }
 
 pub struct PostgresFleet {
     pool: Pool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FleetExecutionRecord {
+    pub record: ExecutionRecord,
+    pub owner_key: String,
+    pub api_key_id: String,
+    pub host_id: String,
 }
 
 impl PostgresFleet {
@@ -38,14 +51,33 @@ impl PostgresFleet {
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), tls)
             .map_err(|e| FleetError::Config(e.to_string()))?;
-        let client = pool.get().await?;
-        client.batch_execute(FLEET_SCHEMA).await?;
-        client
-            .batch_execute("ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS owner_key TEXT;")
-            .await?;
-        client
-            .batch_execute("ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS api_key_id TEXT;")
-            .await?;
+        let mut client = pool.get().await?;
+        let tx = client.transaction().await?;
+        // Every node may start concurrently. The transaction-scoped advisory
+        // lock serializes schema migration without leaving a session lock behind
+        // when startup fails.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended('tarit-fleet-schema', 0))",
+            &[],
+        )
+        .await?;
+        tx.batch_execute(FLEET_SCHEMA).await?;
+        tx.batch_execute(
+            "ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS owner_key TEXT;
+             ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS api_key_id TEXT;
+             ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+             ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS startup_path TEXT;
+             ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
+             CREATE INDEX IF NOT EXISTS fleet_vms_owner_status ON fleet_vms (owner_key, status);
+             CREATE TABLE IF NOT EXISTS fleet_schema_migrations (
+               version BIGINT PRIMARY KEY,
+               applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+             );
+             INSERT INTO fleet_schema_migrations (version) VALUES (1)
+               ON CONFLICT (version) DO NOTHING;",
+        )
+        .await?;
+        tx.commit().await?;
         Ok(Self { pool })
     }
 
@@ -99,29 +131,52 @@ impl PostgresFleet {
             .collect())
     }
 
-    pub async fn upsert_vm(&self, vm: &VmRecord) -> Result<(), FleetError> {
-        let client = self.pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO fleet_vms (id, host_id, owner_key, api_key_id, status, memory_mib, vcpus, kernel_path, rootfs_path, cmdline, created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    /// Atomically claim a VM id or update the same resource incarnation.
+    ///
+    /// `(host_id, created_at)` is the fencing identity already carried by every
+    /// `VmRecord`; `generation` is advanced for each accepted transition. A
+    /// different host or a reused UUID with a different creation timestamp can
+    /// never steal the row. Older lifecycle writes also cannot regress state.
+    pub async fn upsert_vm(&self, vm: &VmRecord) -> Result<u64, FleetError> {
+        // PostgreSQL TIMESTAMPTZ and the postgres wire protocol preserve
+        // microseconds, while chrono can carry nanoseconds. Compare retries
+        // against the same representation that PostgreSQL persists so an
+        // identical retry cannot become a false same-revision conflict.
+        let vm = normalize_vm_timestamps_for_postgres(vm);
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let row = tx
+            .query_opt(
+                "INSERT INTO fleet_vms (
+                   id, host_id, owner_key, api_key_id, status, revision, startup_path, memory_mib, vcpus,
+                   kernel_path, rootfs_path, cmdline, created_at, updated_at, generation
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1)
                  ON CONFLICT (id) DO UPDATE SET
-                   host_id = EXCLUDED.host_id,
                    owner_key = EXCLUDED.owner_key,
                    api_key_id = EXCLUDED.api_key_id,
                    status = EXCLUDED.status,
+                   revision = EXCLUDED.revision,
+                   startup_path = EXCLUDED.startup_path,
                    memory_mib = EXCLUDED.memory_mib,
                    vcpus = EXCLUDED.vcpus,
                    kernel_path = EXCLUDED.kernel_path,
                    rootfs_path = EXCLUDED.rootfs_path,
                    cmdline = EXCLUDED.cmdline,
-                   updated_at = EXCLUDED.updated_at",
+                   updated_at = EXCLUDED.updated_at,
+                   generation = fleet_vms.generation + 1
+                 WHERE fleet_vms.host_id = EXCLUDED.host_id
+                   AND fleet_vms.created_at = EXCLUDED.created_at
+                   AND fleet_vms.revision < EXCLUDED.revision
+                 RETURNING generation",
                 &[
                     &vm.id,
                     &vm.host_id,
                     &vm.owner_key,
                     &vm.api_key_id,
                     &vm.status.as_str(),
+                    &i64::try_from(vm.revision)
+                        .map_err(|_| FleetError::Config("VM revision exceeds PostgreSQL BIGINT".into()))?,
+                    &vm.startup_path.map(VmStartupPath::as_str),
                     &(vm.memory_mib as i64),
                     &(vm.vcpus as i16),
                     &vm.kernel_path,
@@ -132,7 +187,67 @@ impl PostgresFleet {
                 ],
             )
             .await?;
-        Ok(())
+        let row = match row {
+            Some(row) => row,
+            None => {
+                let existing = tx
+                    .query_opt(
+                        "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
+                                memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
+                                created_at, updated_at, generation
+                           FROM fleet_vms WHERE id = $1",
+                        &[&vm.id],
+                    )
+                    .await?
+                    .ok_or(FleetError::NotFound)?;
+                let existing_vm = row_to_vm(&existing)?;
+                if existing_vm.host_id != vm.host_id || existing_vm.created_at != vm.created_at {
+                    return Err(FleetError::Conflict(format!(
+                        "VM {} is owned by another resource incarnation",
+                        vm.id
+                    )));
+                }
+                let mut expected = vm.clone();
+                expected.socket_path = None;
+                expected.pid = None;
+                if existing_vm.revision == vm.revision && existing_vm != expected {
+                    return Err(FleetError::Conflict(format!(
+                        "VM {} has two different records at revision {}",
+                        vm.id, vm.revision
+                    )));
+                }
+                tx.commit().await?;
+                return u64::try_from(existing.get::<_, i64>(14))
+                    .map_err(|_| FleetError::Config("negative VM generation".into()));
+            }
+        };
+        if let Some(owner_key) = vm.owner_key.as_deref() {
+            tx.execute(
+                "DELETE FROM tenant_vm_reservations WHERE id = $1 AND owner_key = $2",
+                &[&vm.id, &owner_key],
+            )
+            .await?;
+        }
+        let generation = u64::try_from(row.get::<_, i64>(0))
+            .map_err(|_| FleetError::Config("negative VM generation".into()))?;
+        tx.commit().await?;
+        Ok(generation)
+    }
+
+    pub async fn list_vms(&self, owner_key: Option<&str>) -> Result<Vec<VmRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
+                        memory_mib, vcpus, kernel_path, rootfs_path, cmdline, created_at, updated_at
+                   FROM fleet_vms
+                 WHERE ($1::TEXT IS NULL OR owner_key = $1)
+                   AND status <> 'stopped'
+                  ORDER BY created_at DESC",
+                &[&owner_key],
+            )
+            .await?;
+        rows.iter().map(row_to_vm).collect()
     }
 
     pub async fn count_active_vms_for_owner(&self, owner_key: &str) -> Result<usize, FleetError> {
@@ -140,7 +255,7 @@ impl PostgresFleet {
         let row = client
             .query_one(
                 "SELECT COUNT(*) FROM fleet_vms
-                 WHERE owner_key = $1 AND status IN ('creating', 'running', 'paused')",
+                 WHERE owner_key = $1 AND status IN ('creating', 'running', 'paused', 'suspended')",
                 &[&owner_key],
             )
             .await?;
@@ -178,11 +293,218 @@ impl PostgresFleet {
 
     /// Remove a VM's ownership row (called when a VM is stopped/deleted) so the
     /// cluster no longer routes to a dead sandbox.
-    pub async fn delete_vm(&self, id: Uuid) -> Result<(), FleetError> {
+    pub async fn delete_vm(&self, vm: &VmRecord) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        let deleted = client
+            .execute(
+                "DELETE FROM fleet_vms
+                  WHERE id = $1 AND host_id = $2 AND created_at = $3",
+                &[&vm.id, &vm.host_id, &vm.created_at],
+            )
+            .await?;
+        if deleted > 0 {
+            return Ok(());
+        }
+        match client
+            .query_opt(
+                "SELECT host_id, created_at FROM fleet_vms WHERE id = $1",
+                &[&vm.id],
+            )
+            .await?
+        {
+            None => Ok(()), // idempotent retry after a successful fenced delete
+            Some(_) => Err(FleetError::Conflict(format!(
+                "refusing stale ownership delete for VM {}",
+                vm.id
+            ))),
+        }
+    }
+
+    /// Reserve a tenant quota slot before placement. The tenant-scoped advisory
+    /// lock makes count+reserve atomic across all API nodes. Reservations expire
+    /// automatically if a request is cancelled before it can release the slot.
+    pub async fn reserve_vm_quota(
+        &self,
+        owner_key: &str,
+        id: Uuid,
+        max_vms: usize,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), FleetError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&owner_key],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM tenant_vm_reservations WHERE expires_at <= NOW()",
+            &[],
+        )
+        .await?;
+        if tx
+            .query_opt("SELECT 1 FROM fleet_vms WHERE id = $1", &[&id])
+            .await?
+            .is_some()
+        {
+            return Err(FleetError::Conflict(format!("VM {id} already exists")));
+        }
+        if let Some(row) = tx
+            .query_opt(
+                "SELECT owner_key FROM tenant_vm_reservations WHERE id = $1",
+                &[&id],
+            )
+            .await?
+        {
+            let existing_owner: String = row.get(0);
+            if existing_owner != owner_key {
+                return Err(FleetError::Conflict(format!(
+                    "VM {id} quota reservation belongs to another tenant"
+                )));
+            }
+            // Match the single-host store: an existing reservation is a
+            // conflict even for the same tenant. Treating a duplicate request
+            // as success would let two admission paths share one reservation
+            // and release the survivor's quota protection early.
+            return Err(FleetError::Conflict(format!(
+                "VM {id} already exists or is being created"
+            )));
+        }
+        let active = tx
+            .query_one(
+                "SELECT
+                   (SELECT COUNT(*) FROM fleet_vms
+                     WHERE owner_key = $1 AND status IN ('creating','running','paused','suspended'))
+                   +
+                   (SELECT COUNT(*) FROM tenant_vm_reservations
+                     WHERE owner_key = $1 AND expires_at > NOW())",
+                &[&owner_key],
+            )
+            .await?
+            .get::<_, i64>(0);
+        if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
+            return Err(FleetError::QuotaExceeded {
+                owner_key: owner_key.to_string(),
+                max_vms,
+            });
+        }
+        tx.execute(
+            "INSERT INTO tenant_vm_reservations (id, owner_key, expires_at)
+             VALUES ($1,$2,$3)",
+            &[&id, &owner_key, &expires_at],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn release_vm_quota(&self, owner_key: &str, id: Uuid) -> Result<(), FleetError> {
         let client = self.pool.get().await?;
         client
-            .execute("DELETE FROM fleet_vms WHERE id = $1", &[&id])
+            .execute(
+                "DELETE FROM tenant_vm_reservations WHERE id = $1 AND owner_key = $2",
+                &[&id, &owner_key],
+            )
             .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_execution(
+        &self,
+        exec: &ExecutionRecord,
+        owner_key: &str,
+        api_key_id: &str,
+        host_id: &str,
+    ) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        let updated = client
+            .execute(
+                "INSERT INTO fleet_executions (
+                   id, vm_id, owner_key, api_key_id, host_id, command, timeout_ms, status,
+                   exit_code, stdout, stderr, duration_ms, error, created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 ON CONFLICT (id) DO UPDATE SET
+                   status = EXCLUDED.status,
+                   exit_code = EXCLUDED.exit_code,
+                   stdout = EXCLUDED.stdout,
+                   stderr = EXCLUDED.stderr,
+                   duration_ms = EXCLUDED.duration_ms,
+                   error = EXCLUDED.error,
+                   updated_at = EXCLUDED.updated_at
+                 WHERE fleet_executions.owner_key = EXCLUDED.owner_key
+                   AND fleet_executions.vm_id = EXCLUDED.vm_id
+                   AND fleet_executions.updated_at <= EXCLUDED.updated_at",
+                &[
+                    &exec.id,
+                    &exec.vm_id,
+                    &owner_key,
+                    &api_key_id,
+                    &host_id,
+                    &exec.command,
+                    &u64_to_sql_i64(exec.timeout_ms)?,
+                    &exec.status.as_str(),
+                    &exec.exit_code,
+                    &exec.stdout,
+                    &exec.stderr,
+                    &exec
+                        .duration_ms
+                        .map(i64::try_from)
+                        .transpose()
+                        .map_err(|e| {
+                            FleetError::Config(format!(
+                                "execution duration exceeds PostgreSQL BIGINT: {e}"
+                            ))
+                        })?,
+                    &exec.error,
+                    &exec.created_at,
+                    &exec.updated_at,
+                ],
+            )
+            .await?;
+        if updated == 0 {
+            return Err(FleetError::Conflict(format!(
+                "execution {} was modified by another owner or a newer transition",
+                exec.id
+            )));
+        }
+        Ok(())
+    }
+
+    pub async fn get_execution(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<FleetExecutionRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "SELECT id, vm_id, owner_key, api_key_id, host_id, command, timeout_ms,
+                        status, exit_code, stdout, stderr, duration_ms, error, created_at, updated_at
+                   FROM fleet_executions WHERE id = $1",
+                &[&id],
+            )
+            .await?;
+        row.as_ref().map(row_to_execution).transpose()
+    }
+
+    pub async fn fail_incomplete_executions_for_host(
+        &self,
+        host_id: &str,
+        reason: &str,
+    ) -> Result<u64, FleetError> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "UPDATE fleet_executions
+                    SET status = 'failed', error = $2, updated_at = NOW()
+                  WHERE host_id = $1 AND status IN ('pending','running')",
+                &[&host_id, &reason],
+            )
+            .await?)
+    }
+
+    pub async fn healthcheck(&self) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        client.query_one("SELECT 1", &[]).await?;
         Ok(())
     }
 
@@ -498,13 +820,16 @@ CREATE TABLE IF NOT EXISTS fleet_vms (
   owner_key TEXT,
   api_key_id TEXT,
   status TEXT NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 1 CHECK (revision > 0),
+  startup_path TEXT,
   memory_mib BIGINT NOT NULL,
   vcpus SMALLINT NOT NULL,
   kernel_path TEXT NOT NULL,
   rootfs_path TEXT,
   cmdline TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL
+  updated_at TIMESTAMPTZ NOT NULL,
+  generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0)
 );
 CREATE TABLE IF NOT EXISTS fleet_leader (
   id INT PRIMARY KEY,
@@ -553,7 +878,115 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS audit_events_key_time ON audit_events (api_key_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS audit_events_vm ON audit_events (vm_id);
+CREATE TABLE IF NOT EXISTS tenant_vm_reservations (
+  id UUID PRIMARY KEY,
+  owner_key TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tenant_vm_reservations_owner_expiry
+  ON tenant_vm_reservations (owner_key, expires_at);
+CREATE TABLE IF NOT EXISTS fleet_executions (
+  id UUID PRIMARY KEY,
+  vm_id UUID NOT NULL,
+  owner_key TEXT NOT NULL,
+  api_key_id TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  command TEXT NOT NULL,
+  timeout_ms BIGINT NOT NULL CHECK (timeout_ms >= 0),
+  status TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
+  exit_code INTEGER,
+  stdout TEXT,
+  stderr TEXT,
+  duration_ms BIGINT,
+  error TEXT,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fleet_executions_owner_time
+  ON fleet_executions (owner_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS fleet_executions_host_status
+  ON fleet_executions (host_id, status);
 ";
+
+fn row_to_vm(row: &tokio_postgres::Row) -> Result<VmRecord, FleetError> {
+    let status: String = row.get(4);
+    let revision = u64::try_from(row.get::<_, i64>(5))
+        .map_err(|_| FleetError::Config("negative VM revision in fleet row".into()))?;
+    let startup_path: Option<String> = row.get(6);
+    let memory_mib = u64::try_from(row.get::<_, i64>(7))
+        .map_err(|_| FleetError::Config("negative VM memory in fleet row".into()))?;
+    let vcpus = u8::try_from(row.get::<_, i16>(8))
+        .map_err(|_| FleetError::Config("invalid VM vCPU count in fleet row".into()))?;
+    Ok(VmRecord {
+        id: row.get(0),
+        host_id: row.get(1),
+        owner_key: row.get(2),
+        api_key_id: row.get(3),
+        status: VmStatus::parse(&status).ok_or_else(|| {
+            FleetError::Config(format!("invalid VM status in fleet row: {status}"))
+        })?,
+        revision,
+        startup_path: startup_path.as_deref().and_then(VmStartupPath::parse),
+        memory_mib,
+        vcpus,
+        kernel_path: row.get(9),
+        rootfs_path: row.get(10),
+        cmdline: row.get(11),
+        // Process handles are node-local and must never be reconstructed from
+        // the global ownership index.
+        socket_path: None,
+        pid: None,
+        created_at: row.get(12),
+        updated_at: row.get(13),
+    })
+}
+
+fn normalize_vm_timestamps_for_postgres(vm: &VmRecord) -> VmRecord {
+    let mut normalized = vm.clone();
+    normalized.created_at = normalize_timestamp_for_postgres(normalized.created_at);
+    normalized.updated_at = normalize_timestamp_for_postgres(normalized.updated_at);
+    normalized
+}
+
+fn normalize_timestamp_for_postgres(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp(
+        timestamp.timestamp(),
+        timestamp.timestamp_subsec_micros() * 1_000,
+    )
+    .expect("normalizing a valid chrono timestamp preserves its range")
+}
+
+fn row_to_execution(row: &tokio_postgres::Row) -> Result<FleetExecutionRecord, FleetError> {
+    let timeout_ms = u64::try_from(row.get::<_, i64>(6))
+        .map_err(|_| FleetError::Config("negative execution timeout in fleet row".into()))?;
+    let status: String = row.get(7);
+    let duration_ms = row
+        .get::<_, Option<i64>>(11)
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| FleetError::Config("negative execution duration in fleet row".into()))?;
+    Ok(FleetExecutionRecord {
+        record: ExecutionRecord {
+            id: row.get(0),
+            vm_id: row.get(1),
+            command: row.get(5),
+            timeout_ms,
+            status: ExecutionStatus::parse(&status).ok_or_else(|| {
+                FleetError::Config(format!("invalid execution status in fleet row: {status}"))
+            })?,
+            exit_code: row.get(8),
+            stdout: row.get(9),
+            stderr: row.get(10),
+            duration_ms,
+            error: row.get(12),
+            created_at: row.get(13),
+            updated_at: row.get(14),
+        },
+        owner_key: row.get(2),
+        api_key_id: row.get(3),
+        host_id: row.get(4),
+    })
+}
 
 fn share_visibility_as_str(visibility: ShareVisibility) -> &'static str {
     match visibility {
@@ -669,7 +1102,7 @@ pub async fn heartbeat_local_host(
 
 /// Mark stale peers unhealthy (optional housekeeping).
 pub async fn touch_vm_in_fleet(fleet: &PostgresFleet, vm: &VmRecord) -> Result<(), FleetError> {
-    fleet.upsert_vm(vm).await
+    fleet.upsert_vm(vm).await.map(|_| ())
 }
 
 /// Build a host record for heartbeat from scheduler state.
@@ -695,6 +1128,28 @@ pub fn host_record_from_capacity(
 mod tests {
     use super::*;
     use tarit_types::ShareRecord;
+
+    fn test_vm(id: Uuid, host_id: &str, owner_key: &str) -> VmRecord {
+        let now = Utc::now();
+        VmRecord {
+            id,
+            host_id: host_id.into(),
+            owner_key: Some(owner_key.into()),
+            api_key_id: Some("key-id".into()),
+            status: VmStatus::Creating,
+            revision: 1,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "/opt/tarit/vmlinux".into(),
+            rootfs_path: Some("/opt/tarit/rootfs.ext4".into()),
+            cmdline: "console=ttyS0".into(),
+            socket_path: None,
+            pid: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 
     fn test_share(slug: String, owner_key: &str) -> ShareRecord {
         let now = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
@@ -748,6 +1203,92 @@ mod tests {
         assert!(FLEET_SCHEMA.contains("visibility IN ('public', 'private')"));
         assert!(FLEET_SCHEMA
             .contains("revoked_at TEXT,\n  created_at TEXT NOT NULL,\n  updated_at TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn fleet_schema_defines_fencing_quota_and_global_operations() {
+        assert!(FLEET_SCHEMA.contains("generation BIGINT NOT NULL DEFAULT 1"));
+        assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS tenant_vm_reservations"));
+        assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_executions"));
+        assert!(FLEET_SCHEMA.contains("fleet_executions_host_status"));
+    }
+
+    #[test]
+    fn vm_timestamp_normalization_matches_postgres_precision() {
+        let mut vm = test_vm(Uuid::new_v4(), "host-a", "tenant-a");
+        vm.created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        vm.updated_at = DateTime::from_timestamp(1_700_000_001, 987_654_321).unwrap();
+
+        let normalized = normalize_vm_timestamps_for_postgres(&vm);
+
+        assert_eq!(normalized.created_at.timestamp_subsec_nanos(), 123_456_000);
+        assert_eq!(normalized.updated_at.timestamp_subsec_nanos(), 987_654_000);
+        assert_eq!(normalized.id, vm.id);
+        assert_eq!(normalized.revision, vm.revision);
+    }
+
+    #[tokio::test]
+    async fn vm_claims_and_deletes_are_incarnation_fenced_when_database_is_configured(
+    ) -> Result<(), FleetError> {
+        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        if database_url.is_empty() {
+            return Ok(());
+        }
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let id = Uuid::new_v4();
+        let owner = format!("tenant-{id}");
+        let mut vm = test_vm(id, "host-a", &owner);
+        vm.created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        vm.updated_at = DateTime::from_timestamp(1_700_000_001, 987_654_321).unwrap();
+        let result = async {
+            let first_generation = fleet.upsert_vm(&vm).await?;
+            let retry_generation = fleet.upsert_vm(&vm).await?;
+            assert_eq!(
+                retry_generation, first_generation,
+                "an identical retry must be idempotent at PostgreSQL timestamp precision"
+            );
+            let mut running = vm.clone();
+            running.status = VmStatus::Running;
+            running.revision += 1;
+            running.updated_at += chrono::Duration::seconds(1);
+            let second_generation = fleet.upsert_vm(&running).await?;
+            assert!(second_generation > first_generation);
+
+            let mut conflicting_retry = running.clone();
+            conflicting_retry.cmdline = "different".into();
+            assert!(matches!(
+                fleet.upsert_vm(&conflicting_retry).await,
+                Err(FleetError::Conflict(_))
+            ));
+
+            let stale_owner = VmRecord {
+                host_id: "host-b".into(),
+                ..running.clone()
+            };
+            assert!(matches!(
+                fleet.upsert_vm(&stale_owner).await,
+                Err(FleetError::Conflict(_))
+            ));
+            assert!(matches!(
+                fleet.delete_vm(&stale_owner).await,
+                Err(FleetError::Conflict(_))
+            ));
+            assert_eq!(fleet.get_vm_host(id).await?, Some("host-a".into()));
+            fleet.delete_vm(&running).await?;
+            assert_eq!(fleet.get_vm_host(id).await?, None);
+            Ok::<(), FleetError>(())
+        }
+        .await;
+        let client = fleet.pool.get().await?;
+        client
+            .execute("DELETE FROM tenant_vm_reservations WHERE id = $1", &[&id])
+            .await?;
+        client
+            .execute("DELETE FROM fleet_vms WHERE id = $1", &[&id])
+            .await?;
+        result
     }
 
     #[allow(dead_code)]

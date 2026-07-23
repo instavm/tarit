@@ -307,7 +307,7 @@ fn comprehensive_all_features_and_edge_cases() {
         "large dirty set continues",
         matches!(decision, RoundDecision::Continue { .. })
     );
-    let decision = decide(&params, 1, 1 * 1024 * 1024);
+    let decision = decide(&params, 1, 1024 * 1024);
     check!(
         "small dirty set stops",
         matches!(decision, RoundDecision::FinalStop { .. })
@@ -344,12 +344,8 @@ fn comprehensive_all_features_and_edge_cases() {
 
     // Build the "full" image (what the memory looks like after writes)
     let mut full = base.clone();
-    for i in 0x1000..0x2000 {
-        full[i] = 0xBB;
-    }
-    for i in 0x5000..0x6000 {
-        full[i] = 0xCC;
-    }
+    full[0x1000..0x2000].fill(0xBB);
+    full[0x5000..0x6000].fill(0xCC);
 
     // Build diffs
     let diff1 = vmm_snapshot::diff::PageDelta {

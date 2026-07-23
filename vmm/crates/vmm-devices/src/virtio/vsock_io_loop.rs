@@ -74,7 +74,7 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
 }
 
 fn run(stop: Arc<AtomicBool>, device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd, wake_fd: RawFd) {
-    if let Err(e) = vmm_jailer::seccomp::SeccompProfile::device().install() {
+    if let Err(e) = vmm_jailer::seccomp::SeccompProfile::vsock().install() {
         log::error!("vsock pump: seccomp install failed; refusing guest I/O: {e}");
         return;
     }

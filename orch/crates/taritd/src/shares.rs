@@ -1028,6 +1028,8 @@ mod tests {
             owner_key: Some(owner_key.into()),
             api_key_id: Some("test-key".into()),
             status,
+            revision: 1,
+            startup_path: None,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: "kernel".into(),

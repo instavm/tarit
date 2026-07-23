@@ -63,6 +63,9 @@ type UpstreamWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const MAX_PENDING_PINGS: usize = 64;
 const MAX_PENDING_BRIDGE_COMMANDS: usize = 256;
 const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
+/// Minimum time the closing direction of a WebSocket bridge gets to finish
+/// its close handshake, independent of how short the idle timeout is.
+const WEBSOCKET_CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 struct PendingUpgradeState {
     accepting: bool,
@@ -539,7 +542,7 @@ struct LocalWebSocketRequest<'a> {
 }
 
 struct RemoteWebSocketRequest<'a> {
-    rpc_addr: &'a str,
+    target: &'a crate::cluster::PeerTarget,
     request_uri: &'a Uri,
     websocket: WebSocketUpgrade,
     protocols: Vec<String>,
@@ -606,10 +609,12 @@ impl From<OrchError> for GatewayError {
     fn from(error: OrchError) -> Self {
         match error {
             OrchError::Unauthorized => Self::Unauthorized,
-            OrchError::NotFound(_) | OrchError::BadRequest(_) | OrchError::Conflict(_) => {
-                Self::NotFound
-            }
+            OrchError::NotFound(_)
+            | OrchError::BadRequest(_)
+            | OrchError::Unprocessable(_)
+            | OrchError::Conflict(_) => Self::NotFound,
             OrchError::Forbidden(_)
+            | OrchError::Unavailable(_)
             | OrchError::Internal(_)
             | OrchError::Vmm(_)
             | OrchError::Overloaded { .. } => Self::Unavailable,
@@ -712,12 +717,12 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
                     )
                     .await
                 }
-                Owner::Remote(rpc_addr) => {
+                Owner::Remote(target) => {
                     proxy_remote_websocket(
                         &state,
                         &share,
                         RemoteWebSocketRequest {
-                            rpc_addr: &rpc_addr,
+                            target: &target,
                             request_uri: &parts.uri,
                             websocket,
                             protocols,
@@ -733,9 +738,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             let request = Request::from_parts(parts, body);
             match owner {
                 Owner::Local => proxy_local_http(&state, &share, request).await,
-                Owner::Remote(rpc_addr) => {
-                    proxy_remote_http(&state, &share, &rpc_addr, request).await
-                }
+                Owner::Remote(target) => proxy_remote_http(&state, &share, &target, request).await,
             }
         }
     }
@@ -834,7 +837,7 @@ pub(crate) fn share_peer_identity_id(share: &ShareRecord) -> String {
 async fn proxy_remote_http(
     state: &AppState,
     share: &ShareRecord,
-    rpc_addr: &str,
+    target: &crate::cluster::PeerTarget,
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
     let identity = share_identity(share);
@@ -845,7 +848,7 @@ async fn proxy_remote_http(
         .ok_or(GatewayError::Unavailable)?;
     state
         .peer
-        .proxy_share_http(rpc_addr, share.id, &identity, request, scheme)
+        .proxy_share_http(target, share.id, &identity, request, scheme)
         .await
         .map_err(|error| {
             tracing::warn!(share_id = %share.id, %error, "owner share HTTP proxy failed");
@@ -860,7 +863,7 @@ async fn proxy_remote_websocket(
     request: RemoteWebSocketRequest<'_>,
 ) -> Result<Response, GatewayError> {
     let RemoteWebSocketRequest {
-        rpc_addr,
+        target,
         request_uri,
         websocket,
         protocols,
@@ -871,7 +874,7 @@ async fn proxy_remote_websocket(
     let (upstream, response_protocol) = time::timeout(
         connect_timeout(state),
         state.peer.connect_share_websocket(
-            rpc_addr,
+            target,
             share.id,
             &identity,
             crate::peer::ShareWebSocketRequest {
@@ -1590,12 +1593,16 @@ async fn bridge_websocket(
         client_close_rx,
     ));
 
+    // Give the surviving direction a real chance to deliver its Close frame:
+    // with a very short idle timeout, a loaded scheduler can otherwise cancel
+    // the peer mid-handshake and the client observes a bare TCP reset.
+    let close_grace = idle_timeout.max(WEBSOCKET_CLOSE_GRACE);
     tokio::select! {
         _ = &mut client_to_upstream => {
-            let _ = time::timeout(idle_timeout, &mut upstream_to_client).await;
+            let _ = time::timeout(close_grace, &mut upstream_to_client).await;
         }
         _ = &mut upstream_to_client => {
-            let _ = time::timeout(idle_timeout, &mut client_to_upstream).await;
+            let _ = time::timeout(close_grace, &mut client_to_upstream).await;
         }
     }
 }
@@ -1695,6 +1702,10 @@ async fn forward_upstream_to_client(
             }
             changed = client_close_rx.changed() => {
                 if changed.is_err() {
+                    // The client-to-upstream direction is gone (idle timeout or
+                    // client EOF). Complete the close handshake toward the
+                    // client instead of dropping the TCP stream mid-protocol.
+                    let _ = time::timeout(idle_timeout, sink.send(AxumMessage::Close(None))).await;
                     return;
                 }
                 if *client_close_rx.borrow_and_update() {
@@ -3041,6 +3052,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_share_request_rejects_spliced_identity_envelope() {
+        let upstream = start_axum(
+            Router::new().route("/stream", get(|| async { Response::new(Body::from("ok")) })),
+        )
+        .await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+        let mut headers = signed_share_identity_headers(&cluster.share);
+
+        // A validly signed identity envelope captured from another request by
+        // the same source must not be combinable with this signed request.
+        let issued_at = Utc::now().timestamp();
+        let nonce = Uuid::new_v4().to_string();
+        let identity_id = super::share_peer_identity_id(&cluster.share);
+        let mut spliced_mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
+        spliced_mac.update(b"tarit-peer-identity-v1\nnon-owner\n");
+        spliced_mac.update(issued_at.to_string().as_bytes());
+        spliced_mac.update(b"\n");
+        spliced_mac.update(nonce.as_bytes());
+        spliced_mac.update(b"\n");
+        spliced_mac.update(cluster.share.owner_key.as_bytes());
+        spliced_mac.update(b"\nuser\n");
+        spliced_mac.update(identity_id.as_bytes());
+        headers.insert(
+            "x-tarit-identity-timestamp",
+            HeaderValue::from_str(&issued_at.to_string()).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-identity-nonce",
+            HeaderValue::from_str(&nonce).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-identity-signature",
+            HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(spliced_mac.finalize().into_bytes()))
+                .unwrap(),
+        );
+
+        let spliced = reqwest::Client::new()
+            .get(cluster.owner_share_url("/stream"))
+            .headers(headers)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spliced.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn remote_owner_enforces_private_share_auth_and_keeps_control_credentials_from_guest() {
         let (upstream, received) = spawn_inspecting_http_upstream().await;
         let cluster =
@@ -3269,6 +3327,7 @@ mod tests {
         crate::cluster::set_test_authoritative_owner(
             "owner",
             cluster.share.vm_id,
+            "reassigned-owner",
             "http://127.0.0.1:9".into(),
         );
 
@@ -3375,6 +3434,7 @@ mod tests {
             crate::cluster::set_test_authoritative_owner(
                 "non-owner",
                 share.vm_id,
+                "owner",
                 format!("http://{owner_addr}"),
             );
 
@@ -3444,19 +3504,59 @@ mod tests {
 
     fn signed_share_identity_headers(share: &ShareRecord) -> HeaderMap {
         let issued_at = Utc::now().timestamp();
-        let nonce = Uuid::new_v4().to_string();
+        let identity_nonce = Uuid::new_v4().to_string();
+        let request_nonce = Uuid::new_v4().to_string();
         let identity_id = super::share_peer_identity_id(share);
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
-        mac.update(b"tarit-peer-identity-v1\n");
-        mac.update(issued_at.to_string().as_bytes());
-        mac.update(b"\n");
-        mac.update(nonce.as_bytes());
-        mac.update(b"\n");
-        mac.update(share.owner_key.as_bytes());
-        mac.update(b"\nuser\n");
-        mac.update(identity_id.as_bytes());
+        let canonical_path = format!("/internal/v1/shares/{}/stream", share.id);
+        let mut identity_mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
+        identity_mac.update(b"tarit-peer-identity-v1\nnon-owner\n");
+        identity_mac.update(issued_at.to_string().as_bytes());
+        identity_mac.update(b"\n");
+        identity_mac.update(identity_nonce.as_bytes());
+        identity_mac.update(b"\n");
+        identity_mac.update(share.owner_key.as_bytes());
+        identity_mac.update(b"\nuser\n");
+        identity_mac.update(identity_id.as_bytes());
+        let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
+        let mut request_mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
+        for component in [
+            "tarit-peer-request-v2",
+            "GET",
+            canonical_path.as_str(),
+            "STREAMING-UNSIGNED-PAYLOAD",
+            &issued_at.to_string(),
+            request_nonce.as_str(),
+            "non-owner",
+            "owner",
+            identity_signature.as_str(),
+        ] {
+            request_mac.update(component.as_bytes());
+            request_mac.update(b"\n");
+        }
         let mut headers = HeaderMap::new();
-        headers.insert("x-peer-secret", HeaderValue::from_static("peer-secret"));
+        headers.insert(
+            "x-tarit-peer-version",
+            HeaderValue::from_static("tarit-peer-request-v2"),
+        );
+        headers.insert("x-tarit-peer-source", HeaderValue::from_static("non-owner"));
+        headers.insert("x-tarit-peer-target", HeaderValue::from_static("owner"));
+        headers.insert(
+            "x-tarit-peer-timestamp",
+            HeaderValue::from_str(&issued_at.to_string()).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-peer-nonce",
+            HeaderValue::from_str(&request_nonce).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-peer-body-sha256",
+            HeaderValue::from_static("STREAMING-UNSIGNED-PAYLOAD"),
+        );
+        headers.insert(
+            "x-tarit-peer-signature",
+            HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(request_mac.finalize().into_bytes()))
+                .unwrap(),
+        );
         headers.insert(
             "x-tarit-tenant",
             HeaderValue::from_str(&share.owner_key).unwrap(),
@@ -3472,11 +3572,11 @@ mod tests {
         );
         headers.insert(
             "x-tarit-identity-nonce",
-            HeaderValue::from_str(&nonce).unwrap(),
+            HeaderValue::from_str(&identity_nonce).unwrap(),
         );
         headers.insert(
             "x-tarit-identity-signature",
-            HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())).unwrap(),
+            HeaderValue::from_str(&identity_signature).unwrap(),
         );
         headers
     }
@@ -3505,9 +3605,14 @@ mod tests {
             peer_secret: "peer-secret".into(),
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: WarmPoolConfig::default(),
@@ -3529,7 +3634,7 @@ mod tests {
         };
         let store = Arc::new(Mutex::new(tarit_store::Store::open(":memory:").unwrap()));
         let shares = ShareRepository::new(Arc::clone(&store), None);
-        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, _store_rx) = tokio::sync::mpsc::channel(128);
         let peer = std::thread::spawn(|| PeerClient::new("peer-secret".into()))
             .join()
             .unwrap();

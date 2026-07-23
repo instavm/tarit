@@ -24,7 +24,7 @@ mod warmpool;
 use anyhow::Context;
 use api::{router, AppState};
 use clap::Parser;
-use config::Config;
+use config::{Config, PtyConnectionLimits};
 use peer::PeerClient;
 use scheduler::Scheduler;
 use std::collections::HashMap;
@@ -43,6 +43,7 @@ use tarit_fleet::PostgresFleet;
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const STORE_QUEUE_CAPACITY: usize = 8_192;
 
 #[derive(Clone)]
 struct ShutdownCoordinator {
@@ -87,7 +88,8 @@ async fn main() -> anyhow::Result<()> {
             "contain pre-existing Tarit TAPs before configuration, database, image, or VM discovery",
         )?;
         let config = Config::from_env().context("load config")?;
-        run_server(config, preflight_taps).await
+        let pty_limits = PtyConnectionLimits::from_env().context("load PTY connection limits")?;
+        run_server(config, preflight_taps, pty_limits).await
     } else {
         cli::run_client(cli).await
     }
@@ -103,7 +105,11 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::Result<()> {
+async fn run_server(
+    mut config: Config,
+    preflight_taps: Vec<String>,
+    pty_limits: PtyConnectionLimits,
+) -> anyhow::Result<()> {
     tracing::info!(
         listen = %config.listen,
         host_id = %config.host_id,
@@ -127,14 +133,17 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
 
     let store = Store::open(&config.db_path).context("open store")?;
     image::resolve_warm_pool_images(&mut config, &store).context("resolve warm-pool images")?;
-    let persisted_vms = store
+    let mut persisted_vms = store
         .list_vms()
         .context("load persisted VMs during startup")?;
     let live_vm_ids = persisted_vms
         .iter()
         .filter(|vm| {
             vm.host_id == config.host_id
-                && matches!(vm.status, VmStatus::Running | VmStatus::Paused)
+                && matches!(
+                    vm.status,
+                    VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                )
         })
         .map(|vm| vm.id)
         .collect::<Vec<_>>();
@@ -142,7 +151,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     let supervisor = Arc::new(
         VmmSupervisor::new_with_live_vms(
             config.clone(),
-            live_vm_ids,
+            live_vm_ids.iter().copied(),
             &preflight_taps,
             Arc::clone(&scheduler),
         )
@@ -156,18 +165,46 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     // missing network allocation) are marked terminal so the API never reports
     // an uncontrollable VM as running. Persisting that terminal state is
     // mandatory: if it fails, startup aborts rather than serve stale durable
-    // Running/Paused records for VMs that no longer exist.
-    let unadoptable: std::collections::HashSet<Uuid> = {
-        let ids = supervisor.readopt_running_vms(&persisted_vms).await;
+    // Running/Paused/Suspended records for VMs that no longer exist.
+    {
+        let ids = supervisor
+            .readopt_running_vms(&mut persisted_vms)
+            .await
+            .map_err(|error| anyhow::anyhow!("fail-closed VM re-adoption: {error}"))?;
         for id in &ids {
-            store
-                .update_vm_status(*id, VmStatus::Error)
-                .map_err(|error| {
-                    anyhow::anyhow!("persist terminal status for unadoptable VM {id}: {error}")
-                })?;
+            let vm = persisted_vms
+                .iter_mut()
+                .find(|vm| vm.id == *id)
+                .ok_or_else(|| anyhow::anyhow!("unadoptable VM {id} disappeared at startup"))?;
+            vm.status = VmStatus::Error;
+            // N+1 may have reached the fleet before the previous process
+            // crashed with SQLite still at N. Fence the terminal observation
+            // at N+2 and publish this exact record to every store.
+            vm.revision = vm.revision.checked_add(2).ok_or_else(|| {
+                anyhow::anyhow!("unadoptable VM {id} revision exhausted at startup")
+            })?;
+            vm.updated_at = chrono::Utc::now();
+            store.insert_vm(vm).map_err(|error| {
+                anyhow::anyhow!("persist terminal status for unadoptable VM {id}: {error}")
+            })?;
         }
-        ids.into_iter().collect()
-    };
+        for vm in &persisted_vms {
+            if vm.host_id == config.host_id
+                && matches!(
+                    vm.status,
+                    VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                )
+                && !ids.contains(&vm.id)
+            {
+                store.insert_vm(vm).map_err(|error| {
+                    anyhow::anyhow!(
+                        "persist observed status for re-adopted VM {}: {error}",
+                        vm.id
+                    )
+                })?;
+            }
+        }
+    }
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio
     // context panics on current tokio ("Cannot drop a runtime ... from within
@@ -176,7 +213,9 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     // spawn_blocking, so this only moves the one-time construction off-thread.
     let peer = {
         let secret = config.peer_secret.clone();
-        std::thread::spawn(move || PeerClient::new(secret))
+        let allow_insecure = config.allow_insecure_peer_http;
+        let host_id = config.host_id.clone();
+        std::thread::spawn(move || PeerClient::new_for_host(secret, allow_insecure, host_id))
             .join()
             .map_err(|_| anyhow::anyhow!("peer client init thread panicked"))?
     };
@@ -205,14 +244,12 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         Arc::new(RwLock::new(HashMap::new()));
     {
         let mut c = vm_cache.write().unwrap();
-        for mut vm in persisted_vms {
-            if unadoptable.contains(&vm.id) {
-                vm.status = VmStatus::Error;
-            }
-            c.insert(vm.id, vm);
+        for vm in &persisted_vms {
+            c.insert(vm.id, vm.clone());
         }
     }
-    let (store_tx, mut store_rx) = tokio::sync::mpsc::unbounded_channel::<api::StoreWrite>();
+    let (store_tx, mut store_rx) =
+        tokio::sync::mpsc::channel::<api::StoreWrite>(STORE_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
     let shutdown = ShutdownCoordinator::new(shutdown_tx.clone(), Arc::clone(&supervisor));
 
@@ -225,6 +262,28 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
                 .await
                 .context("postgres fleet")?,
         );
+        // SQLite and the local read cache already contain the restart-fenced
+        // VMM observation. Publish that same record to the fleet before any
+        // listener can serve or route traffic.
+        for vm in persisted_vms
+            .iter()
+            .filter(|vm| live_vm_ids.contains(&vm.id))
+        {
+            fleet
+                .upsert_vm(vm)
+                .await
+                .with_context(|| format!("publish restart-reconciled VM {} to fleet", vm.id))?;
+        }
+        let interrupted = fleet
+            .fail_incomplete_executions_for_host(
+                &config.host_id,
+                "accepting taritd restarted before execution reached a terminal state",
+            )
+            .await
+            .context("reconcile incomplete fleet executions")?;
+        if interrupted > 0 {
+            tracing::warn!(interrupted, "marked interrupted global executions failed");
+        }
         let fleet_sync = spawn_fleet_sync(
             Arc::clone(&fleet),
             Arc::clone(&store),
@@ -262,7 +321,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         #[cfg(test)]
         lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
         terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
-        pty_registry: Arc::new(pty::PtyRegistry::default()),
+        pty_registry: Arc::new(pty::PtyRegistry::new(pty_limits)),
         supervisor: Arc::clone(&supervisor),
         scheduler: scheduler.clone(),
         peer: Arc::new(peer),
@@ -275,6 +334,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     // Start every background worker only after all listener binds succeeded.
     let store_writer = {
         let store = Arc::clone(&state.store);
+        let metrics = Arc::clone(&state.metrics);
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -288,24 +348,36 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
                 };
                 match store.lock() {
                     Ok(s) => match op {
-                        api::StoreWrite::Vm(rec) => {
-                            let _ = s.insert_vm(&rec);
-                        }
                         api::StoreWrite::VmDurable(rec, completion) => {
                             let result = s.insert_vm(&rec).map_err(api::store_err);
+                            if let Err(error) = &result {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(vm = %rec.id, %error, "persist durable VM record");
+                            }
                             let _ = completion.send(result);
                         }
                         api::StoreWrite::Exec(rec) => {
-                            let _ = s.insert_execution(&rec);
+                            if let Err(error) = s.insert_execution(&rec) {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(execution = %rec.id, %error, "persist execution record");
+                            }
                         }
                         api::StoreWrite::Usage(ev) => {
-                            let _ = s.enqueue_usage(&ev);
+                            if let Err(error) = s.enqueue_usage(&ev) {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(event = %ev.id, %error, "persist usage outbox event");
+                            }
                         }
                         api::StoreWrite::Audit(ev) => {
-                            let _ = s.enqueue_audit(&ev);
+                            if let Err(error) = s.enqueue_audit(&ev) {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(event = %ev.id, %error, "persist audit outbox event");
+                            }
                         }
                     },
                     Err(_) => {
+                        metrics.inc_store_write_failure();
+                        tracing::error!("store lock poisoned in persistence worker");
                         if let api::StoreWrite::VmDurable(_, completion) = op {
                             let _ = completion.send(Err(tarit_types::OrchError::Internal(
                                 "store lock poisoned during shutdown persistence".into(),
@@ -337,6 +409,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     let usage_meter = usage::spawn_usage_meter(state.clone(), meter_secs, shutdown_rx.clone());
     let outbox_flusher =
         usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
+    let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());
 
     let shutdown_signal_task = spawn_shutdown_signal(shutdown.clone(), shutdown_rx.clone());
     let worker_tasks = BackgroundTasks::new(
@@ -346,6 +419,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
             fleet_sync,
             Some(usage_meter),
             outbox_flusher,
+            Some(vm_exit_reconciler),
             Some(shutdown_signal_task),
         ],
         warm_pool,
@@ -384,6 +458,26 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         move |reason| async move { shutdown_sweep(&shutdown_state, reason).await },
     )
     .await
+}
+
+fn spawn_vm_exit_reconciler(
+    state: AppState,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
+            for failure in ops::reconcile_unexpected_vmm_exits(&state).await {
+                tracing::error!(%failure, "unexpected VMM exit reconciliation failed");
+            }
+        }
+    })
 }
 
 struct ServerListeners {
@@ -943,7 +1037,9 @@ mod tests {
         config.net_state_path = root.join("net-state.json");
         config.ssh_gateway_host_key_path = root.join("ssh-host");
 
-        let error = run_server(config, Vec::new()).await.unwrap_err();
+        let error = run_server(config, Vec::new(), PtyConnectionLimits::default())
+            .await
+            .unwrap_err();
 
         assert!(error
             .to_string()
@@ -1431,9 +1527,14 @@ mod tests {
             peer_secret: "peer-secret".into(),
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
             vm_cgroup_pids_max: 1024,
             warm_pool: config::WarmPoolConfig::default(),
@@ -1459,7 +1560,7 @@ mod tests {
         let config = test_config();
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = shares::ShareRepository::new(Arc::clone(&store), None);
-        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, _store_rx) = tokio::sync::mpsc::channel(128);
         AppState {
             config: config.clone(),
             audit_outbox: Arc::new(audit::LocalAuditOutbox::new(Arc::clone(&store))),

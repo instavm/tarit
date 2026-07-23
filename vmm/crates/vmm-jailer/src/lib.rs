@@ -1,6 +1,6 @@
 //! vmm-jailer: host-side confinement of the VMM process.
 //!
-//! Jailer wrapper: chroot, PID/mount/network/user namespaces,
+//! Jailer wrapper: chroot, mount/UTS/IPC/network namespaces,
 //! cgroups (CPU/mem/IO/PID limits), drop to unprivileged uid/gid,
 //! `--resource-limit` style fd/file caps.
 //!

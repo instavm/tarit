@@ -1,12 +1,13 @@
 //! Real jailer execution — chroot + namespaces + cgroups + privilege drop.
 //!
-//! Jailer wrapper: chroot, PID/mount/network/user namespaces,
+//! Jailer wrapper: chroot, mount/UTS/IPC/network namespaces,
 //! cgroups (CPU/mem/IO/PID limits), drop to unprivileged uid/gid.
 
 #![cfg(target_os = "linux")]
 
 use crate::jailer::{JailerConfig, JailerError};
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
 /// Execute the jailer: set up namespaces, chroot, cgroups, drop privs,
@@ -42,6 +43,8 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
         )));
     }
 
+    let last_capability = read_last_capability()?;
+
     // 1. Set resource limits (RLIMIT_NOFILE, RLIMIT_AS).
     set_rlimits(cfg)?;
 
@@ -50,22 +53,41 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
         apply_cgroup(cfg)?;
     }
 
-    // 2. Enter the network namespace (if specified).
+    // 2. Enter the assigned network namespace, or create a fresh empty one for
+    // no-NIC workloads. A jailed VMM must never retain the host net namespace.
     if !cfg.netns.is_empty() {
         enter_netns(&cfg.netns)?;
+    } else {
+        unshare_empty_netns()?;
     }
 
-    // 3. Create + enter a new mount namespace.
-    unshare_mount()?;
+    // 3. Create private mount, UTS, and IPC namespaces. PID namespaces need a
+    // fork to take effect and are therefore the launcher's responsibility.
+    unshare_namespaces()?;
+    make_mounts_private()?;
 
     // 4. Chroot into the jail directory.
     do_chroot(&cfg.chroot_dir)?;
 
-    // 5. Drop capabilities (CAP_NET_RAW, CAP_SYS_ADMIN, etc.).
-    drop_capabilities()?;
+    // 5. Prevent privilege gains and clear the capability bounding/ambient
+    // sets while CAP_SETPCAP is still effective. Clearing the effective set
+    // first would also remove CAP_SETUID/CAP_SETGID and make the identity
+    // transition fail.
+    set_no_new_privileges()?;
+    drop_capability_bounding_set(last_capability)?;
+    clear_ambient_capabilities()?;
 
-    // 6. Drop to unprivileged uid/gid.
+    // 6. Drop supplementary groups and all real/effective/saved IDs.
     drop_privileges(cfg.uid, cfg.gid)?;
+
+    // 7. Clear and verify every remaining capability set after setresuid.
+    clear_process_capabilities()?;
+    verify_confinement(cfg.uid, cfg.gid, last_capability)?;
+
+    // Files created after confinement must never be group/world accessible,
+    // even if a caller inherited a permissive umask.
+    // SAFETY: umask takes and returns scalar mode values only.
+    unsafe { libc::umask(0o077) };
 
     log::info!("jail: all confinement applied successfully");
     Ok(())
@@ -97,7 +119,10 @@ fn set_rlimits(cfg: &JailerConfig) -> Result<(), JailerError> {
         // the duration of the syscall.
         let rc = unsafe { libc::setrlimit(libc::RLIMIT_AS, &rlim_as) };
         if rc < 0 {
-            log::warn!("setrlimit AS failed: {}", std::io::Error::last_os_error());
+            return Err(JailerError::PrivDrop(format!(
+                "setrlimit AS: {}",
+                std::io::Error::last_os_error()
+            )));
         }
     }
 
@@ -124,7 +149,7 @@ fn enter_netns(path: &str) -> Result<(), JailerError> {
         .map_err(|_| JailerError::Namespace(format!("netns path contains NUL: {path:?}")))?;
     // SAFETY: `c_path` is a valid NUL-terminated C string and `open` does not
     // retain the pointer after returning.
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(JailerError::Namespace(format!(
             "open netns {path}: {}",
@@ -147,47 +172,100 @@ fn enter_netns(path: &str) -> Result<(), JailerError> {
     Ok(())
 }
 
-fn unshare_mount() -> Result<(), JailerError> {
-    // SAFETY: `unshare` is called with only the CLONE_NEWNS flag and no pointer
-    // arguments.
-    let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
-    if rc < 0 {
-        // The mount namespace is a required confinement step. Fail closed
-        // rather than run the VMM without it, so we never claim confinement we
-        // did not apply.
+fn unshare_empty_netns() -> Result<(), JailerError> {
+    // SAFETY: unshare is called with a namespace flag and no pointer arguments.
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } < 0 {
         return Err(JailerError::Namespace(format!(
-            "unshare(CLONE_NEWNS) failed: {} — refusing to run without a mount namespace",
+            "unshare(CLONE_NEWNET) for empty network namespace: {}",
             std::io::Error::last_os_error()
         )));
     }
-    log::info!("jail: mount namespace created");
+    log::info!("jail: fresh empty network namespace created");
+    Ok(())
+}
+
+fn unshare_namespaces() -> Result<(), JailerError> {
+    let flags = libc::CLONE_NEWNS | libc::CLONE_NEWUTS | libc::CLONE_NEWIPC;
+    // SAFETY: `unshare` is called with namespace flags and no pointer arguments.
+    let rc = unsafe { libc::unshare(flags) };
+    if rc < 0 {
+        return Err(JailerError::Namespace(format!(
+            "unshare(CLONE_NEWNS|CLONE_NEWUTS|CLONE_NEWIPC) failed: {} — refusing to run without private namespaces",
+            std::io::Error::last_os_error()
+        )));
+    }
+    log::info!("jail: private mount, UTS, and IPC namespaces created");
+    Ok(())
+}
+
+fn make_mounts_private() -> Result<(), JailerError> {
+    let root = CString::new("/").expect("static root path contains no NUL");
+    // SAFETY: the target is a valid NUL-terminated string, source/fs/data are
+    // null as required for a propagation-only mount operation.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if rc < 0 {
+        return Err(JailerError::Namespace(format!(
+            "make mount tree private: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    log::info!("jail: mount propagation made recursively private");
     Ok(())
 }
 
 fn do_chroot(dir: &str) -> Result<(), JailerError> {
     let c_dir = CString::new(dir)
         .map_err(|_| JailerError::PrivDrop(format!("chroot path contains NUL: {dir:?}")))?;
-    // SAFETY: `c_dir` is a valid NUL-terminated C string that lives for the
-    // duration of the `chroot` call.
-    let rc = unsafe { libc::chroot(c_dir.as_ptr()) };
-    if rc < 0 {
+    // Open the jail root without following its final component, then operate
+    // on the descriptor. This prevents a concurrent final-component symlink
+    // swap between validation and chroot.
+    // SAFETY: c_dir is a valid NUL-terminated path and open retains no pointer.
+    let fd = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(JailerError::PrivDrop(format!(
+            "open jail root {dir}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: fd was returned by open above and is uniquely owned here.
+    let jail_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: jail_fd is an open directory descriptor.
+    if unsafe { libc::fchdir(jail_fd.as_raw_fd()) } < 0 {
+        return Err(JailerError::PrivDrop(format!(
+            "fchdir jail root {dir}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let dot = CString::new(".").expect("static dot path contains no NUL");
+    // SAFETY: dot is valid and the current directory is the opened jail root.
+    if unsafe { libc::chroot(dot.as_ptr()) } < 0 {
         return Err(JailerError::PrivDrop(format!(
             "chroot {dir}: {}",
             std::io::Error::last_os_error()
         )));
     }
-    // chdir to "/" (inside the chroot)
     let root = CString::new("/").expect("static root path contains no NUL");
-    // SAFETY: `root` is a valid NUL-terminated C string that lives for the
-    // duration of the `chroot` call.
-    let rc = unsafe { libc::chroot(root.as_ptr()) };
-    // Ignore this result — we're already chrooted.
-    let _ = rc;
     // SAFETY: `root` is a valid NUL-terminated C string that lives for the
     // duration of the `chdir` call.
     let rc = unsafe { libc::chdir(root.as_ptr()) };
     if rc < 0 {
-        log::warn!("jail: chdir / after chroot failed");
+        return Err(JailerError::PrivDrop(format!(
+            "chdir / after chroot: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     log::info!("jail: chrooted to {dir}");
     Ok(())
@@ -242,8 +320,10 @@ mod cap {
 }
 
 const PR_CAPBSET_DROP: libc::c_int = 24;
+const PR_CAPBSET_READ: libc::c_int = 23;
 const PR_CAP_AMBIENT: libc::c_int = 47;
 const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+const PR_GET_NO_NEW_PRIVS: libc::c_int = 39;
 
 #[repr(C)]
 struct CapUserHeader {
@@ -261,8 +341,25 @@ struct CapUserData {
 
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080922;
 
-fn drop_capabilities() -> Result<(), JailerError> {
-    // 1. Set PR_SET_NO_NEW_PRIVS as the baseline.
+fn read_last_capability() -> Result<u32, JailerError> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap").map_err(|e| {
+        JailerError::PrivDrop(format!(
+            "read /proc/sys/kernel/cap_last_cap before chroot: {e}"
+        ))
+    })?;
+    let last = raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| JailerError::PrivDrop(format!("parse /proc/sys/kernel/cap_last_cap: {e}")))?;
+    if last > 4096 {
+        return Err(JailerError::PrivDrop(format!(
+            "implausible cap_last_cap value {last}"
+        )));
+    }
+    Ok(last)
+}
+
+fn set_no_new_privileges() -> Result<(), JailerError> {
     // SAFETY: `prctl` is called with scalar arguments only and does not access
     // Rust-managed memory.
     let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -273,30 +370,43 @@ fn drop_capabilities() -> Result<(), JailerError> {
         )));
     }
     log::info!("jail: PR_SET_NO_NEW_PRIVS set");
+    Ok(())
+}
 
-    // 2. Drop all capabilities from the bounding set.
-    //    This prevents the process from regaining caps after setuid.
-    for cap in 0..=cap::LAST {
+fn drop_capability_bounding_set(last_capability: u32) -> Result<(), JailerError> {
+    for capability in 0..=last_capability {
         // SAFETY: `prctl` is called with scalar arguments only and does not
         // access Rust-managed memory.
-        let rc = unsafe { libc::prctl(PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
+        let rc = unsafe { libc::prctl(PR_CAPBSET_DROP, capability as libc::c_ulong, 0, 0, 0) };
         if rc < 0 {
-            // Some caps may not exist on older kernels — only warn.
-            log::debug!("jail: PR_CAPBSET_DROP({cap}) failed: continuing");
+            return Err(JailerError::PrivDrop(format!(
+                "PR_CAPBSET_DROP({capability}): {}",
+                std::io::Error::last_os_error()
+            )));
         }
     }
     log::info!("jail: capability bounding set cleared");
+    Ok(())
+}
 
-    // 3. Clear all ambient capabilities.
+fn clear_ambient_capabilities() -> Result<(), JailerError> {
     // SAFETY: `prctl` is called with scalar arguments only and does not access
     // Rust-managed memory.
     let rc = unsafe { libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) };
     if rc < 0 {
-        log::debug!("jail: PR_CAP_AMBIENT_CLEAR_ALL failed (non-critical)");
+        let error = std::io::Error::last_os_error();
+        // Kernels predating ambient capabilities return EINVAL; in that case
+        // there is no ambient set to clear. Every other error is unsafe.
+        if error.raw_os_error() != Some(libc::EINVAL) {
+            return Err(JailerError::PrivDrop(format!(
+                "PR_CAP_AMBIENT_CLEAR_ALL: {error}"
+            )));
+        }
     }
+    Ok(())
+}
 
-    // 4. Use capset() to drop effective + permitted + inheritable sets.
-    //    We set all three to 0 (no capabilities).
+fn clear_process_capabilities() -> Result<(), JailerError> {
     let header = CapUserHeader {
         version: LINUX_CAPABILITY_VERSION_3,
         pid: 0, // 0 = self
@@ -325,7 +435,7 @@ fn drop_capabilities() -> Result<(), JailerError> {
             std::io::Error::last_os_error()
         )));
     }
-    log::info!("jail: effective/permitted/inheritable capabilities cleared via capset");
+    log::info!("jail: effective/permitted/inheritable capabilities cleared");
 
     Ok(())
 }
@@ -338,39 +448,125 @@ fn drop_privileges(uid: u32, gid: u32) -> Result<(), JailerError> {
         ));
     }
 
-    // Drop GID first, then UID (order matters — can't drop UID first
-    // and then GID because you'd need privileges to change GID).
-    // Also drop the supplementary groups first.
     // SAFETY: passing a null group pointer is valid when the group count is 0.
     let rc = unsafe { libc::setgroups(0, std::ptr::null()) };
     if rc < 0 {
-        log::warn!(
-            "jail: setgroups(0) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    // SAFETY: `setgid` takes a scalar gid and does not access Rust-managed
-    // memory.
-    let rc = unsafe { libc::setgid(gid) };
-    if rc < 0 {
         return Err(JailerError::PrivDrop(format!(
-            "setgid({gid}): {}",
+            "setgroups(0): {}",
             std::io::Error::last_os_error()
         )));
     }
 
-    // SAFETY: `setuid` takes a scalar uid and does not access Rust-managed
-    // memory.
-    let rc = unsafe { libc::setuid(uid) };
+    // setresgid/setresuid clear real, effective, and saved IDs. A saved root ID
+    // would make the privilege drop reversible.
+    // SAFETY: setresgid takes scalar IDs only.
+    let rc = unsafe { libc::setresgid(gid, gid, gid) };
     if rc < 0 {
         return Err(JailerError::PrivDrop(format!(
-            "setuid({uid}): {}",
+            "setresgid({gid}): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // SAFETY: setresuid takes scalar IDs only.
+    let rc = unsafe { libc::setresuid(uid, uid, uid) };
+    if rc < 0 {
+        return Err(JailerError::PrivDrop(format!(
+            "setresuid({uid}): {}",
             std::io::Error::last_os_error()
         )));
     }
 
     log::info!("jail: privileges dropped to uid={uid} gid={gid}");
+    Ok(())
+}
+
+fn verify_confinement(uid: u32, gid: u32, last_capability: u32) -> Result<(), JailerError> {
+    let mut real_uid = 0;
+    let mut effective_uid = 0;
+    let mut saved_uid = 0;
+    // SAFETY: pointers refer to valid uid_t storage.
+    if unsafe { libc::getresuid(&mut real_uid, &mut effective_uid, &mut saved_uid) } < 0 {
+        return Err(JailerError::PrivDrop(format!(
+            "getresuid: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut real_gid = 0;
+    let mut effective_gid = 0;
+    let mut saved_gid = 0;
+    // SAFETY: pointers refer to valid gid_t storage.
+    if unsafe { libc::getresgid(&mut real_gid, &mut effective_gid, &mut saved_gid) } < 0 {
+        return Err(JailerError::PrivDrop(format!(
+            "getresgid: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if [real_uid, effective_uid, saved_uid] != [uid, uid, uid]
+        || [real_gid, effective_gid, saved_gid] != [gid, gid, gid]
+    {
+        return Err(JailerError::PrivDrop(format!(
+            "identity verification failed: uid={real_uid}/{effective_uid}/{saved_uid}, gid={real_gid}/{effective_gid}/{saved_gid}"
+        )));
+    }
+
+    // SAFETY: a zero-size getgroups query accepts a null pointer.
+    let group_count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if group_count != 0 {
+        return Err(JailerError::PrivDrop(format!(
+            "supplementary groups remain after drop: {group_count}"
+        )));
+    }
+
+    let header = CapUserHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapUserData {
+        effective: u32::MAX,
+        permitted: u32::MAX,
+        inheritable: u32::MAX,
+    }; 2];
+    // SAFETY: header/data have the capget ABI layout and valid lifetimes.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &header as *const CapUserHeader,
+            data.as_mut_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(JailerError::PrivDrop(format!(
+            "capget verification: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if data
+        .iter()
+        .any(|set| set.effective != 0 || set.permitted != 0 || set.inheritable != 0)
+    {
+        return Err(JailerError::PrivDrop(
+            "effective, permitted, or inheritable capabilities remain".into(),
+        ));
+    }
+
+    for capability in 0..=last_capability {
+        // SAFETY: prctl is called with scalar arguments only.
+        let present = unsafe { libc::prctl(PR_CAPBSET_READ, capability as libc::c_ulong, 0, 0, 0) };
+        if present != 0 {
+            return Err(JailerError::PrivDrop(format!(
+                "capability {capability} remains in bounding set"
+            )));
+        }
+    }
+
+    // SAFETY: PR_GET_NO_NEW_PRIVS accepts scalar zero arguments.
+    if unsafe { libc::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) } != 1 {
+        return Err(JailerError::PrivDrop(
+            "PR_SET_NO_NEW_PRIVS verification failed".into(),
+        ));
+    }
+
     Ok(())
 }
 

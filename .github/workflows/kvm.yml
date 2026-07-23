@@ -1,0 +1,148 @@
+name: KVM integration and startup performance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kvm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kvm:
+    name: KVM lifecycle and performance gates
+    # Never execute pull-request code on a persistent privileged runner. Runs
+    # are limited to the protected main ref, including manual dispatches.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: vmm
+          key: kvm-integration
+
+      - name: Verify runner capabilities and guest assets
+        working-directory: vmm
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
+          test -r "${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
+          test -r "${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}"
+          sudo -n true
+
+      - name: Build release VMM
+        working-directory: vmm
+        run: cargo build --release --locked -p vmm --features boot
+
+      - name: Build release orchestrator
+        working-directory: orch
+        run: cargo build --release --locked -p taritd -p tarit-bench
+
+      - name: Enforce orchestrated suspend contract
+        env:
+          TARIT_KERNEL: /tmp/vmlinux.microvm
+          TARIT_ROOTFS: /tmp/vsock-rootfs.ext4
+          TARIT_VMM_BIN: ${{ github.workspace }}/vmm/target/release/vmm
+          TARITD_BIN: ${{ github.workspace }}/orch/target/release/taritd
+          SUSPEND_MIN_RSS_DROP_KIB: "32768"
+          SUSPEND_RESUME_EXEC_MAX_MS: "5000"
+        run: |
+          sudo -E env "PATH=$PATH" bash test/e2e.sh suspend
+
+      - name: Enforce snapshot disk ownership and restore isolation
+        env:
+          TARIT_KERNEL: /tmp/vmlinux.microvm
+          TARIT_ROOTFS: /tmp/vsock-rootfs.ext4
+          TARIT_VMM_BIN: ${{ github.workspace }}/vmm/target/release/vmm
+          TARITD_BIN: ${{ github.workspace }}/orch/target/release/taritd
+        run: |
+          sudo -E env "PATH=$PATH" bash test/e2e.sh snapshot-disk
+
+      - name: Run KVM integration suite
+        working-directory: vmm
+        run: |
+          sudo -E env "PATH=$HOME/.cargo/bin:$PATH" cargo test --locked --workspace \
+            --features vmm-core/kvm \
+            --features vmm-core/boot \
+            --features vmm-memory-backend/kvm \
+            --features vmm-integration/kvm \
+            -- --include-ignored
+
+      - name: Prove orchestrated cold create-to-exec path
+        env:
+          TARIT_KERNEL: /tmp/vmlinux.microvm
+          TARIT_ROOTFS: /tmp/vsock-rootfs.ext4
+          TARIT_VMM_BIN: ${{ github.workspace }}/vmm/target/release/vmm
+          MODE: direct
+          BENCHMARK_MODE: sequential
+          TARGET: "1"
+          N: "100"
+          MEM: "256"
+          CMD: "true"
+          MAX_P99_MS: "5000"
+          MIN_SUCCESS_PERCENT: "100"
+          RESULTS_DIR: ${{ github.workspace }}/perf-orch/cold
+        run: sudo -E env "PATH=$PATH" bash orch/scripts/bench-warmpool.sh
+
+      - name: Prove orchestrated warm handout create-to-exec path
+        env:
+          TARIT_KERNEL: /tmp/vmlinux.microvm
+          TARIT_ROOTFS: /tmp/vsock-rootfs.ext4
+          TARIT_VMM_BIN: ${{ github.workspace }}/vmm/target/release/vmm
+          MODE: restore
+          BENCHMARK_MODE: sequential
+          TARGET: "32"
+          N: "100"
+          MEM: "256"
+          CMD: "true"
+          MAX_P99_MS: "1000"
+          MIN_SUCCESS_PERCENT: "100"
+          RESULTS_DIR: ${{ github.workspace }}/perf-orch/warm
+        run: sudo -E env "PATH=$PATH" bash orch/scripts/bench-warmpool.sh
+
+      - name: Enforce startup performance ceilings
+        working-directory: vmm
+        run: |
+          set -o pipefail
+          sudo -E env \
+            VMM="$PWD/target/release/vmm" \
+            KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}" \
+            ROOTFS="${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}" \
+            VMM_PERF_STRICT=1 \
+            bash ci/perf-gates.sh 2>&1 | tee perf-results.txt
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kvm-performance-${{ github.run_id }}
+          path: vmm/perf-results.txt
+          if-no-files-found: ignore
+
+      - name: Upload orchestrator benchmark results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: orchestrator-performance-${{ github.run_id }}
+          path: perf-orch
+          if-no-files-found: ignore
+
+      - name: Reclaim root-owned workspace files
+        # Several steps run under sudo and leave root-owned artifacts that
+        # break the next checkout on this persistent runner.
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"

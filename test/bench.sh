@@ -6,12 +6,13 @@
 # staggered, and burst modes, and writes a results table.
 #
 #   sudo test/bench.sh                 # warm-pool TTI, defaults from BENCHMARK-RESULTS.md
-#   sudo MODE=cold N=50 test/bench.sh  # cold-boot each VM instead of restore-from-golden
+#   sudo MODE=cold N=100 test/bench.sh   # warm handout, pool refilled by cold boot
+#   sudo MODE=direct N=100 test/bench.sh # actual cold create-to-exec path
 #
 # Bare metal gives the headline numbers; a nested-KVM guest works too but pays a
 # ~10x KVM-exit tax (the runner warns about this).
 set -uo pipefail
-HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 . "$HERE/lib/preflight.sh"
 
 require_kvm

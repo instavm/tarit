@@ -209,14 +209,21 @@ fn remove_owned_scratch_file(file: &OwnedScratchFile) {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 struct OwnedOverlayGuard {
     files: Vec<OwnedScratchFile>,
     armed: bool,
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 impl OwnedOverlayGuard {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     fn create(config: &VmConfig) -> Result<Self> {
         let mut files = Vec::new();
         for path in config
@@ -245,13 +252,17 @@ impl OwnedOverlayGuard {
         Self { files, armed: true }
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     fn disarm(mut self) -> Vec<OwnedScratchFile> {
         self.armed = false;
         std::mem::take(&mut self.files)
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 impl Drop for OwnedOverlayGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -885,6 +896,20 @@ impl VmmController {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub fn restore(&self, snapshot_path: &str, overlay: Option<String>) -> Result<()> {
+        self.restore_with_overrides(snapshot_path, overlay, None)
+    }
+
+    /// Restore a snapshot while explicitly replacing host-bound resources.
+    /// Network bindings are never inferred or merged: a networked snapshot
+    /// requires a same-cardinality replacement so stale tap/IP assignments
+    /// cannot be reused on a different host.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn restore_with_overrides(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net_override: Option<Vec<crate::config::NetConfig>>,
+    ) -> Result<()> {
         use std::time::Instant;
 
         let start = Instant::now();
@@ -991,20 +1016,13 @@ impl VmmController {
             volumes,
             net,
         };
-        let requested_overlay = overlay.is_some();
-        let overlay_seed = restore_overlay_seed(&config, overlay.as_deref())?;
+        apply_restore_network_override(&mut config, net_override)?;
+        let overlay_guard = match overlay.as_deref() {
+            Some(target) => prepare_restore_overlay(&config, target)?,
+            None => OwnedOverlayGuard::from_created(Vec::new()),
+        };
         apply_restore_overlay(&mut config, overlay)?;
         config.validate()?;
-        let overlay_guard = if let Some((golden_overlay, clone_overlay)) = overlay_seed {
-            OwnedOverlayGuard::from_created(vec![seed_restore_overlay(
-                &golden_overlay,
-                &clone_overlay,
-            )?])
-        } else if requested_overlay {
-            OwnedOverlayGuard::create(&config)?
-        } else {
-            OwnedOverlayGuard::from_created(Vec::new())
-        };
 
         // Keep the owned state blob aligned with the restored config. Future
         // snapshots start from this blob and only patch in live device/vCPU
@@ -1012,6 +1030,7 @@ impl VmmController {
         // point back at the shared golden upper layer.
         let state_blob = if let Some(saved) = saved.as_mut() {
             saved.volumes = config.volumes.clone();
+            saved.net = config.net.clone();
             postcard::to_allocvec(saved).unwrap_or_else(|_| state_blob.clone())
         } else {
             state_blob
@@ -1023,18 +1042,16 @@ impl VmmController {
         // never hard-fails.
         let (running, state) = match vcpu_full.as_ref() {
             Some(fs) => {
-                match build_running_vm(
-                    mem.clone(),
-                    &config,
-                    fs,
-                    &ap_states,
-                    vm_full.as_ref(),
-                    &serial_state,
-                    &virtio_blk,
-                    &virtio_net,
-                    vsock_state.as_ref(),
-                    entry,
-                ) {
+                let restored = RestoredRuntimeState {
+                    vcpu: fs,
+                    aps: &ap_states,
+                    vm: vm_full.as_ref(),
+                    serial: &serial_state,
+                    virtio_blk: &virtio_blk,
+                    virtio_net: &virtio_net,
+                    vsock: vsock_state.as_ref(),
+                };
+                match build_running_vm(mem.clone(), &config, restored, entry) {
                     Ok(r) => (Some(r), VmState::Running),
                     Err(e) => {
                         log::warn!(
@@ -1072,6 +1089,16 @@ impl VmmController {
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
     pub fn restore(&self, _snapshot_path: &str, _overlay: Option<String>) -> Result<()> {
+        Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn restore_with_overrides(
+        &self,
+        _snapshot_path: &str,
+        _overlay: Option<String>,
+        _net_override: Option<Vec<crate::config::NetConfig>>,
+    ) -> Result<()> {
         Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
     }
 
@@ -1796,6 +1823,36 @@ fn apply_restore_overlay(config: &mut VmConfig, overlay: Option<String>) -> Resu
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
+fn apply_restore_network_override(
+    config: &mut VmConfig,
+    net_override: Option<Vec<crate::config::NetConfig>>,
+) -> Result<()> {
+    match net_override {
+        None if !config.net.is_empty() => Err(VmmError::InvalidConfig(
+            "networked snapshot restore requires an explicit net replacement".into(),
+        )),
+        None => Ok(()),
+        Some(replacement) if replacement.len() != config.net.len() => {
+            Err(VmmError::InvalidConfig(format!(
+                "restore net replacement count {} does not match snapshot device count {}",
+                replacement.len(),
+                config.net.len()
+            )))
+        }
+        Some(replacement) => {
+            config.net = replacement;
+            // Validate before any tap is opened. VmConfig validation also
+            // rejects duplicate taps, MACs, IPs, and host port bindings.
+            config.validate()?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn restore_overlay_seed(
     config: &VmConfig,
     overlay: Option<&str>,
@@ -1821,6 +1878,72 @@ fn restore_overlay_seed(
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
+fn prepare_restore_overlay(config: &VmConfig, target: &str) -> Result<OwnedOverlayGuard> {
+    match OwnedScratchFile::adopt_private(target) {
+        Ok(adopted) => {
+            // A preseeded target is authoritative. Never reopen the overlay
+            // serialized in the RAM image: the source VM may already be gone.
+            // But adopting the golden overlay itself would share its writable
+            // state with the clone and delete it on stop, so refuse aliases.
+            reject_golden_overlay_target(config, target, &adopted)?;
+            return Ok(OwnedOverlayGuard::from_created(vec![adopted]));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(VmmError::Snapshot(format!(
+                "adopt private restore overlay {target}: {error}"
+            )));
+        }
+    }
+
+    let target_path = PathBuf::from(target);
+    let owned = match restore_overlay_seed(config, Some(target))? {
+        Some((source, target)) => seed_restore_overlay(&source, &target)?,
+        None => OwnedScratchFile::create_new(&target_path).map_err(|error| {
+            VmmError::Snapshot(format!(
+                "create private restore overlay {}: {error}",
+                target_path.display()
+            ))
+        })?,
+    };
+    Ok(OwnedOverlayGuard::from_created(vec![owned]))
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn reject_golden_overlay_target(
+    config: &VmConfig,
+    target: &str,
+    adopted: &OwnedScratchFile,
+) -> Result<()> {
+    let Some(source) = restore_overlay_volume_index(&config.volumes)
+        .and_then(|index| config.volumes[index].overlay.as_deref())
+    else {
+        return Ok(());
+    };
+    // Path equality catches the direct case; inode identity catches aliased
+    // spellings of the same file. A missing source cannot alias anything.
+    let aliases_golden = source == target
+        || match OwnedScratchFile::identity_for(Path::new(source)) {
+            Ok(identity) => adopted.identity().is_some_and(|adopted| {
+                adopted.device == identity.device && adopted.inode == identity.inode
+            }),
+            Err(_) => false,
+        };
+    if aliases_golden {
+        return Err(VmmError::InvalidConfig(format!(
+            "restore overlay must differ from golden overlay: {target}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile> {
     if source == target {
         return Err(VmmError::InvalidConfig(format!(
@@ -1836,11 +1959,13 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
         ))
     })?;
     let copy_result = (|| -> std::io::Result<()> {
-        let mut source_file = std::fs::File::open(source)?;
+        let source_owned = OwnedScratchFile::adopt_private(source)?;
+        let mut source_file = source_owned.file().try_clone()?;
         let mut target_file = owned_target.file().try_clone()?;
         let result = copy_restore_overlay(&mut source_file, &mut target_file);
         drop(target_file);
         drop(source_file);
+        drop(source_owned);
         result
     })();
 
@@ -1865,6 +1990,20 @@ fn copy_restore_overlay(
 ) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
+        use std::os::fd::AsRawFd;
+
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+        if cloned == 0 {
+            return target.sync_all();
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) | Some(libc::EXDEV) | Some(libc::EINVAL)
+        ) {
+            return Err(error);
+        }
         copy_sparse_restore_overlay(source, target)
     }
 
@@ -1941,11 +2080,12 @@ fn copy_sparse_restore_overlay(
                 error.raw_os_error(),
                 Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
             ) {
-                target.set_len(0)?;
-                source.seek(SeekFrom::Start(0))?;
-                target.seek(SeekFrom::Start(0))?;
-                std::io::copy(source, target)?;
-                return target.sync_all();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "reflink and sparse extent discovery are unavailable; refusing dense overlay copy: {error}"
+                    ),
+                ));
             }
             return Err(error);
         }
@@ -2045,7 +2185,7 @@ pub(crate) fn write_snapshot_file(
         state_blob,
         mem_dump,
         diff,
-        SnapshotCreateMode::Truncate,
+        SnapshotCreateMode::CreateNew,
     )
 }
 
@@ -2065,7 +2205,7 @@ fn write_scratch_snapshot_file(
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 enum SnapshotCreateMode {
-    Truncate,
+    CreateNew,
 }
 
 #[cfg(any(
@@ -2074,8 +2214,18 @@ enum SnapshotCreateMode {
 ))]
 fn open_snapshot_output(path: &str, mode: SnapshotCreateMode) -> Result<std::fs::File> {
     match mode {
-        SnapshotCreateMode::Truncate => std::fs::File::create(path)
-            .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}"))),
+        SnapshotCreateMode::CreateNew => {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            options
+                .open(path)
+                .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}")))
+        }
     }
 }
 
@@ -2155,7 +2305,7 @@ fn write_diff_snapshot_file(
         state_blob,
         mem,
         dirty,
-        SnapshotCreateMode::Truncate,
+        SnapshotCreateMode::CreateNew,
     )
 }
 
@@ -2170,7 +2320,7 @@ fn write_scratch_diff_snapshot_file(
     write_diff_snapshot_to_file(owned_file.file(), parent, state_blob, mem, dirty)
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn write_diff_snapshot_file_with_mode(
     path: &str,
     parent: &str,
@@ -2179,8 +2329,8 @@ fn write_diff_snapshot_file_with_mode(
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
     mode: SnapshotCreateMode,
 ) -> Result<usize> {
-    let mut file = open_snapshot_output(path, mode)?;
-    write_diff_snapshot_to_file(&mut file, parent, state_blob, mem, dirty)
+    let file = open_snapshot_output(path, mode)?;
+    write_diff_snapshot_to_file(&file, parent, state_blob, mem, dirty)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -2264,6 +2414,32 @@ const MAX_DIFF_CHAIN_DEPTH: usize = 1024;
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
 const MAX_EAGER_DIFF_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn open_snapshot_input(path: &Path) -> Result<std::fs::File> {
+    let display = path.display();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| VmmError::Snapshot(format!("open {display}: {e}")))?;
+    if !file
+        .metadata()
+        .map_err(|e| VmmError::Snapshot(format!("stat {display}: {e}")))?
+        .file_type()
+        .is_file()
+    {
+        return Err(VmmError::Snapshot(format!(
+            "snapshot is not a regular file: {display}"
+        )));
+    }
+    Ok(file)
+}
 
 #[cfg(any(
     test,
@@ -2405,6 +2581,11 @@ fn parse_full_snapshot_header(
             "truncated full snapshot: need {expected_len} bytes, got {file_len}"
         )));
     }
+    if file_len > expected_len {
+        return Err(VmmError::Snapshot(format!(
+            "full snapshot has trailing data: expected {expected_len} bytes, got {file_len}"
+        )));
+    }
     Ok(FullSnapshotHeader {
         flags,
         layout,
@@ -2420,12 +2601,12 @@ fn validate_snapshot_lengths(state_len: u64, mem_len: u64, path: &str) -> Result
             "state blob too large in {path}: {state_len} bytes"
         )));
     }
-    if mem_len < crate::config::MIB || mem_len > crate::config::MAX_MEMORY_BYTES {
+    if !(crate::config::MIB..=crate::config::MAX_MEMORY_BYTES).contains(&mem_len) {
         return Err(VmmError::Snapshot(format!(
             "memory image size out of range in {path}: {mem_len} bytes"
         )));
     }
-    if mem_len % crate::config::MIB != 0 {
+    if !mem_len.is_multiple_of(crate::config::MIB) {
         return Err(VmmError::Snapshot(format!(
             "memory image size is not MiB-aligned in {path}: {mem_len} bytes"
         )));
@@ -2497,8 +2678,7 @@ struct RestoredSnapshot {
 fn try_lazy_restore_full_snapshot(path: &str) -> Result<Option<RestoredSnapshot>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file =
-        std::fs::File::open(path).map_err(|e| VmmError::Snapshot(format!("open {path}: {e}")))?;
+    let mut file = open_snapshot_input(Path::new(path))?;
     let file_len = file
         .metadata()
         .map_err(|e| VmmError::Snapshot(format!("stat {path}: {e}")))?
@@ -2611,6 +2791,13 @@ fn ensure_file_has_bytes(
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn canonical_snapshot_tip(path: &str) -> Result<(PathBuf, PathBuf)> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| VmmError::Snapshot(format!("stat snapshot {path}: {e}")))?;
+    if !metadata.file_type().is_file() {
+        return Err(VmmError::Snapshot(format!(
+            "snapshot tip must be a regular non-symlink file: {path}"
+        )));
+    }
     let tip = std::fs::canonicalize(path)
         .map_err(|e| VmmError::Snapshot(format!("canonicalize {path}: {e}")))?;
     let root = tip
@@ -2631,6 +2818,15 @@ fn resolve_snapshot_parent(parent: &str, snapshot_root: &Path) -> Result<PathBuf
     } else {
         snapshot_root.join(parent_path)
     };
+    let metadata = std::fs::symlink_metadata(&candidate).map_err(|e| {
+        VmmError::Snapshot(format!("stat diff parent {}: {e}", candidate.display()))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(VmmError::Snapshot(format!(
+            "diff parent must be a regular non-symlink file: {}",
+            candidate.display()
+        )));
+    }
     let canonical = std::fs::canonicalize(&candidate).map_err(|e| {
         VmmError::Snapshot(format!(
             "canonicalize diff parent {}: {e}",
@@ -2651,8 +2847,7 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
     use std::io::{Read, Seek, SeekFrom};
 
     let path_display = path.display().to_string();
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| VmmError::Snapshot(format!("open {path_display}: {e}")))?;
+    let mut file = open_snapshot_input(path)?;
     let file_len = file
         .metadata()
         .map_err(|e| VmmError::Snapshot(format!("stat {path_display}: {e}")))?
@@ -2815,6 +3010,14 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
             rd(&mut file, &mut bytes, "read page bytes")?;
             pages.push((gpa, bytes));
         }
+        let consumed = file
+            .stream_position()
+            .map_err(|e| VmmError::Snapshot(format!("tell {path_display}: {e}")))?;
+        if consumed != file_len {
+            return Err(VmmError::Snapshot(format!(
+                "diff snapshot has trailing data: parsed {consumed} of {file_len} bytes"
+            )));
+        }
         Ok(SnapshotContent::Diff {
             parent,
             state,
@@ -2833,7 +3036,10 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>)> {
     // Follow the chain tip→base, collecting each diff's (state, pages).
-    let mut diffs: Vec<(Vec<u8>, Vec<(u64, Vec<u8>)>)> = Vec::new();
+    type DiffPages = Vec<(u64, Vec<u8>)>;
+    type DiffChain = Vec<(Vec<u8>, DiffPages)>;
+
+    let mut diffs: DiffChain = Vec::new();
     let mut chain_page_bytes = 0u64;
     let (mut cur, snapshot_root) = canonical_snapshot_tip(path)?;
     let mut seen = std::collections::HashSet::new();
@@ -3042,16 +3248,21 @@ fn restore_virtio_net_states(
 /// vCPU state instead of setting up a fresh boot entry, and does NOT rewrite the
 /// kernel/GDT/ACPI tables (they are already present in the restored memory).
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+struct RestoredRuntimeState<'a> {
+    vcpu: &'a crate::vcpu_setup::VcpuFullState,
+    aps: &'a [crate::vcpu_setup::VcpuFullState],
+    vm: Option<&'a crate::kvm::VmFullState>,
+    serial: &'a vmm_devices::serial::SerialState,
+    virtio_blk: &'a [Vec<u8>],
+    virtio_net: &'a [Vec<u8>],
+    vsock: Option<&'a vmm_devices::virtio::vsock::VirtioVsockMmioState>,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn build_running_vm(
     mem: vmm_memory_backend::GuestMemory,
     config: &VmConfig,
-    full_state: &crate::vcpu_setup::VcpuFullState,
-    ap_states: &[crate::vcpu_setup::VcpuFullState],
-    vm_state: Option<&crate::kvm::VmFullState>,
-    serial_state: &vmm_devices::serial::SerialState,
-    virtio_blk_states: &[Vec<u8>],
-    virtio_net_states: &[Vec<u8>],
-    vsock_state: Option<&vmm_devices::virtio::vsock::VirtioVsockMmioState>,
+    restored: RestoredRuntimeState<'_>,
     entry: u64,
 ) -> Result<RunningVm> {
     use crate::vcpu_thread::VcpuThread;
@@ -3070,9 +3281,9 @@ fn build_running_vm(
         rng_irq,
         vsock,
     } = build_devices(config, &mem)?;
-    restore_virtio_blk_states(&mut blks, virtio_blk_states);
+    restore_virtio_blk_states(&mut blks, restored.virtio_blk);
     let mut net_devices: Vec<_> = nets.iter().map(|n| n.dev.clone()).collect();
-    restore_virtio_net_states(&mut net_devices, virtio_net_states);
+    restore_virtio_net_states(&mut net_devices, restored.virtio_net);
     let mut irq_evts: Vec<vmm_sys_util::eventfd::EventFd> = blk_irq_evts;
 
     let template = crate::cpu_template::CpuTemplate::bare();
@@ -3083,7 +3294,7 @@ fn build_running_vm(
     // would be masked/default and post-restore device I/O would stall waiting
     // for interrupts). Must happen after the irqchip/PIT exist (new_with_options
     // created them) and before the vCPU runs.
-    if let Some(vm_state) = vm_state {
+    if let Some(vm_state) = restored.vm {
         kvm_vm.restore_vm_state(vm_state)?;
     }
 
@@ -3112,7 +3323,7 @@ fn build_running_vm(
     // Replay the guest's captured UART programming so the restored serial
     // re-arms its RX interrupt; without this, host→guest bytes (exec commands)
     // raise no IRQ and the guest agent never wakes — exec hangs post-restore.
-    vmm_devices::persist::Persist::restore(&mut serial_dev, serial_state.clone());
+    vmm_devices::persist::Persist::restore(&mut serial_dev, restored.serial.clone());
     let serial = Arc::new(serial_dev);
     irq_evts.push(serial_evt);
 
@@ -3177,7 +3388,7 @@ fn build_running_vm(
             // until the vCPU is resumed (below). An RST delivered while the vCPU
             // is still paused raises an RX completion interrupt the paused LAPIC
             // drops, so the guest never sees the reset and never re-dials.
-            let reset = vsock_state.map(|state| {
+            let reset = restored.vsock.map(|state| {
                 device.restore_transport_state(state);
                 (device.clone(), state.connections.clone())
             });
@@ -3205,7 +3416,7 @@ fn build_running_vm(
     // applied; the captured LAPIC already carries the LVT config, so we do not
     // re-run set_lint here.
     kvm_vm.setup_cpuid(&vcpu)?;
-    crate::vcpu_setup::restore_vcpu_full_state(&vcpu, full_state)?;
+    crate::vcpu_setup::restore_vcpu_full_state(&vcpu, restored.vcpu)?;
     kvm_vm.apply_cpu_template_msrs(&vcpu)?;
     let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
 
@@ -3213,8 +3424,8 @@ fn build_running_vm(
     // state (which includes its RUNNABLE MP_STATE + LAPIC), so the restored VM
     // comes back with all vCPUs online. Per-AP CPUID (with its APIC id) is set
     // before the saved state, matching create_live.
-    let mut ap_threads = Vec::with_capacity(ap_states.len());
-    for (i, ap_state) in ap_states.iter().enumerate() {
+    let mut ap_threads = Vec::with_capacity(restored.aps.len());
+    for (i, ap_state) in restored.aps.iter().enumerate() {
         let id = (i + 1) as u8;
         let ap = kvm_vm.create_vcpu(id)?;
         kvm_vm.apply_boot_cpuid(&ap, id)?;
@@ -3520,7 +3731,24 @@ fn serialize_state_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{KernelConfig, MemoryConfig, VcpuConfig, VmConfig, VolumeConfig};
+    use crate::config::{
+        KernelConfig, MemoryConfig, NetConfig, VcpuConfig, VmConfig, VolumeConfig,
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(unix)]
+    fn write_private(path: &Path, bytes: &[u8]) {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path).expect("create private test file");
+        std::io::Write::write_all(&mut file, bytes).expect("write private test file");
+        file.sync_all().expect("sync private test file");
+    }
 
     fn cfg() -> VmConfig {
         VmConfig {
@@ -3534,6 +3762,49 @@ mod tests {
             volumes: vec![],
             net: vec![],
         }
+    }
+
+    fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {
+        NetConfig {
+            tap: tap.into(),
+            guest_mac: Some(mac.into()),
+            guest_ip: Some(ip.into()),
+            port_forwards: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_networks_require_an_explicit_valid_replacement() {
+        let mut config = cfg();
+        config.net = vec![net("tap-old", "02:00:00:00:00:01", "10.0.0.2")];
+        let error = apply_restore_network_override(&mut config, None).unwrap_err();
+        assert!(error.to_string().contains("explicit net replacement"));
+
+        let error = apply_restore_network_override(&mut config, Some(Vec::new())).unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+
+        apply_restore_network_override(
+            &mut config,
+            Some(vec![net("tap-new", "02:00:00:00:00:02", "10.0.0.3")]),
+        )
+        .unwrap();
+        assert_eq!(config.net[0].tap, "tap-new");
+        assert_eq!(config.net[0].guest_ip.as_deref(), Some("10.0.0.3"));
+    }
+
+    #[test]
+    fn restore_network_replacement_rejects_duplicate_host_bindings() {
+        let mut config = cfg();
+        config.net = vec![
+            net("tap-old-a", "02:00:00:00:00:01", "10.0.0.2"),
+            net("tap-old-b", "02:00:00:00:00:02", "10.0.0.3"),
+        ];
+        let duplicate = net("tap-new", "02:00:00:00:00:03", "10.0.0.4");
+        assert!(apply_restore_network_override(
+            &mut config,
+            Some(vec![duplicate.clone(), duplicate])
+        )
+        .is_err());
     }
 
     #[test]
@@ -3683,7 +3954,7 @@ mod tests {
         let cleanup = [golden.clone(), clone.clone()];
         let golden_bytes = b"golden writable upper state";
 
-        std::fs::write(&golden, golden_bytes).expect("write golden upper");
+        write_private(&golden, golden_bytes);
         seed_restore_overlay(&golden, &clone).expect("seed clone upper");
 
         assert_eq!(
@@ -3724,8 +3995,8 @@ mod tests {
         let golden = dir.join(format!("{unique}-golden.cow"));
         let clone = dir.join(format!("{unique}-clone.cow"));
         let existing_bytes = b"another clone owns this overlay";
-        std::fs::write(&golden, b"golden state").expect("write golden upper");
-        std::fs::write(&clone, existing_bytes).expect("write existing clone upper");
+        write_private(&golden, b"golden state");
+        write_private(&clone, existing_bytes);
 
         seed_restore_overlay(&golden, &clone).expect_err("existing target must reject seeding");
 
@@ -3735,6 +4006,77 @@ mod tests {
         );
         let _ = std::fs::remove_file(golden);
         let _ = std::fs::remove_file(clone);
+    }
+
+    #[test]
+    fn preseeded_restore_overlay_never_reopens_saved_source() {
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-preseeded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let missing_source = dir.join(format!("{unique}-deleted-source.cow"));
+        let target = dir.join(format!("{unique}-target.cow"));
+        let checkpoint = b"snapshot-owned checkpoint";
+        write_private(&target, checkpoint);
+
+        let mut config = cfg();
+        config.volumes = vec![VolumeConfig {
+            path: "/base/rootfs.ext4".into(),
+            read_only: true,
+            overlay: Some(missing_source.display().to_string()),
+        }];
+        let guard = prepare_restore_overlay(&config, target.to_str().unwrap())
+            .expect("adopt the orchestrator-preseeded target");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read adopted target"),
+            checkpoint,
+            "VMM must not overwrite the preseeded target from saved metadata"
+        );
+        drop(guard);
+        assert!(
+            !target.exists(),
+            "failed restore cleanup must remove the exact adopted target"
+        );
+    }
+
+    #[test]
+    fn restore_overlay_refuses_to_adopt_the_golden_overlay() {
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-golden-adopt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let golden = dir.join(format!("{unique}-golden.cow"));
+        let golden_bytes = b"reusable golden upper state";
+        write_private(&golden, golden_bytes);
+
+        let mut config = cfg();
+        config.volumes = vec![VolumeConfig {
+            path: "/base/rootfs.ext4".into(),
+            read_only: true,
+            overlay: Some(golden.display().to_string()),
+        }];
+
+        let err = match prepare_restore_overlay(&config, golden.to_str().unwrap()) {
+            Ok(_) => panic!("golden overlay must never be adopted as a restore target"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VmmError::InvalidConfig(_)));
+        assert_eq!(
+            std::fs::read(&golden).expect("golden overlay must survive"),
+            golden_bytes
+        );
+        let _ = std::fs::remove_file(golden);
     }
 
     #[test]
@@ -3902,6 +4244,38 @@ mod tests {
         for p in [base_s, d1_s, d2_s] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn restore_rejects_snapshot_symlinks_and_trailing_data() {
+        use std::io::Write;
+
+        let dir = private_runtime_dir().unwrap();
+        let base = unique_runtime_file_path("snapshot-input-test", "snap").unwrap();
+        let link = dir.join(format!("snapshot-input-link-{}.snap", std::process::id()));
+        let memory = vec![0u8; crate::config::MIB as usize];
+        write_snapshot_file(base.to_str().unwrap(), b"state", &memory, false).unwrap();
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+
+        let symlink_error = load_snapshot_chain(link.to_str().unwrap())
+            .err()
+            .expect("snapshot symlink must be rejected");
+        assert!(symlink_error.to_string().contains("non-symlink"));
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&base)
+            .unwrap()
+            .write_all(b"trailing")
+            .unwrap();
+        let trailing_error = load_snapshot_chain(base.to_str().unwrap())
+            .err()
+            .expect("snapshot trailing data must be rejected");
+        assert!(trailing_error.to_string().contains("trailing data"));
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(base);
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]

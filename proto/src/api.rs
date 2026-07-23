@@ -1,6 +1,6 @@
 //! Request / response types for the control plane (1:1 model — no VM ids).
 
-use crate::config::VmConfig;
+use crate::config::{NetConfig, VmConfig};
 use crate::state::VmStatus;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,13 @@ pub enum ApiRequest {
         snapshot_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overlay: Option<String>,
+        /// Explicit replacement for snapshot-saved host network bindings.
+        /// `Some([])` is valid only for a networkless snapshot. NIC addition or
+        /// removal is unsupported because restored MMIO topology must match.
+        /// `None` is accepted only when the snapshot itself has no NIC,
+        /// preventing stale tap/IP reuse.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net: Option<Vec<NetConfig>>,
     },
     Stop,
     /// Execute a command in the guest.
@@ -270,9 +277,11 @@ mod tests {
             ApiRequest::Restore {
                 snapshot_path,
                 overlay,
+                net,
             } => {
                 assert_eq!(snapshot_path, "/golden.snap");
                 assert_eq!(overlay, None);
+                assert!(net.is_none());
             }
             _ => panic!("expected restore"),
         }
@@ -283,6 +292,7 @@ mod tests {
         let r = ApiRequest::Restore {
             snapshot_path: "/golden.snap".into(),
             overlay: Some("/clones/a.cow".into()),
+            net: None,
         };
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -294,8 +304,30 @@ mod tests {
             back,
             ApiRequest::Restore {
                 snapshot_path,
-                overlay: Some(overlay)
+                overlay: Some(overlay),
+                net: None,
             } if snapshot_path == "/golden.snap" && overlay == "/clones/a.cow"
+        ));
+    }
+
+    #[test]
+    fn request_restore_round_trips_with_explicit_network_rebind() {
+        let r = ApiRequest::Restore {
+            snapshot_path: "/golden.snap".into(),
+            overlay: None,
+            net: Some(vec![NetConfig {
+                tap: "tap-new".into(),
+                guest_mac: Some("02:00:00:00:00:02".into()),
+                guest_ip: Some("10.0.0.3".into()),
+                port_forwards: Vec::new(),
+            }]),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ApiRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            ApiRequest::Restore { net: Some(net), .. }
+                if net.len() == 1 && net[0].tap == "tap-new"
         ));
     }
 

@@ -79,29 +79,63 @@ fn map_deadline_io_error(error: std::io::Error, deadline: Instant) -> VmmError {
     }
 }
 
-fn retry_connect_error(error: &std::io::Error) -> bool {
+fn phase_poll_expired(error: &std::io::Error, deadline: Instant) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-    ) || error.raw_os_error() == Some(libc::EAGAIN)
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) && Instant::now() < deadline
+}
+
+/// Block until `stream` is ready for `events` or the request deadline passes.
+/// Deadline-bounded I/O polls readiness instead of re-arming `SO_RCVTIMEO` /
+/// `SO_SNDTIMEO` around every syscall: macOS `setsockopt` intermittently
+/// fails with EINVAL once the peer has shut the socket down, which turned a
+/// completed VMM response into a spurious client error.
+fn wait_for_stream_ready(
+    stream: &UnixStream,
+    events: libc::c_short,
+    deadline: Instant,
+) -> Result<(), VmmError> {
+    loop {
+        let remaining = request_phase_timeout(Some(deadline), Instant::now(), Duration::MAX)?;
+        let timeout_ms = remaining
+            .as_millis()
+            .min(i32::MAX as u128)
+            .try_into()
+            .expect("bounded poll timeout fits i32");
+        let mut poll_fd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready == 0 {
+            return Err(VmmError::Io(request_timeout_error()));
+        }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(VmmError::Io(error));
+        }
+        return Ok(());
+    }
 }
 
 fn write_all_until(
     stream: &mut UnixStream,
     bytes: &[u8],
     deadline: Instant,
-    fallback: Duration,
 ) -> Result<(), VmmError> {
     let mut remaining = bytes;
     while !remaining.is_empty() {
-        stream.set_write_timeout(Some(request_phase_timeout(
-            Some(deadline),
-            Instant::now(),
-            fallback,
-        )?))?;
-        let written = stream
-            .write(remaining)
-            .map_err(|error| map_deadline_io_error(error, deadline))?;
+        wait_for_stream_ready(stream, libc::POLLOUT, deadline)?;
+        let written = match stream.write(remaining) {
+            Ok(written) => written,
+            Err(error) if phase_poll_expired(&error, deadline) => continue,
+            Err(error) => return Err(map_deadline_io_error(error, deadline)),
+        };
         if written == 0 {
             return Err(VmmError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -117,18 +151,18 @@ fn read_exact_until(
     stream: &mut UnixStream,
     bytes: &mut [u8],
     deadline: Instant,
-    fallback: Duration,
 ) -> Result<(), VmmError> {
     let mut remaining = bytes;
     while !remaining.is_empty() {
-        stream.set_read_timeout(Some(request_phase_timeout(
-            Some(deadline),
-            Instant::now(),
-            fallback,
-        )?))?;
-        let read = stream
-            .read(remaining)
-            .map_err(|error| map_deadline_io_error(error, deadline))?;
+        // A VMM op that dumps guest RAM (suspend, snapshot) is silent for far
+        // longer than any per-read stream timeout; only the request deadline
+        // fails it.
+        wait_for_stream_ready(stream, libc::POLLIN, deadline)?;
+        let read = match stream.read(remaining) {
+            Ok(read) => read,
+            Err(error) if phase_poll_expired(&error, deadline) => continue,
+            Err(error) => return Err(map_deadline_io_error(error, deadline)),
+        };
         if read == 0 {
             return Err(VmmError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -140,32 +174,29 @@ fn read_exact_until(
     Ok(())
 }
 
+fn retry_connect_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    ) || error.raw_os_error() == Some(libc::EAGAIN)
+}
+
 fn write_api_frame_until(
     stream: &mut UnixStream,
     body: &[u8],
     deadline: Instant,
-    fallback: Duration,
 ) -> Result<(), VmmError> {
     let len = body.len() as u32;
-    write_all_until(stream, &len.to_be_bytes(), deadline, fallback)?;
-    write_all_until(stream, body, deadline, fallback)?;
-    stream.set_write_timeout(Some(request_phase_timeout(
-        Some(deadline),
-        Instant::now(),
-        fallback,
-    )?))?;
+    write_all_until(stream, &len.to_be_bytes(), deadline)?;
+    write_all_until(stream, body, deadline)?;
     stream
         .flush()
         .map_err(|error| map_deadline_io_error(error, deadline))
 }
 
-fn read_api_frame_until(
-    stream: &mut UnixStream,
-    deadline: Instant,
-    fallback: Duration,
-) -> Result<Vec<u8>, VmmError> {
+fn read_api_frame_until(stream: &mut UnixStream, deadline: Instant) -> Result<Vec<u8>, VmmError> {
     let mut len_buf = [0u8; 4];
-    read_exact_until(stream, &mut len_buf, deadline, fallback)?;
+    read_exact_until(stream, &mut len_buf, deadline)?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_API_FRAME_LEN {
         return Err(VmmError::Io(std::io::Error::new(
@@ -174,7 +205,7 @@ fn read_api_frame_until(
         )));
     }
     let mut body = vec![0u8; len];
-    read_exact_until(stream, &mut body, deadline, fallback)?;
+    read_exact_until(stream, &mut body, deadline)?;
     Ok(body)
 }
 
@@ -380,8 +411,8 @@ impl VmmClient {
         let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
         let mut stream = self.connect_for_request(deadline)?;
         let resp_body = if let Some(deadline) = deadline {
-            write_api_frame_until(&mut stream, &body, deadline, self.connect_timeout)?;
-            read_api_frame_until(&mut stream, deadline, self.connect_timeout)?
+            write_api_frame_until(&mut stream, &body, deadline)?;
+            read_api_frame_until(&mut stream, deadline)?
         } else {
             write_api_frame(&mut stream, &body)?;
             read_api_frame(&mut stream)?
@@ -413,6 +444,15 @@ impl VmmClient {
 
     pub fn pause(&self) -> Result<(), VmmError> {
         match self.request_ok(&ApiRequest::Pause)? {
+            ApiResponse::Ok => Ok(()),
+            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
+        }
+    }
+
+    /// Pause vCPUs and release resident guest RAM into the VMM's private lazy
+    /// suspend image. This is distinct from `pause`, which retains RAM.
+    pub fn suspend(&self) -> Result<(), VmmError> {
+        match self.request_ok(&ApiRequest::Suspend)? {
             ApiResponse::Ok => Ok(()),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
@@ -544,9 +584,22 @@ impl VmmClient {
     /// Restore a VM from a snapshot file into this (freshly spawned) `vmm serve`
     /// process, resuming it to a running state.
     pub fn restore(&self, snapshot_path: &str, overlay: Option<String>) -> Result<(), VmmError> {
+        self.restore_with_network_override(snapshot_path, overlay, None)
+    }
+
+    /// Restore while replacing every host-network binding saved in the
+    /// snapshot. Orchestrators must use this with `Some`, including an empty
+    /// vector, so a restore can never silently reuse a stale tap or guest IP.
+    pub fn restore_with_network_override(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net: Option<Vec<NetConfig>>,
+    ) -> Result<(), VmmError> {
         match self.request_ok(&ApiRequest::Restore {
             snapshot_path: snapshot_path.to_string(),
             overlay,
+            net,
         })? {
             ApiResponse::Restored | ApiResponse::Ok => Ok(()),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
@@ -694,10 +747,34 @@ mod tests {
     }
 
     #[test]
+    fn slow_response_within_request_budget_survives_read_poll_intervals() {
+        let socket = socket_path();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket.0).expect("bind test VMM socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            read_api_frame(&mut stream).expect("read request");
+            // Stay silent for several connect-timeout poll intervals, like a
+            // suspend copying guest RAM, then answer within the request budget.
+            std::thread::sleep(Duration::from_millis(400));
+            let body = serde_json::to_vec(&ApiResponse::Ok).expect("encode response");
+            write_api_frame(&mut stream, &body).expect("write response");
+        });
+
+        VmmClient::new(&socket.0)
+            .with_connect_timeout(Duration::from_millis(100))
+            .with_request_timeout(Duration::from_secs(5))
+            .suspend()
+            .expect("a slow suspend within the request budget must succeed");
+        server.join().expect("join server");
+    }
+
+    #[test]
     fn restore_request_round_trips_without_overlay() {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),
             overlay: None,
+            net: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -714,9 +791,11 @@ mod tests {
             ApiRequest::Restore {
                 snapshot_path,
                 overlay,
+                net,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
                 assert_eq!(overlay, None);
+                assert!(net.is_none());
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -727,6 +806,7 @@ mod tests {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),
             overlay: Some("/overlays/clone.cow".into()),
+            net: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -744,9 +824,11 @@ mod tests {
             ApiRequest::Restore {
                 snapshot_path,
                 overlay,
+                net,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
                 assert_eq!(overlay, Some("/overlays/clone.cow".into()));
+                assert!(net.is_none());
             }
             other => panic!("unexpected request: {other:?}"),
         }

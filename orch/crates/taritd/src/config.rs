@@ -491,22 +491,32 @@ pub struct Config {
     pub peer_secret: String,
     /// Optional Postgres URL for global fleet sync (`tokio-postgres`, MIT/Apache-2.0).
     pub database_url: Option<String>,
-    /// Address advertised to peers for HTTP RPC (e.g. http://10.0.0.1:8080).
+    /// HTTPS origin advertised to fleet peers. Plain HTTP is available only
+    /// through the explicit development escape hatch below.
     pub rpc_addr: String,
+    /// Explicit development escape hatch for plaintext peer RPC. Fleet mode is
+    /// HTTPS-only by default because signed caller identity and request metadata
+    /// otherwise cross the network in cleartext. The shared key itself is never
+    /// transmitted.
+    pub allow_insecure_peer_http: bool,
     /// Provision per-VM host networking (tap + /30 + NAT). Requires
     /// CAP_NET_ADMIN (run taritd as root). Off by default.
     pub enable_net: bool,
-    /// Treat the rootfs as an immutable, shared read-only base (virtio-blk
-    /// read-only + `ro` cmdline). Lets many VMs safely share one image without
-    /// journal-recovery corruption; writes go to the agent's tmpfs mounts.
-    /// Env TARIT_ROOTFS_READONLY. Off by default (rw, single-owner rootfs).
+    /// Request read-only guest mount semantics (`ro` kernel cmdline). The host
+    /// always opens the base image immutably and gives each VM a private CoW
+    /// overlay, regardless of this setting. Env TARIT_ROOTFS_READONLY.
     pub rootfs_read_only: bool,
-    /// Expose raw tenant names and VM ids as labels on the unauthenticated
+    /// Expose raw tenant names and VM ids as labels on the authenticated
     /// `/metrics` endpoint. Off by default: tenant and vm_id labels are replaced
     /// with a stable short hash so scraping cannot enumerate tenant or VM
     /// identities. Only enable this when `/metrics` is bound to a trusted
     /// private network. Env TARIT_METRICS_EXPOSE_TENANT_LABELS.
     pub metrics_expose_tenant_labels: bool,
+    /// Public API load-shedding and request envelope limits.
+    pub api_max_in_flight: usize,
+    pub api_requests_per_second: u64,
+    pub api_request_timeout_ms: u64,
+    pub api_max_body_bytes: usize,
     /// Parent cgroup v2 path under which taritd places a per-VM cgroup for each
     /// `vmm serve` child (memory + PID limits), e.g. `/sys/fs/cgroup/tarit`.
     /// When unset, no per-VM cgroup is applied (host must be cgroup v2 and
@@ -546,6 +556,58 @@ pub struct Config {
     pub share_idle_timeout_secs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PtyConnectionLimits {
+    pub(crate) global: usize,
+    pub(crate) per_tenant: usize,
+    pub(crate) per_vm: usize,
+}
+
+impl Default for PtyConnectionLimits {
+    fn default() -> Self {
+        Self {
+            global: 1_024,
+            per_tenant: 128,
+            per_vm: 16,
+        }
+    }
+}
+
+impl PtyConnectionLimits {
+    pub(crate) fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        Self::new(
+            env_positive_usize("TARIT_PTY_MAX_ACTIVE_CONNECTIONS", defaults.global)?,
+            env_positive_usize(
+                "TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT",
+                defaults.per_tenant,
+            )?,
+            env_positive_usize("TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM", defaults.per_vm)?,
+        )
+    }
+
+    fn new(global: usize, per_tenant: usize, per_vm: usize) -> Result<Self> {
+        if global > tokio::sync::Semaphore::MAX_PERMITS {
+            bail!("TARIT_PTY_MAX_ACTIVE_CONNECTIONS exceeds the runtime semaphore capacity");
+        }
+        if per_tenant >= global {
+            bail!(
+                "TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT must be less than TARIT_PTY_MAX_ACTIVE_CONNECTIONS"
+            );
+        }
+        if per_vm > per_tenant {
+            bail!(
+                "TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM must not exceed TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT"
+            );
+        }
+        Ok(Self {
+            global,
+            per_tenant,
+            per_vm,
+        })
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let listen = env::var("TARIT_LISTEN")
@@ -577,17 +639,9 @@ impl Config {
             &env::var("TARIT_IMAGES_DIR").unwrap_or_else(|_| "~/.taritd/images".into()),
         );
 
-        let max_vms = env::var("TARIT_MAX_VMS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(32);
-        let max_vcpus_env = env::var("TARIT_MAX_VCPUS")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let max_memory_mib = env::var("TARIT_MAX_MEMORY_MIB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(65_536);
+        let max_vms = env_positive_usize("TARIT_MAX_VMS", 32)?;
+        let max_vcpus_env = env_optional_positive_u64("TARIT_MAX_VCPUS")?;
+        let max_memory_mib = env_positive_u64("TARIT_MAX_MEMORY_MIB", 65_536)?;
         let database_url = env::var("TARIT_DATABASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
@@ -595,29 +649,36 @@ impl Config {
             load_peer_secret_for_mode(env::var("TARIT_PEER_SECRET").ok(), database_url.is_some())?;
         let rpc_addr = env::var("TARIT_RPC_ADDR")
             .unwrap_or_else(|_| format!("http://{}:{}", listen.ip(), listen.port()));
+        let allow_insecure_peer_http = env_bool_checked("TARIT_ALLOW_INSECURE_PEER_HTTP", false)?;
+        let production_mode = env_bool_checked("TARIT_PRODUCTION", false)?;
+        validate_rpc_addr(
+            &rpc_addr,
+            database_url.is_some(),
+            allow_insecure_peer_http,
+            production_mode,
+        )?;
 
-        let enable_net = env_bool("TARIT_ENABLE_NET", false);
+        let enable_net = env_bool_checked("TARIT_ENABLE_NET", false)?;
 
-        let rootfs_read_only = env_bool("TARIT_ROOTFS_READONLY", false);
+        let rootfs_read_only = env_bool_checked("TARIT_ROOTFS_READONLY", false)?;
 
-        let metrics_expose_tenant_labels = env_bool("TARIT_METRICS_EXPOSE_TENANT_LABELS", false);
+        let metrics_expose_tenant_labels =
+            env_bool_checked("TARIT_METRICS_EXPOSE_TENANT_LABELS", false)?;
+        let api_max_in_flight = env_positive_usize("TARIT_API_MAX_IN_FLIGHT", 1_024)?;
+        let api_requests_per_second = env_positive_u64("TARIT_API_REQUESTS_PER_SECOND", 5_000)?;
+        let api_request_timeout_ms = env_positive_u64("TARIT_API_REQUEST_TIMEOUT_MS", 180_000)?;
+        let api_max_body_bytes = env_positive_usize("TARIT_API_MAX_BODY_BYTES", 1024 * 1024)?;
 
         let vm_cgroup_parent = env::var("TARIT_VM_CGROUP_PARENT")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let vm_cgroup_pids_max = env::var("TARIT_VM_CGROUP_PIDS_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024);
+        let vm_cgroup_pids_max = env_positive_u64("TARIT_VM_CGROUP_PIDS_MAX", 1024)?;
 
         let warm_pool = load_warm_pool(file_config.as_ref())?;
 
-        let admission_timeout_ms = env::var("TARIT_ADMISSION_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60_000);
-        let reap_on_shutdown = env_bool("TARIT_REAP_ON_SHUTDOWN", true);
+        let admission_timeout_ms = env_positive_u64("TARIT_ADMISSION_TIMEOUT_MS", 60_000)?;
+        let reap_on_shutdown = env_bool_checked("TARIT_REAP_ON_SHUTDOWN", true)?;
 
         // CPU overcommit: when the warm pool is on and TARIT_MAX_VCPUS is not
         // pinned, derive the vCPU ceiling from physical cores * overcommit so
@@ -641,7 +702,7 @@ impl Config {
         let env_usize =
             |k: &str, d: usize| env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
         let autoscale = AutoscaleConfig {
-            enabled: env_bool("TARIT_AUTOSCALE", false),
+            enabled: env_bool_checked("TARIT_AUTOSCALE", false)?,
             min_nodes: env_usize("TARIT_AUTOSCALE_MIN", 1),
             max_nodes: env_usize("TARIT_AUTOSCALE_MAX", 10),
             scale_out_free_vcpus: env_u64("TARIT_AUTOSCALE_OUT_FREE_VCPUS", 2),
@@ -651,7 +712,7 @@ impl Config {
                 .filter(|s| !s.is_empty()),
         };
 
-        let ssh_gateway_enabled = env_bool("TARIT_SSH_GATEWAY", false);
+        let ssh_gateway_enabled = env_bool_checked("TARIT_SSH_GATEWAY", false)?;
         let ssh_gateway_addr = env::var("TARIT_SSH_GATEWAY_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:2222".into())
             .parse::<SocketAddr>()
@@ -682,6 +743,18 @@ impl Config {
             share_idle_timeout_secs_raw.as_deref(),
         )?;
 
+        if production_mode {
+            validate_production_requirements(
+                database_url.as_deref(),
+                &vmm_bin,
+                &kernel,
+                &rootfs,
+                enable_net,
+                vm_cgroup_parent.as_deref(),
+                allow_insecure_peer_http,
+            )?;
+        }
+
         Ok(Self {
             listen,
             api_keys,
@@ -699,9 +772,14 @@ impl Config {
             peer_secret,
             database_url,
             rpc_addr,
+            allow_insecure_peer_http,
             enable_net,
             rootfs_read_only,
             metrics_expose_tenant_labels,
+            api_max_in_flight,
+            api_requests_per_second,
+            api_request_timeout_ms,
+            api_max_body_bytes,
             vm_cgroup_parent,
             vm_cgroup_pids_max,
             warm_pool,
@@ -746,12 +824,17 @@ impl fmt::Debug for Config {
                 &self.database_url.as_ref().map(|_| "[REDACTED]"),
             )
             .field("rpc_addr", &self.rpc_addr)
+            .field("allow_insecure_peer_http", &self.allow_insecure_peer_http)
             .field("enable_net", &self.enable_net)
             .field("rootfs_read_only", &self.rootfs_read_only)
             .field(
                 "metrics_expose_tenant_labels",
                 &self.metrics_expose_tenant_labels,
             )
+            .field("api_max_in_flight", &self.api_max_in_flight)
+            .field("api_requests_per_second", &self.api_requests_per_second)
+            .field("api_request_timeout_ms", &self.api_request_timeout_ms)
+            .field("api_max_body_bytes", &self.api_max_body_bytes)
             .field("vm_cgroup_parent", &self.vm_cgroup_parent)
             .field("vm_cgroup_pids_max", &self.vm_cgroup_pids_max)
             .field("warm_pool", &self.warm_pool)
@@ -904,6 +987,84 @@ fn load_peer_secret_for_mode(raw: Option<String>, cluster_mode: bool) -> Result<
     }
 }
 
+fn validate_rpc_addr(
+    raw: &str,
+    cluster_mode: bool,
+    allow_insecure_http: bool,
+    production_mode: bool,
+) -> Result<()> {
+    let url = reqwest::Url::parse(raw).context("TARIT_RPC_ADDR must be an absolute HTTP URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.port_or_known_default().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!(
+            "TARIT_RPC_ADDR must be a normalized http(s) origin without credentials, path, query, or fragment"
+        );
+    }
+    if cluster_mode && url.scheme() != "https" && !allow_insecure_http {
+        bail!(
+            "fleet peer RPC must use https; set TARIT_ALLOW_INSECURE_PEER_HTTP=1 only for an isolated development network"
+        );
+    }
+    if production_mode && (url.scheme() != "https" || allow_insecure_http) {
+        bail!("TARIT_PRODUCTION requires HTTPS peer RPC and forbids insecure peer HTTP");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_production_requirements(
+    database_url: Option<&str>,
+    vmm_bin: &Path,
+    kernel: &Path,
+    rootfs: &Path,
+    enable_net: bool,
+    vm_cgroup_parent: Option<&str>,
+    allow_insecure_peer_http: bool,
+) -> Result<()> {
+    if database_url.is_none() {
+        bail!(
+            "TARIT_PRODUCTION requires TARIT_DATABASE_URL for durable global control-plane state"
+        );
+    }
+    if !enable_net {
+        bail!("TARIT_PRODUCTION requires TARIT_ENABLE_NET=1");
+    }
+    // Rootfs isolation is enforced by the supervisor: every immutable base is
+    // attached through a private per-VM CoW overlay. `TARIT_ROOTFS_READONLY`
+    // controls guest mount semantics and is intentionally not a production gate.
+    let cgroup = vm_cgroup_parent
+        .map(Path::new)
+        .filter(|path| path.is_absolute() && path.starts_with("/sys/fs/cgroup/"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("TARIT_PRODUCTION requires TARIT_VM_CGROUP_PARENT below /sys/fs/cgroup")
+        })?;
+    if cgroup == Path::new("/sys/fs/cgroup") {
+        bail!("TARIT_VM_CGROUP_PARENT must be a dedicated child cgroup");
+    }
+    for (name, path) in [
+        ("TARIT_VMM_BIN", vmm_bin),
+        ("TARIT_KERNEL", kernel),
+        ("TARIT_ROOTFS", rootfs),
+    ] {
+        if !path.is_absolute() || !path.is_file() {
+            bail!("{name} must be an existing absolute regular file in TARIT_PRODUCTION");
+        }
+    }
+    if allow_insecure_peer_http {
+        bail!("TARIT_PRODUCTION forbids TARIT_ALLOW_INSECURE_PEER_HTTP");
+    }
+    bail!(
+        "TARIT_PRODUCTION is disabled until taritd stages every VM in a unique uid/gid jail with private mounts/netns, mandatory CPU/memory/pids/io cgroups, and in-jail asset/socket path rewriting"
+    )
+}
+
 #[cfg(test)]
 mod security_tests {
     use super::*;
@@ -983,6 +1144,27 @@ mod security_tests {
         assert_ne!(a, b);
         assert!(a.len() >= 32);
         assert!(b.len() >= 32);
+    }
+
+    #[test]
+    fn peer_rpc_origin_requires_https_unless_development_escape_is_explicit() {
+        assert!(validate_rpc_addr("http://node-a:8080", true, false, false).is_err());
+        assert!(validate_rpc_addr("http://node-a:8080", true, true, false).is_ok());
+        assert!(validate_rpc_addr("https://node-a.example:8443", true, false, false).is_ok());
+        assert!(validate_rpc_addr("https://node-a.example/path", true, false, false).is_err());
+        assert!(validate_rpc_addr("https://node-a.example:8443", true, true, true).is_err());
+    }
+
+    #[test]
+    fn pty_active_connection_limits_preserve_noisy_neighbor_headroom() {
+        assert_eq!(
+            PtyConnectionLimits::new(1_024, 128, 16).unwrap(),
+            PtyConnectionLimits::default()
+        );
+        assert!(PtyConnectionLimits::new(8, 8, 1).is_err());
+        assert!(PtyConnectionLimits::new(8, 4, 5).is_err());
+        assert!(PtyConnectionLimits::new(8, 4, 4).is_ok());
+        assert!(PtyConnectionLimits::new(tokio::sync::Semaphore::MAX_PERMITS + 1, 4, 1).is_err());
     }
 }
 
@@ -1224,12 +1406,46 @@ fn default_hostname() -> String {
         .unwrap_or_else(|| "localhost".into())
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
+fn env_bool_checked(key: &str, default: bool) -> Result<bool> {
+    match env::var(key) {
+        Ok(raw) => parse_bool(&raw).ok_or_else(|| {
+            anyhow::anyhow!("{key} must be a boolean (1/0, true/false, yes/no, on/off)")
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_positive_u64(key: &str, default: u64) -> Result<u64> {
+    let Some(raw) = env::var(key).ok() else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<u64>()
+        .with_context(|| format!("{key} must be a positive integer"))?;
+    if value == 0 {
+        bail!("{key} must be a positive integer");
+    }
+    Ok(value)
+}
+
+fn env_optional_positive_u64(key: &str) -> Result<Option<u64>> {
     env::var(key)
         .ok()
-        .as_deref()
-        .and_then(parse_bool)
-        .unwrap_or(default)
+        .map(|raw| {
+            let value = raw
+                .parse::<u64>()
+                .with_context(|| format!("{key} must be a positive integer"))?;
+            if value == 0 {
+                bail!("{key} must be a positive integer");
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+fn env_positive_usize(key: &str, default: usize) -> Result<usize> {
+    let value = env_positive_u64(key, default as u64)?;
+    usize::try_from(value).with_context(|| format!("{key} exceeds this platform's size limit"))
 }
 
 fn env_usize(key: &str) -> Option<usize> {

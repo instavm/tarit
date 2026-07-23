@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use vmm_core::controller::VmmController;
 
 /// Maximum accepted length-prefixed JSON frame size.
@@ -22,11 +23,40 @@ use vmm_core::controller::VmmController;
 pub const MAX_FRAME_BYTES: usize = tarit_proto::MAX_API_FRAME_LEN;
 const SOCKET_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A framed request: 4-byte big-endian length + JSON body.
 pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+    read_frame_with_timeout(stream, CONTROL_IO_TIMEOUT)
+}
+
+/// Read a response frame with no absolute deadline. Client-side only: exec,
+/// snapshot, restore, and resume legitimately outlive the control-plane I/O
+/// timeout, so the CLI blocks until its own VMM answers. The frame size cap
+/// still applies.
+pub fn read_frame_unbounded(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+    stream.set_read_timeout(None)?;
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
+    let len = validated_frame_len(len_buf)?;
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn read_frame_with_timeout(stream: &mut UnixStream, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "timeout overflow"))?;
+    let mut len_buf = [0u8; 4];
+    read_exact_before(stream, &mut len_buf, deadline)?;
+    let len = validated_frame_len(len_buf)?;
+    let mut body = vec![0u8; len];
+    read_exact_before(stream, &mut body, deadline)?;
+    Ok(body)
+}
+
+fn validated_frame_len(len_buf: [u8; 4]) -> std::io::Result<usize> {
     let declared_len = u32::from_be_bytes(len_buf);
     let len = usize::try_from(declared_len).map_err(|_| {
         std::io::Error::new(
@@ -40,13 +70,19 @@ pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
             "frame too large",
         ));
     }
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
-    Ok(body)
+    Ok(len)
 }
 
 /// Write a framed JSON body.
 pub fn write_frame(stream: &mut UnixStream, body: &[u8]) -> std::io::Result<()> {
+    write_frame_with_timeout(stream, body, CONTROL_IO_TIMEOUT)
+}
+
+fn write_frame_with_timeout(
+    stream: &mut UnixStream,
+    body: &[u8],
+    timeout: Duration,
+) -> std::io::Result<()> {
     if body.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -59,9 +95,72 @@ pub fn write_frame(stream: &mut UnixStream, body: &[u8]) -> std::io::Result<()> 
             "frame length does not fit u32",
         )
     })?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(body)?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "timeout overflow"))?;
+    write_all_before(stream, &len.to_be_bytes(), deadline)?;
+    write_all_before(stream, body, deadline)?;
     Ok(())
+}
+
+fn read_exact_before(
+    stream: &mut UnixStream,
+    mut buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let remaining = remaining_before(deadline, "read frame deadline exceeded")?;
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed during frame",
+                ))
+            }
+            Ok(read) => buf = &mut buf[read..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_before(
+    stream: &mut UnixStream,
+    mut buf: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let remaining = remaining_before(deadline, "write frame deadline exceeded")?;
+        stream.set_write_timeout(Some(remaining))?;
+        match stream.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "peer stopped accepting frame",
+                ))
+            }
+            Ok(written) => buf = &buf[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn remaining_before(deadline: Instant, message: &'static str) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn clear_control_timeouts(stream: &UnixStream) -> std::io::Result<()> {
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)
 }
 
 /// Dispatch a single `ApiRequest` using the VMM controller.
@@ -108,7 +207,8 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         ApiRequest::Restore {
             snapshot_path,
             overlay,
-        } => match controller.restore(&snapshot_path, overlay) {
+            net,
+        } => match controller.restore_with_overrides(&snapshot_path, overlay, net) {
             Ok(()) => ApiResponse::Restored,
             Err(e) => ApiResponse::Err {
                 msg: format!("{e}"),
@@ -244,6 +344,12 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
             }
         };
         if let ApiRequest::AttachPty { cols, rows, shell } = req {
+            // PTY sessions are intentionally long-lived. The absolute framing
+            // deadline protects only their initial authenticated request.
+            if let Err(e) = clear_control_timeouts(&stream) {
+                log::warn!("clear AttachPty control timeout: {e}");
+                continue;
+            }
             let controller = controller.clone();
             if let Err(e) = std::thread::Builder::new()
                 .name("api-attach-pty".into())
@@ -769,6 +875,55 @@ mod tests {
 
         let err = read_frame(&mut reader).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_frame_unbounded_enforces_cap_and_reads_slow_responses() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let too_large = u32::try_from(MAX_FRAME_BYTES + 1).unwrap();
+        writer.write_all(&too_large.to_be_bytes()).unwrap();
+        let err = read_frame_unbounded(&mut reader).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            writer.write_all(&4u32.to_be_bytes()).unwrap();
+            writer.write_all(b"sl").unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            writer.write_all(b"ow").unwrap();
+        });
+        assert_eq!(read_frame_unbounded(&mut reader).unwrap(), b"slow");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn read_frame_has_an_absolute_deadline_for_partial_bodies() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(&8u32.to_be_bytes()).unwrap();
+        writer.write_all(b"x").unwrap();
+
+        let started = Instant::now();
+        let error = read_frame_with_timeout(&mut reader, Duration::from_millis(25)).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn write_frame_has_an_absolute_deadline_when_peer_does_not_drain() {
+        let (mut writer, _reader) = UnixStream::pair().unwrap();
+        let body = vec![0u8; 4 * 1024 * 1024];
+
+        let started = Instant::now();
+        let error =
+            write_frame_with_timeout(&mut writer, &body, Duration::from_millis(25)).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

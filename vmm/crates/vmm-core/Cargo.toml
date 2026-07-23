@@ -30,6 +30,7 @@ serde_json.workspace = true
 postcard.workspace = true
 crc32fast.workspace = true
 zerocopy.workspace = true
+tempfile.workspace = true
 
 kvm-ioctls = { workspace = true, optional = true }
 kvm-bindings = { workspace = true, optional = true }

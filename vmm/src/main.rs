@@ -986,7 +986,6 @@ fn serve(
     let mut netns_entered = false;
     #[cfg(target_os = "linux")]
     if let Some(chroot_dir) = &jail_dir {
-        let requested_netns = netns.as_deref().is_some_and(|path| !path.is_empty());
         let cfg = vmm_jailer::jailer::JailerConfig {
             chroot_dir: chroot_dir.clone(),
             uid,
@@ -998,7 +997,9 @@ fn serve(
             netns: netns.clone().unwrap_or_default(),
         };
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
-        netns_entered = requested_netns;
+        // The jailer either enters the assigned namespace or creates a fresh
+        // empty one, so host-level egress can never be affected from here.
+        netns_entered = true;
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
     }
     #[cfg(target_os = "linux")]
@@ -1109,6 +1110,10 @@ fn attach_pty(socket: &str, shell: Option<String>) -> Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     vmm_api::rpc::write_frame(&mut stream, &body)?;
     stream.flush()?;
+    // The initial control frame has a bounded deadline; the PTY stream itself
+    // is intentionally long-lived and uses poll-driven backpressure.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
 
     let _raw = RawTerminal::enter(libc::STDIN_FILENO)?;
     install_sigwinch_handler();
@@ -1321,26 +1326,14 @@ fn pull_oci(
 }
 
 fn send_raw(socket: &str, body: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Read;
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(socket)?;
     vmm_api::rpc::write_frame(&mut stream, body)?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let declared_len = u32::from_be_bytes(len_buf);
-    let len = usize::try_from(declared_len)
-        .map_err(|_| anyhow::anyhow!("api response frame length does not fit usize"))?;
-    if len > vmm_api::rpc::MAX_FRAME_BYTES {
-        anyhow::bail!(
-            "api response frame too large: {len} bytes (max {})",
-            vmm_api::rpc::MAX_FRAME_BYTES
-        );
-    }
-    let mut resp_buf = vec![0u8; len];
-    stream.read_exact(&mut resp_buf)?;
-    Ok(resp_buf)
+    // Requests are small and framed writes keep the control deadline; the
+    // response wait is unbounded because exec, snapshot, and restore can
+    // legitimately take longer than the control-plane I/O timeout.
+    Ok(vmm_api::rpc::read_frame_unbounded(&mut stream)?)
 }
 
 #[cfg(test)]

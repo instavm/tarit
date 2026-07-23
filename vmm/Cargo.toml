@@ -52,6 +52,7 @@ nix = { version = "0.29", features = ["sched", "process", "fs", "user", "mount",
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 crc32fast = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

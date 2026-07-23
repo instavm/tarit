@@ -8,8 +8,8 @@ This document reflects the Rust handlers in `crates/taritd/src/api.rs` and `crat
 | --- | --- | --- |
 | Public API | `X-API-Key: <api key>` | All `/v1/*` routes. Keys resolve to a tenant and role. |
 | PTY WebSocket | `?token=<connect_token>` | `/v1/vms/{id}/pty/{pty_id}/connect`. The one-time token comes from the create-session response and expires after 5 minutes. |
-| Peer API | `X-Peer-Secret: <TARIT_PEER_SECRET>` | All `/internal/v1/*` routes. |
-| Unauthenticated | none | `/health`, `/metrics`, `/openapi.yaml`, `/docs`. |
+| Peer API | target-bound request HMAC derived from `TARIT_PEER_SECRET` | All `/internal/v1/*` routes. The shared key is never sent. |
+| Unauthenticated | none | `/health`, `/livez`, `/startupz`, `/readyz`, `/openapi.yaml`, `/docs`. |
 
 Error responses from public handlers use:
 
@@ -17,7 +17,7 @@ Error responses from public handlers use:
 { "error": "message" }
 ```
 
-The peer secret middleware returns a bare `401 Unauthorized` with no JSON body.
+The peer HMAC middleware returns a bare `401 Unauthorized` with no JSON body.
 
 API keys are configured either with legacy `TARIT_API_KEY` (tenant `default`,
 role `admin`, unlimited VMs), `TARIT_API_KEYS="key:tenant:role:max_vms,..."`,
@@ -40,25 +40,25 @@ admin keys can call admin-only routes such as `/v1/cluster`.
 ```json
 {
   "id": "uuid",
-  "host_id": "node-a",
-  "status": "creating|running|paused|stopped|error",
+  "status": "creating|running|paused|suspended|error",
+  "revision": 3,
+  "startup_path": "cold|warm|snapshot_restore",
   "memory_mib": 256,
   "vcpus": 1,
-  "kernel_path": "/path/to/kernel",
-  "rootfs_path": "/path/to/rootfs or null",
-  "cmdline": "kernel command line",
-  "socket_path": "/path/to/vm.sock or null",
-  "pid": 12345,
   "created_at": "2026-07-02T00:00:00Z",
   "updated_at": "2026-07-02T00:00:01Z"
 }
 ```
 
-`rootfs_path`, `socket_path`, and `pid` may be `null`. Restored VM records currently use placeholder shape fields: `memory_mib: 0`, `vcpus: 0`, `kernel_path: "(restored)"`, and `cmdline: "(restored)"`.
+This public representation deliberately omits the physical host id, tenant
+ownership metadata, kernel/rootfs/socket paths, kernel command line, and VMM
+process id. Those fields exist only in node persistence and authenticated peer
+RPC. Successfully deleted records are not returned by list or get.
 
 ### `LiveVmStatus`
 
-Returned by the VMM `Status` op. This is live runtime state from the owning VMM process, not the stored orchestrator record returned by `GET /v1/vms/{id}`.
+Returned by the public status endpoint after sanitizing the owning VMM's live
+status. It is not the stored record returned by `GET /v1/vms/{id}`.
 
 ```json
 {
@@ -66,9 +66,6 @@ Returned by the VMM `Status` op. This is live runtime state from the owning VMM 
   "uptime_ms": 1037,
   "vcpus": 1,
   "mem_mib": 256,
-  "volumes": 1,
-  "nets": 0,
-  "kernel": "/path/to/kernel",
   "vcpu_alive": true
 }
 ```
@@ -108,11 +105,17 @@ Response `200`:
 
 ### `GET /metrics`
 
-No authentication. Returns Prometheus text exposition metrics for the local `taritd` process.
-Includes `taritd_tenant_vms{tenant="..."}` for local active VM counts by tenant.
-The `tenant` and per-VM `vm_id` labels are a stable short hash by default so
-scraping cannot enumerate tenant or VM identities; set
+Requires an admin API key. Returns Prometheus text exposition metrics for the
+local `taritd` process. Includes `taritd_tenant_vms{tenant="..."}` for local
+active VM counts by tenant, plus bounded PTY metrics for active connections,
+configured global/tenant/VM limits, and admission rejections by scope. The
+`tenant` and per-VM `vm_id` labels are a stable short hash by default so scraping
+cannot enumerate tenant or VM identities; set
 `TARIT_METRICS_EXPOSE_TENANT_LABELS=1` to expose raw values on a trusted network.
+PTY samples are `taritd_pty_active_connections`,
+`taritd_pty_connection_limit{scope="..."}`, and
+`taritd_pty_admission_rejections_total{scope="..."}`; their scope label is one
+of `global`, `tenant`, or `vm` and never contains an identity.
 
 Response `200`: `text/plain; version=0.0.4`.
 
@@ -308,7 +311,8 @@ Status codes:
 | `401` | Missing or wrong `X-API-Key`. |
 | `403` | VM belongs to a different tenant. |
 | `404` | VM not found in fleet or local fallback. |
-| `500` | Owner host missing `rpc_addr`, peer failure, or store failure. |
+| `500` | Internal store or protocol failure. Details are not exposed. |
+| `503` | The owning host is unhealthy, stale, or unavailable. |
 
 ### `GET /v1/vms/{id}/status`
 
@@ -316,9 +320,11 @@ Resolve owner through the fleet registry and query the owning VMM over its Unix 
 
 Response `200`: `LiveVmStatus`.
 
-This differs from `GET /v1/vms/{id}`: `/status` reports the live VMM state, uptime, configured device counts, kernel path, and `vcpu_alive`; `GET /v1/vms/{id}` returns the persisted orchestrator `VmRecord`.
+This differs from `GET /v1/vms/{id}`: `/status` reports sanitized live state,
+uptime, shape, and `vcpu_alive`; it does not expose the VMM's kernel path or
+device configuration.
 
-Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`.
+Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`, `503`.
 
 ### SSH keys
 
@@ -384,9 +390,9 @@ Additional REST routes:
 | `DELETE` | `/v1/vms/{id}/pty/sessions/{pty_id}` | `204` no body |
 | `POST` | `/v1/vms/{id}/pty/sessions/{pty_id}/resize` | `{ "pty_id": "uuid", "cols": N, "rows": N }` |
 
-`WS /v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` upgrades to a WebSocket. It authenticates with the session's one-time `connect_token`, not the API key. Binary messages are raw PTY bytes. Text messages are JSON controls: client-to-server `{"type":"resize","cols":N,"rows":N}` and server-to-client `{"type":"exit","exit_code":N}`.
+`WS /v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` upgrades to a WebSocket. It authenticates with the session's one-time `connect_token`, not the API key. Before upgrading, taritd reserves the configured global, authenticated-tenant, and VM active-connection capacity. Capacity rejection returns HTTP `429` without consuming a valid token, preserving it for retry. Binary messages are raw PTY bytes. Text messages are JSON controls: client-to-server `{"type":"resize","cols":N,"rows":N}` and server-to-client `{"type":"exit","exit_code":N}`.
 
-Status codes: `200`, `201`, `204`, `400`, `401`, `404`, `409`, `500`. WebSocket failures close the socket instead: `4401` for a bad or missing token, `1008` for an unknown session, `1013` when the VM is not on this node, `1011` for attach errors.
+Status codes: `200`, `201`, `204`, `400`, `401`, `404`, `409`, `429`, `500`. A bad, missing, expired, reused, or unknown connect token is rejected with HTTP `401` before upgrade. Post-upgrade failures close the socket with `1013` when the VM is unavailable on this node and `1011` for attach or stream errors.
 
 ### `DELETE /v1/vms/{id}`
 
@@ -417,6 +423,9 @@ Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`.
 ### `POST /v1/vms/{id}/snapshot`
 
 Resolve owner and ask the VMM to write a snapshot. Snapshot files are node-local.
+Only full snapshots are accepted. `diff: true` returns `422` before contacting
+the VMM because incremental snapshot headers contain parent paths; durable
+parent-chain relocation is not implemented yet.
 
 Request:
 
@@ -615,7 +624,13 @@ Status codes: `200`, `401`, `500`.
 
 ## Internal peer API
 
-Internal routes are mounted on the same HTTP listener and are protected only by `X-Peer-Secret`. Do not expose them publicly. Place nodes on a private network, restrict security groups, and prefer mTLS in production.
+Internal routes are currently mounted on the same HTTP listener. Each request
+uses a short-lived HMAC bound to method, path, body hash, nonce, source host, and
+target host; caller identity is signed separately and replay protected. The
+shared key is never transmitted, and the legacy `X-Peer-Secret` header is
+rejected. This is not a substitute for a separate internal listener with mTLS
+and host-session fencing; keep `/internal/v1/*` unreachable from public
+networks.
 
 ### Internal endpoint table
 

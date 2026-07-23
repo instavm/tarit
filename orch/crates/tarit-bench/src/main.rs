@@ -15,6 +15,7 @@ type SharedClient = Arc<api::TaritClient>;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    args.validate()?;
     let client = Arc::new(api::TaritClient::new(&args.url, &args.api_key)?);
     let ctx = RunContext::from_args(&args);
 
@@ -29,8 +30,10 @@ async fn main() -> Result<()> {
             Mode::Burst => run_burst(client.clone(), &ctx).await,
             Mode::All => unreachable!("all is expanded before execution"),
         };
+        let gate_result = outcome.verify_performance(&ctx);
         let path = write_report(&ctx, outcome)?;
         println!("wrote {}", path.display());
+        gate_result?;
     }
 
     Ok(())
@@ -145,6 +148,24 @@ async fn iteration_inner(client: SharedClient, ctx: &RunContext) -> Result<u64> 
         if vm.status != "running" {
             anyhow::bail!("created VM {} returned status {}", vm.id, vm.status);
         }
+        match ctx.startup_path {
+            args::StartupPath::Cold | args::StartupPath::Warm => {
+                let expected = ctx.startup_path.as_str();
+                let actual = vm.startup_path.as_deref().unwrap_or("missing");
+                if actual != expected {
+                    anyhow::bail!(
+                        "requested {expected} benchmark but server reported startup_path={actual}"
+                    );
+                }
+            }
+            args::StartupPath::Snapshot | args::StartupPath::Suspend => {
+                anyhow::bail!(
+                    "{} benchmark requires its dedicated lifecycle workflow; create-only measurement is not valid",
+                    ctx.startup_path.as_str()
+                );
+            }
+            args::StartupPath::Unspecified => {}
+        }
         vm_id = Some(vm.id);
 
         let exec_timeout_ms = ctx.timeout_ms.min(30_000);
@@ -155,7 +176,9 @@ async fn iteration_inner(client: SharedClient, ctx: &RunContext) -> Result<u64> 
         .await??;
         match execution.status.as_str() {
             "completed" if execution.exit_code == Some(0) => {
-                Ok(started.elapsed().as_millis() as u64)
+                Ok(u64::try_from(started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1))
             }
             "completed" => anyhow::bail!(
                 "execution {} completed with exit code {:?}",
@@ -173,14 +196,23 @@ async fn iteration_inner(client: SharedClient, ctx: &RunContext) -> Result<u64> 
     }
     .await;
 
-    if let Some(id) = vm_id {
-        let _ = client.delete_vm(id).await;
-    }
+    let cleanup = match vm_id {
+        Some(id) => client.delete_vm(id).await,
+        None => Ok(()),
+    };
 
-    match result {
-        Ok(tti_ms) => Ok(tti_ms),
-        Err(err) if err.is::<tokio::time::error::Elapsed>() => anyhow::bail!("iteration timed out"),
-        Err(err) => Err(err),
+    match (result, cleanup) {
+        (Ok(tti_ms), Ok(())) => Ok(tti_ms),
+        (Ok(_), Err(cleanup_error)) => {
+            anyhow::bail!("iteration cleanup failed: {cleanup_error}")
+        }
+        (Err(err), Err(cleanup_error)) => {
+            anyhow::bail!("{err}; iteration cleanup also failed: {cleanup_error}")
+        }
+        (Err(err), Ok(())) if err.is::<tokio::time::error::Elapsed>() => {
+            anyhow::bail!("iteration timed out")
+        }
+        (Err(err), Ok(())) => Err(err),
     }
 }
 

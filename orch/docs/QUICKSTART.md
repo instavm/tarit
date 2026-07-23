@@ -36,7 +36,7 @@ export TARIT_LISTEN='127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
 export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
-export TARIT_ROOTFS_READONLY=1        # required when many VMs share one base image
+export TARIT_ROOTFS_READONLY=1        # optional read-only guest mount; base isolation is always CoW
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"
 
