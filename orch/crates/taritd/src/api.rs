@@ -295,11 +295,30 @@ pub(crate) async fn enforce_api_traffic(
     if !limits.take_rate_token() {
         return overloaded_response("API rate limit exceeded");
     }
-    let Ok(_permit) = Arc::clone(&limits.concurrency).try_acquire_owned() else {
+    let Ok(permit) = Arc::clone(&limits.concurrency).try_acquire_owned() else {
         return overloaded_response("API concurrency limit exceeded");
     };
-    match tokio::time::timeout(limits.timeout, next.run(request)).await {
-        Ok(response) => response,
+    // Own the handler in a spawned task so the deadline cannot cancel a
+    // mutating operation mid-flight: `spawn_blocking` VMM transitions would
+    // otherwise keep running while their persistence and rollback logic is
+    // dropped. On timeout the task runs to completion (holding its
+    // concurrency permit) and only the response is abandoned.
+    let mut handler = tokio::spawn(async move {
+        let _permit = permit;
+        next.run(request).await
+    });
+    match tokio::time::timeout(limits.timeout, &mut handler).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(join_error)) => {
+            tracing::error!(%join_error, "API handler task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: "API handler failed".into(),
+                }),
+            )
+                .into_response()
+        }
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
             Json(ErrorBody {

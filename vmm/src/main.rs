@@ -1330,7 +1330,10 @@ fn send_raw(socket: &str, body: &[u8]) -> Result<Vec<u8>> {
 
     let mut stream = UnixStream::connect(socket)?;
     vmm_api::rpc::write_frame(&mut stream, body)?;
-    Ok(vmm_api::rpc::read_frame(&mut stream)?)
+    // Requests are small and framed writes keep the control deadline; the
+    // response wait is unbounded because exec, snapshot, and restore can
+    // legitimately take longer than the control-plane I/O timeout.
+    Ok(vmm_api::rpc::read_frame_unbounded(&mut stream)?)
 }
 
 #[cfg(test)]

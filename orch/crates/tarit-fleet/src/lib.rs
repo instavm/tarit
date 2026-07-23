@@ -362,13 +362,13 @@ impl PostgresFleet {
                     "VM {id} quota reservation belongs to another tenant"
                 )));
             }
-            tx.execute(
-                "UPDATE tenant_vm_reservations SET expires_at = $2 WHERE id = $1",
-                &[&id, &expires_at],
-            )
-            .await?;
-            tx.commit().await?;
-            return Ok(());
+            // Match the single-host store: an existing reservation is a
+            // conflict even for the same tenant. Treating a duplicate request
+            // as success would let two admission paths share one reservation
+            // and release the survivor's quota protection early.
+            return Err(FleetError::Conflict(format!(
+                "VM {id} already exists or is being created"
+            )));
         }
         let active = tx
             .query_one(

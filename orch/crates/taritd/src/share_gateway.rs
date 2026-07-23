@@ -3041,6 +3041,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_share_request_rejects_spliced_identity_envelope() {
+        let upstream = start_axum(
+            Router::new().route("/stream", get(|| async { Response::new(Body::from("ok")) })),
+        )
+        .await;
+        let cluster =
+            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
+        let mut headers = signed_share_identity_headers(&cluster.share);
+
+        // A validly signed identity envelope captured from another request by
+        // the same source must not be combinable with this signed request.
+        let issued_at = Utc::now().timestamp();
+        let nonce = Uuid::new_v4().to_string();
+        let identity_id = super::share_peer_identity_id(&cluster.share);
+        let mut spliced_mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
+        spliced_mac.update(b"tarit-peer-identity-v1\nnon-owner\n");
+        spliced_mac.update(issued_at.to_string().as_bytes());
+        spliced_mac.update(b"\n");
+        spliced_mac.update(nonce.as_bytes());
+        spliced_mac.update(b"\n");
+        spliced_mac.update(cluster.share.owner_key.as_bytes());
+        spliced_mac.update(b"\nuser\n");
+        spliced_mac.update(identity_id.as_bytes());
+        headers.insert(
+            "x-tarit-identity-timestamp",
+            HeaderValue::from_str(&issued_at.to_string()).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-identity-nonce",
+            HeaderValue::from_str(&nonce).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-identity-signature",
+            HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(spliced_mac.finalize().into_bytes()))
+                .unwrap(),
+        );
+
+        let spliced = reqwest::Client::new()
+            .get(cluster.owner_share_url("/stream"))
+            .headers(headers)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(spliced.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn remote_owner_enforces_private_share_auth_and_keeps_control_credentials_from_guest() {
         let (upstream, received) = spawn_inspecting_http_upstream().await;
         let cluster =
@@ -3459,9 +3506,10 @@ mod tests {
         identity_mac.update(share.owner_key.as_bytes());
         identity_mac.update(b"\nuser\n");
         identity_mac.update(identity_id.as_bytes());
+        let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
         let mut request_mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
         for component in [
-            "tarit-peer-request-v1",
+            "tarit-peer-request-v2",
             "GET",
             canonical_path.as_str(),
             "STREAMING-UNSIGNED-PAYLOAD",
@@ -3469,6 +3517,7 @@ mod tests {
             request_nonce.as_str(),
             "non-owner",
             "owner",
+            identity_signature.as_str(),
         ] {
             request_mac.update(component.as_bytes());
             request_mac.update(b"\n");
@@ -3476,7 +3525,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-tarit-peer-version",
-            HeaderValue::from_static("tarit-peer-request-v1"),
+            HeaderValue::from_static("tarit-peer-request-v2"),
         );
         headers.insert("x-tarit-peer-source", HeaderValue::from_static("non-owner"));
         headers.insert("x-tarit-peer-target", HeaderValue::from_static("owner"));
@@ -3516,8 +3565,7 @@ mod tests {
         );
         headers.insert(
             "x-tarit-identity-signature",
-            HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes()))
-                .unwrap(),
+            HeaderValue::from_str(&identity_signature).unwrap(),
         );
         headers
     }

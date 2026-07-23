@@ -1880,10 +1880,13 @@ fn restore_overlay_seed(
 ))]
 fn prepare_restore_overlay(config: &VmConfig, target: &str) -> Result<OwnedOverlayGuard> {
     match OwnedScratchFile::adopt_private(target) {
-        Ok(target) => {
+        Ok(adopted) => {
             // A preseeded target is authoritative. Never reopen the overlay
             // serialized in the RAM image: the source VM may already be gone.
-            return Ok(OwnedOverlayGuard::from_created(vec![target]));
+            // But adopting the golden overlay itself would share its writable
+            // state with the clone and delete it on stop, so refuse aliases.
+            reject_golden_overlay_target(config, target, &adopted)?;
+            return Ok(OwnedOverlayGuard::from_created(vec![adopted]));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -1904,6 +1907,37 @@ fn prepare_restore_overlay(config: &VmConfig, target: &str) -> Result<OwnedOverl
         })?,
     };
     Ok(OwnedOverlayGuard::from_created(vec![owned]))
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn reject_golden_overlay_target(
+    config: &VmConfig,
+    target: &str,
+    adopted: &OwnedScratchFile,
+) -> Result<()> {
+    let Some(source) = restore_overlay_volume_index(&config.volumes)
+        .and_then(|index| config.volumes[index].overlay.as_deref())
+    else {
+        return Ok(());
+    };
+    // Path equality catches the direct case; inode identity catches aliased
+    // spellings of the same file. A missing source cannot alias anything.
+    let aliases_golden = source == target
+        || match OwnedScratchFile::identity_for(Path::new(source)) {
+            Ok(identity) => adopted.identity().is_some_and(|adopted| {
+                adopted.device == identity.device && adopted.inode == identity.inode
+            }),
+            Err(_) => false,
+        };
+    if aliases_golden {
+        return Err(VmmError::InvalidConfig(format!(
+            "restore overlay must differ from golden overlay: {target}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(any(
@@ -4009,6 +4043,40 @@ mod tests {
             !target.exists(),
             "failed restore cleanup must remove the exact adopted target"
         );
+    }
+
+    #[test]
+    fn restore_overlay_refuses_to_adopt_the_golden_overlay() {
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-golden-adopt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let golden = dir.join(format!("{unique}-golden.cow"));
+        let golden_bytes = b"reusable golden upper state";
+        write_private(&golden, golden_bytes);
+
+        let mut config = cfg();
+        config.volumes = vec![VolumeConfig {
+            path: "/base/rootfs.ext4".into(),
+            read_only: true,
+            overlay: Some(golden.display().to_string()),
+        }];
+
+        let err = match prepare_restore_overlay(&config, golden.to_str().unwrap()) {
+            Ok(_) => panic!("golden overlay must never be adopted as a restore target"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, VmmError::InvalidConfig(_)));
+        assert_eq!(
+            std::fs::read(&golden).expect("golden overlay must survive"),
+            golden_bytes
+        );
+        let _ = std::fs::remove_file(golden);
     }
 
     #[test]

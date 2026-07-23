@@ -210,7 +210,11 @@ pub async fn peer_rpc(state: &AppState, host_id: &str) -> Result<Option<PeerTarg
 
 fn ensure_routable_host(host: &HostRecord, purpose: &str) -> Result<(), OrchError> {
     let age = chrono::Utc::now() - host.last_heartbeat;
-    let fresh = age >= -HOST_FUTURE_SKEW && age.to_std().is_ok_and(|age| age < HOST_STALE_AFTER);
+    // Compare signed durations: converting a slightly-future (negative) age
+    // through to_std() fails and would reject healthy owners on any skew.
+    let stale_after = chrono::Duration::from_std(HOST_STALE_AFTER)
+        .expect("stale-after constant fits chrono range");
+    let fresh = age >= -HOST_FUTURE_SKEW && age < stale_after;
     if !host.healthy || !fresh {
         return Err(OrchError::Unavailable(format!(
             "{purpose} host {} is unhealthy or its heartbeat is stale",

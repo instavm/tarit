@@ -130,9 +130,16 @@ impl SeccompProfile {
         let mut profile = Self::device();
         profile.kind = ThreadKind::Vsock;
         profile.allow.extend(
-            ["socket", "connect", "fcntl", "getsockopt", "setsockopt"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "socket",
+                "connect",
+                "fcntl",
+                "getsockopt",
+                "setsockopt",
+                "ioctl",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         );
         profile
     }
@@ -217,6 +224,19 @@ impl SeccompProfile {
                 SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0)
                     .map_err(|e| format!("socket protocol condition: {e}"))?,
             ],
+            // std's UnixStream::set_nonblocking issues ioctl(FIONBIO) on Linux;
+            // the pump calls it for every lazily connected host stream. Allow
+            // exactly that request and nothing else. The cast is kept because
+            // libc types FIONBIO differently across gnu (c_ulong) and musl
+            // (c_int) targets.
+            #[allow(clippy::unnecessary_cast)]
+            (ThreadKind::Vsock, "ioctl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::FIONBIO as u64,
+            )
+            .map_err(|e| format!("ioctl condition: {e}"))?],
             _ => return Ok(Vec::new()),
         };
         Ok(vec![
@@ -318,6 +338,8 @@ mod tests {
         assert!(!device.allow.contains(&"ioctl".to_string()));
         assert!(vsock.allow.contains(&"socket".to_string()));
         assert!(vsock.allow.contains(&"connect".to_string()));
+        // set_nonblocking on lazily connected host streams needs ioctl(FIONBIO).
+        assert!(vsock.allow.contains(&"ioctl".to_string()));
     }
 
     #[cfg(target_os = "linux")]
@@ -333,6 +355,13 @@ mod tests {
         assert_eq!(
             SeccompProfile::vsock()
                 .rules_for_syscall("socket")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SeccompProfile::vsock()
+                .rules_for_syscall("ioctl")
                 .unwrap()
                 .len(),
             1

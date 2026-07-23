@@ -74,7 +74,24 @@ async fn vm_set_status(
         .insert_vm(&rec)
         .map_err(crate::api::store_err)?;
     commit_vm_record(state, rec.clone())?;
+    refresh_running_lifecycle(state, &rec)?;
     Ok(rec)
+}
+
+/// Keep the `Running` lifecycle record aligned with the newest committed
+/// revision so terminal transitions never derive from a stale record. Other
+/// lifecycle phases own their records and are left untouched.
+fn refresh_running_lifecycle(state: &AppState, record: &VmRecord) -> Result<(), OrchError> {
+    let mut lifecycle = state
+        .lifecycle
+        .lock()
+        .map_err(|_| OrchError::Internal("lifecycle state lock poisoned".into()))?;
+    if let Some(current @ LifecycleState::Running { .. }) = lifecycle.get_mut(&record.id) {
+        *current = LifecycleState::Running {
+            record: record.clone(),
+        };
+    }
+    Ok(())
 }
 
 /// Fence a failed live transition with a newer record for the state restored in
@@ -101,6 +118,7 @@ async fn compensate_vm_status(
         .insert_vm(&compensation)
         .map_err(crate::api::store_err)?;
     commit_vm_record(state, compensation.clone())?;
+    refresh_running_lifecycle(state, &compensation)?;
     Ok(compensation)
 }
 
@@ -252,24 +270,33 @@ async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<()
         return Err(OrchError::Internal("injected SQLite failure".into()));
     }
     let (completion, persisted) = tokio::sync::oneshot::channel();
+    let fallback = record.clone();
+    let direct_insert = |record: &VmRecord| {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .insert_vm(record)
+            .map_err(crate::api::store_err)
+    };
     match state
         .store_tx
         .send(StoreWrite::VmDurable(record, completion))
         .await
     {
-        Ok(()) => persisted.await.map_err(|_| {
-            OrchError::Internal("store writer dropped shutdown persistence confirmation".into())
-        })?,
+        // The writer can accept the send and still exit on the shutdown signal
+        // before draining it. A dropped confirmation therefore falls back to
+        // the direct durable write, which is idempotent if the writer already
+        // committed the record.
+        Ok(()) => match persisted.await {
+            Ok(result) => result,
+            Err(_) => direct_insert(&fallback),
+        },
         Err(error) => {
             let StoreWrite::VmDurable(record, _) = error.0 else {
                 unreachable!("only durable VM writes are sent here");
             };
-            state
-                .store
-                .lock()
-                .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-                .insert_vm(&record)
-                .map_err(crate::api::store_err)
+            direct_insert(&record)
         }
     }
 }
@@ -382,10 +409,18 @@ fn set_lifecycle_state(
 }
 
 fn terminal_record(state: &AppState, id: Uuid, status: VmStatus) -> Result<VmRecord, OrchError> {
-    let mut record = lifecycle_state(state, id)?
-        .map(|lifecycle| lifecycle.record().clone())
-        .or_else(|| state.vm_cache.read().ok()?.get(&id).cloned())
-        .ok_or_else(|| OrchError::NotFound(format!("vm {id} not found")))?;
+    // Base the terminal write on the newest committed record. The lifecycle
+    // record can trail the cache when live transitions or partially failed
+    // creations advanced the durable revision, and reusing that stale revision
+    // would collide with the already-committed record in SQLite.
+    let lifecycle = lifecycle_state(state, id)?.map(|lifecycle| lifecycle.record().clone());
+    let cached = state.vm_cache.read().ok().and_then(|c| c.get(&id).cloned());
+    let mut record = match (lifecycle, cached) {
+        (Some(lifecycle), Some(cached)) if cached.revision > lifecycle.revision => cached,
+        (Some(lifecycle), _) => lifecycle,
+        (None, Some(cached)) => cached,
+        (None, None) => return Err(OrchError::NotFound(format!("vm {id} not found"))),
+    };
     record.status = status;
     record.revision = record
         .revision

@@ -140,3 +140,9 @@ jobs:
           name: orchestrator-performance-${{ github.run_id }}
           path: perf-orch
           if-no-files-found: ignore
+
+      - name: Reclaim root-owned workspace files
+        # Several steps run under sudo and leave root-owned artifacts that
+        # break the next checkout on this persistent runner.
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"

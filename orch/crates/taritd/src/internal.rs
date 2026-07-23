@@ -38,7 +38,7 @@ use crate::{
 };
 
 const IDENTITY_SIGNATURE_VERSION: &str = "tarit-peer-identity-v1";
-const REQUEST_SIGNATURE_VERSION: &str = "tarit-peer-request-v1";
+const REQUEST_SIGNATURE_VERSION: &str = "tarit-peer-request-v2";
 const STREAMING_PAYLOAD: &str = "STREAMING-UNSIGNED-PAYLOAD";
 // A 10-second acceptance window tolerates ordinary clock skew while keeping a
 // captured signature's replay lifetime short. At the default 5,000 request/s
@@ -188,6 +188,19 @@ async fn verify_peer_request(
     let claimed_payload_hash = single_header(headers, "X-Tarit-Peer-Body-SHA256")?.to_string();
     let signature = single_header(headers, "X-Tarit-Peer-Signature")
         .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())?;
+    // The request signature binds the forwarded identity envelope (empty when
+    // absent) so a signed request cannot be spliced together with an identity
+    // captured from a different request by the same source host.
+    let identity_binding = if headers
+        .get_all("X-Tarit-Identity-Signature")
+        .iter()
+        .next()
+        .is_none()
+    {
+        String::new()
+    } else {
+        single_header(headers, "X-Tarit-Identity-Signature")?.to_string()
+    };
 
     let is_share = request.uri().path().starts_with("/internal/v1/shares/");
     let actual_payload_hash = if claimed_payload_hash == STREAMING_PAYLOAD {
@@ -223,6 +236,7 @@ async fn verify_peer_request(
         nonce_string.as_str(),
         source.as_str(),
         target.as_str(),
+        identity_binding.as_str(),
     ] {
         mac.update(component.as_bytes());
         mac.update(b"\n");

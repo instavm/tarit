@@ -30,12 +30,33 @@ pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     read_frame_with_timeout(stream, CONTROL_IO_TIMEOUT)
 }
 
+/// Read a response frame with no absolute deadline. Client-side only: exec,
+/// snapshot, restore, and resume legitimately outlive the control-plane I/O
+/// timeout, so the CLI blocks until its own VMM answers. The frame size cap
+/// still applies.
+pub fn read_frame_unbounded(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
+    stream.set_read_timeout(None)?;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = validated_frame_len(len_buf)?;
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    Ok(body)
+}
+
 fn read_frame_with_timeout(stream: &mut UnixStream, timeout: Duration) -> std::io::Result<Vec<u8>> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "timeout overflow"))?;
     let mut len_buf = [0u8; 4];
     read_exact_before(stream, &mut len_buf, deadline)?;
+    let len = validated_frame_len(len_buf)?;
+    let mut body = vec![0u8; len];
+    read_exact_before(stream, &mut body, deadline)?;
+    Ok(body)
+}
+
+fn validated_frame_len(len_buf: [u8; 4]) -> std::io::Result<usize> {
     let declared_len = u32::from_be_bytes(len_buf);
     let len = usize::try_from(declared_len).map_err(|_| {
         std::io::Error::new(
@@ -49,9 +70,7 @@ fn read_frame_with_timeout(stream: &mut UnixStream, timeout: Duration) -> std::i
             "frame too large",
         ));
     }
-    let mut body = vec![0u8; len];
-    read_exact_before(stream, &mut body, deadline)?;
-    Ok(body)
+    Ok(len)
 }
 
 /// Write a framed JSON body.
@@ -856,6 +875,25 @@ mod tests {
 
         let err = read_frame(&mut reader).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_frame_unbounded_enforces_cap_and_reads_slow_responses() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let too_large = u32::try_from(MAX_FRAME_BYTES + 1).unwrap();
+        writer.write_all(&too_large.to_be_bytes()).unwrap();
+        let err = read_frame_unbounded(&mut reader).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            writer.write_all(&4u32.to_be_bytes()).unwrap();
+            writer.write_all(b"sl").unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            writer.write_all(b"ow").unwrap();
+        });
+        assert_eq!(read_frame_unbounded(&mut reader).unwrap(), b"slow");
+        handle.join().unwrap();
     }
 
     #[test]

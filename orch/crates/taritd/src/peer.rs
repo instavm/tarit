@@ -41,7 +41,8 @@ pub struct PeerClient {
 pub type PeerWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const IDENTITY_SIGNATURE_VERSION: &str = "tarit-peer-identity-v1";
-const REQUEST_SIGNATURE_VERSION: &str = "tarit-peer-request-v1";
+// v2 binds the forwarded identity envelope into the request signature.
+const REQUEST_SIGNATURE_VERSION: &str = "tarit-peer-request-v2";
 const STREAMING_PAYLOAD: &str = "STREAMING-UNSIGNED-PAYLOAD";
 
 struct RequestSignature<'a> {
@@ -49,6 +50,12 @@ struct RequestSignature<'a> {
     method: &'a str,
     canonical_path: &'a str,
     payload_hash: &'a str,
+}
+
+struct SignedIdentity {
+    issued_at: i64,
+    nonce: String,
+    signature: String,
 }
 
 pub struct ShareWebSocketRequest<'a> {
@@ -149,6 +156,7 @@ impl PeerClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn request_signature(
         &self,
         method: &str,
@@ -157,6 +165,7 @@ impl PeerClient {
         issued_at: i64,
         nonce: &str,
         target_host_id: &str,
+        identity_signature: &str,
     ) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes())
             .expect("HMAC accepts arbitrary key lengths");
@@ -169,11 +178,26 @@ impl PeerClient {
             nonce,
             &self.source_host_id,
             target_host_id,
+            // Binding the forwarded identity envelope (empty when absent)
+            // prevents splicing a signed request together with an identity
+            // captured from a different request by the same source host.
+            identity_signature,
         ] {
             mac.update(component.as_bytes());
             mac.update(b"\n");
         }
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    fn sign_identity(&self, identity: &ApiIdentity) -> SignedIdentity {
+        let issued_at = Utc::now().timestamp();
+        let nonce = Uuid::new_v4().to_string();
+        let signature = self.identity_signature(identity, issued_at, &nonce);
+        SignedIdentity {
+            issued_at,
+            nonce,
+            signature,
+        }
     }
 
     fn with_request_signature(
@@ -183,10 +207,16 @@ impl PeerClient {
         method: &str,
         canonical_path: &str,
         payload_hash: &str,
+        identity: Option<&ApiIdentity>,
     ) -> reqwest::blocking::RequestBuilder {
+        let signed_identity = identity.map(|identity| (identity, self.sign_identity(identity)));
+        let identity_signature = signed_identity
+            .as_ref()
+            .map(|(_, signed)| signed.signature.as_str())
+            .unwrap_or("");
         let issued_at = Utc::now().timestamp();
         let nonce = Uuid::new_v4().to_string();
-        request
+        let request = request
             .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
             .header("X-Tarit-Peer-Source", &self.source_host_id)
             .header("X-Tarit-Peer-Target", &target.host_id)
@@ -202,8 +232,19 @@ impl PeerClient {
                     issued_at,
                     &nonce,
                     &target.host_id,
+                    identity_signature,
                 ),
-            )
+            );
+        match signed_identity {
+            Some((identity, signed)) => request
+                .header("X-Tarit-Tenant", &identity.tenant)
+                .header("X-Tarit-Role", identity.role.as_str())
+                .header("X-Tarit-Api-Key-Id", &identity.api_key_id)
+                .header("X-Tarit-Identity-Timestamp", signed.issued_at)
+                .header("X-Tarit-Identity-Nonce", &signed.nonce)
+                .header("X-Tarit-Identity-Signature", &signed.signature),
+            None => request,
+        }
     }
 
     fn insert_request_signature_headers(
@@ -213,6 +254,7 @@ impl PeerClient {
         method: &str,
         canonical_path: &str,
         payload_hash: &str,
+        identity_signature: &str,
     ) -> Result<(), OrchError> {
         let issued_at = Utc::now().timestamp();
         let nonce = Uuid::new_v4().to_string();
@@ -223,6 +265,7 @@ impl PeerClient {
             issued_at,
             &nonce,
             &target.host_id,
+            identity_signature,
         );
         for (name, value) in [
             ("x-tarit-peer-version", REQUEST_SIGNATURE_VERSION),
@@ -452,14 +495,15 @@ impl PeerClient {
             sanitized.append(name.clone(), value.clone());
         }
         sanitized.insert("x-forwarded-proto", HeaderValue::from_static(trusted_proto));
+        let identity_signature = self.insert_signed_identity_headers(&mut sanitized, identity)?;
         self.insert_request_signature_headers(
             &mut sanitized,
             signature.target,
             signature.method,
             signature.canonical_path,
             signature.payload_hash,
+            &identity_signature,
         )?;
-        self.insert_signed_identity_headers(&mut sanitized, identity)?;
         Ok(sanitized)
     }
 
@@ -480,9 +524,8 @@ impl PeerClient {
             .post(Self::peer_url(&target.rpc_addr, path))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
-        let req = self.with_request_signature(req, target, "POST", path, &payload_hash);
-        let resp = self
-            .with_identity(req, identity)
+        let req = self.with_request_signature(req, target, "POST", path, &payload_hash, identity);
+        let resp = req
             .send()
             .map_err(|e| OrchError::Internal(format!("peer {what} request: {e}")))?;
         Self::decode(resp, what)
@@ -493,13 +536,21 @@ impl PeerClient {
         target: &PeerTarget,
         method: reqwest::Method,
         path: &str,
+        identity: Option<&ApiIdentity>,
     ) -> Result<reqwest::blocking::RequestBuilder, OrchError> {
         self.validate_rpc_addr(&target.rpc_addr)?;
         let payload_hash = Self::payload_hash(&[]);
         let request = self
             .http
             .request(method.clone(), Self::peer_url(&target.rpc_addr, path));
-        Ok(self.with_request_signature(request, target, method.as_str(), path, &payload_hash))
+        Ok(self.with_request_signature(
+            request,
+            target,
+            method.as_str(),
+            path,
+            &payload_hash,
+            identity,
+        ))
     }
 
     fn decode<R: for<'de> Deserialize<'de>>(
@@ -666,9 +717,9 @@ impl PeerClient {
             .patch(Self::peer_url(&target.rpc_addr, &path))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(encoded);
-        let req = self.with_request_signature(req, target, "PATCH", &path, &payload_hash);
-        let resp = self
-            .with_identity(req, Some(identity))
+        let req =
+            self.with_request_signature(req, target, "PATCH", &path, &payload_hash, Some(identity));
+        let resp = req
             .send()
             .map_err(|e| OrchError::Internal(format!("peer egress request: {e}")))?;
         Self::decode(resp, "egress")
@@ -681,9 +732,8 @@ impl PeerClient {
         identity: &ApiIdentity,
     ) -> Result<VmRecord, OrchError> {
         let path = format!("/internal/v1/vms/{vm_id}");
-        let req = self.empty_request(target, reqwest::Method::GET, &path)?;
-        let resp = self
-            .with_identity(req, Some(identity))
+        let req = self.empty_request(target, reqwest::Method::GET, &path, Some(identity))?;
+        let resp = req
             .send()
             .map_err(|e| OrchError::Internal(format!("peer get request: {e}")))?;
         Self::decode(resp, "get")
@@ -696,9 +746,8 @@ impl PeerClient {
         identity: &ApiIdentity,
     ) -> Result<serde_json::Value, OrchError> {
         let path = format!("/internal/v1/vms/{vm_id}/status");
-        let req = self.empty_request(target, reqwest::Method::GET, &path)?;
-        let resp = self
-            .with_identity(req, Some(identity))
+        let req = self.empty_request(target, reqwest::Method::GET, &path, Some(identity))?;
+        let resp = req
             .send()
             .map_err(|e| OrchError::Internal(format!("peer status request: {e}")))?;
         Self::decode(resp, "status")
@@ -711,9 +760,8 @@ impl PeerClient {
         identity: &ApiIdentity,
     ) -> Result<(), OrchError> {
         let path = format!("/internal/v1/vms/{vm_id}");
-        let req = self.empty_request(target, reqwest::Method::DELETE, &path)?;
-        let resp = self
-            .with_identity(req, Some(identity))
+        let req = self.empty_request(target, reqwest::Method::DELETE, &path, Some(identity))?;
+        let resp = req
             .send()
             .map_err(|e| OrchError::Internal(format!("peer stop request: {e}")))?;
         let status = resp.status();
@@ -729,35 +777,12 @@ impl PeerClient {
         Ok(())
     }
 
-    fn with_identity(
-        &self,
-        req: reqwest::blocking::RequestBuilder,
-        identity: Option<&ApiIdentity>,
-    ) -> reqwest::blocking::RequestBuilder {
-        if let Some(identity) = identity {
-            let issued_at = Utc::now().timestamp();
-            let nonce = Uuid::new_v4().to_string();
-            req.header("X-Tarit-Tenant", &identity.tenant)
-                .header("X-Tarit-Role", identity.role.as_str())
-                .header("X-Tarit-Api-Key-Id", &identity.api_key_id)
-                .header("X-Tarit-Identity-Timestamp", issued_at)
-                .header("X-Tarit-Identity-Nonce", &nonce)
-                .header(
-                    "X-Tarit-Identity-Signature",
-                    self.identity_signature(identity, issued_at, &nonce),
-                )
-        } else {
-            req
-        }
-    }
-
     fn insert_signed_identity_headers(
         &self,
         headers: &mut HeaderMap,
         identity: &ApiIdentity,
-    ) -> Result<(), OrchError> {
-        let issued_at = Utc::now().timestamp();
-        let nonce = Uuid::new_v4().to_string();
+    ) -> Result<String, OrchError> {
+        let signed = self.sign_identity(identity);
         headers.insert(
             "x-tarit-tenant",
             HeaderValue::from_str(&identity.tenant)
@@ -774,20 +799,20 @@ impl PeerClient {
         );
         headers.insert(
             "x-tarit-identity-timestamp",
-            HeaderValue::from_str(&issued_at.to_string())
+            HeaderValue::from_str(&signed.issued_at.to_string())
                 .map_err(|_| OrchError::Internal("invalid peer identity timestamp".into()))?,
         );
         headers.insert(
             "x-tarit-identity-nonce",
-            HeaderValue::from_str(&nonce)
+            HeaderValue::from_str(&signed.nonce)
                 .map_err(|_| OrchError::Internal("invalid peer identity nonce".into()))?,
         );
         headers.insert(
             "x-tarit-identity-signature",
-            HeaderValue::from_str(&self.identity_signature(identity, issued_at, &nonce))
+            HeaderValue::from_str(&signed.signature)
                 .map_err(|_| OrchError::Internal("invalid peer identity signature".into()))?,
         );
-        Ok(())
+        Ok(signed.signature)
     }
 
     fn identity_signature(&self, identity: &ApiIdentity, issued_at: i64, nonce: &str) -> String {
