@@ -1882,6 +1882,7 @@ async fn execute_async_impl(
                 );
             }
             Err(e) => {
+                tracing::warn!(execution = %exec_id, vm = %vm_id, error = %e, "async exec failed");
                 audit::record(
                     &state2,
                     &identity,
@@ -1972,20 +1973,25 @@ async fn execute_impl(
         // Precondition rejections (e.g. exec against a suspended VM) are API
         // errors, not execution outcomes: no command ran, so no record.
         Err(e @ OrchError::Conflict(_)) => return Err(e.into()),
-        Err(e) => ExecutionRecord {
-            id: exec_id,
-            vm_id,
-            command,
-            timeout_ms,
-            status: ExecutionStatus::Failed,
-            exit_code: None,
-            stdout: None,
-            stderr: None,
-            duration_ms: None,
-            error: Some(public_operation_error(&e)),
-            created_at: now,
-            updated_at: Utc::now(),
-        },
+        Err(e) => {
+            // The record carries only the sanitized message; keep the cause
+            // diagnosable server-side.
+            tracing::warn!(execution = %exec_id, vm = %vm_id, error = %e, "exec failed");
+            ExecutionRecord {
+                id: exec_id,
+                vm_id,
+                command,
+                timeout_ms,
+                status: ExecutionStatus::Failed,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                duration_ms: None,
+                error: Some(public_operation_error(&e)),
+                created_at: now,
+                updated_at: Utc::now(),
+            }
+        }
     };
     persist_exec(state, &rec, identity).await?;
     if matches!(rec.status, ExecutionStatus::Completed) {
