@@ -2,23 +2,31 @@
 
 Tarit VMM is a minimal rust-vmm based microVM monitor for x86_64 Linux/KVM. It boots one microVM per `vmm` process, exposes a Unix domain socket control protocol, and can be used directly, under the Tarit orchestrator (`taritd`), or under any orchestrator that speaks the protocol in `proto/`.
 
-The VMM provides direct kernel boot from bzImage or vmlinux, virtio-mmio block and net devices, fast boot mode for kernel benchmarks, full Linux userspace boot, snapshot and restore, suspend and resume, guest exec and interactive PTY over the guest agent, and OCI image conversion to an ext4 rootfs. It is not an HTTP service. The control API is length-prefixed JSON over a Unix domain socket.
+The VMM provides direct kernel boot, virtio-mmio block and net devices, full
+Linux userspace boot, snapshots, suspend and resume, guest exec and PTY, and OCI
+image conversion. The release kernel is an uncompressed ELF `vmlinux`. The
+loader also accepts user-supplied `bzImage` kernels. The VMM is not an HTTP
+service. Its control API is length-prefixed JSON over a Unix domain socket.
 
 It is built from rust-vmm components including kvm-ioctls, vm-memory, linux-loader, virtio-queue, vm-superio, seccompiler, and vmm-sys-util.
 
 ## Quickstart
 
-Assumes an x86_64 Linux host with `/dev/kvm`, a guest kernel at `guest/bzImage`, and an ext4 rootfs at `guest/rootfs.ext4`.
+On an x86_64 Linux host with `/dev/kvm`, run these commands from the repository
+root:
 
 ```sh
-cd vmm
-cargo build --release -p vmm --features boot
-sudo install -m 0755 target/release/vmm /usr/local/bin/vmm
-sudo vmm run --kernel guest/bzImage --rootfs guest/rootfs.ext4 --mem 512 --vcpus 1 --full-boot \
+make vmm
+sudo make guest
+sudo install -m 0755 vmm/target/release/vmm /usr/local/bin/vmm
+sudo vmm run --kernel guest-assets/vmlinux --rootfs guest-assets/rootfs.ext4 --mem 512 --vcpus 1 --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 # API mode, one socket per microVM process:
 sudo vmm serve --socket /tmp/vmm.sock
 ```
+
+`sudo vmm kernel install` installs only the pinned kernel. Interactive `run`
+and `create` commands offer that install when `--kernel` is omitted.
 
 ## Capabilities
 

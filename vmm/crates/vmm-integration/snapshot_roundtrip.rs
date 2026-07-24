@@ -7,6 +7,9 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
+mod test_support;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
 fn workspace_path(rel: &str) -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     PathBuf::from(manifest_dir)
@@ -57,16 +60,8 @@ fn restored_clones_get_private_rootfs_overlays() {
     use vmm_core::config::{KernelConfig, MemoryConfig, VcpuConfig, VmConfig, VolumeConfig};
     use vmm_core::controller::VmmController;
 
-    let kernel = std::env::var("VMM_TEST_KERNEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_path("guest/bzImage"));
-    let base_rootfs = std::env::var("VMM_TEST_ROOTFS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_path("guest/rootfs.ext4"));
-    if !kernel.exists() || !base_rootfs.exists() {
-        eprintln!("kernel/rootfs not found — skip");
-        return;
-    }
+    let kernel = test_support::kernel_path();
+    let base_rootfs = test_support::rootfs_path();
 
     let dir = local_test_dir("restore-clone-overlays");
     let mut artifacts = RestoreCloneArtifacts {
@@ -84,7 +79,7 @@ fn restored_clones_get_private_rootfs_overlays() {
             path: kernel.to_string_lossy().into_owned(),
             cmdline: "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 \
                 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw \
-                virtio_mmio.device=4K@0xd0000000:5 init=/usr/sbin/vmm-agent"
+                init=/usr/sbin/vmm-agent"
                 .into(),
             initramfs: None,
         },

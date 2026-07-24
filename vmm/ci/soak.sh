@@ -2,9 +2,9 @@
 # Soak test: runs boot/snapshot/restore cycles continuously.
 #
 # Two modes:
-#   --mode=fast  Runs the single boot+snapshot+restore E2E (~50ms-1s on c8i).
-#                Enables tens of thousands of cycles in ~3h. Default for
-#                leak hunting and steady-state regression.
+#   --mode=fast  Boots the candidate with the agent rootfs, executes in the
+#                guest, snapshots, restores, and executes again every cycle.
+#                Default for leak hunting and steady-state regression.
 #   --mode=full  Runs the full workspace test suite (~minutes per cycle).
 #                Default for correctness coverage on long runs.
 #
@@ -26,9 +26,32 @@ esac
 
 DURATION=${1:-10800}
 DELAY=${2:-5}
+case "$DURATION" in
+  ''|*[!0-9]*) echo "duration must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$DURATION" -gt 0 ] || { echo "duration must be greater than zero" >&2; exit 2; }
+
+if [ -n "${KERNEL:-}" ]; then
+    export VMM_TEST_KERNEL="$KERNEL"
+fi
+if [ -n "${ROOTFS:-}" ]; then
+    export VMM_TEST_ROOTFS="$ROOTFS"
+fi
+: "${VMM_TEST_KERNEL:?set KERNEL or VMM_TEST_KERNEL to the candidate vmlinux}"
+: "${VMM_TEST_ROOTFS:?set ROOTFS or VMM_TEST_ROOTFS to the agent rootfs}"
+[ -r "$VMM_TEST_KERNEL" ] || {
+    echo "candidate kernel is not readable: $VMM_TEST_KERNEL" >&2
+    exit 2
+}
+[ -r "$VMM_TEST_ROOTFS" ] || {
+    echo "agent rootfs is not readable: $VMM_TEST_ROOTFS" >&2
+    exit 2
+}
+KERNEL_SHA256=$(sha256sum "$VMM_TEST_KERNEL" | awk '{print $1}')
+ROOTFS_SHA256=$(sha256sum "$VMM_TEST_ROOTFS" | awk '{print $1}')
 START=$(date +%s)
 CYCLE=0
-RESULTS=docs/soak-results.md
+RESULTS=${RESULTS:-docs/soak-results.md}
 CONTINUE_ON_FAIL=${CONTINUE_ON_FAIL:-0}
 
 mkdir -p docs
@@ -52,6 +75,10 @@ Mode: $MODE
 Duration target: ${DURATION}s
 Cycle delay: ${DELAY}s
 Command: ${CMD[*]}
+Kernel: $VMM_TEST_KERNEL
+Kernel SHA-256: $KERNEL_SHA256
+Rootfs: $VMM_TEST_ROOTFS
+Rootfs SHA-256: $ROOTFS_SHA256
 
 ## Summary
 
@@ -113,6 +140,7 @@ while true; do
     # the test binary each cycle), and slab cache size (kernel-side
     # leaks like UFFD pages or KVM dirty bitmaps show up here).
     RSS=$(ps -eo rss,comm 2>/dev/null | awk '/cargo|vmm|comprehensive/ {sum += $1} END {print sum+0}')
+    # shellcheck disable=SC2012 # proc fd entries cannot contain unsafe names.
     FDS=$(ls /proc/$SELF_PID/fd 2>/dev/null | wc -l)
     SLAB_KB=$(awk '/^Slab:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
 
@@ -134,15 +162,17 @@ while true; do
             sed -i.bak "s|| First failure | .*|| First failure | $FIRST_FAILURE ||" "$RESULTS"
             rm -f "${RESULTS}.bak"
         fi
-        echo "" >> "$RESULTS"
-        echo "### Cycle $CYCLE failure" >> "$RESULTS"
-        echo '```' >> "$RESULTS"
-        tail -50 "$LOG" >> "$RESULTS"
-        echo '```' >> "$RESULTS"
-        echo '#### dmesg (last 30 lines)' >> "$RESULTS"
-        echo '```' >> "$RESULTS"
-        dmesg 2>/dev/null | tail -30 >> "$RESULTS" || true
-        echo '```' >> "$RESULTS"
+        {
+            echo ""
+            echo "### Cycle $CYCLE failure"
+            echo '```'
+            tail -50 "$LOG"
+            echo '```'
+            echo '#### dmesg (last 30 lines)'
+            echo '```'
+            dmesg 2>/dev/null | tail -30 || true
+            echo '```'
+        } >> "$RESULTS"
 
         if [ "$CONTINUE_ON_FAIL" != "1" ]; then
             echo ""
@@ -156,6 +186,11 @@ while true; do
     echo "Cycle $CYCLE: $PASS pass, $FAIL fail (elapsed ${ELAPSED}s rss=${RSS}KB fds=${FDS})"
     [ "$DELAY" -gt 0 ] && sleep "$DELAY"
 done
+
+[ "$CYCLE" -gt 0 ] || {
+    echo "=== SOAK FAILED: no test cycles completed ===" >&2
+    exit 1
+}
 
 echo ""
 echo "=== Soak complete: $CYCLE cycles, $TOTAL_PASS passed, $TOTAL_FAIL failed ==="

@@ -7,7 +7,7 @@ ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-BASE_ROOTFS="${BASE_ROOTFS:-/tmp/vsock-rootfs.ext4}"
+BASE_ROOTFS="${BASE_ROOTFS:-${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}}"
 ROOTFS=/tmp/taritd-pty-rootfs.ext4
 BASE=http://127.0.0.1:8080
 
@@ -15,7 +15,7 @@ export TARIT_API_KEY="admin-key"                      # legacy => default/admin/
 export TARIT_API_KEYS="key-a:tenantA:user:1,key-b:tenantB:user:5"
 export TARIT_LISTEN="127.0.0.1:8080"
 export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
-export TARIT_KERNEL="/tmp/vmlinux.microvm"
+export TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
 export TARIT_ROOTFS="$ROOTFS"
 export TARIT_ROOTFS_READONLY="0"
 export TARIT_ENABLE_NET="0"
@@ -24,6 +24,7 @@ export TARIT_SOCKET_DIR="${TARIT_SOCKET_DIR:-$TARITD_HOME/sockets}"
 export TARIT_DB="${TARIT_DB:-$TARITD_HOME/fleet.db}"
 export RUST_LOG="info"
 LOG=/tmp/taritd-mt.log
+B2_BODY=/tmp/taritd-mt-b2-$$.json
 PASS=1
 mkdir -p "$TARIT_SOCKET_DIR"; rm -f "$TARIT_DB" "$LOG"
 for p in $(pgrep -f 'target/debug/taritd' 2>/dev/null) $(pgrep -f 'vmm serve' 2>/dev/null); do kill "$p" 2>/dev/null || true; done
@@ -35,11 +36,22 @@ sh "$VMM_ROOT/guest/agent/bake-agent.sh" "$ROOTFS" "$VMM_ROOT/guest/agent/vmm-ag
 
 "$TARIT" serve >"$LOG" 2>&1 & SP=$!
 sleep 4
-cleanup() { kill "$SP" 2>/dev/null || true; sleep 1; }
+cleanup() { kill "$SP" 2>/dev/null || true; sleep 1; rm -f "$B2_BODY"; }
 trap cleanup EXIT
 
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 create() { curl -s -H "X-API-Key: $1" -H 'Content-Type: application/json' -d '{"memory_mib":512,"vcpus":1}' "$BASE/v1/vms"; }
+exec_ok() {
+  local key=$1 vm_id=$2 marker=$3 payload reply
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"vm_id":sys.argv[1],"command":"bash -c \"echo "+sys.argv[2]+"\"","timeout_ms":30000}))' "$vm_id" "$marker")
+  reply=$(curl -fsS -H "X-API-Key: $key" -H 'Content-Type: application/json' -d "$payload" "$BASE/v1/execute") || return 1
+  printf '%s' "$reply" | python3 -c '
+import json, sys
+marker = sys.argv[1]
+result = json.load(sys.stdin)
+assert result["exit_code"] == 0 and marker in result.get("stdout", ""), result
+' "$marker"
+}
 ids() { python3 -c 'import sys,json
 d=json.load(sys.stdin)
 d=d if isinstance(d,list) else d.get("vms",[])
@@ -57,6 +69,8 @@ A_VM=$(create key-a | python3 -c 'import sys,json;print(json.load(sys.stdin).get
 B_VM=$(create key-b | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))')
 echo "  tenantA VM=$A_VM  tenantB VM=$B_VM"
 [ -n "$A_VM" ] && [ -n "$B_VM" ] || { echo "FAIL: create"; PASS=0; }
+exec_ok key-a "$A_VM" tenant-a-runtime-ok || { echo "FAIL: tenant A guest exec"; PASS=0; }
+exec_ok key-b "$B_VM" tenant-b-runtime-ok || { echo "FAIL: tenant B guest exec"; PASS=0; }
 
 echo "=== 4) tenant isolation: each key sees only its own VMs ==="
 LA=$(curl -s -H 'X-API-Key: key-a' "$BASE/v1/vms" | ids)
@@ -71,8 +85,12 @@ echo "=== 5) per-tenant quota: tenantA max_vms=1, 2nd create -> 403 ==="
 C=$(code -H 'X-API-Key: key-a' -H 'Content-Type: application/json' -d '{"memory_mib":512,"vcpus":1}' "$BASE/v1/vms")
 echo "  tenantA 2nd create: $C"; [ "$C" = 403 ] || { echo "FAIL: quota not enforced (got $C)"; PASS=0; }
 echo "  tenantB 2nd create (quota 5):"
-C=$(code -H 'X-API-Key: key-b' -H 'Content-Type: application/json' -d '{"memory_mib":512,"vcpus":1}' "$BASE/v1/vms")
+C=$(curl -s -o "$B2_BODY" -w '%{http_code}' -H 'X-API-Key: key-b' -H 'Content-Type: application/json' -d '{"memory_mib":512,"vcpus":1}' "$BASE/v1/vms")
 echo "    $C"; [ "$C" = 200 ] || [ "$C" = 201 ] || { echo "FAIL: tenantB within quota rejected ($C)"; PASS=0; }
+if [ "$C" = 200 ] || [ "$C" = 201 ]; then
+  B2_VM=$(python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' <"$B2_BODY")
+  exec_ok key-b "$B2_VM" tenant-b-second-runtime-ok || { echo "FAIL: tenant B second guest exec"; PASS=0; }
+fi
 
 echo ""
 if [ "$PASS" = 1 ]; then echo "RESULT: MULTITENANT_PASS"; exit 0; else echo "RESULT: MULTITENANT_FAIL"; exit 1; fi

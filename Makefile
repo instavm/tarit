@@ -33,8 +33,8 @@ taritd:
 agent:
 	$(MAKE) -C vmm/guest/agent
 
-# One-time quickstart assets: build a vsock-capable guest kernel and pre-pull an
-# Ubuntu rootfs (into guest-assets/), so starting a microVM later is instant.
+# One-time quickstart assets: fetch the verified guest kernel (or build it from
+# pinned source) and pre-pull an Ubuntu rootfs into guest-assets/.
 guest:
 	./scripts/setup-guest.sh
 

@@ -1314,7 +1314,12 @@ TEST_UPLINK=$(ip route get "$EGRESS_TEST_IP" |
 # These guest utilities are required for the behavioral checks; do not treat a
 # missing tool as a pass because that would skip the actual isolation gate.
 for vm_id in "$VM_A" "$VM_B"; do
-  expect_guest_success "$vm_id" 'command -v sh ip ping nc ss sysctl timeout'
+  expect_guest_success "$vm_id" 'command -v sh curl ip ping nc ss sysctl timeout'
+done
+
+GUEST_CURL="curl --insecure --fail --silent --show-error --connect-timeout 3 --max-time 8 --output /dev/null https://$EGRESS_TEST_IP:$EGRESS_TEST_PORT/"
+for vm_id in "$VM_A" "$VM_B"; do
+  expect_guest_denial "$vm_id" "$GUEST_CURL"
 done
 
 # Keep listeners on guest B alive while guest A attempts lateral TCP and UDP.
@@ -1389,15 +1394,15 @@ expect_guest_denial "$VM_A" "ping -6 -I eth0 -c 1 -W 3 $IPV6_GUEST_B"
 # A guest cannot initiate host-local traffic through its TAP.
 expect_guest_denial "$VM_A" "ping -c 1 -W 2 $UPLINK_IP"
 
-# Permit one external TCP destination and prove a connection plus its return
-# traffic. EGRESS_TEST_IP is an externally supplied real endpoint, not localhost.
+# Permit one external TCP destination and prove an HTTP response plus its return
+# traffic with curl from inside each guest.
 for vm_id in "$VM_A" "$VM_B"; do
   curl -fsS -X PATCH \
     -H "X-API-Key: $TARIT_API_KEY" \
     -H 'Content-Type: application/json' \
     -d "{\"allowlist\":[\"$EGRESS_TEST_IP/32:$EGRESS_TEST_PORT/tcp\"],\"allow_existing\":true}" \
     "$TARIT_BASE_URL/v1/egress/vm/$vm_id" >/dev/null
-  expect_guest_success "$vm_id" "timeout 8 nc -z -w 5 $EGRESS_TEST_IP $EGRESS_TEST_PORT"
+  expect_guest_success "$vm_id" "$GUEST_CURL"
 done
 
 STALE_VM_A=$(cat /proc/sys/kernel/random/uuid) ||
@@ -1415,8 +1420,8 @@ assert_recovered_policy "$VM_B" "$TAP_B" "$GUEST_B" "$UPLINK"
 ! nft -a list chain ip taritd_nat vm_egress |
   grep -F "vm=$STALE_VM_A tap=$TAP_A" >/dev/null ||
   fail "restart left the prior-owner sentinel policy installed"
-expect_guest_success "$VM_A" "timeout 8 nc -z -w 5 $EGRESS_TEST_IP $EGRESS_TEST_PORT"
-expect_guest_success "$VM_B" "timeout 8 nc -z -w 5 $EGRESS_TEST_IP $EGRESS_TEST_PORT"
+expect_guest_success "$VM_A" "$GUEST_CURL"
+expect_guest_success "$VM_B" "$GUEST_CURL"
 
 delete_vm "$VM_A"
 OLD_VM_A=$VM_A
@@ -1440,6 +1445,7 @@ curl -fsS -X PATCH \
   -d "{\"allowlist\":[\"$EGRESS_TEST_IP/32:$EGRESS_TEST_PORT/tcp\"],\"allow_existing\":true}" \
   "$TARIT_BASE_URL/v1/egress/vm/$VM_C" >/dev/null
 assert_recovered_policy "$VM_C" "$TAP_C" "$GUEST_C" "$UPLINK"
+expect_guest_success "$VM_C" "$GUEST_CURL"
 ! nft -a list table ip taritd_nat | grep -F "vm=$OLD_VM_A tap=$TAP_C" >/dev/null ||
   fail "slot reuse retained prior-owner policy for $OLD_VM_A"
 

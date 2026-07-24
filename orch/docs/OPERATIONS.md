@@ -7,7 +7,7 @@ This guide covers building, running, clustering, load balancing, deployment help
 - Linux host with KVM for actually running microVMs.
 - Rust stable toolchain.
 - The rust-vmm based `vmm` binary from the sibling VMM repository.
-- Guest kernel and optional rootfs image readable by `taritd`.
+- The release ELF `vmlinux` and optional rootfs image readable by `taritd`.
 - `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`.
 - PostgreSQL for distributed cluster mode.
 - `CAP_NET_ADMIN` or root only if `TARIT_ENABLE_NET=true`.
@@ -30,6 +30,18 @@ cargo build --release --features "vmm-core/kvm vmm-core/boot vmm-memory-backend/
 
 The deploy script uses the command above when the `vmm` binary is not found on `PATH`.
 
+Prepare and install the kernel and rootfs:
+
+```sh
+cd /path/to/tarit
+sudo make guest
+sudo install -d -m 0755 /var/lib/taritd
+sudo install -m 0644 guest-assets/vmlinux guest-assets/rootfs.ext4 /var/lib/taritd/
+```
+
+`make guest` verifies the pinned release kernel checksum and falls back to the
+same checksum-pinned source build if the artifact is unavailable.
+
 ## Run one node
 
 ```sh
@@ -40,7 +52,7 @@ export TARIT_LISTEN='0.0.0.0:8080'
 export TARIT_HOST_ID="$(hostname)"
 export TARIT_RPC_ADDR='http://127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"
@@ -101,7 +113,7 @@ export TARIT_API_KEY='replace-with-a-long-random-token'
 export TARIT_PEER_SECRET='replace-with-a-long-random-peer-secret'
 export TARIT_DATABASE_URL='postgres://taritd:password@postgres.example:5432/taritd?sslmode=require'
 export TARIT_VMM_BIN='/opt/taritd/bin/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_MAX_VMS='32'
 export TARIT_MAX_MEMORY_MIB='65536'
@@ -306,11 +318,13 @@ export TARIT_RDS_CA_FILE="$HOME/.taritd/rds-global-bundle.pem"
 
 | Script | Purpose | Important inputs |
 | --- | --- | --- |
-| `deploy/c8i-deploy.sh` | Rsync this repo to an EC2 c8i host, build `taritd`, build or reuse `vmm`, start `taritd`, and run `tests/e2e_c8i.sh`. | `C8I_HOST`, `C8I_USER`, `C8I_KEY`, `REMOTE_DIR`, `VMM_DIR`, `TARIT_API_KEY`. |
+| `deploy/c8i-deploy.sh` | Rsync this repo to an EC2 c8i host, build `taritd`, build or reuse `vmm`, start network-enabled `taritd` as root, and run `tests/e2e_c8i.sh`. | `C8I_HOST`, a 32-character `TARIT_API_KEY`, `TARIT_KERNEL`, and `TARIT_ROOTFS` are required. The host must be in `C8I_KNOWN_HOSTS`. It binds to `127.0.0.1:8080` unless `TARIT_LISTEN` is set. |
 | `deploy/provision-rds.sh` | Create a new RDS PostgreSQL fleet store and credentials env file. | `AWS_REGION`, `TARIT_CP_VPC_ID`, `TARIT_CP_C8I_SG`, `TARIT_CP_DB_PASSWORD`. |
 | `deploy/open-api-port.sh` | Open TCP API port on the configured EC2 security group. | `C8I_SG`, `TARIT_PORT`, `TARIT_PUBLIC_CIDR`, `AWS_REGION`. |
 
-The deploy script uses `pkill -f 'target/release/taritd'` on the remote host. Use caution on shared hosts.
+The c8i rootfs must contain `curl`; `make guest` includes it. The deploy script
+records the remote daemon PID in `~/.taritd/taritd.pid` and verifies the process
+identity before stopping a prior run.
 
 ## Benchmarks
 

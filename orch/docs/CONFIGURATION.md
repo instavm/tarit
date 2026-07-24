@@ -18,7 +18,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_HOST_ID` | string | output of `hostname`, else `localhost` | Stable node identity used in local records and fleet ownership. |
 | `TARIT_RPC_ADDR` | string | `http://{listen.ip()}:{listen.port()}` | HTTP(S) origin advertised to peers. In cluster mode, set this to an address other nodes can reach; HTTPS is required unless insecure peer HTTP is explicitly enabled for development. |
 | `TARIT_VMM_BIN` | path | `vmm` (looked up on `PATH`) | Path to the rust-vmm based `vmm` binary. `~/` is expanded. |
-| `TARIT_KERNEL` | path | `/tmp/vmlinux.microvm` | Default guest kernel path used when a create request omits `kernel_path`. `~/` is expanded. |
+| `TARIT_KERNEL` | path | `/tmp/vmlinux.microvm` | Default guest kernel path used when a create request omits `kernel_path`. `make guest` writes the release kernel to `guest-assets/vmlinux`. `~/` is expanded. |
 | `TARIT_ROOTFS` | path | `/tmp/debian-rootfs.ext4` | Default rootfs path used when a create request omits `rootfs_path`. `~/` is expanded. |
 | `TARIT_ROOTFS_READONLY` | bool | `false` | Request read-only guest mount semantics (`ro` kernel cmdline). The host base is always immutable and every VM gets a private CoW overlay. |
 | `TARIT_SOCKET_DIR` | path | `~/.taritd/sockets` | Directory for per-VM VMM Unix domain sockets. `~/` is expanded. |
@@ -219,7 +219,7 @@ export TARIT_LISTEN='0.0.0.0:8080'
 export TARIT_HOST_ID="$(hostname)"
 export TARIT_RPC_ADDR='http://127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"
@@ -237,7 +237,7 @@ export TARIT_LISTEN='0.0.0.0:8080'
 # HTTPS endpoint supplied by the private peer TLS proxy.
 export TARIT_RPC_ADDR='https://node-a.peer.example.com:8443'
 export TARIT_VMM_BIN='/opt/taritd/bin/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/node-a/sockets"
 export TARIT_DB="$HOME/.taritd/node-a/fleet.db"

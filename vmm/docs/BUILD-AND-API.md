@@ -8,6 +8,12 @@
 - **Linux x86_64 host with KVM** (`/dev/kvm`) for running VMs
 - For OCI image pulling: `skopeo`, `umoci`, `e2fsprogs` (`sudo apt install skopeo umoci e2fsprogs`)
 
+From the repository root, `sudo make guest` downloads Tarit's pinned,
+checksum-verified ELF `vmlinux` and creates an agent-enabled rootfs under
+`guest-assets/`. If the release artifact is unavailable, it builds the same
+kernel from checksum-pinned source. The loader also supports user-supplied
+`bzImage` kernels, but the release artifact is `vmlinux`.
+
 ### Build Commands
 
 ```sh
@@ -39,11 +45,15 @@ cargo test --workspace
 # KVM smoke tests (Linux+KVM only)
 sudo cargo test -p vmm-memory-backend --features kvm -- --include-ignored
 
-# E2E integration tests (Linux+KVM + guest/bzImage)
-sudo cargo test -p vmm-integration --features kvm -- --include-ignored
+# E2E integration tests (Linux+KVM, run from vmm/)
+sudo VMM_TEST_KERNEL=../guest-assets/vmlinux \
+  VMM_TEST_ROOTFS=../guest-assets/rootfs.ext4 \
+  cargo test -p vmm-integration --features kvm -- --include-ignored
 
 # Comprehensive test (44 feature checks)
-sudo cargo test -p vmm-integration --features kvm --test comprehensive_e2e -- --include-ignored --nocapture
+sudo VMM_TEST_KERNEL=../guest-assets/vmlinux \
+  VMM_TEST_ROOTFS=../guest-assets/rootfs.ext4 \
+  cargo test -p vmm-integration --features kvm --test comprehensive_e2e -- --include-ignored --nocapture
 
 # Virtio-blk E2E (5 tests: read/write/flush/RO/OOB)
 sudo cargo test -p vmm-integration --test virtio_blk_e2e -- --include-ignored
@@ -60,12 +70,12 @@ cargo fmt --all -- --check
 ### `vmm run` (`start`): Boot a fresh VM
 
 ```sh
-vmm run --kernel <PATH> [OPTIONS]
+vmm run [--kernel <PATH>] [OPTIONS]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernel <PATH>` | (required) | Path to bzImage or vmlinux |
+| `--kernel <PATH>` | installed pinned kernel | Path to a user-supplied bzImage or vmlinux |
 | `--cmdline <CMDLINE>` | loader default | Kernel command line |
 | `--initramfs <PATH>` | none | Path to initramfs image |
 | `--mem <MIB>` | 256 | Guest memory size in MiB |
@@ -81,28 +91,29 @@ vmm run --kernel <PATH> [OPTIONS]
 
 **Examples:**
 ```sh
-# Fast boot (kernel HLTs: for benchmarks)
-vmm run --kernel guest/bzImage --mem 256
+# Fast boot for a purpose-built HLT benchmark kernel
+vmm run --kernel /path/to/hlt-test-kernel --mem 256
 
 # Full boot with rootfs
-vmm run --kernel guest/bzImage --rootfs rootfs.ext4 --full-boot \
+vmm run --kernel ../guest-assets/vmlinux --rootfs ../guest-assets/rootfs.ext4 --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 
 # With initramfs
-vmm run --kernel guest/bzImage --initramfs guest/initramfs.cpio.gz --mem 512
+vmm run --kernel ../guest-assets/vmlinux --initramfs guest/initramfs.cpio.gz \
+  --mem 512 --full-boot
 ```
 
 ### `vmm create`: Boot a VM inside `vmm serve` (via API)
 
 ```sh
-vmm create --kernel <PATH> [OPTIONS] [--socket <PATH>]
+vmm create [--kernel <PATH>] [OPTIONS] [--socket <PATH>]
 ```
 
 This sends an API `create` request to an existing `vmm serve` socket.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernel <PATH>` | (required) | Path to bzImage or vmlinux |
+| `--kernel <PATH>` | installed pinned kernel | Path to a user-supplied bzImage or vmlinux |
 | `--cmdline <CMDLINE>` | loader default, with `root=/dev/vda rw` prepended when `--rootfs` is set | Kernel command line |
 | `--initramfs <PATH>` | none | Path to initramfs image |
 | `--mem <MIB>` | 256 | Guest memory size in MiB |
@@ -110,6 +121,21 @@ This sends an API `create` request to an existing `vmm serve` socket.
 | `--rootfs <PATH>` | none | Attach a boot rootfs as `/dev/vda` read-write |
 | `--volume <PATH[:ro\|rw]>` | none | Attach a storage volume (repeatable) |
 | `--overlay <PATH>` | none | Attach a private CoW overlay for each `--volume` |
+
+When `--kernel` is omitted, interactive `run` and `create` commands verify the
+installed pinned kernel and offer a `[y/N]` download if it is missing.
+Non-interactive commands fail with an install command instead of prompting.
+
+### `vmm kernel install`: Install the pinned kernel
+
+```sh
+vmm kernel install [--output <PATH>] [--force]
+```
+
+The command downloads the version and URL embedded at build time, requires
+HTTPS, verifies the embedded SHA-256, and installs with an atomic rename.
+`TARIT_KERNEL` overrides the default path. `--force` replaces a regular file
+whose checksum is wrong; symlinks and non-regular files are rejected.
 
 ### `vmm serve` (`server`): Start the API server
 
@@ -303,7 +329,7 @@ All requests are JSON objects with an `op` field (snake_case):
   "op": "create",
   "config": {
     "kernel": {
-      "path": "guest/vmlinux.minimal",
+      "path": "../guest-assets/vmlinux",
       "cmdline": "console=ttyS0 quiet loglevel=0 reboot=k panic=-1 nomodule pci=off root=/dev/vda rw init=/usr/sbin/vmm-agent",
       "initramfs": null
     },
@@ -428,7 +454,7 @@ All responses are JSON objects with a `status` field:
 { "status": "restored" }
 { "status": "exec", "exit_code": 0, "stdout": "hello\n", "stderr": "", "duration_ms": 15 }
 { "status": "egress_updated", "rules_applied": 2 }
-{ "status": "vm_status", "state": "running", "uptime_ms": 1234, "vcpus": 1, "mem_mib": 256, "volumes": 1, "nets": 1, "kernel": "guest/bzImage", "vcpu_alive": true }
+{ "status": "vm_status", "state": "running", "uptime_ms": 1234, "vcpus": 1, "mem_mib": 256, "volumes": 1, "nets": 1, "kernel": "../guest-assets/vmlinux", "vcpu_alive": true }
 { "status": "err", "msg": "VM not found" }
 ```
 
@@ -473,7 +499,7 @@ print(vmm_request("build/run/vmm.sock", {
     "op": "create",
     "config": {
         "kernel": {
-            "path": "guest/vmlinux.minimal",
+            "path": "../guest-assets/vmlinux",
             "cmdline": "console=ttyS0 quiet loglevel=0 reboot=k panic=-1 nomodule pci=off root=/dev/vda rw init=/usr/sbin/vmm-agent",
             "initramfs": None,
         },
@@ -530,7 +556,7 @@ crates/
 src/                  The vmm binary (CLI + wiring)
 docs/                 Build and API reference, design choices, integration, benchmarks
 ci/                   CI scripts (check.sh, kvm-runner-bootstrap.sh, perf-gates.sh)
-guest/                Guest kernel configs + bzImage (gitignored)
+guest/                Guest kernel configs, release tooling, and agent
 ```
 
 ## Security Model

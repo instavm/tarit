@@ -34,13 +34,14 @@ use vmm_devices::bus::{MmioDevice, MmioRange};
 use vmm_devices::virtio::blk_backend::BlkBackend;
 use vmm_devices::virtio::blk_transport::{status_bits, VirtioBlkMmio};
 
+mod test_support;
+use test_support::kernel_path;
+
 /// MMIO base for the rootfs device. Matches the CLI default in src/main.rs.
 const VBLK_MMIO_BASE: u64 = 0xd000_0000;
 const VBLK_IRQ: u32 = 5;
 
-/// Build a minimal ext4 rootfs file (32 MiB) using mke2fs. Returns the path,
-/// or skips the test if mke2fs is absent. The image only needs the ext4
-/// superblock — the kernel will mount it long before any guest userspace.
+/// Build a minimal ext4 rootfs file (32 MiB) using mke2fs.
 fn ensure_rootfs() -> Option<String> {
     let path = "/tmp/vmm-oci-diag-rootfs.ext4";
     if std::path::Path::new(path).exists() {
@@ -55,7 +56,7 @@ fn ensure_rootfs() -> Option<String> {
         .status()
         .ok()?;
     if !st.success() {
-        eprintln!("mkfs.ext4 failed; skipping");
+        eprintln!("mkfs.ext4 failed");
         return None;
     }
     Some(path.into())
@@ -143,10 +144,7 @@ fn probe_virtio_blk_activation_inner(
          virtio_mmio.device=4K@0x{VBLK_MMIO_BASE:x}:{VBLK_IRQ}"
     );
 
-    let kernel_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/bzImage");
-    if !kernel_path.exists() {
-        panic!("guest/bzImage not found — needed for OCI boot probe");
-    }
+    let kernel_path = kernel_path();
     let loaded =
         load(&mem.inner, &kernel_path, &cmdline, None, mem.size_bytes).expect("load kernel");
 
@@ -210,14 +208,8 @@ fn probe_baseline_no_virtio(run_duration: Duration) -> (u64, u64) {
     let mem = GuestMemory::new(mem_size).expect("alloc guest mem");
     let cmdline = "console=ttyS0 earlyprintk=ttyS0 reboot=k panic=1 pci=off i8042.noaux \
                    random.trust_cpu=on nowatchdog nokaslr";
-    let loaded = load(
-        &mem.inner,
-        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest/bzImage"),
-        cmdline,
-        None,
-        mem.size_bytes,
-    )
-    .expect("load kernel");
+    let loaded =
+        load(&mem.inner, &kernel_path(), cmdline, None, mem.size_bytes).expect("load kernel");
     vcpu_setup::write_gdt(&mem).expect("write_gdt");
     let template = vmm_core::cpu_template::CpuTemplate::bare();
     let vm = KvmVm::new_with_options(mem.clone(), vec![], template, false).expect("KvmVm");
@@ -243,13 +235,7 @@ fn probe_baseline_no_virtio(run_duration: Duration) -> (u64, u64) {
 #[ignore]
 fn oci_boot_to_login_attempt() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let rootfs = match ensure_rootfs() {
-        Some(p) => p,
-        None => {
-            eprintln!("rootfs setup failed — skipping");
-            return;
-        }
-    };
+    let rootfs = ensure_rootfs().expect("rootfs setup must succeed");
 
     // Baseline: boot the same kernel without virtio. If THIS path doesn't
     // produce PIO exits, the kernel itself isn't reaching userspace and the
@@ -345,7 +331,7 @@ fn oci_boot_to_login_attempt() {
          | B: virtio, no IRQCHIP | false | no | {pb_sw} | {pb_n} | 0x{pb_st:x} | {pb_ms} ms (101 HLTs) |\n\
          | C: virtio, IRQCHIP+PIT | true | yes | {pc_sw} | {pc_n} | 0x{pc_st:x} ({pc_flag}) | {pc_ms} ms (0 PIO, 0 HLT) |\n\
          \n\
-         **Conditions.** 128 MiB guest, in-tree `guest/bzImage` (Linux 5.10.230 \
+         **Conditions.** 128 MiB guest, candidate `VMM_TEST_KERNEL` \
          with CONFIG_VIRTIO_BLK=y, CONFIG_VIRTIO_MMIO=y, CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y \
          confirmed by `strings`), virtio-blk at 0x{VBLK_MMIO_BASE:x} IRQ {VBLK_IRQ}, \
          cmdline includes `virtio_mmio.device=4K@0x{VBLK_MMIO_BASE:x}:{VBLK_IRQ}`. \

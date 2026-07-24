@@ -3,33 +3,11 @@
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
 
-use std::path::PathBuf;
 use std::time::Instant;
-use vmm_core::config::{KernelConfig, MemoryConfig, VcpuConfig, VmConfig};
 use vmm_core::controller::VmmController;
 
-fn kernel_path() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    PathBuf::from(manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("guest/bzImage"))
-        .unwrap_or_else(|| PathBuf::from("guest/bzImage"))
-}
-
-fn vm_config() -> VmConfig {
-    VmConfig {
-        kernel: KernelConfig {
-            path: kernel_path().to_string_lossy().to_string(),
-            cmdline: "console=ttyS0 reboot=k panic=1 nokaslr".into(),
-            initramfs: None,
-        },
-        memory: MemoryConfig { size_mib: 256 },
-        vcpus: VcpuConfig { count: 1 },
-        volumes: vec![],
-        net: vec![],
-    }
-}
+mod test_support;
+use test_support::{agent_vm_config, assert_guest_exec, private_overlay_path};
 
 fn retain_snapshot(controller: &VmmController, path: &str) {
     let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
@@ -40,19 +18,20 @@ fn retain_snapshot(controller: &VmmController, path: &str) {
 }
 
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn e2e_boot_snapshot_restore() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let controller = VmmController::new();
 
     // 1. Boot (Create).
     let t0 = Instant::now();
-    controller.create(vm_config()).expect("boot");
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest");
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo lifecycle-create-ok'",
+        "lifecycle-create-ok",
+    );
     let boot_ms = t0.elapsed().as_millis();
     eprintln!("Boot: {boot_ms}ms");
 
@@ -66,7 +45,21 @@ fn e2e_boot_snapshot_restore() {
 
     // 3. Restore.
     let t2 = Instant::now();
-    controller.restore(&snap_path, None).expect("restore");
+    controller
+        .restore(
+            &snap_path,
+            Some(
+                private_overlay_path("lifecycle-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore");
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo lifecycle-restore-ok'",
+        "lifecycle-restore-ok",
+    );
     let restore_ms = t2.elapsed().as_millis();
     eprintln!("Restore: {restore_ms}ms");
 
@@ -101,46 +94,24 @@ fn e2e_boot_snapshot_restore() {
 }
 
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn perf_cold_boot_latency() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let mut times = Vec::new();
     for i in 0..5 {
         let controller = VmmController::new();
         // 1. Boot the VM.
         let start = Instant::now();
-        controller.create(vm_config()).expect("boot");
-        let boot_elapsed = start.elapsed();
-        eprintln!("boot {i}: {:?}", boot_elapsed);
-
-        // 2. Exec `echo hello` — this is the full boot-to-exec-echo path.
-        //    It boots a fresh VM with a custom init that runs the command
-        //    and writes the result to the guest channel at GPA 0x70000.
-        let exec_start = Instant::now();
-        let result = controller.exec("echo hello", 5000);
-        let exec_elapsed = exec_start.elapsed();
-
-        match &result {
-            Ok((exit_code, output, duration_ms)) => {
-                eprintln!(
-                    "exec {i}: exit={exit_code} output='{output}' {}ms (total {:?})",
-                    duration_ms, exec_elapsed
-                );
-                times.push(exec_elapsed);
-            }
-            Err(e) => {
-                // exec may fail if the guest kernel lacks CONFIG_DEVMEM
-                // (needed for the /dev/mem memory channel). Fall back to
-                // measuring boot-to-HLT only.
-                eprintln!("exec {i} failed: {e} — falling back to boot-to-HLT metric");
-                times.push(boot_elapsed);
-            }
-        }
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo cold-boot-runtime-ok'",
+            "cold-boot-runtime-ok",
+        );
+        let boot_to_exec = start.elapsed();
+        eprintln!("boot-to-exec {i}: {boot_to_exec:?}");
+        times.push(boot_to_exec);
 
         controller.stop().ok();
     }
@@ -154,20 +125,35 @@ fn perf_cold_boot_latency() {
 }
 
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn stability_soak_10_cycles() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     for i in 0..10 {
         let controller = VmmController::new();
-        controller.create(vm_config()).expect("boot");
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo soak-create-ok'",
+            "soak-create-ok",
+        );
         let snap_path = controller.snapshot(false).expect("snapshot");
         retain_snapshot(&controller, &snap_path);
-        controller.restore(&snap_path, None).expect("restore");
+        controller
+            .restore(
+                &snap_path,
+                Some(
+                    private_overlay_path("soak-restore")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            )
+            .expect("restore");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo soak-restore-ok'",
+            "soak-restore-ok",
+        );
         controller.stop().ok();
         let _ = std::fs::remove_file(&snap_path);
         eprintln!("soak cycle {i}: OK");

@@ -43,8 +43,17 @@ with the exec agent baked in. Build both once from the repo root:
 sudo make guest        # writes guest-assets/vmlinux and guest-assets/rootfs.ext4
 ```
 
+The command verifies the pinned kernel SHA-256. If the release download fails,
+it builds the same kernel from checksum-pinned source. The generated rootfs
+includes `curl`, `ip`, `ping`, `nc`, `ss`, and `sysctl`, which the network
+suites execute inside the guest.
+
 Point the runners at them with `TARIT_KERNEL` and `TARIT_ROOTFS` (they default to
 `/tmp/vmlinux.microvm` and `/tmp/vsock-rootfs.ext4`).
+
+`vmm/ci/kvm-runner-bootstrap.sh` requires `VMM_TEST_KERNEL` and
+`VMM_TEST_ROOTFS` to name readable paths inside the Colima VM. It checks both
+before starting ignored KVM tests.
 
 ## 1. Single-node e2e
 

@@ -7,13 +7,13 @@ ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-BASE_ROOTFS="${BASE_ROOTFS:-/tmp/vsock-rootfs.ext4}"
+BASE_ROOTFS="${BASE_ROOTFS:-${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}}"
 ROOTFS=/tmp/net-rootfs.ext4
 
 export TARIT_API_KEY="net-key"
 export TARIT_LISTEN="127.0.0.1:8080"
 export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
-export TARIT_KERNEL="/tmp/vmlinux.microvm"
+export TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
 export TARIT_ROOTFS="$ROOTFS"
 export TARIT_ROOTFS_READONLY="0"
 export TARIT_ENABLE_NET="1"
@@ -55,9 +55,24 @@ create_n() {
   echo "$ids"
 }
 
+assert_guest_runtime() {
+  local id output
+  for id in "$@"; do
+    output=$("$TARIT" exec "$id" "bash -c 'echo net-runtime-ok'" 2>&1) || {
+      echo "FAIL: guest exec failed for $id: $output"
+      return 1
+    }
+    printf '%s' "$output" | grep -q 'net-runtime-ok' || {
+      echo "FAIL: guest exec returned no marker for $id: $output"
+      return 1
+    }
+  done
+}
+
 echo "=== create $N VMs ==="
 VMS=$(create_n "$N")
 echo "  VMs:$VMS"
+assert_guest_runtime $VMS || PASS=0
 sleep 2
 T1=$(ntaps); TAPS1=$(taps | tr '\n' ' ')
 echo "  taps after create ($T1): $TAPS1"
@@ -74,6 +89,7 @@ echo "  taps after delete ($T2): $(taps | tr '\n' ' ')"
 
 echo "=== recreate $N VMs (expect slot/tap reuse) ==="
 VMS=$(create_n "$N")
+assert_guest_runtime $VMS || PASS=0
 sleep 2
 TAPS3=$(taps | tr '\n' ' ')
 echo "  taps after recreate: $TAPS3"
