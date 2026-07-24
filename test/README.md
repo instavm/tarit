@@ -43,6 +43,9 @@ with the exec agent baked in. Build both once from the repo root:
 sudo make guest        # writes guest-assets/vmlinux and guest-assets/rootfs.ext4
 ```
 
+The command verifies the pinned kernel SHA-256. If the release download fails,
+it builds the same kernel from checksum-pinned source.
+
 Point the runners at them with `TARIT_KERNEL` and `TARIT_ROOTFS` (they default to
 `/tmp/vmlinux.microvm` and `/tmp/vsock-rootfs.ext4`).
 

@@ -81,8 +81,9 @@ sudo make guest        # one-time: fetch a verified guest kernel + pull an Ubunt
 `make guest` downloads the pinned, checksum-verified guest kernel and pulls the
 OCI rootfs once. If the release artifact is unavailable, it builds the same
 kernel from checksum-pinned source. It writes `guest-assets/vmlinux` and
-`guest-assets/rootfs.ext4`, so later starts do not
-repeat image conversion. Boot one, run a command in it, tear it down:
+`guest-assets/rootfs.ext4`, so later starts do not repeat image conversion.
+The [guest kernel documentation](vmm/guest/README.md) lists the pins, build,
+and release checks. Boot one, run a command in it, tear it down:
 
 ```sh
 sudo vmm serve --socket /tmp/vm.sock &

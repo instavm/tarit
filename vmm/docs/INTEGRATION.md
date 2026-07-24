@@ -22,6 +22,12 @@ The orchestrator owns:
 - UDS permissions and any higher-level auth.
 - Multi-VM state, names, ids, and cleanup.
 
+From the repository root, `sudo make guest` prepares the release kernel at
+`guest-assets/vmlinux` and an agent-enabled rootfs at
+`guest-assets/rootfs.ext4`. Deploy those files to stable host paths readable by
+the VMM. The release kernel is an ELF `vmlinux`; bzImage is only an alternate
+loader input for user-supplied kernels.
+
 The VMM owns:
 
 - KVM VM creation for one microVM.
@@ -53,14 +59,14 @@ Boot the single VM. This is the API equivalent of creating a live VM under `vmm 
   "op": "create",
   "config": {
     "kernel": {
-      "path": "guest/bzImage",
+      "path": "/var/lib/tarit/vmlinux",
       "cmdline": "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr",
       "initramfs": null
     },
     "memory": { "size_mib": 512 },
     "vcpus": { "count": 1 },
     "volumes": [
-      { "path": "guest/rootfs.ext4", "read_only": false, "overlay": null },
+      { "path": "/var/lib/tarit/rootfs.ext4", "read_only": false, "overlay": null },
       { "path": "disks/data-base.ext4", "read_only": true, "overlay": "run/vm0-data.cow" }
     ],
     "net": [
@@ -192,7 +198,7 @@ All non-PTY responses are internally tagged with a `status` field:
   "mem_mib": 512,
   "volumes": 1,
   "nets": 1,
-  "kernel": "guest/bzImage",
+  "kernel": "/var/lib/tarit/vmlinux",
   "vcpu_alive": true
 }
 ```
@@ -252,14 +258,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let config = VmConfig {
         kernel: KernelConfig {
-            path: "guest/bzImage".into(),
+            path: "/var/lib/tarit/vmlinux".into(),
             cmdline: "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr".into(),
             initramfs: None,
         },
         memory: MemoryConfig { size_mib: 512 },
         vcpus: VcpuConfig { count: 1 },
         volumes: vec![VolumeConfig {
-            path: "guest/rootfs.ext4".into(),
+            path: "/var/lib/tarit/rootfs.ext4".into(),
             read_only: false,
             overlay: None,
         }],

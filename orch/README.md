@@ -23,7 +23,15 @@ cargo build --release -p taritd
 
 cd /path/to/tarit/vmm
 cargo build --release --features "vmm-core/kvm vmm-core/boot vmm-memory-backend/kvm"
+
+cd /path/to/tarit
+sudo make guest
+sudo install -d -m 0755 /var/lib/taritd
+sudo install -m 0644 guest-assets/vmlinux guest-assets/rootfs.ext4 /var/lib/taritd/
 ```
+
+`make guest` verifies the pinned release kernel checksum and falls back to the
+same checksum-pinned source build if the artifact is unavailable.
 
 Start one Linux/KVM host:
 
@@ -34,7 +42,7 @@ export TARIT_LISTEN='0.0.0.0:8080'
 export TARIT_HOST_ID="$(hostname)"
 export TARIT_RPC_ADDR='http://127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"

@@ -13,6 +13,10 @@ versions may contain breaking changes.
 ### Changed
 
 - SSH gateway client authentication no longer accepts RSA public keys.
+- Guest setup now downloads a reproducibly built Linux 6.12 LTS `vmlinux`,
+  verifies its pinned SHA-256, and falls back to a checksum-pinned source build.
+  Kernel releases are attested and gated by the full c8i promotion suite and a
+  minimum three-hour lifecycle soak.
 
 ## [0.1.0] - 2026-07-03
 

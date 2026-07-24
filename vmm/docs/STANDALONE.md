@@ -8,7 +8,8 @@ See [BUILD-AND-API.md](BUILD-AND-API.md) for the full CLI reference.
 
 - x86_64 Linux with KVM available at `/dev/kvm`.
 - Rust 1.95 or newer to build the VMM.
-- A guest Linux kernel image, usually `bzImage` or `vmlinux`.
+- The release ELF `vmlinux`, prepared with `sudo make guest` from the
+  repository root. The loader also accepts user-supplied bzImage kernels.
 - An ext4 rootfs image for userspace boot.
 - Root or the needed capabilities for KVM, TAP devices, network namespaces, cgroups, and jailing.
 - For OCI image conversion: `skopeo`, `umoci`, and `e2fsprogs`.
@@ -27,14 +28,14 @@ cargo build --release -p vmm --features boot
 Fast boot mode is the default. It is useful for kernel-load and HLT-loop checks:
 
 ```sh
-sudo target/release/vmm run --kernel guest/bzImage --mem 256
+sudo target/release/vmm run --kernel /path/to/hlt-test-kernel --mem 256
 ```
 
 For a normal Linux userspace boot from an ext4 rootfs, use `--full-boot`:
 
 ```sh
-sudo target/release/vmm run --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --mem 512 \
   --vcpus 1 \
   --full-boot \
@@ -45,8 +46,8 @@ Attach a data volume with a private CoW overlay. `--overlay` applies to `--volum
 
 ```sh
 mkdir -p run
-sudo target/release/vmm run --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --volume disks/data-base.ext4:ro \
   --overlay run/vm0-data.cow \
   --full-boot \
@@ -59,8 +60,8 @@ Attach virtio-net to a host TAP. The orchestrator or operator is responsible for
 sudo ip tuntap add dev tap0 mode tap
 sudo ip addr add 172.16.0.1/24 dev tap0
 sudo ip link set tap0 up
-sudo target/release/vmm run --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --net tap=tap0,mac=02:00:00:00:00:02 \
   --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
@@ -98,8 +99,8 @@ socket.
 
 ```sh
 target/release/vmm --socket /tmp/vmm.sock create \
-  --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+  --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --mem 512 \
   --vcpus 1 \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
@@ -124,13 +125,13 @@ req = {
     "op": "create",
     "config": {
         "kernel": {
-            "path": "guest/bzImage",
+            "path": "../guest-assets/vmlinux",
             "cmdline": "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr",
             "initramfs": None,
         },
         "memory": {"size_mib": 512},
         "vcpus": {"count": 1},
-        "volumes": [{"path": "guest/rootfs.ext4", "read_only": False, "overlay": None}],
+        "volumes": [{"path": "../guest-assets/rootfs.ext4", "read_only": False, "overlay": None}],
         "net": [],
     },
 }
@@ -224,7 +225,7 @@ target/release/vmm pull docker://alpine:3.20 \
   --size 1024 \
   --agent guest/agent/vmm-agent
 
-sudo target/release/vmm run --kernel guest/bzImage \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --rootfs images/alpine.ext4 \
   --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
