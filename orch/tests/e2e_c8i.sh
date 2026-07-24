@@ -73,6 +73,7 @@ echo "$SNAP" | grep -q '"path"'
 SNAP_PATH=$(printf '%s' "$SNAP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["path"])')
 
 echo "== egress update =="
+expect_exec_success "$VM_ID" 'command -v bash >/dev/null && command -v curl' curl
 expect_exec_failure "$VM_ID" "$GUEST_CURL"
 curl_json PATCH "/v1/egress/vm/${VM_ID}" \
   -d "{\"allowlist\":[\"${EGRESS_TEST_IP}/32:${EGRESS_TEST_PORT}/tcp\"],\"allow_existing\":false}" \

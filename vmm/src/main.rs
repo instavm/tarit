@@ -6,8 +6,9 @@
 //! # Quick Start
 //!
 //! ```sh
-//! # Boot a VM from a bzImage kernel
-//! vmm run --kernel guest/bzImage --mem 256
+//! # Install the pinned release kernel, then boot a VM
+//! vmm kernel install
+//! vmm run --mem 256
 //!
 //! # Start the API server
 //! vmm serve --socket /tmp/vmm.sock
@@ -24,6 +25,8 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+
+mod kernel_install;
 
 const DEFAULT_CPU_PERIOD_US: u64 = 100_000;
 
@@ -191,9 +194,9 @@ enum Cmd {
     /// Boot a fresh VM from a kernel image.
     #[command(alias = "start")]
     Run {
-        /// Path to the kernel image (bzImage or vmlinux).
+        /// Kernel path. If omitted, use or offer to install the pinned vmlinux.
         #[arg(long, value_name = "PATH")]
-        kernel: String,
+        kernel: Option<String>,
 
         /// Kernel command line (overrides the default).
         #[arg(long, value_name = "CMDLINE")]
@@ -256,9 +259,9 @@ enum Cmd {
     /// Send this to a `vmm serve` socket to boot the single VM from flags,
     /// then drive it with `exec`, `status`, `snapshot`, and `stop`.
     Create {
-        /// Path to the kernel image (bzImage or vmlinux).
+        /// Kernel path. If omitted, use or offer to install the pinned vmlinux.
         #[arg(long, value_name = "PATH")]
-        kernel: String,
+        kernel: Option<String>,
 
         /// Kernel command line. Defaults to a fast-boot cmdline (plus
         /// `root=/dev/vda rw` when `--rootfs` is given).
@@ -425,6 +428,26 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         agent: Option<String>,
     },
+
+    /// Install and verify Tarit's pinned guest kernel.
+    Kernel {
+        #[command(subcommand)]
+        command: KernelCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KernelCommand {
+    /// Download the pinned vmlinux release artifact.
+    Install {
+        /// Install path. Defaults to TARIT_KERNEL or the versioned Tarit data directory.
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+
+        /// Replace an existing file whose checksum does not match.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -457,8 +480,19 @@ fn main() -> Result<()> {
             uid,
             gid,
         } => run(
-            kernel, cmdline, initramfs, mem, vcpus, rootfs, volume, overlay, net, full_boot, jail,
-            uid, gid,
+            kernel_install::resolve(kernel)?,
+            cmdline,
+            initramfs,
+            mem,
+            vcpus,
+            rootfs,
+            volume,
+            overlay,
+            net,
+            full_boot,
+            jail,
+            uid,
+            gid,
         ),
         Cmd::Restore {
             snapshot,
@@ -485,7 +519,7 @@ fn main() -> Result<()> {
             overlay,
         } => cmd_create(
             &cli.socket,
-            kernel,
+            kernel_install::resolve(kernel)?,
             cmdline,
             initramfs,
             mem,
@@ -525,6 +559,11 @@ fn main() -> Result<()> {
             auth,
             agent,
         } => pull_oci(image, output, size, auth, agent),
+        Cmd::Kernel { command } => match command {
+            KernelCommand::Install { output, force } => {
+                kernel_install::install(output, force).map(|_| ())
+            }
+        },
     }
 }
 
@@ -1362,6 +1401,40 @@ mod tests {
                 assert_eq!(overlay, vec!["/overlay.cow"]);
             }
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_allows_default_kernel_for_run() {
+        let cli = Cli::try_parse_from(["vmm", "run"]).unwrap();
+        match cli.cmd {
+            Cmd::Run { kernel, .. } => assert!(kernel.is_none()),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_kernel_install() {
+        let cli = Cli::try_parse_from([
+            "vmm",
+            "kernel",
+            "install",
+            "--output",
+            "/tmp/vmlinux",
+            "--force",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Kernel {
+                command: KernelCommand::Install { output, force },
+            } => {
+                assert_eq!(
+                    output.as_deref(),
+                    Some(std::path::Path::new("/tmp/vmlinux"))
+                );
+                assert!(force);
+            }
+            _ => panic!("expected kernel install command"),
         }
     }
 

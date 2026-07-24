@@ -10,7 +10,6 @@
 *.log
 
 # Local-only c8i deploy helper (holds real host IP; kept on disk, not published)
-deploy/c8i-deploy.sh
 
 # Local benchmark output (tarit-bench default output dir)
 bench-results/

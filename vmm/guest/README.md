@@ -24,6 +24,16 @@ same checksum-pinned source build:
 sudo make guest
 ```
 
+To install only the pinned release kernel:
+
+```sh
+sudo vmm kernel install
+```
+
+The command verifies the SHA-256 embedded in the `vmm` binary and installs to a
+versioned data directory. `TARIT_KERNEL` or `--output` selects another path.
+It does not fall back to a local build.
+
 For a direct local build on Linux:
 
 ```sh
@@ -80,8 +90,9 @@ resistance: no block device needed, kernel boots straight to a shell.
 
 ## Rootfs / initramfs
 
-A minimal ext4 rootfs or an initramfs. For a first boot test an
-initramfs is easiest, since no block device is needed.
+`make guest` creates an ext4 rootfs with the guest agent, `curl`, and the
+network tools used by the egress suites. For a first boot test an initramfs is
+easiest, since no block device is needed.
 
 Place files at:
 - `guest/vmlinux`

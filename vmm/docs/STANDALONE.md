@@ -19,7 +19,12 @@ Build the binary on the Linux host:
 ```sh
 cd vmm
 cargo build --release -p vmm --features boot
+sudo target/release/vmm kernel install
 ```
+
+The install command downloads the kernel version pinned in the binary and
+verifies its SHA-256. Interactive `run` and `create` commands offer the same
+install when `--kernel` is omitted. Automation never prompts.
 
 ## One-shot boot with `vmm run`
 
@@ -71,7 +76,7 @@ sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
 
 | Flag | Default | Meaning |
 |---|---:|---|
-| `--kernel <PATH>` | required | Kernel image, bzImage or vmlinux. |
+| `--kernel <PATH>` | installed pinned kernel | User-supplied bzImage or vmlinux. |
 | `--cmdline <CMDLINE>` | loader default | Kernel command line. |
 | `--initramfs <PATH>` | none | Optional initramfs image. |
 | `--mem <MIB>` | `256` | Guest memory in MiB. |

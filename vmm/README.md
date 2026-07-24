@@ -25,6 +25,9 @@ sudo vmm run --kernel guest-assets/vmlinux --rootfs guest-assets/rootfs.ext4 --m
 sudo vmm serve --socket /tmp/vmm.sock
 ```
 
+`sudo vmm kernel install` installs only the pinned kernel. Interactive `run`
+and `create` commands offer that install when `--kernel` is omitted.
+
 ## Capabilities
 
 - Direct x86_64 Linux/KVM boot with MMIO-only virtio devices and no PCI.

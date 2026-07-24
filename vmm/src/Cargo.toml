@@ -34,6 +34,8 @@ log.workspace = true
 env_logger.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

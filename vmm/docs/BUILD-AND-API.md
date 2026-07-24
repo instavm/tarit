@@ -70,12 +70,12 @@ cargo fmt --all -- --check
 ### `vmm run` (`start`): Boot a fresh VM
 
 ```sh
-vmm run --kernel <PATH> [OPTIONS]
+vmm run [--kernel <PATH>] [OPTIONS]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernel <PATH>` | (required) | Path to bzImage or vmlinux |
+| `--kernel <PATH>` | installed pinned kernel | Path to a user-supplied bzImage or vmlinux |
 | `--cmdline <CMDLINE>` | loader default | Kernel command line |
 | `--initramfs <PATH>` | none | Path to initramfs image |
 | `--mem <MIB>` | 256 | Guest memory size in MiB |
@@ -106,14 +106,14 @@ vmm run --kernel ../guest-assets/vmlinux --initramfs guest/initramfs.cpio.gz \
 ### `vmm create`: Boot a VM inside `vmm serve` (via API)
 
 ```sh
-vmm create --kernel <PATH> [OPTIONS] [--socket <PATH>]
+vmm create [--kernel <PATH>] [OPTIONS] [--socket <PATH>]
 ```
 
 This sends an API `create` request to an existing `vmm serve` socket.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernel <PATH>` | (required) | Path to bzImage or vmlinux |
+| `--kernel <PATH>` | installed pinned kernel | Path to a user-supplied bzImage or vmlinux |
 | `--cmdline <CMDLINE>` | loader default, with `root=/dev/vda rw` prepended when `--rootfs` is set | Kernel command line |
 | `--initramfs <PATH>` | none | Path to initramfs image |
 | `--mem <MIB>` | 256 | Guest memory size in MiB |
@@ -121,6 +121,21 @@ This sends an API `create` request to an existing `vmm serve` socket.
 | `--rootfs <PATH>` | none | Attach a boot rootfs as `/dev/vda` read-write |
 | `--volume <PATH[:ro\|rw]>` | none | Attach a storage volume (repeatable) |
 | `--overlay <PATH>` | none | Attach a private CoW overlay for each `--volume` |
+
+When `--kernel` is omitted, interactive `run` and `create` commands verify the
+installed pinned kernel and offer a `[y/N]` download if it is missing.
+Non-interactive commands fail with an install command instead of prompting.
+
+### `vmm kernel install`: Install the pinned kernel
+
+```sh
+vmm kernel install [--output <PATH>] [--force]
+```
+
+The command downloads the version and URL embedded at build time, requires
+HTTPS, verifies the embedded SHA-256, and installs with an atomic rename.
+`TARIT_KERNEL` overrides the default path. `--force` replaces a regular file
+whose checksum is wrong; symlinks and non-regular files are rejected.
 
 ### `vmm serve` (`server`): Start the API server
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One-time quickstart setup: build a vsock-capable guest kernel and pre-pull an
-# Ubuntu rootfs with the exec agent baked in as init. Doing this once means
+# One-time quickstart setup: install a verified guest kernel and pre-pull an
+# Ubuntu rootfs with the exec agent and runtime tools. Doing this once means
 # starting a microVM later is instant (no kernel build, no OCI pull at boot).
 #
 # Run from the repo root (needs root for the OCI unpack):
@@ -19,9 +19,11 @@ IMAGE="${IMAGE:-docker://ubuntu:22.04}"
 VMM="${VMM:-$(command -v vmm || echo "$REPO/vmm/target/release/vmm")}"
 AGENT="$REPO/vmm/guest/agent/vmm-agent"
 export JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
-# shellcheck source=../vmm/guest/kernel-version.env
+# shellcheck source=../vmm/guest/kernel-version.env disable=SC1091
 . "$REPO/vmm/guest/kernel-version.env"
 KERNEL_MARKER="$OUT_DIR/kernel.version"
+ROOTFS_TOOLS_MARKER="$OUT_DIR/rootfs.tools.version"
+ROOTFS_TOOLS_VERSION=1
 
 mkdir -p "$OUT_DIR"
 
@@ -82,9 +84,17 @@ fi
 # 3. Ubuntu rootfs with the agent baked in as init. Skip if present.
 if [ ! -f "$OUT_DIR/rootfs.ext4" ]; then
   echo "== pulling $IMAGE into a rootfs (one-time) =="
+  rm -f "$ROOTFS_TOOLS_MARKER"
   "$VMM" pull "$IMAGE" --output "$OUT_DIR/rootfs.ext4" --agent "$AGENT"
 else
   echo "== rootfs already at $OUT_DIR/rootfs.ext4 =="
+fi
+
+if [ ! -f "$ROOTFS_TOOLS_MARKER" ] ||
+    [ "$(cat "$ROOTFS_TOOLS_MARKER")" != "$ROOTFS_TOOLS_VERSION" ]; then
+  "$REPO/vmm/guest/install-runtime-tools.sh" "$OUT_DIR/rootfs.ext4"
+  printf '%s\n' "$ROOTFS_TOOLS_VERSION" > "$ROOTFS_TOOLS_MARKER.new"
+  mv "$ROOTFS_TOOLS_MARKER.new" "$ROOTFS_TOOLS_MARKER"
 fi
 
 cat <<EOF

@@ -53,6 +53,7 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 crc32fast = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 tempfile = "3"
+sha2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

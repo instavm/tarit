@@ -318,11 +318,13 @@ export TARIT_RDS_CA_FILE="$HOME/.taritd/rds-global-bundle.pem"
 
 | Script | Purpose | Important inputs |
 | --- | --- | --- |
-| `deploy/c8i-deploy.sh` | Rsync this repo to an EC2 c8i host, build `taritd`, build or reuse `vmm`, start `taritd`, and run `tests/e2e_c8i.sh`. | `C8I_HOST`, `C8I_USER`, `C8I_KEY`, `REMOTE_DIR`, `VMM_DIR`, `TARIT_API_KEY`. |
+| `deploy/c8i-deploy.sh` | Rsync this repo to an EC2 c8i host, build `taritd`, build or reuse `vmm`, start network-enabled `taritd` as root, and run `tests/e2e_c8i.sh`. | `C8I_HOST`, a 32-character `TARIT_API_KEY`, `TARIT_KERNEL`, and `TARIT_ROOTFS` are required. The host must be in `C8I_KNOWN_HOSTS`. It binds to `127.0.0.1:8080` unless `TARIT_LISTEN` is set. |
 | `deploy/provision-rds.sh` | Create a new RDS PostgreSQL fleet store and credentials env file. | `AWS_REGION`, `TARIT_CP_VPC_ID`, `TARIT_CP_C8I_SG`, `TARIT_CP_DB_PASSWORD`. |
 | `deploy/open-api-port.sh` | Open TCP API port on the configured EC2 security group. | `C8I_SG`, `TARIT_PORT`, `TARIT_PUBLIC_CIDR`, `AWS_REGION`. |
 
-The deploy script uses `pkill -f 'target/release/taritd'` on the remote host. Use caution on shared hosts.
+The c8i rootfs must contain `curl`; `make guest` includes it. The deploy script
+records the remote daemon PID in `~/.taritd/taritd.pid` and verifies the process
+identity before stopping a prior run.
 
 ## Benchmarks
 

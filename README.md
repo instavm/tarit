@@ -93,6 +93,11 @@ sudo vmm --socket /tmp/vm.sock exec "uname -a"
 sudo vmm --socket /tmp/vm.sock stop
 ```
 
+For a kernel-only install, run `sudo vmm kernel install`. Interactive
+`vmm run` and `vmm create` commands offer to install that pinned kernel when
+`--kernel` is omitted. Non-interactive commands require `--kernel` or a prior
+install.
+
 Only want the hypervisor? `sudo make install-vmm` installs just `vmm`.
 
 ### Layer 2: snapshot, suspend, restore
