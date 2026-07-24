@@ -8,8 +8,8 @@ version = "0.1.0"
 dependencies = [
  "displaydoc",
  "thiserror 1.0.69",
- "vm-memory 0.18.0",
- "zerocopy 0.8.52",
+ "vm-memory",
+ "zerocopy",
 ]
 
 [[package]]
@@ -106,12 +106,6 @@ checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
 ]
-
-[[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cfg-if"
@@ -325,7 +319,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13bdac971eb2efaceffca0976058ab80c715945cc565c8a4aa1ed3bb0dc8d0e4"
 dependencies = [
  "libc",
- "vmm-sys-util 0.15.0",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -423,25 +417,25 @@ dependencies = [
 
 [[package]]
 name = "kvm-bindings"
-version = "0.10.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa4933174d0cc4b77b958578cd45784071cc5ae212c2d78fbd755aaaa6dfa71a"
+checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
 dependencies = [
  "serde",
- "vmm-sys-util 0.12.1",
- "zerocopy 0.7.35",
+ "vmm-sys-util",
+ "zerocopy",
 ]
 
 [[package]]
 name = "kvm-ioctls"
-version = "0.19.1"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e013ae7fcd2c6a8f384104d16afe7ea02969301ea2bb2a56e44b011ebc907cab"
+checksum = "06ac372c120eb893b086d1a12027669cf2b478d1f71204021ffa7adf57948d63"
 dependencies = [
  "bitflags 2.13.0",
  "kvm-bindings",
  "libc",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -456,7 +450,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d54207cb617cd75b10c57ad20235c914ab62b180ceeff2ef3111983670d3b321"
 dependencies = [
- "vm-memory 0.18.0",
+ "vm-memory",
 ]
 
 [[package]]
@@ -602,9 +596,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "seccompiler"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "345a3e4dddf721a478089d4697b83c6c0a8f5bf16086f6c13397e4534eb6e2e5"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
 dependencies = [
  "libc",
 ]
@@ -788,15 +782,15 @@ checksum = "b48f0d43ce075a159555c22785ea8739cdb33ef6db475771e02585b436b8f97e"
 
 [[package]]
 name = "virtio-queue"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e358084f32ed165fddb41d98ff1b7ff3c08b9611d8d6114a1b422e2e85688baf"
+checksum = "f631bfd09362a9b17f0cfd5ca3b0a1b179d153fa276f9ce86919d560891e61d6"
 dependencies = [
  "libc",
  "log",
  "virtio-bindings",
- "vm-memory 0.17.2",
- "vmm-sys-util 0.15.0",
+ "vm-memory",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -804,15 +798,6 @@ name = "vm-device"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "599adbdaddea4947ca23c085d2b8e47f3499ccda35438424526f3853748a8eb6"
-
-[[package]]
-name = "vm-memory"
-version = "0.17.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e201ed63fdaba7bdafd07176f2060ffa6949aa05559acbc3f5189824bb285428"
-dependencies = [
- "vm-memory 0.18.0",
-]
 
 [[package]]
 name = "vm-memory"
@@ -844,7 +829,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "vm-memory 0.18.0",
+ "vm-memory",
  "vmm-api",
  "vmm-core",
  "vmm-devices",
@@ -853,7 +838,7 @@ dependencies = [
  "vmm-memory-backend",
  "vmm-net",
  "vmm-snapshot",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -887,15 +872,15 @@ dependencies = [
  "tarit-proto",
  "tempfile",
  "thiserror 1.0.69",
- "vm-memory 0.18.0",
+ "vm-memory",
  "vmm-devices",
  "vmm-jailer",
  "vmm-loader",
  "vmm-memory-backend",
  "vmm-net",
  "vmm-snapshot",
- "vmm-sys-util 0.12.1",
- "zerocopy 0.8.52",
+ "vmm-sys-util",
+ "zerocopy",
 ]
 
 [[package]]
@@ -912,11 +897,11 @@ dependencies = [
  "virtio-devices",
  "virtio-queue",
  "vm-device",
- "vm-memory 0.18.0",
+ "vm-memory",
  "vm-superio",
  "vmm-jailer",
  "vmm-memory-backend",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -929,7 +914,7 @@ dependencies = [
  "libc",
  "postcard",
  "tempfile",
- "vm-memory 0.18.0",
+ "vm-memory",
  "vmm-core",
  "vmm-devices",
  "vmm-jailer",
@@ -938,7 +923,7 @@ dependencies = [
  "vmm-migration",
  "vmm-net",
  "vmm-snapshot",
- "vmm-sys-util 0.12.1",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -962,8 +947,8 @@ dependencies = [
  "log",
  "serde",
  "thiserror 1.0.69",
- "vm-memory 0.18.0",
- "vmm-sys-util 0.12.1",
+ "vm-memory",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -976,8 +961,8 @@ dependencies = [
  "log",
  "serde",
  "thiserror 1.0.69",
- "vm-memory 0.18.0",
- "vmm-sys-util 0.12.1",
+ "vm-memory",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -1014,20 +999,10 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "vm-memory 0.18.0",
+ "vm-memory",
  "vmm-devices",
  "vmm-memory-backend",
- "vmm-sys-util 0.12.1",
-]
-
-[[package]]
-name = "vmm-sys-util"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1435039746e20da4f8d507a72ee1b916f7b4b05af7a91c093d2c6561934ede"
-dependencies = [
- "bitflags 1.3.2",
- "libc",
+ "vmm-sys-util",
 ]
 
 [[package]]
@@ -1088,32 +1063,11 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
-dependencies = [
- "byteorder",
- "zerocopy-derive 0.7.35",
-]
-
-[[package]]
-name = "zerocopy"
 version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
 dependencies = [
- "zerocopy-derive 0.8.52",
-]
-
-[[package]]
-name = "zerocopy-derive"
-version = "0.7.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa4f8080344d4671fb4e831a13ad1e68092748387dfc4f55e356242fae12ce3e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "zerocopy-derive",
 ]
 
 [[package]]
