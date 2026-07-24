@@ -10,13 +10,13 @@ ORCH_ROOT="${ORCH_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-BASE_ROOTFS="${BASE_ROOTFS:-/tmp/vsock-rootfs.ext4}"
+BASE_ROOTFS="${BASE_ROOTFS:-${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}}"
 ROOTFS=/tmp/taritd-pty-rootfs.ext4
 
 export TARIT_API_KEY="life-e2e-key"
 export TARIT_LISTEN="127.0.0.1:8080"
 export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
-export TARIT_KERNEL="/tmp/vmlinux.microvm"
+export TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
 export TARIT_ROOTFS="$ROOTFS"
 export TARIT_ROOTFS_READONLY="0"
 export TARIT_ENABLE_NET="0"
@@ -27,6 +27,11 @@ export TARIT_REAP_ON_SHUTDOWN="true"
 export RUST_LOG="info"
 
 py() { python3 -c "import sys,json;print(json.load(sys.stdin).get('$1',''))"; }
+guest_exec_ok() {
+  local id=$1 marker=$2 output
+  output=$("$TARIT" exec "$id" "bash -c 'echo $marker'" 2>&1) &&
+    printf '%s' "$output" | grep -q "$marker"
+}
 REAP=0; BP=0
 mkdir -p "$TARIT_SOCKET_DIR"; rm -f "$TARIT_DB"
 for p in $(pgrep -f 'target/debug/taritd' 2>/dev/null) $(pgrep -f 'vmm serve' 2>/dev/null); do kill "$p" 2>/dev/null || true; done
@@ -44,6 +49,10 @@ export TARIT_MAX_VMS=4
 sleep 4
 VM=$("$TARIT" --json vm create --vcpus 1 --memory-mib 512)
 VM_ID=$(echo "$VM" | py id)
+guest_exec_ok "$VM_ID" lifecycle-before-shutdown-ok || {
+  echo "  FAIL: created guest did not execute before shutdown"
+  exit 1
+}
 SOCK="$TARIT_SOCKET_DIR/$VM_ID.sock"
 CHILD=$(pgrep -f -- "vmm serve --socket $SOCK" | head -n 1 || true)
 echo "  child vmm serve pid=$CHILD socket=$SOCK"
@@ -67,7 +76,11 @@ export TARIT_MAX_VMS=1 TARIT_ADMISSION_TIMEOUT_MS=1000
 "$TARIT" serve >/tmp/taritd-life2.log 2>&1 & IP2=$!
 sleep 4
 echo "  create VM 1 (takes the only slot)"
-"$TARIT" --json vm create --vcpus 1 --memory-mib 512 | py id
+CAPACITY_VM=$("$TARIT" --json vm create --vcpus 1 --memory-mib 512 | py id)
+guest_exec_ok "$CAPACITY_VM" lifecycle-capacity-ok || {
+  echo "  FAIL: capacity guest did not execute"
+  exit 1
+}
 echo "  create VM 2 (expect 429)"
 CODE=$(curl -s -o /tmp/life-body -w '%{http_code}' -D /tmp/life-hdr \
   -H "X-API-Key: $TARIT_API_KEY" -H 'Content-Type: application/json' \

@@ -9,7 +9,7 @@ ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-BASE_ROOTFS="${BASE_ROOTFS:-/tmp/vsock-rootfs.ext4}"
+BASE_ROOTFS="${BASE_ROOTFS:-${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}}"
 ROOTFS=/tmp/warmpool-base.ext4
 CONFIG="${CONFIG:-$TARITD_HOME/warmpool.toml}"
 LOG=/tmp/taritd-warmpool.log
@@ -17,7 +17,7 @@ LOG=/tmp/taritd-warmpool.log
 export TARIT_API_KEY="warm-e2e-key"
 export TARIT_LISTEN="127.0.0.1:8080"
 export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
-export TARIT_KERNEL="/tmp/vmlinux.microvm"
+export TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
 export TARIT_ROOTFS="$ROOTFS"
 # The shared host base is always immutable through per-VM CoW. Keep the guest
 # root writable so the isolation assertions below exercise each private layer.

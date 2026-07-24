@@ -10,28 +10,46 @@ kernel config is one of the biggest boot-time levers.
 
 ### Minimal cold-boot kernel
 
-`guest/configs/minimal-x86_64.config` is the measured 5.10.230 config for the
-cold create-to-exec path. Rebuild it on a Linux/KVM host in an isolated
-`~/kernel-build` workspace:
+`guest/configs/minimal-x86_64.config` is the Linux 6.12 LTS config for the cold
+create-to-exec path. It has virtio-mmio block, net, and vsock devices built in,
+with modules and unused device families disabled.
+
+The normal entry point downloads the release artifact and verifies its
+repository-pinned SHA-256. If the artifact is unavailable, it falls back to the
+same checksum-pinned source build:
 
 ```sh
-scp guest/build-minimal-kernel.sh ubuntu@<kvm-host>:~/kernel-build/
-scp guest/kernel-configs/microvm-base-5.10.config ubuntu@<kvm-host>:~/kernel-build/kernel-configs/
-ssh ubuntu@<kvm-host> 'cd ~/kernel-build && ./build-minimal-kernel.sh'
-# output: ~/kernel-build/vmlinux.minimal and /tmp/vmlinux.minimal
+sudo make guest
 ```
 
-The script starts from the vendored 5.10 no-ACPI microVM base config
-(`guest/kernel-configs/microvm-base-5.10.config`, expected in a
-`kernel-configs/` dir next to the script; override with `BASE_CONFIG` or
-`BASE_CONFIG_URL`), keeps minimal ACPI for this VMM's DSDT virtio-mmio
-discovery, and emits an uncompressed ELF `vmlinux`.
+For a direct local build on Linux:
+
+```sh
+OUT=/tmp/vmlinux CONFIG_OUT=/tmp/minimal-x86_64.config \
+  guest/build-minimal-kernel.sh
+guest/verify-kernel-config.sh /tmp/minimal-x86_64.config
+```
+
+`guest/kernel-version.env` pins the LTS point release, kernel.org source
+checksum, reproducible build timestamp, release tag, and expected artifact
+checksum. The build fixes its user, host, timestamp, build number, source paths,
+and toolchain container.
+
+### Release and promotion
+
+The `Guest kernel release` workflow builds `vmlinux`, the generated config, and
+`SHA256SUMS`, then creates GitHub artifact attestations. Publishing is manual
+and is blocked until the candidate passes all 19 `orch/tests/e2e_*.sh`
+programs plus the configured c8i soak. Point-release maintenance updates the
+pins in `kernel-version.env`, rebuilds the config, and repeats that gate.
+Lifecycle gates execute commands inside guests after create, resume, and
+restore. Egress gates run real guest-side `curl` requests and prove deny,
+allow, revoke, restart recovery, and slot reuse behavior.
 
 ### Ready-made configs (in `guest/kernel-configs/`)
 
-`microvm-base-5.10.config` is the vendored 5.10 no-ACPI microVM base config
-consumed by `build-minimal-kernel.sh` (upstream kconfig output; the build
-applies Tarit overrides on top).
+`microvm-base-5.10.config` is retained only for the older reference builder.
+The release builder consumes `guest/configs/minimal-x86_64.config`.
 
 The rest are cherry-picked from `rust-vmm/vmm-reference`'s `resources/kernel/`
 (Apache-2.0 OR BSD-3-Clause). These are minimal microVM kernel configs, not

@@ -1,0 +1,279 @@
+name: Guest kernel release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/guest-kernel.yml"
+      - "vmm/guest/build-minimal-kernel.sh"
+      - "vmm/guest/configs/minimal-x86_64.config"
+      - "vmm/guest/kernel-builder.Dockerfile"
+      - "vmm/guest/kernel-version.env"
+      - "vmm/guest/download-kernel.sh"
+      - "vmm/guest/verify-kernel-config.sh"
+      - "vmm/ci/soak.sh"
+      - "vmm/crates/vmm-integration/**"
+      - "scripts/setup-guest.sh"
+      - "test/kernel-promotion.sh"
+      - "orch/tests/e2e_*.sh"
+  pull_request:
+    paths:
+      - ".github/workflows/guest-kernel.yml"
+      - "vmm/guest/build-minimal-kernel.sh"
+      - "vmm/guest/configs/minimal-x86_64.config"
+      - "vmm/guest/kernel-builder.Dockerfile"
+      - "vmm/guest/kernel-version.env"
+      - "vmm/guest/download-kernel.sh"
+      - "vmm/guest/verify-kernel-config.sh"
+      - "vmm/ci/soak.sh"
+      - "vmm/crates/vmm-integration/**"
+      - "scripts/setup-guest.sh"
+      - "test/kernel-promotion.sh"
+      - "orch/tests/e2e_*.sh"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish after the c8i promotion gates pass
+        required: true
+        type: boolean
+        default: false
+      soak_seconds:
+        description: Candidate soak duration in seconds
+        required: true
+        type: string
+        default: "10800"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build reproducible guest kernel
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.kernel.outputs.version }}
+      tag: ${{ steps.kernel.outputs.tag }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Load pinned kernel metadata
+        id: kernel
+        run: |
+          set -euo pipefail
+          . vmm/guest/kernel-version.env
+          test "$KERNEL_RELEASE_REPOSITORY" = "$GITHUB_REPOSITORY"
+          {
+            echo "version=$KERNEL_VERSION"
+            echo "tag=$KERNEL_RELEASE_TAG"
+            echo "artifact_sha256=$KERNEL_ARTIFACT_SHA256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build fixed toolchain image
+        run: docker build --platform linux/amd64 -f vmm/guest/kernel-builder.Dockerfile -t tarit-kernel-builder vmm/guest
+
+      - name: Build guest kernel
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env JOBS="$(nproc)" \
+            --env WORKDIR=/tmp/kernel-build \
+            --env OUT="/out/vmlinux-${{ steps.kernel.outputs.version }}-x86_64" \
+            --env CONFIG_OUT=/out/minimal-x86_64.config \
+            --volume "$PWD:/workspace:ro" \
+            --volume "$PWD/dist:/out" \
+            tarit-kernel-builder \
+            bash /workspace/vmm/guest/build-minimal-kernel.sh
+          cp vmm/guest/kernel-version.env dist/kernel-version.env
+
+      - name: Verify config and reproducible artifact pin
+        run: |
+          set -euo pipefail
+          bash vmm/guest/verify-kernel-config.sh dist/minimal-x86_64.config
+          cmp vmm/guest/configs/minimal-x86_64.config dist/minimal-x86_64.config
+          cd dist
+          actual="$(sha256sum "vmlinux-${{ steps.kernel.outputs.version }}-x86_64" | awk '{print $1}')"
+          test -n "${{ steps.kernel.outputs.artifact_sha256 }}"
+          test "$actual" = "${{ steps.kernel.outputs.artifact_sha256 }}"
+          sha256sum "vmlinux-${{ steps.kernel.outputs.version }}-x86_64" \
+            minimal-x86_64.config kernel-version.env > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Rebuild byte-for-byte
+        run: |
+          set -euo pipefail
+          mkdir -p dist/repro
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env JOBS="$(nproc)" \
+            --env WORKDIR=/tmp/kernel-build \
+            --env OUT="/out/repro/vmlinux-${{ steps.kernel.outputs.version }}-x86_64" \
+            --env CONFIG_OUT=/out/repro/minimal-x86_64.config \
+            --volume "$PWD:/workspace:ro" \
+            --volume "$PWD/dist:/out" \
+            tarit-kernel-builder \
+            bash /workspace/vmm/guest/build-minimal-kernel.sh
+          cmp "dist/vmlinux-${{ steps.kernel.outputs.version }}-x86_64" \
+            "dist/repro/vmlinux-${{ steps.kernel.outputs.version }}-x86_64"
+          cmp dist/minimal-x86_64.config dist/repro/minimal-x86_64.config
+          rm -rf dist/repro
+
+      - name: Attest guest kernel artifacts
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: dist/*
+
+      - name: Upload candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: guest-kernel-${{ steps.kernel.outputs.version }}
+          path: dist/
+
+  validate:
+    name: c8i 19-suite and soak promotion gate
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 480
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: guest-kernel-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Verify candidate and runner fixtures
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS)
+          test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm
+          test -r /tmp/bench-node-rootfs-vsock.ext4
+          test -x /tmp/caddy
+          test -r "$HOME/.taritd/tarit-rds.env"
+          sudo -n true
+
+      - name: Build promotion binaries
+        run: |
+          cargo build --locked --manifest-path vmm/Cargo.toml -p vmm --features boot
+          cargo build --release --locked --manifest-path vmm/Cargo.toml -p vmm --features boot
+          cargo build --locked --manifest-path orch/Cargo.toml -p taritd
+          cargo build --release --locked --manifest-path orch/Cargo.toml -p taritd
+          make -C vmm/guest/agent
+
+      - name: Run all 19 e2e programs
+        run: |
+          set -euo pipefail
+          set -a
+          . "$HOME/.taritd/tarit-rds.env"
+          set +a
+          kernel="$(find "$PWD/dist" -maxdepth 1 -name 'vmlinux-*-x86_64' -print -quit)"
+          sudo -E env \
+            HOME="$HOME" \
+            PATH="$HOME/.cargo/bin:$PATH" \
+            TARIT_KERNEL="$kernel" \
+            TARIT_ROOTFS=/tmp/bench-node-rootfs-vsock.ext4 \
+            TARIT_SHARE_ROOTFS=/tmp/bench-node-rootfs-vsock.ext4 \
+            TARIT_CADDY_BIN=/tmp/caddy \
+            bash test/kernel-promotion.sh 2>&1 | tee kernel-promotion-results.txt
+
+      - name: Run candidate soak
+        working-directory: vmm
+        env:
+          SOAK_SECONDS: ${{ inputs.soak_seconds }}
+        run: |
+          set -euo pipefail
+          [[ "$SOAK_SECONDS" =~ ^[0-9]+$ ]] && [ "$SOAK_SECONDS" -ge 10800 ]
+          kernel="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 1 -name 'vmlinux-*-x86_64' -print -quit)"
+          sudo -E env \
+            HOME="$HOME" \
+            PATH="$HOME/.cargo/bin:$PATH" \
+            KERNEL="$kernel" \
+            ROOTFS=/tmp/bench-node-rootfs-vsock.ext4 \
+            bash ci/soak.sh --mode=fast "$SOAK_SECONDS" 0
+
+      - name: Upload promotion results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: guest-kernel-promotion-${{ github.run_id }}
+          path: |
+            kernel-promotion-results.txt
+            vmm/docs/soak-results.md
+            vmm/docs/soak-cycle-*.log
+          if-no-files-found: ignore
+
+      - name: Reclaim root-owned workspace files
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
+  release:
+    name: Publish attested guest kernel
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref == 'refs/heads/main'
+    needs: [build, validate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: guest-kernel-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Load release metadata
+        id: kernel
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS)
+          . dist/kernel-version.env
+          test "$KERNEL_RELEASE_REPOSITORY" = "$GITHUB_REPOSITORY"
+          {
+            echo "version=$KERNEL_VERSION"
+            echo "tag=$KERNEL_RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require a new release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.kernel.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+              gh api --silent \
+                "repos/$GITHUB_REPOSITORY/git/ref/tags/${{ steps.kernel.outputs.tag }}" >/dev/null 2>&1; then
+            echo "release tag already exists: ${{ steps.kernel.outputs.tag }}" >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ steps.kernel.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Tarit guest kernel ${{ steps.kernel.outputs.version }}
+          files: |
+            dist/vmlinux-${{ steps.kernel.outputs.version }}-x86_64
+            dist/minimal-x86_64.config
+            dist/kernel-version.env
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          body: |
+            Reproducible Tarit x86_64 guest kernel built from Linux ${{ steps.kernel.outputs.version }} LTS.
+
+            Promotion requires all 19 c8i end-to-end programs and the configured soak to pass.
+            Verify checksums with `sha256sum -c SHA256SUMS` and provenance with `gh attestation verify`.

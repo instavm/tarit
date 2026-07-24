@@ -2,9 +2,9 @@
 # Soak test: runs boot/snapshot/restore cycles continuously.
 #
 # Two modes:
-#   --mode=fast  Runs the single boot+snapshot+restore E2E (~50ms-1s on c8i).
-#                Enables tens of thousands of cycles in ~3h. Default for
-#                leak hunting and steady-state regression.
+#   --mode=fast  Boots the candidate with the agent rootfs, executes in the
+#                guest, snapshots, restores, and executes again every cycle.
+#                Default for leak hunting and steady-state regression.
 #   --mode=full  Runs the full workspace test suite (~minutes per cycle).
 #                Default for correctness coverage on long runs.
 #
@@ -26,6 +26,17 @@ esac
 
 DURATION=${1:-10800}
 DELAY=${2:-5}
+case "$DURATION" in
+  ''|*[!0-9]*) echo "duration must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$DURATION" -gt 0 ] || { echo "duration must be greater than zero" >&2; exit 2; }
+
+if [ -n "${KERNEL:-}" ]; then
+    export VMM_TEST_KERNEL="$KERNEL"
+fi
+if [ -n "${ROOTFS:-}" ]; then
+    export VMM_TEST_ROOTFS="$ROOTFS"
+fi
 START=$(date +%s)
 CYCLE=0
 RESULTS=docs/soak-results.md
@@ -156,6 +167,11 @@ while true; do
     echo "Cycle $CYCLE: $PASS pass, $FAIL fail (elapsed ${ELAPSED}s rss=${RSS}KB fds=${FDS})"
     [ "$DELAY" -gt 0 ] && sleep "$DELAY"
 done
+
+[ "$CYCLE" -gt 0 ] || {
+    echo "=== SOAK FAILED: no test cycles completed ===" >&2
+    exit 1
+}
 
 echo ""
 echo "=== Soak complete: $CYCLE cycles, $TOTAL_PASS passed, $TOTAL_FAIL failed ==="

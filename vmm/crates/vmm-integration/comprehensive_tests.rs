@@ -6,18 +6,11 @@
 
 use std::path::PathBuf;
 use std::time::Instant;
-use vmm_core::config::{KernelConfig, MemoryConfig, VcpuConfig, VmConfig};
 use vmm_core::controller::VmmController;
 use vmm_core::live_snapshot::LiveSnapshotConfig;
 
-fn kernel_path() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    PathBuf::from(manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("guest/bzImage"))
-        .unwrap_or_else(|| PathBuf::from("guest/bzImage"))
-}
+mod test_support;
+use test_support::{agent_vm_config, assert_guest_exec, private_overlay_path};
 
 /// Perf-gate strictness. Boot latency and creation rate are dominated by the
 /// host's virtualization nesting (on nested KVM every guest exit traps to L0,
@@ -27,20 +20,6 @@ fn kernel_path() -> PathBuf {
 /// independent gates (snapshot/restore/memory) are always enforced.
 fn perf_strict() -> bool {
     std::env::var("VMM_PERF_STRICT").is_ok()
-}
-
-fn vm_config() -> VmConfig {
-    VmConfig {
-        kernel: KernelConfig {
-            path: kernel_path().to_string_lossy().to_string(),
-            cmdline: "console=ttyS0 reboot=k panic=1 nokaslr".into(),
-            initramfs: None,
-        },
-        memory: MemoryConfig { size_mib: 128 },
-        vcpus: VcpuConfig { count: 1 },
-        volumes: vec![],
-        net: vec![],
-    }
 }
 
 fn retain_snapshot(controller: &VmmController, path: &str) {
@@ -57,21 +36,19 @@ fn retain_snapshot(controller: &VmmController, path: &str) {
 /// point-in-time image. The on-disk artifact must be page-aligned and
 /// carry the canonical VMSN snapshot magic so it can be restored later.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn live_snapshot_consistency_harness() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let controller = VmmController::new();
 
     // Step 1: launch the VM with its vCPU running in the background.
-    controller.create_live(vm_config()).expect("create_live");
-
-    // Give the kernel a moment to start executing before we start tracking.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("create_live");
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo live-snapshot-source-ok'",
+        "live-snapshot-source-ok",
+    );
 
     // Step 2: take a live snapshot while the vCPU keeps running.
     let cfg = LiveSnapshotConfig::default();
@@ -145,8 +122,20 @@ fn live_snapshot_consistency_harness() {
     //     blob, the restore path will reject it or produce a corrupt VM.
     let restore_controller = VmmController::new();
     restore_controller
-        .restore(&snap_path, None)
+        .restore(
+            &snap_path,
+            Some(
+                test_support::private_overlay_path("live-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
         .expect("restore from live snapshot");
+    assert_guest_exec(
+        &restore_controller,
+        "bash -c 'echo live-snapshot-restore-ok'",
+        "live-snapshot-restore-ok",
+    );
     eprintln!("restored live snapshot");
 
     // (c) Take a SECOND live snapshot while the source VM keeps running.
@@ -179,14 +168,8 @@ fn live_snapshot_consistency_harness() {
 /// Performance gates.
 /// Cold boot latency (p50/p99), restore latency, snapshot latency.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn perf_gates_comprehensive() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let mut boot_times = Vec::new();
     let mut snapshot_times = Vec::new();
     let mut restore_times = Vec::new();
@@ -204,7 +187,14 @@ fn perf_gates_comprehensive() {
         let controller = VmmController::new();
         flushed_eprintln!("iter {i}: pre-create");
         let t0 = Instant::now();
-        controller.create(vm_config()).expect("boot");
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo perf-create-ok'",
+            "perf-create-ok",
+        );
         let boot_ms = t0.elapsed().as_millis();
         boot_times.push(boot_ms);
         flushed_eprintln!("iter {i}: boot done — {boot_ms}ms");
@@ -217,7 +207,21 @@ fn perf_gates_comprehensive() {
         flushed_eprintln!("iter {i}: snapshot done — {snap_ms}ms ({snap_path})");
 
         let t2 = Instant::now();
-        controller.restore(&snap_path, None).expect("restore");
+        controller
+            .restore(
+                &snap_path,
+                Some(
+                    private_overlay_path("perf-restore")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            )
+            .expect("restore");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo perf-restore-ok'",
+            "perf-restore-ok",
+        );
         let restore_ms = t2.elapsed().as_millis();
         restore_times.push(restore_ms);
         flushed_eprintln!("iter {i}: restore done — {restore_ms}ms");
@@ -238,21 +242,17 @@ fn perf_gates_comprehensive() {
     let snap_p50 = snapshot_times[snapshot_times.len() / 2];
     let restore_p50 = restore_times[restore_times.len() / 2];
 
-    // Thresholds are nested-virt gates, not bare-metal targets. The design
-    // targets are <125ms boot, <30ms snapshot, <10ms restore on bare metal; on
-    // c8i nested KVM (L0 hides ioeventfd, no kvm-clock vDSO) the same
-    // operations run 2-5× slower because every guest exit traps to L0.
-    // We assert against the nested ceiling so the gate fails loud on
-    // any real regression while still ratcheting toward bare-metal numbers.
-    const BOOT_GATE_MS: u128 = 125; // bare-metal target — c8i ~30-100ms.
+    // Boot and restore include a successful guest command. Snapshot measures
+    // only the state capture itself.
+    const BOOT_GATE_MS: u128 = 5_000;
     const SNAP_GATE_MS: u128 = 200; // bare-metal <30ms; nested ~73ms.
-    const RESTORE_GATE_MS: u128 = 200; // bare-metal <10ms (UFFD); nested eager copy.
+    const RESTORE_GATE_MS: u128 = 5_000;
 
     eprintln!("=== PERF GATES ===");
     eprintln!("Cold boot p50: {boot_p50}ms (gate <{BOOT_GATE_MS}ms)");
     eprintln!("Cold boot p99: {boot_p99}ms");
-    eprintln!("Snapshot p50: {snap_p50}ms (gate <{SNAP_GATE_MS}ms; bare-metal target <30ms)");
-    eprintln!("Restore p50: {restore_p50}ms (gate <{RESTORE_GATE_MS}ms; bare-metal target <10ms)");
+    eprintln!("Snapshot p50: {snap_p50}ms (gate <{SNAP_GATE_MS}ms)");
+    eprintln!("Restore-to-exec p50: {restore_p50}ms (gate <{RESTORE_GATE_MS}ms)");
 
     assert!(
         snap_p50 < SNAP_GATE_MS,
@@ -271,7 +271,7 @@ fn perf_gates_comprehensive() {
         eprintln!(
             "boot p50 {boot_p50}ms — informational only (boot latency is dominated by \
              host virt nesting; set VMM_PERF_STRICT=1 to enforce the {BOOT_GATE_MS}ms \
-             bare-metal gate)"
+             create-to-command-ready gate)"
         );
     }
     eprintln!("perf gates: PASS");
@@ -279,29 +279,29 @@ fn perf_gates_comprehensive() {
 
 /// VM creation rate (VMs/sec/host).
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn perf_creation_rate() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let n = 10;
     let controller = VmmController::new();
     let t0 = Instant::now();
     for _ in 0..n {
-        controller.create(vm_config()).expect("boot");
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo creation-rate-ok'",
+            "creation-rate-ok",
+        );
         controller.stop().ok();
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let rate = n as f64 / elapsed;
-    // Gate: 3 VMs/sec on nested virt (bare-metal target is >100/s).
-    // c8i nested virt is ~5-15 VMs/sec for the minimal kernel.
-    const RATE_GATE: f64 = 3.0;
+    // This is create-to-command-ready throughput, not kernel-load throughput.
+    const RATE_GATE: f64 = 0.2;
     eprintln!("=== CREATION RATE ===");
     eprintln!(
-        "Created {n} VMs in {elapsed:.2}s = {rate:.1} VMs/sec (gate >{RATE_GATE:.0}/s; bare-metal target >100/s)"
+        "Created and executed in {n} VMs in {elapsed:.2}s = {rate:.1} VMs/sec (gate >{RATE_GATE:.1}/s)"
     );
     if perf_strict() {
         assert!(
@@ -319,14 +319,8 @@ fn perf_creation_rate() {
 
 /// Per-VM memory overhead.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn perf_memory_overhead() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     // Incremental overhead — boot one VM, measure RSS; boot a second,
     // measure RSS again; the delta isolates per-VM cost from VMM-binary
     // cost (the classic microVM design point is ~5 MiB on bare metal).
@@ -342,16 +336,30 @@ fn perf_memory_overhead() {
     }
 
     let controller1 = VmmController::new();
-    controller1.create(vm_config()).expect("boot 1");
+    controller1
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest 1");
+    assert_guest_exec(
+        &controller1,
+        "bash -c 'echo memory-vm-1-ok'",
+        "memory-vm-1-ok",
+    );
     let rss1 = rss_mib();
     let controller2 = VmmController::new();
-    controller2.create(vm_config()).expect("boot 2");
+    controller2
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest 2");
+    assert_guest_exec(
+        &controller2,
+        "bash -c 'echo memory-vm-2-ok'",
+        "memory-vm-2-ok",
+    );
     let rss2 = rss_mib();
     let delta_mib = rss2.saturating_sub(rss1);
 
     eprintln!("=== MEMORY OVERHEAD ===");
     eprintln!("RSS after VM1: {rss1} MiB, after VM2: {rss2} MiB, delta: {delta_mib} MiB");
-    eprintln!("Target: <5 MiB per-VM (bare metal); gate <20 MiB allows demand-paged guest pages");
+    eprintln!("Gate: <256 MiB incremental RSS per live 256 MiB guest");
 
     // Gate: <256 MiB per VM on nested virt (guest RAM is 256 MiB; on nested
     // virt the L0 may eagerly map pages). On bare metal, this would be <20 MiB.
@@ -368,16 +376,17 @@ fn perf_memory_overhead() {
 
 /// Snapshot tampering — corrupt state file → restore must refuse.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn snapshot_tampering_rejected() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let controller = VmmController::new();
-    controller.create(vm_config()).expect("boot");
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest");
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo tamper-source-ok'",
+        "tamper-source-ok",
+    );
     let snap_path = controller.snapshot(false).expect("snapshot");
     retain_snapshot(&controller, &snap_path);
 
@@ -550,25 +559,14 @@ fn jailer_escape_attempts() {
     eprintln!("jailer escape attempts: PASS");
 }
 
-/// Cold-boot benchmark — 100 iterations of (create → snapshot → drop), measuring
-/// the wall-clock from `create()` entry to return. The synchronous boot path
-/// runs to first HLT (kernel init runs, then KVM_RUN returns Ok(()) via the
-/// watchdog or HLT exit). This is the standard microVM "cold boot to
-/// userspace" metric — though it stops at kernel-to-init handoff because
-/// the c8i nested-virt stack blocks virtio-blk DRIVER_OK from firing, so we
-/// can't reach a real `/bin/echo` without bare metal.
+/// Cold-boot benchmark — 100 iterations from live create through a successful
+/// command executed by the guest agent.
 ///
 /// Reports p50/p95/p99 + p999 to expose tail jitter. Writes
 /// `target/cold-boot-bench.md` so the numbers stick around across runs.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage; ~10 minutes"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS; ~10 minutes"]
 fn cold_boot_benchmark_100() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     const N: usize = 100;
     let mut samples_ms: Vec<u128> = Vec::with_capacity(N);
 
@@ -577,7 +575,14 @@ fn cold_boot_benchmark_100() {
     for i in 0..N {
         let controller = VmmController::new();
         let t0 = Instant::now();
-        controller.create(vm_config()).expect("boot");
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo cold-boot-benchmark-ok'",
+            "cold-boot-benchmark-ok",
+        );
         let elapsed_us = t0.elapsed().as_micros();
         samples_ms.push(elapsed_us);
         controller.stop().ok();
@@ -605,11 +610,9 @@ fn cold_boot_benchmark_100() {
     let report = format!(
         "# Cold-boot benchmark — {N} iterations\n\
          \n\
-         Boots a 128 MiB VM with the in-tree minimal bzImage to first HLT (kernel\n\
-         init runs, returns to the controller). c8i nested-virt; no userspace\n\
-         echo because virtio-blk DRIVER_OK doesn't fire on L1 (a known\n\
-         nested-virt limitation). Bare-metal numbers would skip the L0 trap penalty\n\
-         and run 2-5× faster.\n\
+         Boots a 256 MiB VM with the configured candidate kernel and rootfs, then\n\
+         executes a bash marker through the guest agent. Each sample is a real\n\
+         create-to-command-ready measurement.\n\
          \n\
          | metric | value |\n\
          |---|---|\n\
@@ -688,13 +691,7 @@ fn oci_cold_boot_pull_pipeline() {
     let out = std::env::temp_dir().join("vmm-oci-bench-alpine.ext4");
 
     let t0 = Instant::now();
-    let result = match pull_and_convert(&image, &out, 256) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("oci pipeline skipped — {e}");
-            return; // tool missing or offline; the gate is the binary, not the network
-        }
-    };
+    let result = pull_and_convert(&image, &out, 256).expect("OCI pull and conversion must succeed");
     let pull_ms = t0.elapsed().as_millis();
 
     eprintln!(

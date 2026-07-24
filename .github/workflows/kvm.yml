@@ -74,6 +74,9 @@ jobs:
 
       - name: Run KVM integration suite
         working-directory: vmm
+        env:
+          VMM_TEST_KERNEL: /tmp/vmlinux.microvm
+          VMM_TEST_ROOTFS: /tmp/vsock-rootfs.ext4
         run: |
           sudo -E env "PATH=$HOME/.cargo/bin:$PATH" cargo test --locked --workspace \
             --features vmm-core/kvm \

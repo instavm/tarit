@@ -6,6 +6,8 @@ set -uo pipefail
 ROOT="${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 TARITD=$ROOT/orch/target/release/taritd
 VMM=$ROOT/vmm/target/debug/vmm
+KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
+BASE_ROOTFS="${BASE_ROOTFS:-${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}}"
 KEY=smoke-key
 PORT=18099
 DIR=/tmp/tarit-smoke-$$
@@ -13,14 +15,14 @@ ROOTFS=/tmp/tarit-smoke-rootfs.ext4
 mkdir -p "$DIR/sockets"
 PASS=1; note(){ printf '%s\n' "$*"; }; fail(){ printf 'FAIL %s\n' "$*"; PASS=0; }
 
-cp -f /tmp/vsock-rootfs.ext4 "$ROOTFS"
+cp -f "$BASE_ROOTFS" "$ROOTFS"
 make -C "$ROOT/vmm/guest/agent" >/dev/null 2>&1 || true
 sh "$ROOT/vmm/guest/agent/bake-agent.sh" "$ROOTFS" "$ROOT/vmm/guest/agent/vmm-agent" >/dev/null 2>&1 || true
 e2fsck -fy "$ROOTFS" >/dev/null 2>&1 || true
 
 for p in $(pgrep -f 'release/taritd' 2>/dev/null); do kill "$p" 2>/dev/null; done; sleep 1
 TARIT_API_KEY=$KEY TARIT_LISTEN=127.0.0.1:$PORT TARIT_RPC_ADDR=http://127.0.0.1:$PORT \
-TARIT_VMM_BIN=$VMM TARIT_KERNEL=/tmp/vmlinux.microvm TARIT_ROOTFS=$ROOTFS TARIT_ROOTFS_READONLY=1 \
+TARIT_VMM_BIN=$VMM TARIT_KERNEL="$KERNEL" TARIT_ROOTFS=$ROOTFS TARIT_ROOTFS_READONLY=1 \
 TARIT_SOCKET_DIR=$DIR/sockets TARIT_DB=$DIR/db.sqlite TARIT_CONFIG=$DIR/none.toml \
 TARIT_WARM_POOL=0 TARIT_SSH_GATEWAY=1 TARIT_SSH_GATEWAY_ADDR=127.0.0.1:2299 \
 TARIT_SSH_GATEWAY_HOST_KEY=$DIR/hostkey RUST_LOG=taritd=info \

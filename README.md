@@ -75,11 +75,13 @@ microVMs needs root (or membership in the `kvm` group), so the commands use
 ```sh
 git clone https://github.com/instavm/tarit && cd tarit
 sudo make install      # build + install vmm, taritd, and the guest agent
-sudo make guest        # one-time: build a guest kernel + pull an Ubuntu rootfs
+sudo make guest        # one-time: fetch a verified guest kernel + pull an Ubuntu rootfs
 ```
 
-`make guest` does the slow work once (kernel build + OCI pull) and writes
-`guest-assets/vmlinux` and `guest-assets/rootfs.ext4`, so later starts do not
+`make guest` downloads the pinned, checksum-verified guest kernel and pulls the
+OCI rootfs once. If the release artifact is unavailable, it builds the same
+kernel from checksum-pinned source. It writes `guest-assets/vmlinux` and
+`guest-assets/rootfs.ext4`, so later starts do not
 repeat image conversion. Boot one, run a command in it, tear it down:
 
 ```sh

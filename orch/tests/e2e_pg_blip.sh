@@ -28,8 +28,8 @@ start(){ local i=$1 nd="$DIR/n$i"; mkdir -p "$nd/sockets"
       TARIT_LISTEN=127.0.0.1:${P[$i]} TARIT_RPC_ADDR=http://127.0.0.1:${P[$i]} \
       TARIT_ALLOW_INSECURE_PEER_HTTP=1 \
       TARIT_HOST_ID=${H[$i]} TARIT_SOCKET_DIR="$nd/sockets" TARIT_DB="$nd/i.sqlite" \
-      TARIT_VMM_BIN="$VMM_BIN" TARIT_KERNEL=/tmp/vmlinux.microvm \
-      TARIT_ROOTFS=/tmp/vsock-rootfs.ext4 TARIT_CONFIG="$nd/none.toml" TARIT_WARM_POOL=0 \
+      TARIT_VMM_BIN="$VMM_BIN" TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}" \
+      TARIT_ROOTFS="${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}" TARIT_CONFIG="$nd/none.toml" TARIT_WARM_POOL=0 \
       TARIT_MAX_VMS=2 RUST_LOG=taritd=info
     exec "$TARIT" >"$nd/log" 2>&1 ) &
   PIDS[$i]=$!; }

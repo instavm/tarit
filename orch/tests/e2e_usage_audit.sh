@@ -21,6 +21,7 @@ PORT=18090
 DIR=/tmp/usage-$$
 ROOTFS=/tmp/usage-rootfs.ext4
 BASE=/tmp/vsock-rootfs.ext4
+BASE="${BASE_ROOTFS:-${TARIT_ROOTFS:-$BASE}}"
 mkdir -p "$DIR/sockets"
 PASS=1
 note(){ printf '%s\n' "$*"; }
@@ -41,7 +42,7 @@ TARIT_DATABASE_URL="$TARIT_DATABASE_URL" TARIT_RDS_CA_FILE="$CA" \
 TARIT_LISTEN="127.0.0.1:$PORT" TARIT_RPC_ADDR="http://127.0.0.1:$PORT" TARIT_HOST_ID="usage-n1" \
 TARIT_ALLOW_INSECURE_PEER_HTTP=1 \
 TARIT_SOCKET_DIR="$DIR/sockets" TARIT_DB="$DIR/i.sqlite" TARIT_CONFIG="$DIR/none.toml" \
-TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm" TARIT_KERNEL=/tmp/vmlinux.microvm TARIT_ROOTFS="$ROOTFS" \
+TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm" TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}" TARIT_ROOTFS="$ROOTFS" \
 TARIT_ROOTFS_READONLY=1 TARIT_WARM_POOL=0 TARIT_MAX_VMS=4 \
 TARIT_USAGE_METER_INTERVAL_SECS=3 TARIT_USAGE_FLUSH_INTERVAL_SECS=2 \
 RUST_LOG=taritd=info "$TARIT" serve >"$DIR/log" 2>&1 &
@@ -60,7 +61,10 @@ VM=$(api -H 'content-type: application/json' -d '{"vcpus":1,"memory_mib":256}' "
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
 note "created vm=$VM; letting it run ~9s for runtime metering"
 sleep 9
-api -H 'content-type: application/json' -d "{\"vm_id\":\"$VM\",\"command\":\"echo usage-ok\",\"timeout_ms\":5000}" "http://127.0.0.1:$PORT/v1/execute" >/dev/null
+api -H 'content-type: application/json' -d "{\"vm_id\":\"$VM\",\"command\":\"bash -c 'echo usage-runtime-ok'\",\"timeout_ms\":5000}" \
+  "http://127.0.0.1:$PORT/v1/execute" |
+  python3 -c 'import json,sys; result=json.load(sys.stdin); assert result["exit_code"] == 0 and "usage-runtime-ok" in result.get("stdout",""), result' ||
+  fail "created guest did not execute"
 api -H 'content-type: application/json' -d '{"diff":false}' "http://127.0.0.1:$PORT/v1/vms/$VM/snapshot" >/dev/null
 sleep 5   # let the flusher push to Postgres
 
