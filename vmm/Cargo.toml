@@ -17,7 +17,7 @@ members = [
 default-members = ["src"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.95"
 license = "AGPL-3.0-or-later"

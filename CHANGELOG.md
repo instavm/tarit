@@ -10,16 +10,33 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-27
+
+### Added
+
+- `vmm kernel install`: downloads a reproducibly built Linux 6.12 LTS `vmlinux`
+  over HTTPS and verifies its pinned SHA-256, falling back to a checksum-pinned
+  source build.
+
 ### Changed
 
+- Fenced lifecycle and snapshot transitions, with tightened isolation and
+  admission control.
 - SSH gateway client authentication no longer accepts RSA public keys.
-- Guest setup now downloads a reproducibly built Linux 6.12 LTS `vmlinux`,
-  verifies its pinned SHA-256, and falls back to a checksum-pinned source build.
-  Kernel releases are attested and gated by the full c8i promotion suite and a
-  minimum three-hour lifecycle soak.
-- `vmm kernel install` downloads the pinned kernel with HTTPS and SHA-256
-  verification. Interactive `run` and `create` commands can install it when no
-  kernel path is supplied.
+- Lifecycle and snapshot clients use a 600s request deadline instead of a 5s
+  per-read timeout, so suspend and snapshot no longer fail while guest RAM is
+  copied.
+
+### Fixed
+
+- Live snapshots now pre-copy and restore correctly: state is captured at the
+  final stop, dirty bits consumed from KVM are replayed so a following diff
+  snapshot stays a diff, and only the residual is copied during downtime.
+- SSH gateway command mode and serial exec: command strings run through `sh -c`,
+  client EOF no longer tears down the VMM stream, and exec markers no longer
+  desync.
+- Warm pools stayed empty because the golden overlay was deleted with its source
+  VM.
 
 ## [0.1.0] - 2026-07-03
 
