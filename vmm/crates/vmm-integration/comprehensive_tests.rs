@@ -264,6 +264,16 @@ fn live_snapshot_consistency_harness() {
         "a live snapshot dropped dirty pages from the following diff snapshot"
     );
     diff_controller.stop().ok();
+    // The diff must stay a diff: replaying the live snapshot's consumed dirty
+    // bits must not mark all of guest RAM dirty and silently turn every
+    // subsequent incremental snapshot into a full-RAM copy.
+    let diff_len = std::fs::metadata(&diff_snap).expect("diff metadata").len();
+    let full_len = std::fs::metadata(&full_snap).expect("full metadata").len();
+    eprintln!("diff after live snapshot: {diff_len} bytes vs full {full_len} bytes");
+    assert!(
+        diff_len < full_len / 2,
+        "a live snapshot inflated the following diff to {diff_len} bytes (full is {full_len})"
+    );
     let _ = std::fs::remove_file(&full_snap);
     let _ = std::fs::remove_file(&diff_snap);
     eprintln!("diff snapshot after live snapshot: consistent");

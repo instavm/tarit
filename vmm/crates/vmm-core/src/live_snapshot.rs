@@ -214,15 +214,21 @@ where
     // Step 1: enable dirty logging with the vCPU paused. Re-registering memory
     // regions under a running vCPU races with in-flight guest accesses.
     let mut consumed_dirty = DirtyBitmap::new();
+    let baseline_pages;
     {
         let pause_guard = VcpuPauseGuard::pause(vcpu_thread);
-        // Draining the baseline is what makes the first real read meaningful:
-        // every page reads back dirty right after registration.
+        // Draining the baseline is what makes the first real read meaningful.
+        // These bits are still replayed to the host-dirty tracker: if dirty
+        // logging was already on, they are pages the guest wrote since the
+        // previous snapshot, and dropping them would corrupt the next diff.
         let baseline = kvm_vm
             .enable_dirty_logging()
             .and_then(|()| kvm_vm.read_dirty());
         match baseline {
-            Ok(baseline) => consumed_dirty.merge(&baseline),
+            Ok(baseline) => {
+                baseline_pages = baseline.len() as u64;
+                consumed_dirty.merge(&baseline);
+            }
             Err(e) => {
                 pause_guard.resume();
                 return Err(e);
@@ -230,7 +236,14 @@ where
         }
         pause_guard.resume();
     }
-    log::info!("live_snapshot: dirty logging active, vCPU resumed");
+    // The dirty set accumulates from here, so the first round's dirty rate must
+    // be measured from here too — not from the end of the bulk copy, which would
+    // divide a whole bulk-copy's worth of writes by one inter-round sleep and
+    // overestimate the rate by an order of magnitude.
+    let mut last_read = Instant::now();
+    log::info!(
+        "live_snapshot: dirty logging active ({baseline_pages} baseline pages), vCPU resumed"
+    );
 
     // Step 2: bulk round — copy all of guest RAM while the guest runs. This is
     // also the bandwidth sample that drives the convergence decision.
@@ -254,7 +267,6 @@ where
         round: 1,
         dirty_bytes: mem.size_bytes,
     };
-    let mut last_read = Instant::now();
 
     for round in 2..=config.max_rounds.max(2) {
         if start.elapsed() > timeout {
