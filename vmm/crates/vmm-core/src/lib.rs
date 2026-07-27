@@ -38,7 +38,9 @@ pub mod vsock_pty;
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub use kvm::KvmVm;
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
-pub use live_snapshot::{live_snapshot, LiveSnapshotConfig, LiveSnapshotResult};
+pub use live_snapshot::{
+    live_snapshot, LiveSnapshotConfig, LiveSnapshotOutput, LiveSnapshotResult,
+};
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub use vcpu_setup::{
     set_lint, setup_ap_vcpu, setup_cpuid, setup_vcpu_for_bzimage_boot,

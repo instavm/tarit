@@ -10,7 +10,12 @@ use vmm_core::controller::VmmController;
 use vmm_core::live_snapshot::LiveSnapshotConfig;
 
 mod test_support;
-use test_support::{agent_vm_config, assert_guest_exec, private_overlay_path};
+use test_support::{agent_vm_config, assert_guest_exec, guest_stdout, private_overlay_path};
+
+/// Guest-RAM-only directory used by the live-snapshot consistency harness.
+/// The harness mounts its own tmpfs there so the payload is guaranteed to live
+/// in guest memory and never on the (restore-time discarded) disk overlay.
+const GUEST_RAM_DIR: &str = "/run/livesnap";
 
 /// Perf-gate strictness. Boot latency and creation rate are dominated by the
 /// host's virtualization nesting (on nested KVM every guest exit traps to L0,
@@ -31,10 +36,11 @@ fn retain_snapshot(controller: &VmmController, path: &str) {
 }
 
 /// Memory-consistency harness for live snapshot.
-/// Boot a VM with `create_live` (vCPU executing in background), then take a
-/// live snapshot while it runs and verify the snapshot is a consistent
-/// point-in-time image. The on-disk artifact must be page-aligned and
-/// carry the canonical VMSN snapshot magic so it can be restored later.
+/// Boot a VM with `create_live` (vCPU executing in background), write a known
+/// payload inside the running guest, then take a live snapshot while it runs.
+/// The restored VM must observe the *same* payload — that is what proves the
+/// snapshot pairs a coherent memory image with the vCPU/device state captured
+/// during the final stop, rather than boot-time registers.
 #[test]
 #[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn live_snapshot_consistency_harness() {
@@ -50,29 +56,73 @@ fn live_snapshot_consistency_harness() {
         "live-snapshot-source-ok",
     );
 
-    // Step 2: take a live snapshot while the vCPU keeps running.
+    // Step 2: write a payload that only exists in guest RAM (tmpfs), and
+    // record its digest. A snapshot that captures stale memory or stale vCPU
+    // state cannot reproduce this after a restore.
+    let ready = guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'mkdir -p {GUEST_RAM_DIR} && mount -t tmpfs -o size=128m tmpfs \
+             {GUEST_RAM_DIR} && grep -c \" {GUEST_RAM_DIR} tmpfs \" /proc/mounts'"
+        ),
+    );
+    assert_eq!(
+        ready.trim(),
+        "1",
+        "guest payload directory is not a tmpfs: {ready}"
+    );
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'dd if=/dev/urandom of={GUEST_RAM_DIR}/live-marker bs=1M count=8 && sync'"
+        ),
+    );
+    let source_digest = guest_stdout(
+        &controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/live-marker | cut -d\" \" -f1'"),
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        source_digest.len(),
+        64,
+        "unexpected digest: {source_digest}"
+    );
+
+    // Step 3: take a live snapshot while the vCPU keeps running.
     let cfg = LiveSnapshotConfig::default();
     let result = controller.live_snapshot(cfg).expect("live snapshot");
 
     eprintln!(
-        "Live snapshot: {} rounds, {} pages, {} final dirty, {:?} elapsed",
-        result.rounds, result.pages_copied, result.final_dirty_pages, result.elapsed
+        "Live snapshot: {} rounds, {} pages copied, {} residual, {:?} downtime, {:?} elapsed",
+        result.rounds,
+        result.pages_copied,
+        result.final_dirty_pages,
+        result.downtime,
+        result.elapsed
     );
 
+    assert_eq!(result.mem_bytes, 256 * 1024 * 1024, "snapshot memory size");
+    assert_eq!(result.mem_bytes % 4096, 0, "snapshot must be page-aligned");
+    // The pre-copy loop must actually copy: at minimum the bulk round.
     assert!(
-        !result.mem_snapshot.is_empty(),
-        "snapshot must contain memory"
+        result.pages_copied >= result.mem_bytes / 4096,
+        "pre-copy copied {} pages, less than the {} page bulk round",
+        result.pages_copied,
+        result.mem_bytes / 4096
     );
-    assert_eq!(
-        result.mem_snapshot.len() % 4096,
-        0,
-        "snapshot must be page-aligned"
+    // The blackout must be a residual copy, not a full-RAM copy. A full 256 MiB
+    // copy is tens of milliseconds even on fast hosts; allow generous slack for
+    // nested virtualization but still catch a whole-RAM stop-and-copy.
+    assert!(
+        result.downtime < std::time::Duration::from_secs(2),
+        "final stop blacked the guest out for {:?}",
+        result.downtime
     );
 
-    // Step 3: verify the on-disk snapshot file exists and has the correct
-    // header — this proves the live snapshot is restorable, not just an
-    // in-memory byte buffer. The controller writes it to a private per-process
-    // scratch path (not a fixed /tmp name), reported back on the result.
+    // Step 4: verify the on-disk snapshot file exists and has the correct
+    // header. The controller writes it to a private per-process scratch path
+    // (not a fixed /tmp name), reported back on the result.
     let snap_path = result.snapshot_path.clone();
     assert!(
         !snap_path.is_empty(),
@@ -86,20 +136,13 @@ fn live_snapshot_consistency_harness() {
     );
 
     eprintln!(
-        "Snapshot size: {} bytes ({} pages); on-disk: {} bytes at {}",
-        result.mem_snapshot.len(),
-        result.mem_snapshot.len() / 4096,
+        "Snapshot: {} bytes on disk at {snap_path}; decision {:?}",
         snap_bytes.len(),
-        snap_path,
+        result.final_decision
     );
-    eprintln!("Final decision: {:?}", result.final_decision);
 
-    // Step 4: verify the snapshot bytes pass a few structural checks that
-    // would fail if the pre-copy loop captured a torn page or wrote a
-    // corrupted state blob.
-    //
-    // (a) The state blob (parsed from the on-disk file) must be present
-    //     and bounded within the snapshot artifact. VMSN header layout:
+    // (a) The state blob must be present and bounded within the artifact.
+    //     VMSN header layout:
     //     [4B magic][2B version][2B flags][8B state_len][4B state_crc]
     //     [8B mem_len][4B mem_crc] = 32B, then state_blob, then mem_dump
     //     (matches write_snapshot_file / restore's own parsing).
@@ -111,15 +154,15 @@ fn live_snapshot_consistency_harness() {
         state_end <= snap_bytes.len(),
         "state blob must fit in snapshot"
     );
+    assert!(state_len > 0, "live snapshot must carry a state blob");
     assert_eq!(
-        mem_len,
-        result.mem_snapshot.len(),
-        "on-disk mem_len must match in-memory snapshot length"
+        mem_len as u64, result.mem_bytes,
+        "on-disk mem_len must match the reported memory size"
     );
 
-    // (b) Restore the snapshot — the surest test of consistency. If the
-    //     pre-copy loop produced a torn page or wrote an inconsistent state
-    //     blob, the restore path will reject it or produce a corrupt VM.
+    // (b) Restore the snapshot and re-read the payload. This is the real
+    //     consistency assertion: a snapshot carrying boot-time vCPU registers
+    //     against post-boot memory cannot come back with the same digest.
     let restore_controller = VmmController::new();
     restore_controller
         .restore(
@@ -136,33 +179,115 @@ fn live_snapshot_consistency_harness() {
         "bash -c 'echo live-snapshot-restore-ok'",
         "live-snapshot-restore-ok",
     );
-    eprintln!("restored live snapshot");
+    let restored_digest = guest_stdout(
+        &restore_controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/live-marker | cut -d\" \" -f1'"),
+    );
+    assert_eq!(
+        restored_digest.trim(),
+        source_digest,
+        "restored guest RAM does not match the live-snapshotted guest"
+    );
+    eprintln!("restored live snapshot; payload digest matches");
 
-    // (c) Take a SECOND live snapshot while the source VM keeps running.
-    //     The two snapshots are independent — they must each parse, but
-    //     their memory contents may legitimately differ (the guest mutated
-    //     pages between them). What we assert is that taking back-to-back
-    //     live snapshots does not interfere: both succeed, both produce
-    //     valid restorable artifacts.
+    // (c) Take a SECOND live snapshot while the source VM keeps running. The
+    //     two snapshots are independent: both must succeed, both must produce
+    //     valid artifacts, and — the regression this covers — taking the
+    //     second must NOT delete the first one's file.
     let cfg2 = LiveSnapshotConfig::default();
     let result2 = controller
         .live_snapshot(cfg2)
         .expect("second live snapshot");
     assert_eq!(
-        result2.mem_snapshot.len(),
-        result.mem_snapshot.len(),
+        result2.mem_bytes, result.mem_bytes,
         "back-to-back snapshots must have the same memory size"
     );
-    eprintln!(
-        "second live snapshot: {} rounds, {} pages, {:?} elapsed",
-        result2.rounds, result2.pages_copied, result2.elapsed
+    assert_ne!(
+        result2.snapshot_path, snap_path,
+        "each live snapshot must get its own path"
     );
+    assert!(
+        std::path::Path::new(&snap_path).exists(),
+        "a second live snapshot must not delete the first snapshot's file"
+    );
+    assert!(
+        std::path::Path::new(&result2.snapshot_path).exists(),
+        "second live snapshot file is missing"
+    );
+    eprintln!(
+        "second live snapshot: {} rounds, {} pages, {:?} downtime",
+        result2.rounds, result2.pages_copied, result2.downtime
+    );
+
+    // (d) A diff snapshot taken after live snapshots must still restore
+    //     correctly. The live snapshot drains KVM's dirty bitmap, so without
+    //     replaying those bits into the host-dirty tracker the diff would
+    //     silently omit pages the guest had written.
+    let full_snap = controller.snapshot(false).expect("full snapshot");
+    retain_snapshot(&controller, &full_snap);
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'dd if=/dev/urandom of={GUEST_RAM_DIR}/diff-marker bs=1M count=4 && sync'"
+        ),
+    );
+    let diff_digest = guest_stdout(
+        &controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/diff-marker | cut -d\" \" -f1'"),
+    )
+    .trim()
+    .to_string();
+    let _ = controller
+        .live_snapshot(LiveSnapshotConfig::default())
+        .expect("live snapshot between full and diff");
+    let diff_snap = controller.snapshot(true).expect("diff snapshot");
+    retain_snapshot(&controller, &diff_snap);
+
+    let diff_controller = VmmController::new();
+    diff_controller
+        .restore(
+            &diff_snap,
+            Some(
+                test_support::private_overlay_path("live-diff-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore from diff snapshot taken after a live snapshot");
+    let restored_diff_digest = guest_stdout(
+        &diff_controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/diff-marker | cut -d\" \" -f1'"),
+    );
+    assert_eq!(
+        restored_diff_digest.trim(),
+        diff_digest,
+        "a live snapshot dropped dirty pages from the following diff snapshot"
+    );
+    diff_controller.stop().ok();
+    // The diff must stay a diff: replaying the live snapshot's consumed dirty
+    // bits must not mark all of guest RAM dirty and silently turn every
+    // subsequent incremental snapshot into a full-RAM copy.
+    let diff_len = std::fs::metadata(&diff_snap).expect("diff metadata").len();
+    let full_len = std::fs::metadata(&full_snap).expect("full metadata").len();
+    eprintln!("diff after live snapshot: {diff_len} bytes vs full {full_len} bytes");
+    assert!(
+        diff_len < full_len / 2,
+        "a live snapshot inflated the following diff to {diff_len} bytes (full is {full_len})"
+    );
+    let _ = std::fs::remove_file(&full_snap);
+    let _ = std::fs::remove_file(&diff_snap);
+    eprintln!("diff snapshot after live snapshot: consistent");
 
     // Step 5: cleanly stop the running VM (joins the background vCPU thread).
     restore_controller.stop().ok();
+    let second_path = result2.snapshot_path.clone();
     controller.stop().expect("stop");
-    let _ = std::fs::remove_file(&snap_path);
-    eprintln!("live snapshot consistency: PASS (struct + restore + 2x snapshot)");
+    // Stopping the VM releases every live snapshot it still owns.
+    assert!(
+        !std::path::Path::new(&snap_path).exists() && !std::path::Path::new(&second_path).exists(),
+        "stopping the VM must remove the live snapshots it still owns"
+    );
+    eprintln!("live snapshot consistency: PASS (payload + restore + diff + 2x snapshot)");
 }
 
 /// Performance gates.

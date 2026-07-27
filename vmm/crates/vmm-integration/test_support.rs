@@ -69,6 +69,26 @@ pub fn agent_vm_config(memory_mib: u64) -> VmConfig {
     }
 }
 
+/// Run a command in the guest and return its stdout, retrying while the guest
+/// agent is still coming up. Panics if the command itself fails, so a silent
+/// "wrote nothing" can never be mistaken for a successful payload write.
+pub fn guest_stdout(controller: &VmmController, command: &str) -> String {
+    let started = std::time::Instant::now();
+    loop {
+        match controller.exec(command, 30_000) {
+            Ok((0, output, _)) => return output,
+            Ok((code, output, stderr)) => {
+                panic!("guest command failed ({code}): {command}: {output}{stderr}")
+            }
+            Err(error) if started.elapsed() < std::time::Duration::from_secs(90) => {
+                eprintln!("guest not command-ready yet: {error}");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(error) => panic!("guest command failed to execute: {command}: {error}"),
+        }
+    }
+}
+
 pub fn assert_guest_exec(controller: &VmmController, command: &str, expected: &str) {
     let started = std::time::Instant::now();
     loop {

@@ -54,6 +54,11 @@ pub struct RunningVm {
 /// A VM instance with its memory available for snapshot.
 pub struct VmInstance {
     pub state: VmState,
+    /// Monotonic, process-unique id for this instance. Long-running operations
+    /// that must release the controller lock (live snapshot) record it before
+    /// and re-check it after, so a concurrent stop + create cannot get an old
+    /// VM's `RunningVm` grafted onto the new instance in the slot.
+    pub generation: u64,
     /// When this instance was created in-process, for uptime reporting.
     pub created_at: std::time::Instant,
     /// Path of the most recent snapshot of this VM (the parent for the next
@@ -90,7 +95,10 @@ impl Drop for VmInstance {
 /// Scratch files owned by one VM instance.
 #[derive(Debug, Default)]
 pub struct VmTransientFiles {
-    live_snapshot: Option<OwnedScratchFile>,
+    /// Live snapshots taken of this VM. Each one is kept until the VM stops or
+    /// its ownership is transferred, so taking a second live snapshot never
+    /// deletes the path an earlier call already handed to a caller.
+    live_snapshots: Vec<OwnedScratchFile>,
     suspend_snapshot: Option<OwnedScratchFile>,
     snapshots: Vec<OwnedScratchFile>,
     owned_overlays: Vec<OwnedScratchFile>,
@@ -106,10 +114,8 @@ impl VmTransientFiles {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-    fn set_live_snapshot_owned(&mut self, path: OwnedScratchFile) {
-        if let Some(old) = self.live_snapshot.replace(path) {
-            remove_owned_scratch_file(&old);
-        }
+    fn add_live_snapshot_owned(&mut self, path: OwnedScratchFile) {
+        self.live_snapshots.push(path);
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -130,7 +136,7 @@ impl VmTransientFiles {
         };
         match kind {
             OwnedScratchKind::LiveSnapshot => {
-                self.live_snapshot.take();
+                self.live_snapshots.remove(index);
             }
             OwnedScratchKind::SuspendSnapshot => {
                 self.suspend_snapshot.take();
@@ -150,12 +156,12 @@ impl VmTransientFiles {
         path: &Path,
         identity: &ScratchIdentity,
     ) -> Option<(OwnedScratchKind, usize)> {
-        if self
-            .live_snapshot
-            .as_ref()
-            .is_some_and(|file| file.path() == path && file.matches_identity(identity))
+        if let Some(index) = self
+            .live_snapshots
+            .iter()
+            .position(|file| file.path() == path && file.matches_identity(identity))
         {
-            return Some((OwnedScratchKind::LiveSnapshot, 0));
+            return Some((OwnedScratchKind::LiveSnapshot, index));
         }
         if self
             .suspend_snapshot
@@ -178,7 +184,7 @@ impl VmTransientFiles {
     }
 
     fn cleanup(&mut self) {
-        if let Some(path) = self.live_snapshot.take() {
+        for path in self.live_snapshots.drain(..) {
             remove_owned_scratch_file(&path);
         }
         if let Some(path) = self.suspend_snapshot.take() {
@@ -199,6 +205,12 @@ enum OwnedScratchKind {
     SuspendSnapshot,
     Snapshot,
     Overlay,
+}
+
+/// Allocate the next process-unique VM generation.
+fn next_vm_generation() -> u64 {
+    static VM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    VM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn remove_owned_scratch_file(file: &OwnedScratchFile) {
@@ -309,6 +321,7 @@ impl VmmController {
         {
             let (guest_mem, state_blob) = self.boot_vm(&config)?;
             *slot = Some(VmInstance {
+                generation: next_vm_generation(),
                 state: VmState::Paused,
                 created_at: std::time::Instant::now(),
                 last_snapshot: None,
@@ -326,6 +339,7 @@ impl VmmController {
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
         {
             *slot = Some(VmInstance {
+                generation: next_vm_generation(),
                 state: VmState::Created,
                 created_at: std::time::Instant::now(),
                 last_snapshot: None,
@@ -783,6 +797,7 @@ impl VmmController {
         );
 
         *slot = Some(VmInstance {
+            generation: next_vm_generation(),
             state: VmState::Running,
             created_at: std::time::Instant::now(),
             last_snapshot: None,
@@ -824,7 +839,7 @@ impl VmmController {
         &self,
         snapshot_config: crate::live_snapshot::LiveSnapshotConfig,
     ) -> Result<crate::live_snapshot::LiveSnapshotResult> {
-        let (running, mem, state_blob) = {
+        let (running, mem, base_blob, generation) = {
             let mut slot = self.lock();
             let vm = slot
                 .as_mut()
@@ -835,60 +850,107 @@ impl VmmController {
                     "SMP live snapshot (vcpus.count > 1) not yet supported".into(),
                 ));
             }
-            let running = vm
-                .running
-                .take()
-                .ok_or_else(|| VmmError::InvalidConfig("VM not running".into()))?;
             let mem = vm
                 .guest_mem
                 .clone()
                 .ok_or_else(|| VmmError::Memory("no guest memory".into()))?;
-            let state_blob = vm.state_blob.clone().unwrap_or_default();
-            (running, mem, state_blob)
+            let base_blob = vm.state_blob.clone().unwrap_or_default();
+            let running = vm
+                .running
+                .take()
+                .ok_or_else(|| VmmError::InvalidConfig("VM not running".into()))?;
+            (running, mem, base_blob, vm.generation)
         };
 
+        // The controller lock is released for the whole pre-copy loop so other
+        // operations are not blocked for seconds. `capture_state` runs inside
+        // the final vCPU pause, which is what makes the state blob coherent
+        // with the memory image (a blob captured before the loop would carry
+        // boot-time registers against post-boot memory).
         let snap_result = crate::live_snapshot::live_snapshot(
-            &running.kvm_vm.vm_fd,
+            &running.kvm_vm,
             &mem,
-            &running.kvm_vm.slots,
             &running.vcpu_thread,
             &snapshot_config,
+            || {
+                Ok(capture_live_state_blob(&running, &base_blob)
+                    .unwrap_or_else(|| base_blob.clone()))
+            },
         );
 
+        // Put the VM back only if the slot still holds the same instance. A
+        // concurrent stop + create would otherwise get this VM's threads and
+        // devices grafted onto an unrelated instance.
+        let mut reclaimed = Some(running);
         {
             let mut slot = self.lock();
-            if let Some(vm) = slot.as_mut() {
-                vm.running = Some(running);
+            match slot.as_mut() {
+                Some(vm) if vm.generation == generation && vm.running.is_none() => {
+                    vm.running = reclaimed.take();
+                }
+                _ => {
+                    log::warn!("live_snapshot: VM replaced during the snapshot; discarding it");
+                }
             }
         }
+        // Dropping the stale `RunningVm` stops its vCPU and I/O threads.
+        drop(reclaimed);
 
-        let mut result = snap_result?;
+        let output = snap_result?;
+        let mut result = output.result;
+
         let live_path = unique_scratch_snapshot_path("vmm-live")?;
         let live_path_s = live_path.to_string_lossy().into_owned();
         let owned_live_path = OwnedScratchFile::create_new(&live_path)
             .map_err(|e| VmmError::Snapshot(format!("create {live_path_s}: {e}")))?;
-        if let Err(e) =
-            write_scratch_snapshot_file(&owned_live_path, &state_blob, &result.mem_snapshot, false)
-        {
+        let write = write_scratch_snapshot_file(
+            &owned_live_path,
+            &output.state_blob,
+            &output.mem_snapshot,
+            false,
+        );
+        // Free the memory image before returning: holding it alongside guest
+        // RAM would keep the host at two copies for the caller's lifetime.
+        drop(output.mem_snapshot);
+        if let Err(e) = write {
             remove_owned_scratch_file(&owned_live_path);
             return Err(e);
         }
-        result.snapshot_path = live_path_s.clone();
+        result.snapshot_path.clone_from(&live_path_s);
+
         let mut owned_live_path = Some(owned_live_path);
         {
             let mut slot = self.lock();
-            if let Some(vm) = slot.as_mut() {
+            if let Some(vm) = slot.as_mut().filter(|vm| vm.generation == generation) {
                 vm.transient_files
-                    .set_live_snapshot_owned(owned_live_path.take().expect("owned snapshot"));
+                    .add_live_snapshot_owned(owned_live_path.take().expect("owned snapshot"));
+                // KVM_GET_DIRTY_LOG cleared every bit this snapshot consumed.
+                // Replay them into the host-dirty tracker, which snapshot()
+                // merges into the KVM dirty set, so a later diff snapshot still
+                // carries the pages the live snapshot observed.
+                if let Some(guest_mem) = vm.guest_mem.as_ref() {
+                    for pfn in output.consumed_dirty.dirty_pfns() {
+                        guest_mem.mark_host_dirty(
+                            pfn.saturating_mul(crate::live_snapshot::PAGE_SIZE),
+                            crate::live_snapshot::PAGE_SIZE,
+                        );
+                    }
+                }
+                // Dirty logging stays enabled after a live snapshot, exactly as
+                // it does after a full snapshot. Record it so diff snapshots and
+                // teardown see the real state of the VM.
+                vm.dirty_logging = true;
             }
         }
         if let Some(owned_live_path) = owned_live_path {
             remove_owned_scratch_file(&owned_live_path);
         }
         log::info!(
-            "VM: live snapshot — {} rounds, {} pages, {:?}",
+            "VM: live snapshot — {} rounds, {} pages copied, {} residual, {:?} downtime, {:?} total",
             result.rounds,
             result.pages_copied,
+            result.final_dirty_pages,
+            result.downtime,
             result.elapsed
         );
         Ok(result)
@@ -1067,6 +1129,7 @@ impl VmmController {
 
         let mut slot = self.lock();
         *slot = Some(VmInstance {
+            generation: next_vm_generation(),
             state,
             created_at: std::time::Instant::now(),
             last_snapshot: None,
@@ -1580,16 +1643,37 @@ fn resume_running_vcpus(vm: &VmInstance) {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn capture_live_state(vm: &mut VmInstance) {
-    let captured = vm.running.as_ref().and_then(|r| {
-        r.vcpu_thread
-            .captured_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    });
-    let ap_captured: Option<Vec<Vec<u8>>> = vm.running.as_ref().and_then(|r| {
-        let mut v = Vec::with_capacity(r.ap_threads.len());
-        for ap in &r.ap_threads {
+    let Some(running) = vm.running.as_ref() else {
+        return;
+    };
+    let Some(existing) = vm.state_blob.as_deref() else {
+        return;
+    };
+    if let Some(blob) = capture_live_state_blob(running, existing) {
+        vm.state_blob = Some(blob);
+    }
+}
+
+/// Fold the vCPU registers and device state captured during the current pause
+/// into `existing`, returning the updated state blob.
+///
+/// Call this with every vCPU paused: the returned blob is only coherent with a
+/// memory image taken during the same pause. Returns `None` when the vCPU has
+/// not published any captured state (e.g. a VM that never ran) or when
+/// `existing` is not a parseable state blob, in which case the caller should
+/// keep using `existing` unchanged.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Option<Vec<u8>> {
+    let captured = running
+        .vcpu_thread
+        .captured_state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let ap_captured: Option<Vec<Vec<u8>>> = {
+        let mut v = Vec::with_capacity(running.ap_threads.len());
+        let mut all = true;
+        for ap in &running.ap_threads {
             match ap
                 .captured_state
                 .lock()
@@ -1597,51 +1681,36 @@ fn capture_live_state(vm: &mut VmInstance) {
                 .clone()
             {
                 Some(s) => v.push(s),
-                None => return None,
-            }
-        }
-        Some(v)
-    });
-    let vm_state = vm
-        .running
-        .as_ref()
-        .and_then(|r| r.kvm_vm.capture_vm_state().ok())
-        .and_then(|s| postcard::to_allocvec(&s).ok());
-    let serial_state = vm
-        .running
-        .as_ref()
-        .map(|r| vmm_devices::persist::Persist::save(&*r.vcpu_thread.serial));
-    let (virtio_blk, virtio_net) = vm
-        .running
-        .as_ref()
-        .map(|r| {
-            (
-                capture_virtio_blk_states(&r.blk_devices),
-                capture_virtio_net_states(&r.net_devices),
-            )
-        })
-        .unwrap_or_default();
-    let vsock_state = vm
-        .running
-        .as_ref()
-        .and_then(|r| r.vsock_pump.as_ref())
-        .map(|p| vmm_devices::persist::Persist::save(&*p.device));
-    if let Some(full) = captured {
-        if let Some(existing) = vm.state_blob.as_deref() {
-            if let Ok(mut b) = postcard::from_bytes::<StateBlob>(existing) {
-                b.vcpu_full = Some(full);
-                b.vcpu_full_aps = ap_captured.unwrap_or_default();
-                b.vm_full = vm_state;
-                if let Some(s) = serial_state {
-                    b.serial = s;
+                None => {
+                    all = false;
+                    break;
                 }
-                b.virtio_blk = virtio_blk;
-                b.virtio_net = virtio_net;
-                b.vsock = vsock_state;
-                vm.state_blob = Some(postcard::to_allocvec(&b).unwrap_or_default());
             }
         }
-    }
+        all.then_some(v)
+    };
+    let vm_state = running
+        .kvm_vm
+        .capture_vm_state()
+        .ok()
+        .and_then(|s| postcard::to_allocvec(&s).ok());
+    let serial_state = vmm_devices::persist::Persist::save(&*running.vcpu_thread.serial);
+    let virtio_blk = capture_virtio_blk_states(&running.blk_devices);
+    let virtio_net = capture_virtio_net_states(&running.net_devices);
+    let vsock_state = running
+        .vsock_pump
+        .as_ref()
+        .map(|p| vmm_devices::persist::Persist::save(&*p.device));
+
+    let mut b = postcard::from_bytes::<StateBlob>(existing).ok()?;
+    b.vcpu_full = Some(captured);
+    b.vcpu_full_aps = ap_captured.unwrap_or_default();
+    b.vm_full = vm_state;
+    b.serial = serial_state;
+    b.virtio_blk = virtio_blk;
+    b.virtio_net = virtio_net;
+    b.vsock = vsock_state;
+    postcard::to_allocvec(&b).ok()
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
