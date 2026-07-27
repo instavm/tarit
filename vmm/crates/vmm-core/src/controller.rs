@@ -2106,7 +2106,7 @@ fn copy_restore_overlay(
     {
         use std::os::fd::AsRawFd;
 
-        const FICLONE: libc::c_ulong = 0x4004_9409;
+        const FICLONE: libc::Ioctl = 0x4004_9409;
         let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE, source.as_raw_fd()) };
         if cloned == 0 {
             return target.sync_all();

@@ -3954,7 +3954,9 @@ fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std
 
     // FICLONE is the fastest safe path on XFS/btrfs and compatible filesystems:
     // the new inode gets private CoW mappings without copying the sparse upper.
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    // `libc::Ioctl` is c_ulong on glibc and c_int on musl, so spell the constant
+    // with that alias to keep the musl release build compiling.
+    const FICLONE: libc::Ioctl = 0x4004_9409;
     let cloned = unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
     if cloned == 0 {
         return Ok(());
