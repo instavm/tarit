@@ -44,7 +44,7 @@ jobs:
       # zig provides a complete cross sysroot, which lets the C dependencies in
       # the tree (aws-lc-rs via russh, etc.) build cleanly for the musl target.
       - name: Install zig
-        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.13.0
 
