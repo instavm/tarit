@@ -23,7 +23,7 @@ tarit-store = { path = "../tarit-store" }
 tarit-types = { path = "../tarit-types" }
 tarit-vmm-client = { path = "../tarit-vmm-client" }
 reqwest = { workspace = true }
-russh = { version = "0.61", default-features = false, features = ["aws-lc-rs", "flate2"] }
+russh = { version = "0.62", default-features = false, features = ["aws-lc-rs", "flate2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
