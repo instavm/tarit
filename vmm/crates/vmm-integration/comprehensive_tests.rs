@@ -290,6 +290,127 @@ fn live_snapshot_consistency_harness() {
     eprintln!("live snapshot consistency: PASS (payload + restore + diff + 2x snapshot)");
 }
 
+/// Device-DMA staleness regression. KVM's dirty log only records guest vCPU
+/// writes; pages that virtio devices DMA into (block reads filling the page
+/// cache, net/vsock RX buffers, used rings) are written by VMM userspace and
+/// are invisible to it. A live snapshot that consults only KVM's log captures
+/// those pages as they were during the bulk copy — stale.
+///
+/// Witness: the guest DMA-reads a disk range into its page cache *while* the
+/// pre-copy loop runs (a vCPU-side churn loop keeps the loop going long
+/// enough), and nothing touches those cache pages afterwards. After a
+/// restore, re-reading the range is served from the restored page cache, so
+/// the digest only matches if the image carried the DMA'd pages.
+#[test]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
+fn live_snapshot_captures_device_dma() {
+    let controller = VmmController::new();
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("create_live");
+    assert_guest_exec(&controller, "bash -c 'echo dma-src-ok'", "dma-src-ok");
+    guest_stdout(
+        &controller,
+        &format!("bash -c 'mkdir -p {GUEST_RAM_DIR} && mount -t tmpfs -o size=64m tmpfs {GUEST_RAM_DIR}'"),
+    );
+
+    // Witness range: 16 MiB of /dev/vda past the ext4 journal area.
+    let witness = "dd if=/dev/vda bs=1M skip=32 count=16 2>/dev/null";
+
+    // Evict any cached copy of the witness range so the only way its pages
+    // get into guest RAM is the DMA performed during the snapshot.
+    guest_stdout(
+        &controller,
+        "bash -c 'sync && echo 3 > /proc/sys/vm/drop_caches && echo dropped'",
+    );
+
+    // vCPU-side churn: keeps the pre-copy loop iterating (its writes are in
+    // KVM's log) so the witness DMA below lands between the bulk copy and the
+    // final stop. Stopped via sentinel file so the restored guest can halt it.
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'nohup bash -c \"while [ ! -f {GUEST_RAM_DIR}/stop-churn ]; do \
+             dd if=/dev/zero of={GUEST_RAM_DIR}/churn bs=1M count=8 conv=notrunc 2>/dev/null; \
+             done\" >/dev/null 2>&1 & echo churn-started'"
+        ),
+    );
+
+    // Witness DMA, delayed past the bulk copy.
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'nohup bash -c \"sleep 0.1; {witness} >/dev/null; \
+             touch {GUEST_RAM_DIR}/witness-done\" >/dev/null 2>&1 & echo witness-started'"
+        ),
+    );
+
+    let result = controller
+        .live_snapshot(LiveSnapshotConfig::default())
+        .expect("live snapshot during device DMA");
+    eprintln!(
+        "DMA snapshot: {} rounds, {} pages, {} residual, {:?} downtime",
+        result.rounds, result.pages_copied, result.final_dirty_pages, result.downtime
+    );
+    // The churn loop must have kept the snapshot in its pre-copy rounds long
+    // enough for the delayed witness DMA to overlap it.
+    assert!(
+        result.rounds >= 3,
+        "snapshot converged after only {} rounds — the witness DMA cannot have \
+         overlapped the pre-copy loop",
+        result.rounds
+    );
+    let snap_path = result.snapshot_path.clone();
+
+    // Ground truth: the source guest's own (cached) view of the range.
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'for i in $(seq 50); do [ -f {GUEST_RAM_DIR}/witness-done ] && break; \
+             sleep 0.1; done; echo synced'"
+        ),
+    );
+    let source_digest = guest_stdout(
+        &controller,
+        &format!("bash -c '{witness} | sha256sum | cut -d\" \" -f1'"),
+    )
+    .trim()
+    .to_string();
+    assert_eq!(source_digest.len(), 64, "bad digest: {source_digest}");
+
+    // Restore and compare. The restored guest's read is served from the
+    // restored page cache — the pages the snapshot must have carried.
+    let restore_controller = VmmController::new();
+    restore_controller
+        .restore(
+            &snap_path,
+            Some(
+                private_overlay_path("live-dma-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore from DMA-window live snapshot");
+    guest_stdout(
+        &restore_controller,
+        &format!("bash -c 'touch {GUEST_RAM_DIR}/stop-churn; echo churn-stopped'"),
+    );
+    let restored_digest = guest_stdout(
+        &restore_controller,
+        &format!("bash -c '{witness} | sha256sum | cut -d\" \" -f1'"),
+    );
+    assert_eq!(
+        restored_digest.trim(),
+        source_digest,
+        "restored page cache does not match the source: device-DMA'd pages \
+         went stale in the live snapshot image"
+    );
+
+    restore_controller.stop().ok();
+    controller.stop().expect("stop");
+    eprintln!("live snapshot device DMA: PASS");
+}
+
 /// Performance gates.
 /// Cold boot latency (p50/p99), restore latency, snapshot latency.
 #[test]
