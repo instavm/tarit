@@ -161,6 +161,7 @@ target/release/vmm --socket /tmp/vmm.sock suspend
 target/release/vmm --socket /tmp/vmm.sock resume
 target/release/vmm --socket /tmp/vmm.sock snapshot
 target/release/vmm --socket /tmp/vmm.sock snapshot --diff
+target/release/vmm --socket /tmp/vmm.sock snapshot --live
 target/release/vmm --socket /tmp/vmm.sock update-egress \
   --allow 10.0.0.0/8:443/tcp \
   --allow 8.8.8.8/32:53/udp \
