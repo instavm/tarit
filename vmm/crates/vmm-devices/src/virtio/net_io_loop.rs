@@ -295,14 +295,21 @@ fn drain_kick(tx_kick_fd: RawFd, device: &Arc<VirtioNetMmio>) {
 fn drain_wake(wake_fd: RawFd) {
     let mut counter = [0u8; 8];
     // SAFETY: `counter` is a valid writable 8-byte eventfd counter buffer;
-    // invalid or empty fds are reported by read and ignored (best-effort).
-    let _ = unsafe {
+    // read reports invalid fds via its return value.
+    let n = unsafe {
         libc::read(
             wake_fd,
             counter.as_mut_ptr() as *mut libc::c_void,
             counter.len(),
         )
     };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        // EAGAIN just means the counter was already drained (nonblocking fd).
+        if err.raw_os_error() != Some(libc::EAGAIN) {
+            log::warn!("net io loop: wake eventfd drain failed: {err}");
+        }
+    }
 }
 
 #[cfg(test)]

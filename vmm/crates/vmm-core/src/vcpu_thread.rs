@@ -349,8 +349,21 @@ impl VcpuThread {
     /// guest.
     pub fn wait_resumed(&self) {
         let start = std::time::Instant::now();
+        let mut next_probe = std::time::Duration::from_micros(200);
         while self.paused.load(Ordering::Relaxed) && !self.exited.load(Ordering::Relaxed) {
-            if start.elapsed() < std::time::Duration::from_micros(100) {
+            let elapsed = start.elapsed();
+            if elapsed >= next_probe {
+                // Same failure mode as pause(): a signal-terminated vCPU
+                // thread never clears `paused` (VcpuExitGuard doesn't run on
+                // SIGSYS), so probe liveness instead of spinning forever.
+                if !self.vcpu_alive() {
+                    log::warn!("vCPU thread is gone; aborting wait_resumed");
+                    self.exited.store(true, Ordering::Relaxed);
+                    return;
+                }
+                next_probe += std::time::Duration::from_micros(200);
+            }
+            if elapsed < std::time::Duration::from_micros(100) {
                 std::hint::spin_loop();
             } else {
                 thread::sleep(std::time::Duration::from_micros(10));

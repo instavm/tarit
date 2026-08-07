@@ -362,13 +362,20 @@ fn live_snapshot_captures_device_dma() {
     );
     let snap_path = result.snapshot_path.clone();
 
-    // Ground truth: the source guest's own (cached) view of the range.
-    guest_stdout(
+    // Ground truth: the source guest's own (cached) view of the range. The
+    // wait must observe witness-done — if the witness DMA never ran, the
+    // restored guest's read would silently fall back to disk and mask a
+    // staleness bug as a passing digest match.
+    let witness_sync = guest_stdout(
         &controller,
         &format!(
             "bash -c 'for i in $(seq 50); do [ -f {GUEST_RAM_DIR}/witness-done ] && break; \
-             sleep 0.1; done; echo synced'"
+             sleep 0.1; done; [ -f {GUEST_RAM_DIR}/witness-done ] && echo synced || echo missing'"
         ),
+    );
+    assert!(
+        witness_sync.contains("synced"),
+        "witness DMA never completed in the source guest: {witness_sync}"
     );
     let source_digest = guest_stdout(
         &controller,
