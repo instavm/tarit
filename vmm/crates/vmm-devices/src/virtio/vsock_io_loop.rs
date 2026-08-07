@@ -21,9 +21,14 @@ use vmm_sys_util::eventfd::EventFd;
 
 const POLL_TIMEOUT_MS: libc::c_int = 250;
 
+/// How long the paused pump sleeps between checks of the pause flag.
+const PAUSE_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+
 /// Handle for the vsock pump thread. Dropping it stops + joins the thread.
 pub struct VsockPump {
     stop: Arc<AtomicBool>,
+    pause_req: Arc<AtomicBool>,
+    pause_ack: Arc<AtomicBool>,
     wake_evt: EventFd,
     handle: Option<JoinHandle<()>>,
     pub device: Arc<VirtioVsockMmio>,
@@ -36,10 +41,41 @@ impl VsockPump {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Unblock a paused or polling pump so it observes stop promptly.
+        self.pause_req.store(false, Ordering::SeqCst);
         let _ = self.wake_evt.write(1);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+
+    /// Pause the pump and wait until it acknowledges: after this returns, the
+    /// thread is parked and will not touch guest memory until
+    /// [`Self::resume`]. Callers pause this thread *before* pausing the vCPU,
+    /// so the handshake latency here never contributes to guest downtime.
+    pub fn pause(&self) {
+        if self.thread_gone() {
+            return;
+        }
+        self.pause_req.store(true, Ordering::SeqCst);
+        let _ = self.wake_evt.write(1);
+        while !self.pause_ack.load(Ordering::SeqCst) {
+            if self.thread_gone() {
+                return;
+            }
+            std::thread::sleep(PAUSE_POLL);
+        }
+    }
+
+    /// Release a pause. Does not wait: the thread re-enters its poll loop on
+    /// its own within [`PAUSE_POLL`].
+    pub fn resume(&self) {
+        self.pause_req.store(false, Ordering::SeqCst);
+    }
+
+    /// A finished thread writes no guest memory, so it counts as paused.
+    fn thread_gone(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
 }
 
@@ -54,7 +90,11 @@ impl Drop for VsockPump {
 /// of trapping into the vCPU thread.
 pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::Result<VsockPump> {
     let stop = Arc::new(AtomicBool::new(false));
+    let pause_req = Arc::new(AtomicBool::new(false));
+    let pause_ack = Arc::new(AtomicBool::new(false));
     let stop_t = stop.clone();
+    let pause_req_t = pause_req.clone();
+    let pause_ack_t = pause_ack.clone();
     let device_t = device.clone();
     let wake_evt = EventFd::new(libc::EFD_NONBLOCK)?;
     let wake_fd = wake_evt.as_raw_fd();
@@ -62,24 +102,45 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
     let handle = std::thread::Builder::new()
         .name("virtio-vsock-pump".into())
         .spawn(move || {
-            run(stop_t, device_t, tx_kick_fd, wake_fd);
+            run(stop_t, pause_req_t, pause_ack_t, device_t, tx_kick_fd, wake_fd);
         })?;
 
     Ok(VsockPump {
         stop,
+        pause_req,
+        pause_ack,
         wake_evt,
         handle: Some(handle),
         device,
     })
 }
 
-fn run(stop: Arc<AtomicBool>, device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd, wake_fd: RawFd) {
+fn run(
+    stop: Arc<AtomicBool>,
+    pause_req: Arc<AtomicBool>,
+    pause_ack: Arc<AtomicBool>,
+    device: Arc<VirtioVsockMmio>,
+    tx_kick_fd: RawFd,
+    wake_fd: RawFd,
+) {
     if let Err(e) = vmm_jailer::seccomp::SeccompProfile::vsock().install() {
         log::error!("vsock pump: seccomp install failed; refusing guest I/O: {e}");
         return;
     }
 
     while !stop.load(Ordering::Relaxed) {
+        // Pause request: acknowledge and park. While parked this thread
+        // performs no guest-memory writes — the live snapshot's final stop
+        // relies on that to keep the memory image and device state coherent.
+        if pause_req.load(Ordering::SeqCst) {
+            pause_ack.store(true, Ordering::SeqCst);
+            while pause_req.load(Ordering::SeqCst) && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(PAUSE_POLL);
+            }
+            pause_ack.store(false, Ordering::SeqCst);
+            continue;
+        }
+
         let mut pfds = [
             libc::pollfd {
                 fd: tx_kick_fd,
