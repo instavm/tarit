@@ -867,11 +867,35 @@ impl VmmController {
         // the final vCPU pause, which is what makes the state blob coherent
         // with the memory image (a blob captured before the loop would carry
         // boot-time registers against post-boot memory).
+        //
+        // `quiesce` parks the VMM threads that DMA into guest memory (net I/O
+        // loops, vsock pump) for the final stop, so no page can go stale
+        // between the residual copy and the device-state capture. Virtio-blk
+        // needs no entry here: its QUEUE_NOTIFY traps to the vCPU thread, so
+        // pausing the vCPU already quiesces it.
+        let quiesce = |pause: bool| {
+            if pause {
+                for io_loop in &running.net_io_loops {
+                    io_loop.pause();
+                }
+                if let Some(pump) = running.vsock_pump.as_ref() {
+                    pump.pause();
+                }
+            } else {
+                for io_loop in &running.net_io_loops {
+                    io_loop.resume();
+                }
+                if let Some(pump) = running.vsock_pump.as_ref() {
+                    pump.resume();
+                }
+            }
+        };
         let snap_result = crate::live_snapshot::live_snapshot(
             &running.kvm_vm,
             &mem,
             &running.vcpu_thread,
             &snapshot_config,
+            &quiesce,
             || {
                 Ok(capture_live_state_blob(&running, &base_blob)
                     .unwrap_or_else(|| base_blob.clone()))
@@ -954,6 +978,19 @@ impl VmmController {
             result.elapsed
         );
         Ok(result)
+    }
+
+    /// API-facing live snapshot: run with the default config and return the
+    /// on-disk snapshot path, mirroring what `snapshot()` returns.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn live_snapshot_to_path(&self) -> Result<String> {
+        self.live_snapshot(crate::live_snapshot::LiveSnapshotConfig::default())
+            .map(|result| result.snapshot_path)
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn live_snapshot_to_path(&self) -> Result<String> {
+        Err(VmmError::Kvm("live snapshot needs Linux+KVM+boot".into()))
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
