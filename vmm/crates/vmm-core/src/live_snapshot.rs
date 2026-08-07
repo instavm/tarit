@@ -62,6 +62,39 @@ impl Drop for VcpuPauseGuard<'_> {
     }
 }
 
+/// RAII guard around the caller's I/O quiesce hook: engaging it parks every
+/// VMM thread that writes guest memory (net/vsock pumps); disengaging (or
+/// dropping, on error paths) releases them.
+struct IoQuiesceGuard<'a> {
+    quiesce: &'a dyn Fn(bool),
+    armed: bool,
+}
+
+impl<'a> IoQuiesceGuard<'a> {
+    fn engage(quiesce: &'a dyn Fn(bool)) -> Self {
+        quiesce(true);
+        Self {
+            quiesce,
+            armed: true,
+        }
+    }
+
+    fn disengage(mut self) {
+        if self.armed {
+            (self.quiesce)(false);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for IoQuiesceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            (self.quiesce)(false);
+        }
+    }
+}
+
 /// Configuration for a live snapshot.
 #[derive(Debug, Clone)]
 pub struct LiveSnapshotConfig {
@@ -76,7 +109,7 @@ pub struct LiveSnapshotConfig {
 impl Default for LiveSnapshotConfig {
     fn default() -> Self {
         Self {
-            target_downtime_us: 5_000, // 5ms
+            target_downtime_us: 500, // 0.5ms — the pause must stay imperceptible
             max_rounds: 20,
             timeout_secs: 30,
         }
@@ -188,8 +221,18 @@ fn dirty_rate_sample(bytes: u64, elapsed: Duration) -> u64 {
 /// 1. Pause the vCPU, enable dirty logging, clear the baseline, resume.
 /// 2. Bulk round: copy all of guest RAM while the vCPU runs.
 /// 3. Pre-copy rounds: read the dirty log, copy those pages, check convergence.
-/// 4. Final stop: pause, copy the residual dirty pages, capture vCPU + device
-///    state via `capture_state`, resume.
+/// 4. Final stop: quiesce device I/O threads, pause the vCPU, copy the residual
+///    dirty pages, capture vCPU + device state via `capture_state`, resume.
+///
+/// Dirty pages come from two sources, and both are consulted every round:
+/// KVM's dirty log (guest vCPU writes) and the software host-dirty tracker
+/// (virtio DMA — used rings, blk/net/vsock payloads — written by VMM threads,
+/// which KVM's log cannot see).
+///
+/// `quiesce_io(true)` must park every non-vCPU thread that writes guest
+/// memory and only return once they have acknowledged; `quiesce_io(false)`
+/// releases them. It is engaged *before* the final vCPU pause — its
+/// handshake costs guest I/O stall, never guest downtime.
 ///
 /// `capture_state` runs while the vCPU is paused for the final stop, so the
 /// state blob it returns is coherent with the memory image.
@@ -198,6 +241,7 @@ pub fn live_snapshot<F>(
     mem: &GuestMemory,
     vcpu_thread: &VcpuThread,
     config: &LiveSnapshotConfig,
+    quiesce_io: &dyn Fn(bool),
     capture_state: F,
 ) -> Result<LiveSnapshotOutput>
 where
@@ -234,6 +278,11 @@ where
                 return Err(e);
             }
         }
+        // Also drain the host-dirty (device DMA) baseline. The bulk copy below
+        // captures these pages anyway; draining them here just keeps them out
+        // of the first round's residual. They still flow into `consumed_dirty`
+        // so the controller replays them for later diff snapshots.
+        consumed_dirty.merge(&mem.drain_host_dirty());
         pause_guard.resume();
     }
     // The dirty set accumulates from here, so the first round's dirty rate must
@@ -281,7 +330,12 @@ where
 
         std::thread::sleep(ROUND_IDLE_SLEEP);
 
-        let dirty = kvm_vm.read_dirty()?;
+        // A round's dirty set is the union of vCPU writes (KVM's log) and
+        // device DMA writes (the software host-dirty tracker). Missing the
+        // latter is what used to leave used rings and DMA'd payloads stale
+        // in the image.
+        let mut dirty = kvm_vm.read_dirty()?;
+        dirty.merge(&mem.drain_host_dirty());
         let since_last_read = last_read.elapsed();
         last_read = Instant::now();
         consumed_dirty.merge(&dirty);
@@ -326,13 +380,27 @@ where
         }
     }
 
-    // Step 4: final stop — pause, copy the residual dirty set, capture state.
-    // On any error below, `final_pause_guard` resumes the vCPU as it drops.
-    log::info!("live_snapshot: final stop — pausing vCPU");
-    let final_pause_guard = VcpuPauseGuard::pause(vcpu_thread);
+    // Step 4: final stop. Order matters for the "no noticeable pause" goal:
+    //
+    //   1. Quiesce the device I/O threads (net/vsock pumps) while the guest
+    //      is still running — their ack handshake stalls guest I/O briefly
+    //      but adds zero guest downtime.
+    //   2. Pause the vCPU. In-flight MMIO (including virtio-blk DMA, which
+    //      runs on the vCPU thread) completes before the pause is acked, so
+    //      after this point nothing writes guest memory.
+    //   3. Inside the pause do only O(residual) work: read both dirty
+    //      sources, copy the residual pages, capture state.
+    //
+    // On any error below, the guards resume the vCPU and I/O threads as they
+    // drop. Downtime is measured across the whole pause — including the
+    // pause/resume handshakes — because that is the blackout the guest sees.
+    log::info!("live_snapshot: final stop — quiescing I/O, pausing vCPU");
+    let io_guard = IoQuiesceGuard::engage(quiesce_io);
     let final_stop_start = Instant::now();
+    let final_pause_guard = VcpuPauseGuard::pause(vcpu_thread);
 
-    let final_dirty = kvm_vm.read_dirty()?;
+    let mut final_dirty = kvm_vm.read_dirty()?;
+    final_dirty.merge(&mem.drain_host_dirty());
     let final_dirty_pages = final_dirty.len() as u64;
     consumed_dirty.merge(&final_dirty);
     total_pages_copied += copy_dirty_pages(mem, &mut dest, &final_dirty);
@@ -340,8 +408,13 @@ where
     // coherent with the memory image assembled above.
     let state_blob = capture_state()?;
 
-    let downtime = final_stop_start.elapsed();
     final_pause_guard.resume();
+    // `resume()` only requests the resume; wait for the vCPU to actually
+    // leave its park before stopping the clock so the reported downtime is
+    // the blackout the guest really saw.
+    vcpu_thread.wait_resumed();
+    let downtime = final_stop_start.elapsed();
+    io_guard.disengage();
     log::info!("live_snapshot: final stop took {downtime:?}, residual {final_dirty_pages} pages");
 
     let elapsed = start.elapsed();
@@ -374,7 +447,7 @@ mod tests {
     #[test]
     fn live_snapshot_config_default() {
         let c = LiveSnapshotConfig::default();
-        assert_eq!(c.target_downtime_us, 5_000);
+        assert_eq!(c.target_downtime_us, 500);
         assert_eq!(c.max_rounds, 20);
         assert_eq!(c.timeout_secs, 30);
     }

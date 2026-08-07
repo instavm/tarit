@@ -12,16 +12,24 @@
 
 use crate::virtio::net_transport::VirtioNetMmio;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use vmm_sys_util::eventfd::EventFd;
 
 const MAX_FRAME: usize = 1600;
+
+/// How long the paused loop sleeps between checks of the pause flag. Guest
+/// I/O is stalled (not lost) while paused; the vCPU keeps running.
+const PAUSE_POLL: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// Handle returned by [`spawn_net_io_loop`]. Dropping it stops the thread.
 pub struct NetIoLoop {
     stop: Arc<AtomicBool>,
+    pause_req: Arc<AtomicBool>,
+    pause_ack: Arc<AtomicBool>,
+    wake_evt: EventFd,
     handle: Option<JoinHandle<()>>,
     /// Caller may inspect packet counts via the device after stop.
     pub device: Arc<VirtioNetMmio>,
@@ -30,9 +38,41 @@ pub struct NetIoLoop {
 impl NetIoLoop {
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Unblock a paused or epoll-waiting loop so it observes stop promptly.
+        self.pause_req.store(false, Ordering::SeqCst);
+        let _ = self.wake_evt.write(1);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+
+    /// Pause the I/O thread and wait until it acknowledges: after this
+    /// returns, the thread is parked and will not touch guest memory until
+    /// [`Self::resume`]. Callers pause this thread *before* pausing the vCPU,
+    /// so the handshake latency here never contributes to guest downtime.
+    pub fn pause(&self) {
+        if self.thread_gone() {
+            return;
+        }
+        self.pause_req.store(true, Ordering::SeqCst);
+        let _ = self.wake_evt.write(1);
+        while !self.pause_ack.load(Ordering::SeqCst) {
+            if self.thread_gone() {
+                return;
+            }
+            std::thread::sleep(PAUSE_POLL);
+        }
+    }
+
+    /// Release a pause. Does not wait: the thread re-enters its poll loop on
+    /// its own within [`PAUSE_POLL`].
+    pub fn resume(&self) {
+        self.pause_req.store(false, Ordering::SeqCst);
+    }
+
+    /// A finished thread writes no guest memory, so it counts as paused.
+    fn thread_gone(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
 }
 
@@ -52,23 +92,48 @@ pub fn spawn_net_io_loop(
     tx_kick_fd: RawFd,
 ) -> io::Result<NetIoLoop> {
     let stop = Arc::new(AtomicBool::new(false));
+    let pause_req = Arc::new(AtomicBool::new(false));
+    let pause_ack = Arc::new(AtomicBool::new(false));
+    let wake_evt = EventFd::new(libc::EFD_NONBLOCK)?;
     let stop_t = stop.clone();
+    let pause_req_t = pause_req.clone();
+    let pause_ack_t = pause_ack.clone();
+    let wake_fd = wake_evt.as_raw_fd();
     let device_t = device.clone();
 
     let handle = std::thread::Builder::new()
         .name("virtio-net-io".into())
         .spawn(move || {
-            run(stop_t, device_t, tap_fd, tx_kick_fd);
+            run(
+                stop_t,
+                pause_req_t,
+                pause_ack_t,
+                device_t,
+                tap_fd,
+                tx_kick_fd,
+                wake_fd,
+            );
         })?;
 
     Ok(NetIoLoop {
         stop,
+        pause_req,
+        pause_ack,
+        wake_evt,
         handle: Some(handle),
         device,
     })
 }
 
-fn run(stop: Arc<AtomicBool>, device: Arc<VirtioNetMmio>, tap_fd: RawFd, tx_kick_fd: RawFd) {
+fn run(
+    stop: Arc<AtomicBool>,
+    pause_req: Arc<AtomicBool>,
+    pause_ack: Arc<AtomicBool>,
+    device: Arc<VirtioNetMmio>,
+    tap_fd: RawFd,
+    tx_kick_fd: RawFd,
+    wake_fd: RawFd,
+) {
     // SAFETY: epoll_create1 has no pointer arguments; flags are a valid libc
     // constant, and errors are handled from the returned fd.
     let ep = match unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) } {
@@ -110,6 +175,13 @@ fn run(stop: Arc<AtomicBool>, device: Arc<VirtioNetMmio>, tap_fd: RawFd, tx_kick
         unsafe { libc::close(ep) };
         return;
     }
+    if let Err(e) = add(wake_fd, 3) {
+        log::error!("net_io_loop: epoll add wake: {e}");
+        // SAFETY: `ep` is the fd returned by epoll_create1 above and is owned
+        // by this function on this error path.
+        unsafe { libc::close(ep) };
+        return;
+    }
 
     if let Err(e) = vmm_jailer::seccomp::SeccompProfile::device().install() {
         log::error!("net_io_loop: seccomp install failed; refusing guest I/O: {e}");
@@ -123,6 +195,18 @@ fn run(stop: Arc<AtomicBool>, device: Arc<VirtioNetMmio>, tap_fd: RawFd, tx_kick
     let mut buf = [0u8; MAX_FRAME];
 
     while !stop.load(Ordering::Relaxed) {
+        // Pause request: acknowledge and park. While parked this thread
+        // performs no guest-memory writes — the live snapshot's final stop
+        // relies on that to keep the memory image and device state coherent.
+        if pause_req.load(Ordering::SeqCst) {
+            pause_ack.store(true, Ordering::SeqCst);
+            while pause_req.load(Ordering::SeqCst) && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(PAUSE_POLL);
+            }
+            pause_ack.store(false, Ordering::SeqCst);
+            continue;
+        }
+
         // 100 ms timeout so we can observe the stop flag promptly.
         // SAFETY: `events` is a valid writable array, and the maxevents value
         // matches its length. Errors are handled from the return value.
@@ -139,6 +223,7 @@ fn run(stop: Arc<AtomicBool>, device: Arc<VirtioNetMmio>, tap_fd: RawFd, tx_kick
             match ev.u64 {
                 1 => drain_tap(tap_fd, &device, &mut buf),
                 2 => drain_kick(tx_kick_fd, &device),
+                3 => drain_wake(wake_fd),
                 _ => {}
             }
         }
@@ -203,6 +288,28 @@ fn drain_kick(tx_kick_fd: RawFd, device: &Arc<VirtioNetMmio>) {
         }
     }
     device.process_tx_queue();
+}
+
+/// Consume the wake EventFd counter. The wake exists only to interrupt
+/// `epoll_wait` for pause/stop requests; the payload is meaningless.
+fn drain_wake(wake_fd: RawFd) {
+    let mut counter = [0u8; 8];
+    // SAFETY: `counter` is a valid writable 8-byte eventfd counter buffer;
+    // read reports invalid fds via its return value.
+    let n = unsafe {
+        libc::read(
+            wake_fd,
+            counter.as_mut_ptr() as *mut libc::c_void,
+            counter.len(),
+        )
+    };
+    if n < 0 {
+        let err = std::io::Error::last_os_error();
+        // EAGAIN just means the counter was already drained (nonblocking fd).
+        if err.raw_os_error() != Some(libc::EAGAIN) {
+            log::warn!("net io loop: wake eventfd drain failed: {err}");
+        }
+    }
 }
 
 #[cfg(test)]

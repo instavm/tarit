@@ -166,11 +166,24 @@ impl VcpuThread {
                         }
                         paus.store(true, Ordering::Relaxed);
                         log::info!("vCPU thread pausing");
-                        // Spin-wait for control to clear (resume) or for stop.
+                        // Wait for control to clear (resume) or for stop.
+                        // Adaptive backoff: a live-snapshot final stop resumes
+                        // within microseconds, so spin briefly and poll at µs
+                        // granularity first — a coarse sleep here would become
+                        // guest downtime. Long pauses (suspend, full snapshot)
+                        // back off to 10ms ticks after the first 5ms.
+                        let park_start = std::time::Instant::now();
                         while ctrl.load(Ordering::Relaxed)
                             && !stop_for_thread.load(Ordering::Relaxed)
                         {
-                            thread::sleep(std::time::Duration::from_millis(10));
+                            let parked = park_start.elapsed();
+                            if parked < std::time::Duration::from_micros(200) {
+                                std::hint::spin_loop();
+                            } else if parked < std::time::Duration::from_millis(5) {
+                                thread::sleep(std::time::Duration::from_micros(10));
+                            } else {
+                                thread::sleep(std::time::Duration::from_millis(10));
+                            }
                         }
                         if stop_for_thread.load(Ordering::Relaxed) {
                             log::info!("vCPU thread stopping (from pause)");
@@ -286,32 +299,76 @@ impl VcpuThread {
 
     /// Request the vCPU to pause. Blocks until the vCPU is actually paused
     /// — or returns immediately if the run loop has already exited.
+    ///
+    /// The wait is µs-granular: live snapshots measure their guest blackout
+    /// across this handshake, so a coarse poll here would put a floor under
+    /// the achievable downtime. Spin first, then sleep in 10µs steps, and
+    /// re-kick/liveness-probe the vCPU only every ~200µs.
     pub fn pause(&self) {
         if self.exited.load(Ordering::Relaxed) {
             return;
         }
         self.control.store(true, Ordering::Relaxed);
-        // Poke the vCPU thread until it pauses. The kick is re-sent every
-        // tick because KVM may re-enter the guest before we observe `paused`.
+        self.signal_vcpu();
+        let start = std::time::Instant::now();
+        let mut next_kick = std::time::Duration::from_micros(200);
         while !self.paused.load(Ordering::Relaxed) && !self.exited.load(Ordering::Relaxed) {
-            // If the vCPU thread died abruptly (a seccomp SIGSYS terminates it
-            // without running the exit guard), it can never set paused/exited.
-            // A zero-signal liveness probe lets pause() — and therefore
-            // snapshot()/stop() — abort instead of spinning forever.
-            if !self.vcpu_alive() {
-                log::warn!("vCPU thread is gone; aborting pause (guest already dead)");
-                self.exited.store(true, Ordering::Relaxed);
-                self.paused.store(true, Ordering::Relaxed);
-                return;
+            let elapsed = start.elapsed();
+            if elapsed >= next_kick {
+                // If the vCPU thread died abruptly (a seccomp SIGSYS terminates
+                // it without running the exit guard), it can never set
+                // paused/exited. A zero-signal liveness probe lets pause() —
+                // and therefore snapshot()/stop() — abort instead of spinning
+                // forever. The kick is re-sent because KVM may re-enter the
+                // guest before we observe `paused`.
+                if !self.vcpu_alive() {
+                    log::warn!("vCPU thread is gone; aborting pause (guest already dead)");
+                    self.exited.store(true, Ordering::Relaxed);
+                    self.paused.store(true, Ordering::Relaxed);
+                    return;
+                }
+                self.signal_vcpu();
+                next_kick += std::time::Duration::from_micros(200);
             }
-            self.signal_vcpu();
-            thread::sleep(std::time::Duration::from_millis(1));
+            if elapsed < std::time::Duration::from_micros(100) {
+                std::hint::spin_loop();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(10));
+            }
         }
     }
 
     /// Resume the vCPU from a pause.
     pub fn resume(&self) {
         self.control.store(false, Ordering::Relaxed);
+    }
+
+    /// Block until the vCPU thread has left its pause park (or exited). Used
+    /// by callers that measure guest blackout: `resume()` only requests the
+    /// resume, this observes the vCPU actually committing to re-enter the
+    /// guest.
+    pub fn wait_resumed(&self) {
+        let start = std::time::Instant::now();
+        let mut next_probe = std::time::Duration::from_micros(200);
+        while self.paused.load(Ordering::Relaxed) && !self.exited.load(Ordering::Relaxed) {
+            let elapsed = start.elapsed();
+            if elapsed >= next_probe {
+                // Same failure mode as pause(): a signal-terminated vCPU
+                // thread never clears `paused` (VcpuExitGuard doesn't run on
+                // SIGSYS), so probe liveness instead of spinning forever.
+                if !self.vcpu_alive() {
+                    log::warn!("vCPU thread is gone; aborting wait_resumed");
+                    self.exited.store(true, Ordering::Relaxed);
+                    return;
+                }
+                next_probe += std::time::Duration::from_micros(200);
+            }
+            if elapsed < std::time::Duration::from_micros(100) {
+                std::hint::spin_loop();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(10));
+            }
+        }
     }
 
     /// Stop the vCPU permanently (joins the thread).

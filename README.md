@@ -109,14 +109,23 @@ guest RAM; resume brings it back. Restore boots a fresh VMM from a snapshot.
 ```sh
 sudo vmm --socket /tmp/vm.sock snapshot              # full snapshot, prints the .snap path
 sudo vmm --socket /tmp/vm.sock snapshot --diff       # incremental (dirty pages only)
+sudo vmm --socket /tmp/vm.sock snapshot --live       # live: guest keeps running
 sudo vmm --socket /tmp/vm.sock suspend               # release resident guest RAM
 sudo vmm --socket /tmp/vm.sock resume
 sudo vmm restore --snapshot /path/to.snap            # restore into a new VMM process
 ```
 
-Tarit also does **live snapshots**: a memory-consistent snapshot of a running
-guest with a brief final vCPU pause while remaining dirty pages are copied.
-Orchestrated full snapshots similarly use a disk-consistency pause. They use
+Tarit also does **live snapshots** (`snapshot --live`): pre-copy rounds run
+while the guest executes, then a final stop copies only the residual dirty
+pages and captures vCPU + device state. The final stop targets sub-millisecond
+downtime (500µs by default); dirty pages are tracked from both KVM's dirty log
+(vCPU writes) and a software tracker covering virtio DMA, and device I/O
+threads are quiesced for the final stop so the image stays coherent. One
+caveat: a guest that dirties memory faster than it can be copied never
+converges, so after a bounded number of rounds (or timeout) the snapshot
+forces the final stop and downtime grows with the residual — the reported
+`downtime` in the result is always the real measured blackout. Orchestrated
+full snapshots similarly use a disk-consistency pause. They use
 FICLONE/reflink when available; the correctness-preserving sparse-copy
 fallback is not a low-latency path, so production latency gates require
 reflink-capable storage. See

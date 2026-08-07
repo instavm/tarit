@@ -190,12 +190,23 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 msg: format!("{e}"),
             },
         },
-        ApiRequest::Snapshot { diff } => match controller.snapshot(diff) {
-            Ok(path) => ApiResponse::Snapshot { path },
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
-        },
+        ApiRequest::Snapshot { diff, live } => {
+            let result = if live && diff {
+                Err(vmm_core::error::VmmError::Snapshot(
+                    "live diff snapshots are not supported".into(),
+                ))
+            } else if live {
+                controller.live_snapshot_to_path()
+            } else {
+                controller.snapshot(diff)
+            };
+            match result {
+                Ok(path) => ApiResponse::Snapshot { path },
+                Err(e) => ApiResponse::Err {
+                    msg: format!("{e}"),
+                },
+            }
+        }
         ApiRequest::ReleaseScratch { path, identity } => {
             match controller.release_scratch(&path, identity) {
                 Ok(()) => ApiResponse::Ok,
