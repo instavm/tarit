@@ -10,6 +10,30 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-07
+
+### Added
+
+- `vmm snapshot --live` on the CLI and a wire-compatible `live` flag on the
+  snapshot API request, exposing live snapshots of a running guest.
+- Integration test that verifies pages written by device DMA during a live
+  snapshot survive restore byte-for-byte.
+
+### Changed
+
+- Live snapshot final stop targets sub-millisecond downtime (500µs default,
+  measured at 92–279µs on c8i): pause/park polling is now µs-granular, device
+  I/O quiesce happens before the vCPU pause, and the reported downtime spans
+  the entire guest-visible blackout including both handshakes.
+
+### Fixed
+
+- Live snapshots no longer capture stale device-DMA pages: the software
+  host-dirty tracker (virtio used rings, blk/net/vsock payloads — invisible
+  to KVM's dirty log) is merged into every pre-copy round and the final stop.
+- Net and vsock I/O pump threads are parked during the live snapshot final
+  stop, so no VMM thread writes guest memory while the residual is copied.
+
 ## [0.1.1] - 2026-07-27
 
 ### Added

@@ -2946,7 +2946,7 @@ dependencies = [
 
 [[package]]
 name = "tarit-bench"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "tarit-fleet"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "deadpool-postgres",
@@ -2981,7 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "tarit-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "tarit-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "tarit-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "chrono",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "tarit-vmm-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "serde",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "taritd"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",

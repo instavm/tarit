@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acpi_tables"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "displaydoc",
  "thiserror 1.0.69",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "tarit-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -834,7 +834,7 @@ checksum = "69c376a9b84afdf97bddd2628096cf3554208b2a676cf06b4532e0f433a54e02"
 
 [[package]]
 name = "vmm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "log",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "acpi_tables",
  "anyhow",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-devices"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "event-manager",
  "libc",
@@ -921,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-integration"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "env_logger 0.10.2",
  "kvm-bindings",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-jailer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "log",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-loader"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "linux-loader",
  "log",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-memory-backend"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-migration"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "log",
  "serde",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "libc",
  "log",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "vmm-snapshot"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crc32fast",
  "log",
