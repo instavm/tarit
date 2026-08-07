@@ -102,7 +102,14 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
     let handle = std::thread::Builder::new()
         .name("virtio-vsock-pump".into())
         .spawn(move || {
-            run(stop_t, pause_req_t, pause_ack_t, device_t, tx_kick_fd, wake_fd);
+            run(
+                stop_t,
+                pause_req_t,
+                pause_ack_t,
+                device_t,
+                tx_kick_fd,
+                wake_fd,
+            );
         })?;
 
     Ok(VsockPump {
