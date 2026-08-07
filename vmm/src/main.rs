@@ -342,6 +342,11 @@ enum Cmd {
         /// Create a diff (incremental) snapshot.
         #[arg(long)]
         diff: bool,
+
+        /// Take a live (pre-copy) snapshot: the guest keeps running and only
+        /// blacks out for a sub-millisecond final stop.
+        #[arg(long, conflicts_with = "diff")]
+        live: bool,
     },
 
     /// Execute a command in the guest VM (via the API).
@@ -507,7 +512,7 @@ fn main() -> Result<()> {
             netns,
             cgroup,
         } => serve(&cli.socket, jail, uid, gid, netns, cgroup),
-        Cmd::Snapshot { diff } => api_snapshot(&cli.socket, diff),
+        Cmd::Snapshot { diff, live } => api_snapshot(&cli.socket, diff, live),
         Cmd::Create {
             kernel,
             cmdline,
@@ -1077,8 +1082,8 @@ fn apply_serve_cgroup(
     Ok(())
 }
 
-fn api_snapshot(socket: &str, diff: bool) -> Result<()> {
-    let request = vmm_api::types::ApiRequest::Snapshot { diff };
+fn api_snapshot(socket: &str, diff: bool, live: bool) -> Result<()> {
+    let request = vmm_api::types::ApiRequest::Snapshot { diff, live };
     let body = serde_json::to_vec(&request)?;
     let response = send_raw(socket, &body)?;
     let response: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;

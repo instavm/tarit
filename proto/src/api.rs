@@ -41,6 +41,11 @@ pub enum ApiRequest {
     Resume,
     Snapshot {
         diff: bool,
+        /// Take a live (pre-copy) snapshot: the guest keeps running and only
+        /// blacks out for a sub-millisecond final stop. Defaults to false so
+        /// older clients' requests still parse.
+        #[serde(default)]
+        live: bool,
     },
     /// Transfer one exact VMM-owned scratch file to the caller.
     ReleaseScratch {
@@ -241,10 +246,31 @@ mod tests {
 
     #[test]
     fn request_snapshot_round_trips_with_diff_flag() {
-        let r = ApiRequest::Snapshot { diff: true };
+        let r = ApiRequest::Snapshot {
+            diff: true,
+            live: false,
+        };
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, ApiRequest::Snapshot { diff } if diff));
+        assert!(matches!(back, ApiRequest::Snapshot { diff, live } if diff && !live));
+    }
+
+    #[test]
+    fn request_snapshot_live_round_trips() {
+        let r = ApiRequest::Snapshot {
+            diff: false,
+            live: true,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: ApiRequest = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, ApiRequest::Snapshot { diff, live } if !diff && live));
+    }
+
+    #[test]
+    fn request_snapshot_without_live_field_still_parses() {
+        // Wire compat: requests from clients predating the `live` flag.
+        let back: ApiRequest = serde_json::from_str(r#"{"op":"snapshot","diff":true}"#).unwrap();
+        assert!(matches!(back, ApiRequest::Snapshot { diff, live } if diff && !live));
     }
 
     #[test]

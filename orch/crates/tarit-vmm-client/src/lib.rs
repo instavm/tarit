@@ -477,7 +477,7 @@ impl VmmClient {
     /// Callers that need to transfer the artifact must capture its identity and
     /// explicitly call `release_scratch` only after they hold local ownership.
     pub fn snapshot_unreleased(&self, diff: bool) -> Result<String, VmmError> {
-        match self.request_ok(&ApiRequest::Snapshot { diff })? {
+        match self.request_ok(&ApiRequest::Snapshot { diff, live: false })? {
             ApiResponse::Snapshot { path } => Ok(path),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
