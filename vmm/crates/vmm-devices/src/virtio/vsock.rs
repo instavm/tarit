@@ -312,6 +312,29 @@ pub struct VirtioVsockMmio {
 }
 
 impl VirtioVsockMmio {
+    fn fail_device(&self, context: &str) {
+        log::error!("virtio-vsock: {context}");
+        self.status.fetch_or(
+            status_bits::DEVICE_NEEDS_RESET | status_bits::FAILED,
+            Ordering::SeqCst,
+        );
+        self.activated.store(false, Ordering::SeqCst);
+    }
+
+    fn lock_state<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> std::sync::MutexGuard<'a, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.fail_device(&format!("poisoned {name} lock"));
+                poisoned.into_inner()
+            }
+        }
+    }
+
     pub fn new(irq: u32, guest_cid: u64) -> Self {
         Self {
             irq,
@@ -356,21 +379,19 @@ impl VirtioVsockMmio {
     }
 
     pub fn set_guest_memory(&self, mem: Arc<GuestMemoryMmap>) {
-        *self.guest_mem.lock().unwrap() = Some(mem);
+        *self.lock_state(&self.guest_mem, "guest_mem") = Some(mem);
     }
 
     pub fn set_guest_dirty_tracker(&self, dirty: SoftwareDirtyBitmap) {
-        *self.host_dirty.lock().unwrap() = Some(dirty);
+        *self.lock_state(&self.host_dirty, "host_dirty") = Some(dirty);
     }
 
     pub fn set_host_listener(&self, listener: Arc<dyn HostVsockListener>) {
-        *self.host_listener.lock().unwrap() = Some(listener);
+        *self.lock_state(&self.host_listener, "host_listener") = Some(listener);
     }
 
     pub fn active_connection_states(&self) -> Vec<VsockConnectionState> {
-        self.connections
-            .lock()
-            .unwrap()
+        self.lock_state(&self.connections, "connections")
             .iter()
             .map(|(key, conn)| VsockConnectionState {
                 guest_cid: key.guest_cid,
@@ -383,7 +404,7 @@ impl VirtioVsockMmio {
 
     #[cfg(unix)]
     pub fn connect_guest_stream(&self, guest_port: u32) -> io::Result<UnixStream> {
-        if self.connections.lock().unwrap().len() >= MAX_CONNECTIONS {
+        if self.lock_state(&self.connections, "connections").len() >= MAX_CONNECTIONS {
             return Err(connection_cap_error());
         }
 
@@ -392,7 +413,7 @@ impl VirtioVsockMmio {
         device_stream.set_nonblocking(true)?;
 
         let (_key, host_port) = {
-            let mut connections = self.connections.lock().unwrap();
+            let mut connections = self.lock_state(&self.connections, "connections");
             if connections.len() >= MAX_CONNECTIONS {
                 return Err(connection_cap_error());
             }
@@ -462,7 +483,7 @@ impl VirtioVsockMmio {
         }
 
         {
-            let mut live = self.connections.lock().unwrap();
+            let mut live = self.lock_state(&self.connections, "connections");
             for conn in connections {
                 live.remove(&conn.key());
             }
@@ -491,20 +512,20 @@ impl VirtioVsockMmio {
 
     #[cfg(target_os = "linux")]
     pub fn set_irq_evt(&self, evt: vmm_sys_util::eventfd::EventFd) {
-        *self.irq_evt.lock().unwrap() = Some(evt);
+        *self.lock_state(&self.irq_evt, "irq_evt") = Some(evt);
     }
 
     fn trigger_interrupt(&self) {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
         #[cfg(target_os = "linux")]
-        if let Some(evt) = self.irq_evt.lock().unwrap().as_ref() {
+        if let Some(evt) = self.lock_state(&self.irq_evt, "irq_evt").as_ref() {
             let _ = evt.write(1);
         }
     }
 
     fn queue_config(&self, idx: usize) -> Option<QueueConfig> {
-        let qs = self.queues.lock().unwrap();
+        let qs = self.lock_state(&self.queues, "queues");
         let q = qs.get(idx)?;
         if !q.ready || !q.valid_size() {
             return None;
@@ -519,7 +540,7 @@ impl VirtioVsockMmio {
     }
 
     fn queue_indices(&self, idx: usize) -> (u16, u16) {
-        let qs = self.queues.lock().unwrap();
+        let qs = self.lock_state(&self.queues, "queues");
         qs.get(idx)
             .map(|q| (q.last_avail_idx, q.last_used_idx))
             .unwrap_or_default()
@@ -536,28 +557,28 @@ impl VirtioVsockMmio {
             .store(state.guest_features_low, Ordering::Relaxed);
         self.guest_features_high
             .store(state.guest_features_high, Ordering::Relaxed);
-        *self.queues.lock().unwrap() = state.queues.clone();
-        *self.rx_processor.lock().unwrap() = None;
-        *self.tx_processor.lock().unwrap() = None;
-        self.pending_rx.lock().unwrap().clear();
-        self.connections.lock().unwrap().clear();
+        *self.lock_state(&self.queues, "queues") = state.queues.clone();
+        *self.lock_state(&self.rx_processor, "rx_processor") = None;
+        *self.lock_state(&self.tx_processor, "tx_processor") = None;
+        self.lock_state(&self.pending_rx, "pending_rx").clear();
+        self.lock_state(&self.connections, "connections").clear();
         self.activated.store(state.activated, Ordering::Relaxed);
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
     }
 
     pub fn process_tx_queue(&self) -> usize {
-        let mem = match self.guest_mem.lock().unwrap().clone() {
+        let mem = match self.lock_state(&self.guest_mem, "guest_mem").clone() {
             Some(mem) => mem,
             None => return 0,
         };
-        let dirty = self.host_dirty.lock().unwrap().clone();
+        let dirty = self.lock_state(&self.host_dirty, "host_dirty").clone();
         let cfg = match self.queue_config(QUEUE_TX) {
             Some(cfg) => cfg,
             None => return 0,
         };
 
-        let mut proc_guard = self.tx_processor.lock().unwrap();
+        let mut proc_guard = self.lock_state(&self.tx_processor, "tx_processor");
         if proc_guard.is_none() {
             let (last_avail_idx, last_used_idx) = self.queue_indices(QUEUE_TX);
             *proc_guard = Some(VirtQueueProcessor::new_with_indices(
@@ -590,15 +611,15 @@ impl VirtioVsockMmio {
     }
 
     pub fn process_rx_queue(&self) -> usize {
-        let mem = match self.guest_mem.lock().unwrap().clone() {
+        let mem = match self.lock_state(&self.guest_mem, "guest_mem").clone() {
             Some(mem) => mem,
             None => return 0,
         };
-        let dirty = self.host_dirty.lock().unwrap().clone();
+        let dirty = self.lock_state(&self.host_dirty, "host_dirty").clone();
         let cfg = match self.queue_config(QUEUE_RX) {
             Some(cfg) => cfg,
             None => {
-                let pending = self.pending_rx.lock().unwrap().len();
+                let pending = self.lock_state(&self.pending_rx, "pending_rx").len();
                 if pending > 0 {
                     log::debug!("vsock rx: RX queue not ready but {pending} pending packets");
                 }
@@ -606,7 +627,7 @@ impl VirtioVsockMmio {
             }
         };
 
-        let mut proc_guard = self.rx_processor.lock().unwrap();
+        let mut proc_guard = self.lock_state(&self.rx_processor, "rx_processor");
         if proc_guard.is_none() {
             let (last_avail_idx, last_used_idx) = self.queue_indices(QUEUE_RX);
             *proc_guard = Some(VirtQueueProcessor::new_with_indices(
@@ -622,7 +643,11 @@ impl VirtioVsockMmio {
             .as_mut()
             .unwrap()
             .process_queue_descriptors_dirty(&mem, dirty.as_ref(), |_readable, writable| {
-                let packet = match self.pending_rx.lock().unwrap().front().cloned() {
+                let packet = match self
+                    .lock_state(&self.pending_rx, "pending_rx")
+                    .front()
+                    .cloned()
+                {
                     Some(packet) => packet,
                     None => return None,
                 };
@@ -639,7 +664,7 @@ impl VirtioVsockMmio {
                 if !write_desc_chain(&mem, dirty.as_ref(), writable, &bytes) {
                     return Some(0);
                 }
-                self.pending_rx.lock().unwrap().pop_front();
+                self.lock_state(&self.pending_rx, "pending_rx").pop_front();
                 self.rx_packets.fetch_add(1, Ordering::Relaxed);
                 self.rx_bytes
                     .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
@@ -649,7 +674,7 @@ impl VirtioVsockMmio {
         if processed > 0 {
             self.trigger_interrupt();
         }
-        let pending = self.pending_rx.lock().unwrap().len();
+        let pending = self.lock_state(&self.pending_rx, "pending_rx").len();
         if pending > 0 {
             log::debug!(
                 "vsock rx: delivered {processed}, still {pending} pending (RX bufs short?)"
@@ -664,7 +689,7 @@ impl VirtioVsockMmio {
         let mut packets = Vec::new();
         let mut closed = Vec::new();
         {
-            let mut connections = self.connections.lock().unwrap();
+            let mut connections = self.lock_state(&self.connections, "connections");
             for (key, conn) in connections.iter_mut() {
                 if !conn.established {
                     continue;
@@ -715,7 +740,7 @@ impl VirtioVsockMmio {
     }
 
     fn enqueue_rx(&self, packet: VsockPacket) {
-        let mut q = self.pending_rx.lock().unwrap();
+        let mut q = self.lock_state(&self.pending_rx, "pending_rx");
         if q.len() >= MAX_PENDING_RX {
             // Backpressure: drop rather than grow without bound. The guest is
             // not draining RX (no descriptors posted), so buffering more only
@@ -752,7 +777,9 @@ impl VirtioVsockMmio {
             return;
         }
 
-        let listener = self.host_listener.lock().unwrap().clone();
+        let listener = self
+            .lock_state(&self.host_listener, "host_listener")
+            .clone();
         let Some(listener) = listener else {
             self.enqueue_rx(self.reply_packet(&header, op::RST, 0, Vec::new(), 0));
             return;
@@ -760,7 +787,7 @@ impl VirtioVsockMmio {
 
         let key = key_from_guest(&header);
         {
-            let connections = self.connections.lock().unwrap();
+            let connections = self.lock_state(&self.connections, "connections");
             if connection_insert_would_exceed_cap(&connections, &key) {
                 log::warn!(
                     "vsock: connection cap ({MAX_CONNECTIONS}) reached; rejecting REQUEST guest_port={} host_port={}",
@@ -774,7 +801,7 @@ impl VirtioVsockMmio {
 
         match listener.connect(header.dst_port) {
             Ok(stream) => {
-                let mut connections = self.connections.lock().unwrap();
+                let mut connections = self.lock_state(&self.connections, "connections");
                 if connection_insert_would_exceed_cap(&connections, &key) {
                     log::warn!(
                         "vsock: connection cap ({MAX_CONNECTIONS}) reached after connect; rejecting REQUEST guest_port={} host_port={}",
@@ -808,7 +835,10 @@ impl VirtioVsockMmio {
 
     fn handle_response(&self, header: VsockPacketHeader) {
         let key = key_from_guest(&header);
-        if let Some(conn) = self.connections.lock().unwrap().get_mut(&key) {
+        if let Some(conn) = self
+            .lock_state(&self.connections, "connections")
+            .get_mut(&key)
+        {
             conn.established = true;
             conn.peer_buf_alloc = header.buf_alloc;
             conn.peer_fwd_cnt = header.fwd_cnt;
@@ -824,7 +854,7 @@ impl VirtioVsockMmio {
         let key = key_from_guest(&header);
         let mut reset = false;
         {
-            let mut connections = self.connections.lock().unwrap();
+            let mut connections = self.lock_state(&self.connections, "connections");
             if let Some(conn) = connections.get_mut(&key) {
                 log::debug!("vsock: guest→host {} bytes (RW)", data.len());
                 if let Err(err) = conn.stream.write_all(data) {
@@ -851,7 +881,10 @@ impl VirtioVsockMmio {
 
     fn handle_credit_update(&self, header: VsockPacketHeader) {
         let key = key_from_guest(&header);
-        if let Some(conn) = self.connections.lock().unwrap().get_mut(&key) {
+        if let Some(conn) = self
+            .lock_state(&self.connections, "connections")
+            .get_mut(&key)
+        {
             conn.peer_buf_alloc = header.buf_alloc;
             conn.peer_fwd_cnt = header.fwd_cnt;
         }
@@ -860,9 +893,7 @@ impl VirtioVsockMmio {
     fn handle_credit_request(&self, header: VsockPacketHeader) {
         let key = key_from_guest(&header);
         let fwd_cnt = self
-            .connections
-            .lock()
-            .unwrap()
+            .lock_state(&self.connections, "connections")
             .get(&key)
             .map(|conn| conn.fwd_cnt)
             .unwrap_or(0);
@@ -870,17 +901,13 @@ impl VirtioVsockMmio {
     }
 
     fn handle_shutdown(&self, header: VsockPacketHeader) {
-        self.connections
-            .lock()
-            .unwrap()
+        self.lock_state(&self.connections, "connections")
             .remove(&key_from_guest(&header));
         self.enqueue_rx(self.reply_packet(&header, op::SHUTDOWN, header.flags, Vec::new(), 0));
     }
 
     fn handle_rst(&self, header: VsockPacketHeader) {
-        self.connections
-            .lock()
-            .unwrap()
+        self.lock_state(&self.connections, "connections")
             .remove(&key_from_guest(&header));
     }
 
@@ -918,13 +945,13 @@ impl VirtioVsockMmio {
         self.guest_features_high.store(0, Ordering::SeqCst);
         self.queue_sel.store(0, Ordering::SeqCst);
         self.interrupt_status.store(0, Ordering::SeqCst);
-        for q in self.queues.lock().unwrap().iter_mut() {
+        for q in self.lock_state(&self.queues, "queues").iter_mut() {
             *q = QueueState::default();
         }
-        *self.rx_processor.lock().unwrap() = None;
-        *self.tx_processor.lock().unwrap() = None;
-        self.pending_rx.lock().unwrap().clear();
-        self.connections.lock().unwrap().clear();
+        *self.lock_state(&self.rx_processor, "rx_processor") = None;
+        *self.lock_state(&self.tx_processor, "tx_processor") = None;
+        self.lock_state(&self.pending_rx, "pending_rx").clear();
+        self.lock_state(&self.connections, "connections").clear();
     }
 
     fn read_config(&self, off: u64, len: u8) -> u64 {
@@ -943,13 +970,13 @@ impl VirtioVsockMmio {
     }
 
     fn q_addr<F: Fn(&QueueState) -> u64>(&self, f: F) -> u64 {
-        let qs = self.queues.lock().unwrap();
+        let qs = self.lock_state(&self.queues, "queues");
         let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
         qs.get(sel).map(f).unwrap_or(0)
     }
 
     fn q_write<F: FnMut(&mut QueueState)>(&self, mut f: F) {
-        let mut qs = self.queues.lock().unwrap();
+        let mut qs = self.lock_state(&self.queues, "queues");
         let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
         if let Some(q) = qs.get_mut(sel) {
             f(q);
@@ -961,14 +988,14 @@ impl Persist for VirtioVsockMmio {
     type State = VirtioVsockMmioState;
 
     fn save(&self) -> Self::State {
-        let mut queues = self.queues.lock().unwrap().clone();
-        if let Some(proc) = self.rx_processor.lock().unwrap().as_ref() {
+        let mut queues = self.lock_state(&self.queues, "queues").clone();
+        if let Some(proc) = self.lock_state(&self.rx_processor, "rx_processor").as_ref() {
             if let Some(q) = queues.get_mut(QUEUE_RX) {
                 q.last_avail_idx = proc.avail_idx();
                 q.last_used_idx = proc.used_idx();
             }
         }
-        if let Some(proc) = self.tx_processor.lock().unwrap().as_ref() {
+        if let Some(proc) = self.lock_state(&self.tx_processor, "tx_processor").as_ref() {
             if let Some(q) = queues.get_mut(QUEUE_TX) {
                 q.last_avail_idx = proc.avail_idx();
                 q.last_used_idx = proc.used_idx();
@@ -1020,12 +1047,12 @@ impl MmioDevice for VirtioVsockMmio {
             reg::INTERRUPT_STATUS => self.interrupt_status.load(Ordering::SeqCst),
             reg::CONFIG_GENERATION => 0,
             reg::QUEUE_NUM => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 qs.get(sel).map(|q| q.size as u32).unwrap_or(0)
             }
             reg::QUEUE_READY => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 qs.get(sel)
                     .map(|q| u32::from(q.ready && q.valid_size()))
@@ -1271,6 +1298,21 @@ mod tests {
 
     fn new_mem() -> Arc<GuestMemoryMmap> {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap())
+    }
+
+    #[test]
+    fn poisoned_guest_mem_lock_marks_device_failed_without_panicking() {
+        let dev = Arc::new(VirtioVsockMmio::new(7, GUEST_CID));
+        let poisoned = Arc::clone(&dev);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.guest_mem.lock().unwrap();
+            panic!("poison guest_mem");
+        })
+        .join()
+        .is_err());
+
+        dev.set_guest_memory(new_mem());
+        assert_ne!(dev.current_status() & status_bits::FAILED, 0);
     }
 
     fn config_queue(dev: &VirtioVsockMmio, idx: usize, desc: u64, avail: u64, used: u64) {

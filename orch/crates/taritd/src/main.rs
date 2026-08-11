@@ -105,6 +105,12 @@ fn init_tracing() {
         .init();
 }
 
+fn persist_startup_vm_observation(store: &Store, vm: &tarit_types::VmRecord, context: &str) {
+    if let Err(error) = store.insert_vm(vm) {
+        tracing::error!(vm = %vm.id, %error, "{context}");
+    }
+}
+
 async fn run_server(
     mut config: Config,
     preflight_taps: Vec<String>,
@@ -167,26 +173,40 @@ async fn run_server(
     // mandatory: if it fails, startup aborts rather than serve stale durable
     // Running/Paused/Suspended records for VMs that no longer exist.
     {
-        let ids = supervisor
-            .readopt_running_vms(&mut persisted_vms)
-            .await
-            .map_err(|error| anyhow::anyhow!("fail-closed VM re-adoption: {error}"))?;
-        for id in &ids {
-            let vm = persisted_vms
-                .iter_mut()
-                .find(|vm| vm.id == *id)
-                .ok_or_else(|| anyhow::anyhow!("unadoptable VM {id} disappeared at startup"))?;
+        let failures = supervisor.readopt_running_vms(&mut persisted_vms).await;
+        let failed_ids = failures
+            .iter()
+            .map(|failure| failure.id)
+            .collect::<Vec<_>>();
+        for failure in &failures {
+            let vm = match persisted_vms.iter_mut().find(|vm| vm.id == failure.id) {
+                Some(vm) => vm,
+                None => {
+                    tracing::error!(vm = %failure.id, reason = %failure.reason,
+                        "startup reconciliation lost a persisted VM record while marking it terminal");
+                    continue;
+                }
+            };
             vm.status = VmStatus::Error;
             // N+1 may have reached the fleet before the previous process
             // crashed with SQLite still at N. Fence the terminal observation
             // at N+2 and publish this exact record to every store.
-            vm.revision = vm.revision.checked_add(2).ok_or_else(|| {
-                anyhow::anyhow!("unadoptable VM {id} revision exhausted at startup")
-            })?;
+            vm.revision = match vm.revision.checked_add(2) {
+                Some(revision) => revision,
+                None => {
+                    tracing::error!(vm = %failure.id, reason = %failure.reason,
+                        "startup reconciliation exhausted the persisted revision while marking the VM terminal");
+                    continue;
+                }
+            };
             vm.updated_at = chrono::Utc::now();
-            store.insert_vm(vm).map_err(|error| {
-                anyhow::anyhow!("persist terminal status for unadoptable VM {id}: {error}")
-            })?;
+            tracing::warn!(vm = %failure.id, reason = %failure.reason,
+                "startup reconciliation fenced an unrecoverable VM record");
+            persist_startup_vm_observation(
+                &store,
+                vm,
+                "persist terminal status for startup-reconciled VM",
+            );
         }
         for vm in &persisted_vms {
             if vm.host_id == config.host_id
@@ -194,14 +214,13 @@ async fn run_server(
                     vm.status,
                     VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
                 )
-                && !ids.contains(&vm.id)
+                && !failed_ids.contains(&vm.id)
             {
-                store.insert_vm(vm).map_err(|error| {
-                    anyhow::anyhow!(
-                        "persist observed status for re-adopted VM {}: {error}",
-                        vm.id
-                    )
-                })?;
+                persist_startup_vm_observation(
+                    &store,
+                    vm,
+                    "persist observed status for re-adopted VM",
+                );
             }
         }
     }
@@ -1536,7 +1555,10 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
             warm_pool: config::WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

@@ -7,6 +7,7 @@
 //! the host uplink. Requires CAP_NET_ADMIN (run taritd as root); gated behind
 //! `TARIT_ENABLE_NET` so the default (no-net) path is unaffected.
 
+use crate::config::VmNetQuotaConfig;
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -100,6 +101,7 @@ pub struct NetProvisioner {
     network_transactions: NetworkTransactionLock,
     state_path: PathBuf,
     uplink: String,
+    quota: VmNetQuotaConfig,
     /// A post-rename state-sync error leaves the on-disk ownership ambiguous.
     /// Keep all current reservations and refuse further provisioning in this
     /// process rather than risk reusing a slot after a failed free.
@@ -130,6 +132,7 @@ impl NetProvisioner {
     pub fn new(
         state_path: PathBuf,
         live_vm_ids: impl IntoIterator<Item = Uuid>,
+        quota: VmNetQuotaConfig,
     ) -> Result<Self, OrchError> {
         let live_vm_ids = live_vm_ids.into_iter().collect::<HashSet<_>>();
         // This is deliberately the first fallible startup action. A corrupt
@@ -144,6 +147,7 @@ impl NetProvisioner {
             network_transactions: NetworkTransactionLock::default(),
             state_path,
             uplink,
+            quota,
             fail_closed: AtomicBool::new(false),
         };
         let all_allocations = provisioner.all_allocations()?;
@@ -354,7 +358,11 @@ impl NetProvisioner {
         self.add_nft_rule(alloc)?;
         self.install_egress_policy(alloc, policy)?;
         self.validate_complete_effective_policies(None)?;
-        run("ip", &["link", "set", &alloc.tap, "up"])
+        run("ip", &["link", "set", &alloc.tap, "up"])?;
+        for argv in traffic_control_argv(alloc, &self.quota) {
+            run_argv(&argv)?;
+        }
+        Ok(())
     }
 
     fn add_nft_rule(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -1788,6 +1796,70 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
         ],
     ]);
     argv
+}
+
+fn traffic_control_argv(alloc: &NetAlloc, quota: &VmNetQuotaConfig) -> Vec<Vec<String>> {
+    let mut argv = Vec::new();
+    if let Some(rate_bps) = quota.egress_bps_max {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "replace".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "root".into(),
+            "tbf".into(),
+            "rate".into(),
+            format!("{rate_bps}bps"),
+            "burst".into(),
+            format!("{}b", tbf_burst_bytes(rate_bps)),
+            "latency".into(),
+            "50ms".into(),
+        ]);
+    }
+    if let Some(rate_bps) = quota.ingress_bps_max {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "replace".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "handle".into(),
+            "ffff:".into(),
+            "ingress".into(),
+        ]);
+        argv.push(vec![
+            "tc".into(),
+            "filter".into(),
+            "replace".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "parent".into(),
+            "ffff:".into(),
+            "protocol".into(),
+            "all".into(),
+            "prio".into(),
+            "1".into(),
+            "u32".into(),
+            "match".into(),
+            "u32".into(),
+            "0".into(),
+            "0".into(),
+            "police".into(),
+            "rate".into(),
+            format!("{rate_bps}bps"),
+            "burst".into(),
+            format!("{}b", tbf_burst_bytes(rate_bps)),
+            "drop".into(),
+            "flowid".into(),
+            ":1".into(),
+        ]);
+    }
+    argv
+}
+
+fn tbf_burst_bytes(rate_bps: u64) -> u64 {
+    (rate_bps / 100).max(16 * 1024)
 }
 
 fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
@@ -3523,6 +3595,56 @@ mod tests {
         assert!(c.ends_with("eth0:off"));
     }
 
+    #[test]
+    fn traffic_control_argv_programs_ingress_and_egress_limits() {
+        let alloc = NetAlloc::for_idx(7);
+        let argv = traffic_control_argv(
+            &alloc,
+            &VmNetQuotaConfig {
+                ingress_bps_max: Some(1_000_000),
+                egress_bps_max: Some(2_000_000),
+            },
+        );
+        assert_eq!(
+            argv[0],
+            vec![
+                "tc",
+                "qdisc",
+                "replace",
+                "dev",
+                alloc.tap.as_str(),
+                "root",
+                "tbf",
+                "rate",
+                "2000000bps",
+                "burst",
+                "20000b",
+                "latency",
+                "50ms"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            argv[1],
+            vec![
+                "tc",
+                "qdisc",
+                "replace",
+                "dev",
+                alloc.tap.as_str(),
+                "handle",
+                "ffff:",
+                "ingress"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        assert!(argv[2].iter().any(|part| part == "1000000bps"));
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
@@ -4746,7 +4868,7 @@ esac
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
         std::env::set_var("TARIT_TEST_QUARANTINE", &quarantine);
-        let result = NetProvisioner::new(state_path, [vm_id]);
+        let result = NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -4902,8 +5024,8 @@ esac
         std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
         std::env::set_var("TARIT_TEST_OLD_VM_ID", old_vm_id.to_string());
         std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
-        let result = NetProvisioner::new(state_path.clone(), [vm_id])
-            .and_then(|_| NetProvisioner::new(state_path, [vm_id]));
+        let result = NetProvisioner::new(state_path.clone(), [vm_id], VmNetQuotaConfig::default())
+            .and_then(|_| NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default()));
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5107,6 +5229,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
             fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
@@ -5205,7 +5328,7 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path, [vm_id]);
+        let result = NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5289,7 +5412,11 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path, [first_vm_id, second_vm_id]);
+        let result = NetProvisioner::new(
+            state_path,
+            [first_vm_id, second_vm_id],
+            VmNetQuotaConfig::default(),
+        );
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5445,7 +5572,11 @@ esac
         std::env::set_var("TARIT_TEST_QUARANTINE", &quarantine);
         std::env::set_var("TARIT_TEST_VM_7", first_vm_id.to_string());
         std::env::set_var("TARIT_TEST_VM_8", second_vm_id.to_string());
-        let result = NetProvisioner::new(state_path, [first_vm_id, second_vm_id]);
+        let result = NetProvisioner::new(
+            state_path,
+            [first_vm_id, second_vm_id],
+            VmNetQuotaConfig::default(),
+        );
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5576,7 +5707,7 @@ esac
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
         std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
         std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
-        let result = NetProvisioner::new(state_path, [vm_id]);
+        let result = NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5846,7 +5977,11 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path.clone(), std::iter::empty());
+        let result = NetProvisioner::new(
+            state_path.clone(),
+            std::iter::empty(),
+            VmNetQuotaConfig::default(),
+        );
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5922,7 +6057,7 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path.clone(), [vm_id]);
+        let result = NetProvisioner::new(state_path.clone(), [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -6029,6 +6164,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
             fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
@@ -6518,6 +6654,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
             fail_closed: AtomicBool::new(false),
         };
 
@@ -6634,6 +6771,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
             fail_closed: AtomicBool::new(false),
         };
 
@@ -6727,6 +6865,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
             fail_closed: AtomicBool::new(false),
         };
         let alloc = NetAlloc::for_slot(Uuid::new_v4(), 7).unwrap();
@@ -6840,6 +6979,7 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
             fail_closed: AtomicBool::new(false),
         };
 

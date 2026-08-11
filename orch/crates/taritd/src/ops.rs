@@ -683,6 +683,7 @@ fn start_terminal_transition(
 }
 
 async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    state.pty_registry.close_vm_sessions(id);
     loop {
         let LifecycleState::Terminal { record, phase } = lifecycle_state(state, id)?
             .ok_or_else(|| OrchError::NotFound(format!("vm {id} has no terminal lifecycle")))?
@@ -3082,7 +3083,10 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

@@ -277,6 +277,12 @@ enum ReadoptFailure {
     Fatal(String),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReadoptWarning {
+    pub(crate) id: Uuid,
+    pub(crate) reason: String,
+}
+
 impl std::fmt::Display for ReadoptFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1077,7 +1083,11 @@ impl VmmSupervisor {
         let live_vm_ids = live_vm_ids.into_iter().collect::<Vec<_>>();
         validate_network_startup_mode(config.enable_net, preflight_taps, live_vm_ids.len())?;
         let net = if config.enable_net {
-            let provisioner = NetProvisioner::new(config.net_state_path.clone(), live_vm_ids)?;
+            let provisioner = NetProvisioner::new(
+                config.net_state_path.clone(),
+                live_vm_ids,
+                config.vm_net_quota.clone(),
+            )?;
             tracing::info!(uplink = provisioner.uplink(), "per-VM networking enabled");
             Some(provisioner)
         } else {
@@ -1254,7 +1264,12 @@ impl VmmSupervisor {
 
     /// Build `vmm serve` cgroup arguments from the exact scheduler reservation.
     /// Cold boot and restore receive identical CPU, memory and PID enforcement.
-    fn cgroup_args(&self, id: Uuid, shape: ResourceShape) -> Result<Vec<String>, OrchError> {
+    fn cgroup_args(
+        &self,
+        id: Uuid,
+        shape: ResourceShape,
+        vm_config: &VmSpawnConfig,
+    ) -> Result<Vec<String>, OrchError> {
         let Some(path) = self.exact_vm_cgroup_path(id) else {
             return Ok(Vec::new());
         };
@@ -1267,7 +1282,7 @@ impl VmmSupervisor {
             .checked_add(shape.memory_mib / 2)
             .and_then(|value| value.checked_add(256))
             .ok_or_else(|| OrchError::BadRequest("memory cgroup limit overflow".into()))?;
-        Ok(vec![
+        let mut args = vec![
             "--cgroup".to_string(),
             path.display().to_string(),
             "--cgroup-pids-max".to_string(),
@@ -1276,7 +1291,62 @@ impl VmmSupervisor {
             format!("{cpu_millis}m"),
             "--cgroup-memory-max".to_string(),
             format!("{max_mib}M"),
-        ])
+        ];
+        if let Some(io_max) = self.cgroup_io_max_arg(vm_config)? {
+            args.push("--cgroup-io-max".to_string());
+            args.push(io_max);
+        }
+        Ok(args)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cgroup_io_max_arg(&self, vm_config: &VmSpawnConfig) -> Result<Option<String>, OrchError> {
+        use std::collections::BTreeSet;
+
+        let quota = &self.config.vm_io_quota;
+        if !quota.is_configured() {
+            return Ok(None);
+        }
+
+        let mut devices = BTreeSet::new();
+        if let Some(rootfs) = vm_config.rootfs_path.as_ref() {
+            let metadata = std::fs::metadata(rootfs).map_err(|error| {
+                OrchError::Internal(format!(
+                    "stat VM rootfs {} for cgroup io.max: {error}",
+                    rootfs.display()
+                ))
+            })?;
+            devices.insert(format!(
+                "{}:{}",
+                libc::major(metadata.dev()),
+                libc::minor(metadata.dev())
+            ));
+        }
+        if devices.is_empty() {
+            return Ok(None);
+        }
+
+        let suffix = [
+            quota.read_bps_max.map(|value| format!(" rbps={value}")),
+            quota.write_bps_max.map(|value| format!(" wbps={value}")),
+            quota.read_iops_max.map(|value| format!(" riops={value}")),
+            quota.write_iops_max.map(|value| format!(" wiops={value}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<String>();
+        Ok((!suffix.is_empty()).then(|| {
+            devices
+                .into_iter()
+                .map(|device| format!("{device}{suffix}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn cgroup_io_max_arg(&self, _vm_config: &VmSpawnConfig) -> Result<Option<String>, OrchError> {
+        Ok(None)
     }
 
     /// The VMM creates this child and applies the VM's exact CPU, memory and PID
@@ -2104,11 +2174,15 @@ impl VmmSupervisor {
         }
     }
 
-    fn spawn_server_for_boot(&self, ticket: &BootTicket) -> Result<RunningVm, OrchError> {
+    fn spawn_server_for_boot(
+        &self,
+        ticket: &BootTicket,
+        vm_config: &VmSpawnConfig,
+    ) -> Result<RunningVm, OrchError> {
         let id = ticket.id;
         let socket_path = self.socket_path_for(id);
         let _ = std::fs::remove_file(&socket_path);
-        let cgroup_args = self.cgroup_args(id, ticket.shape)?;
+        let cgroup_args = self.cgroup_args(id, ticket.shape, vm_config)?;
         let boot_gate = self.boot_gate.blocking_lock();
         let can_start = !self.is_shutting_down()
             && !ticket.control.is_cancelled()
@@ -2190,7 +2264,7 @@ impl VmmSupervisor {
         vm_config: &VmSpawnConfig,
     ) -> Result<BootedVm, OrchError> {
         let id = ticket.id;
-        let base_vm = self.spawn_server_for_boot(&ticket)?;
+        let base_vm = self.spawn_server_for_boot(&ticket, vm_config)?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -2296,7 +2370,21 @@ impl VmmSupervisor {
     ) -> Result<BootedVm, OrchError> {
         let id = ticket.id;
         debug_assert_eq!(ticket.shape, shape);
-        let base_vm = self.spawn_server_for_boot(&ticket)?;
+        let base_vm = self.spawn_server_for_boot(
+            &ticket,
+            &VmSpawnConfig {
+                memory_mib: shape.memory_mib,
+                vcpus: shape.vcpus as u8,
+                kernel_path: self.config.kernel.clone(),
+                rootfs_path: self
+                    .config
+                    .rootfs
+                    .exists()
+                    .then(|| self.config.rootfs.clone()),
+                cmdline: DEFAULT_CMDLINE.to_string(),
+                read_only: self.config.rootfs_read_only,
+            },
+        )?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -2400,25 +2488,16 @@ impl VmmSupervisor {
         let Some(net) = booted.vm.net.as_ref() else {
             return Ok(booted);
         };
-        let command = restored_network_rebind_command(net);
-        // Deadline must outlive the 5s guest budget (see exec_vm).
-        let client = VmmClient::new(&booted.vm.socket_path)
-            .with_request_timeout(Duration::from_secs(5) + EXEC_OP_MARGIN);
-        match client.exec(&command, 5_000) {
-            Ok((0, _, _, _)) => Ok(booted),
-            Ok((status, _, stderr, _)) => Err(self.cleanup_boot_failure(
-                booted.id,
-                &booted.control,
-                &booted.vm,
-                OrchError::Vmm(format!(
-                    "restore network reconfiguration exited {status}: {stderr}"
-                )),
-            )),
+        let request = restored_guest_network_repair(net);
+        let client =
+            VmmClient::new(&booted.vm.socket_path).with_request_timeout(Duration::from_secs(5));
+        match client.repair_guest_network(request) {
+            Ok(()) => Ok(booted),
             Err(error) => Err(self.cleanup_boot_failure(
                 booted.id,
                 &booted.control,
                 &booted.vm,
-                OrchError::Vmm(format!("restore network reconfiguration: {error}")),
+                OrchError::Vmm(format!("restore guest network repair: {error}")),
             )),
         }
     }
@@ -2944,7 +3023,7 @@ impl VmmSupervisor {
     pub async fn readopt_running_vms(
         self: &Arc<Self>,
         records: &mut [VmRecord],
-    ) -> Result<Vec<Uuid>, String> {
+    ) -> Vec<ReadoptWarning> {
         let mut failed = Vec::new();
         for record in records {
             match self.readopt_one(record).await {
@@ -2958,18 +3037,31 @@ impl VmmSupervisor {
                         "cannot re-adopt VM after restart; tearing down its network and marking it failed");
                     if let Some(net) = &self.net {
                         if let Err(error) = net.teardown_vm_id(record.id) {
-                            return Err(format!(
-                                "tear down network for unadoptable VM {}: {error}",
-                                record.id
-                            ));
+                            failed.push(ReadoptWarning {
+                                id: record.id,
+                                reason: format!(
+                                    "{reason}; network teardown for unrecovered VM failed: {error}"
+                                ),
+                            });
+                            continue;
                         }
                     }
-                    failed.push(record.id);
+                    failed.push(ReadoptWarning {
+                        id: record.id,
+                        reason,
+                    });
                 }
-                Err(ReadoptFailure::Fatal(reason)) => return Err(reason),
+                Err(ReadoptFailure::Fatal(reason)) => {
+                    tracing::error!(vm = %record.id, reason = %reason,
+                        "startup re-adoption hit a fatal cleanup path; marking the VM failed and continuing");
+                    failed.push(ReadoptWarning {
+                        id: record.id,
+                        reason,
+                    });
+                }
             }
         }
-        Ok(failed)
+        failed
     }
 
     /// Attempt to re-adopt a single persisted VM. Returns `Ok(true)` on success,
@@ -4336,13 +4428,13 @@ fn net_config_for_allocation(allocation: &NetAlloc) -> NetConfig {
     }
 }
 
-fn restored_network_rebind_command(allocation: &NetAlloc) -> String {
-    format!(
-        "ip addr flush dev eth0 scope global && ip addr add {guest}/{prefix} dev eth0 && ip link set eth0 up && ip route replace default via {gateway} && ip -4 -o addr show dev eth0 scope global | grep -F -q ' {guest}/{prefix} ' && ip route show default | grep -F -q 'default via {gateway} '",
-        guest = allocation.guest_ip,
-        prefix = allocation.prefix,
-        gateway = allocation.host_ip,
-    )
+fn restored_guest_network_repair(allocation: &NetAlloc) -> tarit_vmm_client::GuestNetworkRepair {
+    tarit_vmm_client::GuestNetworkRepair {
+        addr: allocation.guest_ip.clone(),
+        prefix: allocation.prefix,
+        gateway: allocation.host_ip.clone(),
+        dns_servers: Vec::new(),
+    }
 }
 
 fn validate_network_startup_mode(
@@ -4491,7 +4583,10 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,
@@ -4555,7 +4650,10 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,
@@ -4726,6 +4824,66 @@ mod tests {
         std::fs::remove_dir(&overlay_path).unwrap();
         supervisor.stop_vm(id).unwrap();
         assert!(supervisor.scheduler.release(id));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restart_reconciliation_continues_past_a_bad_vm_record() {
+        let root = PathBuf::from(format!(
+            "target/taritd-restart-continues-{}",
+            Uuid::new_v4()
+        ));
+        let good_socket = root.join("good-vmm.sock");
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&good_socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(request, tarit_vmm_client::ApiRequest::Status));
+            let response = tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                state: tarit_vmm_client::VmState::Paused,
+                uptime_ms: 1,
+                vcpus: 1,
+                mem_mib: 256,
+                volumes: 0,
+                nets: 0,
+                kernel: "kernel".into(),
+                vcpu_alive: true,
+            });
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+        });
+        let supervisor = Arc::new(VmmSupervisor::new(supervisor_config(&root)));
+
+        let good_id = Uuid::new_v4();
+        let good_process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        let mut good_record = restart_record(good_id, &good_socket);
+        good_record.pid = Some(good_process.pid);
+
+        let bad_id = Uuid::new_v4();
+        let bad_process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        let mut bad_record = restart_record(bad_id, &root.join("missing.sock"));
+        bad_record.pid = Some(bad_process.pid);
+
+        let mut records = vec![good_record, bad_record];
+        let failures = test_runtime().block_on(supervisor.readopt_running_vms(&mut records));
+
+        server.join().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].id, bad_id);
+        assert_eq!(records[0].status, VmStatus::Paused);
+        assert_eq!(records[0].revision, 9);
+        assert!(records[1].status == VmStatus::Running);
+        supervisor.stop_vm(good_id).unwrap();
+        assert!(supervisor.scheduler.release(good_id));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4942,15 +5100,24 @@ mod tests {
         let root = PathBuf::from(format!("target/cgroup-args-{}", Uuid::new_v4()));
         let mut config = supervisor_config(&root);
         config.vm_cgroup_parent = Some("/sys/fs/cgroup/tarit".into());
+        config.vm_io_quota = crate::config::VmIoQuotaConfig {
+            read_bps_max: Some(1_048_576),
+            write_bps_max: Some(2_097_152),
+            read_iops_max: None,
+            write_iops_max: None,
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("rootfs"), vec![0u8; 4096]).unwrap();
         let supervisor = VmmSupervisor::new(config);
         let id = Uuid::new_v4();
+        let spawn_cfg = spawn_config(false, Some(root.join("rootfs")));
         for (vcpus, memory_mib, cpu, memory) in [
             (1, 256, "1000m", "640M"),
             (2, 512, "2000m", "1024M"),
             (8, 4096, "8000m", "6400M"),
         ] {
             let args = supervisor
-                .cgroup_args(id, ResourceShape::new(vcpus, memory_mib))
+                .cgroup_args(id, ResourceShape::new(vcpus, memory_mib), &spawn_cfg)
                 .unwrap();
             let path_index = args.iter().position(|arg| arg == "--cgroup").unwrap();
             let cpu_index = args
@@ -4967,6 +5134,17 @@ mod tests {
             );
             assert_eq!(args[cpu_index + 1], cpu);
             assert_eq!(args[memory_index + 1], memory);
+            #[cfg(target_os = "linux")]
+            {
+                let io_index = args
+                    .iter()
+                    .position(|arg| arg == "--cgroup-io-max")
+                    .unwrap();
+                assert!(args[io_index + 1].contains("rbps=1048576"));
+                assert!(args[io_index + 1].contains("wbps=2097152"));
+            }
+            #[cfg(not(target_os = "linux"))]
+            assert!(args.iter().all(|arg| arg != "--cgroup-io-max"));
         }
     }
 
@@ -5119,9 +5297,10 @@ mod tests {
         let pause = supervisor.pause_after_spawn_before_registry_attachment_for_test();
         let (done_tx, done_rx) = mpsc::channel();
         let worker_supervisor = Arc::clone(&supervisor);
+        let worker_cfg = spawn_config(false, Some(supervisor.config.rootfs.clone()));
         let worker = thread::spawn(move || {
             done_tx
-                .send(worker_supervisor.spawn_server_for_boot(&ticket))
+                .send(worker_supervisor.spawn_server_for_boot(&ticket, &worker_cfg))
                 .unwrap();
         });
 
@@ -5763,12 +5942,11 @@ mod tests {
             guest_ip: "172.16.0.14".into(),
             prefix: 30,
         };
-        let command = restored_network_rebind_command(&allocation);
-        assert!(command.starts_with("ip addr flush dev eth0 scope global"));
-        assert!(command.contains("ip addr add 172.16.0.14/30 dev eth0"));
-        assert!(command.contains("ip route replace default via 172.16.0.13"));
-        assert!(command.contains("grep -F -q ' 172.16.0.14/30 '"));
-        assert!(command.contains("grep -F -q 'default via 172.16.0.13 '"));
+        let request = restored_guest_network_repair(&allocation);
+        assert_eq!(request.addr, "172.16.0.14");
+        assert_eq!(request.prefix, 30);
+        assert_eq!(request.gateway, "172.16.0.13");
+        assert!(request.dns_servers.is_empty());
     }
 
     #[test]

@@ -160,6 +160,29 @@ pub struct VirtioBlkMmio {
 }
 
 impl VirtioBlkMmio {
+    fn fail_device(&self, context: &str) {
+        log::error!("virtio-blk: {context}");
+        self.status.fetch_or(
+            status_bits::DEVICE_NEEDS_RESET | status_bits::FAILED,
+            Ordering::SeqCst,
+        );
+        self.activated.store(false, Ordering::SeqCst);
+    }
+
+    fn lock_state<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> std::sync::MutexGuard<'a, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.fail_device(&format!("poisoned {name} lock"));
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Create a new virtio-blk MMIO device with a file-backed backend.
     pub fn new(irq: u32, backend: BlkBackend) -> Self {
         Self {
@@ -229,7 +252,7 @@ impl VirtioBlkMmio {
     /// Set the IRQ EventFd (Linux only — called after registering irqfd with KVM).
     #[cfg(target_os = "linux")]
     pub fn set_irq_evt(&self, evt: vmm_sys_util::eventfd::EventFd) {
-        *self.irq_evt.lock().unwrap() = Some(evt);
+        *self.lock_state(&self.irq_evt, "irq_evt") = Some(evt);
     }
 
     /// Signal an interrupt to the guest.
@@ -237,7 +260,7 @@ impl VirtioBlkMmio {
     fn trigger_interrupt(&self) {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
-        if let Some(evt) = self.irq_evt.lock().unwrap().as_ref() {
+        if let Some(evt) = self.lock_state(&self.irq_evt, "irq_evt").as_ref() {
             let _ = evt.write(1);
         }
     }
@@ -250,20 +273,20 @@ impl VirtioBlkMmio {
 
     /// Set the guest memory (called after KvmVm creation).
     pub fn set_guest_memory(&self, mem: std::sync::Arc<GuestMemoryMmap>) {
-        *self.guest_mem.lock().unwrap() = Some(mem);
+        *self.lock_state(&self.guest_mem, "guest_mem") = Some(mem);
     }
 
     pub fn set_guest_dirty_tracker(&self, dirty: SoftwareDirtyBitmap) {
-        *self.host_dirty.lock().unwrap() = Some(dirty);
+        *self.lock_state(&self.host_dirty, "host_dirty") = Some(dirty);
     }
 
     /// Install a per-device rate limiter. Leaving it unset keeps I/O unlimited.
     pub fn set_rate_limiter(&self, rl: RateLimiter) {
-        *self.rate_limiter.lock().unwrap() = Some(rl);
+        *self.lock_state(&self.rate_limiter, "rate_limiter") = Some(rl);
     }
 
     fn rate_limit_allows(&self, bytes: u64) -> bool {
-        match self.rate_limiter.lock().unwrap().as_mut() {
+        match self.lock_state(&self.rate_limiter, "rate_limiter").as_mut() {
             Some(rl) => rl.try_charge(1, bytes),
             None => true,
         }
@@ -373,16 +396,16 @@ impl VirtioBlkMmio {
 
     /// Process the virtqueue when the guest kicks (writes to QUEUE_NOTIFY).
     fn process_queue(&self, _queue_idx: u32) {
-        let mem = match self.guest_mem.lock().unwrap().clone() {
+        let mem = match self.lock_state(&self.guest_mem, "guest_mem").clone() {
             Some(m) => m,
             None => {
                 log::debug!("BLK process_queue: guest_mem is None");
                 return;
             }
         };
-        let dirty = self.host_dirty.lock().unwrap().clone();
+        let dirty = self.lock_state(&self.host_dirty, "host_dirty").clone();
 
-        let qs = self.queues.lock().unwrap();
+        let qs = self.lock_state(&self.queues, "queues");
         let Some(q) = qs.first() else {
             log::error!("BLK process_queue: missing queue 0 in restored state");
             return;
@@ -406,14 +429,14 @@ impl VirtioBlkMmio {
         drop(qs);
 
         // Get or create the persistent processor.
-        let mut proc_guard = self.processor.lock().unwrap();
+        let mut proc_guard = self.lock_state(&self.processor, "processor");
         if proc_guard.is_none() {
             *proc_guard = Some(VirtQueueProcessor::new(config));
         } else {
             proc_guard.as_mut().unwrap().update_config(config);
         }
 
-        let mut backend_guard = self.backend.lock().unwrap();
+        let mut backend_guard = self.lock_state(&self.backend, "backend");
         if backend_guard.is_none() {
             return;
         }
@@ -540,13 +563,11 @@ impl Persist for VirtioBlkMmio {
             guest_features_sel: self.guest_features_sel.load(Ordering::Relaxed),
             guest_features_low: self.guest_features_low.load(Ordering::Relaxed),
             guest_features_high: self.guest_features_high.load(Ordering::Relaxed),
-            queues: self.queues.lock().unwrap().clone(),
+            queues: self.lock_state(&self.queues, "queues").clone(),
             activated: self.activated.load(Ordering::Relaxed),
             interrupt_status: self.interrupt_status.load(Ordering::SeqCst),
             processor: self
-                .processor
-                .lock()
-                .unwrap()
+                .lock_state(&self.processor, "processor")
                 .as_ref()
                 .map(VirtQueueProcessor::save_state),
         }
@@ -563,18 +584,16 @@ impl Persist for VirtioBlkMmio {
             .store(state.guest_features_low, Ordering::Relaxed);
         self.guest_features_high
             .store(state.guest_features_high, Ordering::Relaxed);
-        *self.queues.lock().unwrap() = state.queues;
+        *self.lock_state(&self.queues, "queues") = state.queues;
         self.activated.store(state.activated, Ordering::Relaxed);
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
         let config = self
-            .queues
-            .lock()
-            .unwrap()
+            .lock_state(&self.queues, "queues")
             .first()
             .map(Self::queue_config_from_state)
             .unwrap_or_default();
-        *self.processor.lock().unwrap() = state
+        *self.lock_state(&self.processor, "processor") = state
             .processor
             .map(|p| VirtQueueProcessor::from_state(config, p));
     }
@@ -598,18 +617,16 @@ impl Persist for std::sync::Arc<VirtioBlkMmio> {
             .store(state.guest_features_low, Ordering::Relaxed);
         self.guest_features_high
             .store(state.guest_features_high, Ordering::Relaxed);
-        *self.queues.lock().unwrap() = state.queues;
+        *self.lock_state(&self.queues, "queues") = state.queues;
         self.activated.store(state.activated, Ordering::Relaxed);
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
         let config = self
-            .queues
-            .lock()
-            .unwrap()
+            .lock_state(&self.queues, "queues")
             .first()
             .map(VirtioBlkMmio::queue_config_from_state)
             .unwrap_or_default();
-        *self.processor.lock().unwrap() = state
+        *self.lock_state(&self.processor, "processor") = state
             .processor
             .map(|p| VirtQueueProcessor::from_state(config, p));
     }
@@ -638,7 +655,7 @@ impl MmioDevice for VirtioBlkMmio {
                 // 0 here (the old `_ => 0` fallthrough) makes Linux >=5.15 tear
                 // the queue down, so block I/O never completes and root mount
                 // hangs. Report the actual per-queue ready flag.
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     u32::from(qs[sel].ready && qs[sel].valid_size())
@@ -654,7 +671,7 @@ impl MmioDevice for VirtioBlkMmio {
             // u32 blk_size at offset 8 (optional).
             off if off >= reg::CONFIG => {
                 let cfg_off = (off - reg::CONFIG) as usize;
-                let backend = self.backend.lock().unwrap();
+                let backend = self.lock_state(&self.backend, "backend");
                 match &*backend {
                     Some(b) => {
                         let cap_bytes = b.sectors.to_le_bytes();
@@ -681,7 +698,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_NUM => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].size as u32
@@ -690,7 +707,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DESC_LOW => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     (qs[sel].desc_table_addr & 0xFFFFFFFF) as u32
@@ -699,7 +716,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DESC_HIGH => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     (qs[sel].desc_table_addr >> 32) as u32
@@ -708,7 +725,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DRIVER_LOW => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     (qs[sel].avail_ring_addr & 0xFFFFFFFF) as u32
@@ -717,7 +734,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DRIVER_HIGH => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     (qs[sel].avail_ring_addr >> 32) as u32
@@ -726,7 +743,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DEVICE_LOW => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     (qs[sel].used_ring_addr & 0xFFFFFFFF) as u32
@@ -735,7 +752,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DEVICE_HIGH => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     (qs[sel].used_ring_addr >> 32) as u32
@@ -766,10 +783,10 @@ impl MmioDevice for VirtioBlkMmio {
                     self.guest_features_high.store(0, Ordering::SeqCst);
                     self.queue_sel.store(0, Ordering::SeqCst);
                     self.interrupt_status.store(0, Ordering::SeqCst);
-                    for q in self.queues.lock().unwrap().iter_mut() {
+                    for q in self.lock_state(&self.queues, "queues").iter_mut() {
                         *q = QueueState::default();
                     }
-                    *self.processor.lock().unwrap() = None;
+                    *self.lock_state(&self.processor, "processor") = None;
                     return Ok(());
                 }
                 self.status.store(val, Ordering::Relaxed);
@@ -800,21 +817,21 @@ impl MmioDevice for VirtioBlkMmio {
                 self.queue_sel.store(val, Ordering::Relaxed);
             }
             reg::QUEUE_NUM => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].set_size(val);
                 }
             }
             reg::QUEUE_DESC_LOW => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].desc_table_addr = (qs[sel].desc_table_addr & !0xFFFFFFFF) | val as u64;
                 }
             }
             reg::QUEUE_DESC_HIGH => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].desc_table_addr =
@@ -822,14 +839,14 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DRIVER_LOW => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].avail_ring_addr = (qs[sel].avail_ring_addr & !0xFFFFFFFF) | val as u64;
                 }
             }
             reg::QUEUE_DRIVER_HIGH => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].avail_ring_addr =
@@ -837,14 +854,14 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_DEVICE_LOW => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].used_ring_addr = (qs[sel].used_ring_addr & !0xFFFFFFFF) | val as u64;
                 }
             }
             reg::QUEUE_DEVICE_HIGH => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].used_ring_addr =
@@ -852,7 +869,7 @@ impl MmioDevice for VirtioBlkMmio {
                 }
             }
             reg::QUEUE_READY => {
-                let mut qs = self.queues.lock().unwrap();
+                let mut qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 if sel < qs.len() {
                     qs[sel].set_ready(val != 0);
@@ -929,6 +946,26 @@ mod tests {
         let path = test_disk_path(name);
         std::fs::write(&path, vec![0u8; 4096]).unwrap();
         (BlkBackend::open(&path, false).unwrap(), path)
+    }
+
+    #[test]
+    fn poisoned_guest_mem_lock_marks_device_failed_without_panicking() {
+        let (backend, path) = new_test_backend("poisoned-guest-mem");
+        let dev = Arc::new(VirtioBlkMmio::new(5, backend));
+        let poisoned = Arc::clone(&dev);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.guest_mem.lock().unwrap();
+            panic!("poison guest_mem");
+        })
+        .join()
+        .is_err());
+
+        dev.set_guest_memory(Arc::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20_000)]).unwrap(),
+        ));
+        assert_ne!(dev.current_status() & status_bits::FAILED, 0);
+
+        let _ = std::fs::remove_file(path);
     }
 
     fn new_test_mem() -> Arc<GuestMemoryMmap> {

@@ -470,6 +470,47 @@ impl WarmPoolDraft {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmJailConfig {
+    /// Parent directory for per-VM jail roots.
+    pub base_dir: PathBuf,
+    /// First non-root uid reserved for per-VM jail identities.
+    pub uid_base: u32,
+    /// First non-root gid reserved for per-VM jail identities.
+    pub gid_base: u32,
+    /// Number of unique uid/gid pairs available.
+    pub id_count: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmIoQuotaConfig {
+    pub read_bps_max: Option<u64>,
+    pub write_bps_max: Option<u64>,
+    pub read_iops_max: Option<u64>,
+    pub write_iops_max: Option<u64>,
+}
+
+impl VmIoQuotaConfig {
+    pub fn is_configured(&self) -> bool {
+        self.read_bps_max.is_some()
+            || self.write_bps_max.is_some()
+            || self.read_iops_max.is_some()
+            || self.write_iops_max.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmNetQuotaConfig {
+    pub ingress_bps_max: Option<u64>,
+    pub egress_bps_max: Option<u64>,
+}
+
+impl VmNetQuotaConfig {
+    pub fn is_configured(&self) -> bool {
+        self.ingress_bps_max.is_some() || self.egress_bps_max.is_some()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -522,9 +563,16 @@ pub struct Config {
     /// When unset, no per-VM cgroup is applied (host must be cgroup v2 and
     /// taritd must run as root for this to work). Env TARIT_VM_CGROUP_PARENT.
     pub vm_cgroup_parent: Option<String>,
+    /// Optional per-VM jail root + uid/gid pool. When set, every VMM is staged
+    /// in a private chroot with rewritten in-jail asset and socket paths.
+    pub vm_jail: Option<VmJailConfig>,
     /// pids.max for each per-VM cgroup (fork-bomb ceiling). Env
     /// TARIT_VM_CGROUP_PIDS_MAX. Only used when `vm_cgroup_parent` is set.
     pub vm_cgroup_pids_max: u64,
+    /// Optional per-VM cgroup v2 block-I/O throttles.
+    pub vm_io_quota: VmIoQuotaConfig,
+    /// Optional per-VM host TAP shaping limits.
+    pub vm_net_quota: VmNetQuotaConfig,
     /// Warm-pool policy (loaded from the optional config file + env).
     pub warm_pool: WarmPoolConfig,
     /// How long a create() waits for a VM slot (warm backfill or a freed cold
@@ -673,7 +721,24 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let vm_jail = parse_vm_jail_config(max_vms)?;
         let vm_cgroup_pids_max = env_positive_u64("TARIT_VM_CGROUP_PIDS_MAX", 1024)?;
+        let vm_io_quota = VmIoQuotaConfig {
+            read_bps_max: env_optional_positive_u64("TARIT_VM_IO_READ_BPS_MAX")?,
+            write_bps_max: env_optional_positive_u64("TARIT_VM_IO_WRITE_BPS_MAX")?,
+            read_iops_max: env_optional_positive_u64("TARIT_VM_IO_READ_IOPS_MAX")?,
+            write_iops_max: env_optional_positive_u64("TARIT_VM_IO_WRITE_IOPS_MAX")?,
+        };
+        let vm_net_quota = VmNetQuotaConfig {
+            ingress_bps_max: env_optional_positive_u64("TARIT_VM_NET_INGRESS_BPS_MAX")?,
+            egress_bps_max: env_optional_positive_u64("TARIT_VM_NET_EGRESS_BPS_MAX")?,
+        };
+        if vm_io_quota.is_configured() && vm_cgroup_parent.is_none() {
+            bail!("TARIT_VM_IO_* limits require TARIT_VM_CGROUP_PARENT");
+        }
+        if vm_net_quota.is_configured() && !enable_net {
+            bail!("TARIT_VM_NET_* limits require TARIT_ENABLE_NET=1");
+        }
 
         let warm_pool = load_warm_pool(file_config.as_ref())?;
 
@@ -751,6 +816,9 @@ impl Config {
                 &rootfs,
                 enable_net,
                 vm_cgroup_parent.as_deref(),
+                vm_jail.as_ref(),
+                &vm_io_quota,
+                &vm_net_quota,
                 allow_insecure_peer_http,
             )?;
         }
@@ -781,7 +849,10 @@ impl Config {
             api_request_timeout_ms,
             api_max_body_bytes,
             vm_cgroup_parent,
+            vm_jail,
             vm_cgroup_pids_max,
+            vm_io_quota,
+            vm_net_quota,
             warm_pool,
             admission_timeout_ms,
             reap_on_shutdown,
@@ -836,7 +907,10 @@ impl fmt::Debug for Config {
             .field("api_request_timeout_ms", &self.api_request_timeout_ms)
             .field("api_max_body_bytes", &self.api_max_body_bytes)
             .field("vm_cgroup_parent", &self.vm_cgroup_parent)
+            .field("vm_jail", &self.vm_jail)
             .field("vm_cgroup_pids_max", &self.vm_cgroup_pids_max)
+            .field("vm_io_quota", &self.vm_io_quota)
+            .field("vm_net_quota", &self.vm_net_quota)
             .field("warm_pool", &self.warm_pool)
             .field("admission_timeout_ms", &self.admission_timeout_ms)
             .field("reap_on_shutdown", &self.reap_on_shutdown)
@@ -1026,6 +1100,9 @@ fn validate_production_requirements(
     rootfs: &Path,
     enable_net: bool,
     vm_cgroup_parent: Option<&str>,
+    vm_jail: Option<&VmJailConfig>,
+    vm_io_quota: &VmIoQuotaConfig,
+    vm_net_quota: &VmNetQuotaConfig,
     allow_insecure_peer_http: bool,
 ) -> Result<()> {
     if database_url.is_none() {
@@ -1035,6 +1112,14 @@ fn validate_production_requirements(
     }
     if !enable_net {
         bail!("TARIT_PRODUCTION requires TARIT_ENABLE_NET=1");
+    }
+    let vm_jail = vm_jail.ok_or_else(|| {
+        anyhow::anyhow!(
+            "TARIT_PRODUCTION requires TARIT_VM_JAIL_BASE plus TARIT_VM_JAIL_UID_BASE/TARIT_VM_JAIL_GID_BASE"
+        )
+    })?;
+    if !vm_jail.base_dir.is_absolute() {
+        bail!("TARIT_VM_JAIL_BASE must be an absolute path");
     }
     // Rootfs isolation is enforced by the supervisor: every immutable base is
     // attached through a private per-VM CoW overlay. `TARIT_ROOTFS_READONLY`
@@ -1047,6 +1132,12 @@ fn validate_production_requirements(
         })?;
     if cgroup == Path::new("/sys/fs/cgroup") {
         bail!("TARIT_VM_CGROUP_PARENT must be a dedicated child cgroup");
+    }
+    if vm_io_quota.is_configured() && vm_cgroup_parent.is_none() {
+        bail!("TARIT_VM_IO_* limits require TARIT_VM_CGROUP_PARENT");
+    }
+    if vm_net_quota.is_configured() && !enable_net {
+        bail!("TARIT_VM_NET_* limits require TARIT_ENABLE_NET=1");
     }
     for (name, path) in [
         ("TARIT_VMM_BIN", vmm_bin),
@@ -1061,7 +1152,7 @@ fn validate_production_requirements(
         bail!("TARIT_PRODUCTION forbids TARIT_ALLOW_INSECURE_PEER_HTTP");
     }
     bail!(
-        "TARIT_PRODUCTION is disabled until taritd stages every VM in a unique uid/gid jail with private mounts/netns, mandatory CPU/memory/pids/io cgroups, and in-jail asset/socket path rewriting"
+        "TARIT_PRODUCTION remains disabled until taritd wires TARIT_VM_JAIL_* into per-VM uid/gid jails with private mount/pid/net namespaces and in-jail asset/socket staging"
     )
 }
 
@@ -1443,6 +1534,47 @@ fn env_optional_positive_u64(key: &str) -> Result<Option<u64>> {
         .transpose()
 }
 
+fn env_optional_positive_u32(key: &str) -> Result<Option<u32>> {
+    env_optional_positive_u64(key)?
+        .map(|value| u32::try_from(value).with_context(|| format!("{key} exceeds u32")))
+        .transpose()
+}
+
+fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
+    let base_dir = env::var("TARIT_VM_JAIL_BASE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from);
+    let uid_base = env_optional_positive_u32("TARIT_VM_JAIL_UID_BASE")?;
+    let gid_base = env_optional_positive_u32("TARIT_VM_JAIL_GID_BASE")?;
+    let id_count = env_optional_positive_u32("TARIT_VM_JAIL_ID_COUNT")?;
+
+    if base_dir.is_none() && uid_base.is_none() && gid_base.is_none() && id_count.is_none() {
+        return Ok(None);
+    }
+
+    let base_dir = base_dir.ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_BASE must be set"))?;
+    if !base_dir.is_absolute() {
+        bail!("TARIT_VM_JAIL_BASE must be an absolute path");
+    }
+    let uid_base = uid_base.ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_UID_BASE must be set"))?;
+    let gid_base = gid_base.ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_GID_BASE must be set"))?;
+    let id_count = id_count.unwrap_or_else(|| u32::try_from(max_vms.max(1)).unwrap_or(u32::MAX));
+    let required_ids = u32::try_from(max_vms.max(1))
+        .context("TARIT_MAX_VMS exceeds the supported jail uid/gid pool size")?;
+    if id_count < required_ids {
+        bail!("TARIT_VM_JAIL_ID_COUNT must be at least TARIT_MAX_VMS");
+    }
+
+    Ok(Some(VmJailConfig {
+        base_dir,
+        uid_base,
+        gid_base,
+        id_count,
+    }))
+}
+
 fn env_positive_usize(key: &str, default: usize) -> Result<usize> {
     let value = env_positive_u64(key, default as u64)?;
     usize::try_from(value).with_context(|| format!("{key} exceeds this platform's size limit"))
@@ -1493,6 +1625,12 @@ pub fn expand_path(raw: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn parse_reap(raw: Option<&str>) -> bool {
         raw.and_then(parse_bool).unwrap_or(true)
@@ -1642,5 +1780,34 @@ mod tests {
         .unwrap();
 
         assert!(warm_pool_draft_from_file(Some(&file)).finish().is_err());
+    }
+
+    #[test]
+    fn vm_jail_config_requires_base_uid_and_gid_together() {
+        let _guard = env_lock();
+        std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
+        std::env::remove_var("TARIT_VM_JAIL_UID_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_GID_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_ID_COUNT");
+        let error = parse_vm_jail_config(4).expect_err("partial jail config must fail");
+        assert!(error.to_string().contains("TARIT_VM_JAIL_UID_BASE"));
+        std::env::remove_var("TARIT_VM_JAIL_BASE");
+    }
+
+    #[test]
+    fn vm_jail_config_defaults_id_count_to_max_vms() {
+        let _guard = env_lock();
+        std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
+        std::env::set_var("TARIT_VM_JAIL_UID_BASE", "200000");
+        std::env::set_var("TARIT_VM_JAIL_GID_BASE", "300000");
+        std::env::remove_var("TARIT_VM_JAIL_ID_COUNT");
+        let jail = parse_vm_jail_config(8).unwrap().expect("jail config");
+        assert_eq!(jail.base_dir, PathBuf::from("/srv/tarit/jails"));
+        assert_eq!(jail.uid_base, 200_000);
+        assert_eq!(jail.gid_base, 300_000);
+        assert_eq!(jail.id_count, 8);
+        std::env::remove_var("TARIT_VM_JAIL_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_UID_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_GID_BASE");
     }
 }

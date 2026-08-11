@@ -524,6 +524,7 @@ pub fn router(state: AppState) -> Router {
             delete(crate::ssh_keys::delete_ssh_key),
         )
         .route("/v1/cluster", get(cluster_status))
+        .route("/v1/warm-pool", get(warm_pool_status))
         .route("/v1/usage", get(usage_stats))
         .route("/v1/audit", get(audit_log))
         .route("/metrics", get(metrics_handler))
@@ -2131,6 +2132,7 @@ async fn cluster_status(
                 free_vcpus += h.free_vcpus;
                 free_mem += h.free_memory_mib;
             }
+
             serde_json::json!({
                 "host_id": h.host_id,
                 "rpc_addr": h.rpc_addr,
@@ -2151,6 +2153,41 @@ async fn cluster_status(
         "cluster_free_vcpus": free_vcpus,
         "cluster_free_memory_mib": free_mem,
         "nodes": nodes,
+    })))
+}
+
+async fn warm_pool_status(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&identity)?;
+    let classes = state
+        .config
+        .warm_pool
+        .classes
+        .iter()
+        .map(|class| {
+            serde_json::json!({
+                "vcpus": class.vcpus,
+                "memory_mib": class.memory_mib,
+                "hard_floor": class.hard_floor,
+                "low_watermark": class.low_watermark,
+                "target": class.target,
+                "high_watermark": class.high_watermark,
+                "restore": class.restore,
+                "rootfs": class.rootfs.as_ref().map(|path| path.display().to_string()),
+                "image": class.image,
+                "depth": state.supervisor.warm_count(class.vcpus, class.memory_mib),
+                "refill_needed": class.refill_needed(state.supervisor.warm_count(class.vcpus, class.memory_mib)),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
+        "enabled": state.config.warm_pool.enabled,
+        "cpu_overcommit": state.config.warm_pool.cpu_overcommit,
+        "replenish_concurrency": state.config.warm_pool.replenish_concurrency,
+        "total_target": state.config.warm_pool.total_target(),
+        "classes": classes,
     })))
 }
 
@@ -2711,6 +2748,31 @@ mod tests {
         drop(rt);
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn admin_can_query_warm_pool_status() {
+        let app = router(test_state());
+        let rt = test_runtime();
+        let response = rt
+            .block_on(
+                app.clone().oneshot(
+                    Request::builder()
+                        .uri("/v1/warm-pool")
+                        .header("X-API-Key", "admin-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let body = rt
+            .block_on(async { axum::body::to_bytes(response.into_body(), usize::MAX).await })
+            .unwrap();
+        drop(rt);
+
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("\"replenish_concurrency\""));
     }
 
     #[test]
@@ -3720,7 +3782,10 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,
