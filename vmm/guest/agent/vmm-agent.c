@@ -257,57 +257,56 @@ static int read_line(int fd, char *line, size_t cap, bool eof_disconnect) {
 }
 
 #ifdef __linux__
-    static int read_line_with_prefix(int fd, const unsigned char *prefix, size_t prefix_len,
-                                     char *line, size_t cap, bool ignore_overflow) {
-        size_t len = 0;
-        bool overflow = false;
-        for (size_t i = 0; i < prefix_len; i++) {
-            unsigned char c = prefix[i];
-            if (c == '\r') {
-                continue;
-            }
-            if (c == '\n') {
-                if (cap > 0) {
-                    line[len] = '\0';
-                }
-                return overflow ? 1 : 0;
-            }
-            if (len + 1 < cap) {
-                line[len++] = (char)c;
-            } else {
-                overflow = true;
-            }
+static int read_line_with_prefix(int fd, const unsigned char *prefix, size_t prefix_len,
+                                 char *line, size_t cap, bool ignore_overflow) {
+    size_t len = 0;
+    bool overflow = false;
+    for (size_t i = 0; i < prefix_len; i++) {
+        unsigned char c = prefix[i];
+        if (c == '\r') {
+            continue;
         }
+        if (c == '\n') {
+            if (cap > 0) {
+                line[len] = '\0';
+            }
+            return overflow ? 1 : 0;
+        }
+        if (len + 1 < cap) {
+            line[len++] = (char)c;
+        } else {
+            overflow = true;
+        }
+    }
 
-        for (;;) {
-            char c;
-            ssize_t n = read(fd, &c, 1);
-            if (n < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return -1;
-            }
-            if (n == 0) {
-                return -1;
-            }
-            if (c == '\r') {
+    for (;;) {
+        char c;
+        ssize_t n = read(fd, &c, 1);
+        if (n < 0) {
+            if (errno == EINTR) {
                 continue;
             }
-            if (c == '\n') {
-                if (cap > 0) {
-                    line[len] = '\0';
-                }
-                return overflow ? 1 : 0;
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            if (cap > 0) {
+                line[len] = '\0';
             }
-            if (len + 1 < cap) {
-                line[len++] = c;
-            } else {
-                overflow = true;
-            }
-            if (overflow && !ignore_overflow) {
-                return 1;
-            }
+            return overflow ? 1 : 0;
+        }
+        if (len + 1 < cap) {
+            line[len++] = c;
+        } else {
+            overflow = true;
+        }
+        if (overflow && !ignore_overflow) {
+            return 1;
         }
     }
 }
@@ -462,10 +461,6 @@ static int send_exec_exit(int fd, uint64_t request_id, int exit_code) {
     payload[10] = (unsigned char)((exit_code >> 8) & 0xff);
     payload[11] = (unsigned char)(exit_code & 0xff);
     return write_exec_frame(fd, EXEC_FRAME_EXIT, payload, sizeof(payload));
-}
-
-static int send_exec_error(int fd, uint64_t request_id, const char *msg) {
-    return send_exec_chunk(fd, EXEC_FRAME_ERROR, request_id, msg, (uint32_t)strlen(msg));
 }
 
 static int read_exec_request_frame(int fd, const unsigned char magic[4], uint64_t *request_id, char **command_out) {
