@@ -753,9 +753,14 @@ fn read_exact_before(
     deadline: Instant,
 ) -> Result<bool, String> {
     while !bytes.is_empty() {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Ok(false);
         }
+        let remaining = deadline.saturating_duration_since(now);
+        stream
+            .set_read_timeout(Some(remaining.min(EXEC_IO_TIMEOUT)))
+            .map_err(|error| format!("set vsock exec read timeout: {error}"))?;
         match stream.read(bytes) {
             Ok(0) => return Err("vsock exec: peer closed".into()),
             Ok(read) => bytes = &mut bytes[read..],
