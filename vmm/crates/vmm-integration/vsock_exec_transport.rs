@@ -15,11 +15,9 @@ const STDERR: u8 = 4;
 const EXIT: u8 = 5;
 
 fn socket_path(name: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/vsock-exec-tests")
-        .join(std::process::id().to_string());
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join(format!("{name}.sock"))
+    let path = PathBuf::from(format!("/tmp/vx-{}-{name}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path
 }
 
 fn read_frame(stream: &mut UnixStream) -> (u8, Vec<u8>) {
@@ -166,5 +164,58 @@ fn channel_reconnects_after_ambiguous_timeout() {
     assert_eq!(stdout, "done\n");
     assert!(stderr.is_empty());
     second.join().unwrap();
+    let _ = std::fs::remove_file(socket);
+}
+
+#[test]
+fn channel_spools_output_larger_than_legacy_frame_limit() {
+    const CHUNK: usize = 64 * 1024;
+    const OUTPUT_LEN: usize = 17 * 1024 * 1024;
+
+    let socket = socket_path("large-output");
+    let channel = VsockExecChannel::bind(&socket).unwrap();
+    let guest = std::thread::spawn({
+        let socket = socket.clone();
+        move || {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .write_all(b"VMM_AGENT_READY\nVMM_VSOCK_EXEC_PROTO=2\n")
+                .unwrap();
+            let (kind, payload) = read_frame(&mut stream);
+            assert_eq!(kind, REQUEST);
+            let (request_id, _) = request_id_and_command(&payload);
+            write_frame(&mut stream, START, &request_id.to_be_bytes());
+
+            let bytes = vec![b'x'; CHUNK];
+            let mut remaining = OUTPUT_LEN;
+            while remaining > 0 {
+                let len = remaining.min(bytes.len());
+                let mut out = request_id.to_be_bytes().to_vec();
+                out.extend_from_slice(&bytes[..len]);
+                write_frame(&mut stream, STDOUT, &out);
+                remaining -= len;
+            }
+
+            let mut exit = request_id.to_be_bytes().to_vec();
+            exit.extend_from_slice(&0i32.to_be_bytes());
+            write_frame(&mut stream, EXIT, &exit);
+        }
+    });
+
+    for _ in 0..20 {
+        if channel.is_connected() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (code, stdout, stderr, _) = channel
+        .exec("large-output", Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(stdout.len(), OUTPUT_LEN);
+    assert!(stdout.bytes().all(|byte| byte == b'x'));
+    assert!(stderr.is_empty());
+    guest.join().unwrap();
     let _ = std::fs::remove_file(socket);
 }
