@@ -285,17 +285,18 @@ impl VsockExecChannel {
         let (connection_id, protocol, mut stream) = {
             let guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
             let connection = guard.as_ref()?;
+            let connection_id = connection.id;
             let stream = match connection.stream.try_clone() {
                 Ok(stream) => stream,
                 Err(error) => {
                     drop(guard);
-                    self.clear_connection(connection.id);
+                    self.clear_connection(connection_id);
                     return Some(Err(VsockExecError::Ambiguous(format!(
                         "clone exec stream: {error}"
                     ))));
                 }
             };
-            (connection.id, connection.protocol, stream)
+            (connection_id, connection.protocol, stream)
         };
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let outcome = run_exec(
