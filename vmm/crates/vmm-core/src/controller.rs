@@ -10,7 +10,7 @@ use crate::state::VmState;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tarit_proto::ScratchIdentity;
+use tarit_proto::{GuestNetworkRepair, ScratchIdentity};
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const EXEC_OUTPUT_CAP: usize = 16 * 1024 * 1024;
@@ -1774,6 +1774,46 @@ impl VmmController {
         Err(VmmError::Kvm("exec needs Linux+KVM+boot".into()))
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn repair_guest_network(&self, network: GuestNetworkRepair) -> Result<()> {
+        if network.addr.is_empty() || network.gateway.is_empty() {
+            return Err(VmmError::InvalidConfig(
+                "guest network repair requires addr and gateway".into(),
+            ));
+        }
+        let mut command = format!(
+            "ip addr flush dev eth0 && ip addr add {}/{} dev eth0 && ip link set eth0 up && ip route replace default via {} dev eth0",
+            shell_single_quote(&network.addr),
+            network.prefix,
+            shell_single_quote(&network.gateway),
+        );
+        if !network.dns_servers.is_empty() {
+            let mut resolv = String::from("printf '%s\\n'");
+            for dns in &network.dns_servers {
+                resolv.push(' ');
+                resolv.push_str(&shell_single_quote(&format!("nameserver {dns}")));
+            }
+            resolv.push_str(" > /etc/resolv.conf");
+            command.push_str(" && ");
+            command.push_str(&resolv);
+        }
+        let (exit_code, output, _duration_ms) = self.exec(&command, 5_000)?;
+        if exit_code == 0 {
+            Ok(())
+        } else {
+            Err(VmmError::Kvm(format!(
+                "guest network repair failed with exit {exit_code}: {output}"
+            )))
+        }
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn repair_guest_network(&self, _network: GuestNetworkRepair) -> Result<()> {
+        Err(VmmError::Kvm(
+            "guest network repair needs Linux+KVM+boot".into(),
+        ))
+    }
+
     /// Stop the VM and clear the slot.
     pub fn stop(&self) -> Result<()> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Stop)?;
@@ -1793,6 +1833,11 @@ impl Default for VmmController {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]

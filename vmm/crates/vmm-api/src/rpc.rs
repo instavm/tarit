@@ -254,6 +254,14 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 msg: format!("{e}"),
             },
         },
+        ApiRequest::RepairGuestNetwork { network } => {
+            match controller.repair_guest_network(network) {
+                Ok(()) => ApiResponse::GuestNetworkRepaired,
+                Err(e) => ApiResponse::Err {
+                    msg: format!("{e}"),
+                },
+            }
+        }
         ApiRequest::AttachPty { .. } => ApiResponse::Err {
             msg: "AttachPty is a streaming request".into(),
         },

@@ -26,6 +26,15 @@ pub struct VmSpec {
     pub config: VmConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestNetworkRepair {
+    pub addr: String,
+    pub prefix: u8,
+    pub gateway: String,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
+}
+
 /// Stable Unix file identity used to transfer ownership of VMM scratch files.
 ///
 /// The receiver must verify this identity before disarming cleanup; a path on
@@ -98,6 +107,9 @@ pub enum ApiRequest {
         #[serde(default)]
         timeout_ms: u64,
     },
+    RepairGuestNetwork {
+        network: GuestNetworkRepair,
+    },
     /// Attach an interactive PTY stream in the guest. This switches the UDS
     /// connection to PTY stream framing and does not produce an ApiResponse.
     AttachPty {
@@ -134,6 +146,7 @@ pub enum ApiResponse {
         stderr: String,
         duration_ms: u64,
     },
+    GuestNetworkRepaired,
     EgressUpdated {
         rules_applied: usize,
     },
@@ -248,6 +261,27 @@ mod tests {
                 cols: 100,
                 rows: 30,
                 shell: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn request_repair_guest_network_round_trips() {
+        let r = ApiRequest::RepairGuestNetwork {
+            network: GuestNetworkRepair {
+                addr: "10.0.0.10".into(),
+                prefix: 24,
+                gateway: "10.0.0.1".into(),
+                dns_servers: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+            },
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"op\":\"repair_guest_network\""));
+        let back: ApiRequest = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            ApiRequest::RepairGuestNetwork {
+                network: GuestNetworkRepair { prefix: 24, .. }
             }
         ));
     }
