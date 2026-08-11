@@ -120,7 +120,7 @@ struct ExecFrame {
 }
 
 struct OutputSpool {
-    owned: OwnedScratchFile,
+    _owned: OwnedScratchFile,
     writer: File,
 }
 
@@ -155,7 +155,10 @@ impl OutputSink {
             let mut writer = owned.file().try_clone()?;
             writer.write_all(&self.memory)?;
             self.memory.clear();
-            self.spool = Some(OutputSpool { owned, writer });
+            self.spool = Some(OutputSpool {
+                _owned: owned,
+                writer,
+            });
         }
         if let Some(spool) = self.spool.as_mut() {
             spool.writer.write_all(bytes)?;
