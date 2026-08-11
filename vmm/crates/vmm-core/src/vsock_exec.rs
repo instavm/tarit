@@ -2,35 +2,83 @@
 //!
 //! The virtio-vsock device bridges the guest agent's outbound connection (guest
 //! -> host CID 2, port 1024) to a per-VM Unix control socket. This module binds
-//! that socket, accepts the guest's connection, and runs exec commands over it
-//! using the same `VMM_EXEC:` / `VMM_EXEC_EXIT=` marker protocol as serial, but
-//! on a dedicated framed stream so exec output never interleaves with the ttyS0
-//! console and a connection dropped by a restore is transparently re-accepted.
+//! that socket, accepts the guest's connection, and runs exec commands over it.
+//! Newer guests advertise a chunked protocol with explicit stdout/stderr frames;
+//! older guests stay on the legacy line protocol.
 
 #![cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 
-use std::io::{ErrorKind, Read, Write};
+use crate::gc::OwnedScratchFile;
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vmm_sys_util::eventfd::EventFd;
 
-const EXEC_OUTPUT_CAP: usize = 16 * 1024 * 1024;
-const EXEC_OUTPUT_TRUNCATED: &[u8] = b"\n[VMM exec output truncated]\n";
-const EXEC_OUTPUT_PAYLOAD_CAP: usize = EXEC_OUTPUT_CAP - EXEC_OUTPUT_TRUNCATED.len();
+const READY_LINE: &str = "VMM_AGENT_READY";
+const CHUNKED_CAPABILITY_LINE: &str = "VMM_VSOCK_EXEC_PROTO=2";
+const ACCEPT_POLL_TIMEOUT: i32 = 250;
+const CONNECT_READY_TIMEOUT: Duration = Duration::from_millis(500);
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(25);
+const EXEC_IO_TIMEOUT: Duration = Duration::from_millis(200);
 const EXEC_ACC_TAIL_CAP: usize = 64 * 1024;
+const EXEC_FRAME_MAGIC: &[u8; 4] = b"VEX2";
+const EXEC_FRAME_VERSION: u8 = 2;
+const EXEC_FRAME_HEADER_LEN: usize = 10;
+const EXEC_FRAME_MAX_PAYLOAD: usize = 1024 * 1024;
+const EXEC_CHUNK_MAX_BYTES: usize = 64 * 1024;
+const EXEC_SPOOL_MEMORY_CAP: usize = 512 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecProtocol {
+    MarkerV1,
+    ChunkedV2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ExecFrameKind {
+    Request = 1,
+    Start = 2,
+    Stdout = 3,
+    Stderr = 4,
+    Exit = 5,
+    Error = 6,
+}
+
+impl ExecFrameKind {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Request),
+            2 => Some(Self::Start),
+            3 => Some(Self::Stdout),
+            4 => Some(Self::Stderr),
+            5 => Some(Self::Exit),
+            6 => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+struct ExecConnection {
+    id: u64,
+    protocol: ExecProtocol,
+    stream: UnixStream,
+}
 
 /// A live exec channel over vsock. Holds the accepted guest connection (if the
 /// agent has dialed) and re-accepts on reconnect.
 pub struct VsockExecChannel {
-    stream: Arc<Mutex<Option<UnixStream>>>,
+    stream: Arc<Mutex<Option<ExecConnection>>>,
     stop: Arc<AtomicBool>,
     pump_wake: Option<EventFd>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    next_request_id: AtomicU64,
 }
 
 /// Why a vsock exec did not return a result. The split matters because exec is
@@ -38,9 +86,7 @@ pub struct VsockExecChannel {
 /// another channel risks running it twice.
 #[derive(Debug)]
 pub enum VsockExecError {
-    /// The command line was not delivered (the trailing newline never reached
-    /// the guest, whose agent discards partial lines on disconnect). Retrying
-    /// on serial is safe.
+    /// The command line was not delivered. Retrying on serial is safe.
     NotDelivered(String),
     /// The command was (or may have been) delivered but the exchange did not
     /// complete. The guest may still run it; do not re-send.
@@ -56,35 +102,111 @@ impl std::fmt::Display for VsockExecError {
     }
 }
 
-/// Internal result of one exec exchange; tells `exec` whether the stream is
-/// still framed correctly or must be dropped so the agent re-dials.
 enum RunExecOutcome {
-    /// Clean completion up to `VMM_EXEC_EXIT=`; the stream stays usable.
-    Completed((i32, String, u64)),
-    /// Deadline passed. When `started`, the guest acknowledged the command and
-    /// its exit marker will arrive on a stream we are abandoning.
+    Completed((i32, String, String, u64)),
     TimedOut {
         started: bool,
-        output: String,
+        stdout: String,
+        stderr: String,
         duration_ms: u64,
     },
-    /// The write failed, so the newline-terminated command line never fully
-    /// reached the guest.
     WriteFailed(String),
-    /// Read-side failure after the command was delivered.
     TransportFailed(String),
 }
 
+struct ExecFrame {
+    kind: ExecFrameKind,
+    payload: Vec<u8>,
+}
+
+struct OutputSpool {
+    owned: OwnedScratchFile,
+    writer: File,
+}
+
+struct OutputSink {
+    memory: Vec<u8>,
+    spool: Option<OutputSpool>,
+}
+
+struct ExecOutputs {
+    stdout: OutputSink,
+    stderr: OutputSink,
+}
+
+impl OutputSink {
+    fn new() -> Self {
+        Self {
+            memory: Vec::new(),
+            spool: None,
+        }
+    }
+
+    fn append(&mut self, label: &str, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.spool.is_none()
+            && self.memory.len().saturating_add(bytes.len()) > EXEC_SPOOL_MEMORY_CAP
+        {
+            let path = crate::controller::unique_runtime_file_path("vsock-exec", label)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let owned = OwnedScratchFile::create_new(path)?;
+            let mut writer = owned.file().try_clone()?;
+            writer.write_all(&self.memory)?;
+            self.memory.clear();
+            self.spool = Some(OutputSpool { owned, writer });
+        }
+        if let Some(spool) = self.spool.as_mut() {
+            spool.writer.write_all(bytes)?;
+        } else {
+            self.memory.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<String> {
+        if let Some(mut spool) = self.spool.take() {
+            spool.writer.flush()?;
+            spool.writer.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            spool.writer.read_to_end(&mut bytes)?;
+            drop(spool);
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            Ok(String::from_utf8_lossy(&self.memory).into_owned())
+        }
+    }
+}
+
+impl ExecOutputs {
+    fn new() -> Self {
+        Self {
+            stdout: OutputSink::new(),
+            stderr: OutputSink::new(),
+        }
+    }
+
+    fn stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.stdout.append("stdout", bytes)
+    }
+
+    fn stderr(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.stderr.append("stderr", bytes)
+    }
+
+    fn finish(self) -> Result<(String, String), String> {
+        let stdout = self.stdout.finish().map_err(|error| error.to_string())?;
+        let stderr = self.stderr.finish().map_err(|error| error.to_string())?;
+        Ok((stdout, stderr))
+    }
+}
+
 impl VsockExecChannel {
-    /// Bind `control_socket` and spawn a thread that accepts the guest agent's
-    /// connection (the device connects here when the guest dials vsock) and
-    /// keeps the newest stream for exec.
     pub fn bind(control_socket: &Path) -> std::io::Result<Arc<Self>> {
         Self::bind_with_pump_wake(control_socket, None)
     }
 
-    /// Like [`Self::bind`], but also wakes the vsock pump after host→guest
-    /// writes so commands do not wait for the pump's stop/RX timeout.
     pub fn bind_with_pump_wake(
         control_socket: &Path,
         pump_wake: Option<EventFd>,
@@ -93,17 +215,13 @@ impl VsockExecChannel {
         let listener = UnixListener::bind(control_socket)?;
         listener.set_nonblocking(true)?;
 
-        let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let stream = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let stream_t = stream.clone();
-        let stop_t = stop.clone();
+        let next_connection_id = Arc::new(AtomicU64::new(1));
+        let stream_t = Arc::clone(&stream);
+        let stop_t = Arc::clone(&stop);
+        let next_connection_id_t = Arc::clone(&next_connection_id);
 
-        // The accept thread blocks in poll() until the guest agent connects
-        // (0 idle CPU) and wakes immediately on connect — no fixed sleep, so a
-        // freshly-booted or freshly-restored guest is picked up with no accept
-        // quantization latency. The 250ms timeout only bounds how often we
-        // re-check the stop flag. The listener stays non-blocking so accept()
-        // never blocks after a spurious wake.
         let listener_fd = listener.as_raw_fd();
         let handle = std::thread::Builder::new()
             .name("vsock-exec-accept".into())
@@ -116,19 +234,28 @@ impl VsockExecChannel {
                     };
                     // SAFETY: `pfd` points to one initialized pollfd and the
                     // listener fd remains open for the lifetime of this thread.
-                    if unsafe { libc::poll(&mut pfd, 1, 250) } <= 0 {
-                        continue; // timeout or EINTR -> re-check the stop flag
+                    if unsafe { libc::poll(&mut pfd, 1, ACCEPT_POLL_TIMEOUT) } <= 0 {
+                        continue;
                     }
                     match listener.accept() {
-                        Ok((s, _)) => {
-                            log::info!("vsock exec: guest agent connected");
-                            // Blocking with a short read timeout for the exec loop.
-                            let _ = s.set_nonblocking(false);
-                            let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
-                            // Newest connection wins (guest re-dials after restore).
-                            *stream_t.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+                        Ok((stream, _)) => {
+                            let id = next_connection_id_t.fetch_add(1, Ordering::Relaxed);
+                            match prepare_connection(stream, id) {
+                                Ok(connection) => {
+                                    log::info!(
+                                        "vsock exec: guest agent connected (protocol={:?}, conn={})",
+                                        connection.protocol,
+                                        connection.id
+                                    );
+                                    *stream_t.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection);
+                                }
+                                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                                Err(error) => {
+                                    log::warn!("vsock exec: rejected guest connection: {error}");
+                                }
+                            }
                         }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                         Err(_) => std::thread::sleep(Duration::from_millis(50)),
                     }
                 }
@@ -139,10 +266,10 @@ impl VsockExecChannel {
             stop,
             pump_wake,
             handle: Mutex::new(Some(handle)),
+            next_request_id: AtomicU64::new(1),
         }))
     }
 
-    /// True once the guest agent has dialed and a stream is available.
     pub fn is_connected(&self) -> bool {
         self.stream
             .lock()
@@ -150,59 +277,131 @@ impl VsockExecChannel {
             .is_some()
     }
 
-    /// Run `command` over vsock. Returns `None` when no guest connection
-    /// exists (caller falls back to serial); `Some(Ok(..))` on completion —
-    /// including a guest-side timeout, reported as exit `-1` with partial
-    /// output to match serial semantics; `Some(Err(..))` on a transport
-    /// failure, with [`VsockExecError`] saying whether a serial retry is safe.
-    ///
-    /// Any outcome other than clean completion leaves the stream desynced
-    /// (late reply bytes could corrupt the next exec), so it is dropped and
-    /// the guest agent re-dials; execs in the interim use serial.
     pub fn exec(
         &self,
         command: &str,
         timeout: Duration,
-    ) -> Option<Result<(i32, String, u64), VsockExecError>> {
-        let mut guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        let stream = guard.as_mut()?;
-        let outcome = run_exec(stream, command, timeout, self.pump_wake.as_ref());
+    ) -> Option<Result<(i32, String, String, u64), VsockExecError>> {
+        let (connection_id, protocol, mut stream) = {
+            let guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+            let connection = guard.as_ref()?;
+            let stream = match connection.stream.try_clone() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    drop(guard);
+                    self.clear_connection(connection.id);
+                    return Some(Err(VsockExecError::Ambiguous(format!(
+                        "clone exec stream: {error}"
+                    ))));
+                }
+            };
+            (connection.id, connection.protocol, stream)
+        };
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let outcome = run_exec(
+            &mut stream,
+            protocol,
+            request_id,
+            command,
+            timeout,
+            self.pump_wake.as_ref(),
+        );
         let (result, stream_intact) = match outcome {
-            RunExecOutcome::Completed(r) => (Ok(r), true),
+            RunExecOutcome::Completed(result) => (Ok(result), true),
             RunExecOutcome::TimedOut {
                 started: true,
-                output,
+                stdout,
+                stderr,
                 duration_ms,
-            } => (Ok((-1, output, duration_ms)), false),
+            } => (Ok((-1, stdout, stderr, duration_ms)), false),
             RunExecOutcome::TimedOut { started: false, .. } => (
                 Err(VsockExecError::Ambiguous(
                     "timed out before the guest acknowledged the command".into(),
                 )),
                 false,
             ),
-            RunExecOutcome::WriteFailed(e) => (Err(VsockExecError::NotDelivered(e)), false),
-            RunExecOutcome::TransportFailed(e) => (Err(VsockExecError::Ambiguous(e)), false),
+            RunExecOutcome::WriteFailed(error) => (Err(VsockExecError::NotDelivered(error)), false),
+            RunExecOutcome::TransportFailed(error) => {
+                (Err(VsockExecError::Ambiguous(error)), false)
+            }
         };
         if !stream_intact {
-            // Drop the connection: the agent sees EOF/EPIPE (possibly after it
-            // finishes the in-flight command) and re-dials a fresh stream.
-            *guard = None;
+            self.clear_connection(connection_id);
         }
         Some(result)
+    }
+
+    fn clear_connection(&self, connection_id: u64) {
+        let mut guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|connection| connection.id == connection_id)
+        {
+            *guard = None;
+        }
     }
 }
 
 impl Drop for VsockExecChannel {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = h.join();
+        if let Some(handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = handle.join();
         }
     }
 }
 
-/// Send one command and read back its output up to the `VMM_EXEC_EXIT=` marker.
+fn prepare_connection(
+    mut stream: UnixStream,
+    connection_id: u64,
+) -> std::io::Result<ExecConnection> {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(CONNECT_READY_TIMEOUT));
+    let ready = read_text_line(&mut stream, CONNECT_READY_TIMEOUT)?
+        .ok_or_else(|| std::io::Error::new(ErrorKind::TimedOut, "guest agent ready timeout"))?;
+    if ready != READY_LINE {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unexpected vsock exec banner: {ready:?}"),
+        ));
+    }
+    let _ = stream.set_read_timeout(Some(CAPABILITY_PROBE_TIMEOUT));
+    let protocol = match read_text_line(&mut stream, CAPABILITY_PROBE_TIMEOUT)? {
+        Some(line) if line == CHUNKED_CAPABILITY_LINE => ExecProtocol::ChunkedV2,
+        Some(line) => {
+            log::warn!("vsock exec: ignoring unexpected capability line {line:?}");
+            ExecProtocol::MarkerV1
+        }
+        None => ExecProtocol::MarkerV1,
+    };
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(None);
+    Ok(ExecConnection {
+        id: connection_id,
+        protocol,
+        stream,
+    })
+}
+
 fn run_exec(
+    stream: &mut UnixStream,
+    protocol: ExecProtocol,
+    request_id: u64,
+    command: &str,
+    timeout: Duration,
+    pump_wake: Option<&EventFd>,
+) -> RunExecOutcome {
+    let _ = stream.set_read_timeout(Some(EXEC_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(EXEC_IO_TIMEOUT));
+    match protocol {
+        ExecProtocol::MarkerV1 => run_exec_marker_v1(stream, command, timeout, pump_wake),
+        ExecProtocol::ChunkedV2 => {
+            run_exec_chunked_v2(stream, request_id, command, timeout, pump_wake)
+        }
+    }
+}
+
+fn run_exec_marker_v1(
     stream: &mut UnixStream,
     command: &str,
     timeout: Duration,
@@ -210,101 +409,560 @@ fn run_exec(
 ) -> RunExecOutcome {
     let start = Instant::now();
     let msg = format!("VMM_EXEC:{command}\n");
-    if let Err(e) = stream
+    if let Err(error) = stream
         .write_all(msg.as_bytes())
         .and_then(|_| stream.flush())
     {
-        return RunExecOutcome::WriteFailed(format!("vsock exec write: {e}"));
+        return RunExecOutcome::WriteFailed(format!("vsock exec write: {error}"));
     }
     if let Some(evt) = pump_wake {
         let _ = evt.write(1);
     }
 
-    let mut acc: Vec<u8> = Vec::new();
-    let mut output: Vec<u8> = Vec::new();
-    let mut truncated = false;
+    let mut acc = Vec::new();
+    let mut outputs = ExecOutputs::new();
     let mut started = false;
     let mut buf = [0u8; 4096];
 
     while start.elapsed() < timeout {
         match stream.read(&mut buf) {
             Ok(0) => return RunExecOutcome::TransportFailed("vsock exec: peer closed".into()),
-            Ok(n) => acc.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+            Ok(read) => acc.extend_from_slice(&buf[..read]),
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
                 continue
             }
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return RunExecOutcome::TransportFailed(format!("vsock exec read: {e}")),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return RunExecOutcome::TransportFailed(format!("vsock exec read: {error}"));
+            }
         }
-        while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+        while let Some(pos) = acc.iter().position(|&byte| byte == b'\n') {
             let mut line: Vec<u8> = acc.drain(..=pos).collect();
             line.pop();
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            let s = String::from_utf8_lossy(&line);
-            if s == "VMM_AGENT_READY" {
+            let text = String::from_utf8_lossy(&line);
+            if text == READY_LINE || text == CHUNKED_CAPABILITY_LINE {
                 continue;
             }
-            if s == "VMM_EXEC_START" {
+            if text == "VMM_EXEC_START" {
                 started = true;
                 continue;
             }
-            if let Some(code) = s.strip_prefix("VMM_EXEC_EXIT=") {
+            if let Some(code) = text.strip_prefix("VMM_EXEC_EXIT=") {
                 let exit_code: i32 = code.trim().parse().unwrap_or(0);
-                let output_str = finish_exec_output(output, truncated);
+                let (stdout, stderr) = match outputs.finish() {
+                    Ok(outputs) => outputs,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
                 return RunExecOutcome::Completed((
                     exit_code,
-                    output_str,
+                    stdout,
+                    stderr,
                     start.elapsed().as_millis() as u64,
                 ));
             }
             if started {
-                append_exec_output(&mut output, &line, &mut truncated);
-                append_exec_output(&mut output, b"\n", &mut truncated);
+                if let Err(error) = outputs.stdout(&line).and_then(|()| outputs.stdout(b"\n")) {
+                    return RunExecOutcome::TransportFailed(error.to_string());
+                }
             }
         }
-        trim_exec_accumulator(&mut acc, started, &mut output, &mut truncated);
+        if let Err(error) = trim_exec_accumulator(&mut acc, started, &mut outputs) {
+            return RunExecOutcome::TransportFailed(error.to_string());
+        }
     }
+    let (stdout, stderr) = match outputs.finish() {
+        Ok(outputs) => outputs,
+        Err(error) => return RunExecOutcome::TransportFailed(error),
+    };
     RunExecOutcome::TimedOut {
         started,
-        output: finish_exec_output(output, truncated),
+        stdout,
+        stderr,
         duration_ms: start.elapsed().as_millis() as u64,
     }
 }
 
-fn append_exec_output(output: &mut Vec<u8>, bytes: &[u8], truncated: &mut bool) {
-    if *truncated || bytes.is_empty() {
-        return;
+fn run_exec_chunked_v2(
+    stream: &mut UnixStream,
+    request_id: u64,
+    command: &str,
+    timeout: Duration,
+    pump_wake: Option<&EventFd>,
+) -> RunExecOutcome {
+    let start = Instant::now();
+    let mut payload = Vec::with_capacity(12 + command.len());
+    payload.extend_from_slice(&request_id.to_be_bytes());
+    let command_len = match u32::try_from(command.len()) {
+        Ok(length) => length,
+        Err(_) => {
+            return RunExecOutcome::WriteFailed("vsock exec command too large for protocol".into())
+        }
+    };
+    payload.extend_from_slice(&command_len.to_be_bytes());
+    payload.extend_from_slice(command.as_bytes());
+    if let Err(error) = write_exec_frame(stream, ExecFrameKind::Request, &payload) {
+        return RunExecOutcome::WriteFailed(format!("vsock exec frame write: {error}"));
     }
-    let remaining = EXEC_OUTPUT_PAYLOAD_CAP.saturating_sub(output.len());
-    if bytes.len() <= remaining {
-        output.extend_from_slice(bytes);
-        return;
+    if let Some(evt) = pump_wake {
+        let _ = evt.write(1);
     }
-    output.extend_from_slice(&bytes[..remaining]);
-    *truncated = true;
+
+    let deadline = start.checked_add(timeout).unwrap_or_else(Instant::now);
+    let mut outputs = ExecOutputs::new();
+    let mut started = false;
+
+    loop {
+        let frame = match read_exec_frame_before(stream, deadline) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                let (stdout, stderr) = match outputs.finish() {
+                    Ok(outputs) => outputs,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
+                return RunExecOutcome::TimedOut {
+                    started,
+                    stdout,
+                    stderr,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+            Err(error) => return RunExecOutcome::TransportFailed(error),
+        };
+        match frame.kind {
+            ExecFrameKind::Request => {
+                return RunExecOutcome::TransportFailed("guest echoed an exec request frame".into())
+            }
+            ExecFrameKind::Start => {
+                let frame_request_id = match parse_request_only_frame(&frame.payload) {
+                    Ok(request_id) => request_id,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
+                if frame_request_id != request_id {
+                    return RunExecOutcome::TransportFailed(format!(
+                        "unexpected exec start for request {frame_request_id} (wanted {request_id})"
+                    ));
+                }
+                started = true;
+            }
+            ExecFrameKind::Stdout => {
+                let (frame_request_id, bytes) = match parse_chunk_frame(&frame.payload) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
+                if frame_request_id != request_id {
+                    return RunExecOutcome::TransportFailed(format!(
+                        "unexpected stdout frame for request {frame_request_id} (wanted {request_id})"
+                    ));
+                }
+                if !started {
+                    return RunExecOutcome::TransportFailed(
+                        "stdout chunk arrived before exec start".into(),
+                    );
+                }
+                if let Err(error) = outputs.stdout(bytes) {
+                    return RunExecOutcome::TransportFailed(error.to_string());
+                }
+            }
+            ExecFrameKind::Stderr => {
+                let (frame_request_id, bytes) = match parse_chunk_frame(&frame.payload) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
+                if frame_request_id != request_id {
+                    return RunExecOutcome::TransportFailed(format!(
+                        "unexpected stderr frame for request {frame_request_id} (wanted {request_id})"
+                    ));
+                }
+                if !started {
+                    return RunExecOutcome::TransportFailed(
+                        "stderr chunk arrived before exec start".into(),
+                    );
+                }
+                if let Err(error) = outputs.stderr(bytes) {
+                    return RunExecOutcome::TransportFailed(error.to_string());
+                }
+            }
+            ExecFrameKind::Exit => {
+                let (frame_request_id, exit_code) = match parse_exit_frame(&frame.payload) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
+                if frame_request_id != request_id {
+                    return RunExecOutcome::TransportFailed(format!(
+                        "unexpected exec exit for request {frame_request_id} (wanted {request_id})"
+                    ));
+                }
+                let (stdout, stderr) = match outputs.finish() {
+                    Ok(outputs) => outputs,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
+                return RunExecOutcome::Completed((
+                    exit_code,
+                    stdout,
+                    stderr,
+                    start.elapsed().as_millis() as u64,
+                ));
+            }
+            ExecFrameKind::Error => {
+                let (frame_request_id, message) = match parse_error_frame(&frame.payload) {
+                    Ok(parsed) => parsed,
+                    Err(error) => return RunExecOutcome::TransportFailed(error),
+                };
+                if frame_request_id != request_id {
+                    return RunExecOutcome::TransportFailed(format!(
+                        "unexpected exec error for request {frame_request_id} (wanted {request_id})"
+                    ));
+                }
+                return RunExecOutcome::TransportFailed(format!(
+                    "guest vsock exec error: {message}"
+                ));
+            }
+        }
+    }
 }
 
 fn trim_exec_accumulator(
     acc: &mut Vec<u8>,
     started: bool,
-    output: &mut Vec<u8>,
-    truncated: &mut bool,
-) {
+    outputs: &mut ExecOutputs,
+) -> std::io::Result<()> {
     if acc.len() <= EXEC_ACC_TAIL_CAP {
-        return;
+        return Ok(());
     }
     let drain_len = acc.len() - EXEC_ACC_TAIL_CAP;
     let drained: Vec<u8> = acc.drain(..drain_len).collect();
     if started {
-        append_exec_output(output, &drained, truncated);
+        outputs.stdout(&drained)?;
+    }
+    Ok(())
+}
+
+fn read_text_line(stream: &mut UnixStream, timeout: Duration) -> std::io::Result<Option<String>> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "peer closed while reading line",
+                ))
+            }
+            Ok(1) => {
+                if byte[0] == b'\n' {
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+                }
+                line.push(byte[0]);
+                if line.len() > EXEC_ACC_TAIL_CAP {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "line exceeds vsock exec control limit",
+                    ));
+                }
+            }
+            Ok(_) => unreachable!("single-byte reads return at most one byte"),
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
-fn finish_exec_output(mut output: Vec<u8>, truncated: bool) -> String {
-    if truncated {
-        output.extend_from_slice(EXEC_OUTPUT_TRUNCATED);
+fn write_exec_frame(
+    stream: &mut UnixStream,
+    kind: ExecFrameKind,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    if payload.len() > EXEC_FRAME_MAX_PAYLOAD {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "vsock exec frame exceeds payload cap",
+        ));
     }
-    String::from_utf8_lossy(&output).to_string()
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "vsock exec payload length overflow",
+        )
+    })?;
+    let mut header = [0u8; EXEC_FRAME_HEADER_LEN];
+    header[0..4].copy_from_slice(EXEC_FRAME_MAGIC);
+    header[4] = EXEC_FRAME_VERSION;
+    header[5] = kind as u8;
+    header[6..10].copy_from_slice(&len.to_be_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(payload)?;
+    stream.flush()
+}
+
+fn read_exec_frame_before(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<Option<ExecFrame>, String> {
+    let mut header = [0u8; EXEC_FRAME_HEADER_LEN];
+    if !read_exact_before(stream, &mut header, deadline)? {
+        return Ok(None);
+    }
+    if &header[0..4] != EXEC_FRAME_MAGIC {
+        return Err("bad vsock exec frame magic".into());
+    }
+    if header[4] != EXEC_FRAME_VERSION {
+        return Err(format!(
+            "unsupported vsock exec frame version {}",
+            header[4]
+        ));
+    }
+    let kind = ExecFrameKind::from_u8(header[5])
+        .ok_or_else(|| format!("unknown vsock exec frame kind {}", header[5]))?;
+    let len = usize::try_from(u32::from_be_bytes(header[6..10].try_into().unwrap()))
+        .map_err(|_| "vsock exec frame length overflow".to_string())?;
+    if len > EXEC_FRAME_MAX_PAYLOAD {
+        return Err(format!("vsock exec frame payload too large: {len}"));
+    }
+    let mut payload = vec![0u8; len];
+    if !read_exact_before(stream, &mut payload, deadline)? {
+        return Ok(None);
+    }
+    Ok(Some(ExecFrame { kind, payload }))
+}
+
+fn read_exact_before(
+    stream: &mut UnixStream,
+    mut bytes: &mut [u8],
+    deadline: Instant,
+) -> Result<bool, String> {
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        match stream.read(bytes) {
+            Ok(0) => return Err("vsock exec: peer closed".into()),
+            Ok(read) => bytes = &mut bytes[read..],
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
+            {
+                continue
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("vsock exec read: {error}")),
+        }
+    }
+    Ok(true)
+}
+
+fn parse_request_only_frame(payload: &[u8]) -> Result<u64, String> {
+    if payload.len() != 8 {
+        return Err(format!(
+            "unexpected control payload length: {}",
+            payload.len()
+        ));
+    }
+    Ok(u64::from_be_bytes(payload.try_into().unwrap()))
+}
+
+fn parse_chunk_frame(payload: &[u8]) -> Result<(u64, &[u8]), String> {
+    if payload.len() < 8 {
+        return Err("chunk payload too short".into());
+    }
+    let request_id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+    let bytes = &payload[8..];
+    if bytes.len() > EXEC_CHUNK_MAX_BYTES {
+        return Err(format!("exec chunk too large: {}", bytes.len()));
+    }
+    Ok((request_id, bytes))
+}
+
+fn parse_exit_frame(payload: &[u8]) -> Result<(u64, i32), String> {
+    if payload.len() != 12 {
+        return Err(format!(
+            "exit payload has invalid length: {}",
+            payload.len()
+        ));
+    }
+    let request_id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+    let exit_code = i32::from_be_bytes(payload[8..12].try_into().unwrap());
+    Ok((request_id, exit_code))
+}
+
+fn parse_error_frame(payload: &[u8]) -> Result<(u64, String), String> {
+    if payload.len() < 8 {
+        return Err("error payload too short".into());
+    }
+    let request_id = u64::from_be_bytes(payload[0..8].try_into().unwrap());
+    let message = String::from_utf8_lossy(&payload[8..]).into_owned();
+    Ok((request_id, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn exec_request(stream: &mut UnixStream) -> (u64, String) {
+        let frame = read_exec_frame_before(stream, Instant::now() + Duration::from_secs(1))
+            .expect("frame read")
+            .expect("frame available");
+        assert_eq!(frame.kind, ExecFrameKind::Request);
+        let request_id = u64::from_be_bytes(frame.payload[0..8].try_into().unwrap());
+        let len = u32::from_be_bytes(frame.payload[8..12].try_into().unwrap()) as usize;
+        let command = String::from_utf8(frame.payload[12..12 + len].to_vec()).unwrap();
+        (request_id, command)
+    }
+
+    fn write_start(stream: &mut UnixStream, request_id: u64) {
+        write_exec_frame(stream, ExecFrameKind::Start, &request_id.to_be_bytes()).unwrap();
+    }
+
+    fn write_chunk(stream: &mut UnixStream, kind: ExecFrameKind, request_id: u64, bytes: &[u8]) {
+        let mut payload = Vec::with_capacity(8 + bytes.len());
+        payload.extend_from_slice(&request_id.to_be_bytes());
+        payload.extend_from_slice(bytes);
+        write_exec_frame(stream, kind, &payload).unwrap();
+    }
+
+    fn write_exit(stream: &mut UnixStream, request_id: u64, exit_code: i32) {
+        let mut payload = Vec::with_capacity(12);
+        payload.extend_from_slice(&request_id.to_be_bytes());
+        payload.extend_from_slice(&exit_code.to_be_bytes());
+        write_exec_frame(stream, ExecFrameKind::Exit, &payload).unwrap();
+    }
+
+    #[test]
+    fn chunked_exec_keeps_stdout_and_stderr_separate() {
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut guest = guest;
+            let (request_id, command) = exec_request(&mut guest);
+            assert_eq!(command, "echo separated");
+            write_start(&mut guest, request_id);
+            write_chunk(&mut guest, ExecFrameKind::Stdout, request_id, b"out\n");
+            write_chunk(&mut guest, ExecFrameKind::Stderr, request_id, b"err\n");
+            write_exit(&mut guest, request_id, 7);
+        });
+
+        let outcome = run_exec_chunked_v2(
+            &mut host,
+            11,
+            "echo separated",
+            Duration::from_secs(1),
+            None,
+        );
+        match outcome {
+            RunExecOutcome::Completed((exit, stdout, stderr, _)) => {
+                assert_eq!(exit, 7);
+                assert_eq!(stdout, "out\n");
+                assert_eq!(stderr, "err\n");
+            }
+            _ => panic!("unexpected outcome"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn chunked_exec_streams_more_than_sixteen_mib_losslessly() {
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let total = 17 * 1024 * 1024;
+        let server = std::thread::spawn(move || {
+            let mut guest = guest;
+            let (request_id, _) = exec_request(&mut guest);
+            write_start(&mut guest, request_id);
+            let chunk = vec![b'x'; EXEC_CHUNK_MAX_BYTES];
+            let mut sent = 0usize;
+            while sent < total {
+                let remaining = total - sent;
+                let bytes = &chunk[..remaining.min(chunk.len())];
+                write_chunk(&mut guest, ExecFrameKind::Stdout, request_id, bytes);
+                sent += bytes.len();
+            }
+            write_exit(&mut guest, request_id, 0);
+        });
+
+        let outcome = run_exec_chunked_v2(&mut host, 12, "emit-big", Duration::from_secs(5), None);
+        match outcome {
+            RunExecOutcome::Completed((exit, stdout, stderr, _)) => {
+                assert_eq!(exit, 0);
+                assert_eq!(stdout.len(), total);
+                assert!(stdout.bytes().all(|byte| byte == b'x'));
+                assert!(stderr.is_empty());
+            }
+            _ => panic!("unexpected outcome"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn marker_exec_reports_timeout_with_partial_output() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut request = [0u8; 64];
+            let _ = guest.read(&mut request).unwrap();
+            guest.write_all(b"VMM_EXEC_START\npartial").unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+        });
+
+        let outcome = run_exec_marker_v1(&mut host, "sleep", Duration::from_millis(40), None);
+        match outcome {
+            RunExecOutcome::TimedOut {
+                started,
+                stdout,
+                stderr,
+                ..
+            } => {
+                assert!(started);
+                assert_eq!(stdout, "partial");
+                assert!(stderr.is_empty());
+            }
+            _ => panic!("unexpected outcome"),
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn chunked_exec_detects_disconnects() {
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut guest = guest;
+            let _ = exec_request(&mut guest);
+        });
+
+        let outcome =
+            run_exec_chunked_v2(&mut host, 13, "disconnect", Duration::from_secs(1), None);
+        assert!(
+            matches!(outcome, RunExecOutcome::TransportFailed(message) if message.contains("peer closed"))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn chunked_exec_rejects_reconnect_reply_with_wrong_request_id() {
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut guest = guest;
+            let (request_id, _) = exec_request(&mut guest);
+            write_start(&mut guest, request_id + 1);
+        });
+
+        let outcome = run_exec_chunked_v2(&mut host, 14, "wrong-id", Duration::from_secs(1), None);
+        assert!(
+            matches!(outcome, RunExecOutcome::TransportFailed(message) if message.contains("unexpected exec start"))
+        );
+        server.join().unwrap();
+    }
 }

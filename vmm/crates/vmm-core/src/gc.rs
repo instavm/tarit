@@ -165,6 +165,24 @@ impl OwnedScratchFile {
         &self._file
     }
 
+    /// Atomically publish this owned file at `target`, updating the tracked
+    /// path while retaining ownership of the same inode.
+    pub fn rename_to(&mut self, target: impl Into<PathBuf>) -> io::Result<()> {
+        let target = target.into();
+        if self.path == target {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            sync_directory(parent)?;
+        }
+        fs::rename(&self.path, &target)?;
+        if let Some(parent) = target.parent() {
+            sync_directory(parent)?;
+        }
+        self.path = target;
+        Ok(())
+    }
+
     /// Remove the file if it still points at the inode this VM created.
     pub fn remove(&self) -> io::Result<bool> {
         if !self.still_points_to_owned_file()? {
@@ -370,6 +388,11 @@ fn file_identity(metadata: fs::Metadata) -> ScratchIdentity {
         created_secs,
         created_nanos,
     }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let dir = File::open(path)?;
+    dir.sync_all()
 }
 
 #[cfg(target_os = "linux")]

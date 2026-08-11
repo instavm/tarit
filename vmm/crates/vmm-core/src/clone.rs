@@ -141,14 +141,35 @@ pub fn clone_fanout(
 pub fn create_cow_overlay(base_path: &str, overlay_path: &str) -> Result<(), String> {
     use std::fs;
     use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
 
     let src = fs::File::open(base_path).map_err(|e| format!("open base: {e}"))?;
-    let dst = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(overlay_path)
-        .map_err(|e| format!("create overlay: {e}"))?;
+    let overlay_path = PathBuf::from(overlay_path);
+    let parent = overlay_path
+        .parent()
+        .ok_or_else(|| format!("overlay path has no parent: {}", overlay_path.display()))?;
+    let file_name = overlay_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid overlay path: {}", overlay_path.display()))?;
+    let stage_path = parent.join(format!(
+        ".{file_name}.stage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let dst = options
+        .open(&stage_path)
+        .map_err(|e| format!("create staged overlay {}: {e}", stage_path.display()))?;
 
     let src_size = src.metadata().map_err(|e| format!("metadata: {e}"))?.len();
 
@@ -173,12 +194,26 @@ pub fn create_cow_overlay(base_path: &str, overlay_path: &str) -> Result<(), Str
         let mut src = fs::File::open(base_path).map_err(|e| format!("reopen: {e}"))?;
         std::io::copy(
             &mut src,
-            &mut fs::File::create(overlay_path).map_err(|e| format!("recreate: {e}"))?,
+            &mut dst
+                .try_clone()
+                .map_err(|e| format!("clone staged overlay: {e}"))?,
         )
         .map_err(|e| format!("copy: {e}"))?;
     }
+    dst.sync_all()
+        .map_err(|e| format!("sync staged overlay {}: {e}", stage_path.display()))?;
+    fs::rename(&stage_path, &overlay_path).map_err(|e| {
+        format!(
+            "publish staged overlay {} -> {}: {e}",
+            stage_path.display(),
+            overlay_path.display()
+        )
+    })?;
 
-    log::info!("CoW overlay: {base_path} → {overlay_path} ({src_size} bytes)");
+    log::info!(
+        "CoW overlay: {base_path} → {} ({src_size} bytes)",
+        overlay_path.display()
+    );
     Ok(())
 }
 

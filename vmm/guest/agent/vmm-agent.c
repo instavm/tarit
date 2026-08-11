@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -27,6 +28,8 @@
 
 #define EXEC_PREFIX "VMM_EXEC:"
 #define EXEC_PREFIX_LEN 9
+#define REPAIR_NET_PREFIX "VMM_REPAIR_NET:"
+#define REPAIR_NET_PREFIX_LEN 15
 
 /* Host-side vsock port the agent dials for the exec channel. The VMM bridges
  * (guest_cid, this port) → a per-VM host Unix socket the controller accepts on.
@@ -46,10 +49,30 @@
 #define PTY_FRAME_ERROR 3
 #define PTY_FRAME_START 4
 #define PTY_MAX_FRAME_LEN (16U * 1024U * 1024U)
+#define EXEC_FRAME_MAGIC "VEX2"
+#define EXEC_FRAME_MAGIC_LEN 4U
+#define EXEC_FRAME_VERSION 2U
+#define EXEC_FRAME_REQUEST 1U
+#define EXEC_FRAME_START 2U
+#define EXEC_FRAME_STDOUT 3U
+#define EXEC_FRAME_STDERR 4U
+#define EXEC_FRAME_EXIT 5U
+#define EXEC_FRAME_ERROR 6U
+#define EXEC_FRAME_MAX_PAYLOAD (1024U * 1024U)
+#define EXEC_STREAM_CHUNK_BYTES (16U * 1024U)
+#define EXEC_PROTOCOL_LINE "VMM_VSOCK_EXEC_PROTO=2\n"
 
 /* A sane default PATH so commands (node, python, ...) resolve when we run as
  * init on an OCI-derived rootfs where no login shell exported one. */
 #define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+static const char *json_value_for_key(const char *json, const char *key);
+static bool json_get_u16(const char *json, const char *key, uint16_t *out);
+#ifdef __linux__
+static int read_line_with_prefix(int fd, const unsigned char *prefix, size_t prefix_len,
+                                 char *line, size_t cap, bool ignore_overflow);
+static int read_exact_fd(int fd, void *buf, size_t len);
+#endif
 
 static int write_all(int fd, const void *buf, size_t len) {
     const unsigned char *p = (const unsigned char *)buf;
@@ -233,6 +256,63 @@ static int read_line(int fd, char *line, size_t cap, bool eof_disconnect) {
     }
 }
 
+#ifdef __linux__
+    static int read_line_with_prefix(int fd, const unsigned char *prefix, size_t prefix_len,
+                                     char *line, size_t cap, bool ignore_overflow) {
+        size_t len = 0;
+        bool overflow = false;
+        for (size_t i = 0; i < prefix_len; i++) {
+            unsigned char c = prefix[i];
+            if (c == '\r') {
+                continue;
+            }
+            if (c == '\n') {
+                if (cap > 0) {
+                    line[len] = '\0';
+                }
+                return overflow ? 1 : 0;
+            }
+            if (len + 1 < cap) {
+                line[len++] = (char)c;
+            } else {
+                overflow = true;
+            }
+        }
+
+        for (;;) {
+            char c;
+            ssize_t n = read(fd, &c, 1);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            if (n == 0) {
+                return -1;
+            }
+            if (c == '\r') {
+                continue;
+            }
+            if (c == '\n') {
+                if (cap > 0) {
+                    line[len] = '\0';
+                }
+                return overflow ? 1 : 0;
+            }
+            if (len + 1 < cap) {
+                line[len++] = c;
+            } else {
+                overflow = true;
+            }
+            if (overflow && !ignore_overflow) {
+                return 1;
+            }
+        }
+    }
+}
+#endif
+
 static int status_to_exit_code(int status) {
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
@@ -314,6 +394,426 @@ static void run_command(int serial_fd, const char *command) {
         (void)serial_write(serial_fd, "\n", 1);
     }
     serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", exit_code);
+}
+
+#ifdef __linux__
+static void write_be64(unsigned char *out, uint64_t value) {
+    for (int i = 7; i >= 0; i--) {
+        out[i] = (unsigned char)(value & 0xffU);
+        value >>= 8;
+    }
+}
+
+static uint64_t read_be64(const unsigned char *in) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < 8; i++) {
+        value = (value << 8) | (uint64_t)in[i];
+    }
+    return value;
+}
+
+static int write_exec_frame(int fd, uint8_t kind, const void *payload, uint32_t len) {
+    unsigned char header[10];
+    if (len > EXEC_FRAME_MAX_PAYLOAD) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    memcpy(header, EXEC_FRAME_MAGIC, EXEC_FRAME_MAGIC_LEN);
+    header[4] = EXEC_FRAME_VERSION;
+    header[5] = kind;
+    header[6] = (unsigned char)((len >> 24) & 0xffU);
+    header[7] = (unsigned char)((len >> 16) & 0xffU);
+    header[8] = (unsigned char)((len >> 8) & 0xffU);
+    header[9] = (unsigned char)(len & 0xffU);
+    if (write_all(fd, header, sizeof(header)) < 0) {
+        return -1;
+    }
+    if (len > 0 && write_all(fd, payload, len) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int send_exec_start(int fd, uint64_t request_id) {
+    unsigned char payload[8];
+    write_be64(payload, request_id);
+    return write_exec_frame(fd, EXEC_FRAME_START, payload, sizeof(payload));
+}
+
+static int send_exec_chunk(int fd, uint8_t kind, uint64_t request_id, const void *bytes, uint32_t len) {
+    unsigned char *payload = (unsigned char *)malloc(8U + len);
+    if (payload == NULL) {
+        return -1;
+    }
+    write_be64(payload, request_id);
+    if (len > 0) {
+        memcpy(payload + 8, bytes, len);
+    }
+    int rc = write_exec_frame(fd, kind, payload, 8U + len);
+    free(payload);
+    return rc;
+}
+
+static int send_exec_exit(int fd, uint64_t request_id, int exit_code) {
+    unsigned char payload[12];
+    write_be64(payload, request_id);
+    payload[8] = (unsigned char)((exit_code >> 24) & 0xff);
+    payload[9] = (unsigned char)((exit_code >> 16) & 0xff);
+    payload[10] = (unsigned char)((exit_code >> 8) & 0xff);
+    payload[11] = (unsigned char)(exit_code & 0xff);
+    return write_exec_frame(fd, EXEC_FRAME_EXIT, payload, sizeof(payload));
+}
+
+static int send_exec_error(int fd, uint64_t request_id, const char *msg) {
+    return send_exec_chunk(fd, EXEC_FRAME_ERROR, request_id, msg, (uint32_t)strlen(msg));
+}
+
+static int read_exec_request_frame(int fd, const unsigned char magic[4], uint64_t *request_id, char **command_out) {
+    unsigned char header[6];
+    if (memcmp(magic, EXEC_FRAME_MAGIC, EXEC_FRAME_MAGIC_LEN) != 0) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (read_exact_fd(fd, header, sizeof(header)) != 0) {
+        return -1;
+    }
+    if (header[0] != EXEC_FRAME_VERSION || header[1] != EXEC_FRAME_REQUEST) {
+        errno = EPROTO;
+        return -1;
+    }
+    uint32_t len = ((uint32_t)header[2] << 24) | ((uint32_t)header[3] << 16) |
+                   ((uint32_t)header[4] << 8) | (uint32_t)header[5];
+    if (len < 12U || len > EXEC_FRAME_MAX_PAYLOAD) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    unsigned char *payload = (unsigned char *)malloc(len + 1U);
+    if (payload == NULL) {
+        return -1;
+    }
+    int rc = read_exact_fd(fd, payload, len);
+    if (rc != 0) {
+        free(payload);
+        return -1;
+    }
+    *request_id = read_be64(payload);
+    uint32_t command_len = ((uint32_t)payload[8] << 24) | ((uint32_t)payload[9] << 16) |
+                           ((uint32_t)payload[10] << 8) | (uint32_t)payload[11];
+    if (command_len != len - 12U) {
+        free(payload);
+        errno = EPROTO;
+        return -1;
+    }
+    payload[len] = '\0';
+    *command_out = (char *)payload;
+    memmove(*command_out, payload + 12, command_len);
+    (*command_out)[command_len] = '\0';
+    return 0;
+}
+
+static void run_command_chunked(int fd, uint64_t request_id, const char *command) {
+    int stdout_pipe[2] = { -1, -1 };
+    int stderr_pipe[2] = { -1, -1 };
+    if (send_exec_start(fd, request_id) < 0) {
+        return;
+    }
+    if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+        char message[128];
+        snprintf(message, sizeof(message), "vmm-agent: pipe failed: %s", strerror(errno));
+        (void)send_exec_chunk(fd, EXEC_FRAME_STDERR, request_id, message, (uint32_t)strlen(message));
+        (void)send_exec_chunk(fd, EXEC_FRAME_STDERR, request_id, "\n", 1U);
+        (void)send_exec_exit(fd, request_id, 127);
+        if (stdout_pipe[0] >= 0) close(stdout_pipe[0]);
+        if (stdout_pipe[1] >= 0) close(stdout_pipe[1]);
+        if (stderr_pipe[0] >= 0) close(stderr_pipe[0]);
+        if (stderr_pipe[1] >= 0) close(stderr_pipe[1]);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        char message[128];
+        snprintf(message, sizeof(message), "vmm-agent: fork failed: %s", strerror(errno));
+        (void)send_exec_chunk(fd, EXEC_FRAME_STDERR, request_id, message, (uint32_t)strlen(message));
+        (void)send_exec_chunk(fd, EXEC_FRAME_STDERR, request_id, "\n", 1U);
+        (void)send_exec_exit(fd, request_id, 127);
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
+        return;
+    }
+
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || dup2(stderr_pipe[1], STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    struct pollfd pfds[2];
+    pfds[0].fd = stdout_pipe[0];
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    pfds[1].fd = stderr_pipe[0];
+    pfds[1].events = POLLIN;
+    pfds[1].revents = 0;
+
+    while (pfds[0].fd >= 0 || pfds[1].fd >= 0) {
+        int prc = poll(pfds, 2, -1);
+        if (prc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        for (size_t i = 0; i < 2; i++) {
+            if (pfds[i].fd < 0 || !(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
+                continue;
+            }
+            char buf[EXEC_STREAM_CHUNK_BYTES];
+            ssize_t n = read(pfds[i].fd, buf, sizeof(buf));
+            if (n < 0) {
+                if (errno == EINTR || errno == EAGAIN) {
+                    continue;
+                }
+                close(pfds[i].fd);
+                pfds[i].fd = -1;
+                continue;
+            }
+            if (n == 0) {
+                close(pfds[i].fd);
+                pfds[i].fd = -1;
+                continue;
+            }
+            (void)send_exec_chunk(fd, i == 0 ? EXEC_FRAME_STDOUT : EXEC_FRAME_STDERR,
+                                  request_id, buf, (uint32_t)n);
+        }
+    }
+
+    if (stdout_pipe[0] >= 0) {
+        close(stdout_pipe[0]);
+    }
+    if (stderr_pipe[0] >= 0) {
+        close(stderr_pipe[0]);
+    }
+    (void)send_exec_exit(fd, request_id, wait_for_child(pid));
+}
+#endif
+
+static bool json_get_string_field(const char *json, const char *key, char *out, size_t cap) {
+    const char *p = json_value_for_key(json, key);
+    if (p == NULL || cap == 0 || *p != '"') {
+        return false;
+    }
+    p++;
+    size_t j = 0;
+    while (*p != '\0' && *p != '"') {
+        char ch = *p++;
+        if (ch == '\\') {
+            ch = *p++;
+            switch (ch) {
+            case '"':
+            case '\\':
+            case '/':
+                break;
+            case 'b':
+                ch = '\b';
+                break;
+            case 'f':
+                ch = '\f';
+                break;
+            case 'n':
+                ch = '\n';
+                break;
+            case 'r':
+                ch = '\r';
+                break;
+            case 't':
+                ch = '\t';
+                break;
+            default:
+                return false;
+            }
+        }
+        if (j + 1 >= cap) {
+            return false;
+        }
+        out[j++] = ch;
+    }
+    if (*p != '"') {
+        return false;
+    }
+    out[j] = '\0';
+    return j > 0;
+}
+
+static size_t json_get_string_array(const char *json, const char *key, char out[][64], size_t max_items) {
+    const char *p = json_value_for_key(json, key);
+    if (p == NULL || *p != '[') {
+        return 0;
+    }
+    p++;
+    size_t count = 0;
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            p++;
+        }
+        if (*p == ']') {
+            return count;
+        }
+        if (*p != '"' || count >= max_items) {
+            return 0;
+        }
+        p++;
+        size_t j = 0;
+        while (*p != '\0' && *p != '"') {
+            char ch = *p++;
+            if (ch == '\\') {
+                ch = *p++;
+                if (!(ch == '"' || ch == '\\' || ch == '/')) {
+                    return 0;
+                }
+            }
+            if (j + 1 >= sizeof(out[0])) {
+                return 0;
+            }
+            out[count][j++] = ch;
+        }
+        if (*p != '"') {
+            return 0;
+        }
+        out[count][j] = '\0';
+        count++;
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            p++;
+        }
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == ']') {
+            return count;
+        }
+        return 0;
+    }
+}
+
+static int run_argv_and_stream_output(int serial_fd, char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        serial_printf(serial_fd, "fork failed: %s\n", strerror(errno));
+        return 127;
+    }
+    if (pid == 0) {
+        if (dup2(serial_fd, STDOUT_FILENO) < 0 || dup2(serial_fd, STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    return wait_for_child(pid);
+}
+
+static int write_resolv_conf(char dns[][64], size_t dns_count) {
+    int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < dns_count; i++) {
+        if (dprintf(fd, "nameserver %s\n", dns[i]) < 0) {
+            close(fd);
+            return -1;
+        }
+    }
+    if (fsync(fd) < 0) {
+        close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+static void run_guest_network_repair(int serial_fd, const char *json) {
+    char addr[64];
+    char gateway[64];
+    char dns[4][64];
+    uint16_t prefix_u16 = 0;
+    size_t dns_count = 0;
+    struct in_addr ignored;
+
+    (void)serial_write(serial_fd, "VMM_REPAIR_NET_START\n", 21);
+    if (!json_get_string_field(json, "addr", addr, sizeof(addr)) ||
+        !json_get_u16(json, "prefix", &prefix_u16) ||
+        !json_get_string_field(json, "gateway", gateway, sizeof(gateway))) {
+        (void)serial_write(serial_fd, "invalid network repair payload\n", 31);
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", 64);
+        return;
+    }
+    if (prefix_u16 > 32U ||
+        inet_pton(AF_INET, addr, &ignored) != 1 ||
+        inet_pton(AF_INET, gateway, &ignored) != 1) {
+        (void)serial_write(serial_fd, "invalid IPv4 network repair settings\n", 37);
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", 65);
+        return;
+    }
+    dns_count = json_get_string_array(json, "dns_servers", dns, 4);
+    for (size_t i = 0; i < dns_count; i++) {
+        if (inet_pton(AF_INET, dns[i], &ignored) != 1) {
+            (void)serial_write(serial_fd, "invalid DNS server in network repair payload\n", 45);
+            serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", 66);
+            return;
+        }
+    }
+
+    char prefix[4];
+    snprintf(prefix, sizeof(prefix), "%u", (unsigned)prefix_u16);
+    char cidr[80];
+    snprintf(cidr, sizeof(cidr), "%s/%s", addr, prefix);
+
+    char *flush_argv[] = {"ip", "addr", "flush", "dev", "eth0", "scope", "global", NULL};
+    int exit_code = run_argv_and_stream_output(serial_fd, flush_argv);
+    if (exit_code != 0) {
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
+        return;
+    }
+
+    char *addr_argv[] = {"ip", "addr", "add", cidr, "dev", "eth0", NULL};
+    exit_code = run_argv_and_stream_output(serial_fd, addr_argv);
+    if (exit_code != 0) {
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
+        return;
+    }
+
+    char *link_argv[] = {"ip", "link", "set", "eth0", "up", NULL};
+    exit_code = run_argv_and_stream_output(serial_fd, link_argv);
+    if (exit_code != 0) {
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
+        return;
+    }
+
+    char *route_argv[] = {"ip", "route", "replace", "default", "via", gateway, NULL};
+    exit_code = run_argv_and_stream_output(serial_fd, route_argv);
+    if (exit_code != 0) {
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
+        return;
+    }
+
+    if (dns_count > 0 && write_resolv_conf(dns, dns_count) < 0) {
+        serial_printf(serial_fd, "write /etc/resolv.conf failed: %s\n", strerror(errno));
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", 74);
+        return;
+    }
+
+    serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", 0);
 }
 
 #ifdef __linux__
@@ -825,16 +1325,37 @@ static void serve_vsock_forever(void) {
         }
         reconnect_backoff_us = VSOCK_RECONNECT_BACKOFF_INITIAL_US;
         (void)serial_write(fd, "VMM_AGENT_READY\n", 16);
+        (void)serial_write(fd, EXEC_PROTOCOL_LINE, sizeof(EXEC_PROTOCOL_LINE) - 1U);
         for (;;) {
-            int rc = read_line(fd, line, sizeof(line), true);
+            unsigned char prefix[EXEC_FRAME_MAGIC_LEN];
+            int rc = read_exact_fd(fd, prefix, sizeof(prefix));
             if (rc < 0) {
                 break; /* peer closed (e.g. after restore) -> reconnect */
+            }
+            if (rc > 0) {
+                break;
+            }
+            if (memcmp(prefix, EXEC_FRAME_MAGIC, EXEC_FRAME_MAGIC_LEN) == 0) {
+                uint64_t request_id = 0;
+                char *command = NULL;
+                if (read_exec_request_frame(fd, prefix, &request_id, &command) < 0) {
+                    break;
+                }
+                run_command_chunked(fd, request_id, command);
+                free(command);
+                continue;
+            }
+            rc = read_line_with_prefix(fd, prefix, sizeof(prefix), line, sizeof(line), true);
+            if (rc < 0) {
+                break;
             }
             if (rc > 0 || line[0] == '\0') {
                 continue;
             }
             if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
                 run_command(fd, line + EXEC_PREFIX_LEN);
+            } else if (strncmp(line, REPAIR_NET_PREFIX, REPAIR_NET_PREFIX_LEN) == 0) {
+                run_guest_network_repair(fd, line + REPAIR_NET_PREFIX_LEN);
             }
         }
         close(fd);
@@ -901,6 +1422,8 @@ int main(void) {
         }
         if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
             run_command(serial_fd, line + EXEC_PREFIX_LEN);
+        } else if (strncmp(line, REPAIR_NET_PREFIX, REPAIR_NET_PREFIX_LEN) == 0) {
+            run_guest_network_repair(serial_fd, line + REPAIR_NET_PREFIX_LEN);
         }
     }
 }

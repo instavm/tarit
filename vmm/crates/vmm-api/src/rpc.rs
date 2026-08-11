@@ -219,12 +219,21 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             snapshot_path,
             overlay,
             net,
-        } => match controller.restore_with_overrides(&snapshot_path, overlay, net) {
+            memory_policy,
+        } => match controller.restore_with_overrides(&snapshot_path, overlay, net, memory_policy) {
             Ok(()) => ApiResponse::Restored,
             Err(e) => ApiResponse::Err {
                 msg: format!("{e}"),
             },
         },
+        ApiRequest::RepairGuestNetwork { network } => {
+            match controller.repair_guest_network(network) {
+                Ok(()) => ApiResponse::GuestNetworkRepaired,
+                Err(e) => ApiResponse::Err {
+                    msg: format!("{e}"),
+                },
+            }
+        }
         ApiRequest::Stop => match controller.stop() {
             Ok(()) => ApiResponse::Ok,
             Err(e) => ApiResponse::Err {
@@ -235,10 +244,10 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             command,
             timeout_ms,
         } => match controller.exec(&command, timeout_ms) {
-            Ok((exit_code, stdout, duration_ms)) => ApiResponse::Exec {
+            Ok((exit_code, stdout, stderr, duration_ms)) => ApiResponse::Exec {
                 exit_code,
                 stdout,
-                stderr: String::new(),
+                stderr,
                 duration_ms,
             },
             Err(e) => ApiResponse::Err {
