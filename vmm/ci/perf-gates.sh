@@ -182,7 +182,7 @@ def frame(sock_path, request):
         raise InvalidRun(f"request frame is too large: {len(body)}")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(60)
-        client.connect(sock_path)
+        client.connect(os.fspath(sock_path))
         client.sendall(struct.pack(">I", len(body)) + body)
         response_len = struct.unpack(">I", recv_exact(client, 4))[0]
         if response_len > MAX_FRAME:
