@@ -71,6 +71,7 @@ fn is_process_gone(error: &std::io::Error) -> bool {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 fn tolerate_process_disappearance<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -221,6 +222,7 @@ impl ProcessVerificationError {
         matches!(self, Self::Gone { .. })
     }
 
+    #[cfg(test)]
     fn is_permission_denied(&self) -> bool {
         matches!(
             self,
