@@ -410,6 +410,21 @@ Set `diff` to `true` to request a diff snapshot.
 `timeout_ms` defaults to `0` in the wire type. The controller treats `0` as
 the built-in 30 second timeout.
 
+#### `repair_guest_network`: Reapply guest IPv4 configuration
+```json
+{
+  "op": "repair_guest_network",
+  "network": {
+    "addr": "172.16.0.2",
+    "prefix": 30,
+    "gateway": "172.16.0.1",
+    "dns_servers": []
+  }
+}
+```
+The address and gateway must be IPv4 addresses, the prefix must be `0..=32`,
+and each DNS entry must be an IP address.
+
 #### `attach_pty`: Attach an interactive PTY stream
 ```json
 { "op": "attach_pty", "cols": 120, "rows": 40, "shell": "/bin/sh" }
@@ -445,6 +460,7 @@ All responses are JSON objects with a `status` field:
 | `snapshot` | `path` | `snapshot` |
 | `restored` | none | `restore` |
 | `exec` | `exit_code`, `stdout`, `stderr`, `duration_ms` | `exec` |
+| `guest_network_repaired` | none | `repair_guest_network` |
 | `egress_updated` | `rules_applied` | `update_egress` |
 | `vm_status` | `state`, `uptime_ms`, `vcpus`, `mem_mib`, `volumes`, `nets`, `kernel`, `vcpu_alive` | `status` |
 | `err` | `msg` | Any non-PTY request |

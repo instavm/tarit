@@ -151,7 +151,7 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 | POST/GET/DELETE | `/v1/ssh-keys[/{key_id}]` | Register, list, and deactivate caller-scoped OpenSSH public keys. |
 | POST/GET/DELETE | `/v1/vms/{id}/pty/sessions[/{pty_id}]` | Manage local PTY session records for a VM. |
 | POST | `/v1/vms/{id}/pty/sessions/{pty_id}/resize` | Update a PTY session's recorded dimensions. |
-| WS | `/v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` | Bridge WebSocket PTY bytes to the owning local VMM stream. The token comes from the create-session response. |
+| WS | `/v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` | Bridge WebSocket PTY bytes to the owning local VMM stream. One connection is active per session; the session can reconnect after disconnect. |
 | GET | `/v1/cluster` | Admin-only cluster capacity and health summary. |
 | GET | `/v1/usage` | Per-key usage stats from the primary store (admin: all keys; user: own). |
 | GET | `/v1/audit` | Per-key audit trail from the primary store (admin: all keys; user: own). |

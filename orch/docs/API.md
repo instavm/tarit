@@ -7,7 +7,7 @@ This document reflects the Rust handlers in `crates/taritd/src/api.rs` and `crat
 | Surface | Header | Applies to |
 | --- | --- | --- |
 | Public API | `X-API-Key: <api key>` | All `/v1/*` routes. Keys resolve to a tenant and role. |
-| PTY WebSocket | `?token=<connect_token>` | `/v1/vms/{id}/pty/{pty_id}/connect`. The one-time token comes from the create-session response and expires after 5 minutes. |
+| PTY WebSocket | `?token=<connect_token>` | `/v1/vms/{id}/pty/{pty_id}/connect`. The session token comes from the create-session response and expires after 5 minutes without a connection. |
 | Peer API | target-bound request HMAC derived from `TARIT_PEER_SECRET` | All `/internal/v1/*` routes. The shared key is never sent. |
 | Unauthenticated | none | `/health`, `/livez`, `/startupz`, `/readyz`, `/openapi.yaml`, `/docs`. |
 
@@ -379,7 +379,9 @@ Response `201`:
 { "pty_id": "uuid", "cols": 80, "rows": 24, "connect_token": "..." }
 ```
 
-`connect_token` is a one-time per-session secret. Pass it as the `token` query parameter when attaching over the WebSocket route below. It expires after 5 minutes or on first successful connect.
+`connect_token` is a per-session secret. Pass it as the `token` query parameter
+when attaching over the WebSocket route below. It expires five minutes after
+creation or the most recent disconnect.
 
 Additional REST routes:
 
@@ -390,9 +392,9 @@ Additional REST routes:
 | `DELETE` | `/v1/vms/{id}/pty/sessions/{pty_id}` | `204` no body |
 | `POST` | `/v1/vms/{id}/pty/sessions/{pty_id}/resize` | `{ "pty_id": "uuid", "cols": N, "rows": N }` |
 
-`WS /v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` upgrades to a WebSocket. It authenticates with the session's one-time `connect_token`, not the API key. Before upgrading, taritd reserves the configured global, authenticated-tenant, and VM active-connection capacity. Capacity rejection returns HTTP `429` without consuming a valid token, preserving it for retry. Binary messages are raw PTY bytes. Text messages are JSON controls: client-to-server `{"type":"resize","cols":N,"rows":N}` and server-to-client `{"type":"exit","exit_code":N}`.
+`WS /v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` upgrades to a WebSocket. It authenticates with the session's `connect_token`, not the API key. One connection may be active for a session at a time; after disconnect, the same session may reconnect for another five minutes. Before upgrading, taritd reserves the configured global, authenticated-tenant, and VM active-connection capacity. Capacity rejection returns HTTP `429` without invalidating the token. Binary messages are raw PTY bytes. Text messages are JSON controls: client-to-server `{"type":"resize","cols":N,"rows":N}` and server-to-client `{"type":"exit","exit_code":N}`. VM teardown removes all of its pending and connected session records.
 
-Status codes: `200`, `201`, `204`, `400`, `401`, `404`, `409`, `429`, `500`. A bad, missing, expired, reused, or unknown connect token is rejected with HTTP `401` before upgrade. Post-upgrade failures close the socket with `1013` when the VM is unavailable on this node and `1011` for attach or stream errors.
+Status codes: `200`, `201`, `204`, `400`, `401`, `404`, `409`, `429`, `500`. A bad, missing, expired, or unknown connect token is rejected with HTTP `401` before upgrade. A second concurrent connection or deletion of a connected session returns `409`. Post-upgrade failures close the socket with `1013` when the VM is unavailable on this node and `1011` for attach or stream errors.
 
 ### `DELETE /v1/vms/{id}`
 

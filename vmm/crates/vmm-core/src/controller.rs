@@ -1776,20 +1776,44 @@ impl VmmController {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub fn repair_guest_network(&self, network: GuestNetworkRepair) -> Result<()> {
-        if network.addr.is_empty() || network.gateway.is_empty() {
-            return Err(VmmError::InvalidConfig(
-                "guest network repair requires addr and gateway".into(),
-            ));
+        let addr = network
+            .addr
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|error| {
+                VmmError::InvalidConfig(format!("invalid guest network repair address: {error}"))
+            })?;
+        let gateway = network
+            .gateway
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|error| {
+                VmmError::InvalidConfig(format!("invalid guest network repair gateway: {error}"))
+            })?;
+        if network.prefix > 32 {
+            return Err(VmmError::InvalidConfig(format!(
+                "invalid guest network repair prefix {}",
+                network.prefix
+            )));
         }
+        let dns_servers = network
+            .dns_servers
+            .iter()
+            .map(|server| {
+                server.parse::<std::net::IpAddr>().map_err(|error| {
+                    VmmError::InvalidConfig(format!(
+                        "invalid guest network repair DNS server {server:?}: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut command = format!(
-            "ip addr flush dev eth0 && ip addr add {}/{} dev eth0 && ip link set eth0 up && ip route replace default via {} dev eth0",
-            shell_single_quote(&network.addr),
+            "ip -4 addr flush dev eth0 && ip -4 addr add {}/{} dev eth0 && ip link set eth0 up && ip -4 route replace default via {} dev eth0",
+            addr,
             network.prefix,
-            shell_single_quote(&network.gateway),
+            gateway,
         );
-        if !network.dns_servers.is_empty() {
+        if !dns_servers.is_empty() {
             let mut resolv = String::from("printf '%s\\n'");
-            for dns in &network.dns_servers {
+            for dns in dns_servers {
                 resolv.push(' ');
                 resolv.push_str(&shell_single_quote(&format!("nameserver {dns}")));
             }

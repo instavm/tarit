@@ -133,6 +133,24 @@ Set `diff` to `true` to request an incremental snapshot when the VMM has a previ
 
 `timeout_ms` defaults to `0` in the wire type. Guest exec requires a guest image that runs the VMM guest agent for the vsock exec path.
 
+### `repair_guest_network`
+
+```json
+{
+  "op": "repair_guest_network",
+  "network": {
+    "addr": "172.16.0.2",
+    "prefix": 30,
+    "gateway": "172.16.0.1",
+    "dns_servers": []
+  }
+}
+```
+
+This validates the supplied IP configuration and reapplies the guest `eth0`
+address, default route, and optional DNS servers through the guest agent. taritd
+uses it after restoring a snapshot into a new TAP allocation.
+
 ### `attach_pty`
 
 ```json

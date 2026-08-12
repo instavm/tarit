@@ -308,41 +308,6 @@ impl PtyRegistry {
             .ok_or_else(|| OrchError::NotFound(format!("pty session {pty_id} not found")))
     }
 
-    #[cfg(test)]
-    pub(crate) fn consume_connect_token(
-        &self,
-        vm_id: Uuid,
-        pty_id: Uuid,
-        provided: &str,
-    ) -> Result<PtySession, OrchError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| OrchError::Internal("pty registry lock".into()))?;
-        purge_expired_sessions(&mut sessions);
-        let Some(session) = sessions
-            .get(&pty_id)
-            .filter(|session| session.vm_id == vm_id)
-        else {
-            return Err(OrchError::Unauthorized);
-        };
-        if Utc::now() > session.connect_token_expires_at {
-            sessions.remove(&pty_id);
-            return Err(OrchError::Unauthorized);
-        }
-        if provided.is_empty() || !connect_token_matches(provided, &session.connect_token) {
-            return Err(OrchError::Unauthorized);
-        }
-        let session = sessions
-            .get_mut(&pty_id)
-            .expect("session exists after token validation");
-        if session.active_connection {
-            return Err(OrchError::Conflict("PTY session already connected".into()));
-        }
-        session.active_connection = true;
-        Ok(session.clone())
-    }
-
     pub(crate) fn delete(&self, vm_id: Uuid, pty_id: Uuid) -> Result<(), OrchError> {
         let mut sessions = self
             .sessions
@@ -350,6 +315,9 @@ impl PtyRegistry {
             .map_err(|_| OrchError::Internal("pty registry lock".into()))?;
         match sessions.get(&pty_id) {
             Some(session) if session.vm_id == vm_id => {
+                if session.active_connection {
+                    return Err(OrchError::Conflict("PTY session is connected".into()));
+                }
                 sessions.remove(&pty_id);
                 Ok(())
             }
@@ -493,6 +461,18 @@ impl PtyRegistry {
     }
 }
 
+struct PtyConnectionState {
+    registry: Arc<PtyRegistry>,
+    vm_id: Uuid,
+    pty_id: Uuid,
+}
+
+impl Drop for PtyConnectionState {
+    fn drop(&mut self) {
+        self.registry.finish_connection(self.vm_id, self.pty_id);
+    }
+}
+
 fn purge_expired_sessions(sessions: &mut HashMap<Uuid, PtySession>) {
     let now = Utc::now();
     sessions
@@ -582,11 +562,24 @@ pub(crate) async fn connect_ws(
     let provided = query.token.unwrap_or_default();
     let (session, connection_permit) =
         state.pty_registry.admit_connect(vm_id, pty_id, &provided)?;
+    let connection_state = PtyConnectionState {
+        registry: Arc::clone(&state.pty_registry),
+        vm_id,
+        pty_id,
+    };
     Ok(ws
         .max_frame_size(MAX_FRAME_LEN)
         .max_message_size(MAX_FRAME_LEN)
         .on_upgrade(move |socket| {
-            handle_ws(socket, state, vm_id, pty_id, session, connection_permit)
+            handle_ws(
+                socket,
+                state,
+                vm_id,
+                pty_id,
+                session,
+                connection_permit,
+                connection_state,
+            )
         }))
 }
 
@@ -597,17 +590,16 @@ async fn handle_ws(
     pty_id: Uuid,
     session: PtySession,
     _connection_permit: PtyConnectionPermit,
+    _connection_state: PtyConnectionState,
 ) {
-    // Authenticate the upgrade with a one-time per-session connect token, not the
+    // Authenticate the upgrade with a per-session connect token, not the
     // caller's long-lived API key. The token was handed to the authenticated
     // creator of this session, so we authorize against that recorded identity.
     let identity = session.owner.clone();
-    let registry = Arc::clone(&state.pty_registry);
 
     if let Err(error) = ensure_local_vm_for_pty(&state, vm_id, &identity).await {
         tracing::warn!(vm = %vm_id, pty = %pty_id, %error, "PTY VM authorization failed");
         close_ws(&mut socket, 1013, "PTY session unavailable").await;
-        registry.finish_connection(vm_id, pty_id);
         return;
     }
 
@@ -623,13 +615,11 @@ async fn handle_ws(
         Ok(Err(error)) => {
             tracing::warn!(vm = %vm_id, pty = %pty_id, %error, "VMM PTY attach failed");
             close_ws(&mut socket, 1011, "PTY attach failed").await;
-            registry.finish_connection(vm_id, pty_id);
             return;
         }
         Err(error) => {
             tracing::warn!(vm = %vm_id, pty = %pty_id, %error, "PTY attach worker failed");
             close_ws(&mut socket, 1011, "PTY attach failed").await;
-            registry.finish_connection(vm_id, pty_id);
             return;
         }
     };
@@ -637,7 +627,6 @@ async fn handle_ws(
     if let Err(error) = stream.set_nonblocking(true) {
         tracing::warn!(vm = %vm_id, pty = %pty_id, %error, "configure PTY stream failed");
         close_ws(&mut socket, 1011, "PTY attach failed").await;
-        registry.finish_connection(vm_id, pty_id);
         return;
     }
     let stream = match tokio::net::UnixStream::from_std(stream) {
@@ -645,14 +634,13 @@ async fn handle_ws(
         Err(error) => {
             tracing::warn!(vm = %vm_id, pty = %pty_id, %error, "adopt PTY stream failed");
             close_ws(&mut socket, 1011, "PTY attach failed").await;
-            registry.finish_connection(vm_id, pty_id);
             return;
         }
     };
 
     let (mut vmm_reader, mut vmm_writer) = stream.into_split();
     let (mut ws_sender, mut ws_receiver) = socket.split();
-    let resize_registry = Arc::clone(&registry);
+    let resize_registry = Arc::clone(&state.pty_registry);
     let (activity_tx, mut activity_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let vmm_activity = activity_tx.clone();
     let ws_activity = activity_tx.clone();
@@ -763,7 +751,6 @@ async fn handle_ws(
             ws_to_vmm.abort();
         }
     }
-    registry.finish_connection(vm_id, pty_id);
 }
 
 impl From<&PtySession> for PtySessionResponse {
@@ -1282,7 +1269,7 @@ mod tests {
             .connect_token_expires_at = Utc::now() - chrono::Duration::seconds(1);
 
         assert!(matches!(
-            registry.consume_connect_token(vm_id, session.pty_id, &session.connect_token),
+            registry.admit_connect(vm_id, session.pty_id, &session.connect_token),
             Err(OrchError::Unauthorized)
         ));
         assert!(matches!(
