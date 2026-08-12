@@ -25,7 +25,9 @@ Wiring: `tarit-vmm-client::VolumeConfig.overlay`, set per VM in
 `<TARIT_SOCKET_DIR>/overlays/<vm-uuid>.cow` directory; removed in `stop_vm`.
 Restore-based warm-pool clones pass the same per-VM path as the VMM
 `Restore.overlay` override, so clones restored from one golden snapshot do not
-share writable disk state.
+share writable disk state. Jailed restores use a VM-specific in-jail overlay
+name, and taritd persists that runtime path so a restored VM can be snapshotted
+and restored again without aliasing the source disk.
 
 ## Production confinement gate
 

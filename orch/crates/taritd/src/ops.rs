@@ -6,6 +6,7 @@
 //! logic (DRY). Placement/routing decisions live in `cluster`; the public
 //! handlers combine the two.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -1322,7 +1323,7 @@ async fn restore_local_owned(
         runtime_layout: Some(
             state
                 .supervisor
-                .runtime_layout_for_config(id, &restore_config),
+                .runtime_layout_for_restore_config(id, &restore_config),
         ),
         socket_path: None,
         pid: None,
@@ -1647,11 +1648,15 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
         &[VmStatus::Running, VmStatus::Paused],
     )?;
     let resume_after = vm.status == VmStatus::Running;
-    let has_overlay = vm.rootfs_path.is_some();
+    let overlay_path = vm
+        .runtime_layout
+        .as_ref()
+        .and_then(|layout| layout.overlay_path.as_ref())
+        .map(PathBuf::from);
     let memory_mib = vm.memory_mib;
     let sup = Arc::clone(&state.supervisor);
     let bundle = tokio::task::spawn_blocking(move || {
-        sup.snapshot_bundle_vm(id, diff, resume_after, has_overlay, memory_mib)
+        sup.snapshot_bundle_vm(id, diff, resume_after, overlay_path, memory_mib)
     })
     .await;
     let bundle = match bundle {

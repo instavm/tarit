@@ -328,7 +328,7 @@ struct CapUserData {
     inheritable: u32,
 }
 
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080922;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 fn read_last_capability() -> Result<u32, JailerError> {
     let raw = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap").map_err(|e| {
@@ -563,6 +563,27 @@ fn verify_confinement(uid: u32, gid: u32, last_capability: u32) -> Result<(), Ja
 mod tests {
     use super::*;
     use crate::jailer::JailerConfig;
+
+    #[test]
+    fn capability_v3_abi_is_supported() {
+        let header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_capget,
+                &header as *const CapUserHeader,
+                data.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "capability v3 ABI must be accepted");
+    }
 
     #[test]
     fn jailer_config_round_trips() {

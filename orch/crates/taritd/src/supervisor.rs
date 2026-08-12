@@ -896,6 +896,10 @@ const JAIL_ROOTFS_PATH: &str = "/assets/rootfs";
 const JAIL_OVERLAY_PATH: &str = "/assets/rootfs.cow";
 const JAIL_RESTORE_PATH: &str = "/assets/restore.ram";
 
+fn jail_restore_overlay_path(id: Uuid) -> String {
+    format!("/assets/restored-rootfs-{id}.cow")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JailMarker {
     version: u32,
@@ -2537,6 +2541,21 @@ impl VmmSupervisor {
         .to_string()
     }
 
+    fn restore_overlay_path_for(&self, id: Uuid) -> String {
+        match &self.jails {
+            Some(jails) => jails
+                .root_for(id)
+                .join(jail_restore_overlay_path(id).trim_start_matches('/')),
+            None => self
+                .config
+                .socket_dir
+                .join("overlays")
+                .join(format!("{id}.cow")),
+        }
+        .display()
+        .to_string()
+    }
+
     fn overlay_path_for_config(&self, id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
         cfg.rootfs_path.is_some().then(|| self.overlay_path_for(id))
     }
@@ -2546,7 +2565,24 @@ impl VmmSupervisor {
         id: Uuid,
         cfg: &VmSpawnConfig,
     ) -> VmRuntimeLayout {
-        let overlay_path = self.overlay_path_for_config(id, cfg);
+        self.runtime_layout_with_overlay(id, cfg, self.overlay_path_for(id))
+    }
+
+    pub(crate) fn runtime_layout_for_restore_config(
+        &self,
+        id: Uuid,
+        cfg: &VmSpawnConfig,
+    ) -> VmRuntimeLayout {
+        self.runtime_layout_with_overlay(id, cfg, self.restore_overlay_path_for(id))
+    }
+
+    fn runtime_layout_with_overlay(
+        &self,
+        id: Uuid,
+        cfg: &VmSpawnConfig,
+        overlay: String,
+    ) -> VmRuntimeLayout {
+        let overlay_path = cfg.rootfs_path.is_some().then_some(overlay);
         let jail_path = self
             .jails
             .as_ref()
@@ -2566,17 +2602,19 @@ impl VmmSupervisor {
     }
 
     fn expected_runtime_layout(&self, record: &VmRecord) -> VmRuntimeLayout {
-        self.runtime_layout_for_config(
-            record.id,
-            &VmSpawnConfig {
-                memory_mib: record.memory_mib,
-                vcpus: record.vcpus,
-                kernel_path: PathBuf::from(&record.kernel_path),
-                rootfs_path: record.rootfs_path.as_ref().map(PathBuf::from),
-                cmdline: record.cmdline.clone(),
-                read_only: record.rootfs_read_only,
-            },
-        )
+        let config = VmSpawnConfig {
+            memory_mib: record.memory_mib,
+            vcpus: record.vcpus,
+            kernel_path: PathBuf::from(&record.kernel_path),
+            rootfs_path: record.rootfs_path.as_ref().map(PathBuf::from),
+            cmdline: record.cmdline.clone(),
+            read_only: record.rootfs_read_only,
+        };
+        if record.startup_path == Some(tarit_types::VmStartupPath::SnapshotRestore) {
+            self.runtime_layout_for_restore_config(record.id, &config)
+        } else {
+            self.runtime_layout_for_config(record.id, &config)
+        }
     }
 
     fn register_artifact_owner(&self, id: Uuid) -> Result<(), OrchError> {
@@ -2676,10 +2714,15 @@ impl VmmSupervisor {
                     let _ = jails.release(id);
                     return Err(error);
                 }
+                let overlay_path = if snapshot_path.is_some() {
+                    jail_restore_overlay_path(id)
+                } else {
+                    JAIL_OVERLAY_PATH.to_string()
+                };
                 (
                     Some(PathBuf::from(JAIL_ROOTFS_PATH)),
-                    Some(lease.root.join(JAIL_OVERLAY_PATH.trim_start_matches('/'))),
-                    Some(JAIL_OVERLAY_PATH.to_string()),
+                    Some(lease.root.join(overlay_path.trim_start_matches('/'))),
+                    Some(overlay_path),
                 )
             } else {
                 (None, None, None)
@@ -6023,9 +6066,10 @@ impl VmmSupervisor {
         id: Uuid,
         diff: bool,
         resume_after: bool,
-        has_overlay: bool,
+        overlay_path: Option<PathBuf>,
         memory_mib: u64,
     ) -> Result<SnapshotBundle, OrchError> {
+        let has_overlay = overlay_path.is_some();
         let _reservation = self.reserve_snapshot_space(id, memory_mib, has_overlay)?;
         let client = self.lifecycle_client_for(id)?;
         if resume_after {
@@ -6069,7 +6113,7 @@ impl VmmSupervisor {
             .map(|(uid, _)| uid)
             .unwrap_or_else(|| unsafe { libc::geteuid() });
         let overlay_artifact = if has_overlay {
-            let source = PathBuf::from(self.overlay_path_for(id));
+            let source = overlay_path.expect("has_overlay is derived from overlay_path");
             let staging = self.snapshot_overlay_staging_path();
             let destination = self.snapshot_overlay_path();
             match copy_private_artifact_owned(&source, &staging, expected_uid) {
@@ -8830,6 +8874,37 @@ mod tests {
             supervisor.overlay_path_for_config(id, &configured_rw),
         );
         assert!(rw_config.kernel.cmdline.contains("root=/dev/vda rw"));
+    }
+
+    #[test]
+    fn jailed_restore_layout_uses_a_unique_overlay_path() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/restore-layout-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.vm_jail = Some(crate::config::VmJailConfig {
+            base_dir: root.join("jails"),
+            uid_base: 20_000,
+            gid_base: 30_000,
+            id_count: 4,
+            profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        });
+        let supervisor = VmmSupervisor::new(config);
+        let id = Uuid::new_v4();
+        let cfg = spawn_config(true, Some(PathBuf::from("/rootfs.ext4")));
+        let normal = supervisor.runtime_layout_for_config(id, &cfg);
+        let restored = supervisor.runtime_layout_for_restore_config(id, &cfg);
+        assert_ne!(normal.overlay_path, restored.overlay_path);
+        assert!(restored
+            .overlay_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(&format!("/assets/restored-rootfs-{id}.cow"))));
+
+        let next_id = Uuid::new_v4();
+        let next_restored = supervisor.runtime_layout_for_restore_config(next_id, &cfg);
+        assert_ne!(restored.overlay_path, next_restored.overlay_path);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
