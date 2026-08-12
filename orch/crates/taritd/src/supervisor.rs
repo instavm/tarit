@@ -12,6 +12,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -97,22 +99,18 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
             std::io::Error::last_os_error()
         )));
     }
-    let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-    if descriptor_flags < 0
-        || unsafe {
-            libc::fcntl(
-                fd.as_raw_fd(),
-                libc::F_SETFD,
-                descriptor_flags & !libc::FD_CLOEXEC,
-            )
-        } < 0
-    {
-        return Err(OrchError::Internal(format!(
-            "make TAP descriptor inheritable for {tap_name}: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
     Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_cloexec_for_child(fd: libc::c_int) -> std::io::Result<()> {
+    let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if descriptor_flags < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFD, descriptor_flags & !libc::FD_CLOEXEC) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn graceful_stop_vmm(socket_path: &Path) {
@@ -4275,10 +4273,13 @@ impl VmmSupervisor {
         };
         #[cfg(target_os = "linux")]
         if let (Some(allocation), Some(fd)) = (&net_alloc, &inherited_tap) {
-            command.env(
-                "VMM_TAP_FDS",
-                format!("{}={}", allocation.tap, fd.as_raw_fd()),
-            );
+            let raw_fd = fd.as_raw_fd();
+            command.env("VMM_TAP_FDS", format!("{}={raw_fd}", allocation.tap));
+            // SAFETY: this runs after fork in the VMM child. It changes only
+            // the explicitly inherited TAP descriptor before exec.
+            unsafe {
+                command.pre_exec(move || clear_cloexec_for_child(raw_fd));
+            }
         }
         let child = match command
             .stdin(Stdio::null())
@@ -7870,6 +7871,37 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::mpsc;
     use std::thread;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tap_descriptor_becomes_inheritable_only_in_the_vmm_child() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 returned two new owned descriptors.
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let raw_fd = read_fd.as_raw_fd();
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("test -e /proc/self/fd/{raw_fd}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the closure changes only the test descriptor after fork.
+        unsafe {
+            command.pre_exec(move || clear_cloexec_for_child(raw_fd));
+        }
+        assert!(command.status().unwrap().success());
+
+        let parent_flags = unsafe { libc::fcntl(read_fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(parent_flags & libc::FD_CLOEXEC, 0);
+        drop(write_fd);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

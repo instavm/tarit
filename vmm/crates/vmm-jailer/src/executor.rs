@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn capability_v3_abi_is_supported() {
-        let header = CapUserHeader {
+        let mut header = CapUserHeader {
             version: LINUX_CAPABILITY_VERSION_3,
             pid: 0,
         };
@@ -730,7 +730,7 @@ mod tests {
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_capget,
-                &header as *const CapUserHeader,
+                &mut header as *mut CapUserHeader,
                 data.as_mut_ptr(),
             )
         };
