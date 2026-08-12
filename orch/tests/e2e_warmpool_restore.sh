@@ -58,7 +58,7 @@ target = $TARGET
 restore = true
 rootfs = "$ROOTFS"
 TOML
-LABEL="1vcpu_512mib"
+LABEL_PREFIX="1vcpu_512mib_"
 
 echo "=== taritd serve (restore warm pool) ==="
 "$TARIT" serve >"$LOG" 2>&1 &
@@ -70,8 +70,9 @@ trap cleanup EXIT
 echo "=== wait for warm pool to fill via restore (target=$TARGET) ==="
 filled=0
 for i in $(seq 1 90); do
-  depth=$("$TARIT" metrics 2>/dev/null | awk -F'[ ]' "/taritd_warm_pool_depth\\{class=\"$LABEL\"\\}/{print \$2}")
-  echo "  [$i] warm_pool_depth{$LABEL}=${depth:-0}"
+  depth=$("$TARIT" metrics 2>/dev/null | awk -v prefix="$LABEL_PREFIX" \
+    '$1 ~ ("^taritd_warm_pool_depth\\{class=\"" prefix) { print $2; exit }')
+  echo "  [$i] warm_pool_depth{${LABEL_PREFIX}*}=${depth:-0}"
   if [ "${depth:-0}" -ge "$TARGET" ]; then filled=1; break; fi
   sleep 2
 done
