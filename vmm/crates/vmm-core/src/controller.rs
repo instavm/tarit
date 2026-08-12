@@ -2086,6 +2086,12 @@ fn staged_owned_output(target: &Path) -> Result<OwnedScratchFile> {
 }
 
 fn persist_owned_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<()> {
+    owned.file().sync_all().map_err(|error| {
+        VmmError::Snapshot(format!(
+            "sync staged output for {}: {error}",
+            target.display()
+        ))
+    })?;
     owned.rename_to(target).map_err(|error| {
         VmmError::Snapshot(format!(
             "publish staged output {}: {error}",

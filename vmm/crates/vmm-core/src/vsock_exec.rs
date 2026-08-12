@@ -33,6 +33,7 @@ const EXEC_FRAME_HEADER_LEN: usize = 10;
 const EXEC_FRAME_MAX_PAYLOAD: usize = 1024 * 1024;
 const EXEC_CHUNK_MAX_BYTES: usize = 64 * 1024;
 const EXEC_SPOOL_MEMORY_CAP: usize = 512 * 1024;
+const EXEC_OUTPUT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecProtocol {
@@ -78,6 +79,7 @@ pub struct VsockExecChannel {
     stop: Arc<AtomicBool>,
     pump_wake: Option<EventFd>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    exec_gate: Mutex<()>,
     next_request_id: AtomicU64,
 }
 
@@ -132,6 +134,7 @@ struct OutputSink {
 struct ExecOutputs {
     stdout: OutputSink,
     stderr: OutputSink,
+    total_bytes: usize,
 }
 
 impl OutputSink {
@@ -187,15 +190,32 @@ impl ExecOutputs {
         Self {
             stdout: OutputSink::new(),
             stderr: OutputSink::new(),
+            total_bytes: 0,
         }
     }
 
     fn stdout(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.account(bytes.len())?;
         self.stdout.append("stdout", bytes)
     }
 
     fn stderr(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.account(bytes.len())?;
         self.stderr.append("stderr", bytes)
+    }
+
+    fn account(&mut self, len: usize) -> std::io::Result<()> {
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(len)
+            .ok_or_else(|| std::io::Error::other("exec output length overflow"))?;
+        if self.total_bytes > EXEC_OUTPUT_MAX_BYTES {
+            return Err(std::io::Error::other(format!(
+                "exec output exceeds {} MiB limit",
+                EXEC_OUTPUT_MAX_BYTES / (1024 * 1024)
+            )));
+        }
+        Ok(())
     }
 
     fn finish(self) -> Result<(String, String), String> {
@@ -269,6 +289,7 @@ impl VsockExecChannel {
             stop,
             pump_wake,
             handle: Mutex::new(Some(handle)),
+            exec_gate: Mutex::new(()),
             next_request_id: AtomicU64::new(1),
         }))
     }
@@ -285,6 +306,7 @@ impl VsockExecChannel {
         command: &str,
         timeout: Duration,
     ) -> Option<Result<(i32, String, String, u64), VsockExecError>> {
+        let _exec_guard = self.exec_gate.lock().unwrap_or_else(|e| e.into_inner());
         let (connection_id, protocol, mut stream) = {
             let guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
             let connection = guard.as_ref()?;
@@ -412,10 +434,10 @@ fn run_exec_marker_v1(
     pump_wake: Option<&EventFd>,
 ) -> RunExecOutcome {
     let start = Instant::now();
+    let deadline = start.checked_add(timeout).unwrap_or(start);
     let msg = format!("VMM_EXEC:{command}\n");
-    if let Err(error) = stream
-        .write_all(msg.as_bytes())
-        .and_then(|_| stream.flush())
+    if let Err(error) =
+        write_all_before(stream, msg.as_bytes(), deadline).and_then(|_| stream.flush())
     {
         return RunExecOutcome::WriteFailed(format!("vsock exec write: {error}"));
     }
@@ -499,6 +521,7 @@ fn run_exec_chunked_v2(
     pump_wake: Option<&EventFd>,
 ) -> RunExecOutcome {
     let start = Instant::now();
+    let deadline = start.checked_add(timeout).unwrap_or(start);
     let mut payload = Vec::with_capacity(12 + command.len());
     payload.extend_from_slice(&request_id.to_be_bytes());
     let command_len = match u32::try_from(command.len()) {
@@ -509,14 +532,14 @@ fn run_exec_chunked_v2(
     };
     payload.extend_from_slice(&command_len.to_be_bytes());
     payload.extend_from_slice(command.as_bytes());
-    if let Err(error) = write_exec_frame(stream, ExecFrameKind::Request, &payload) {
+    if let Err(error) = write_exec_frame_before(stream, ExecFrameKind::Request, &payload, deadline)
+    {
         return RunExecOutcome::WriteFailed(format!("vsock exec frame write: {error}"));
     }
     if let Some(evt) = pump_wake {
         let _ = evt.write(1);
     }
 
-    let deadline = start.checked_add(timeout).unwrap_or_else(Instant::now);
     let mut outputs = ExecOutputs::new();
     let mut started = false;
 
@@ -714,6 +737,61 @@ fn write_exec_frame(
     stream.write_all(&header)?;
     stream.write_all(payload)?;
     stream.flush()
+}
+
+fn write_exec_frame_before(
+    stream: &mut UnixStream,
+    kind: ExecFrameKind,
+    payload: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let len = u32::try_from(payload.len())
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "exec frame too large"))?;
+    let mut header = [0u8; EXEC_FRAME_HEADER_LEN];
+    header[0..4].copy_from_slice(EXEC_FRAME_MAGIC);
+    header[4] = EXEC_FRAME_VERSION;
+    header[5] = kind as u8;
+    header[6..10].copy_from_slice(&len.to_be_bytes());
+    write_all_before(stream, &header, deadline)?;
+    write_all_before(stream, payload, deadline)?;
+    stream.flush()
+}
+
+fn write_all_before(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "exec write deadline exceeded",
+            ));
+        }
+        stream.set_write_timeout(Some(
+            deadline.saturating_duration_since(now).min(EXEC_IO_TIMEOUT),
+        ))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "exec stream accepted zero bytes",
+                ))
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error)
+                if error.kind() == ErrorKind::WouldBlock
+                    || error.kind() == ErrorKind::TimedOut
+                    || error.kind() == ErrorKind::Interrupted =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn read_exec_frame_before(

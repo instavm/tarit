@@ -219,3 +219,58 @@ fn channel_spools_output_larger_than_legacy_frame_limit() {
     guest.join().unwrap();
     let _ = std::fs::remove_file(socket);
 }
+
+#[test]
+fn channel_serializes_concurrent_exec_requests() {
+    let socket = socket_path("concurrent");
+    let channel = VsockExecChannel::bind(&socket).unwrap();
+    let guest = std::thread::spawn({
+        let socket = socket.clone();
+        move || {
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            stream
+                .write_all(b"VMM_AGENT_READY\nVMM_VSOCK_EXEC_PROTO=2\n")
+                .unwrap();
+            for _ in 0..2 {
+                let (kind, payload) = read_frame(&mut stream);
+                assert_eq!(kind, REQUEST);
+                let (request_id, command) = request_id_and_command(&payload);
+                write_frame(&mut stream, START, &request_id.to_be_bytes());
+                let mut out = request_id.to_be_bytes().to_vec();
+                out.extend_from_slice(command.as_bytes());
+                write_frame(&mut stream, STDOUT, &out);
+                let mut exit = request_id.to_be_bytes().to_vec();
+                exit.extend_from_slice(&0i32.to_be_bytes());
+                write_frame(&mut stream, EXIT, &exit);
+            }
+        }
+    });
+
+    for _ in 0..20 {
+        if channel.is_connected() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let first_channel = channel.clone();
+    let first = std::thread::spawn(move || {
+        first_channel
+            .exec("first", Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+    });
+    let second_channel = channel.clone();
+    let second = std::thread::spawn(move || {
+        second_channel
+            .exec("second", Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+    });
+
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    assert_eq!(first.1, "first");
+    assert_eq!(second.1, "second");
+    guest.join().unwrap();
+    let _ = std::fs::remove_file(socket);
+}

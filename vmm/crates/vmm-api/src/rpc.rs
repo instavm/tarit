@@ -395,7 +395,7 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
                         msg: format!("internal error: {msg}"),
                     }
                 });
-        if let Err(e) = write_frame(&mut stream, &encode_response(&resp)) {
+        if let Err(e) = write_frame(&mut stream, &encode_response_for_frame(&resp)) {
             log::warn!("write_frame: {e}");
         }
     }
@@ -684,6 +684,19 @@ fn encode_response(resp: &ApiResponse) -> Vec<u8> {
     serde_json::to_vec(resp).unwrap_or_else(|_| b"{\"status\":\"err\",\"msg\":\"encode\"}".to_vec())
 }
 
+fn encode_response_for_frame(resp: &ApiResponse) -> Vec<u8> {
+    let encoded = encode_response(resp);
+    if encoded.len() <= MAX_FRAME_BYTES {
+        return encoded;
+    }
+    encode_response(&ApiResponse::Err {
+        msg: format!(
+            "response exceeds {} MiB control-frame limit",
+            MAX_FRAME_BYTES / (1024 * 1024)
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +743,22 @@ mod tests {
         let controller = VmmController::new();
         let resp = dispatch(ApiRequest::Stop, &controller);
         assert!(matches!(resp, ApiResponse::Ok));
+    }
+
+    #[test]
+    fn oversized_response_becomes_a_framed_error() {
+        let encoded = encode_response_for_frame(&ApiResponse::Exec {
+            exit_code: 0,
+            stdout: "x".repeat(MAX_FRAME_BYTES),
+            stderr: String::new(),
+            duration_ms: 1,
+        });
+        assert!(encoded.len() <= MAX_FRAME_BYTES);
+        let response: ApiResponse = serde_json::from_slice(&encoded).unwrap();
+        assert!(matches!(
+            response,
+            ApiResponse::Err { msg } if msg.contains("control-frame limit")
+        ));
     }
 
     #[test]
