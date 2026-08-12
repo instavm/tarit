@@ -856,6 +856,15 @@ impl NetProvisioner {
         }
         self.add_nft_rule(alloc)?;
         self.install_egress_policy(alloc, &self.egress_policy_for(alloc)?)?;
+        self.reconcile_traffic_control(alloc)?;
+        Ok(())
+    }
+
+    fn reconcile_traffic_control(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let qdiscs = command_stdout("tc", &["qdisc", "show", "dev", &alloc.tap])?;
+        for argv in obsolete_traffic_control_argv(alloc, &self.quota, &qdiscs) {
+            run_argv(&argv)?;
+        }
         for argv in traffic_control_argv(alloc, &self.quota) {
             run_argv(&argv)?;
         }
@@ -925,11 +934,8 @@ impl NetProvisioner {
     }
 
     fn verify_traffic_control(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
-        if !self.quota.is_configured() {
-            return Ok(());
-        }
         let qdiscs = command_stdout("tc", &["qdisc", "show", "dev", &alloc.tap])?;
-        let filters = if self.quota.egress_bps_max.is_some() {
+        let filters = if qdiscs.contains(" ingress ") {
             command_stdout(
                 "tc",
                 &["filter", "show", "dev", &alloc.tap, "parent", "ffff:"],
@@ -1921,6 +1927,35 @@ fn traffic_control_argv(alloc: &NetAlloc, quota: &VmNetQuotaConfig) -> Vec<Vec<S
     argv
 }
 
+fn obsolete_traffic_control_argv(
+    alloc: &NetAlloc,
+    quota: &VmNetQuotaConfig,
+    qdiscs: &str,
+) -> Vec<Vec<String>> {
+    let mut argv = Vec::new();
+    if quota.ingress_bps_max.is_none() && qdiscs.contains(" tbf ") {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "del".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "root".into(),
+        ]);
+    }
+    if quota.egress_bps_max.is_none() && qdiscs.contains(" ingress ") {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "del".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "ingress".into(),
+        ]);
+    }
+    argv
+}
+
 fn tap_owner_argv(alloc: &NetAlloc, (uid, gid): (u32, u32)) -> Vec<String> {
     vec![
         "ip".into(),
@@ -1945,11 +1980,20 @@ fn validate_traffic_control_output(
     if quota.ingress_bps_max.is_some() && !qdiscs.contains(" tbf ") {
         return Err("is missing the VM-ingress root tbf");
     }
+    if quota.ingress_bps_max.is_none() && qdiscs.contains(" tbf ") {
+        return Err("retains an obsolete VM-ingress root tbf");
+    }
     if quota.egress_bps_max.is_some() && !qdiscs.contains(" ingress ") {
         return Err("is missing the VM-egress ingress qdisc");
     }
+    if quota.egress_bps_max.is_none() && qdiscs.contains(" ingress ") {
+        return Err("retains an obsolete VM-egress ingress qdisc");
+    }
     if quota.egress_bps_max.is_some() && !filters.contains(" police ") {
         return Err("is missing the VM-egress policer");
+    }
+    if quota.egress_bps_max.is_none() && filters.contains(" police ") {
+        return Err("retains an obsolete VM-egress policer");
     }
     Ok(())
 }
@@ -3744,8 +3788,37 @@ mod tests {
         assert_eq!(argv[2][5], "parent");
         assert!(
             traffic_control_argv(&alloc, &VmNetQuotaConfig::default()).is_empty(),
-            "recovery must remain a no-op when shaping is disabled"
+            "disabled shaping must not add qdiscs"
         );
+    }
+
+    #[test]
+    fn recovered_traffic_control_removes_disabled_quotas() {
+        let alloc = NetAlloc::for_idx(7);
+        let cleanup = obsolete_traffic_control_argv(
+            &alloc,
+            &VmNetQuotaConfig::default(),
+            "qdisc tbf 1: root\nqdisc ingress ffff: parent ffff:fff1",
+        );
+        assert_eq!(
+            cleanup,
+            vec![
+                argv(&["tc", "qdisc", "del", "dev", &alloc.tap, "root"]),
+                argv(&["tc", "qdisc", "del", "dev", &alloc.tap, "ingress"]),
+            ]
+        );
+        assert!(validate_traffic_control_output(
+            &VmNetQuotaConfig::default(),
+            "qdisc tbf 1: root\nqdisc ingress ffff: parent ffff:fff1",
+            "filter parent ffff: police rate 2Mbit",
+        )
+        .is_err());
+        assert!(validate_traffic_control_output(
+            &VmNetQuotaConfig::default(),
+            "qdisc noqueue 0: root",
+            ""
+        )
+        .is_ok());
     }
 
     #[test]

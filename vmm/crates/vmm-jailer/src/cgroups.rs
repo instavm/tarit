@@ -114,20 +114,107 @@ pub fn apply_limits(cgroup_path: &str, limits: &CgroupLimits) -> Result<(), Cgro
                 file_path.display()
             )));
         }
-        match fs::write(&file_path, val.as_bytes()) {
-            Ok(()) => {
-                log::info!("cgroup: {key}={val} → {}", file_path.display());
-            }
-            Err(e) => {
-                log::warn!("cgroup: write {key}={val} failed: {e}");
-                return Err(CgroupError::Write {
-                    key: key.to_string(),
-                    source: e,
-                });
+        for command in limit_write_commands(key, &val)? {
+            match fs::write(&file_path, command.as_bytes()) {
+                Ok(()) => {
+                    log::info!("cgroup: {key}={command} → {}", file_path.display());
+                }
+                Err(e) => {
+                    log::warn!("cgroup: write {key}={command} failed: {e}");
+                    return Err(CgroupError::Write {
+                        key: key.to_string(),
+                        source: e,
+                    });
+                }
             }
         }
     }
     Ok(())
+}
+
+fn limit_write_commands<'a>(key: &str, value: &'a str) -> Result<Vec<&'a str>, CgroupError> {
+    if key != "io.max" {
+        if value.contains('\n') {
+            return Err(CgroupError::Path(format!(
+                "{key} must be written as one command"
+            )));
+        }
+        return Ok(vec![value]);
+    }
+
+    const LIMIT_KEYS: [&str; 4] = ["rbps", "wbps", "riops", "wiops"];
+    let mut devices = BTreeSet::new();
+    let mut commands = Vec::new();
+    for raw in value.lines() {
+        let command = raw.trim();
+        if command.is_empty() {
+            continue;
+        }
+        let mut fields = command.split_whitespace();
+        let device = fields.next().ok_or_else(|| {
+            CgroupError::Path("io.max command must include a MAJOR:MINOR device".into())
+        })?;
+        let (major, minor) = device.split_once(':').ok_or_else(|| {
+            CgroupError::Path(format!(
+                "invalid io.max device {device:?}; expected MAJOR:MINOR"
+            ))
+        })?;
+        major.parse::<u32>().map_err(|error| {
+            CgroupError::Path(format!("invalid io.max major {major:?}: {error}"))
+        })?;
+        minor.parse::<u32>().map_err(|error| {
+            CgroupError::Path(format!("invalid io.max minor {minor:?}: {error}"))
+        })?;
+        if !devices.insert(device) {
+            return Err(CgroupError::Path(format!(
+                "duplicate io.max device {device}"
+            )));
+        }
+
+        let mut keys = BTreeSet::new();
+        let mut has_limit = false;
+        for field in fields {
+            let (limit_key, limit) = field.split_once('=').ok_or_else(|| {
+                CgroupError::Path(format!(
+                    "invalid io.max limit {field:?}; expected KEY=VALUE"
+                ))
+            })?;
+            if !LIMIT_KEYS.contains(&limit_key) {
+                return Err(CgroupError::Path(format!(
+                    "invalid io.max key {limit_key:?}"
+                )));
+            }
+            if !keys.insert(limit_key) {
+                return Err(CgroupError::Path(format!(
+                    "duplicate io.max key {limit_key:?} for device {device}"
+                )));
+            }
+            if limit != "max"
+                && limit
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .is_none()
+            {
+                return Err(CgroupError::Path(format!(
+                    "invalid io.max {limit_key} value {limit:?}"
+                )));
+            }
+            has_limit = true;
+        }
+        if !has_limit {
+            return Err(CgroupError::Path(format!(
+                "io.max device {device} has no limits"
+            )));
+        }
+        commands.push(command);
+    }
+    if commands.is_empty() {
+        return Err(CgroupError::Path(
+            "io.max must include at least one device command".into(),
+        ));
+    }
+    Ok(commands)
 }
 
 /// Write the current process PID into a cgroup's cgroup.procs file.
@@ -382,5 +469,18 @@ mod tests {
         let back: CgroupLimits = serde_json::from_str(&s).unwrap();
         assert_eq!(back, l);
         assert_eq!(back.to_file_map().len(), 10);
+    }
+
+    #[test]
+    fn io_max_is_validated_and_split_into_one_command_per_write() {
+        let commands =
+            limit_write_commands("io.max", "8:0 rbps=1048576 wiops=200\n8:16 wbps=max").unwrap();
+        assert_eq!(
+            commands,
+            vec!["8:0 rbps=1048576 wiops=200", "8:16 wbps=max"]
+        );
+        assert!(limit_write_commands("io.max", "8:0 rbps=1\n8:0 wbps=2").is_err());
+        assert!(limit_write_commands("io.max", "8:0 rbps=0").is_err());
+        assert!(limit_write_commands("io.max", "8:0 unknown=1").is_err());
     }
 }
