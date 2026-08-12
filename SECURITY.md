@@ -43,7 +43,9 @@ host applies defense in depth, in two tiers:
   coordinator thread is not seccomp-confined.
 - Available as an opt-in hardened mode (`vmm serve --jail`): chroot, privilege
   drop to an unprivileged uid/gid, mount and network namespaces, and cgroup
-  placement. This mode fails closed if a required confinement step cannot be
+  placement. Jail mode automatically enables the mandatory built-in seccomp
+  profile; the legacy `--seccomp` flag remains accepted, but the profile cannot
+  be disabled. This mode fails closed if a required confinement step cannot be
   applied.
 
 The standard `taritd` launch path does not yet stage and start every VMM through

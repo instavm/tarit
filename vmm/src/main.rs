@@ -422,7 +422,10 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         netns: Option<String>,
 
-        /// Require the production per-thread seccomp profile for a jailed VMM.
+        /// Select the mandatory built-in seccomp profile for a jailed VMM.
+        ///
+        /// This compatibility flag is optional: --jail enables the profile
+        /// automatically, and jail mode cannot disable it.
         #[arg(long, requires = "jail")]
         seccomp: bool,
 
@@ -1129,10 +1132,10 @@ fn serve(
     // It must also provide /dev/kvm inside the jail and choose a uid/gid with
     // KVM access (for example via the kvm group) before launching this process.
     let cgroup_limits = cgroup.limits();
-    anyhow::ensure!(
-        jail_dir.is_none() || seccomp,
-        "jailed serve requires --seccomp"
-    );
+    let jailed_seccomp = resolve_jailed_seccomp(jail_dir.as_deref(), seccomp)?;
+    if jailed_seccomp {
+        log::info!("serve: mandatory built-in seccomp profile enabled for jail mode");
+    }
     #[cfg(target_os = "linux")]
     let mut netns_entered = false;
     #[cfg(target_os = "linux")]
@@ -1174,6 +1177,14 @@ fn serve(
 
     log::info!("serve: API on {socket}");
     vmm_api::rpc::serve(socket).map_err(|e| anyhow::anyhow!("api serve: {e}"))
+}
+
+fn resolve_jailed_seccomp(jail_dir: Option<&str>, compatibility_flag: bool) -> Result<bool> {
+    anyhow::ensure!(
+        jail_dir.is_some() || !compatibility_flag,
+        "--seccomp requires --jail"
+    );
+    Ok(jail_dir.is_some())
 }
 
 #[cfg(target_os = "linux")]
@@ -1678,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn jailed_serve_requires_explicit_seccomp_profile() {
+    fn jailed_serve_automatically_enables_seccomp_profile() {
         let cli = Cli::try_parse_from([
             "vmm",
             "serve",
@@ -1688,17 +1699,62 @@ mod tests {
             "20000",
             "--gid",
             "30000",
-            "--seccomp",
         ])
         .unwrap();
         match cli.cmd {
-            Cmd::Serve { seccomp, netns, .. } => {
-                assert!(seccomp);
+            Cmd::Serve {
+                jail,
+                seccomp,
+                netns,
+                ..
+            } => {
+                assert!(!seccomp);
                 assert!(netns.is_none());
+                assert!(resolve_jailed_seccomp(jail.as_deref(), seccomp).unwrap());
             }
             _ => panic!("expected serve command"),
         }
+    }
+
+    #[test]
+    fn jailed_serve_accepts_legacy_seccomp_flag_but_rejects_disable() {
+        let cli = Cli::try_parse_from(["vmm", "serve", "--jail", "/srv/jails/vm-1", "--seccomp"])
+            .unwrap();
+        match cli.cmd {
+            Cmd::Serve { jail, seccomp, .. } => {
+                assert!(seccomp);
+                assert!(resolve_jailed_seccomp(jail.as_deref(), seccomp).unwrap());
+            }
+            _ => panic!("expected serve command"),
+        }
+
         assert!(Cli::try_parse_from(["vmm", "serve", "--seccomp"]).is_err());
+        assert!(Cli::try_parse_from(
+            ["vmm", "serve", "--jail", "/srv/jails/vm-1", "--no-seccomp",]
+        )
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "vmm",
+            "serve",
+            "--jail",
+            "/srv/jails/vm-1",
+            "--seccomp=false",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn serve_help_describes_mandatory_automatic_seccomp() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--jail enables the profile automatically"));
+        assert!(help.contains("jail mode cannot disable it"));
     }
 
     #[test]

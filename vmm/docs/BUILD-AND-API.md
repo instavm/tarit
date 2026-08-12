@@ -150,6 +150,7 @@ vmm serve [OPTIONS] [--socket <PATH>]
 | `--uid <UID>` | 1000 | UID to drop to when jailed |
 | `--gid <GID>` | 1000 | GID to drop to when jailed |
 | `--netns <PATH>` | none | Enter a network namespace when jailed |
+| `--seccomp` | automatic with `--jail` | Compatibility flag for the mandatory built-in profile; jail mode cannot disable seccomp |
 | `--cgroup <PATH>` | none | Apply cgroup v2 limits under this cgroup path |
 | `--cgroup-memory-max <BYTES>` | none | Set `memory.max` |
 | `--cgroup-cpu-max <QUOTA/PERIOD\|MILLICPU>` | none | Set `cpu.max` |
