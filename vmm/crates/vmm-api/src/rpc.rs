@@ -670,11 +670,22 @@ fn shutdown_signal_set() -> std::io::Result<libc::sigset_t> {
 /// Stop the VM cleanly and remove the socket file. Split out from the signal
 /// thread so it is unit-testable without raising a real signal.
 fn graceful_teardown(controller: &VmmController, socket_path: &str) {
-    if let Err(e) = controller.stop() {
-        log::warn!("shutdown: stop returned: {e}");
-    }
     if let Err(e) = remove_stale_socket(socket_path) {
         log::warn!("shutdown: socket cleanup returned: {e}");
+    }
+    loop {
+        match controller.stop() {
+            Ok(()) => break,
+            Err(vmm_core::error::VmmError::InvalidConfig(message))
+                if message.starts_with("lifecycle operation already in progress:") =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                log::warn!("shutdown: stop returned: {e}");
+                break;
+            }
+        }
     }
 }
 

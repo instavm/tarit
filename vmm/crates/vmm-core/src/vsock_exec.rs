@@ -122,8 +122,18 @@ struct ExecFrame {
 }
 
 struct OutputSpool {
-    _owned: OwnedScratchFile,
+    owned: OwnedScratchFile,
     writer: File,
+}
+
+impl Drop for OutputSpool {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(self.owned.path()) {
+            if error.kind() != ErrorKind::NotFound {
+                log::warn!("remove exec spool {}: {error}", self.owned.path().display());
+            }
+        }
+    }
 }
 
 struct OutputSink {
@@ -158,10 +168,7 @@ impl OutputSink {
             let mut writer = owned.file().try_clone()?;
             writer.write_all(&self.memory)?;
             self.memory.clear();
-            self.spool = Some(OutputSpool {
-                _owned: owned,
-                writer,
-            });
+            self.spool = Some(OutputSpool { owned, writer });
         }
         if let Some(spool) = self.spool.as_mut() {
             spool.writer.write_all(bytes)?;

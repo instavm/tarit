@@ -221,6 +221,27 @@ fn remove_owned_scratch_file(file: &OwnedScratchFile) {
     }
 }
 
+fn replay_consumed_dirty(vm: &VmInstance, dirty: Option<&vmm_memory_backend::dirty::DirtyBitmap>) {
+    let (Some(guest_mem), Some(dirty)) = (vm.guest_mem.as_ref(), dirty) else {
+        return;
+    };
+    for pfn in dirty.dirty_pfns() {
+        guest_mem.mark_host_dirty(pfn.saturating_mul(4096), 4096);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn replay_live_snapshot_dirty(
+    controller: &VmmController,
+    generation: u64,
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+) {
+    let slot = controller.lock();
+    if let Some(vm) = slot.as_ref().filter(|vm| vm.generation == generation) {
+        replay_consumed_dirty(vm, Some(dirty));
+    }
+}
+
 #[cfg(any(
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
@@ -501,6 +522,10 @@ impl VmmController {
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let paused_here = pause_running_vcpus(vm);
 
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let mut consumed_dirty = None;
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let consumed_dirty = None;
         let snapshot_result = (|| -> Result<usize> {
             // Fold the vCPU state each thread captured during the pause above into
             // the stored state blob, so this snapshot is faithfully resumable (not
@@ -556,6 +581,7 @@ impl VmmController {
                         let host_dirty = guest_mem.drain_host_dirty();
                         dirty.merge(&host_dirty);
                     }
+                    consumed_dirty = Some(dirty.clone());
                     let parent = vm.last_snapshot.clone().unwrap_or_default();
                     write_scratch_diff_snapshot_file(
                         &owned_snapshot,
@@ -579,16 +605,19 @@ impl VmmController {
                         Some(r) => {
                             let ok = r.kvm_vm.enable_dirty_logging().is_ok();
                             if ok {
-                                let _ = r.kvm_vm.read_dirty();
+                                if let Ok(mut dirty) = r.kvm_vm.read_dirty() {
+                                    if let Some(guest_mem) = vm.guest_mem.as_ref() {
+                                        let host_dirty = guest_mem.drain_host_dirty();
+                                        dirty.merge(&host_dirty);
+                                    }
+                                    consumed_dirty = Some(dirty);
+                                }
                             }
                             ok
                         }
                         None => false,
                     };
                     if enabled {
-                        if let Some(guest_mem) = vm.guest_mem.as_ref() {
-                            let _ = guest_mem.drain_host_dirty();
-                        }
                         vm.dirty_logging = true;
                     }
                 }
@@ -605,11 +634,13 @@ impl VmmController {
         let mem_len = match snapshot_result {
             Ok(mem_len) => mem_len,
             Err(error) => {
+                replay_consumed_dirty(vm, consumed_dirty.as_ref());
                 remove_owned_scratch_file(&owned_snapshot);
                 return Err(error);
             }
         };
         if let Err(error) = persist_owned_output(&mut owned_snapshot, &path_buf) {
+            replay_consumed_dirty(vm, consumed_dirty.as_ref());
             remove_owned_scratch_file(&owned_snapshot);
             return Err(error);
         }
@@ -1008,10 +1039,12 @@ impl VmmController {
         // RAM would keep the host at two copies for the caller's lifetime.
         drop(output.mem_snapshot);
         if let Err(e) = write {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
             remove_owned_scratch_file(&owned_live_path);
             return Err(e);
         }
         if let Err(error) = persist_owned_output(&mut owned_live_path, &live_path) {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
             remove_owned_scratch_file(&owned_live_path);
             return Err(error);
         }
@@ -1384,11 +1417,17 @@ impl VmmController {
     pub fn repair_guest_network(&self, network: tarit_proto::GuestNetworkRepair) -> Result<()> {
         use std::time::{Duration, Instant};
 
+        if network.dns_servers.len() > 4 {
+            return Err(VmmError::InvalidConfig(
+                "guest network repair supports at most 4 DNS servers".into(),
+            ));
+        }
         let start = Instant::now();
         let timeout = Duration::from_secs(5);
         let serial = {
             let slot = self.lock();
             slot.as_ref()
+                .filter(|vm| vm.state == VmState::Running)
                 .and_then(|vm| vm.running.as_ref())
                 .map(|running| running.vcpu_thread.serial.clone())
         }
@@ -1426,15 +1465,17 @@ impl VmmController {
                     started = true;
                     continue;
                 }
-                if let Some(code) = line.strip_prefix("VMM_REPAIR_NET_EXIT=") {
-                    let exit_code: i32 = code.trim().parse().unwrap_or(1);
-                    if exit_code == 0 {
-                        return Ok(());
+                if started {
+                    if let Some(code) = line.strip_prefix("VMM_REPAIR_NET_EXIT=") {
+                        let exit_code: i32 = code.trim().parse().unwrap_or(1);
+                        if exit_code == 0 {
+                            return Ok(());
+                        }
+                        return Err(VmmError::Device(format!(
+                            "guest network repair failed ({exit_code}): {}",
+                            finish_exec_output(output, truncated)
+                        )));
                     }
-                    return Err(VmmError::Device(format!(
-                        "guest network repair failed ({exit_code}): {}",
-                        finish_exec_output(output, truncated)
-                    )));
                 }
                 if started {
                     append_exec_output(&mut output, line.as_bytes(), &mut truncated);
