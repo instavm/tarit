@@ -16,7 +16,7 @@ LOG=/tmp/taritd-warmpool.log
 
 export TARIT_API_KEY="warm-e2e-key"
 export TARIT_LISTEN="127.0.0.1:8080"
-export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
+export TARIT_VMM_BIN="${TARIT_VMM_BIN:-$VMM_ROOT/target/debug/vmm}"
 export TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
 export TARIT_ROOTFS="$ROOTFS"
 # The shared host base is always immutable through per-VM CoW. Keep the guest
