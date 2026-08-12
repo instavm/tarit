@@ -1415,12 +1415,29 @@ impl VmmController {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub fn repair_guest_network(&self, network: tarit_proto::GuestNetworkRepair) -> Result<()> {
+        use std::net::IpAddr;
         use std::time::{Duration, Instant};
 
         if network.dns_servers.len() > 4 {
             return Err(VmmError::InvalidConfig(
                 "guest network repair supports at most 4 DNS servers".into(),
             ));
+        }
+        network.addr.parse::<IpAddr>().map_err(|error| {
+            VmmError::InvalidConfig(format!("invalid guest network address: {error}"))
+        })?;
+        network.gateway.parse::<IpAddr>().map_err(|error| {
+            VmmError::InvalidConfig(format!("invalid guest network gateway: {error}"))
+        })?;
+        if network.prefix > 128 {
+            return Err(VmmError::InvalidConfig(
+                "guest network prefix must be at most 128".into(),
+            ));
+        }
+        for dns in &network.dns_servers {
+            dns.parse::<IpAddr>().map_err(|error| {
+                VmmError::InvalidConfig(format!("invalid guest DNS server: {error}"))
+            })?;
         }
         let start = Instant::now();
         let timeout = Duration::from_secs(5);

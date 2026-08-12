@@ -176,7 +176,8 @@ impl OwnedScratchFile {
             sync_directory(parent)?;
         }
         rename_noreplace(&self.path, &target)?;
-        if let Some(parent) = target.parent() {
+        self.path = target;
+        if let Some(parent) = self.path.parent() {
             sync_directory(parent)?;
         }
 
@@ -214,7 +215,6 @@ impl OwnedScratchFile {
             fs::hard_link(source, target)?;
             fs::remove_file(source)
         }
-        self.path = target;
         Ok(())
     }
 

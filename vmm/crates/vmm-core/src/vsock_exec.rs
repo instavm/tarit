@@ -165,10 +165,19 @@ impl OutputSink {
             let path = crate::controller::unique_runtime_file_path("vsock-exec", label)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             let owned = OwnedScratchFile::create_new(path)?;
-            let mut writer = owned.file().try_clone()?;
-            writer.write_all(&self.memory)?;
-            self.memory.clear();
+            let writer = match owned.file().try_clone() {
+                Ok(writer) => writer,
+                Err(error) => {
+                    let _ = std::fs::remove_file(owned.path());
+                    return Err(error);
+                }
+            };
             self.spool = Some(OutputSpool { owned, writer });
+            let Some(spool) = self.spool.as_mut() else {
+                return Err(std::io::Error::other("exec spool initialization failed"));
+            };
+            spool.writer.write_all(&self.memory)?;
+            self.memory.clear();
         }
         if let Some(spool) = self.spool.as_mut() {
             spool.writer.write_all(bytes)?;
