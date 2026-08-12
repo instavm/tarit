@@ -134,18 +134,7 @@ pub fn apply_limits(cgroup_path: &str, limits: &CgroupLimits) -> Result<(), Cgro
 
 fn write_one_command(path: &Path, command: &str) -> std::io::Result<()> {
     let mut file = fs::OpenOptions::new().write(true).open(path)?;
-    let written = file.write(command.as_bytes())?;
-    if written == command.len() {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::WriteZero,
-            format!(
-                "short cgroup command write: wrote {written}/{} bytes",
-                command.len()
-            ),
-        ))
-    }
+    file.write_all(command.as_bytes())
 }
 
 fn limit_write_commands<'a>(key: &str, value: &'a str) -> Result<Vec<&'a str>, CgroupError> {

@@ -42,11 +42,12 @@ host applies defense in depth, in two tiers:
   policy, and per-VM cgroup v2 limits when a parent cgroup is configured. The
   coordinator thread is not seccomp-confined.
 - Available as an opt-in hardened mode (`vmm serve --jail`): chroot, privilege
-  drop to an unprivileged uid/gid, mount and network namespaces, and cgroup
-  placement. Jail mode automatically enables the mandatory built-in seccomp
-  profile; the legacy `--seccomp` flag remains accepted, but the profile cannot
-  be disabled. This mode fails closed if a required confinement step cannot be
-  applied.
+  drop to an unprivileged uid/gid, mount namespaces, optional entry into an
+  explicit network namespace, and cgroup placement. Without `--netns`, the VMM
+  remains in the caller's network namespace. Jail mode automatically enables
+  the mandatory built-in seccomp profile; the legacy `--seccomp` flag remains
+  accepted, but the profile cannot be disabled. This mode fails closed if a
+  required confinement step cannot be applied.
 
 The standard `taritd` launch path does not yet stage and start every VMM through
 that jail. Production mode therefore remains disabled for hostile multi-tenant
