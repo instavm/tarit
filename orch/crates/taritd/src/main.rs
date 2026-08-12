@@ -1224,6 +1224,12 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
+    #[cfg(target_os = "linux")]
+    fn short_test_root(prefix: &str) -> PathBuf {
+        let suffix = Uuid::new_v4().simple().to_string();
+        PathBuf::from("target/t").join(format!("{prefix}-{suffix}"))
+    }
+
     fn test_shutdown(tx: watch::Sender<Option<&'static str>>) -> ShutdownCoordinator {
         ShutdownCoordinator::new(tx, Arc::new(VmmSupervisor::new(test_config())))
     }
@@ -1322,6 +1328,7 @@ mod tests {
             .unwrap()
             .join(format!("target/legacy-creating-upgrade-{}", Uuid::new_v4()));
         let mut config = test_config();
+        config.vmm_bin = std::env::current_exe().unwrap();
         config.socket_dir = root.join("sockets");
         config.db_path = root.join("fleet.db");
         config.net_state_path = root.join("net-state.json");
@@ -1373,9 +1380,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn identity_less_legacy_creating_terminates_discovered_owned_runtime() {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join(format!("target/legacy-creating-runtime-{}", Uuid::new_v4()));
+        let root = short_test_root("lcr");
         let mut config = test_config();
         config.vmm_bin = PathBuf::from("sh");
         config.socket_dir = root.join("sockets");
@@ -1432,9 +1437,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn legacy_active_runtime_is_persisted_before_adoption() {
-        let root = std::env::current_dir()
-            .unwrap()
-            .join(format!("target/legacy-layout-adoption-{}", Uuid::new_v4()));
+        let root = short_test_root("lla");
         let mut config = test_config();
         config.vmm_bin = PathBuf::from("sh");
         config.socket_dir = root.join("sockets");

@@ -64,8 +64,10 @@ fn graceful_stop_vmm(socket_path: &Path) {
 }
 
 fn is_process_gone(error: &std::io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH))
-        || error.kind() == std::io::ErrorKind::NotFound
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::ENOTDIR)
+    ) || error.kind() == std::io::ErrorKind::NotFound
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -93,8 +95,12 @@ fn parse_process_id(raw: &str) -> Option<u32> {
 fn proc_pid_entries(proc_root: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
     let mut processes = Vec::new();
     for entry in std::fs::read_dir(proc_root)? {
-        let Some(entry) = tolerate_process_disappearance(entry)? else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(%error, "skip unreadable proc directory entry");
+                continue;
+            }
         };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -103,8 +109,12 @@ fn proc_pid_entries(proc_root: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
         let Some(pid) = parse_process_id(name) else {
             continue;
         };
-        let Some(file_type) = tolerate_process_disappearance(entry.file_type())? else {
-            continue;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                tracing::debug!(pid, %error, "skip vanished or unreadable proc process entry");
+                continue;
+            }
         };
         if file_type.is_dir() {
             processes.push((pid, entry.path()));
@@ -4989,7 +4999,6 @@ impl VmmSupervisor {
             if let Some(jails) = &self.jails {
                 allowed_uids.extend(jails.uids()?);
             }
-            let mut proc_visibility_incomplete = false;
             let processes = proc_pid_entries(Path::new("/proc")).map_err(|error| {
                 OrchError::Internal(format!("scan /proc for unpersisted warm VMMs: {error}"))
             })?;
@@ -4997,16 +5006,13 @@ impl VmmSupervisor {
                 let cmdline =
                     match verified_process_cmdline(pid, &proc_dir, &executable, &allowed_uids) {
                         Ok(cmdline) => cmdline,
-                        Err(error) if error.is_gone() => continue,
-                        Err(ProcessVerificationError::Rejected(_)) => continue,
-                        Err(error) if error.is_permission_denied() => {
-                            proc_visibility_incomplete = true;
-                            continue;
-                        }
                         Err(error) => {
-                            return Err(OrchError::Internal(format!(
-                                "inspect VMM candidate {pid} during warm VMM recovery: {error}"
-                            )))
+                            tracing::debug!(
+                                pid,
+                                reason = %error,
+                                "skip unverifiable proc entry during warm VMM discovery"
+                            );
+                            continue;
                         }
                     };
                 for arg in cmdline.split(|byte| *byte == 0) {
@@ -5023,11 +5029,6 @@ impl VmmSupervisor {
                         ids.insert(id);
                     }
                 }
-            }
-            if self.config.warm_pool.enabled && proc_visibility_incomplete {
-                return Err(OrchError::Internal(
-                    "cannot inspect every process while reconciling unpersisted warm VMMs".into(),
-                ));
             }
         }
         Ok(ids)
@@ -5070,23 +5071,20 @@ impl VmmSupervisor {
         }
 
         let mut candidate_pids = cgroup_pids.clone();
-        let mut proc_visibility_incomplete = false;
         let processes = proc_pid_entries(Path::new("/proc"))
             .map_err(|error| OrchError::Internal(format!("scan /proc for owned VMMs: {error}")))?;
         for (pid, proc_dir) in processes {
             let cmdline = match verified_process_cmdline(pid, &proc_dir, &executable, &allowed_uids)
             {
                 Ok(cmdline) => cmdline,
-                Err(error) if error.is_gone() => continue,
-                Err(ProcessVerificationError::Rejected(_)) => continue,
-                Err(error) if error.is_permission_denied() => {
-                    proc_visibility_incomplete = true;
-                    continue;
-                }
                 Err(error) => {
-                    return Err(OrchError::Internal(format!(
-                        "inspect VMM candidate {pid} during VMM recovery: {error}"
-                    )))
+                    tracing::debug!(
+                        pid,
+                        reason = %error,
+                        vm = %id,
+                        "skip unverifiable proc entry during owned VMM discovery"
+                    );
+                    continue;
                 }
             };
             let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
@@ -5104,12 +5102,6 @@ impl VmmSupervisor {
                 candidate_pids.insert(pid);
             }
         }
-        if proc_visibility_incomplete {
-            return Err(OrchError::Internal(format!(
-                "cannot inspect every process while reconciling owned runtime for VM {id}; preserving its artifacts and identity lease"
-            )));
-        }
-
         let mut processes = Vec::new();
         for pid in candidate_pids {
             let pidfd = match pidfd_open(pid) {
@@ -5155,16 +5147,10 @@ impl VmmSupervisor {
             match verified {
                 Ok(()) => processes.push(ManagedProcess::adopted(pid, pidfd)),
                 Err(error) if error.is_gone() => continue,
-                Err(reason) if cgroup_pids.contains(&pid) => {
-                    return Err(OrchError::Internal(format!(
-                        "process {pid} remains in owned cgroup for VM {id} but failed VMM ownership verification: {reason}"
-                    )))
-                }
-                Err(ProcessVerificationError::Rejected(_)) => continue,
                 Err(reason) => {
                     return Err(OrchError::Internal(format!(
-                        "inspect pinned VMM candidate {pid} for VM {id}: {reason}"
-                    )))
+                    "owned VMM candidate {pid} for VM {id} failed ownership verification: {reason}"
+                )))
                 }
             }
         }
@@ -7673,6 +7659,7 @@ mod tests {
         std::fs::create_dir_all(root.join("123")).unwrap();
         std::fs::create_dir(root.join("0")).unwrap();
         std::fs::create_dir(root.join("12x")).unwrap();
+        std::fs::write(root.join("456"), b"not a process directory").unwrap();
         std::fs::write(root.join("fb"), b"framebuffer metadata").unwrap();
 
         let entries = proc_pid_entries(&root).unwrap();
@@ -7683,7 +7670,7 @@ mod tests {
 
     #[test]
     fn transient_process_disappearance_errors_are_tolerated() {
-        for errno in [libc::ENOENT, libc::ESRCH] {
+        for errno in [libc::ENOENT, libc::ESRCH, libc::ENOTDIR] {
             let result =
                 tolerate_process_disappearance::<()>(Err(std::io::Error::from_raw_os_error(errno)))
                     .unwrap();
@@ -8104,9 +8091,7 @@ mod tests {
         let error = supervisor
             .cleanup_uncommitted_runtime(id)
             .expect_err("unverified process must fail closed");
-        assert!(error
-            .to_string()
-            .contains("failed VMM ownership verification"));
+        assert!(error.to_string().contains("failed ownership verification"));
         assert!(unrelated.try_wait().unwrap().is_none());
         assert!(lease.root.exists());
         assert!(supervisor.jail_identity(id).unwrap().is_some());
