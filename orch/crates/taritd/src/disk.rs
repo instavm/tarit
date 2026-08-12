@@ -1,6 +1,6 @@
 use crate::config::DiskPressureConfig;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -69,9 +69,21 @@ struct PressureRoot {
 
 pub(crate) struct DiskReservation {
     pressure: Arc<DiskPressure>,
+    growth: Vec<FilesystemGrowth>,
+    released: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FilesystemGrowth {
+    device: u64,
     bytes: u64,
     inodes: u64,
-    released: bool,
+}
+
+pub(crate) struct PathGrowth {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: u64,
+    pub(crate) inodes: u64,
 }
 
 impl DiskPressure {
@@ -193,17 +205,61 @@ impl DiskPressure {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve(
         self: &Arc<Self>,
         operation: &str,
         bytes: u64,
         inodes: u64,
     ) -> Result<DiskReservation, OrchError> {
+        let paths = self
+            .roots
+            .lock()
+            .map_err(|_| OrchError::Internal("disk pressure roots poisoned".into()))?
+            .iter()
+            .map(|root| PathGrowth {
+                path: root.path.clone(),
+                bytes,
+                inodes,
+            })
+            .collect::<Vec<_>>();
+        self.reserve_growth(operation, paths)
+    }
+
+    pub(crate) fn reserve_growth(
+        self: &Arc<Self>,
+        operation: &str,
+        paths: impl IntoIterator<Item = PathGrowth>,
+    ) -> Result<DiskReservation, OrchError> {
         let mut roots = self
             .roots
             .lock()
             .map_err(|_| OrchError::Internal("disk pressure roots poisoned".into()))?;
-        for root in roots.iter() {
+        let mut requested = Vec::new();
+        for growth in paths {
+            let device = filesystem_device(&growth.path).map_err(|error| {
+                OrchError::Internal(format!(
+                    "resolve disk reservation filesystem for {}: {error}",
+                    growth.path.display()
+                ))
+            })?;
+            requested.push(FilesystemGrowth {
+                device,
+                bytes: growth.bytes,
+                inodes: growth.inodes,
+            });
+        }
+        let growth = aggregate_filesystem_growth(requested);
+        for requested in &growth {
+            let root = roots
+                .iter()
+                .find(|root| root.device == requested.device)
+                .ok_or_else(|| {
+                    OrchError::Internal(format!(
+                        "disk reservation for untracked filesystem device {}",
+                        requested.device
+                    ))
+                })?;
             let space = filesystem_space(&root.path).map_err(|error| {
                 OrchError::Internal(format!(
                     "measure disk pressure at {}: {error}",
@@ -213,14 +269,14 @@ impl DiskPressure {
             let projected_bytes = space
                 .used_bytes
                 .saturating_add(root.reserved_bytes)
-                .saturating_add(bytes);
+                .saturating_add(requested.bytes);
             let projected_inodes = space
                 .used_inodes
                 .saturating_add(root.reserved_inodes)
-                .saturating_add(inodes);
-            let exceeds_reservable_space = root.reserved_bytes.saturating_add(bytes)
+                .saturating_add(requested.inodes);
+            let exceeds_reservable_space = root.reserved_bytes.saturating_add(requested.bytes)
                 > space.available_bytes
-                || root.reserved_inodes.saturating_add(inodes) > space.available_inodes;
+                || root.reserved_inodes.saturating_add(requested.inodes) > space.available_inodes;
             if exceeds_reservable_space
                 || self
                     .config
@@ -240,24 +296,33 @@ impl DiskPressure {
                 });
             }
         }
-        for root in roots.iter_mut() {
-            root.reserved_bytes = root.reserved_bytes.saturating_add(bytes);
-            root.reserved_inodes = root.reserved_inodes.saturating_add(inodes);
+        for requested in &growth {
+            let root = roots
+                .iter_mut()
+                .find(|root| root.device == requested.device)
+                .expect("validated reservation device disappeared");
+            root.reserved_bytes = root.reserved_bytes.saturating_add(requested.bytes);
+            root.reserved_inodes = root.reserved_inodes.saturating_add(requested.inodes);
         }
         drop(roots);
         if let Err(error) = self.refresh() {
             if let Ok(mut roots) = self.roots.lock() {
-                for root in roots.iter_mut() {
-                    root.reserved_bytes = root.reserved_bytes.saturating_sub(bytes);
-                    root.reserved_inodes = root.reserved_inodes.saturating_sub(inodes);
+                for requested in &growth {
+                    if let Some(root) = roots
+                        .iter_mut()
+                        .find(|root| root.device == requested.device)
+                    {
+                        root.reserved_bytes = root.reserved_bytes.saturating_sub(requested.bytes);
+                        root.reserved_inodes =
+                            root.reserved_inodes.saturating_sub(requested.inodes);
+                    }
                 }
             }
             return Err(error);
         }
         Ok(DiskReservation {
             pressure: Arc::clone(self),
-            bytes,
-            inodes,
+            growth,
             released: false,
         })
     }
@@ -277,15 +342,58 @@ impl DiskReservation {
         }
         self.released = true;
         if let Ok(mut roots) = self.pressure.roots.lock() {
-            for root in roots.iter_mut() {
-                root.reserved_bytes = root.reserved_bytes.saturating_sub(self.bytes);
-                root.reserved_inodes = root.reserved_inodes.saturating_sub(self.inodes);
+            for requested in &self.growth {
+                if let Some(root) = roots
+                    .iter_mut()
+                    .find(|root| root.device == requested.device)
+                {
+                    root.reserved_bytes = root.reserved_bytes.saturating_sub(requested.bytes);
+                    root.reserved_inodes = root.reserved_inodes.saturating_sub(requested.inodes);
+                }
             }
         }
         if let Err(error) = self.pressure.refresh() {
             tracing::warn!(%error, "refresh disk pressure after reservation release failed");
         }
     }
+}
+
+fn aggregate_filesystem_growth(
+    growth: impl IntoIterator<Item = FilesystemGrowth>,
+) -> Vec<FilesystemGrowth> {
+    let mut aggregated = HashMap::<u64, (u64, u64)>::new();
+    for item in growth {
+        let totals = aggregated.entry(item.device).or_default();
+        totals.0 = totals.0.saturating_add(item.bytes);
+        totals.1 = totals.1.saturating_add(item.inodes);
+    }
+    let mut aggregated = aggregated
+        .into_iter()
+        .map(|(device, (bytes, inodes))| FilesystemGrowth {
+            device,
+            bytes,
+            inodes,
+        })
+        .collect::<Vec<_>>();
+    aggregated.sort_by_key(|growth| growth.device);
+    aggregated
+}
+
+fn filesystem_device(path: &Path) -> std::io::Result<u64> {
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        match std::fs::metadata(current) {
+            Ok(metadata) => return Ok(metadata.dev()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                candidate = current.parent();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{} has no existing ancestor", path.display()),
+    ))
 }
 
 impl Drop for DiskReservation {
@@ -636,6 +744,71 @@ mod tests {
         drop(reservation);
         assert_eq!(pressure.snapshot().reserved_bytes, 0);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_growth_aggregates_peak_bytes_on_one_filesystem() {
+        let growth = aggregate_filesystem_growth([
+            FilesystemGrowth {
+                device: 7,
+                bytes: 256,
+                inodes: 1,
+            },
+            FilesystemGrowth {
+                device: 7,
+                bytes: 256,
+                inodes: 1,
+            },
+            FilesystemGrowth {
+                device: 7,
+                bytes: 64,
+                inodes: 1,
+            },
+        ]);
+        assert_eq!(
+            growth,
+            vec![FilesystemGrowth {
+                device: 7,
+                bytes: 576,
+                inodes: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn snapshot_growth_reserves_each_filesystem_independently() {
+        let growth = aggregate_filesystem_growth([
+            FilesystemGrowth {
+                device: 1,
+                bytes: 256,
+                inodes: 1,
+            },
+            FilesystemGrowth {
+                device: 2,
+                bytes: 256,
+                inodes: 1,
+            },
+            FilesystemGrowth {
+                device: 2,
+                bytes: 64,
+                inodes: 1,
+            },
+        ]);
+        assert_eq!(
+            growth,
+            vec![
+                FilesystemGrowth {
+                    device: 1,
+                    bytes: 256,
+                    inodes: 1,
+                },
+                FilesystemGrowth {
+                    device: 2,
+                    bytes: 320,
+                    inodes: 2,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -1179,6 +1179,7 @@ fn validate_production_requirements(
     if !vm_jail.seccomp {
         bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_SECCOMP=1");
     }
+    validate_production_jail_network_isolation(vm_jail)?;
     // Rootfs isolation is enforced by the supervisor: every immutable base is
     // attached through a private per-VM CoW overlay. `TARIT_ROOTFS_READONLY`
     // controls guest mount semantics and is intentionally not a production gate.
@@ -1213,6 +1214,13 @@ fn validate_production_requirements(
         bail!("TARIT_PRODUCTION forbids TARIT_ALLOW_INSECURE_PEER_HTTP");
     }
     Ok(())
+}
+
+fn validate_production_jail_network_isolation(vm_jail: &VmJailConfig) -> Result<()> {
+    bail!(
+        "TARIT_PRODUCTION rejects jail profile {:?}: it retains the host network namespace; production remains unavailable until dedicated netns/veth/TAP wiring exists",
+        vm_jail.profile
+    )
 }
 
 #[cfg(test)]
@@ -1958,5 +1966,21 @@ mod tests {
         ] {
             std::env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn production_jail_fails_closed_without_network_namespace() {
+        let jail = VmJailConfig {
+            base_dir: PathBuf::from("/srv/tarit/jails"),
+            uid_base: 200_000,
+            gid_base: 300_000,
+            id_count: 8,
+            profile: SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        };
+        let error = validate_production_jail_network_isolation(&jail)
+            .expect_err("host-network jail must not pass the production gate");
+        assert!(error.to_string().contains("host network namespace"));
+        assert!(error.to_string().contains("netns/veth/TAP"));
     }
 }

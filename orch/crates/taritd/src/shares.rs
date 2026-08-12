@@ -1036,6 +1036,7 @@ mod tests {
             rootfs_path: None,
             rootfs_read_only: false,
             cmdline: "console=ttyS0".into(),
+            runtime_layout: None,
             socket_path: None,
             pid: None,
             created_at: now,

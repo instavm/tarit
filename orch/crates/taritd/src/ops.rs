@@ -854,6 +854,7 @@ fn creating_record(
             .map(|path| path.display().to_string()),
         rootfs_read_only: spawn_cfg.read_only,
         cmdline: spawn_cfg.cmdline.clone(),
+        runtime_layout: Some(state.supervisor.runtime_layout_for_config(id, spawn_cfg)),
         socket_path: None,
         pid: None,
         created_at: now,
@@ -1301,11 +1302,7 @@ async fn restore_local_owned(
         kernel_path: kernel_path.clone().into(),
         rootfs_path: snapshot.rootfs_path.clone().map(Into::into),
         cmdline: cmdline.clone(),
-        read_only: snapshot.rootfs_read_only.ok_or_else(|| {
-            OrchError::BadRequest(
-                "snapshot is missing rootfs mount metadata; create a new snapshot".into(),
-            )
-        })?,
+        read_only: restored_rootfs_read_only(snapshot.rootfs_read_only),
     };
     let now = Utc::now();
     let record = VmRecord {
@@ -1322,6 +1319,11 @@ async fn restore_local_owned(
         rootfs_path: snapshot.rootfs_path,
         rootfs_read_only: restore_config.read_only,
         cmdline,
+        runtime_layout: Some(
+            state
+                .supervisor
+                .runtime_layout_for_config(id, &restore_config),
+        ),
         socket_path: None,
         pid: None,
         created_at: now,
@@ -1431,6 +1433,10 @@ async fn restore_local_owned(
     mark_running(state, record.clone())?;
     tracing::info!(id = %id, host = %state.config.host_id, "restore: from snapshot");
     Ok(record)
+}
+
+fn restored_rootfs_read_only(value: Option<bool>) -> bool {
+    value.unwrap_or(true)
 }
 
 pub async fn exec_local(
@@ -3175,6 +3181,7 @@ mod tests {
                 rootfs_path: None,
                 rootfs_read_only: false,
                 cmdline: "console=ttyS0".into(),
+                runtime_layout: None,
                 socket_path: None,
                 pid: None,
                 created_at: now,
@@ -3190,4 +3197,10 @@ mod tests {
             .build()
             .unwrap()
     }
+}
+#[test]
+fn legacy_snapshot_null_rootfs_mode_restores_read_only() {
+    assert!(restored_rootfs_read_only(None));
+    assert!(restored_rootfs_read_only(Some(true)));
+    assert!(!restored_rootfs_read_only(Some(false)));
 }

@@ -514,16 +514,25 @@ fn artifact_references(
     vms: &[tarit_types::VmRecord],
     snapshots: &[tarit_store::SnapshotRecord],
 ) -> disk::ArtifactReferences {
-    let active_vm_ids = vms
-        .iter()
-        .filter(|vm| {
-            matches!(
-                vm.status,
-                VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
-            )
-        })
-        .map(|vm| vm.id)
-        .collect::<HashSet<_>>();
+    let active_vms = vms.iter().filter(|vm| {
+        matches!(
+            vm.status,
+            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        )
+    });
+    let active_vm_ids = active_vms.clone().map(|vm| vm.id).collect::<HashSet<_>>();
+    let mut runtime_paths = HashSet::new();
+    for vm in active_vms {
+        if let Some(layout) = &vm.runtime_layout {
+            runtime_paths.extend(layout.artifact_paths.iter().map(std::path::PathBuf::from));
+            if let Some(path) = &layout.overlay_path {
+                runtime_paths.insert(std::path::PathBuf::from(path));
+            }
+            if let Some(path) = &layout.jail_path {
+                runtime_paths.insert(std::path::PathBuf::from(path));
+            }
+        }
+    }
     let mut snapshot_paths = HashSet::new();
     for snapshot in snapshots {
         snapshot_paths.insert(std::path::PathBuf::from(&snapshot.path));
@@ -534,7 +543,7 @@ fn artifact_references(
     disk::ArtifactReferences {
         active_vm_ids,
         snapshot_paths,
-        runtime_paths: HashSet::new(),
+        runtime_paths,
     }
 }
 
@@ -1116,12 +1125,50 @@ mod tests {
         body::Body,
         http::{header::HOST, Request, StatusCode},
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     fn test_shutdown(tx: watch::Sender<Option<&'static str>>) -> ShutdownCoordinator {
         ShutdownCoordinator::new(tx, Arc::new(VmmSupervisor::new(test_config())))
+    }
+
+    #[test]
+    fn artifact_gc_uses_persisted_runtime_layout_paths() {
+        let now = chrono::Utc::now();
+        let persisted_overlay = PathBuf::from("/old-layout/overlays/vm.cow");
+        let persisted_jail = PathBuf::from("/old-layout/jails/vm");
+        let vm = tarit_types::VmRecord {
+            id: Uuid::new_v4(),
+            host_id: "host-a".into(),
+            owner_key: None,
+            api_key_id: None,
+            status: VmStatus::Running,
+            revision: 1,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: Some("rootfs".into()),
+            rootfs_read_only: true,
+            cmdline: "console=ttyS0".into(),
+            runtime_layout: Some(tarit_types::VmRuntimeLayout {
+                overlay_path: Some(persisted_overlay.display().to_string()),
+                jail_path: Some(persisted_jail.display().to_string()),
+                artifact_paths: vec!["/old-layout/control.sock".into()],
+            }),
+            socket_path: Some("/old-layout/control.sock".into()),
+            pid: Some(42),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let references = artifact_references(&[vm], &[]);
+        assert!(references.runtime_paths.contains(&persisted_overlay));
+        assert!(references.runtime_paths.contains(&persisted_jail));
+        assert!(references
+            .runtime_paths
+            .contains(Path::new("/old-layout/control.sock")));
     }
 
     #[tokio::test]

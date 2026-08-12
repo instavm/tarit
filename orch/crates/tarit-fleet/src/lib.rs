@@ -212,6 +212,7 @@ impl PostgresFleet {
                     )));
                 }
                 let mut expected = vm.clone();
+                expected.runtime_layout = None;
                 expected.socket_path = None;
                 expected.pid = None;
                 if existing_vm.revision == vm.revision && existing_vm != expected {
@@ -939,6 +940,7 @@ fn row_to_vm(row: &tokio_postgres::Row) -> Result<VmRecord, FleetError> {
         rootfs_path: row.get(10),
         rootfs_read_only: row.get(11),
         cmdline: row.get(12),
+        runtime_layout: None,
         // Process handles are node-local and must never be reconstructed from
         // the global ownership index.
         socket_path: None,
@@ -1152,6 +1154,7 @@ mod tests {
             rootfs_path: Some("/opt/tarit/rootfs.ext4".into()),
             rootfs_read_only: true,
             cmdline: "console=ttyS0".into(),
+            runtime_layout: None,
             socket_path: None,
             pid: None,
             created_at: now,

@@ -651,6 +651,7 @@ mod tests {
             rootfs_path: Some("/tmp/rootfs.ext4".into()),
             rootfs_read_only: true,
             cmdline: "console=ttyS0".into(),
+            runtime_layout: None,
             socket_path: Some("/run/taritd/vm.sock".into()),
             pid: Some(42),
             created_at: Utc::now(),

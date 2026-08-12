@@ -1,26 +1,26 @@
 use crate::config::{Config, WarmClass};
 use crate::disk::{
-    ArtifactReferences, DiskPressure, DiskPressureSnapshot, DiskReservation, GcReport,
+    ArtifactReferences, DiskPressure, DiskPressureSnapshot, DiskReservation, GcReport, PathGrowth,
 };
 use crate::net::{NetAlloc, NetProvisioner};
 use crate::scheduler::{ReservationError, ResourceShape, Scheduler};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::time::{Duration, Instant};
-use tarit_types::{OrchError, VmRecord, VmStatus};
+use tarit_types::{OrchError, VmRecord, VmRuntimeLayout, VmStatus};
 use tarit_vmm_client::{
     KernelConfig, MemoryConfig, NetConfig, ScratchIdentity, VcpuConfig, VmConfig, VmmClient,
     VolumeConfig,
@@ -313,6 +313,7 @@ struct OwnedArtifact {
 }
 
 const JAIL_MARKER_VERSION: u32 = 1;
+const JAIL_BASE_MARKER_VERSION: u32 = 1;
 const JAIL_SOCKET_PATH: &str = "/run/vmm.sock";
 const JAIL_KERNEL_PATH: &str = "/assets/kernel";
 const JAIL_ROOTFS_PATH: &str = "/assets/rootfs";
@@ -325,6 +326,12 @@ struct JailMarker {
     vm_id: Uuid,
     uid: u32,
     gid: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JailBaseMarker {
+    version: u32,
+    uid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -347,19 +354,7 @@ struct JailManager {
 
 impl JailManager {
     fn new(config: crate::config::VmJailConfig) -> Result<Self, OrchError> {
-        std::fs::create_dir_all(&config.base_dir).map_err(|error| {
-            OrchError::Internal(format!(
-                "create VM jail base {}: {error}",
-                config.base_dir.display()
-            ))
-        })?;
-        std::fs::set_permissions(&config.base_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| {
-                OrchError::Internal(format!(
-                    "protect VM jail base {}: {error}",
-                    config.base_dir.display()
-                ))
-            })?;
+        ensure_private_jail_base(&config.base_dir)?;
         let mut state = JailLeaseState::default();
         for entry in std::fs::read_dir(&config.base_dir).map_err(|error| {
             OrchError::Internal(format!(
@@ -381,6 +376,18 @@ impl JailManager {
             else {
                 continue;
             };
+            let file_type = entry.file_type().map_err(|error| {
+                OrchError::Internal(format!(
+                    "inspect VM jail entry {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(OrchError::Internal(format!(
+                    "VM jail entry {} must be a real directory, not a symlink",
+                    entry.path().display()
+                )));
+            }
             let root = entry.path();
             let marker = read_jail_marker(&root)?;
             if marker.version != JAIL_MARKER_VERSION || marker.vm_id != vm_id {
@@ -550,6 +557,293 @@ impl JailManager {
     }
 }
 
+fn ensure_private_jail_base(path: &Path) -> Result<(), OrchError> {
+    validate_jail_base_path(path)?;
+    let mut directory = File::open("/").map_err(|error| {
+        OrchError::Internal(format!("open filesystem root for jail base: {error}"))
+    })?;
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(name.to_owned()),
+            _ => unreachable!("validated jail path contains only root and normal components"),
+        })
+        .collect::<Vec<_>>();
+    for component in &components {
+        let name = std::ffi::CString::new(component.as_bytes()).map_err(|_| {
+            OrchError::Internal(format!("VM jail base contains NUL: {}", path.display()))
+        })?;
+        let mut fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(OrchError::Internal(format!(
+                    "open VM jail base component {} without following symlinks: {error}",
+                    component.to_string_lossy()
+                )));
+            }
+            if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                return Err(OrchError::Internal(format!(
+                    "create private VM jail base component {}: {}",
+                    component.to_string_lossy(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+            fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(OrchError::Internal(format!(
+                    "open newly created VM jail base component {}: {}",
+                    component.to_string_lossy(),
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        // SAFETY: fd is a unique successful openat result and ownership moves
+        // into File immediately.
+        directory = unsafe { File::from_raw_fd(fd) };
+    }
+
+    let metadata = directory.metadata().map_err(|error| {
+        OrchError::Internal(format!("inspect VM jail base {}: {error}", path.display()))
+    })?;
+    let expected_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != expected_uid || metadata.mode() & 0o077 != 0 {
+        return Err(OrchError::Internal(format!(
+            "VM jail base {} must be a private directory owned by uid {expected_uid}; existing host paths are never chmodded or claimed",
+            path.display()
+        )));
+    }
+    if is_mount_root(path, &metadata)? {
+        return Err(OrchError::Internal(format!(
+            "VM jail base {} must not be a filesystem mount root",
+            path.display()
+        )));
+    }
+    claim_or_validate_jail_base(path, expected_uid)
+}
+
+fn validate_jail_base_path(path: &Path) -> Result<(), OrchError> {
+    if !path.is_absolute() {
+        return Err(OrchError::Internal(
+            "VM jail base must be an absolute dedicated directory".into(),
+        ));
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(OrchError::Internal(format!(
+            "VM jail base {} contains a non-normal path component",
+            path.display()
+        )));
+    }
+    const PROTECTED_ROOTS: &[&str] = &[
+        "/",
+        "/Applications",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/home",
+        "/Library",
+        "/media",
+        "/mnt",
+        "/opt",
+        "/private",
+        "/proc",
+        "/root",
+        "/run",
+        "/srv",
+        "/sys",
+        "/System",
+        "/tmp",
+        "/Users",
+        "/usr",
+        "/var",
+        "/Volumes",
+    ];
+    if PROTECTED_ROOTS
+        .iter()
+        .any(|protected| path == Path::new(protected))
+    {
+        return Err(OrchError::Internal(format!(
+            "VM jail base {} is a protected broad host path; configure a dedicated child directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn claim_or_validate_jail_base(path: &Path, expected_uid: u32) -> Result<(), OrchError> {
+    use std::io::{Read as _, Write as _};
+
+    let marker_path = path.join(".tarit-jail-base.json");
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    match options.open(&marker_path) {
+        Ok(mut marker_file) => {
+            let metadata = marker_file.metadata().map_err(|error| {
+                OrchError::Internal(format!(
+                    "inspect VM jail base marker {}: {error}",
+                    marker_path.display()
+                ))
+            })?;
+            if !metadata.is_file()
+                || metadata.uid() != expected_uid
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(OrchError::Internal(format!(
+                    "unsafe VM jail base marker {}",
+                    marker_path.display()
+                )));
+            }
+            let mut body = Vec::new();
+            marker_file.read_to_end(&mut body).map_err(|error| {
+                OrchError::Internal(format!(
+                    "read VM jail base marker {}: {error}",
+                    marker_path.display()
+                ))
+            })?;
+            let marker: JailBaseMarker = serde_json::from_slice(&body).map_err(|error| {
+                OrchError::Internal(format!(
+                    "parse VM jail base marker {}: {error}",
+                    marker_path.display()
+                ))
+            })?;
+            if marker.version != JAIL_BASE_MARKER_VERSION || marker.uid != expected_uid {
+                return Err(OrchError::Internal(format!(
+                    "VM jail base marker {} does not match this Tarit identity",
+                    marker_path.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut entries = std::fs::read_dir(path).map_err(|error| {
+                OrchError::Internal(format!(
+                    "scan unclaimed VM jail base {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if entries
+                .next()
+                .transpose()
+                .map_err(|error| {
+                    OrchError::Internal(format!(
+                        "scan unclaimed VM jail base {}: {error}",
+                        path.display()
+                    ))
+                })?
+                .is_some()
+            {
+                return Err(OrchError::Internal(format!(
+                    "refuse to claim non-empty existing VM jail base {} without a Tarit ownership marker",
+                    path.display()
+                )));
+            }
+            let marker = JailBaseMarker {
+                version: JAIL_BASE_MARKER_VERSION,
+                uid: expected_uid,
+            };
+            let mut marker_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&marker_path)
+                .map_err(|error| {
+                    OrchError::Internal(format!("claim VM jail base {}: {error}", path.display()))
+                })?;
+            marker_file
+                .write_all(&serde_json::to_vec(&marker).map_err(|error| {
+                    OrchError::Internal(format!("encode VM jail base marker: {error}"))
+                })?)
+                .and_then(|_| marker_file.sync_all())
+                .map_err(|error| {
+                    OrchError::Internal(format!(
+                        "persist VM jail base marker {}: {error}",
+                        marker_path.display()
+                    ))
+                })?;
+            File::open(path)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    OrchError::Internal(format!("sync VM jail base {}: {error}", path.display()))
+                })
+        }
+        Err(error) => Err(OrchError::Internal(format!(
+            "open VM jail base marker {}: {error}",
+            marker_path.display()
+        ))),
+    }
+}
+
+fn is_mount_root(path: &Path, metadata: &std::fs::Metadata) -> Result<bool, OrchError> {
+    let parent = path.parent().ok_or_else(|| {
+        OrchError::Internal(format!("VM jail base {} has no parent", path.display()))
+    })?;
+    let parent_metadata = std::fs::metadata(parent).map_err(|error| {
+        OrchError::Internal(format!(
+            "inspect VM jail base parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if metadata.dev() != parent_metadata.dev() {
+        return Ok(true);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let target = path.as_os_str().as_bytes();
+        let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|error| {
+            OrchError::Internal(format!(
+                "read mount table for VM jail base validation: {error}"
+            ))
+        })?;
+        for line in mountinfo.split(|byte| *byte == b'\n') {
+            let mut fields = line.split(|byte| *byte == b' ');
+            let mount_point = fields.nth(4).unwrap_or_default();
+            if decode_mountinfo_field(mount_point) == target {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn decode_mountinfo_field(field: &[u8]) -> Vec<u8> {
+    let mut decoded = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while index < field.len() {
+        if field[index] == b'\\' && index + 3 < field.len() {
+            let digits = &field[index + 1..index + 4];
+            if digits.iter().all(|digit| matches!(digit, b'0'..=b'7')) {
+                decoded.push((digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0'));
+                index += 4;
+                continue;
+            }
+        }
+        decoded.push(field[index]);
+        index += 1;
+    }
+    decoded
+}
+
 fn write_jail_marker(root: &Path, marker: &JailMarker) -> Result<(), OrchError> {
     use std::io::Write as _;
 
@@ -584,9 +878,21 @@ fn write_jail_marker(root: &Path, marker: &JailMarker) -> Result<(), OrchError> 
 }
 
 fn read_jail_marker(root: &Path) -> Result<JailMarker, OrchError> {
+    use std::io::Read as _;
+
     let path = root.join(".tarit-jail.json");
-    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-        OrchError::Internal(format!("read VM jail marker {}: {error}", path.display()))
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|error| {
+            OrchError::Internal(format!("read VM jail marker {}: {error}", path.display()))
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        OrchError::Internal(format!(
+            "inspect VM jail marker {}: {error}",
+            path.display()
+        ))
     })?;
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
@@ -598,10 +904,11 @@ fn read_jail_marker(root: &Path) -> Result<JailMarker, OrchError> {
             path.display()
         )));
     }
-    serde_json::from_slice(&std::fs::read(&path).map_err(|error| {
+    let mut body = Vec::new();
+    file.read_to_end(&mut body).map_err(|error| {
         OrchError::Internal(format!("read VM jail marker {}: {error}", path.display()))
-    })?)
-    .map_err(|error| {
+    })?;
+    serde_json::from_slice(&body).map_err(|error| {
         OrchError::Internal(format!("parse VM jail marker {}: {error}", path.display()))
     })
 }
@@ -1470,6 +1777,8 @@ impl VmmSupervisor {
         let mut pressure_roots = vec![config.socket_dir.clone()];
         if let Some(jail) = &config.vm_jail {
             pressure_roots.push(jail.base_dir.clone());
+        } else {
+            pressure_roots.push(std::env::temp_dir());
         }
         let disk_pressure = Arc::new(DiskPressure::new(
             config.disk_pressure.clone(),
@@ -1540,6 +1849,44 @@ impl VmmSupervisor {
 
     fn overlay_path_for_config(&self, id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
         cfg.rootfs_path.is_some().then(|| self.overlay_path_for(id))
+    }
+
+    pub(crate) fn runtime_layout_for_config(
+        &self,
+        id: Uuid,
+        cfg: &VmSpawnConfig,
+    ) -> VmRuntimeLayout {
+        let overlay_path = self.overlay_path_for_config(id, cfg);
+        let jail_path = self
+            .jails
+            .as_ref()
+            .map(|jails| jails.root_for(id).display().to_string());
+        let mut artifact_paths = vec![self.socket_path_for(id).display().to_string()];
+        if let Some(path) = &overlay_path {
+            artifact_paths.push(path.clone());
+        }
+        if let Some(path) = &jail_path {
+            artifact_paths.push(path.clone());
+        }
+        VmRuntimeLayout {
+            overlay_path,
+            jail_path,
+            artifact_paths,
+        }
+    }
+
+    fn expected_runtime_layout(&self, record: &VmRecord) -> VmRuntimeLayout {
+        self.runtime_layout_for_config(
+            record.id,
+            &VmSpawnConfig {
+                memory_mib: record.memory_mib,
+                vcpus: record.vcpus,
+                kernel_path: PathBuf::from(&record.kernel_path),
+                rootfs_path: record.rootfs_path.as_ref().map(PathBuf::from),
+                cmdline: record.cmdline.clone(),
+                read_only: record.rootfs_read_only,
+            },
+        )
     }
 
     fn snapshot_overlay_path(&self) -> PathBuf {
@@ -1959,11 +2306,30 @@ impl VmmSupervisor {
         } else {
             0
         };
-        self.disk_pressure.reserve(
-            "VM snapshot",
-            ram_bytes.saturating_add(overlay_bytes),
-            if has_overlay { 4 } else { 3 },
-        )
+        let scratch_path = match &self.jails {
+            Some(jails) => jails.root_for(id).join("tmp"),
+            None => std::env::temp_dir(),
+        };
+        let mut growth = vec![
+            PathGrowth {
+                path: scratch_path,
+                bytes: ram_bytes,
+                inodes: 1,
+            },
+            PathGrowth {
+                path: self.snapshot_ram_staging_path(),
+                bytes: ram_bytes,
+                inodes: 1,
+            },
+        ];
+        if has_overlay {
+            growth.push(PathGrowth {
+                path: self.snapshot_overlay_staging_path(),
+                bytes: overlay_bytes,
+                inodes: 1,
+            });
+        }
+        self.disk_pressure.reserve_growth("VM snapshot", growth)
     }
 
     pub(crate) fn sweep_owned_artifacts(
@@ -3967,7 +4333,7 @@ impl VmmSupervisor {
                     )))
                 }
             };
-            if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root.as_deref()) {
+            if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root) {
                 if cgroup_pids.contains(&pid) {
                     return Err(OrchError::Internal(format!(
                         "process {pid} remains in owned cgroup for VM {id} but failed VMM ownership verification: {reason}"
@@ -4129,6 +4495,25 @@ impl VmmSupervisor {
         if record.host_id != self.config.host_id {
             return Ok(false);
         }
+        if matches!(
+            record.status,
+            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        ) {
+            let persisted = record.runtime_layout.as_ref().ok_or_else(|| {
+                ReadoptFailure::Fatal(
+                    "persisted active VM has no runtime layout; refusing recovery before artifact GC"
+                        .into(),
+                )
+            })?;
+            let expected = self.expected_runtime_layout(record);
+            if persisted != &expected {
+                self.contain_layout_conflict(record, persisted)
+                    .map_err(ReadoptFailure::Fatal)?;
+                return Err(ReadoptFailure::Unadoptable(format!(
+                    "persisted runtime layout conflicts with current configuration (persisted={persisted:?}, expected={expected:?}); identified VMM was terminated before artifact GC"
+                )));
+            }
+        }
         if record.status == VmStatus::Creating {
             let terminated = self
                 .cleanup_uncommitted_runtime(record.id)
@@ -4201,8 +4586,12 @@ impl VmmSupervisor {
         };
         // Confirm identity while pinned. A failure here means the process is not
         // our VMM (or is already gone), so it must not be signalled.
-        let jail_root = self.jails.as_ref().map(|jails| jails.root_for(record.id));
-        if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root.as_deref()) {
+        let jail_root = record
+            .runtime_layout
+            .as_ref()
+            .and_then(|layout| layout.jail_path.as_deref())
+            .map(Path::new);
+        if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root) {
             self.cleanup_uncommitted_runtime(record.id)
                 .map_err(|cleanup| {
                     ReadoptFailure::Fatal(format!(
@@ -4292,6 +4681,45 @@ impl VmmSupervisor {
         }
         self.reconcile_readopted_status(record).await?;
         Ok(true)
+    }
+
+    fn contain_layout_conflict(
+        &self,
+        record: &VmRecord,
+        persisted: &VmRuntimeLayout,
+    ) -> Result<(), String> {
+        let pid = record.pid.ok_or_else(|| {
+            "runtime layout changed but the persisted active VM has no PID; startup is blocked before GC because safe containment cannot be proven".to_string()
+        })?;
+        let socket_path = record.socket_path.as_deref().map(Path::new).ok_or_else(|| {
+            "runtime layout changed but the persisted active VM has no control socket; startup is blocked before GC because safe containment cannot be proven".to_string()
+        })?;
+        let pidfd = pidfd_open(pid)
+            .map_err(|error| format!("pin layout-conflicting VMM {pid} before GC: {error}"))?;
+        verify_live_vmm(
+            pid,
+            socket_path,
+            persisted.jail_path.as_deref().map(Path::new),
+        )
+        .map_err(|error| {
+            format!(
+                "runtime layout changed and PID {pid} could not be identified safely; startup is blocked before GC: {error}"
+            )
+        })?;
+        graceful_stop_vmm(socket_path);
+        ManagedProcess::adopted(pid, pidfd)
+            .kill_wait()
+            .map_err(|error| {
+                format!("terminate layout-conflicting VMM {pid} before GC: {error}")
+            })?;
+        if let Some(net) = &self.net {
+            net.teardown_vm_id(record.id).map_err(|error| {
+                format!(
+                    "terminate layout-conflicting VMM {pid}, but failed to tear down its recovered network before GC: {error}"
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Never trust persisted lifecycle state across a coordinator crash. Pin
@@ -5925,7 +6353,9 @@ mod tests {
 
     #[test]
     fn jail_identity_leases_are_unique_durable_and_cleaned() {
-        let root = PathBuf::from(format!("target/jail-leases-{}", Uuid::new_v4()));
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/jail-leases-{}", Uuid::new_v4()));
         let config = crate::config::VmJailConfig {
             base_dir: root.clone(),
             uid_base: 20_000,
@@ -5954,6 +6384,85 @@ mod tests {
         assert!(!first.root.exists());
         recovered.release(second_id).unwrap();
         assert!(!root.join(format!("tarit-{second_id}")).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jail_base_rejects_protected_broad_paths() {
+        for path in ["/", "/tmp", "/var", "/srv"] {
+            let error =
+                validate_jail_base_path(Path::new(path)).expect_err("broad path must be rejected");
+            assert!(error.to_string().contains("protected broad host path"));
+        }
+    }
+
+    #[test]
+    fn mountinfo_paths_are_decoded_before_mount_root_checks() {
+        assert_eq!(
+            decode_mountinfo_field(br"/srv/tarit\040jails\134private"),
+            b"/srv/tarit jails\\private"
+        );
+    }
+
+    #[test]
+    fn jail_base_rejects_symlinks_and_does_not_chmod_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/jail-base-symlink-{}", Uuid::new_v4()));
+        let target = root.join("target");
+        let link = root.join("jails");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(ensure_private_jail_base(&link).is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(&target).unwrap().mode() & 0o777,
+            0o755
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jail_base_rejects_existing_non_private_or_unclaimed_directories() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/jail-base-existing-{}", Uuid::new_v4()));
+        let public = root.join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_private_jail_base(&public).is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(&public).unwrap().mode() & 0o777,
+            0o755
+        );
+
+        let occupied = root.join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(occupied.join("host-data"), b"keep").unwrap();
+        let error = ensure_private_jail_base(&occupied)
+            .expect_err("non-empty unclaimed directory must be rejected");
+        assert!(error.to_string().contains("refuse to claim non-empty"));
+        assert_eq!(std::fs::read(occupied.join("host-data")).unwrap(), b"keep");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jail_base_creates_and_reopens_private_owned_directory() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/jail-base-private-{}", Uuid::new_v4()));
+        let base = root.join("owned/jails");
+        ensure_private_jail_base(&base).unwrap();
+        assert_eq!(
+            std::fs::symlink_metadata(&base).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert!(base.join(".tarit-jail-base.json").is_file());
+        ensure_private_jail_base(&base).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5993,7 +6502,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn startup_reconciliation_terminates_unpersisted_jailed_vmm() {
-        let root = PathBuf::from(format!("target/startup-orphan-jail-{}", Uuid::new_v4()));
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/startup-orphan-jail-{}", Uuid::new_v4()));
         let mut config = supervisor_config(&root);
         config.vm_jail = Some(crate::config::VmJailConfig {
             base_dir: root.join("jails"),
@@ -6021,7 +6532,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn startup_reconciliation_contains_durable_creating_runtime() {
-        let root = PathBuf::from(format!("target/startup-creating-jail-{}", Uuid::new_v4()));
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/startup-creating-jail-{}", Uuid::new_v4()));
         let mut config = supervisor_config(&root);
         config.vm_jail = Some(crate::config::VmJailConfig {
             base_dir: root.join("jails"),
@@ -6035,7 +6548,7 @@ mod tests {
         let id = Uuid::new_v4();
         let lease = supervisor.jails.as_ref().unwrap().lease(id).unwrap();
         let mut child = spawn_jailed_vmm_standin(&lease.root);
-        let mut record = restart_record(id, &supervisor.socket_path_for(id));
+        let mut record = restart_record(&supervisor, id, &supervisor.socket_path_for(id));
         record.status = VmStatus::Creating;
         record.pid = None;
         record.socket_path = None;
@@ -6053,8 +6566,68 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn restart_layout_change_terminates_persisted_runtime_before_gc() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/restart-layout-change-{}", Uuid::new_v4()));
+        let old_jail = root
+            .join("old-jails")
+            .join(format!("tarit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(old_jail.join("run")).unwrap();
+        let mut child = spawn_jailed_vmm_standin(&old_jail);
+
+        let mut config = supervisor_config(&root);
+        config.vm_jail = Some(crate::config::VmJailConfig {
+            base_dir: root.join("new-jails"),
+            uid_base: 20_000,
+            gid_base: 30_000,
+            id_count: 4,
+            profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        });
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let id = Uuid::new_v4();
+        let socket = old_jail.join(JAIL_SOCKET_PATH.trim_start_matches('/'));
+        let mut record = restart_record(&supervisor, id, &socket);
+        record.pid = Some(child.id());
+        record.runtime_layout = Some(VmRuntimeLayout {
+            overlay_path: Some(old_jail.join("assets/rootfs.cow").display().to_string()),
+            jail_path: Some(old_jail.display().to_string()),
+            artifact_paths: vec![
+                socket.display().to_string(),
+                old_jail.display().to_string(),
+                old_jail.join("assets/rootfs.cow").display().to_string(),
+            ],
+        });
+
+        let warnings = test_runtime()
+            .block_on(supervisor.readopt_running_vms(std::slice::from_mut(&mut record)))
+            .unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].reason.contains("runtime layout conflicts"));
+        child.wait().expect("reap layout-conflicting stand-in");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restart_missing_runtime_layout_blocks_before_gc() {
+        let root = PathBuf::from(format!("target/restart-layout-missing-{}", Uuid::new_v4()));
+        let supervisor = Arc::new(VmmSupervisor::new(supervisor_config(&root)));
+        let id = Uuid::new_v4();
+        let socket = supervisor.socket_path_for(id);
+        let mut record = restart_record(&supervisor, id, &socket);
+        record.runtime_layout = None;
+        let error = test_runtime()
+            .block_on(supervisor.readopt_running_vms(std::slice::from_mut(&mut record)))
+            .expect_err("missing active runtime layout must block startup");
+        assert!(error.to_string().contains("before artifact GC"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn unverified_cgroup_process_retains_jail_identity() {
-        let root = PathBuf::from(format!(
+        let root = std::env::current_dir().unwrap().join(format!(
             "target/startup-unverified-cgroup-{}",
             Uuid::new_v4()
         ));
@@ -6151,8 +6724,10 @@ mod tests {
         Arc::new(VmmSupervisor::new(config))
     }
 
-    fn restart_record(id: Uuid, socket_path: &Path) -> VmRecord {
+    fn restart_record(supervisor: &VmmSupervisor, id: Uuid, socket_path: &Path) -> VmRecord {
         let now = chrono::Utc::now();
+        let runtime_layout =
+            supervisor.runtime_layout_for_config(id, &spawn_config(true, Some("/rootfs".into())));
         VmRecord {
             id,
             host_id: "test-host".into(),
@@ -6167,6 +6742,7 @@ mod tests {
             rootfs_path: Some("rootfs".into()),
             rootfs_read_only: true,
             cmdline: DEFAULT_CMDLINE.into(),
+            runtime_layout: Some(runtime_layout),
             socket_path: Some(socket_path.display().to_string()),
             pid: None,
             created_at: now,
@@ -6216,7 +6792,7 @@ mod tests {
             id,
             RunningVm::new(process.pid, socket_path.clone(), process, None),
         );
-        let mut record = restart_record(id, &socket_path);
+        let mut record = restart_record(&supervisor, id, &socket_path);
         let previous_updated_at = record.updated_at;
 
         test_runtime()
@@ -6254,7 +6830,7 @@ mod tests {
             id,
             RunningVm::new(process.pid, socket_path.clone(), process, None),
         );
-        let mut record = restart_record(id, &socket_path);
+        let mut record = restart_record(&supervisor, id, &socket_path);
 
         let error = test_runtime()
             .block_on(supervisor.reconcile_readopted_status(&mut record))
@@ -6291,7 +6867,7 @@ mod tests {
         );
         let overlay_path = PathBuf::from(supervisor.overlay_path_for(id));
         std::fs::create_dir_all(&overlay_path).unwrap();
-        let mut record = restart_record(id, &socket_path);
+        let mut record = restart_record(&supervisor, id, &socket_path);
 
         let error = test_runtime()
             .block_on(supervisor.reconcile_readopted_status(&mut record))
@@ -6357,7 +6933,7 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        let mut good_record = restart_record(good_id, &good_socket);
+        let mut good_record = restart_record(&supervisor, good_id, &good_socket);
         good_record.pid = Some(good_process.pid);
 
         let bad_id = Uuid::new_v4();
@@ -6372,7 +6948,7 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        let mut bad_record = restart_record(bad_id, &bad_socket);
+        let mut bad_record = restart_record(&supervisor, bad_id, &bad_socket);
         bad_record.pid = Some(bad_process.pid);
         for (pid, socket) in [
             (good_process.pid, good_socket.as_path()),

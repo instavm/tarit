@@ -29,10 +29,11 @@ share writable disk state.
 
 ## Production confinement gate
 
-`TARIT_PRODUCTION=1` currently fails closed. Non-production mode remains useful
-for local development, but `taritd` does not yet stage the complete jail that a
-hostile multi-tenant workload requires. Production mode must not be enabled
-until the orchestrated launch path performs all of the following atomically:
+`TARIT_PRODUCTION=1` currently fails closed because the supported development
+jail retains the host network namespace. Non-production mode may use that jail
+for trusted local development, but it is not a hostile multi-tenant boundary.
+Production mode remains unavailable until dedicated netns/veth/TAP wiring is
+implemented, together with the following complete launch boundary:
 
 - allocate a unique nonzero UID/GID and a private PID, mount and network
   namespace for every VM;
