@@ -53,12 +53,13 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
         apply_cgroup(cfg)?;
     }
 
-    // 2. Enter the assigned network namespace, or create a fresh empty one for
-    // no-NIC workloads. A jailed VMM must never retain the host net namespace.
+    // 2. Enter an explicitly assigned network namespace. An empty path retains
+    // the current namespace so orchestrators using host-owned TAP devices can
+    // jail the process without pretending a veth/routing topology exists.
     if !cfg.netns.is_empty() {
         enter_netns(&cfg.netns)?;
     } else {
-        unshare_empty_netns()?;
+        log::info!("jail: network namespace isolation disabled");
     }
 
     // 3. Create private mount, UTS, and IPC namespaces. PID namespaces need a
@@ -169,18 +170,6 @@ fn enter_netns(path: &str) -> Result<(), JailerError> {
         )));
     }
     log::info!("jail: entered netns {path}");
-    Ok(())
-}
-
-fn unshare_empty_netns() -> Result<(), JailerError> {
-    // SAFETY: unshare is called with a namespace flag and no pointer arguments.
-    if unsafe { libc::unshare(libc::CLONE_NEWNET) } < 0 {
-        return Err(JailerError::Namespace(format!(
-            "unshare(CLONE_NEWNET) for empty network namespace: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    log::info!("jail: fresh empty network namespace created");
     Ok(())
 }
 

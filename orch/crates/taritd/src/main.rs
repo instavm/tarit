@@ -4,6 +4,7 @@ mod autoscale;
 mod cli;
 mod cluster;
 mod config;
+mod disk;
 mod gateway;
 mod image;
 mod internal;
@@ -27,7 +28,7 @@ use clap::Parser;
 use config::{Config, PtyConnectionLimits};
 use peer::PeerClient;
 use scheduler::Scheduler;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -105,10 +106,14 @@ fn init_tracing() {
         .init();
 }
 
-fn persist_startup_vm_observation(store: &Store, vm: &tarit_types::VmRecord, context: &str) {
-    if let Err(error) = store.insert_vm(vm) {
-        tracing::error!(vm = %vm.id, %error, "{context}");
-    }
+fn persist_startup_vm_observation(
+    store: &Store,
+    vm: &tarit_types::VmRecord,
+    context: &str,
+) -> anyhow::Result<()> {
+    store
+        .insert_vm(vm)
+        .with_context(|| format!("{context}: {}", vm.id))
 }
 
 async fn run_server(
@@ -139,6 +144,7 @@ async fn run_server(
 
     let store = Store::open(&config.db_path).context("open store")?;
     image::resolve_warm_pool_images(&mut config, &store).context("resolve warm-pool images")?;
+    warmpool::validate_exact_classes(&config).context("validate warm-pool classes")?;
     let mut persisted_vms = store
         .list_vms()
         .context("load persisted VMs during startup")?;
@@ -163,6 +169,20 @@ async fn run_server(
         )
         .context("initialize fail-closed network recovery")?,
     );
+    let startup_references = artifact_references(
+        &persisted_vms,
+        &store
+            .list_snapshots()
+            .context("load durable snapshot references for startup GC")?,
+    );
+    let startup_gc = supervisor
+        .sweep_owned_artifacts(startup_references)
+        .context("sweep owned artifacts during startup")?;
+    tracing::info!(
+        removed_files = startup_gc.removed_files,
+        removed_jails = startup_gc.removed_jails,
+        "startup owned-artifact sweep completed"
+    );
 
     // Re-adopt VMs that survived this restart so the control plane can manage
     // them again. Their network policy was reconciled during supervisor
@@ -173,7 +193,10 @@ async fn run_server(
     // mandatory: if it fails, startup aborts rather than serve stale durable
     // Running/Paused/Suspended records for VMs that no longer exist.
     {
-        let failures = supervisor.readopt_running_vms(&mut persisted_vms).await;
+        let failures = supervisor
+            .readopt_running_vms(&mut persisted_vms)
+            .await
+            .context("re-adopt locally owned VMMs")?;
         let failed_ids = failures
             .iter()
             .map(|failure| failure.id)
@@ -182,9 +205,11 @@ async fn run_server(
             let vm = match persisted_vms.iter_mut().find(|vm| vm.id == failure.id) {
                 Some(vm) => vm,
                 None => {
-                    tracing::error!(vm = %failure.id, reason = %failure.reason,
-                        "startup reconciliation lost a persisted VM record while marking it terminal");
-                    continue;
+                    anyhow::bail!(
+                        "startup reconciliation lost persisted VM {} while fencing: {}",
+                        failure.id,
+                        failure.reason
+                    );
                 }
             };
             vm.status = VmStatus::Error;
@@ -194,9 +219,11 @@ async fn run_server(
             vm.revision = match vm.revision.checked_add(2) {
                 Some(revision) => revision,
                 None => {
-                    tracing::error!(vm = %failure.id, reason = %failure.reason,
-                        "startup reconciliation exhausted the persisted revision while marking the VM terminal");
-                    continue;
+                    anyhow::bail!(
+                        "startup reconciliation exhausted VM {} revision while fencing: {}",
+                        failure.id,
+                        failure.reason
+                    );
                 }
             };
             vm.updated_at = chrono::Utc::now();
@@ -206,7 +233,7 @@ async fn run_server(
                 &store,
                 vm,
                 "persist terminal status for startup-reconciled VM",
-            );
+            )?;
         }
         for vm in &persisted_vms {
             if vm.host_id == config.host_id
@@ -220,7 +247,7 @@ async fn run_server(
                     &store,
                     vm,
                     "persist observed status for re-adopted VM",
-                );
+                )?;
             }
         }
     }
@@ -429,6 +456,7 @@ async fn run_server(
     let outbox_flusher =
         usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
     let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());
+    let artifact_gc = spawn_artifact_gc(state.clone(), shutdown_rx.clone());
 
     let shutdown_signal_task = spawn_shutdown_signal(shutdown.clone(), shutdown_rx.clone());
     let worker_tasks = BackgroundTasks::new(
@@ -439,6 +467,7 @@ async fn run_server(
             Some(usage_meter),
             outbox_flusher,
             Some(vm_exit_reconciler),
+            Some(artifact_gc),
             Some(shutdown_signal_task),
         ],
         warm_pool,
@@ -477,6 +506,83 @@ async fn run_server(
         move |reason| async move { shutdown_sweep(&shutdown_state, reason).await },
     )
     .await
+}
+
+fn artifact_references(
+    vms: &[tarit_types::VmRecord],
+    snapshots: &[tarit_store::SnapshotRecord],
+) -> disk::ArtifactReferences {
+    let active_vm_ids = vms
+        .iter()
+        .filter(|vm| {
+            matches!(
+                vm.status,
+                VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+            )
+        })
+        .map(|vm| vm.id)
+        .collect::<HashSet<_>>();
+    let mut snapshot_paths = HashSet::new();
+    for snapshot in snapshots {
+        snapshot_paths.insert(std::path::PathBuf::from(&snapshot.path));
+        if let Some(path) = &snapshot.overlay_path {
+            snapshot_paths.insert(std::path::PathBuf::from(path));
+        }
+    }
+    disk::ArtifactReferences {
+        active_vm_ids,
+        snapshot_paths,
+        runtime_paths: HashSet::new(),
+    }
+}
+
+fn spawn_artifact_gc(
+    state: AppState,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(state.supervisor.disk_sweep_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
+            let vms = state
+                .vm_cache
+                .read()
+                .map(|cache| cache.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let snapshots = match state.store.lock() {
+                Ok(store) => match store.list_snapshots() {
+                    Ok(snapshots) => snapshots,
+                    Err(error) => {
+                        tracing::error!(%error, "load snapshot references for artifact GC failed");
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    tracing::error!("store lock poisoned during artifact GC");
+                    continue;
+                }
+            };
+            match state
+                .supervisor
+                .sweep_owned_artifacts(artifact_references(&vms, &snapshots))
+            {
+                Ok(report) if report.removed_files > 0 || report.removed_jails > 0 => {
+                    tracing::info!(
+                        removed_files = report.removed_files,
+                        removed_jails = report.removed_jails,
+                        "periodic owned-artifact sweep completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "periodic owned-artifact sweep failed"),
+            }
+        }
+    })
 }
 
 fn spawn_vm_exit_reconciler(
@@ -1559,6 +1665,7 @@ mod tests {
             vm_cgroup_pids_max: 1024,
             vm_io_quota: crate::config::VmIoQuotaConfig::default(),
             vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: config::WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

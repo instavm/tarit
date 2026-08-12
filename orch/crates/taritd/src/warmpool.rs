@@ -20,6 +20,21 @@ use std::time::Duration;
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 
+pub(crate) fn validate_exact_classes(config: &Config) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for class in &config.warm_pool.classes {
+        let spawn = VmSpawnConfig::from_warm_class(config, class);
+        if !seen.insert(spawn) {
+            anyhow::bail!(
+                "warm-pool classes must resolve to unique spawn configurations; duplicate {} vCPU/{} MiB class",
+                class.vcpus,
+                class.memory_mib
+            );
+        }
+    }
+    Ok(())
+}
+
 #[must_use = "warm-pool work must be quiesced before the supervisor sweep"]
 pub(crate) struct Replenisher {
     handle: JoinHandle<()>,
@@ -131,6 +146,30 @@ pub(crate) fn spawn_replenisher(
                     worker_cancelled.store(true, Ordering::Release);
                     break;
                 }
+                match sup.refresh_disk_pressure() {
+                    Ok(state) if state.pressured => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            _ = wait_for_shutdown(&mut shutdown_rx) => {
+                                worker_cancelled.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "warm-pool disk pressure check failed");
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            _ = wait_for_shutdown(&mut shutdown_rx) => {
+                                worker_cancelled.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let mut did_work = false;
                 for class in &classes {
                     if worker_cancelled.load(Ordering::Acquire) || shutdown_pending(&shutdown_rx) {
@@ -139,9 +178,9 @@ pub(crate) fn spawn_replenisher(
                     }
                     let have = {
                         let sup = Arc::clone(&sup);
-                        let (v, m) = (class.vcpus, class.memory_mib);
+                        let key = VmSpawnConfig::from_warm_class(&config, class);
                         await_blocking(
-                            worker_children.spawn(move || sup.warm_count(v, m)).await,
+                            worker_children.spawn(move || sup.warm_count(&key)).await,
                             &worker_cancelled,
                             &mut shutdown_rx,
                         )
@@ -213,9 +252,9 @@ pub(crate) fn spawn_replenisher(
                         };
                         let have = {
                             let sup = Arc::clone(&sup);
-                            let (v, m) = (class.vcpus, class.memory_mib);
+                            let key = VmSpawnConfig::from_warm_class(&config, class);
                             await_blocking(
-                                worker_children.spawn(move || sup.warm_count(v, m)).await,
+                                worker_children.spawn(move || sup.warm_count(&key)).await,
                                 &worker_cancelled,
                                 &mut shutdown_rx,
                             )

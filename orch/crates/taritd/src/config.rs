@@ -480,7 +480,13 @@ pub struct VmJailConfig {
     pub gid_base: u32,
     /// Number of unique uid/gid pairs available.
     pub id_count: u32,
+    /// Versioned jail profile whose supported namespace set is explicit.
+    pub profile: String,
+    /// Per-thread seccomp is mandatory for jailed production VMMs.
+    pub seccomp: bool,
 }
+
+pub const SUPPORTED_VM_JAIL_PROFILE: &str = "chroot-mount-uts-ipc-v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VmIoQuotaConfig {
@@ -508,6 +514,39 @@ pub struct VmNetQuotaConfig {
 impl VmNetQuotaConfig {
     pub fn is_configured(&self) -> bool {
         self.ingress_bps_max.is_some() || self.egress_bps_max.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskPressureConfig {
+    /// Filesystem-used byte watermark that enters pressure.
+    pub bytes_high: Option<u64>,
+    /// Filesystem-used byte watermark below which pressure clears.
+    pub bytes_low: Option<u64>,
+    /// Filesystem-used inode watermark that enters pressure.
+    pub inodes_high: Option<u64>,
+    /// Filesystem-used inode watermark below which pressure clears.
+    pub inodes_low: Option<u64>,
+    pub sweep_interval_secs: u64,
+    pub artifact_min_age_secs: u64,
+}
+
+impl Default for DiskPressureConfig {
+    fn default() -> Self {
+        Self {
+            bytes_high: None,
+            bytes_low: None,
+            inodes_high: None,
+            inodes_low: None,
+            sweep_interval_secs: 30,
+            artifact_min_age_secs: 300,
+        }
+    }
+}
+
+impl DiskPressureConfig {
+    pub fn is_configured(&self) -> bool {
+        self.bytes_high.is_some() || self.inodes_high.is_some()
     }
 }
 
@@ -573,6 +612,8 @@ pub struct Config {
     pub vm_io_quota: VmIoQuotaConfig,
     /// Optional per-VM host TAP shaping limits.
     pub vm_net_quota: VmNetQuotaConfig,
+    /// Filesystem pressure admission and owned-artifact GC policy.
+    pub disk_pressure: DiskPressureConfig,
     /// Warm-pool policy (loaded from the optional config file + env).
     pub warm_pool: WarmPoolConfig,
     /// How long a create() waits for a VM slot (warm backfill or a freed cold
@@ -739,6 +780,7 @@ impl Config {
         if vm_net_quota.is_configured() && !enable_net {
             bail!("TARIT_VM_NET_* limits require TARIT_ENABLE_NET=1");
         }
+        let disk_pressure = parse_disk_pressure_config()?;
 
         let warm_pool = load_warm_pool(file_config.as_ref())?;
 
@@ -819,6 +861,7 @@ impl Config {
                 vm_jail.as_ref(),
                 &vm_io_quota,
                 &vm_net_quota,
+                &disk_pressure,
                 allow_insecure_peer_http,
             )?;
         }
@@ -853,6 +896,7 @@ impl Config {
             vm_cgroup_pids_max,
             vm_io_quota,
             vm_net_quota,
+            disk_pressure,
             warm_pool,
             admission_timeout_ms,
             reap_on_shutdown,
@@ -911,6 +955,7 @@ impl fmt::Debug for Config {
             .field("vm_cgroup_pids_max", &self.vm_cgroup_pids_max)
             .field("vm_io_quota", &self.vm_io_quota)
             .field("vm_net_quota", &self.vm_net_quota)
+            .field("disk_pressure", &self.disk_pressure)
             .field("warm_pool", &self.warm_pool)
             .field("admission_timeout_ms", &self.admission_timeout_ms)
             .field("reap_on_shutdown", &self.reap_on_shutdown)
@@ -1103,8 +1148,15 @@ fn validate_production_requirements(
     vm_jail: Option<&VmJailConfig>,
     vm_io_quota: &VmIoQuotaConfig,
     vm_net_quota: &VmNetQuotaConfig,
+    disk_pressure: &DiskPressureConfig,
     allow_insecure_peer_http: bool,
 ) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("TARIT_PRODUCTION is supported only on Linux");
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("TARIT_PRODUCTION jail, TAP, cgroup, and device staging require root privileges");
+    }
     if database_url.is_none() {
         bail!(
             "TARIT_PRODUCTION requires TARIT_DATABASE_URL for durable global control-plane state"
@@ -1120,6 +1172,12 @@ fn validate_production_requirements(
     })?;
     if !vm_jail.base_dir.is_absolute() {
         bail!("TARIT_VM_JAIL_BASE must be an absolute path");
+    }
+    if vm_jail.profile != SUPPORTED_VM_JAIL_PROFILE {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_PROFILE={SUPPORTED_VM_JAIL_PROFILE}");
+    }
+    if !vm_jail.seccomp {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_SECCOMP=1");
     }
     // Rootfs isolation is enforced by the supervisor: every immutable base is
     // attached through a private per-VM CoW overlay. `TARIT_ROOTFS_READONLY`
@@ -1139,6 +1197,9 @@ fn validate_production_requirements(
     if vm_net_quota.is_configured() && !enable_net {
         bail!("TARIT_VM_NET_* limits require TARIT_ENABLE_NET=1");
     }
+    if !disk_pressure.is_configured() {
+        bail!("TARIT_PRODUCTION requires byte or inode disk-pressure high/low watermarks");
+    }
     for (name, path) in [
         ("TARIT_VMM_BIN", vmm_bin),
         ("TARIT_KERNEL", kernel),
@@ -1151,9 +1212,7 @@ fn validate_production_requirements(
     if allow_insecure_peer_http {
         bail!("TARIT_PRODUCTION forbids TARIT_ALLOW_INSECURE_PEER_HTTP");
     }
-    bail!(
-        "TARIT_PRODUCTION remains disabled until taritd wires TARIT_VM_JAIL_* into per-VM uid/gid jails with private mount/pid/net namespaces and in-jail asset/socket staging"
-    )
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1549,8 +1608,28 @@ fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
     let uid_base = env_optional_positive_u32("TARIT_VM_JAIL_UID_BASE")?;
     let gid_base = env_optional_positive_u32("TARIT_VM_JAIL_GID_BASE")?;
     let id_count = env_optional_positive_u32("TARIT_VM_JAIL_ID_COUNT")?;
+    let profile =
+        env::var("TARIT_VM_JAIL_PROFILE").unwrap_or_else(|_| SUPPORTED_VM_JAIL_PROFILE.to_string());
+    let seccomp = env_bool_checked("TARIT_VM_JAIL_SECCOMP", true)?;
+    let pid_namespace = env_bool_checked("TARIT_VM_JAIL_PID_NAMESPACE", false)?;
+    let network_namespace = env_bool_checked("TARIT_VM_JAIL_NETWORK_NAMESPACE", false)?;
 
-    if base_dir.is_none() && uid_base.is_none() && gid_base.is_none() && id_count.is_none() {
+    if pid_namespace {
+        bail!("TARIT_VM_JAIL_PID_NAMESPACE is unsupported: PID isolation requires a fork/launcher");
+    }
+    if network_namespace {
+        bail!(
+            "TARIT_VM_JAIL_NETWORK_NAMESPACE is unsupported until Tarit provides a veth/routing topology; host TAP networking requires the host network namespace"
+        );
+    }
+
+    if base_dir.is_none()
+        && uid_base.is_none()
+        && gid_base.is_none()
+        && id_count.is_none()
+        && env::var("TARIT_VM_JAIL_PROFILE").is_err()
+        && env::var("TARIT_VM_JAIL_SECCOMP").is_err()
+    {
         return Ok(None);
     }
 
@@ -1566,13 +1645,57 @@ fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
     if id_count < required_ids {
         bail!("TARIT_VM_JAIL_ID_COUNT must be at least TARIT_MAX_VMS");
     }
+    uid_base
+        .checked_add(id_count - 1)
+        .ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_UID_BASE + ID_COUNT overflows u32"))?;
+    gid_base
+        .checked_add(id_count - 1)
+        .ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_GID_BASE + ID_COUNT overflows u32"))?;
+    if profile != SUPPORTED_VM_JAIL_PROFILE {
+        bail!(
+            "unsupported TARIT_VM_JAIL_PROFILE={profile:?}; supported profile is {SUPPORTED_VM_JAIL_PROFILE}"
+        );
+    }
+    if !seccomp {
+        bail!("TARIT_VM_JAIL_SECCOMP=0 is unsupported for the safe jail profile");
+    }
 
     Ok(Some(VmJailConfig {
         base_dir,
         uid_base,
         gid_base,
         id_count,
+        profile,
+        seccomp,
     }))
+}
+
+fn parse_disk_pressure_config() -> Result<DiskPressureConfig> {
+    let bytes_high = env_optional_positive_u64("TARIT_DISK_BYTES_HIGH_WATERMARK")?;
+    let bytes_low = env_optional_positive_u64("TARIT_DISK_BYTES_LOW_WATERMARK")?;
+    let inodes_high = env_optional_positive_u64("TARIT_DISK_INODES_HIGH_WATERMARK")?;
+    let inodes_low = env_optional_positive_u64("TARIT_DISK_INODES_LOW_WATERMARK")?;
+    validate_watermark_pair("TARIT_DISK_BYTES", bytes_high, bytes_low)?;
+    validate_watermark_pair("TARIT_DISK_INODES", inodes_high, inodes_low)?;
+    Ok(DiskPressureConfig {
+        bytes_high,
+        bytes_low,
+        inodes_high,
+        inodes_low,
+        sweep_interval_secs: env_positive_u64("TARIT_ARTIFACT_GC_INTERVAL_SECS", 30)?,
+        artifact_min_age_secs: env_positive_u64("TARIT_ARTIFACT_GC_MIN_AGE_SECS", 300)?,
+    })
+}
+
+fn validate_watermark_pair(prefix: &str, high: Option<u64>, low: Option<u64>) -> Result<()> {
+    match (high, low) {
+        (None, None) => Ok(()),
+        (Some(high), Some(low)) if low < high => Ok(()),
+        (Some(_), Some(_)) => {
+            bail!("{prefix}_LOW_WATERMARK must be less than {prefix}_HIGH_WATERMARK")
+        }
+        _ => bail!("{prefix}_HIGH_WATERMARK and {prefix}_LOW_WATERMARK must be set together"),
+    }
 }
 
 fn env_positive_usize(key: &str, default: usize) -> Result<usize> {
@@ -1806,8 +1929,34 @@ mod tests {
         assert_eq!(jail.uid_base, 200_000);
         assert_eq!(jail.gid_base, 300_000);
         assert_eq!(jail.id_count, 8);
+        assert_eq!(jail.profile, SUPPORTED_VM_JAIL_PROFILE);
+        assert!(jail.seccomp);
         std::env::remove_var("TARIT_VM_JAIL_BASE");
         std::env::remove_var("TARIT_VM_JAIL_UID_BASE");
         std::env::remove_var("TARIT_VM_JAIL_GID_BASE");
+    }
+
+    #[test]
+    fn vm_jail_rejects_unsupported_pid_and_network_namespaces() {
+        let _guard = env_lock();
+        for (key, expected) in [
+            ("TARIT_VM_JAIL_PID_NAMESPACE", "fork/launcher"),
+            ("TARIT_VM_JAIL_NETWORK_NAMESPACE", "veth/routing"),
+        ] {
+            std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
+            std::env::set_var("TARIT_VM_JAIL_UID_BASE", "200000");
+            std::env::set_var("TARIT_VM_JAIL_GID_BASE", "300000");
+            std::env::set_var(key, "1");
+            let error = parse_vm_jail_config(8).expect_err("unsupported namespace must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+            std::env::remove_var(key);
+        }
+        for key in [
+            "TARIT_VM_JAIL_BASE",
+            "TARIT_VM_JAIL_UID_BASE",
+            "TARIT_VM_JAIL_GID_BASE",
+        ] {
+            std::env::remove_var(key);
+        }
     }
 }

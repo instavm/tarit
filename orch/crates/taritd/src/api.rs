@@ -615,6 +615,14 @@ async fn readyz(State(state): State<AppState>) -> Response {
             "closed"
         },
     );
+    checks.insert(
+        "disk_pressure",
+        if state.supervisor.disk_pressure_snapshot().pressured {
+            "pressure"
+        } else {
+            "ok"
+        },
+    );
     if let Some(fleet) = &state.fleet {
         let fleet_status =
             match tokio::time::timeout(Duration::from_secs(2), fleet.healthcheck()).await {
@@ -2152,6 +2160,7 @@ async fn cluster_status(
         "healthy_nodes": healthy_nodes,
         "cluster_free_vcpus": free_vcpus,
         "cluster_free_memory_mib": free_mem,
+        "disk_pressure": state.supervisor.disk_pressure_snapshot(),
         "nodes": nodes,
     })))
 }
@@ -2167,6 +2176,8 @@ async fn warm_pool_status(
         .classes
         .iter()
         .map(|class| {
+            let spawn = VmSpawnConfig::from_warm_class(&state.config, class);
+            let depth = state.supervisor.warm_count(&spawn);
             serde_json::json!({
                 "vcpus": class.vcpus,
                 "memory_mib": class.memory_mib,
@@ -2177,16 +2188,27 @@ async fn warm_pool_status(
                 "restore": class.restore,
                 "rootfs": class.rootfs.as_ref().map(|path| path.display().to_string()),
                 "image": class.image,
-                "depth": state.supervisor.warm_count(class.vcpus, class.memory_mib),
-                "refill_needed": class.refill_needed(state.supervisor.warm_count(class.vcpus, class.memory_mib)),
+                "kernel": spawn.kernel_path,
+                "cmdline": spawn.cmdline,
+                "read_only": spawn.read_only,
+                "depth": depth,
+                "refill_needed": class.refill_needed(depth),
             })
         })
         .collect::<Vec<_>>();
+    let disk_pressure = state.supervisor.disk_pressure_snapshot();
     Ok(Json(serde_json::json!({
         "enabled": state.config.warm_pool.enabled,
         "cpu_overcommit": state.config.warm_pool.cpu_overcommit,
         "replenish_concurrency": state.config.warm_pool.replenish_concurrency,
         "total_target": state.config.warm_pool.total_target(),
+        "disk_pressure": {
+            "active": disk_pressure.pressured,
+            "used_bytes": disk_pressure.used_bytes,
+            "used_inodes": disk_pressure.used_inodes,
+            "last_removed_files": disk_pressure.last_removed_files,
+            "last_removed_jails": disk_pressure.last_removed_jails,
+        },
         "classes": classes,
     })))
 }
@@ -3786,6 +3808,7 @@ mod tests {
             vm_cgroup_pids_max: 1024,
             vm_io_quota: crate::config::VmIoQuotaConfig::default(),
             vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

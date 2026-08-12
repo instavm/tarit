@@ -3618,6 +3618,7 @@ mod tests {
             vm_cgroup_pids_max: 1024,
             vm_io_quota: crate::config::VmIoQuotaConfig::default(),
             vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

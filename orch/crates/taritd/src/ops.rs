@@ -683,7 +683,6 @@ fn start_terminal_transition(
 }
 
 async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), OrchError> {
-    state.pty_registry.close_vm_sessions(id);
     loop {
         let LifecycleState::Terminal { record, phase } = lifecycle_state(state, id)?
             .ok_or_else(|| OrchError::NotFound(format!("vm {id} has no terminal lifecycle")))?
@@ -1301,7 +1300,11 @@ async fn restore_local_owned(
         kernel_path: kernel_path.clone().into(),
         rootfs_path: snapshot.rootfs_path.clone().map(Into::into),
         cmdline: cmdline.clone(),
-        read_only: true,
+        read_only: snapshot.rootfs_read_only.ok_or_else(|| {
+            OrchError::BadRequest(
+                "snapshot is missing rootfs mount metadata; create a new snapshot".into(),
+            )
+        })?,
     };
     let now = Utc::now();
     let record = VmRecord {
@@ -1354,7 +1357,13 @@ async fn restore_local_owned(
     let publication_state = state.clone();
     let publication_record = record.clone();
     let booted = tokio::task::spawn_blocking(move || {
-        sup.restore_vm(ticket, path, snapshot_overlay_path, restore_shape)
+        sup.restore_vm(
+            ticket,
+            path,
+            snapshot_overlay_path,
+            restore_config,
+            restore_shape,
+        )
     })
     .await;
     let booted = match booted {
@@ -1665,6 +1674,7 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
         vcpus: Some(vm.vcpus),
         kernel_path: Some(vm.kernel_path.clone()),
         rootfs_path: vm.rootfs_path.clone(),
+        rootfs_read_only: Some(state.config.rootfs_read_only),
         cmdline: Some(vm.cmdline.clone()),
         created_at: Utc::now(),
     };
@@ -2842,7 +2852,7 @@ mod tests {
                     WarmClaimOutcome::RetainedPublicationFailure(_)
                 ));
                 assert!(state.supervisor.is_running(id));
-                assert_eq!(state.supervisor.warm_count(1, 256), 0);
+                assert_eq!(state.supervisor.warm_count(&warm_cfg), 0);
                 assert_eq!(
                     state.scheduler.local_capacity(1, 1).sandbox_count,
                     index + 1
@@ -3087,6 +3097,7 @@ mod tests {
             vm_cgroup_pids_max: 1024,
             vm_io_quota: crate::config::VmIoQuotaConfig::default(),
             vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

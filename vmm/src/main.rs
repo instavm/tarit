@@ -97,8 +97,9 @@ struct ServeCgroupArgs {
     #[arg(long, value_name = "WEIGHT", value_parser = parse_positive_u64, requires = "cgroup")]
     cgroup_io_weight: Option<u64>,
 
-    /// io.max limit(s) for the served VM process, e.g. `8:0 rbps=1048576 wbps=1048576`.
-    #[arg(long, value_name = "RULE", requires = "cgroup")]
+    /// io.max limits for the served VM process. Repeat newline-separated
+    /// DEVICE LIMIT entries in one value, e.g. "8:0 rbps=1048576".
+    #[arg(long, value_name = "DEVICE LIMITS", value_parser = parse_cgroup_io_max, requires = "cgroup")]
     cgroup_io_max: Option<String>,
 
     /// cpuset.cpus limit for the served VM process, e.g. 0-3 or 0,2.
@@ -214,6 +215,64 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     } else {
         Ok(parsed)
     }
+}
+
+fn parse_cgroup_io_max(value: &str) -> std::result::Result<String, String> {
+    const KEYS: [&str; 4] = ["rbps", "wbps", "riops", "wiops"];
+
+    let mut devices = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for raw_line in value.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let device = fields
+            .next()
+            .ok_or_else(|| "io.max entry must include a major:minor device".to_string())?;
+        let (major, minor) = device
+            .split_once(':')
+            .ok_or_else(|| format!("invalid io.max device {device:?}; expected MAJOR:MINOR"))?;
+        major
+            .parse::<u32>()
+            .map_err(|e| format!("invalid io.max major {major:?}: {e}"))?;
+        minor
+            .parse::<u32>()
+            .map_err(|e| format!("invalid io.max minor {minor:?}: {e}"))?;
+        if !devices.insert(device.to_string()) {
+            return Err(format!("duplicate io.max device {device}"));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut limits = Vec::new();
+        for field in fields {
+            let (key, limit) = field
+                .split_once('=')
+                .ok_or_else(|| format!("invalid io.max limit {field:?}; expected KEY=VALUE"))?;
+            if !KEYS.contains(&key) {
+                return Err(format!(
+                    "invalid io.max key {key:?}; expected rbps, wbps, riops, or wiops"
+                ));
+            }
+            if !seen.insert(key) {
+                return Err(format!("duplicate io.max key {key:?} for device {device}"));
+            }
+            if limit != "max" {
+                parse_positive_u64(limit)
+                    .map_err(|e| format!("invalid io.max {key} value {limit:?}: {e}"))?;
+            }
+            limits.push(format!("{key}={limit}"));
+        }
+        if limits.is_empty() {
+            return Err(format!("io.max device {device} has no limits"));
+        }
+        normalized.push(format!("{device} {}", limits.join(" ")));
+    }
+    if normalized.is_empty() {
+        return Err("io.max must include at least one device limit".into());
+    }
+    Ok(normalized.join("\n"))
 }
 
 #[derive(Subcommand, Debug)]
@@ -362,6 +421,10 @@ enum Cmd {
         /// Network namespace path to enter when jailed.
         #[arg(long, value_name = "PATH")]
         netns: Option<String>,
+
+        /// Require the production per-thread seccomp profile for a jailed VMM.
+        #[arg(long, requires = "jail")]
+        seccomp: bool,
 
         #[command(flatten)]
         cgroup: ServeCgroupArgs,
@@ -542,8 +605,9 @@ fn main() -> Result<()> {
             uid,
             gid,
             netns,
+            seccomp,
             cgroup,
-        } => serve(&cli.socket, jail, uid, gid, netns, cgroup),
+        } => serve(&cli.socket, jail, uid, gid, netns, seccomp, cgroup),
         Cmd::Snapshot { diff, live } => api_snapshot(&cli.socket, diff, live),
         Cmd::Create {
             kernel,
@@ -1056,6 +1120,7 @@ fn serve(
     uid: u32,
     gid: u32,
     netns: Option<String>,
+    seccomp: bool,
     cgroup: ServeCgroupArgs,
 ) -> Result<()> {
     // Apply jailer confinement before serving, if requested. The RPC server
@@ -1064,6 +1129,10 @@ fn serve(
     // It must also provide /dev/kvm inside the jail and choose a uid/gid with
     // KVM access (for example via the kvm group) before launching this process.
     let cgroup_limits = cgroup.limits();
+    anyhow::ensure!(
+        jail_dir.is_none() || seccomp,
+        "jailed serve requires --seccomp"
+    );
     #[cfg(target_os = "linux")]
     let mut netns_entered = false;
     #[cfg(target_os = "linux")]
@@ -1079,9 +1148,7 @@ fn serve(
             netns: netns.clone().unwrap_or_default(),
         };
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
-        // The jailer either enters the assigned namespace or creates a fresh
-        // empty one, so host-level egress can never be affected from here.
-        netns_entered = true;
+        netns_entered = netns.is_some();
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
     }
     #[cfg(target_os = "linux")]
@@ -1102,7 +1169,7 @@ fn serve(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (jail_dir, uid, gid, netns, cgroup, cgroup_limits);
+        let _ = (jail_dir, uid, gid, netns, seccomp, cgroup, cgroup_limits);
     }
 
     log::info!("serve: API on {socket}");
@@ -1578,7 +1645,7 @@ mod tests {
             "--cgroup-io-weight",
             "500",
             "--cgroup-io-max",
-            "8:0 rbps=1048576 wbps=2097152",
+            "8:0 rbps=1048576 wiops=200\n8:16 wbps=max",
             "--cpuset",
             "0-1",
         ])
@@ -1592,10 +1659,10 @@ mod tests {
                     Some(vmm_jailer::cgroups::CgroupLimits {
                         cpu_max: Some("100000 100000".into()),
                         cpuset_cpus: Some("0-1".into()),
-                        io_max: Some("8:0 rbps=1048576 wbps=2097152".into()),
                         io_weight: Some(500),
                         memory_max: Some(536_870_912),
                         pids_max: Some(64),
+                        io_max: Some("8:0 rbps=1048576 wiops=200\n8:16 wbps=max".into()),
                         ..Default::default()
                     })
                 );
@@ -1607,5 +1674,42 @@ mod tests {
     #[test]
     fn serve_cgroup_limit_flags_require_cgroup_path() {
         assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-memory-max", "512M",]).is_err());
+        assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-io-max", "8:0 rbps=1"]).is_err());
+    }
+
+    #[test]
+    fn jailed_serve_requires_explicit_seccomp_profile() {
+        let cli = Cli::try_parse_from([
+            "vmm",
+            "serve",
+            "--jail",
+            "/srv/jails/vm-1",
+            "--uid",
+            "20000",
+            "--gid",
+            "30000",
+            "--seccomp",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Serve { seccomp, netns, .. } => {
+                assert!(seccomp);
+                assert!(netns.is_none());
+            }
+            _ => panic!("expected serve command"),
+        }
+        assert!(Cli::try_parse_from(["vmm", "serve", "--seccomp"]).is_err());
+    }
+
+    #[test]
+    fn io_max_parser_rejects_malformed_or_duplicate_devices() {
+        assert_eq!(
+            parse_cgroup_io_max("8:0 rbps=1024 wiops=max\n8:16 wbps=2048").unwrap(),
+            "8:0 rbps=1024 wiops=max\n8:16 wbps=2048"
+        );
+        assert!(parse_cgroup_io_max("8 rbps=1").is_err());
+        assert!(parse_cgroup_io_max("8:0 rbps=0").is_err());
+        assert!(parse_cgroup_io_max("8:0 unknown=1").is_err());
+        assert!(parse_cgroup_io_max("8:0 rbps=1\n8:0 wbps=2").is_err());
     }
 }

@@ -54,6 +54,7 @@ pub struct SnapshotRecord {
     pub vcpus: Option<u8>,
     pub kernel_path: Option<String>,
     pub rootfs_path: Option<String>,
+    pub rootfs_read_only: Option<bool>,
     pub cmdline: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -198,6 +199,7 @@ impl Store {
                vcpus INTEGER,
                kernel_path TEXT,
                rootfs_path TEXT,
+               rootfs_read_only INTEGER,
                cmdline TEXT,
                created_at TEXT NOT NULL
              );
@@ -234,6 +236,7 @@ impl Store {
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
         ensure_column(&conn, "snapshots", "kernel_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "rootfs_path", "TEXT")?;
+        ensure_column(&conn, "snapshots", "rootfs_read_only", "INTEGER")?;
         ensure_column(&conn, "snapshots", "cmdline", "TEXT")?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint_active ON ssh_keys (fingerprint, is_active)",
@@ -324,8 +327,8 @@ impl Store {
         self.conn.execute(
             "INSERT OR REPLACE INTO snapshots (
                path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
-               kernel_path, rootfs_path, cmdline, created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+               kernel_path, rootfs_path, rootfs_read_only, cmdline, created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 snap.path,
                 snap.overlay_path,
@@ -337,6 +340,7 @@ impl Store {
                 snap.vcpus,
                 snap.kernel_path,
                 snap.rootfs_path,
+                snap.rootfs_read_only,
                 snap.cmdline,
                 snap.created_at.to_rfc3339(),
             ],
@@ -349,13 +353,26 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
-                        kernel_path, rootfs_path, cmdline, created_at
+                        kernel_path, rootfs_path, rootfs_read_only, cmdline, created_at
                  FROM snapshots WHERE path = ?1",
                 params![path],
                 row_to_snapshot,
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+                    kernel_path, rootfs_path, rootfs_read_only, cmdline, created_at
+             FROM snapshots",
+        )?;
+        let snapshots = statement
+            .query_map([], row_to_snapshot)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(snapshots)
     }
 
     pub fn insert_share(&self, share: &ShareRecord) -> Result<(), StoreError> {
@@ -1120,7 +1137,7 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> Result<ImageRecord, rusqlite::Error>
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<SnapshotRecord, rusqlite::Error> {
     let vm_id: String = row.get(5)?;
-    let created_at: String = row.get(11)?;
+    let created_at: String = row.get(12)?;
     Ok(SnapshotRecord {
         path: row.get(0)?,
         overlay_path: row.get(1)?,
@@ -1132,7 +1149,8 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<SnapshotRecord, rusqlite::
         vcpus: row.get(7)?,
         kernel_path: row.get(8)?,
         rootfs_path: row.get(9)?,
-        cmdline: row.get(10)?,
+        rootfs_read_only: row.get(10)?,
+        cmdline: row.get(11)?,
         created_at: parse_ts(&created_at)?,
     })
 }
@@ -1454,6 +1472,7 @@ mod tests {
             vcpus: Some(2),
             kernel_path: Some("/opt/tarit/vmlinux".into()),
             rootfs_path: Some("/opt/tarit/rootfs.ext4".into()),
+            rootfs_read_only: Some(false),
             cmdline: Some("console=ttyS0".into()),
             created_at: Utc::now(),
         };
