@@ -2419,7 +2419,7 @@ impl VmmSupervisor {
             config.disk_pressure.clone(),
             pressure_roots,
         )?);
-        validate_network_startup_mode(config.enable_net, preflight_taps, live_vm_ids.len())?;
+        validate_network_startup_mode(config.enable_net, preflight_taps)?;
         let net = if config.enable_net {
             let mut tap_owners = HashMap::new();
             if let Some(jails) = &jails {
@@ -7500,11 +7500,10 @@ fn net_config_for_allocation(allocation: &NetAlloc) -> NetConfig {
 fn validate_network_startup_mode(
     enable_net: bool,
     preflight_taps: &[String],
-    recovered_live_vm_count: usize,
 ) -> Result<(), OrchError> {
-    if !enable_net && (!preflight_taps.is_empty() || recovered_live_vm_count > 0) {
+    if !enable_net && !preflight_taps.is_empty() {
         return Err(OrchError::Internal(
-            "network-disabled startup refused: contained Tarit TAPs or recovered live VMs require TARIT_ENABLE_NET=1"
+            "network-disabled startup refused: contained Tarit TAPs require TARIT_ENABLE_NET=1"
                 .into(),
         ));
     }
@@ -8433,11 +8432,10 @@ mod tests {
     }
 
     #[test]
-    fn network_disabled_startup_rejects_contained_taps_or_live_recovery() {
-        assert!(validate_network_startup_mode(false, &[], 0).is_ok());
-        assert!(validate_network_startup_mode(false, &["insta7".into()], 0).is_err());
-        assert!(validate_network_startup_mode(false, &[], 1).is_err());
-        assert!(validate_network_startup_mode(true, &["insta7".into()], 1).is_ok());
+    fn network_disabled_startup_rejects_contained_taps() {
+        assert!(validate_network_startup_mode(false, &[]).is_ok());
+        assert!(validate_network_startup_mode(false, &["insta7".into()]).is_err());
+        assert!(validate_network_startup_mode(true, &["insta7".into()]).is_ok());
     }
 
     #[test]
