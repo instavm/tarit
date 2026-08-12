@@ -116,6 +116,39 @@ fn persist_startup_vm_observation(
         .with_context(|| format!("{context}: {}", vm.id))
 }
 
+fn backfill_legacy_runtime_layouts(
+    config: &Config,
+    store: &Store,
+    records: &mut [tarit_types::VmRecord],
+) -> anyhow::Result<()> {
+    for record in records {
+        let Some(layout) = supervisor::infer_legacy_nonjailed_runtime_layout(config, record)
+            .with_context(|| format!("infer legacy runtime layout for VM {}", record.id))?
+        else {
+            continue;
+        };
+        record.runtime_layout = Some(layout);
+        record.revision = record.revision.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy active VM {} revision is exhausted; drain required before upgrade",
+                record.id
+            )
+        })?;
+        record.updated_at = chrono::Utc::now();
+        persist_startup_vm_observation(
+            store,
+            record,
+            "persist inferred legacy runtime layout before adoption",
+        )?;
+        tracing::warn!(
+            vm = %record.id,
+            revision = record.revision,
+            "persisted inferred legacy non-jailed runtime layout before adoption"
+        );
+    }
+    Ok(())
+}
+
 async fn run_server(
     mut config: Config,
     preflight_taps: Vec<String>,
@@ -148,6 +181,8 @@ async fn run_server(
     let mut persisted_vms = store
         .list_vms()
         .context("load persisted VMs during startup")?;
+    backfill_legacy_runtime_layouts(&config, &store, &mut persisted_vms)
+        .context("backfill legacy active VM runtime layouts")?;
     let live_vm_ids = persisted_vms
         .iter()
         .filter(|vm| {
@@ -1126,6 +1161,13 @@ mod tests {
         http::{header::HOST, Request, StatusCode},
     };
     use std::path::{Path, PathBuf};
+    #[cfg(target_os = "linux")]
+    use std::{
+        io::{Read, Write},
+        os::unix::ffi::OsStrExt,
+        process::{Command, Stdio},
+        thread,
+    };
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
@@ -1169,6 +1211,168 @@ mod tests {
         assert!(references
             .runtime_paths
             .contains(Path::new("/old-layout/control.sock")));
+    }
+
+    fn legacy_active_record(
+        config: &Config,
+        id: Uuid,
+        socket_path: PathBuf,
+        pid: Option<u32>,
+    ) -> tarit_types::VmRecord {
+        let now = chrono::Utc::now();
+        tarit_types::VmRecord {
+            id,
+            host_id: config.host_id.clone(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: Some("test-key".into()),
+            status: VmStatus::Running,
+            revision: 7,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: config.kernel.display().to_string(),
+            rootfs_path: Some(config.rootfs.display().to_string()),
+            rootfs_read_only: true,
+            cmdline: supervisor::DEFAULT_CMDLINE.into(),
+            runtime_layout: None,
+            socket_path: Some(socket_path.display().to_string()),
+            pid,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn ambiguous_legacy_runtime_layout_requires_drain() {
+        let config = test_config();
+        let id = Uuid::new_v4();
+        let mut records = vec![legacy_active_record(
+            &config,
+            id,
+            config.socket_dir.join("not-the-vm-id.sock"),
+            None,
+        )];
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&records[0]).unwrap();
+
+        let error = backfill_legacy_runtime_layouts(&config, &store, &mut records)
+            .expect_err("ambiguous legacy layout must block startup");
+        let error = format!("{error:#}");
+        assert!(error.contains("drain required before upgrade"));
+        assert!(error.contains("legacy UUID-scoped socket"));
+        assert_eq!(store.get_vm(id).unwrap().runtime_layout, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_active_runtime_is_persisted_before_adoption() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/legacy-layout-adoption-{}", Uuid::new_v4()));
+        let mut config = test_config();
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        config.kernel = root.join("kernel");
+        config.rootfs = root.join("rootfs");
+        std::fs::create_dir_all(config.socket_dir.join("overlays")).unwrap();
+
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let overlay_path = config.socket_dir.join("overlays").join(format!("{id}.cow"));
+        std::fs::write(&overlay_path, b"legacy overlay").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(request, tarit_vmm_client::ApiRequest::Status));
+            let response = tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                state: tarit_vmm_client::VmState::Paused,
+                uptime_ms: 1,
+                vcpus: 1,
+                mem_mib: 256,
+                volumes: 0,
+                nets: 0,
+                kernel: "kernel".into(),
+                vcpu_alive: true,
+            });
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut published = false;
+        for _ in 0..200 {
+            published =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).is_ok_and(|cmdline| {
+                    cmdline
+                        .windows(socket_path.as_os_str().as_bytes().len())
+                        .any(|window| window == socket_path.as_os_str().as_bytes())
+                });
+            if published {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "legacy VMM stand-in did not publish its argv");
+
+        let store = Store::open(":memory:").unwrap();
+        let mut records = vec![legacy_active_record(
+            &config,
+            id,
+            socket_path.clone(),
+            Some(child.id()),
+        )];
+        store.insert_vm(&records[0]).unwrap();
+        backfill_legacy_runtime_layouts(&config, &store, &mut records).unwrap();
+
+        let durable = store.get_vm(id).unwrap();
+        assert_eq!(durable.revision, 8);
+        assert_eq!(
+            durable.runtime_layout,
+            Some(tarit_types::VmRuntimeLayout {
+                overlay_path: Some(overlay_path.display().to_string()),
+                jail_path: None,
+                artifact_paths: vec![
+                    socket_path.display().to_string(),
+                    overlay_path.display().to_string(),
+                ],
+            })
+        );
+
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let warnings = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(supervisor.readopt_running_vms(&mut records))
+            .unwrap();
+        server.join().unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(records[0].status, VmStatus::Paused);
+        assert_eq!(records[0].revision, 10);
+        supervisor.stop_vm(id).unwrap();
+        child.wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

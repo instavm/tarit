@@ -382,11 +382,8 @@ impl NetProvisioner {
         policy: &EgressPolicy,
         owner: Option<(u32, u32)>,
     ) -> Result<(), OrchError> {
-        for argv in tap_provision_argv(alloc, &self.uplink) {
+        for argv in tap_provision_argv(alloc, &self.uplink, owner) {
             run_argv(&argv)?;
-        }
-        if let Some(owner) = owner {
-            run_argv(&tap_owner_argv(alloc, owner))?;
         }
         self.add_nft_rule(alloc)?;
         self.install_egress_policy(alloc, policy)?;
@@ -848,16 +845,33 @@ impl NetProvisioner {
     }
 
     fn program_recovered_allocation(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        if let Some(owner) = self.recovered_tap_owners.get(&alloc.vm_id).copied() {
+            self.verify_recovered_tap_owner(alloc, owner)?;
+        }
         for argv in recovered_tap_reconcile_argv(alloc, &self.uplink) {
             run_argv(&argv)?;
-        }
-        if let Some(owner) = self.recovered_tap_owners.get(&alloc.vm_id).copied() {
-            run_argv(&tap_owner_argv(alloc, owner))?;
         }
         self.add_nft_rule(alloc)?;
         self.install_egress_policy(alloc, &self.egress_policy_for(alloc)?)?;
         self.reconcile_traffic_control(alloc)?;
         Ok(())
+    }
+
+    fn verify_recovered_tap_owner(
+        &self,
+        alloc: &NetAlloc,
+        expected: (u32, u32),
+    ) -> Result<(), OrchError> {
+        let listing = command_stdout("ip", &["-json", "tuntap", "show"])?;
+        let actual = parse_tap_owner(&listing, &alloc.tap)?;
+        if actual == Some(expected) {
+            Ok(())
+        } else {
+            Err(OrchError::Internal(format!(
+                "net: recovered tap {} ownership mismatch: actual={actual:?}, expected={expected:?}; refusing to recover the jailed VM",
+                alloc.tap
+            )))
+        }
     }
 
     fn reconcile_traffic_control(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -1685,7 +1699,11 @@ fn validate_nft_base_chain_topology_json(chain: &str, listing: &str) -> Result<(
     }
 }
 
-fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
+fn tap_provision_argv(
+    alloc: &NetAlloc,
+    uplink: &str,
+    owner: Option<(u32, u32)>,
+) -> Vec<Vec<String>> {
     let tap = tap_name(alloc.idx);
     let ingress_table = ingress_table_name(alloc.idx);
     let ingress_comment = nft_quote(&ingress_comment(alloc));
@@ -1693,7 +1711,7 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
     let input_comment = nft_quote(&input_comment(alloc));
     let interface = nft_quote(&tap);
     let uplink = nft_quote(uplink);
-    let mut argv = vec![vec![
+    let mut create = vec![
         "ip".into(),
         "tuntap".into(),
         "add".into(),
@@ -1701,7 +1719,16 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
         tap.clone(),
         "mode".into(),
         "tap".into(),
-    ]];
+    ];
+    if let Some((uid, gid)) = owner {
+        create.extend([
+            "user".into(),
+            uid.to_string(),
+            "group".into(),
+            gid.to_string(),
+        ]);
+    }
+    let mut argv = vec![create];
     argv.extend(tap_sysctl_argv(&tap));
     argv.extend([
         vec![
@@ -1956,22 +1983,6 @@ fn obsolete_traffic_control_argv(
     argv
 }
 
-fn tap_owner_argv(alloc: &NetAlloc, (uid, gid): (u32, u32)) -> Vec<String> {
-    vec![
-        "ip".into(),
-        "tuntap".into(),
-        "set".into(),
-        "dev".into(),
-        alloc.tap.clone(),
-        "mode".into(),
-        "tap".into(),
-        "user".into(),
-        uid.to_string(),
-        "group".into(),
-        gid.to_string(),
-    ]
-}
-
 fn validate_traffic_control_output(
     quota: &VmNetQuotaConfig,
     qdiscs: &str,
@@ -2003,7 +2014,7 @@ fn tbf_burst_bytes(rate_bps: u64) -> u64 {
 }
 
 fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
-    tap_provision_argv(alloc, uplink)
+    tap_provision_argv(alloc, uplink, None)
         .into_iter()
         .filter_map(|mut argv| {
             if argv.starts_with(&["ip".into(), "tuntap".into(), "add".into()]) {
@@ -2018,6 +2029,36 @@ fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<Strin
             Some(argv)
         })
         .collect()
+}
+
+fn parse_tap_owner(listing: &str, tap: &str) -> Result<Option<(u32, u32)>, OrchError> {
+    let entries = serde_json::from_str::<Vec<serde_json::Value>>(listing).map_err(|error| {
+        OrchError::Internal(format!("net: parse ip tuntap ownership JSON: {error}"))
+    })?;
+    let mut found = None;
+    for entry in entries {
+        if entry.get("ifname").and_then(serde_json::Value::as_str) != Some(tap) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(OrchError::Internal(format!(
+                "net: ip tuntap reported duplicate entries for {tap}"
+            )));
+        }
+        let user = entry
+            .get("user")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let group = entry
+            .get("group")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        found = match (user, group) {
+            (Some(user), Some(group)) => Some(Some((user, group))),
+            _ => Some(None),
+        };
+    }
+    Ok(found.flatten())
 }
 
 fn tap_sysctl_argv(tap: &str) -> Vec<Vec<String>> {
@@ -3822,14 +3863,42 @@ mod tests {
     }
 
     #[test]
-    fn jailed_tap_owner_command_uses_unique_identity() {
+    fn jailed_tap_creation_uses_unique_identity_atomically() {
         let alloc = NetAlloc::for_idx(9);
         assert_eq!(
-            tap_owner_argv(&alloc, (20_009, 30_009)),
+            tap_provision_argv(&alloc, "eth0", Some((20_009, 30_009)))[0],
             argv(&[
-                "ip", "tuntap", "set", "dev", &alloc.tap, "mode", "tap", "user", "20009", "group",
+                "ip", "tuntap", "add", "dev", &alloc.tap, "mode", "tap", "user", "20009", "group",
                 "30009",
             ])
+        );
+    }
+
+    #[test]
+    fn recovered_tap_plan_never_uses_invalid_owner_set_command() {
+        let alloc = NetAlloc::for_idx(9);
+        let plan = recovered_tap_reconcile_argv(&alloc, "eth0");
+        let invalid_prefix = argv(&["ip", "tuntap", "set"]);
+        assert!(!plan
+            .iter()
+            .any(|command| command.starts_with(&invalid_prefix)));
+    }
+
+    #[test]
+    fn recovered_tap_owner_requires_exact_uid_and_gid() {
+        let listing = r#"[{"ifname":"insta8","flags":["tap","persist"],"user":20008,"group":30008},{"ifname":"insta9","flags":["tap","persist"],"user":20009,"group":30009}]"#;
+        assert_eq!(
+            parse_tap_owner(listing, "insta9").unwrap(),
+            Some((20_009, 30_009))
+        );
+        assert_eq!(parse_tap_owner(listing, "insta7").unwrap(), None);
+        assert_eq!(
+            parse_tap_owner(
+                r#"[{"ifname":"insta9","flags":["tap","persist"],"user":20009}]"#,
+                "insta9"
+            )
+            .unwrap(),
+            None
         );
     }
 
@@ -4066,7 +4135,7 @@ esac
             &comment,
         ]);
         for (kind, plan) in [
-            ("provision", tap_provision_argv(&alloc, "eth0")),
+            ("provision", tap_provision_argv(&alloc, "eth0", None)),
             ("reconcile", recovered_tap_reconcile_argv(&alloc, "eth0")),
         ] {
             let input_rules = plan
@@ -4095,7 +4164,7 @@ esac
     #[test]
     fn tap_provision_plan_hardens_before_link_is_up() {
         let alloc = NetAlloc::for_idx(0);
-        let plan = tap_provision_argv(&alloc, "eth0");
+        let plan = tap_provision_argv(&alloc, "eth0", None);
         assert_eq!(
             plan,
             vec![
@@ -4351,7 +4420,7 @@ esac
     #[test]
     fn forward_egress_guards_precede_broad_guest_allowlists() {
         let alloc = NetAlloc::for_idx(0);
-        let mut forward_rules = tap_provision_argv(&alloc, "eth0")
+        let mut forward_rules = tap_provision_argv(&alloc, "eth0", None)
             .into_iter()
             .filter(|rule| rule.get(5).is_some_and(|chain| chain == NFT_FWD_CHAIN))
             .collect::<Vec<_>>();
@@ -4503,7 +4572,7 @@ esac
     #[test]
     fn forged_source_guard_counts_before_dropping() {
         let alloc = NetAlloc::for_idx(0);
-        let source_guard = tap_provision_argv(&alloc, "eth0")
+        let source_guard = tap_provision_argv(&alloc, "eth0", None)
             .into_iter()
             .find(|argv| {
                 argv.windows(3)

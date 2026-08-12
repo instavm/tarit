@@ -9,9 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -89,6 +87,233 @@ fn verify_live_vmm(pid: u32, socket_path: &Path, jail_root: Option<&Path>) -> Re
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_legacy_nonjailed_vmm(pid: u32, socket_path: &Path) -> Result<(), String> {
+    verify_live_vmm(pid, socket_path, None)?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_err(|error| format!("read /proc/{pid}/cmdline: {error}"))?;
+    let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if args
+        .iter()
+        .any(|arg| *arg == b"--jail" || *arg == b"--jail-root")
+    {
+        return Err(format!(
+            "VMM PID {pid} has jail arguments and is not a legacy non-jailed runtime"
+        ));
+    }
+    if !args.iter().any(|arg| *arg == b"serve") {
+        return Err(format!("VMM PID {pid} is missing the serve subcommand"));
+    }
+    let socket_args = args
+        .windows(2)
+        .filter_map(|pair| (pair[0] == b"--socket").then_some(pair[1]))
+        .collect::<Vec<_>>();
+    if socket_args.len() != 1 || socket_args[0] != socket_path.as_os_str().as_bytes() {
+        return Err(format!(
+            "VMM PID {pid} does not have one exact --socket {} argument",
+            socket_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_layout_drain_required(record: &VmRecord, reason: impl std::fmt::Display) -> OrchError {
+    OrchError::Internal(format!(
+        "legacy active VM {} has no runtime layout and cannot be inferred unambiguously ({reason}); drain required before upgrade",
+        record.id
+    ))
+}
+
+pub(crate) fn infer_legacy_nonjailed_runtime_layout(
+    config: &Config,
+    record: &VmRecord,
+) -> Result<Option<VmRuntimeLayout>, OrchError> {
+    if record.runtime_layout.is_some()
+        || record.host_id != config.host_id
+        || !matches!(
+            record.status,
+            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        )
+    {
+        return Ok(None);
+    }
+    if config.vm_jail.is_some() {
+        return Err(legacy_layout_drain_required(
+            record,
+            "the current host enables VM jails, but legacy rows only describe the pre-jail layout",
+        ));
+    }
+
+    let socket_path = record
+        .socket_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            legacy_layout_drain_required(record, "the persisted control socket is missing")
+        })?;
+    let legacy_socket_name = format!("{}.sock", record.id);
+    if socket_path.file_name().and_then(|name| name.to_str()) != Some(&legacy_socket_name) {
+        return Err(legacy_layout_drain_required(
+            record,
+            format!(
+                "persisted control socket {} is not the legacy UUID-scoped socket",
+                socket_path.display()
+            ),
+        ));
+    }
+    let runtime_root = socket_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            legacy_layout_drain_required(record, "the persisted control socket has no runtime root")
+        })?;
+    let socket_metadata = std::fs::symlink_metadata(&socket_path).map_err(|error| {
+        legacy_layout_drain_required(
+            record,
+            format!(
+                "inspect persisted control socket {}: {error}",
+                socket_path.display()
+            ),
+        )
+    })?;
+    if !socket_metadata.file_type().is_socket() {
+        return Err(legacy_layout_drain_required(
+            record,
+            format!(
+                "persisted control socket {} is not a Unix socket",
+                socket_path.display()
+            ),
+        ));
+    }
+    infer_legacy_nonjailed_runtime_layout_platform(
+        record,
+        socket_path,
+        runtime_root,
+        socket_metadata,
+    )
+    .map(Some)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn infer_legacy_nonjailed_runtime_layout_platform(
+    record: &VmRecord,
+    _socket_path: PathBuf,
+    _runtime_root: PathBuf,
+    _socket_metadata: std::fs::Metadata,
+) -> Result<VmRuntimeLayout, OrchError> {
+    Err(legacy_layout_drain_required(
+        record,
+        "live process ownership verification requires Linux pidfds and /proc",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn infer_legacy_nonjailed_runtime_layout_platform(
+    record: &VmRecord,
+    socket_path: PathBuf,
+    runtime_root: PathBuf,
+    socket_metadata: std::fs::Metadata,
+) -> Result<VmRuntimeLayout, OrchError> {
+    let pid = record
+        .pid
+        .ok_or_else(|| legacy_layout_drain_required(record, "the persisted VMM PID is missing"))?;
+    let _pidfd = pidfd_open(pid).map_err(|error| {
+        legacy_layout_drain_required(record, format!("pin persisted VMM PID {pid}: {error}"))
+    })?;
+    let service_uid = unsafe { libc::geteuid() };
+    let process_uid = std::fs::metadata(format!("/proc/{pid}"))
+        .map_err(|error| {
+            legacy_layout_drain_required(
+                record,
+                format!("inspect persisted VMM PID {pid}: {error}"),
+            )
+        })?
+        .uid();
+    if process_uid != service_uid || socket_metadata.uid() != service_uid {
+        return Err(legacy_layout_drain_required(
+            record,
+            format!(
+                "VMM PID {pid} and control socket {} are not owned by taritd uid {service_uid}",
+                socket_path.display()
+            ),
+        ));
+    }
+    verify_legacy_nonjailed_vmm(pid, &socket_path)
+        .map_err(|reason| legacy_layout_drain_required(record, reason))?;
+
+    if record.rootfs_path.as_deref().is_some_and(str::is_empty) {
+        return Err(legacy_layout_drain_required(
+            record,
+            "the persisted rootfs path is empty",
+        ));
+    }
+    let legacy_overlay = runtime_root
+        .join("overlays")
+        .join(format!("{}.cow", record.id));
+    let overlay_path = if record.rootfs_path.is_some() {
+        let metadata = std::fs::symlink_metadata(&legacy_overlay).map_err(|error| {
+            legacy_layout_drain_required(
+                record,
+                format!(
+                    "inspect legacy overlay {} derived from the persisted socket and rootfs: {error}",
+                    legacy_overlay.display()
+                ),
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(legacy_layout_drain_required(
+                record,
+                format!(
+                    "legacy overlay {} is not a regular file",
+                    legacy_overlay.display()
+                ),
+            ));
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(legacy_layout_drain_required(
+                record,
+                format!(
+                    "legacy overlay {} is not owned by taritd",
+                    legacy_overlay.display()
+                ),
+            ));
+        }
+        Some(legacy_overlay.display().to_string())
+    } else {
+        match std::fs::symlink_metadata(&legacy_overlay) {
+            Ok(_) => {
+                return Err(legacy_layout_drain_required(
+                    record,
+                    format!(
+                        "legacy overlay {} exists although the persisted VM has no rootfs",
+                        legacy_overlay.display()
+                    ),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(legacy_layout_drain_required(
+                    record,
+                    format!(
+                        "inspect unexpected legacy overlay {}: {error}",
+                        legacy_overlay.display()
+                    ),
+                ))
+            }
+        }
+    };
+    let mut artifact_paths = vec![socket_path.display().to_string()];
+    if let Some(path) = &overlay_path {
+        artifact_paths.push(path.clone());
+    }
+    Ok(VmRuntimeLayout {
+        overlay_path,
+        jail_path: None,
+        artifact_paths,
+    })
 }
 
 /// Pin the exact process instance behind `pid` with a pidfd. Once taritd holds
@@ -4714,7 +4939,7 @@ impl VmmSupervisor {
         ) {
             let persisted = record.runtime_layout.as_ref().ok_or_else(|| {
                 ReadoptFailure::Fatal(
-                    "persisted active VM has no runtime layout; refusing recovery before artifact GC"
+                    "persisted active VM has no runtime layout after legacy migration; drain required before recovery and artifact GC"
                         .into(),
                 )
             })?;
@@ -7086,7 +7311,7 @@ mod tests {
         let error = test_runtime()
             .block_on(supervisor.readopt_running_vms(std::slice::from_mut(&mut record)))
             .expect_err("missing active runtime layout must block startup");
-        assert!(error.to_string().contains("before artifact GC"));
+        assert!(error.to_string().contains("drain required"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
