@@ -926,6 +926,45 @@ struct PreparedRuntime {
     jail: Option<JailLease>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CgroupLimitPlan {
+    cpu_max: Option<String>,
+    cpu_weight: Option<u64>,
+    memory_max: Option<u64>,
+    pids_max: Option<u64>,
+    io_weight: Option<u64>,
+    io_max: Option<String>,
+    cpuset_cpus: Option<String>,
+    cpuset_mems: Option<String>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl CgroupLimitPlan {
+    fn entries(&self) -> Vec<(&'static str, String)> {
+        [
+            self.cpuset_mems
+                .as_ref()
+                .map(|value| ("cpuset.mems", value.clone())),
+            self.cpuset_cpus
+                .as_ref()
+                .map(|value| ("cpuset.cpus", value.clone())),
+            self.cpu_max
+                .as_ref()
+                .map(|value| ("cpu.max", value.clone())),
+            self.cpu_weight
+                .map(|value| ("cpu.weight", value.to_string())),
+            self.memory_max
+                .map(|value| ("memory.max", value.to_string())),
+            self.pids_max.map(|value| ("pids.max", value.to_string())),
+            self.io_weight.map(|value| ("io.weight", value.to_string())),
+            self.io_max.as_ref().map(|value| ("io.max", value.clone())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
 impl OwnedArtifact {
     fn capture(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
@@ -1601,6 +1640,11 @@ fn shutdown_error() -> OrchError {
 pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
+    /// Authoritative ownership for UUID-scoped runtime artifacts. An id enters
+    /// before any jail/overlay can be created and leaves only after teardown
+    /// succeeds, so registry-to-registry lifecycle handoffs cannot expose a GC
+    /// deletion gap.
+    artifact_owners: Mutex<HashSet<Uuid>>,
     network_leases: Mutex<HashMap<Uuid, NetworkLeaseState>>,
     booting: Mutex<HashMap<Uuid, BootingVm>>,
     /// Serializes VMM spawn registration with shutdown's boot cancellation sweep.
@@ -1618,6 +1662,8 @@ pub struct VmmSupervisor {
     owned_tasks: Mutex<HashMap<Uuid, Arc<OwnedTaskControl>>>,
     #[cfg(test)]
     spawn_attachment_pause: Mutex<Option<SpawnAttachmentPause>>,
+    #[cfg(test)]
+    warm_handoff_pause: Mutex<Option<SpawnAttachmentPause>>,
     scheduler: Arc<Scheduler>,
     golden_artifacts: Mutex<Vec<OwnedArtifact>>,
     in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
@@ -1773,6 +1819,7 @@ impl VmmSupervisor {
             |error| OrchError::Internal(format!("protect snapshot artifact directory: {error}")),
         )?;
         let live_vm_ids = live_vm_ids.into_iter().collect::<Vec<_>>();
+        let artifact_owners = live_vm_ids.iter().copied().collect();
         let jails = config.vm_jail.clone().map(JailManager::new).transpose()?;
         let mut pressure_roots = vec![config.socket_dir.clone()];
         if let Some(jail) = &config.vm_jail {
@@ -1808,6 +1855,7 @@ impl VmmSupervisor {
         Ok(Self {
             config,
             running: Mutex::new(HashMap::new()),
+            artifact_owners: Mutex::new(artifact_owners),
             network_leases: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
             boot_gate: AsyncMutex::new(()),
@@ -1815,6 +1863,8 @@ impl VmmSupervisor {
             owned_tasks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             spawn_attachment_pause: Mutex::new(None),
+            #[cfg(test)]
+            warm_handoff_pause: Mutex::new(None),
             scheduler,
             golden_artifacts: Mutex::new(Vec::new()),
             in_progress_artifacts: Arc::new(Mutex::new(HashSet::new())),
@@ -1887,6 +1937,35 @@ impl VmmSupervisor {
                 read_only: record.rootfs_read_only,
             },
         )
+    }
+
+    fn register_artifact_owner(&self, id: Uuid) -> Result<(), OrchError> {
+        let mut owners = self
+            .artifact_owners
+            .lock()
+            .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?;
+        if !owners.insert(id) {
+            return Err(OrchError::Conflict(format!(
+                "VM {id} already owns runtime artifacts"
+            )));
+        }
+        Ok(())
+    }
+
+    fn protect_artifact_owner(&self, id: Uuid) -> Result<(), OrchError> {
+        self.artifact_owners
+            .lock()
+            .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?
+            .insert(id);
+        Ok(())
+    }
+
+    fn release_artifact_owner(&self, id: Uuid) -> Result<(), OrchError> {
+        self.artifact_owners
+            .lock()
+            .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?
+            .remove(&id);
+        Ok(())
     }
 
     fn snapshot_overlay_path(&self) -> PathBuf {
@@ -2175,6 +2254,18 @@ impl VmmSupervisor {
 
     #[cfg(target_os = "linux")]
     fn cgroup_io_max_arg(&self, runtime: &PreparedRuntime) -> Result<Option<String>, OrchError> {
+        self.cgroup_io_max_for_paths(
+            runtime.host_rootfs.as_deref(),
+            runtime.host_overlay.as_deref(),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn cgroup_io_max_for_paths(
+        &self,
+        rootfs: Option<&Path>,
+        overlay: Option<&Path>,
+    ) -> Result<Option<String>, OrchError> {
         use std::collections::BTreeSet;
 
         let quota = &self.config.vm_io_quota;
@@ -2183,23 +2274,19 @@ impl VmmSupervisor {
         }
 
         let mut devices = BTreeSet::new();
-        if let Some(rootfs) = runtime.host_rootfs.as_ref() {
+        if let Some(rootfs) = rootfs {
             let metadata = std::fs::metadata(rootfs).map_err(|error| {
                 OrchError::Internal(format!(
                     "stat VM rootfs {} for cgroup io.max: {error}",
                     rootfs.display()
                 ))
             })?;
-            devices.insert(format!(
-                "{}:{}",
-                libc::major(metadata.dev()),
-                libc::minor(metadata.dev())
-            ));
-            let overlay = runtime.host_overlay.as_ref().ok_or_else(|| {
+            devices.insert(cgroup_device_number(&metadata)?);
+            let overlay = overlay.ok_or_else(|| {
                 OrchError::Internal("rootfs-backed VM is missing an overlay path".into())
             })?;
             let overlay_backing = if overlay.exists() {
-                overlay.as_path()
+                overlay
             } else {
                 overlay.parent().ok_or_else(|| {
                     OrchError::Internal(format!(
@@ -2214,11 +2301,7 @@ impl VmmSupervisor {
                     overlay_backing.display()
                 ))
             })?;
-            devices.insert(format!(
-                "{}:{}",
-                libc::major(metadata.dev()),
-                libc::minor(metadata.dev())
-            ));
+            devices.insert(cgroup_device_number(&metadata)?);
         }
         if devices.is_empty() {
             return Ok(None);
@@ -2245,6 +2328,80 @@ impl VmmSupervisor {
     #[cfg(not(target_os = "linux"))]
     fn cgroup_io_max_arg(&self, _runtime: &PreparedRuntime) -> Result<Option<String>, OrchError> {
         Ok(None)
+    }
+
+    fn readopted_cgroup_limit_plan(&self, record: &VmRecord) -> Result<CgroupLimitPlan, OrchError> {
+        let cpu_quota = u64::from(record.vcpus)
+            .checked_mul(100_000)
+            .ok_or_else(|| OrchError::BadRequest("vCPU cgroup limit overflow".into()))?;
+        let max_mib = record
+            .memory_mib
+            .checked_add(record.memory_mib / 2)
+            .and_then(|value| value.checked_add(256))
+            .ok_or_else(|| OrchError::BadRequest("memory cgroup limit overflow".into()))?;
+        let memory_max = max_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| OrchError::BadRequest("memory cgroup byte limit overflow".into()))?;
+        let io_max = self.readopted_cgroup_io_max(record)?;
+        Ok(CgroupLimitPlan {
+            cpu_max: Some(format!("{cpu_quota} 100000")),
+            cpu_weight: Some(NORMAL_CGROUP_CPU_WEIGHT),
+            memory_max: Some(memory_max),
+            pids_max: Some(self.config.vm_cgroup_pids_max),
+            io_weight: self.config.vm_io_quota.is_configured().then_some(100),
+            io_max,
+            ..CgroupLimitPlan::default()
+        })
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn readopted_cgroup_io_max(&self, record: &VmRecord) -> Result<Option<String>, OrchError> {
+        let layout = record.runtime_layout.as_ref().ok_or_else(|| {
+            OrchError::Internal(format!(
+                "VM {} has no runtime layout for cgroup recovery",
+                record.id
+            ))
+        })?;
+        let rootfs = record.rootfs_path.as_ref().map(|rootfs| {
+            layout
+                .jail_path
+                .as_ref()
+                .map(|jail| Path::new(jail).join(JAIL_ROOTFS_PATH.trim_start_matches('/')))
+                .unwrap_or_else(|| PathBuf::from(rootfs))
+        });
+        let overlay = layout.overlay_path.as_deref().map(PathBuf::from);
+        self.cgroup_io_max_for_paths(rootfs.as_deref(), overlay.as_deref())
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(test)))]
+    fn readopted_cgroup_io_max(&self, _record: &VmRecord) -> Result<Option<String>, OrchError> {
+        Ok(None)
+    }
+
+    fn reconcile_readopted_cgroup(&self, record: &VmRecord, pid: u32) -> Result<(), OrchError> {
+        let Some(path) = self.exact_vm_cgroup_path(record.id) else {
+            return Ok(());
+        };
+        let parent = self
+            .config
+            .vm_cgroup_parent
+            .as_deref()
+            .map(Path::new)
+            .ok_or_else(|| OrchError::Internal("VM cgroup parent disappeared".into()))?;
+        validate_owned_vm_cgroup(parent, &path, record.id, pid).map_err(|error| {
+            OrchError::Internal(format!(
+                "verify exact cgroup ownership for adopted VM {}: {error}",
+                record.id
+            ))
+        })?;
+        let plan = self.readopted_cgroup_limit_plan(record)?;
+        apply_and_verify_cgroup_limits(&path, &plan).map_err(|error| {
+            OrchError::Internal(format!(
+                "reapply cgroup limits for adopted VM {} in {}: {error}",
+                record.id,
+                path.display()
+            ))
+        })
     }
 
     /// The VMM creates this child and applies the VM's exact CPU, memory and PID
@@ -2336,6 +2493,20 @@ impl VmmSupervisor {
         &self,
         mut references: ArtifactReferences,
     ) -> Result<GcReport, OrchError> {
+        // Hold the authoritative runtime registry through deletion. Creation
+        // registers before materializing artifacts, and teardown unregisters
+        // only after deletion, so every live jail/overlay is continuously
+        // protected even while moving between booting, warm, and running maps.
+        let owners = self
+            .artifact_owners
+            .lock()
+            .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?;
+        references.active_vm_ids.extend(owners.iter().copied());
+        references.runtime_paths.extend(
+            owners
+                .iter()
+                .map(|id| PathBuf::from(self.overlay_path_for(*id))),
+        );
         // Publication holds this registry while staging names are atomically
         // renamed into the GC namespace. Holding the same lock through the
         // sweep closes the rename-to-registration race.
@@ -2344,29 +2515,6 @@ impl VmmSupervisor {
             .lock()
             .map_err(|_| OrchError::Internal("artifact publication registry poisoned".into()))?;
         references.runtime_paths.extend(in_progress.iter().cloned());
-        if let Ok(running) = self.running.lock() {
-            references.active_vm_ids.extend(running.keys().copied());
-            references.runtime_paths.extend(
-                running
-                    .keys()
-                    .map(|id| PathBuf::from(self.overlay_path_for(*id))),
-            );
-        }
-        if let Ok(warm) = self.warm.lock() {
-            references.active_vm_ids.extend(warm.iter().map(|vm| vm.id));
-            references.runtime_paths.extend(
-                warm.iter()
-                    .map(|vm| PathBuf::from(self.overlay_path_for(vm.id))),
-            );
-        }
-        if let Ok(booting) = self.booting.lock() {
-            references.active_vm_ids.extend(booting.keys().copied());
-            references.runtime_paths.extend(
-                booting
-                    .keys()
-                    .map(|id| PathBuf::from(self.overlay_path_for(*id))),
-            );
-        }
         if let Ok(golden) = self.golden_artifacts.lock() {
             references
                 .runtime_paths
@@ -2506,6 +2654,7 @@ impl VmmSupervisor {
 
         let control = Arc::new(BootControl::new(purpose));
         let socket_path = self.socket_path_for(id);
+        self.register_artifact_owner(id)?;
         let registered = self
             .booting
             .lock()
@@ -2521,13 +2670,17 @@ impl VmmSupervisor {
                     },
                 );
             });
-        registered?;
+        if let Err(error) = registered {
+            let _ = self.release_artifact_owner(id);
+            return Err(error);
+        }
         // Reserve capacity before the durable registration so capacity
         // rejections leave no durable trace: the admission loop retries the
         // same id, and a leftover Error tombstone from a rejected attempt
         // would make the re-registration fail with an incarnation conflict.
         if let Err(error) = self.scheduler.try_reserve(id, shape) {
             self.complete_booting(id, &control, Ok(()));
+            self.release_artifact_owner(id)?;
             return Err(match error {
                 ReservationError::AlreadyReserved => {
                     OrchError::Conflict(format!("VM {id} already has a boot reservation"))
@@ -2546,6 +2699,7 @@ impl VmmSupervisor {
         if let Err(error) = on_registered().await {
             self.scheduler.release(id);
             self.complete_booting(id, &control, Ok(()));
+            self.release_artifact_owner(id)?;
             return Err(error);
         }
         Ok(BootTicket {
@@ -2755,6 +2909,25 @@ impl VmmSupervisor {
     }
 
     #[cfg(test)]
+    fn pause_after_warm_dequeue_for_test(&self) -> SpawnAttachmentPause {
+        let pause = SpawnAttachmentPause::default();
+        *self.warm_handoff_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    fn wait_after_warm_dequeue_before_running_insert(&self) {
+        let pause = self
+            .warm_handoff_pause
+            .lock()
+            .ok()
+            .and_then(|pause| pause.clone());
+        if let Some(pause) = pause {
+            pause.wait_after_spawn();
+        }
+    }
+
+    #[cfg(test)]
     fn track_booting(
         &self,
         id: Uuid,
@@ -2763,10 +2936,11 @@ impl VmmSupervisor {
         purpose: SpawnPurpose,
     ) -> Result<Arc<BootControl>, OrchError> {
         let control = Arc::new(BootControl::new(purpose));
-        let mut booting = self
-            .booting
-            .lock()
-            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?;
+        self.register_artifact_owner(id)?;
+        let mut booting = self.booting.lock().map_err(|_| {
+            let _ = self.release_artifact_owner(id);
+            OrchError::Internal("supervisor booting lock poisoned".into())
+        })?;
         booting.insert(
             id,
             BootingVm {
@@ -2801,6 +2975,7 @@ impl VmmSupervisor {
             .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control));
         if is_current {
             self.complete_booting(ticket.id, &ticket.control, Ok(()));
+            let _ = self.release_artifact_owner(ticket.id);
             if ticket.purpose == SpawnPurpose::Refill {
                 self.release_reservation_after_cleanup(ticket.id);
             }
@@ -2820,6 +2995,7 @@ impl VmmSupervisor {
         id: Uuid,
         spec: VmSpawnConfig,
     ) -> Result<(), OrchError> {
+        self.register_artifact_owner(id)?;
         self.scheduler
             .try_reserve(id, spec.resource_shape())
             .unwrap();
@@ -3244,8 +3420,21 @@ impl VmmSupervisor {
                 .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control));
         if !can_start {
             drop(boot_gate);
-            self.complete_booting(id, &ticket.control, Ok(()));
-            let _ = self.release_jail(id);
+            match self.release_jail(id) {
+                Ok(()) => {
+                    self.complete_booting(id, &ticket.control, Ok(()));
+                    let _ = self.release_artifact_owner(id);
+                }
+                Err(error) => {
+                    self.complete_booting(
+                        id,
+                        &ticket.control,
+                        Err(OrchError::Internal(format!(
+                            "cancelled boot retained staged jail: {error}"
+                        ))),
+                    );
+                }
+            }
             return Err(self.shutdown_error());
         }
         let mut command = Command::new(&self.config.vmm_bin);
@@ -3276,11 +3465,22 @@ impl VmmSupervisor {
             Ok(child) => child,
             Err(error) => {
                 drop(boot_gate);
-                self.complete_booting(id, &ticket.control, Ok(()));
-                if ticket.control.purpose == SpawnPurpose::Refill {
-                    self.release_reservation_after_cleanup(id);
-                }
                 let jail_cleanup = self.release_jail(id).err();
+                if jail_cleanup.is_none() {
+                    self.complete_booting(id, &ticket.control, Ok(()));
+                    let _ = self.release_artifact_owner(id);
+                    if ticket.control.purpose == SpawnPurpose::Refill {
+                        self.release_reservation_after_cleanup(id);
+                    }
+                } else {
+                    self.complete_booting(
+                        id,
+                        &ticket.control,
+                        Err(OrchError::Internal(
+                            "spawn failure retained staged jail for retry".into(),
+                        )),
+                    );
+                }
                 return Err(OrchError::Internal(match jail_cleanup {
                     Some(cleanup) => {
                         format!("spawn vmm: {error}; remove staged jail: {cleanup}")
@@ -3337,6 +3537,7 @@ impl VmmSupervisor {
             Ok(runtime) => runtime,
             Err(error) => {
                 self.complete_booting(id, &ticket.control, Ok(()));
+                let _ = self.release_artifact_owner(id);
                 if ticket.purpose == SpawnPurpose::Refill {
                     self.release_reservation_after_cleanup(id);
                 }
@@ -3458,6 +3659,7 @@ impl VmmSupervisor {
             Ok(runtime) => runtime,
             Err(error) => {
                 self.complete_booting(id, &ticket.control, Ok(()));
+                let _ = self.release_artifact_owner(id);
                 if ticket.purpose == SpawnPurpose::Refill {
                     self.release_reservation_after_cleanup(id);
                 }
@@ -4086,6 +4288,8 @@ impl VmmSupervisor {
         let pid = taken.vm.pid;
         let socket = taken.vm.socket_path.clone();
         self.configure_leased_cgroup(candidate_id, pid);
+        #[cfg(test)]
+        self.wait_after_warm_dequeue_before_running_insert();
         let WarmVm { id, vm, .. } = taken;
         self.running
             .lock()
@@ -4369,6 +4573,7 @@ impl VmmSupervisor {
     }
 
     fn cleanup_uncommitted_runtime(&self, id: Uuid) -> Result<usize, OrchError> {
+        self.protect_artifact_owner(id)?;
         let terminated = self.terminate_owned_processes(id, None)?;
         let remaining = self.owned_processes_for(id)?;
         if !remaining.is_empty() {
@@ -4406,6 +4611,7 @@ impl VmmSupervisor {
         }
         self.scheduler.release(id);
         if failures.is_empty() {
+            self.release_artifact_owner(id)?;
             Ok(terminated)
         } else {
             Err(OrchError::Internal(failures.join("; ")))
@@ -4494,6 +4700,13 @@ impl VmmSupervisor {
     async fn readopt_one(self: &Arc<Self>, record: &mut VmRecord) -> Result<bool, ReadoptFailure> {
         if record.host_id != self.config.host_id {
             return Ok(false);
+        }
+        if matches!(
+            record.status,
+            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        ) {
+            self.protect_artifact_owner(record.id)
+                .map_err(|error| ReadoptFailure::Fatal(error.to_string()))?;
         }
         if matches!(
             record.status,
@@ -4611,6 +4824,9 @@ impl VmmSupervisor {
         // VMM that the control plane cannot manage, so terminate it through the
         // pinned pidfd before marking the VM terminal.
         let recovered: Result<Option<NetAlloc>, String> = 'recover: {
+            if let Err(error) = self.reconcile_readopted_cgroup(record, pid) {
+                break 'recover Err(error.to_string());
+            }
             if !socket_path.exists() {
                 break 'recover Err(format!(
                     "control socket {} is absent",
@@ -4632,13 +4848,7 @@ impl VmmSupervisor {
             Ok(net) => net,
             Err(reason) => {
                 let vm = RunningVm::new(pid, socket_path, process, None);
-                if let Err(error) = self.teardown_vm(record.id, &vm) {
-                    return Err(ReadoptFailure::Fatal(format!(
-                        "{reason}; clean up identified VMM {} after adoption failed: {error}",
-                        record.id
-                    )));
-                }
-                return Err(ReadoptFailure::Unadoptable(reason));
+                return Err(self.fence_readopt_failure(record.id, &vm, reason));
             }
         };
         let vm = RunningVm::new(pid, socket_path, process, net);
@@ -4683,6 +4893,15 @@ impl VmmSupervisor {
         Ok(true)
     }
 
+    fn fence_readopt_failure(&self, id: Uuid, vm: &RunningVm, reason: String) -> ReadoptFailure {
+        match self.teardown_vm(id, vm) {
+            Ok(()) => ReadoptFailure::Unadoptable(reason),
+            Err(error) => ReadoptFailure::Fatal(format!(
+                "{reason}; clean up identified VMM {id} after adoption failed: {error}"
+            )),
+        }
+    }
+
     fn contain_layout_conflict(
         &self,
         record: &VmRecord,
@@ -4719,6 +4938,8 @@ impl VmmSupervisor {
                 )
             })?;
         }
+        self.release_artifact_owner(record.id)
+            .map_err(|error| format!("release contained runtime ownership: {error}"))?;
         Ok(())
     }
 
@@ -4874,6 +5095,7 @@ impl VmmSupervisor {
                 net.teardown_vm_id(id)?;
             }
             self.release_jail(id)?;
+            self.release_artifact_owner(id)?;
             return Ok(());
         };
 
@@ -5459,6 +5681,7 @@ impl VmmSupervisor {
             }
         }
         if failures.is_empty() {
+            self.release_artifact_owner(id)?;
             Ok(())
         } else {
             Err(OrchError::Internal(failures.join("; ")))
@@ -6021,6 +6244,246 @@ where
     )))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_device_number(metadata: &std::fs::Metadata) -> Result<String, OrchError> {
+    let device = libc::dev_t::try_from(metadata.dev())
+        .map_err(|_| OrchError::Internal("filesystem device number does not fit dev_t".into()))?;
+    Ok(format!("{}:{}", libc::major(device), libc::minor(device)))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_owned_vm_cgroup(parent: &Path, path: &Path, id: Uuid, pid: u32) -> std::io::Result<()> {
+    let expected = parent.join(format!("tarit-{id}"));
+    if path != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "derived cgroup {} does not equal expected child {}",
+                path.display(),
+                expected.display()
+            ),
+        ));
+    }
+    #[cfg(not(test))]
+    {
+        if !parent.is_absolute()
+            || !parent.starts_with("/sys/fs/cgroup/")
+            || parent == Path::new("/sys/fs/cgroup")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "configured VM cgroup parent {} is not a dedicated cgroup v2 subtree",
+                    parent.display()
+                ),
+            ));
+        }
+    }
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    let child_metadata = std::fs::symlink_metadata(path)?;
+    let owner = unsafe { libc::geteuid() };
+    if !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != owner
+        || !child_metadata.is_dir()
+        || child_metadata.file_type().is_symlink()
+        || child_metadata.uid() != owner
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "cgroup parent {} and child {} must be real directories owned by uid {owner}",
+                parent.display(),
+                path.display()
+            ),
+        ));
+    }
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let canonical_child = std::fs::canonicalize(path)?;
+    if canonical_child.parent() != Some(canonical_parent.as_path())
+        || canonical_child.file_name() != expected.file_name()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "cgroup child {} escapes configured parent {}",
+                path.display(),
+                parent.display()
+            ),
+        ));
+    }
+    #[cfg(not(test))]
+    {
+        if canonical_parent != parent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "configured cgroup parent {} contains a symlink or non-canonical component",
+                    parent.display()
+                ),
+            ));
+        }
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "cgroup path contains NUL")
+        })?;
+        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stats = unsafe { stats.assume_init() };
+        if stats.f_type as libc::c_long != libc::CGROUP2_SUPER_MAGIC as libc::c_long {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "configured VM cgroup path is not on cgroup v2",
+            ));
+        }
+    }
+
+    let procs = path.join("cgroup.procs");
+    validate_owned_cgroup_control(&procs)?;
+    let owns_pid = std::fs::read_to_string(&procs)?
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .any(|candidate| candidate == pid);
+    if !owns_pid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "adopted VMM PID {pid} is not a member of exact cgroup {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn validate_owned_vm_cgroup(
+    _parent: &Path,
+    _path: &Path,
+    _id: Uuid,
+    _pid: u32,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cgroup v2 is only available on Linux",
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn validate_owned_cgroup_control(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "cgroup control {} must be a real file owned by taritd",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn apply_and_verify_cgroup_limits(cgroup: &Path, plan: &CgroupLimitPlan) -> std::io::Result<()> {
+    for (key, expected) in plan.entries() {
+        let path = cgroup.join(key);
+        validate_owned_cgroup_control(&path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("validate cgroup control {}: {error}", path.display()),
+            )
+        })?;
+        if key == "io.max" {
+            for command in expected
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                write_single_file(&path, command).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("write cgroup control {}: {error}", path.display()),
+                    )
+                })?;
+            }
+        } else {
+            write_single_file(&path, &expected).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("write cgroup control {}: {error}", path.display()),
+                )
+            })?;
+        }
+        let actual = std::fs::read_to_string(&path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("read cgroup control {}: {error}", path.display()),
+            )
+        })?;
+        if !cgroup_value_matches(key, &expected, &actual) {
+            return Err(std::io::Error::other(format!(
+                "verification failed for {key}: expected {expected:?}, read {actual:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn apply_and_verify_cgroup_limits(_cgroup: &Path, _plan: &CgroupLimitPlan) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cgroup v2 is only available on Linux",
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_value_matches(key: &str, expected: &str, actual: &str) -> bool {
+    if key == "io.max" {
+        let actual = parse_io_limits(actual);
+        return parse_io_limits(expected)
+            .into_iter()
+            .all(|(device, limits)| {
+                actual.get(&device).is_some_and(|actual_limits| {
+                    limits
+                        .iter()
+                        .all(|(limit, value)| actual_limits.get(limit) == Some(value))
+                })
+            });
+    }
+    if key == "io.weight" {
+        return actual
+            .split_whitespace()
+            .next_back()
+            .is_some_and(|value| value == expected.trim());
+    }
+    expected.split_whitespace().eq(actual.split_whitespace())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_io_limits(contents: &str) -> HashMap<String, HashMap<String, String>> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let device = fields.next()?.to_string();
+            let limits = fields
+                .filter_map(|field| {
+                    field
+                        .split_once('=')
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                })
+                .collect::<HashMap<_, _>>();
+            Some((device, limits))
+        })
+        .collect()
+}
+
 #[cfg(target_os = "linux")]
 fn move_pid_to_configured_refill_cgroup(
     pid: u32,
@@ -6070,11 +6533,14 @@ fn write_pid_to_cgroup(_cgroup_dir: &Path, _pid: u32) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn write_single_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
-    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
     let bytes = contents.as_bytes();
     let written = file.write(bytes)?;
     if written == bytes.len() {
@@ -7249,6 +7715,171 @@ mod tests {
     }
 
     #[test]
+    fn restart_reapplies_new_and_reduced_cgroup_quotas() {
+        let root = PathBuf::from(format!("target/cgroup-readopt-limits-{}", Uuid::new_v4()));
+        let cgroup_parent = root.join("cgroups");
+        std::fs::create_dir_all(&cgroup_parent).unwrap();
+        let mut config = supervisor_config(&root);
+        config.vm_cgroup_parent = Some(cgroup_parent.display().to_string());
+        config.vm_cgroup_pids_max = 128;
+        config.vm_io_quota = crate::config::VmIoQuotaConfig {
+            read_bps_max: Some(1_048_576),
+            write_bps_max: Some(2_097_152),
+            read_iops_max: None,
+            write_iops_max: None,
+        };
+        let supervisor = VmmSupervisor::new(config);
+        let id = Uuid::new_v4();
+        let rootfs = root.join("rootfs");
+        let overlay = PathBuf::from(supervisor.overlay_path_for(id));
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(&rootfs, b"rootfs").unwrap();
+        std::fs::write(&overlay, b"overlay").unwrap();
+        let child = supervisor.exact_vm_cgroup_path(id).unwrap();
+        std::fs::create_dir(&child).unwrap();
+        for (key, value) in [
+            ("cgroup.procs", "4242"),
+            ("cpu.max", "900000 100000"),
+            ("cpu.weight", "999"),
+            ("memory.max", "2147483648"),
+            ("pids.max", "999"),
+            ("io.weight", "999"),
+            ("io.max", "0:0 rbps=9999999 wbps=9999999"),
+        ] {
+            std::fs::write(child.join(key), value).unwrap();
+        }
+        let mut record = restart_record(&supervisor, id, &supervisor.socket_path_for(id));
+        record.vcpus = 2;
+        record.memory_mib = 512;
+        record.rootfs_path = Some(rootfs.display().to_string());
+        record.runtime_layout = Some(
+            supervisor.runtime_layout_for_config(id, &spawn_config(true, Some(rootfs.clone()))),
+        );
+
+        supervisor
+            .reconcile_readopted_cgroup(&record, 4242)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(child.join("cpu.max")).unwrap(),
+            "200000 100000"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.join("cpu.weight")).unwrap(),
+            "100"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.join("memory.max")).unwrap(),
+            (1024_u64 * 1024 * 1024).to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.join("pids.max")).unwrap(),
+            "128"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.join("io.weight")).unwrap(),
+            "100"
+        );
+        let io_max = std::fs::read_to_string(child.join("io.max")).unwrap();
+        assert!(io_max.contains("rbps=1048576"));
+        assert!(io_max.contains("wbps=2097152"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cgroup_recovery_rejects_unsafe_paths_and_missing_controls() {
+        let root = PathBuf::from(format!("target/cgroup-readopt-unsafe-{}", Uuid::new_v4()));
+        let cgroup_parent = root.join("cgroups");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&cgroup_parent).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("cgroup.procs"), "4242").unwrap();
+        let mut config = supervisor_config(&root);
+        config.vm_cgroup_parent = Some(cgroup_parent.display().to_string());
+        let supervisor = VmmSupervisor::new(config);
+        let id = Uuid::new_v4();
+        let child = supervisor.exact_vm_cgroup_path(id).unwrap();
+        std::os::unix::fs::symlink(&outside, &child).unwrap();
+
+        let unsafe_error = validate_owned_vm_cgroup(&cgroup_parent, &child, id, 4242).unwrap_err();
+        assert_eq!(unsafe_error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        std::fs::remove_file(&child).unwrap();
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("cgroup.procs"), "4242").unwrap();
+        let record = restart_record(&supervisor, id, &supervisor.socket_path_for(id));
+        let missing_error = supervisor
+            .reconcile_readopted_cgroup(&record, 4242)
+            .unwrap_err();
+        assert!(missing_error.to_string().contains("cpu.max"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cgroup_recovery_supports_io_weight_io_max_and_cpuset_verification() {
+        let root = PathBuf::from(format!(
+            "target/cgroup-readopt-full-plan-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for (key, value) in [
+            ("cpu.max", "900000 100000"),
+            ("cpu.weight", "999"),
+            ("memory.max", "2147483648"),
+            ("pids.max", "999"),
+            ("io.weight", "999"),
+            ("io.max", "8:0 rbps=9999999"),
+            ("cpuset.cpus", "2-3"),
+            ("cpuset.mems", "1"),
+        ] {
+            std::fs::write(root.join(key), value).unwrap();
+        }
+        let plan = CgroupLimitPlan {
+            cpu_max: Some("200000 100000".into()),
+            cpu_weight: Some(100),
+            memory_max: Some(1_073_741_824),
+            pids_max: Some(128),
+            io_weight: Some(100),
+            io_max: Some("8:0 rbps=1048576".into()),
+            cpuset_cpus: Some("0-1".into()),
+            cpuset_mems: Some("0".into()),
+        };
+
+        apply_and_verify_cgroup_limits(&root, &plan).unwrap();
+
+        for (key, expected) in plan.entries() {
+            let actual = std::fs::read_to_string(root.join(key)).unwrap();
+            assert!(cgroup_value_matches(key, &expected, &actual));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_adoption_recovery_fences_the_identified_vmm() {
+        let root = PathBuf::from(format!(
+            "target/readopt-fence-cgroup-failure-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+        let id = Uuid::new_v4();
+        supervisor.protect_artifact_owner(id).unwrap();
+        let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        let pid = process.pid;
+        let vm = RunningVm::new(pid, PathBuf::new(), process, None);
+
+        let failure = supervisor.fence_readopt_failure(
+            id,
+            &vm,
+            "injected cgroup reapplication failure".into(),
+        );
+
+        assert!(matches!(failure, ReadoptFailure::Unadoptable(_)));
+        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+        assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn exact_cgroup_cleanup_removes_only_the_vm_child() {
         let parent = PathBuf::from(format!("target/cgroup-cleanup-{}", Uuid::new_v4()));
         let mut config = supervisor_config(&parent);
@@ -7812,6 +8443,113 @@ mod tests {
         assert_eq!(summary.running_ids, vec![id]);
         assert!(summary.warm_ids.is_empty());
         assert!(!supervisor.is_running(id));
+    }
+
+    #[test]
+    fn gc_preserves_live_overlay_during_warm_to_running_handoff() {
+        let root = PathBuf::from(format!("target/warm-handoff-overlay-gc-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.disk_pressure.artifact_min_age_secs = 0;
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let id = Uuid::new_v4();
+        let spec = spawn_config(false, Some(root.join("rootfs")));
+        supervisor.seed_warm_for_test(id, spec.clone()).unwrap();
+        let overlay = PathBuf::from(supervisor.overlay_path_for(id));
+        std::fs::write(&overlay, b"live upper").unwrap();
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let pause = supervisor.pause_after_warm_dequeue_for_test();
+        let handoff_supervisor = Arc::clone(&supervisor);
+        let handoff = thread::spawn(move || {
+            test_runtime()
+                .block_on(handoff_supervisor.take_warm_with_publication(
+                    &spec,
+                    &OwnedTaskControl::new(),
+                    |_| async { Ok(()) },
+                    |vm_id, _, _| async move { Ok::<_, PublicationFailure>(vm_id) },
+                ))
+                .unwrap()
+        });
+
+        pause.wait_until_entered();
+        assert_eq!(
+            supervisor.warm_count(&spawn_config(false, Some(root.join("rootfs")))),
+            0
+        );
+        assert!(!supervisor.is_running(id));
+        let report = supervisor
+            .sweep_owned_artifacts(ArtifactReferences::default())
+            .unwrap();
+        assert_eq!(report.removed_files, 0);
+        assert!(
+            overlay.exists(),
+            "live overlay became collectible in handoff"
+        );
+
+        pause.release();
+        assert!(matches!(
+            handoff.join().unwrap(),
+            WarmClaimOutcome::Published(published) if published == id
+        ));
+        supervisor.stop_vm(id).unwrap();
+        assert!(supervisor.scheduler.release(id));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gc_preserves_live_jail_during_warm_to_running_handoff() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/warm-handoff-jail-gc-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.disk_pressure.artifact_min_age_secs = 0;
+        config.vm_jail = Some(crate::config::VmJailConfig {
+            base_dir: root.join("jails"),
+            uid_base: 20_000,
+            gid_base: 30_000,
+            id_count: 4,
+            profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        });
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let id = Uuid::new_v4();
+        let spec = spawn_config(false, Some(root.join("rootfs")));
+        let lease = supervisor.jails.as_ref().unwrap().lease(id).unwrap();
+        std::fs::create_dir_all(lease.root.join("assets")).unwrap();
+        std::fs::write(lease.root.join("assets/rootfs.cow"), b"live upper").unwrap();
+        supervisor.seed_warm_for_test(id, spec.clone()).unwrap();
+        let pause = supervisor.pause_after_warm_dequeue_for_test();
+        let handoff_supervisor = Arc::clone(&supervisor);
+        let handoff = thread::spawn(move || {
+            test_runtime()
+                .block_on(handoff_supervisor.take_warm_with_publication(
+                    &spec,
+                    &OwnedTaskControl::new(),
+                    |_| async { Ok(()) },
+                    |vm_id, _, _| async move { Ok::<_, PublicationFailure>(vm_id) },
+                ))
+                .unwrap()
+        });
+
+        pause.wait_until_entered();
+        assert!(!supervisor.is_running(id));
+        let report = supervisor
+            .sweep_owned_artifacts(ArtifactReferences::default())
+            .unwrap();
+        assert_eq!(report.removed_jails, 0);
+        assert!(
+            lease.root.exists(),
+            "live jail became collectible in handoff"
+        );
+
+        pause.release();
+        assert!(matches!(
+            handoff.join().unwrap(),
+            WarmClaimOutcome::Published(published) if published == id
+        ));
+        supervisor.stop_vm(id).unwrap();
+        assert!(supervisor.scheduler.release(id));
+        assert!(!lease.root.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
