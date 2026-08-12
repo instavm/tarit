@@ -69,6 +69,51 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = false`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
 
+## Per-VM resource limits
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_VM_CGROUP_PARENT` | absolute path | unset | Dedicated cgroup v2 parent for one `tarit-<vm_id>` child per VM. When set, taritd applies CPU, memory, and PID limits to cold boots, restores, and recovered VMs. |
+| `TARIT_VM_CGROUP_PIDS_MAX` | positive u64 | `1024` | Per-VM `pids.max`. Used only with `TARIT_VM_CGROUP_PARENT`. |
+| `TARIT_VM_IO_READ_BPS_MAX` | positive u64 | unset | Per-VM block read bandwidth limit in bytes per second. |
+| `TARIT_VM_IO_WRITE_BPS_MAX` | positive u64 | unset | Per-VM block write bandwidth limit in bytes per second. |
+| `TARIT_VM_IO_READ_IOPS_MAX` | positive u64 | unset | Per-VM block read operations per second limit. |
+| `TARIT_VM_IO_WRITE_IOPS_MAX` | positive u64 | unset | Per-VM block write operations per second limit. |
+| `TARIT_VM_NET_INGRESS_BPS_MAX` | positive u64 | unset | Guest ingress bandwidth limit on the TAP root qdisc. Requires `TARIT_ENABLE_NET=1`. |
+| `TARIT_VM_NET_EGRESS_BPS_MAX` | positive u64 | unset | Guest egress policer on the TAP ingress hook. Requires `TARIT_ENABLE_NET=1`. |
+
+The cgroup parent must be below `/sys/fs/cgroup`, have the `cpu`, `memory`,
+`pids`, and `io` controllers delegated, and be writable by taritd. I/O limits
+apply to every distinct block device backing the rootfs and its overlay.
+Partition-backed filesystems are resolved to their parent block device before
+writing `io.max`. Any configured I/O limit requires
+`TARIT_VM_CGROUP_PARENT`.
+
+The CPU limit is derived from the reserved vCPU count. The memory limit is the
+guest memory plus 50 percent and 256 MiB for VMM overhead. Reconciliation
+rewrites and verifies the expected cgroup and traffic-control state after a
+taritd restart, including reset of obsolete `io.max` entries and removal of
+obsolete network limits.
+
+## Disk pressure and artifact GC
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_DISK_BYTES_HIGH_WATERMARK` | positive u64 | unset | Used-byte threshold that enters disk pressure. Must be paired with the byte low watermark. |
+| `TARIT_DISK_BYTES_LOW_WATERMARK` | positive u64 | unset | Used-byte threshold below which byte pressure clears. Must be lower than the byte high watermark. |
+| `TARIT_DISK_INODES_HIGH_WATERMARK` | positive u64 | unset | Used-inode threshold that enters disk pressure. Must be paired with the inode low watermark. |
+| `TARIT_DISK_INODES_LOW_WATERMARK` | positive u64 | unset | Used-inode threshold below which inode pressure clears. Must be lower than the inode high watermark. |
+| `TARIT_ARTIFACT_GC_INTERVAL_SECS` | positive u64 | `30` | Pressure refresh and owned-artifact sweep interval. |
+| `TARIT_ARTIFACT_GC_MIN_AGE_SECS` | positive u64 | `300` | Minimum age before an unreferenced Tarit-owned artifact can be collected. |
+
+Watermarks are absolute filesystem usage values, not percentages. Configure
+them from the usable capacity and operating reserve of each host image.
+Pressure is latched at the high watermark and clears only below the matching low
+watermark. While active, VM create, restore, snapshot reservation, and warm-pool
+refill return or apply backpressure. GC only removes recognized Tarit-owned
+artifacts that are old enough and absent from the active runtime and snapshot
+reference sets.
+
 ## Autoscaling
 
 | Variable | Type | Default | Description |

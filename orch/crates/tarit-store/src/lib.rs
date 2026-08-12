@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 use tarit_types::{
     AuditEvent, ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, SshKeyRecord,
-    UsageEvent, UsageKind, VmRecord, VmStartupPath, VmStatus,
+    UsageEvent, UsageKind, VmRecord, VmRuntimeLayout, VmStartupPath, VmStatus,
 };
 use uuid::Uuid;
 
@@ -54,6 +54,7 @@ pub struct SnapshotRecord {
     pub vcpus: Option<u8>,
     pub kernel_path: Option<String>,
     pub rootfs_path: Option<String>,
+    pub rootfs_read_only: Option<bool>,
     pub cmdline: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -109,7 +110,11 @@ impl Store {
                vcpus INTEGER NOT NULL,
                kernel_path TEXT NOT NULL,
                rootfs_path TEXT,
+               rootfs_read_only INTEGER NOT NULL DEFAULT 0,
                cmdline TEXT NOT NULL,
+               runtime_overlay_path TEXT,
+               runtime_jail_path TEXT,
+               runtime_artifact_paths TEXT,
                socket_path TEXT,
                pid INTEGER,
                created_at TEXT NOT NULL,
@@ -198,6 +203,7 @@ impl Store {
                vcpus INTEGER,
                kernel_path TEXT,
                rootfs_path TEXT,
+               rootfs_read_only INTEGER,
                cmdline TEXT,
                created_at TEXT NOT NULL
              );
@@ -229,12 +235,26 @@ impl Store {
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "vms", "startup_path", "TEXT")?;
+        ensure_column(
+            &conn,
+            "vms",
+            "rootfs_read_only",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(&conn, "vms", "runtime_overlay_path", "TEXT")?;
+        ensure_column(&conn, "vms", "runtime_jail_path", "TEXT")?;
+        ensure_column(&conn, "vms", "runtime_artifact_paths", "TEXT")?;
         ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
         ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
         ensure_column(&conn, "snapshots", "kernel_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "rootfs_path", "TEXT")?;
+        ensure_column(&conn, "snapshots", "rootfs_read_only", "INTEGER")?;
         ensure_column(&conn, "snapshots", "cmdline", "TEXT")?;
+        conn.execute(
+            "UPDATE snapshots SET rootfs_read_only = 1 WHERE rootfs_read_only IS NULL",
+            [],
+        )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint_active ON ssh_keys (fingerprint, is_active)",
             [],
@@ -246,8 +266,9 @@ impl Store {
         let changed = self.conn.execute(
             "INSERT INTO vms (
               id, host_id, owner_key, api_key_id, status, revision, startup_path, memory_mib,
-              vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+              vcpus, kernel_path, rootfs_path, rootfs_read_only, cmdline, runtime_overlay_path,
+              runtime_jail_path, runtime_artifact_paths, socket_path, pid, created_at, updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
              ON CONFLICT(id) DO UPDATE SET
                owner_key = excluded.owner_key,
                api_key_id = excluded.api_key_id,
@@ -258,7 +279,11 @@ impl Store {
                vcpus = excluded.vcpus,
                kernel_path = excluded.kernel_path,
                rootfs_path = excluded.rootfs_path,
+               rootfs_read_only = excluded.rootfs_read_only,
                cmdline = excluded.cmdline,
+               runtime_overlay_path = excluded.runtime_overlay_path,
+               runtime_jail_path = excluded.runtime_jail_path,
+               runtime_artifact_paths = excluded.runtime_artifact_paths,
                socket_path = excluded.socket_path,
                pid = excluded.pid,
                updated_at = excluded.updated_at
@@ -277,7 +302,21 @@ impl Store {
                 vm.vcpus,
                 vm.kernel_path,
                 vm.rootfs_path,
+                vm.rootfs_read_only,
                 vm.cmdline,
+                vm.runtime_layout
+                    .as_ref()
+                    .and_then(|layout| layout.overlay_path.as_deref()),
+                vm.runtime_layout
+                    .as_ref()
+                    .and_then(|layout| layout.jail_path.as_deref()),
+                vm.runtime_layout
+                    .as_ref()
+                    .map(|layout| serde_json::to_string(&layout.artifact_paths))
+                    .transpose()
+                    .map_err(|error| StoreError::Conflict(format!(
+                        "encode VM runtime artifact paths: {error}"
+                    )))?,
                 vm.socket_path,
                 vm.pid,
                 vm.created_at.to_rfc3339(),
@@ -308,8 +347,9 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                        memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
-                        created_at, updated_at
+                        memory_mib, vcpus, kernel_path, rootfs_path, rootfs_read_only, cmdline,
+                        runtime_overlay_path, runtime_jail_path, runtime_artifact_paths,
+                        socket_path, pid, created_at, updated_at
                  FROM vms WHERE id = ?1",
                 params![id.to_string()],
                 row_to_vm,
@@ -324,8 +364,8 @@ impl Store {
         self.conn.execute(
             "INSERT OR REPLACE INTO snapshots (
                path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
-               kernel_path, rootfs_path, cmdline, created_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+               kernel_path, rootfs_path, rootfs_read_only, cmdline, created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 snap.path,
                 snap.overlay_path,
@@ -337,6 +377,7 @@ impl Store {
                 snap.vcpus,
                 snap.kernel_path,
                 snap.rootfs_path,
+                snap.rootfs_read_only,
                 snap.cmdline,
                 snap.created_at.to_rfc3339(),
             ],
@@ -349,13 +390,26 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
-                        kernel_path, rootfs_path, cmdline, created_at
+                        kernel_path, rootfs_path, rootfs_read_only, cmdline, created_at
                  FROM snapshots WHERE path = ?1",
                 params![path],
                 row_to_snapshot,
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+                    kernel_path, rootfs_path, rootfs_read_only, cmdline, created_at
+             FROM snapshots",
+        )?;
+        let snapshots = statement
+            .query_map([], row_to_snapshot)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(snapshots)
     }
 
     pub fn insert_share(&self, share: &ShareRecord) -> Result<(), StoreError> {
@@ -484,8 +538,9 @@ impl Store {
     pub fn list_vms(&self) -> Result<Vec<VmRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                    memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
-                    created_at, updated_at
+                    memory_mib, vcpus, kernel_path, rootfs_path, rootfs_read_only, cmdline,
+                    runtime_overlay_path, runtime_jail_path, runtime_artifact_paths,
+                    socket_path, pid, created_at, updated_at
              FROM vms ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
@@ -1008,8 +1063,37 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
     let revision = u64::try_from(revision_i64)
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, revision_i64))?;
     let startup_path: Option<String> = row.get(6)?;
-    let created_at: String = row.get(14)?;
-    let updated_at: String = row.get(15)?;
+    let runtime_overlay_path: Option<String> = row.get(13)?;
+    let runtime_jail_path: Option<String> = row.get(14)?;
+    let runtime_artifact_paths: Option<String> = row.get(15)?;
+    let runtime_layout = match (
+        runtime_overlay_path,
+        runtime_jail_path,
+        runtime_artifact_paths,
+    ) {
+        (None, None, None) => None,
+        (overlay_path, jail_path, artifact_paths) => {
+            let artifact_paths = artifact_paths
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        15,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?
+                .unwrap_or_default();
+            Some(VmRuntimeLayout {
+                overlay_path,
+                jail_path,
+                artifact_paths,
+            })
+        }
+    };
+    let created_at: String = row.get(18)?;
+    let updated_at: String = row.get(19)?;
     Ok(VmRecord {
         id: parse_uuid_col(&id, 0)?,
         host_id: row.get(1)?,
@@ -1022,9 +1106,11 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
         vcpus: row.get(8)?,
         kernel_path: row.get(9)?,
         rootfs_path: row.get(10)?,
-        cmdline: row.get(11)?,
-        socket_path: row.get(12)?,
-        pid: row.get(13)?,
+        rootfs_read_only: row.get(11)?,
+        cmdline: row.get(12)?,
+        runtime_layout,
+        socket_path: row.get(16)?,
+        pid: row.get(17)?,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
     })
@@ -1120,7 +1206,7 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> Result<ImageRecord, rusqlite::Error>
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<SnapshotRecord, rusqlite::Error> {
     let vm_id: String = row.get(5)?;
-    let created_at: String = row.get(11)?;
+    let created_at: String = row.get(12)?;
     Ok(SnapshotRecord {
         path: row.get(0)?,
         overlay_path: row.get(1)?,
@@ -1132,7 +1218,8 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<SnapshotRecord, rusqlite::
         vcpus: row.get(7)?,
         kernel_path: row.get(8)?,
         rootfs_path: row.get(9)?,
-        cmdline: row.get(10)?,
+        rootfs_read_only: row.get(10)?,
+        cmdline: row.get(11)?,
         created_at: parse_ts(&created_at)?,
     })
 }
@@ -1290,7 +1377,7 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tarit_types::{ShareRecord, ShareVisibility};
+    use tarit_types::{ShareRecord, ShareVisibility, VmRuntimeLayout};
 
     fn test_share(slug: &str, owner_key: &str) -> ShareRecord {
         let now = Utc::now();
@@ -1454,6 +1541,7 @@ mod tests {
             vcpus: Some(2),
             kernel_path: Some("/opt/tarit/vmlinux".into()),
             rootfs_path: Some("/opt/tarit/rootfs.ext4".into()),
+            rootfs_read_only: Some(false),
             cmdline: Some("console=ttyS0".into()),
             created_at: Utc::now(),
         };
@@ -1689,7 +1777,16 @@ mod tests {
             vcpus: 1,
             kernel_path: "vmlinux".into(),
             rootfs_path: Some("rootfs.ext4".into()),
+            rootfs_read_only: true,
             cmdline: "console=ttyS0".into(),
+            runtime_layout: Some(VmRuntimeLayout {
+                overlay_path: Some("/run/tarit/overlays/vm.cow".into()),
+                jail_path: Some("/srv/tarit/jails/tarit-vm".into()),
+                artifact_paths: vec![
+                    "/run/tarit/overlays/vm.cow".into(),
+                    "/srv/tarit/jails/tarit-vm".into(),
+                ],
+            }),
             socket_path: Some("vm.sock".into()),
             pid: Some(42),
             created_at: now,
@@ -1700,6 +1797,11 @@ mod tests {
         assert_eq!(
             store.get_vm(vm.id).unwrap().api_key_id,
             Some("api-key-a".into())
+        );
+        assert!(store.get_vm(vm.id).unwrap().rootfs_read_only);
+        assert_eq!(
+            store.get_vm(vm.id).unwrap().runtime_layout,
+            vm.runtime_layout
         );
 
         let mut updated = vm.clone();
@@ -1723,5 +1825,67 @@ mod tests {
         stale.status = VmStatus::Paused;
         store.update_vm(&stale).unwrap();
         assert_eq!(store.get_vm(vm.id).unwrap(), updated);
+    }
+
+    #[test]
+    fn legacy_snapshot_null_rootfs_mode_is_backfilled_read_only() {
+        let path = std::env::current_dir().unwrap().join(format!(
+            "target/store-legacy-snapshot-{}.db",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let created_at = Utc::now();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE snapshots (
+                   path TEXT PRIMARY KEY NOT NULL,
+                   overlay_path TEXT,
+                   host_id TEXT NOT NULL,
+                   owner_key TEXT,
+                   api_key_id TEXT,
+                   vm_id TEXT NOT NULL,
+                   memory_mib INTEGER,
+                   vcpus INTEGER,
+                   kernel_path TEXT,
+                   rootfs_path TEXT,
+                   rootfs_read_only INTEGER,
+                   cmdline TEXT,
+                   created_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots (
+                   path, host_id, vm_id, memory_mib, vcpus, kernel_path, rootfs_path,
+                   rootfs_read_only, cmdline, created_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9)",
+                params![
+                    "legacy.ram",
+                    "host-a",
+                    Uuid::new_v4().to_string(),
+                    256u64,
+                    1u8,
+                    "kernel",
+                    "rootfs",
+                    "console=ttyS0",
+                    created_at.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .get_snapshot("legacy.ram")
+                .unwrap()
+                .unwrap()
+                .rootfs_read_only,
+            Some(true)
+        );
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
     }
 }

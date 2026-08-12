@@ -214,6 +214,7 @@ sudo target/release/vmm restore --snapshot /path/to/snapshot.snap
 | `--uid <UID>` | `1000` | UID to drop to when jailed. |
 | `--gid <GID>` | `1000` | GID to drop to when jailed. |
 | `--netns <PATH>` | none | Network namespace path to enter when jailed. |
+| `--seccomp` | automatic with `--jail` | Compatibility flag for the mandatory built-in profile; jail mode cannot disable seccomp. |
 | `--cgroup <PATH>` | none | cgroup v2 path for the served VMM process. |
 | `--cgroup-memory-max <BYTES>` | none | Set `memory.max`. Accepts bytes or K/M/G/T suffixes. Requires `--cgroup`. |
 | `--cgroup-cpu-max <QUOTA/PERIOD|MILLICPU>` | none | Set `cpu.max`. Accepts `1000m`, `max`, `QUOTA/PERIOD`, or `QUOTA PERIOD`. Requires `--cgroup`. |

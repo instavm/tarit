@@ -8,6 +8,12 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::any::type_name;
 
+#[derive(Debug, thiserror::Error)]
+pub enum PersistError {
+    #[error("device state is unavailable: {0}")]
+    Unavailable(String),
+}
+
 /// A device whose internal state can be serialized to / restored from a
 /// snapshot.
 ///
@@ -25,6 +31,12 @@ pub trait Persist {
 
     /// Serialize device state.
     fn save(&self) -> Self::State;
+
+    /// Serialize device state, failing closed when the device cannot provide a
+    /// coherent snapshot (for example after internal lock poisoning).
+    fn try_save(&self) -> Result<Self::State, PersistError> {
+        Ok(self.save())
+    }
 
     /// Restore device state. Called on a freshly-constructed device.
     fn restore(&mut self, state: Self::State);

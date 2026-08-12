@@ -170,6 +170,34 @@ The current binary mounts public and internal routes on the same listener. In pr
 In fleet mode, asynchronous execution records are stored in PostgreSQL, so
 `GET /v1/executions/{id}` can be polled through any healthy API node.
 
+## Resource isolation and disk pressure
+
+Set `TARIT_VM_CGROUP_PARENT` to a delegated cgroup v2 subtree to enforce
+per-VM CPU, memory, and PID limits. Optional `TARIT_VM_IO_*` limits add
+`io.max` entries for each block device backing the rootfs and overlay.
+Optional `TARIT_VM_NET_*` limits shape guest ingress and police guest egress on
+the VM TAP. taritd reapplies these limits when it adopts a live VMM after
+restart.
+
+Configure byte and/or inode high and low watermarks with
+`TARIT_DISK_*_WATERMARK`. Above a high watermark, create, restore, snapshot,
+and warm refill are blocked. Admission resumes only after usage falls below the
+corresponding low watermark. `/v1/warm-pool`, `/v1/cluster`, and `/metrics`
+expose the current pressure state and reservations.
+
+Use a dedicated cgroup parent and enable its controllers before starting
+taritd:
+
+```sh
+mkdir -p /sys/fs/cgroup/tarit
+echo '+cpu +memory +pids +io' > /sys/fs/cgroup/cgroup.subtree_control
+export TARIT_VM_CGROUP_PARENT=/sys/fs/cgroup/tarit
+export TARIT_VM_CGROUP_PIDS_MAX=256
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md) for the full limit and watermark
+reference.
+
 ## Warm pool operations
 
 Enable the warm pool with environment overrides:
@@ -249,9 +277,9 @@ Before loading configuration, opening a database, resolving images, or looking
 up VMs, `taritd` enumerates strict `insta<N>` names with structured `ip -j
 link` output and lowers them. A containment, VM-list, or recovery error is
 fatal: no supervisor or HTTP listener is published. Network-disabled startup
-is allowed only when that preflight found no Tarit TAP and there are no local
-live VM records requiring recovery. It then reconciles the persisted map with
-live local VM records, validates the
+is allowed only when that preflight found no Tarit TAP. Networkless live VMs
+can still be adopted from local durable state. It then reconciles the persisted
+map with live local VM records, validates the
 required nft base-chain hooks, and atomically inserts top-of-chain forward and
 input drop quarantines for every recovered TAP. It removes Tarit-owned stale
 policy for all their slots and programs and verifies every netdev IPv4/ARP,

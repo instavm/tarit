@@ -38,7 +38,7 @@ forwards operations for VMs owned by peers. Node liveness is a heartbeat row in
 | Node rejoins | Restarted node re-registers; `healthy_nodes` returns to N | e2e: `e2e_ha_failover.sh` |
 | Request lands on a non-owner node | The receiving node looks up the owner in `fleet_vms` and forwards the lifecycle/exec call over the internal peer API | e2e: `e2e_cluster.sh` (`cross-node routing`) |
 | Cross-node snapshot then restore | Snapshot is node-local; restore on another node is routed to the owner (or takes an explicit `host_id`) | e2e: `e2e_cluster.sh` (`restore from full snapshot`, `cross-node routing`) |
-| Startup reconciliation | On boot a node loads persisted VM records, keeps only its own live children, and frees orphaned per-VM resources | unit + design (`main.rs` live-VM reconcile, `net.rs allocator_recovers_only_live_valid_entries`) |
+| Startup reconciliation | On boot a node adopts verified live VMM children, reapplies local limits, and frees orphaned per-VM resources. Networkless VMs do not require TAP recovery. | c8i KVM e2e: taritd SIGKILL, restart, VM adoption, successful exec, graceful cleanup; unit recovery coverage |
 
 Result: `HA_FAILOVER_PASS` (5/5) and `e2e_cluster.sh` 7/7.
 
@@ -128,7 +128,10 @@ Result: `NET_SCALE_PASS`.
 
 | Scenario | Expected behavior | Validation |
 | --- | --- | --- |
-| Per-VM cgroup limits | `vmm serve` applies memory/cpu/pids/cpuset caps when configured | e2e: VMM `cgroup-validate.sh` |
+| Per-VM cgroup limits | taritd derives and applies CPU, memory, and PID limits to cold, restored, and recovered VMs | c8i KVM e2e + VMM `cgroup-validate.sh` |
+| Multi-device I/O limits | `io.max` covers each distinct rootfs/overlay backing device, resolves partitions to parent block devices, and resets obsolete limits after restart | c8i KVM e2e with loop-backed rootfs and NVMe-backed overlay; crash/restart limit-removal gate |
+| Network quota recovery | TAP shaping is reapplied after restart and obsolete qdiscs and policers are removed when configuration changes | c8i KVM crash/restart e2e |
+| Disk pressure | Create, snapshot, and warm refill stop above the high watermark and recover only below the low watermark | c8i KVM e2e |
 | CPU/memory overcommit | Guest RAM is demand-paged (`MAP_NORESERVE`); idle vCPUs block near 0% CPU, so IO/network-bound VMs pack densely | design (memory backend + vcpu thread) |
 | Graceful drain and reaper | Shutdown drains HTTP, reaps local VMs (no orphaned `vmm` processes), and honors `TARIT_REAP_ON_SHUTDOWN` | e2e: `e2e_lifecycle.sh` |
 | Overload backpressure | At capacity the API returns 429 + `Retry-After` instead of failing hard | e2e: `e2e_cluster.sh` (`capacity/backpressure`) |

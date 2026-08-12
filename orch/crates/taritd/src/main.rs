@@ -4,6 +4,7 @@ mod autoscale;
 mod cli;
 mod cluster;
 mod config;
+mod disk;
 mod gateway;
 mod image;
 mod internal;
@@ -27,7 +28,7 @@ use clap::Parser;
 use config::{Config, PtyConnectionLimits};
 use peer::PeerClient;
 use scheduler::Scheduler;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -105,6 +106,99 @@ fn init_tracing() {
         .init();
 }
 
+fn persist_startup_vm_observation(
+    store: &Store,
+    vm: &tarit_types::VmRecord,
+    context: &str,
+) -> anyhow::Result<()> {
+    store
+        .insert_vm(vm)
+        .with_context(|| format!("{context}: {}", vm.id))
+}
+
+fn is_identityless_legacy_creating(config: &Config, record: &tarit_types::VmRecord) -> bool {
+    record.host_id == config.host_id
+        && record.status == VmStatus::Creating
+        && record.runtime_layout.is_none()
+        && record.socket_path.as_deref().is_none_or(str::is_empty)
+        && record.pid.is_none_or(|pid| pid == 0)
+}
+
+fn reconcile_legacy_creating_records(
+    config: &Config,
+    store: &Store,
+    supervisor: &VmmSupervisor,
+    records: &mut [tarit_types::VmRecord],
+) -> anyhow::Result<()> {
+    for record in records
+        .iter_mut()
+        .filter(|record| is_identityless_legacy_creating(config, record))
+    {
+        let fenced_revision = record.revision.checked_add(2).ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy Creating VM {} revision is exhausted; cleanup cannot be fenced",
+                record.id
+            )
+        })?;
+        let terminated = supervisor
+            .reconcile_legacy_creating_runtime(record.id)
+            .with_context(|| {
+                format!(
+                    "contain legacy Creating runtime and clean owned artifacts for VM {}",
+                    record.id
+                )
+            })?;
+        record.status = VmStatus::Error;
+        record.revision = fenced_revision;
+        record.updated_at = chrono::Utc::now();
+        persist_startup_vm_observation(
+            store,
+            record,
+            "persist terminal legacy Creating VM before runtime-layout backfill",
+        )?;
+        tracing::warn!(
+            vm = %record.id,
+            revision = record.revision,
+            terminated,
+            "reconciled identity-less legacy Creating VM before runtime-layout backfill"
+        );
+    }
+    Ok(())
+}
+
+fn backfill_legacy_runtime_layouts(
+    config: &Config,
+    store: &Store,
+    records: &mut [tarit_types::VmRecord],
+) -> anyhow::Result<()> {
+    for record in records {
+        let Some(layout) = supervisor::infer_legacy_nonjailed_runtime_layout(config, record)
+            .with_context(|| format!("infer legacy runtime layout for VM {}", record.id))?
+        else {
+            continue;
+        };
+        record.runtime_layout = Some(layout);
+        record.revision = record.revision.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy active VM {} revision is exhausted; drain required before upgrade",
+                record.id
+            )
+        })?;
+        record.updated_at = chrono::Utc::now();
+        persist_startup_vm_observation(
+            store,
+            record,
+            "persist inferred legacy runtime layout before adoption",
+        )?;
+        tracing::warn!(
+            vm = %record.id,
+            revision = record.revision,
+            "persisted inferred legacy non-jailed runtime layout before adoption"
+        );
+    }
+    Ok(())
+}
+
 async fn run_server(
     mut config: Config,
     preflight_taps: Vec<String>,
@@ -133,6 +227,7 @@ async fn run_server(
 
     let store = Store::open(&config.db_path).context("open store")?;
     image::resolve_warm_pool_images(&mut config, &store).context("resolve warm-pool images")?;
+    warmpool::validate_exact_classes(&config).context("validate warm-pool classes")?;
     let mut persisted_vms = store
         .list_vms()
         .context("load persisted VMs during startup")?;
@@ -140,9 +235,10 @@ async fn run_server(
         .iter()
         .filter(|vm| {
             vm.host_id == config.host_id
+                && !is_identityless_legacy_creating(&config, vm)
                 && matches!(
                     vm.status,
-                    VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                    VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
                 )
         })
         .map(|vm| vm.id)
@@ -157,7 +253,10 @@ async fn run_server(
         )
         .context("initialize fail-closed network recovery")?,
     );
-
+    reconcile_legacy_creating_records(&config, &store, &supervisor, &mut persisted_vms)
+        .context("reconcile legacy Creating VMs before runtime-layout backfill")?;
+    backfill_legacy_runtime_layouts(&config, &store, &mut persisted_vms)
+        .context("backfill legacy active VM runtime layouts")?;
     // Re-adopt VMs that survived this restart so the control plane can manage
     // them again. Their network policy was reconciled during supervisor
     // construction; this restores the exec/pause/snapshot/delete path. VMs that
@@ -167,26 +266,47 @@ async fn run_server(
     // mandatory: if it fails, startup aborts rather than serve stale durable
     // Running/Paused/Suspended records for VMs that no longer exist.
     {
-        let ids = supervisor
+        let failures = supervisor
             .readopt_running_vms(&mut persisted_vms)
             .await
-            .map_err(|error| anyhow::anyhow!("fail-closed VM re-adoption: {error}"))?;
-        for id in &ids {
-            let vm = persisted_vms
-                .iter_mut()
-                .find(|vm| vm.id == *id)
-                .ok_or_else(|| anyhow::anyhow!("unadoptable VM {id} disappeared at startup"))?;
+            .context("re-adopt locally owned VMMs")?;
+        let failed_ids = failures
+            .iter()
+            .map(|failure| failure.id)
+            .collect::<Vec<_>>();
+        for failure in &failures {
+            let vm = match persisted_vms.iter_mut().find(|vm| vm.id == failure.id) {
+                Some(vm) => vm,
+                None => {
+                    anyhow::bail!(
+                        "startup reconciliation lost persisted VM {} while fencing: {}",
+                        failure.id,
+                        failure.reason
+                    );
+                }
+            };
             vm.status = VmStatus::Error;
             // N+1 may have reached the fleet before the previous process
             // crashed with SQLite still at N. Fence the terminal observation
             // at N+2 and publish this exact record to every store.
-            vm.revision = vm.revision.checked_add(2).ok_or_else(|| {
-                anyhow::anyhow!("unadoptable VM {id} revision exhausted at startup")
-            })?;
+            vm.revision = match vm.revision.checked_add(2) {
+                Some(revision) => revision,
+                None => {
+                    anyhow::bail!(
+                        "startup reconciliation exhausted VM {} revision while fencing: {}",
+                        failure.id,
+                        failure.reason
+                    );
+                }
+            };
             vm.updated_at = chrono::Utc::now();
-            store.insert_vm(vm).map_err(|error| {
-                anyhow::anyhow!("persist terminal status for unadoptable VM {id}: {error}")
-            })?;
+            tracing::warn!(vm = %failure.id, reason = %failure.reason,
+                "startup reconciliation fenced an unrecoverable VM record");
+            persist_startup_vm_observation(
+                &store,
+                vm,
+                "persist terminal status for startup-reconciled VM",
+            )?;
         }
         for vm in &persisted_vms {
             if vm.host_id == config.host_id
@@ -194,17 +314,33 @@ async fn run_server(
                     vm.status,
                     VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
                 )
-                && !ids.contains(&vm.id)
+                && !failed_ids.contains(&vm.id)
             {
-                store.insert_vm(vm).map_err(|error| {
-                    anyhow::anyhow!(
-                        "persist observed status for re-adopted VM {}: {error}",
-                        vm.id
-                    )
-                })?;
+                persist_startup_vm_observation(
+                    &store,
+                    vm,
+                    "persist observed status for re-adopted VM",
+                )?;
             }
         }
     }
+    // Only sweep after every durable Creating/live record and every owned
+    // unpersisted jail/cgroup runtime has been adopted or confirmed dead.
+    // Otherwise GC could remove a live jail or free its UID/GID lease.
+    let startup_references = artifact_references(
+        &persisted_vms,
+        &store
+            .list_snapshots()
+            .context("load durable snapshot references for startup GC")?,
+    );
+    let startup_gc = supervisor
+        .sweep_owned_artifacts(startup_references)
+        .context("sweep owned artifacts during startup")?;
+    tracing::info!(
+        removed_files = startup_gc.removed_files,
+        removed_jails = startup_gc.removed_jails,
+        "startup owned-artifact sweep completed"
+    );
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio
     // context panics on current tokio ("Cannot drop a runtime ... from within
@@ -410,6 +546,7 @@ async fn run_server(
     let outbox_flusher =
         usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
     let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());
+    let artifact_gc = spawn_artifact_gc(state.clone(), shutdown_rx.clone());
 
     let shutdown_signal_task = spawn_shutdown_signal(shutdown.clone(), shutdown_rx.clone());
     let worker_tasks = BackgroundTasks::new(
@@ -420,6 +557,7 @@ async fn run_server(
             Some(usage_meter),
             outbox_flusher,
             Some(vm_exit_reconciler),
+            Some(artifact_gc),
             Some(shutdown_signal_task),
         ],
         warm_pool,
@@ -458,6 +596,92 @@ async fn run_server(
         move |reason| async move { shutdown_sweep(&shutdown_state, reason).await },
     )
     .await
+}
+
+fn artifact_references(
+    vms: &[tarit_types::VmRecord],
+    snapshots: &[tarit_store::SnapshotRecord],
+) -> disk::ArtifactReferences {
+    let active_vms = vms.iter().filter(|vm| {
+        matches!(
+            vm.status,
+            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        )
+    });
+    let active_vm_ids = active_vms.clone().map(|vm| vm.id).collect::<HashSet<_>>();
+    let mut runtime_paths = HashSet::new();
+    for vm in active_vms {
+        if let Some(layout) = &vm.runtime_layout {
+            runtime_paths.extend(layout.artifact_paths.iter().map(std::path::PathBuf::from));
+            if let Some(path) = &layout.overlay_path {
+                runtime_paths.insert(std::path::PathBuf::from(path));
+            }
+            if let Some(path) = &layout.jail_path {
+                runtime_paths.insert(std::path::PathBuf::from(path));
+            }
+        }
+    }
+    let mut snapshot_paths = HashSet::new();
+    for snapshot in snapshots {
+        snapshot_paths.insert(std::path::PathBuf::from(&snapshot.path));
+        if let Some(path) = &snapshot.overlay_path {
+            snapshot_paths.insert(std::path::PathBuf::from(path));
+        }
+    }
+    disk::ArtifactReferences {
+        active_vm_ids,
+        snapshot_paths,
+        runtime_paths,
+    }
+}
+
+fn spawn_artifact_gc(
+    state: AppState,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(state.supervisor.disk_sweep_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
+            let vms = state
+                .vm_cache
+                .read()
+                .map(|cache| cache.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let snapshots = match state.store.lock() {
+                Ok(store) => match store.list_snapshots() {
+                    Ok(snapshots) => snapshots,
+                    Err(error) => {
+                        tracing::error!(%error, "load snapshot references for artifact GC failed");
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    tracing::error!("store lock poisoned during artifact GC");
+                    continue;
+                }
+            };
+            match state
+                .supervisor
+                .sweep_owned_artifacts(artifact_references(&vms, &snapshots))
+            {
+                Ok(report) if report.removed_files > 0 || report.removed_jails > 0 => {
+                    tracing::info!(
+                        removed_files = report.removed_files,
+                        removed_jails = report.removed_jails,
+                        "periodic owned-artifact sweep completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "periodic owned-artifact sweep failed"),
+            }
+        }
+    })
 }
 
 fn spawn_vm_exit_reconciler(
@@ -989,12 +1213,336 @@ mod tests {
         body::Body,
         http::{header::HOST, Request, StatusCode},
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "linux")]
+    use std::{
+        io::{Read, Write},
+        os::unix::ffi::OsStrExt,
+        process::{Command, Stdio},
+        thread,
+    };
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
+    #[cfg(target_os = "linux")]
+    fn short_test_root(prefix: &str) -> PathBuf {
+        let suffix = Uuid::new_v4().simple().to_string();
+        PathBuf::from("target/t").join(format!("{prefix}-{suffix}"))
+    }
+
     fn test_shutdown(tx: watch::Sender<Option<&'static str>>) -> ShutdownCoordinator {
         ShutdownCoordinator::new(tx, Arc::new(VmmSupervisor::new(test_config())))
+    }
+
+    #[test]
+    fn artifact_gc_uses_persisted_runtime_layout_paths() {
+        let now = chrono::Utc::now();
+        let persisted_overlay = PathBuf::from("/old-layout/overlays/vm.cow");
+        let persisted_jail = PathBuf::from("/old-layout/jails/vm");
+        let vm = tarit_types::VmRecord {
+            id: Uuid::new_v4(),
+            host_id: "host-a".into(),
+            owner_key: None,
+            api_key_id: None,
+            status: VmStatus::Running,
+            revision: 1,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: Some("rootfs".into()),
+            rootfs_read_only: true,
+            cmdline: "console=ttyS0".into(),
+            runtime_layout: Some(tarit_types::VmRuntimeLayout {
+                overlay_path: Some(persisted_overlay.display().to_string()),
+                jail_path: Some(persisted_jail.display().to_string()),
+                artifact_paths: vec!["/old-layout/control.sock".into()],
+            }),
+            socket_path: Some("/old-layout/control.sock".into()),
+            pid: Some(42),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let references = artifact_references(&[vm], &[]);
+        assert!(references.runtime_paths.contains(&persisted_overlay));
+        assert!(references.runtime_paths.contains(&persisted_jail));
+        assert!(references
+            .runtime_paths
+            .contains(Path::new("/old-layout/control.sock")));
+    }
+
+    fn legacy_active_record(
+        config: &Config,
+        id: Uuid,
+        socket_path: PathBuf,
+        pid: Option<u32>,
+    ) -> tarit_types::VmRecord {
+        let now = chrono::Utc::now();
+        tarit_types::VmRecord {
+            id,
+            host_id: config.host_id.clone(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: Some("test-key".into()),
+            status: VmStatus::Running,
+            revision: 7,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: config.kernel.display().to_string(),
+            rootfs_path: Some(config.rootfs.display().to_string()),
+            rootfs_read_only: true,
+            cmdline: supervisor::DEFAULT_CMDLINE.into(),
+            runtime_layout: None,
+            socket_path: Some(socket_path.display().to_string()),
+            pid,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn ambiguous_legacy_runtime_layout_requires_drain() {
+        let config = test_config();
+        let id = Uuid::new_v4();
+        let mut records = vec![legacy_active_record(
+            &config,
+            id,
+            config.socket_dir.join("not-the-vm-id.sock"),
+            None,
+        )];
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&records[0]).unwrap();
+
+        let error = backfill_legacy_runtime_layouts(&config, &store, &mut records)
+            .expect_err("ambiguous legacy layout must block startup");
+        let error = format!("{error:#}");
+        assert!(error.contains("drain required before upgrade"));
+        assert!(error.contains("legacy UUID-scoped socket"));
+        assert_eq!(store.get_vm(id).unwrap().runtime_layout, None);
+    }
+
+    #[test]
+    fn identity_less_legacy_creating_is_fenced_before_layout_backfill() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/legacy-creating-upgrade-{}", Uuid::new_v4()));
+        let mut config = test_config();
+        config.vmm_bin = std::env::current_exe().unwrap();
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        let supervisor = VmmSupervisor::new(config.clone());
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let overlay_path = config.socket_dir.join("overlays").join(format!("{id}.cow"));
+        std::fs::write(&socket_path, b"stale socket artifact").unwrap();
+        std::fs::write(&overlay_path, b"stale overlay artifact").unwrap();
+        let mut record = legacy_active_record(&config, id, socket_path.clone(), None);
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&record).unwrap();
+        let mut records = vec![record];
+
+        reconcile_legacy_creating_records(&config, &store, &supervisor, &mut records).unwrap();
+        backfill_legacy_runtime_layouts(&config, &store, &mut records).unwrap();
+
+        let durable = store.get_vm(id).unwrap();
+        assert_eq!(durable.status, VmStatus::Error);
+        assert_eq!(durable.revision, 9);
+        assert_eq!(durable.runtime_layout, None);
+        assert!(!socket_path.exists());
+        assert!(!overlay_path.exists());
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_less_legacy_creating_is_excluded_from_live_recovery() {
+        let config = test_config();
+        let id = Uuid::new_v4();
+        let mut record = legacy_active_record(
+            &config,
+            id,
+            config.socket_dir.join(format!("{id}.sock")),
+            None,
+        );
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+
+        assert!(is_identityless_legacy_creating(&config, &record));
+        record.host_id = "other-host".into();
+        assert!(!is_identityless_legacy_creating(&config, &record));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_less_legacy_creating_terminates_discovered_owned_runtime() {
+        let root = short_test_root("lcr");
+        let mut config = test_config();
+        config.vmm_bin = PathBuf::from("sh");
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        let supervisor = VmmSupervisor::new(config.clone());
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut published = false;
+        for _ in 0..200 {
+            published =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).is_ok_and(|cmdline| {
+                    cmdline
+                        .windows(socket_path.as_os_str().as_bytes().len())
+                        .any(|window| window == socket_path.as_os_str().as_bytes())
+                });
+            if published {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "legacy VMM stand-in did not publish its argv");
+        let mut record = legacy_active_record(&config, id, socket_path.clone(), None);
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&record).unwrap();
+        let mut records = vec![record];
+
+        reconcile_legacy_creating_records(&config, &store, &supervisor, &mut records).unwrap();
+
+        child.wait().unwrap();
+        assert_eq!(store.get_vm(id).unwrap().status, VmStatus::Error);
+        assert!(!socket_path.exists());
+        drop(listener);
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_active_runtime_is_persisted_before_adoption() {
+        let root = short_test_root("lla");
+        let mut config = test_config();
+        config.vmm_bin = PathBuf::from("sh");
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        config.kernel = root.join("kernel");
+        config.rootfs = root.join("rootfs");
+        std::fs::create_dir_all(config.socket_dir.join("overlays")).unwrap();
+
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let overlay_path = config.socket_dir.join("overlays").join(format!("{id}.cow"));
+        std::fs::write(&overlay_path, b"legacy overlay").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(request, tarit_vmm_client::ApiRequest::Status));
+            let response = tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                state: tarit_vmm_client::VmState::Paused,
+                uptime_ms: 1,
+                vcpus: 1,
+                mem_mib: 256,
+                volumes: 0,
+                nets: 0,
+                kernel: "kernel".into(),
+                vcpu_alive: true,
+            });
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut published = false;
+        for _ in 0..200 {
+            published =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).is_ok_and(|cmdline| {
+                    cmdline
+                        .windows(socket_path.as_os_str().as_bytes().len())
+                        .any(|window| window == socket_path.as_os_str().as_bytes())
+                });
+            if published {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "legacy VMM stand-in did not publish its argv");
+
+        let store = Store::open(":memory:").unwrap();
+        let mut records = vec![legacy_active_record(
+            &config,
+            id,
+            socket_path.clone(),
+            Some(child.id()),
+        )];
+        store.insert_vm(&records[0]).unwrap();
+        backfill_legacy_runtime_layouts(&config, &store, &mut records).unwrap();
+
+        let durable = store.get_vm(id).unwrap();
+        assert_eq!(durable.revision, 8);
+        assert_eq!(
+            durable.runtime_layout,
+            Some(tarit_types::VmRuntimeLayout {
+                overlay_path: Some(overlay_path.display().to_string()),
+                jail_path: None,
+                artifact_paths: vec![
+                    socket_path.display().to_string(),
+                    overlay_path.display().to_string(),
+                ],
+            })
+        );
+
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let warnings = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(supervisor.readopt_running_vms(&mut records))
+            .unwrap();
+        server.join().unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(records[0].status, VmStatus::Paused);
+        assert_eq!(records[0].revision, 10);
+        supervisor.stop_vm(id).unwrap();
+        child.wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1536,7 +2084,11 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: config::WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

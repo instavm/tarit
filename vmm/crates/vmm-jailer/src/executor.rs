@@ -53,12 +53,13 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
         apply_cgroup(cfg)?;
     }
 
-    // 2. Enter the assigned network namespace, or create a fresh empty one for
-    // no-NIC workloads. A jailed VMM must never retain the host net namespace.
+    // 2. Enter an explicitly assigned network namespace. An empty path retains
+    // the current namespace so orchestrators using host-owned TAP devices can
+    // jail the process without pretending a veth/routing topology exists.
     if !cfg.netns.is_empty() {
         enter_netns(&cfg.netns)?;
     } else {
-        unshare_empty_netns()?;
+        log::info!("jail: network namespace isolation disabled");
     }
 
     // 3. Create private mount, UTS, and IPC namespaces. PID namespaces need a
@@ -169,18 +170,6 @@ fn enter_netns(path: &str) -> Result<(), JailerError> {
         )));
     }
     log::info!("jail: entered netns {path}");
-    Ok(())
-}
-
-fn unshare_empty_netns() -> Result<(), JailerError> {
-    // SAFETY: unshare is called with a namespace flag and no pointer arguments.
-    if unsafe { libc::unshare(libc::CLONE_NEWNET) } < 0 {
-        return Err(JailerError::Namespace(format!(
-            "unshare(CLONE_NEWNET) for empty network namespace: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    log::info!("jail: fresh empty network namespace created");
     Ok(())
 }
 
@@ -339,7 +328,7 @@ struct CapUserData {
     inheritable: u32,
 }
 
-const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080922;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
 fn read_last_capability() -> Result<u32, JailerError> {
     let raw = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap").map_err(|e| {
@@ -574,6 +563,27 @@ fn verify_confinement(uid: u32, gid: u32, last_capability: u32) -> Result<(), Ja
 mod tests {
     use super::*;
     use crate::jailer::JailerConfig;
+
+    #[test]
+    fn capability_v3_abi_is_supported() {
+        let header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_capget,
+                &header as *const CapUserHeader,
+                data.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "capability v3 ABI must be accepted");
+    }
 
     #[test]
     fn jailer_config_round_trips() {

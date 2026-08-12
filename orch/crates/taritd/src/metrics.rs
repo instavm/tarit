@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -429,6 +429,44 @@ pub fn render_metrics(state: &AppState) -> String {
         "taritd_scheduler_free_memory_mib {}",
         capacity.free_memory_mib
     );
+    let disk = state.supervisor.disk_pressure_snapshot();
+    metric_header(
+        &mut out,
+        "taritd_disk_pressure",
+        "gauge",
+        "Whether node disk pressure is blocking VM admission and warm refill.",
+    );
+    let _ = writeln!(out, "taritd_disk_pressure {}", u8::from(disk.pressured));
+    metric_header(
+        &mut out,
+        "taritd_disk_used_bytes",
+        "gauge",
+        "Filesystem bytes currently used on the Tarit artifact filesystem.",
+    );
+    let _ = writeln!(out, "taritd_disk_used_bytes {}", disk.used_bytes);
+    metric_header(
+        &mut out,
+        "taritd_disk_used_inodes",
+        "gauge",
+        "Filesystem inodes currently used on the Tarit artifact filesystem.",
+    );
+    let _ = writeln!(out, "taritd_disk_used_inodes {}", disk.used_inodes);
+    metric_header(
+        &mut out,
+        "taritd_artifact_gc_removed",
+        "gauge",
+        "Tarit-owned artifacts removed by the most recent sweep.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_artifact_gc_removed{{kind=\"file\"}} {}",
+        disk.last_removed_files
+    );
+    let _ = writeln!(
+        out,
+        "taritd_artifact_gc_removed{{kind=\"jail\"}} {}",
+        disk.last_removed_jails
+    );
 
     metric_header(
         &mut out,
@@ -642,29 +680,43 @@ fn tenant_vm_counts(state: &AppState) -> Vec<(String, usize)> {
 }
 
 fn warm_pool_depths(state: &AppState) -> Vec<(String, usize)> {
-    let mut classes = BTreeSet::new();
+    let mut classes = BTreeMap::new();
     for class in &state.config.warm_pool.classes {
-        classes.insert((class.vcpus, class.memory_mib));
+        let spawn = crate::supervisor::VmSpawnConfig::from_warm_class(&state.config, class);
+        classes.insert(warm_pool_class_label(&spawn), spawn);
     }
     classes
         .into_iter()
-        .map(|(vcpus, memory_mib)| {
-            (
-                warm_pool_class_label(vcpus, memory_mib),
-                state.supervisor.warm_count(vcpus, memory_mib),
-            )
-        })
+        .map(|(label, spawn)| (label, state.supervisor.warm_count(&spawn)))
         .collect()
 }
 
-fn warm_pool_class_label(vcpus: u8, memory_mib: u64) -> String {
-    format!("{vcpus}vcpu_{memory_mib}mib")
+fn warm_pool_class_label(spawn: &crate::supervisor::VmSpawnConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{}\0{}\0{}\0{}",
+        spawn.kernel_path.display(),
+        spawn
+            .rootfs_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        spawn.cmdline,
+        spawn.read_only
+    );
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut short = String::with_capacity(12);
+    for byte in &digest[..6] {
+        let _ = write!(&mut short, "{byte:02x}");
+    }
+    format!("{}vcpu_{}mib_{}", spawn.vcpus, spawn.memory_mib, short)
 }
 
 fn warm_pool_watermarks(state: &AppState) -> Vec<(String, &'static str, usize)> {
     let mut out = Vec::new();
     for class in &state.config.warm_pool.classes {
-        let label = warm_pool_class_label(class.vcpus, class.memory_mib);
+        let spawn = crate::supervisor::VmSpawnConfig::from_warm_class(&state.config, class);
+        let label = warm_pool_class_label(&spawn);
         out.push((label.clone(), "hard_floor", class.hard_floor));
         out.push((label.clone(), "low_watermark", class.low_watermark));
         out.push((label.clone(), "target", class.target));
@@ -781,7 +833,9 @@ mod tests {
                 vcpus: 1,
                 kernel_path: "kernel".into(),
                 rootfs_path: None,
+                rootfs_read_only: false,
                 cmdline: "console=ttyS0".into(),
+                runtime_layout: None,
                 socket_path: Some("socket".into()),
                 pid: Some(std::process::id()),
                 created_at: now,
@@ -832,10 +886,8 @@ mod tests {
             body.contains("taritd_tenant_vms{tenant=\"h:"),
             "tenant label should be a hash by default"
         );
-        assert!(body.contains("taritd_warm_pool_depth{class=\"1vcpu_256mib\"} 0\n"));
-        assert!(body.contains(
-            "taritd_warm_pool_watermark{class=\"1vcpu_256mib\",watermark=\"target\"} 8\n"
-        ));
+        assert!(body.contains("taritd_warm_pool_depth{class=\"1vcpu_256mib_"));
+        assert!(body.contains("taritd_warm_pool_watermark{class=\"1vcpu_256mib_"));
         assert!(body.contains("taritd_vm_create_total 1\n"));
         assert!(body.contains("taritd_vm_create_errors_total 1\n"));
         assert!(body.contains("taritd_exec_total 1\n"));
@@ -978,7 +1030,11 @@ mod tests {
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,

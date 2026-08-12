@@ -54,7 +54,9 @@ impl DeviceStateBlob {
     {
         let mut blob = Self::new();
         for dev in devices {
-            let state = dev.save();
+            let state = dev
+                .try_save()
+                .map_err(|e| StateError::Encode(format!("{}: {e}", dev.state_key())))?;
             let bytes = postcard::to_allocvec(&state)
                 .map_err(|e| StateError::Encode(format!("{}: {e}", dev.state_key())))?;
             blob.entries.insert(dev.state_key().to_string(), bytes);
@@ -173,9 +175,27 @@ mod tests {
         fn save(&self) -> Self::State {
             CounterState { n: self.n }
         }
+
         fn restore(&mut self, state: Self::State) {
             self.n = state.n;
         }
+    }
+
+    struct FailedDevice;
+    impl Persist for FailedDevice {
+        type State = CounterState;
+
+        fn save(&self) -> Self::State {
+            CounterState::default()
+        }
+
+        fn try_save(&self) -> Result<Self::State, vmm_devices::persist::PersistError> {
+            Err(vmm_devices::persist::PersistError::Unavailable(
+                "poisoned".into(),
+            ))
+        }
+
+        fn restore(&mut self, _state: Self::State) {}
     }
 
     #[test]
@@ -188,6 +208,13 @@ mod tests {
         let back = DeviceStateBlob::from_bytes(&bytes).unwrap();
         assert_eq!(back, blob);
         assert_eq!(back.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn collection_rejects_failed_device_state() {
+        let error = DeviceStateBlob::collect([FailedDevice])
+            .expect_err("snapshot collection must reject inconsistent device state");
+        assert!(error.to_string().contains("poisoned"));
     }
 
     #[test]

@@ -212,6 +212,15 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_ROOTFS_READONLY` | No | `false` | Attach rootfs read-only and rewrite `root=/dev/vda rw` to `ro`. Use for shared immutable images. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | No | `60000` | How long create waits and retries when the cluster is full before returning 429. |
 | `TARIT_REAP_ON_SHUTDOWN` | No | `true` | On SIGTERM/SIGINT, stop all local `vmm serve` children and remove their sockets/overlays after HTTP drain. Set `false` only for debugging. |
+| `TARIT_VM_CGROUP_PARENT` | No | unset | Dedicated cgroup v2 parent for per-VM CPU, memory, PID, and optional I/O enforcement. |
+| `TARIT_VM_CGROUP_PIDS_MAX` | No | `1024` | Per-VM `pids.max` when cgroup enforcement is enabled. |
+| `TARIT_VM_IO_READ_BPS_MAX` / `TARIT_VM_IO_WRITE_BPS_MAX` | No | unset | Rootfs and overlay block bandwidth limits. Requires `TARIT_VM_CGROUP_PARENT`. |
+| `TARIT_VM_IO_READ_IOPS_MAX` / `TARIT_VM_IO_WRITE_IOPS_MAX` | No | unset | Rootfs and overlay block IOPS limits. Requires `TARIT_VM_CGROUP_PARENT`. |
+| `TARIT_VM_NET_INGRESS_BPS_MAX` / `TARIT_VM_NET_EGRESS_BPS_MAX` | No | unset | Per-TAP guest ingress and egress limits. Requires `TARIT_ENABLE_NET=true`. |
+| `TARIT_DISK_BYTES_HIGH_WATERMARK` / `TARIT_DISK_BYTES_LOW_WATERMARK` | No | unset | Absolute used-byte thresholds for pressure entry and recovery. Both must be set together. |
+| `TARIT_DISK_INODES_HIGH_WATERMARK` / `TARIT_DISK_INODES_LOW_WATERMARK` | No | unset | Absolute used-inode thresholds for pressure entry and recovery. Both must be set together. |
+| `TARIT_ARTIFACT_GC_INTERVAL_SECS` | No | `30` | Disk-pressure refresh and owned-artifact sweep interval. |
+| `TARIT_ARTIFACT_GC_MIN_AGE_SECS` | No | `300` | Minimum age for collection of unreferenced Tarit-owned artifacts. |
 | `TARIT_CONFIG` | No | `~/.taritd/config.toml` | Optional TOML file for warm-pool configuration. Missing file is allowed. |
 | `TARIT_WARM_POOL` | No | `false` | Enable warm-pool replenishment. Accepts `1` or `true`. |
 | `TARIT_WARM_POOL_TARGET` | No | `8` for the default class | Override target count for the first warm-pool class. If watermarks are unset, effective hard/low/high watermarks derive from this target. |

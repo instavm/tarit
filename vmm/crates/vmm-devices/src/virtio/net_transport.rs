@@ -10,8 +10,8 @@
 //!     `inject_rx_packet()` — the I/O loop calls it when a packet arrives
 //!     on the tap fd.
 
-use crate::bus::{MmioDevice, MmioReadResult, MmioWriteResult};
-use crate::persist::Persist;
+use crate::bus::{MmioDevice, MmioError, MmioReadResult, MmioWriteResult};
+use crate::persist::{Persist, PersistError};
 use crate::rate_limit::RateLimiter;
 use crate::virtio::blk_transport::status_bits;
 use crate::virtio::regs::{reg, MAGIC};
@@ -162,6 +162,64 @@ pub struct VirtioNetMmio {
 }
 
 impl VirtioNetMmio {
+    fn fail_device(&self, context: &str) {
+        log::error!("virtio-net: {context}");
+        self.status.fetch_or(
+            status_bits::DEVICE_NEEDS_RESET | status_bits::FAILED,
+            Ordering::SeqCst,
+        );
+        self.activated.store(false, Ordering::SeqCst);
+    }
+
+    fn is_failed(&self) -> bool {
+        self.status.load(Ordering::SeqCst) & (status_bits::DEVICE_NEEDS_RESET | status_bits::FAILED)
+            != 0
+    }
+
+    fn ensure_operational(&self) -> MmioWriteResult {
+        if self.is_failed() {
+            Err(MmioError::Device)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_lock_state<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> Result<std::sync::MutexGuard<'a, T>, MmioError> {
+        mutex.lock().map_err(|_| {
+            self.fail_device(&format!("poisoned {name} lock"));
+            MmioError::Device
+        })
+    }
+
+    fn snapshot_lock<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> Result<std::sync::MutexGuard<'a, T>, PersistError> {
+        mutex.lock().map_err(|_| {
+            self.fail_device(&format!("poisoned {name} lock"));
+            PersistError::Unavailable(format!("virtio-net {name} lock is poisoned"))
+        })
+    }
+
+    fn lock_state<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> std::sync::MutexGuard<'a, T> {
+        match mutex.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.fail_device(&format!("poisoned {name} lock"));
+                poisoned.into_inner()
+            }
+        }
+    }
+
     pub fn new(irq: u32, mac: [u8; 6]) -> Self {
         Self {
             irq,
@@ -203,58 +261,66 @@ impl VirtioNetMmio {
     }
 
     pub fn set_guest_memory(&self, mem: Arc<GuestMemoryMmap>) {
-        *self.guest_mem.lock().unwrap() = Some(mem);
+        *self.lock_state(&self.guest_mem, "guest_mem") = Some(mem);
     }
 
     pub fn set_guest_dirty_tracker(&self, dirty: SoftwareDirtyBitmap) {
-        *self.host_dirty.lock().unwrap() = Some(dirty);
+        *self.lock_state(&self.host_dirty, "host_dirty") = Some(dirty);
     }
 
     /// Install a per-device rate limiter. Leaving it unset keeps I/O unlimited.
     pub fn set_rate_limiter(&self, rl: RateLimiter) {
-        *self.rate_limiter.lock().unwrap() = Some(rl);
+        *self.lock_state(&self.rate_limiter, "rate_limiter") = Some(rl);
     }
 
-    fn rate_limit_allows(&self, bytes: u64) -> bool {
-        match self.rate_limiter.lock().unwrap().as_mut() {
-            Some(rl) => rl.try_charge(1, bytes),
-            None => true,
-        }
+    fn rate_limit_allows(&self, bytes: u64) -> Result<bool, MmioError> {
+        Ok(
+            match self
+                .try_lock_state(&self.rate_limiter, "rate_limiter")?
+                .as_mut()
+            {
+                Some(rl) => rl.try_charge(1, bytes),
+                None => true,
+            },
+        )
     }
 
     /// Hand the transport a tap fd. The fd's lifetime is the caller's; the
     /// transport only uses it for `write(2)` on TX.
     pub fn set_tap_fd(&self, fd: RawFd) {
-        *self.tap_fd.lock().unwrap() = Some(fd);
+        *self.lock_state(&self.tap_fd, "tap_fd") = Some(fd);
     }
 
     #[cfg(target_os = "linux")]
     pub fn set_irq_evt(&self, evt: vmm_sys_util::eventfd::EventFd) {
-        *self.irq_evt.lock().unwrap() = Some(evt);
+        *self.lock_state(&self.irq_evt, "irq_evt") = Some(evt);
     }
 
-    fn trigger_interrupt(&self) {
+    fn trigger_interrupt(&self) -> MmioWriteResult {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
         #[cfg(target_os = "linux")]
-        if let Some(evt) = self.irq_evt.lock().unwrap().as_ref() {
+        if let Some(evt) = self.try_lock_state(&self.irq_evt, "irq_evt")?.as_ref() {
             let _ = evt.write(1);
         }
+        Ok(())
     }
 
-    fn queue_config(&self, idx: usize) -> Option<QueueConfig> {
-        let qs = self.queues.lock().unwrap();
-        let q = qs.get(idx)?;
+    fn queue_config(&self, idx: usize) -> Result<Option<QueueConfig>, MmioError> {
+        let qs = self.try_lock_state(&self.queues, "queues")?;
+        let Some(q) = qs.get(idx) else {
+            return Ok(None);
+        };
         if !q.ready || !q.valid_size() {
-            return None;
+            return Ok(None);
         }
-        Some(QueueConfig {
+        Ok(Some(QueueConfig {
             size: q.size,
             desc_table_addr: q.desc_table_addr,
             avail_ring_addr: q.avail_ring_addr,
             used_ring_addr: q.used_ring_addr,
             ready: q.ready,
-        })
+        }))
     }
 
     fn queue_config_from_state(q: &QueueState) -> QueueConfig {
@@ -271,19 +337,20 @@ impl VirtioNetMmio {
     /// packet bytes) assemble the contiguous packet and `write(tap_fd, ...)`.
     /// Called either from the MMIO QUEUE_NOTIFY path (test/diagnostic) or
     /// from the I/O loop when a TX kick EventFd fires.
-    pub fn process_tx_queue(&self) -> usize {
-        let mem = match self.guest_mem.lock().unwrap().clone() {
+    pub fn process_tx_queue(&self) -> Result<usize, MmioError> {
+        self.ensure_operational()?;
+        let mem = match self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() {
             Some(m) => m,
-            None => return 0,
+            None => return Ok(0),
         };
-        let dirty = self.host_dirty.lock().unwrap().clone();
-        let cfg = match self.queue_config(QUEUE_TX) {
+        let dirty = self.try_lock_state(&self.host_dirty, "host_dirty")?.clone();
+        let cfg = match self.queue_config(QUEUE_TX)? {
             Some(c) => c,
-            None => return 0,
+            None => return Ok(0),
         };
-        let tap_fd = *self.tap_fd.lock().unwrap();
+        let tap_fd = *self.try_lock_state(&self.tap_fd, "tap_fd")?;
 
-        let mut proc_guard = self.tx_processor.lock().unwrap();
+        let mut proc_guard = self.try_lock_state(&self.tx_processor, "tx_processor")?;
         if proc_guard.is_none() {
             *proc_guard = Some(VirtQueueProcessor::new(cfg));
         } else {
@@ -291,6 +358,7 @@ impl VirtioNetMmio {
         }
 
         let mut total_pkts = 0usize;
+        let mut processing_failed = false;
         let processed = proc_guard
             .as_mut()
             .unwrap()
@@ -323,8 +391,13 @@ impl VirtioNetMmio {
                 }
                 let packet = &buf[VIRTIO_NET_HDR_LEN..];
 
-                if !self.rate_limit_allows(packet.len() as u64) {
-                    return None;
+                match self.rate_limit_allows(packet.len() as u64) {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(_) => {
+                        processing_failed = true;
+                        return None;
+                    }
                 }
 
                 if let Some(fd) = tap_fd {
@@ -342,33 +415,38 @@ impl VirtioNetMmio {
             });
 
         if processed > 0 {
-            self.trigger_interrupt();
+            self.trigger_interrupt()?;
         }
-        total_pkts
+        if processing_failed || self.is_failed() {
+            Err(MmioError::Device)
+        } else {
+            Ok(total_pkts)
+        }
     }
 
     /// Inject a packet received from the host tap into the RX queue.
     /// Walks one writable chain, lays down a zero virtio_net_hdr, then the
     /// packet bytes. Returns true iff a chain was consumed. If no avail
     /// descriptor is ready the packet is dropped (caller should retry later).
-    pub fn inject_rx_packet(&self, packet: &[u8]) -> bool {
+    pub fn inject_rx_packet(&self, packet: &[u8]) -> Result<bool, MmioError> {
+        self.ensure_operational()?;
         let Some(need) = packet.len().checked_add(VIRTIO_NET_HDR_LEN) else {
-            return false;
+            return Ok(false);
         };
         if need > MAX_FRAME_BYTES {
-            return false;
+            return Ok(false);
         }
-        let mem = match self.guest_mem.lock().unwrap().clone() {
+        let mem = match self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() {
             Some(m) => m,
-            None => return false,
+            None => return Ok(false),
         };
-        let dirty = self.host_dirty.lock().unwrap().clone();
-        let cfg = match self.queue_config(QUEUE_RX) {
+        let dirty = self.try_lock_state(&self.host_dirty, "host_dirty")?.clone();
+        let cfg = match self.queue_config(QUEUE_RX)? {
             Some(c) => c,
-            None => return false,
+            None => return Ok(false),
         };
 
-        let mut proc_guard = self.rx_processor.lock().unwrap();
+        let mut proc_guard = self.try_lock_state(&self.rx_processor, "rx_processor")?;
         if proc_guard.is_none() {
             *proc_guard = Some(VirtQueueProcessor::new(cfg));
         } else {
@@ -376,6 +454,7 @@ impl VirtioNetMmio {
         }
 
         let mut delivered = false;
+        let mut processing_failed = false;
         let _ = proc_guard
             .as_mut()
             .unwrap()
@@ -394,8 +473,13 @@ impl VirtioNetMmio {
                 if cap < need {
                     return Some(0);
                 }
-                if !self.rate_limit_allows(packet.len() as u64) {
-                    return None;
+                match self.rate_limit_allows(packet.len() as u64) {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(_) => {
+                        processing_failed = true;
+                        return None;
+                    }
                 }
                 // Lay down the 12-byte virtio_net_hdr_v1 (zeroed, with
                 // num_buffers = 1 for this single-descriptor packet), then
@@ -434,9 +518,13 @@ impl VirtioNetMmio {
             });
 
         if delivered {
-            self.trigger_interrupt();
+            self.trigger_interrupt()?;
         }
-        delivered
+        if processing_failed || self.is_failed() {
+            Err(MmioError::Device)
+        } else {
+            Ok(delivered)
+        }
     }
 
     /// Read up to 4 bytes from device-specific CONFIG space (MAC at 0x100..0x106).
@@ -454,34 +542,68 @@ impl VirtioNetMmio {
         buf[..copy_len].copy_from_slice(&self.mac[cfg_off..cfg_off + copy_len]);
         u32::from_le_bytes(buf) as u64
     }
+
+    fn snapshot_state(&self) -> Result<VirtioNetMmioState, PersistError> {
+        if self.is_failed() {
+            return Err(PersistError::Unavailable(
+                "virtio-net is failed and requires reset".into(),
+            ));
+        }
+        Ok(VirtioNetMmioState {
+            status: self.status.load(Ordering::Relaxed),
+            queue_sel: self.queue_sel.load(Ordering::Relaxed),
+            host_features_sel: self.host_features_sel.load(Ordering::Relaxed),
+            guest_features_sel: self.guest_features_sel.load(Ordering::Relaxed),
+            guest_features: self.guest_features.load(Ordering::Relaxed),
+            queues: self.snapshot_lock(&self.queues, "queues")?.clone(),
+            activated: self.activated.load(Ordering::Relaxed),
+            interrupt_status: self.interrupt_status.load(Ordering::SeqCst),
+            rx_processor: self
+                .snapshot_lock(&self.rx_processor, "rx_processor")?
+                .as_ref()
+                .map(VirtQueueProcessor::save_state),
+            tx_processor: self
+                .snapshot_lock(&self.tx_processor, "tx_processor")?
+                .as_ref()
+                .map(VirtQueueProcessor::save_state),
+        })
+    }
+
+    fn reset(&self) {
+        self.queues.clear_poison();
+        self.guest_mem.clear_poison();
+        self.host_dirty.clear_poison();
+        self.rx_processor.clear_poison();
+        self.tx_processor.clear_poison();
+        self.rate_limiter.clear_poison();
+        self.tap_fd.clear_poison();
+        #[cfg(target_os = "linux")]
+        self.irq_evt.clear_poison();
+        self.status.store(0, Ordering::SeqCst);
+        self.activated.store(false, Ordering::SeqCst);
+        self.host_features_sel.store(0, Ordering::SeqCst);
+        self.guest_features_sel.store(0, Ordering::SeqCst);
+        self.guest_features.store(0, Ordering::SeqCst);
+        self.queue_sel.store(0, Ordering::SeqCst);
+        self.interrupt_status.store(0, Ordering::SeqCst);
+        for queue in self.lock_state(&self.queues, "queues").iter_mut() {
+            *queue = QueueState::default();
+        }
+        *self.lock_state(&self.rx_processor, "rx_processor") = None;
+        *self.lock_state(&self.tx_processor, "tx_processor") = None;
+    }
 }
 
 impl Persist for VirtioNetMmio {
     type State = VirtioNetMmioState;
 
     fn save(&self) -> Self::State {
-        VirtioNetMmioState {
-            status: self.status.load(Ordering::Relaxed),
-            queue_sel: self.queue_sel.load(Ordering::Relaxed),
-            host_features_sel: self.host_features_sel.load(Ordering::Relaxed),
-            guest_features_sel: self.guest_features_sel.load(Ordering::Relaxed),
-            guest_features: self.guest_features.load(Ordering::Relaxed),
-            queues: self.queues.lock().unwrap().clone(),
-            activated: self.activated.load(Ordering::Relaxed),
-            interrupt_status: self.interrupt_status.load(Ordering::SeqCst),
-            rx_processor: self
-                .rx_processor
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(VirtQueueProcessor::save_state),
-            tx_processor: self
-                .tx_processor
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(VirtQueueProcessor::save_state),
-        }
+        self.snapshot_state()
+            .expect("virtio-net state is unavailable")
+    }
+
+    fn try_save(&self) -> Result<Self::State, PersistError> {
+        self.snapshot_state()
     }
 
     fn restore(&mut self, state: Self::State) {
@@ -493,11 +615,11 @@ impl Persist for VirtioNetMmio {
             .store(state.guest_features_sel, Ordering::Relaxed);
         self.guest_features
             .store(state.guest_features, Ordering::Relaxed);
-        *self.queues.lock().unwrap() = state.queues;
+        *self.lock_state(&self.queues, "queues") = state.queues;
         self.activated.store(state.activated, Ordering::Relaxed);
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
-        let queues = self.queues.lock().unwrap();
+        let queues = self.lock_state(&self.queues, "queues");
         let rx_config = queues
             .get(QUEUE_RX)
             .map(Self::queue_config_from_state)
@@ -507,10 +629,10 @@ impl Persist for VirtioNetMmio {
             .map(Self::queue_config_from_state)
             .unwrap_or_default();
         drop(queues);
-        *self.rx_processor.lock().unwrap() = state
+        *self.lock_state(&self.rx_processor, "rx_processor") = state
             .rx_processor
             .map(|p| VirtQueueProcessor::from_state(rx_config, p));
-        *self.tx_processor.lock().unwrap() = state
+        *self.lock_state(&self.tx_processor, "tx_processor") = state
             .tx_processor
             .map(|p| VirtQueueProcessor::from_state(tx_config, p));
     }
@@ -523,6 +645,10 @@ impl Persist for Arc<VirtioNetMmio> {
         self.as_ref().save()
     }
 
+    fn try_save(&self) -> Result<Self::State, PersistError> {
+        self.as_ref().try_save()
+    }
+
     fn restore(&mut self, state: Self::State) {
         self.status.store(state.status, Ordering::Relaxed);
         self.queue_sel.store(state.queue_sel, Ordering::Relaxed);
@@ -532,11 +658,11 @@ impl Persist for Arc<VirtioNetMmio> {
             .store(state.guest_features_sel, Ordering::Relaxed);
         self.guest_features
             .store(state.guest_features, Ordering::Relaxed);
-        *self.queues.lock().unwrap() = state.queues;
+        *self.lock_state(&self.queues, "queues") = state.queues;
         self.activated.store(state.activated, Ordering::Relaxed);
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
-        let queues = self.queues.lock().unwrap();
+        let queues = self.lock_state(&self.queues, "queues");
         let rx_config = queues
             .get(QUEUE_RX)
             .map(VirtioNetMmio::queue_config_from_state)
@@ -546,10 +672,10 @@ impl Persist for Arc<VirtioNetMmio> {
             .map(VirtioNetMmio::queue_config_from_state)
             .unwrap_or_default();
         drop(queues);
-        *self.rx_processor.lock().unwrap() = state
+        *self.lock_state(&self.rx_processor, "rx_processor") = state
             .rx_processor
             .map(|p| VirtQueueProcessor::from_state(rx_config, p));
-        *self.tx_processor.lock().unwrap() = state
+        *self.lock_state(&self.tx_processor, "tx_processor") = state
             .tx_processor
             .map(|p| VirtQueueProcessor::from_state(tx_config, p));
     }
@@ -579,12 +705,12 @@ impl MmioDevice for VirtioNetMmio {
             reg::INTERRUPT_STATUS => self.interrupt_status.load(Ordering::SeqCst),
             reg::CONFIG_GENERATION => 0,
             reg::QUEUE_NUM => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 qs.get(sel).map(|q| q.size as u32).unwrap_or(0)
             }
             reg::QUEUE_READY => {
-                let qs = self.queues.lock().unwrap();
+                let qs = self.lock_state(&self.queues, "queues");
                 let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
                 qs.get(sel)
                     .map(|q| u32::from(q.ready && q.valid_size()))
@@ -603,10 +729,17 @@ impl MmioDevice for VirtioNetMmio {
 
     fn mmio_write(&self, off: u64, val: u64, _len: u8) -> MmioWriteResult {
         let val = val as u32;
+        if self.is_failed() && !(off == reg::STATUS && val == 0) {
+            return Err(MmioError::Device);
+        }
         match off {
             reg::STATUS => {
-                self.status.store(val, Ordering::Relaxed);
                 self.status_writes.fetch_add(1, Ordering::Relaxed);
+                if val == 0 {
+                    self.reset();
+                    return Ok(());
+                }
+                self.status.store(val, Ordering::Relaxed);
                 if val & status_bits::DRIVER_OK != 0 {
                     self.activated.store(true, Ordering::Relaxed);
                 }
@@ -647,7 +780,7 @@ impl MmioDevice for VirtioNetMmio {
                 self.notify_count.fetch_add(1, Ordering::Relaxed);
                 // val is the queue index that was kicked.
                 if val as usize == QUEUE_TX {
-                    self.process_tx_queue();
+                    return self.process_tx_queue().map(|_| ());
                 }
                 // RX kicks: nothing for the device to do — the driver just
                 // refreshed avail; we'll see the new descriptors next time
@@ -664,12 +797,12 @@ impl MmioDevice for VirtioNetMmio {
 
 impl VirtioNetMmio {
     fn q_addr<F: Fn(&QueueState) -> u64>(&self, f: F) -> u64 {
-        let qs = self.queues.lock().unwrap();
+        let qs = self.lock_state(&self.queues, "queues");
         let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
         qs.get(sel).map(f).unwrap_or(0)
     }
     fn q_write<F: FnMut(&mut QueueState)>(&self, mut f: F) {
-        let mut qs = self.queues.lock().unwrap();
+        let mut qs = self.lock_state(&self.queues, "queues");
         let sel = self.queue_sel.load(Ordering::Relaxed) as usize;
         if let Some(q) = qs.get_mut(sel) {
             f(q);
@@ -688,6 +821,31 @@ mod tests {
 
     fn new_mem() -> Arc<GuestMemoryMmap> {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap())
+    }
+
+    #[test]
+    fn poisoned_guest_mem_lock_marks_device_failed_without_panicking() {
+        let dev = Arc::new(VirtioNetMmio::new(6, [0xAA; 6]));
+        let poisoned = Arc::clone(&dev);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.guest_mem.lock().unwrap();
+            panic!("poison guest_mem");
+        })
+        .join()
+        .is_err());
+
+        dev.set_guest_memory(new_mem());
+        assert_ne!(dev.current_status() & status_bits::FAILED, 0);
+        assert!(dev.process_tx_queue().is_err());
+        assert!(dev.inject_rx_packet(&[0u8; 64]).is_err());
+        assert!(Persist::try_save(dev.as_ref()).is_err());
+        assert!(dev
+            .mmio_write(reg::QUEUE_NOTIFY, QUEUE_TX as u64, 4)
+            .is_err());
+
+        dev.mmio_write(reg::STATUS, 0, 4).unwrap();
+        assert_eq!(dev.current_status(), 0);
+        assert!(Persist::try_save(dev.as_ref()).is_ok());
     }
 
     #[derive(Debug)]
@@ -907,14 +1065,14 @@ mod tests {
         mem.write_obj(0u16, GuestAddress(USED + 2)).unwrap();
         configure_net_queue(&dev, QUEUE_TX as u32, DESC, AVAIL, USED);
 
-        dev.process_tx_queue();
+        dev.process_tx_queue().unwrap();
         assert_eq!(net_used_idx(&mem, USED), 1);
 
-        dev.process_tx_queue();
+        dev.process_tx_queue().unwrap();
         assert_eq!(net_used_idx(&mem, USED), 1);
 
         clock.advance(1_000_000_000);
-        dev.process_tx_queue();
+        dev.process_tx_queue().unwrap();
         assert_eq!(net_used_idx(&mem, USED), 2);
     }
 
@@ -960,7 +1118,7 @@ mod tests {
         dev.mmio_write(reg::STATUS, status_bits::DRIVER_OK as u64, 4)
             .unwrap();
 
-        dev.process_tx_queue();
+        dev.process_tx_queue().unwrap();
         assert_eq!(net_used_idx(&mem, USED), 1);
 
         let state = dev.save();
@@ -984,7 +1142,7 @@ mod tests {
         assert_eq!(restored.mmio_read(reg::QUEUE_DEVICE_LOW, 4).unwrap(), USED);
         assert_eq!(restored.save().guest_features, net_features::MAC);
 
-        restored.process_tx_queue();
+        restored.process_tx_queue().unwrap();
         assert_eq!(net_used_idx(&mem, USED), 2);
     }
 
@@ -1038,7 +1196,7 @@ mod tests {
         dev.mmio_write(reg::QUEUE_READY, 1, 4).unwrap();
 
         let packet = b"PONG-payload";
-        assert!(dev.inject_rx_packet(packet));
+        assert!(dev.inject_rx_packet(packet).unwrap());
         assert_eq!(dev.rx_packets.load(Ordering::Relaxed), 1);
 
         // Read back the 12-byte virtio_net_hdr_v1 + packet.
@@ -1091,11 +1249,11 @@ mod tests {
         configure_net_queue(&dev, QUEUE_RX as u32, DESC, AVAIL, USED);
 
         let packet = b"rate-limited-rx";
-        assert!(!dev.inject_rx_packet(packet));
+        assert!(!dev.inject_rx_packet(packet).unwrap());
         assert_eq!(net_used_idx(&mem, USED), 0);
 
         clock.advance(1_000_000_000);
-        assert!(dev.inject_rx_packet(packet));
+        assert!(dev.inject_rx_packet(packet).unwrap());
         assert_eq!(net_used_idx(&mem, USED), 1);
     }
 
@@ -1139,7 +1297,7 @@ mod tests {
         dev.mmio_write(reg::GUEST_FEATURES_SEL, 1, 4).unwrap();
         dev.mmio_write(reg::STATUS, status_bits::DRIVER_OK as u64, 4)
             .unwrap();
-        dev.trigger_interrupt();
+        dev.trigger_interrupt().unwrap();
 
         let state = dev.save();
         let mut restored = VirtioNetMmio::new(6, [0; 6]);

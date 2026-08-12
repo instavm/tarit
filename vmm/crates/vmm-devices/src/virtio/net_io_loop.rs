@@ -194,7 +194,7 @@ fn run(
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
     let mut buf = [0u8; MAX_FRAME];
 
-    while !stop.load(Ordering::Relaxed) {
+    'run: while !stop.load(Ordering::Relaxed) {
         // Pause request: acknowledge and park. While parked this thread
         // performs no guest-memory writes — the live snapshot's final stop
         // relies on that to keep the memory image and device state coherent.
@@ -221,8 +221,8 @@ fn run(
         }
         for ev in &events[..n as usize] {
             match ev.u64 {
-                1 => drain_tap(tap_fd, &device, &mut buf),
-                2 => drain_kick(tx_kick_fd, &device),
+                1 if !drain_tap(tap_fd, &device, &mut buf) => break 'run,
+                2 if !drain_kick(tx_kick_fd, &device) => break 'run,
                 3 => drain_wake(wake_fd),
                 _ => {}
             }
@@ -235,7 +235,7 @@ fn run(
 
 /// Pull all available frames from the tap (it's non-blocking) and push them
 /// to the guest RX queue. Stops at EAGAIN.
-fn drain_tap(tap_fd: RawFd, device: &Arc<VirtioNetMmio>, buf: &mut [u8]) {
+fn drain_tap(tap_fd: RawFd, device: &Arc<VirtioNetMmio>, buf: &mut [u8]) -> bool {
     loop {
         // SAFETY: `buf` is a valid writable slice for `buf.len()` bytes; invalid
         // or non-ready fds are reported by read and handled below.
@@ -246,28 +246,35 @@ fn drain_tap(tap_fd: RawFd, device: &Arc<VirtioNetMmio>, buf: &mut [u8]) {
                 err.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
             ) {
-                return;
+                return true;
             }
             log::warn!("net_io_loop: tap read: {err}");
-            return;
+            return true;
         }
         if rc == 0 {
-            return;
+            return true;
         }
         let frame = &buf[..rc as usize];
-        if !device.inject_rx_packet(frame) {
-            log::debug!(
-                "net_io_loop: RX queue full — dropping {}-byte frame",
-                frame.len()
-            );
-            return;
+        match device.inject_rx_packet(frame) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::debug!(
+                    "net_io_loop: RX queue full — dropping {}-byte frame",
+                    frame.len()
+                );
+                return true;
+            }
+            Err(error) => {
+                log::error!("net_io_loop: device failed during RX: {error}");
+                return false;
+            }
         }
     }
 }
 
 /// Consume the TX kick EventFd counter and process whatever the guest
 /// queued. Multiple notifications collapse into one — that's fine.
-fn drain_kick(tx_kick_fd: RawFd, device: &Arc<VirtioNetMmio>) {
+fn drain_kick(tx_kick_fd: RawFd, device: &Arc<VirtioNetMmio>) -> bool {
     let mut counter = [0u8; 8];
     // SAFETY: `counter` is a valid writable 8-byte eventfd counter buffer;
     // invalid or empty fds are reported by read and handled below.
@@ -287,7 +294,13 @@ fn drain_kick(tx_kick_fd: RawFd, device: &Arc<VirtioNetMmio>) {
             log::warn!("net_io_loop: tx_kick read: {err}");
         }
     }
-    device.process_tx_queue();
+    match device.process_tx_queue() {
+        Ok(_) => true,
+        Err(error) => {
+            log::error!("net_io_loop: device failed during TX: {error}");
+            false
+        }
+    }
 }
 
 /// Consume the wake EventFd counter. The wake exists only to interrupt

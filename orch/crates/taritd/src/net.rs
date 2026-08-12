@@ -7,6 +7,7 @@
 //! the host uplink. Requires CAP_NET_ADMIN (run taritd as root); gated behind
 //! `TARIT_ENABLE_NET` so the default (no-net) path is unaffected.
 
+use crate::config::VmNetQuotaConfig;
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -100,6 +101,8 @@ pub struct NetProvisioner {
     network_transactions: NetworkTransactionLock,
     state_path: PathBuf,
     uplink: String,
+    quota: VmNetQuotaConfig,
+    recovered_tap_owners: HashMap<Uuid, (u32, u32)>,
     /// A post-rename state-sync error leaves the on-disk ownership ambiguous.
     /// Keep all current reservations and refuse further provisioning in this
     /// process rather than risk reusing a slot after a failed free.
@@ -127,9 +130,20 @@ impl NetworkTransactionLock {
 impl NetProvisioner {
     /// Detect the default-route interface, recover persisted slot ownership,
     /// ensure the shared nft table exists, and sweep stale taritd-owned artifacts.
+    #[cfg(test)]
     pub fn new(
         state_path: PathBuf,
         live_vm_ids: impl IntoIterator<Item = Uuid>,
+        quota: VmNetQuotaConfig,
+    ) -> Result<Self, OrchError> {
+        Self::new_with_tap_owners(state_path, live_vm_ids, quota, HashMap::new())
+    }
+
+    pub fn new_with_tap_owners(
+        state_path: PathBuf,
+        live_vm_ids: impl IntoIterator<Item = Uuid>,
+        quota: VmNetQuotaConfig,
+        recovered_tap_owners: HashMap<Uuid, (u32, u32)>,
     ) -> Result<Self, OrchError> {
         let live_vm_ids = live_vm_ids.into_iter().collect::<HashSet<_>>();
         // This is deliberately the first fallible startup action. A corrupt
@@ -144,6 +158,8 @@ impl NetProvisioner {
             network_transactions: NetworkTransactionLock::default(),
             state_path,
             uplink,
+            quota,
+            recovered_tap_owners,
             fail_closed: AtomicBool::new(false),
         };
         let all_allocations = provisioner.all_allocations()?;
@@ -207,12 +223,25 @@ impl NetProvisioner {
 
     /// Create a tap for a new VM: allocate a reusable slot, persist ownership,
     /// create `ip tuntap`, configure the host /30, and add an nft NAT rule.
+    #[cfg(test)]
     pub fn provision(&self, vm_id: Uuid) -> Result<NetAlloc, OrchError> {
-        self.network_transactions
-            .run(|| self.provision_locked(vm_id))?
+        self.provision_with_owner(vm_id, None)
     }
 
-    fn provision_locked(&self, vm_id: Uuid) -> Result<NetAlloc, OrchError> {
+    pub fn provision_with_owner(
+        &self,
+        vm_id: Uuid,
+        owner: Option<(u32, u32)>,
+    ) -> Result<NetAlloc, OrchError> {
+        self.network_transactions
+            .run(|| self.provision_locked(vm_id, owner))?
+    }
+
+    fn provision_locked(
+        &self,
+        vm_id: Uuid,
+        owner: Option<(u32, u32)>,
+    ) -> Result<NetAlloc, OrchError> {
         self.ensure_provisioning_available()?;
         let alloc = {
             let mut inner = self
@@ -228,7 +257,7 @@ impl NetProvisioner {
 
         let policy = self.egress_policy_for(&alloc)?;
         self.prepare_slot_for_provision(&alloc)?;
-        if let Err(e) = self.provision_host(&alloc, &policy) {
+        if let Err(e) = self.provision_host(&alloc, &policy, owner) {
             if let Err(cleanup_error) = self.contain_failed_provision(&alloc) {
                 tracing::warn!(
                     tap = %alloc.tap,
@@ -347,14 +376,23 @@ impl NetProvisioner {
         Ok(())
     }
 
-    fn provision_host(&self, alloc: &NetAlloc, policy: &EgressPolicy) -> Result<(), OrchError> {
-        for argv in tap_provision_argv(alloc, &self.uplink) {
+    fn provision_host(
+        &self,
+        alloc: &NetAlloc,
+        policy: &EgressPolicy,
+        owner: Option<(u32, u32)>,
+    ) -> Result<(), OrchError> {
+        for argv in tap_provision_argv(alloc, &self.uplink, owner) {
             run_argv(&argv)?;
         }
         self.add_nft_rule(alloc)?;
         self.install_egress_policy(alloc, policy)?;
         self.validate_complete_effective_policies(None)?;
-        run("ip", &["link", "set", &alloc.tap, "up"])
+        run("ip", &["link", "set", &alloc.tap, "up"])?;
+        for argv in traffic_control_argv(alloc, &self.quota) {
+            run_argv(&argv)?;
+        }
+        Ok(())
     }
 
     fn add_nft_rule(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -807,11 +845,44 @@ impl NetProvisioner {
     }
 
     fn program_recovered_allocation(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        if let Some(owner) = self.recovered_tap_owners.get(&alloc.vm_id).copied() {
+            self.verify_recovered_tap_owner(alloc, owner)?;
+        }
         for argv in recovered_tap_reconcile_argv(alloc, &self.uplink) {
             run_argv(&argv)?;
         }
         self.add_nft_rule(alloc)?;
-        self.install_egress_policy(alloc, &self.egress_policy_for(alloc)?)
+        self.install_egress_policy(alloc, &self.egress_policy_for(alloc)?)?;
+        self.reconcile_traffic_control(alloc)?;
+        Ok(())
+    }
+
+    fn verify_recovered_tap_owner(
+        &self,
+        alloc: &NetAlloc,
+        expected: (u32, u32),
+    ) -> Result<(), OrchError> {
+        let listing = command_stdout("ip", &["-json", "tuntap", "show"])?;
+        let actual = parse_tap_owner(&listing, &alloc.tap)?;
+        if actual == Some(expected) {
+            Ok(())
+        } else {
+            Err(OrchError::Internal(format!(
+                "net: recovered tap {} ownership mismatch: actual={actual:?}, expected={expected:?}; refusing to recover the jailed VM",
+                alloc.tap
+            )))
+        }
+    }
+
+    fn reconcile_traffic_control(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let qdiscs = command_stdout("tc", &["qdisc", "show", "dev", &alloc.tap])?;
+        for argv in obsolete_traffic_control_argv(alloc, &self.quota, &qdiscs) {
+            run_argv(&argv)?;
+        }
+        for argv in traffic_control_argv(alloc, &self.quota) {
+            run_argv(&argv)?;
+        }
+        Ok(())
     }
 
     fn verify_recovered_allocation_policy(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -872,7 +943,23 @@ impl NetProvisioner {
                 )));
             }
         }
+        self.verify_traffic_control(alloc)?;
         Ok(())
+    }
+
+    fn verify_traffic_control(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let qdiscs = command_stdout("tc", &["qdisc", "show", "dev", &alloc.tap])?;
+        let filters = if qdiscs.contains(" ingress ") {
+            command_stdout(
+                "tc",
+                &["filter", "show", "dev", &alloc.tap, "parent", "ffff:"],
+            )?
+        } else {
+            String::new()
+        };
+        validate_traffic_control_output(&self.quota, &qdiscs, &filters).map_err(|reason| {
+            OrchError::Internal(format!("net: recovered tap {} {reason}", alloc.tap))
+        })
     }
 
     fn best_effort_recovery_cleanup(
@@ -1612,7 +1699,11 @@ fn validate_nft_base_chain_topology_json(chain: &str, listing: &str) -> Result<(
     }
 }
 
-fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
+fn tap_provision_argv(
+    alloc: &NetAlloc,
+    uplink: &str,
+    owner: Option<(u32, u32)>,
+) -> Vec<Vec<String>> {
     let tap = tap_name(alloc.idx);
     let ingress_table = ingress_table_name(alloc.idx);
     let ingress_comment = nft_quote(&ingress_comment(alloc));
@@ -1620,7 +1711,7 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
     let input_comment = nft_quote(&input_comment(alloc));
     let interface = nft_quote(&tap);
     let uplink = nft_quote(uplink);
-    let mut argv = vec![vec![
+    let mut create = vec![
         "ip".into(),
         "tuntap".into(),
         "add".into(),
@@ -1628,7 +1719,16 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
         tap.clone(),
         "mode".into(),
         "tap".into(),
-    ]];
+    ];
+    if let Some((uid, gid)) = owner {
+        create.extend([
+            "user".into(),
+            uid.to_string(),
+            "group".into(),
+            gid.to_string(),
+        ]);
+    }
+    let mut argv = vec![create];
     argv.extend(tap_sysctl_argv(&tap));
     argv.extend([
         vec![
@@ -1790,8 +1890,131 @@ fn tap_provision_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
     argv
 }
 
+fn traffic_control_argv(alloc: &NetAlloc, quota: &VmNetQuotaConfig) -> Vec<Vec<String>> {
+    let mut argv = Vec::new();
+    // VM ingress leaves the host through the TAP, so shape it on the TAP root
+    // egress qdisc. VM egress enters the host through the TAP, so police it on
+    // the TAP ingress hook.
+    if let Some(rate_bps) = quota.ingress_bps_max {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "replace".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "root".into(),
+            "tbf".into(),
+            "rate".into(),
+            format!("{rate_bps}bps"),
+            "burst".into(),
+            format!("{}b", tbf_burst_bytes(rate_bps)),
+            "latency".into(),
+            "50ms".into(),
+        ]);
+    }
+
+    if let Some(rate_bps) = quota.egress_bps_max {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "replace".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "handle".into(),
+            "ffff:".into(),
+            "ingress".into(),
+        ]);
+        argv.push(vec![
+            "tc".into(),
+            "filter".into(),
+            "replace".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "parent".into(),
+            "ffff:".into(),
+            "protocol".into(),
+            "all".into(),
+            "prio".into(),
+            "1".into(),
+            "u32".into(),
+            "match".into(),
+            "u32".into(),
+            "0".into(),
+            "0".into(),
+            "police".into(),
+            "rate".into(),
+            format!("{rate_bps}bps"),
+            "burst".into(),
+            format!("{}b", tbf_burst_bytes(rate_bps)),
+            "drop".into(),
+            "flowid".into(),
+            ":1".into(),
+        ]);
+    }
+    argv
+}
+
+fn obsolete_traffic_control_argv(
+    alloc: &NetAlloc,
+    quota: &VmNetQuotaConfig,
+    qdiscs: &str,
+) -> Vec<Vec<String>> {
+    let mut argv = Vec::new();
+    if quota.ingress_bps_max.is_none() && qdiscs.contains(" tbf ") {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "del".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "root".into(),
+        ]);
+    }
+    if quota.egress_bps_max.is_none() && qdiscs.contains(" ingress ") {
+        argv.push(vec![
+            "tc".into(),
+            "qdisc".into(),
+            "del".into(),
+            "dev".into(),
+            alloc.tap.clone(),
+            "ingress".into(),
+        ]);
+    }
+    argv
+}
+
+fn validate_traffic_control_output(
+    quota: &VmNetQuotaConfig,
+    qdiscs: &str,
+    filters: &str,
+) -> Result<(), &'static str> {
+    if quota.ingress_bps_max.is_some() && !qdiscs.contains(" tbf ") {
+        return Err("is missing the VM-ingress root tbf");
+    }
+    if quota.ingress_bps_max.is_none() && qdiscs.contains(" tbf ") {
+        return Err("retains an obsolete VM-ingress root tbf");
+    }
+    if quota.egress_bps_max.is_some() && !qdiscs.contains(" ingress ") {
+        return Err("is missing the VM-egress ingress qdisc");
+    }
+    if quota.egress_bps_max.is_none() && qdiscs.contains(" ingress ") {
+        return Err("retains an obsolete VM-egress ingress qdisc");
+    }
+    if quota.egress_bps_max.is_some() && !filters.contains(" police ") {
+        return Err("is missing the VM-egress policer");
+    }
+    if quota.egress_bps_max.is_none() && filters.contains(" police ") {
+        return Err("retains an obsolete VM-egress policer");
+    }
+    Ok(())
+}
+
+fn tbf_burst_bytes(rate_bps: u64) -> u64 {
+    (rate_bps / 100).max(16 * 1024)
+}
+
 fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<String>> {
-    tap_provision_argv(alloc, uplink)
+    tap_provision_argv(alloc, uplink, None)
         .into_iter()
         .filter_map(|mut argv| {
             if argv.starts_with(&["ip".into(), "tuntap".into(), "add".into()]) {
@@ -1806,6 +2029,36 @@ fn recovered_tap_reconcile_argv(alloc: &NetAlloc, uplink: &str) -> Vec<Vec<Strin
             Some(argv)
         })
         .collect()
+}
+
+fn parse_tap_owner(listing: &str, tap: &str) -> Result<Option<(u32, u32)>, OrchError> {
+    let entries = serde_json::from_str::<Vec<serde_json::Value>>(listing).map_err(|error| {
+        OrchError::Internal(format!("net: parse ip tuntap ownership JSON: {error}"))
+    })?;
+    let mut found = None;
+    for entry in entries {
+        if entry.get("ifname").and_then(serde_json::Value::as_str) != Some(tap) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(OrchError::Internal(format!(
+                "net: ip tuntap reported duplicate entries for {tap}"
+            )));
+        }
+        let user = entry
+            .get("user")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let group = entry
+            .get("group")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        found = match (user, group) {
+            (Some(user), Some(group)) => Some(Some((user, group))),
+            _ => Some(None),
+        };
+    }
+    Ok(found.flatten())
 }
 
 fn tap_sysctl_argv(tap: &str) -> Vec<Vec<String>> {
@@ -3523,6 +3776,153 @@ mod tests {
         assert!(c.ends_with("eth0:off"));
     }
 
+    #[test]
+    fn traffic_control_argv_programs_vm_ingress_and_egress_in_correct_directions() {
+        let alloc = NetAlloc::for_idx(7);
+        let argv = traffic_control_argv(
+            &alloc,
+            &VmNetQuotaConfig {
+                ingress_bps_max: Some(1_000_000),
+                egress_bps_max: Some(2_000_000),
+            },
+        );
+        assert_eq!(
+            argv[0],
+            vec![
+                "tc",
+                "qdisc",
+                "replace",
+                "dev",
+                alloc.tap.as_str(),
+                "root",
+                "tbf",
+                "rate",
+                "1000000bps",
+                "burst",
+                "16384b",
+                "latency",
+                "50ms"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            argv[1],
+            vec![
+                "tc",
+                "qdisc",
+                "replace",
+                "dev",
+                alloc.tap.as_str(),
+                "handle",
+                "ffff:",
+                "ingress"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        assert!(argv[2].iter().any(|part| part == "2000000bps"));
+        assert_eq!(argv[0][5], "root");
+        assert_eq!(argv[1][5], "handle");
+        assert_eq!(argv[2][5], "parent");
+        assert!(
+            traffic_control_argv(&alloc, &VmNetQuotaConfig::default()).is_empty(),
+            "disabled shaping must not add qdiscs"
+        );
+    }
+
+    #[test]
+    fn recovered_traffic_control_removes_disabled_quotas() {
+        let alloc = NetAlloc::for_idx(7);
+        let cleanup = obsolete_traffic_control_argv(
+            &alloc,
+            &VmNetQuotaConfig::default(),
+            "qdisc tbf 1: root\nqdisc ingress ffff: parent ffff:fff1",
+        );
+        assert_eq!(
+            cleanup,
+            vec![
+                argv(&["tc", "qdisc", "del", "dev", &alloc.tap, "root"]),
+                argv(&["tc", "qdisc", "del", "dev", &alloc.tap, "ingress"]),
+            ]
+        );
+        assert!(validate_traffic_control_output(
+            &VmNetQuotaConfig::default(),
+            "qdisc tbf 1: root\nqdisc ingress ffff: parent ffff:fff1",
+            "filter parent ffff: police rate 2Mbit",
+        )
+        .is_err());
+        assert!(validate_traffic_control_output(
+            &VmNetQuotaConfig::default(),
+            "qdisc noqueue 0: root",
+            ""
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn jailed_tap_creation_uses_unique_identity_atomically() {
+        let alloc = NetAlloc::for_idx(9);
+        assert_eq!(
+            tap_provision_argv(&alloc, "eth0", Some((20_009, 30_009)))[0],
+            argv(&[
+                "ip", "tuntap", "add", "dev", &alloc.tap, "mode", "tap", "user", "20009", "group",
+                "30009",
+            ])
+        );
+    }
+
+    #[test]
+    fn recovered_tap_plan_never_uses_invalid_owner_set_command() {
+        let alloc = NetAlloc::for_idx(9);
+        let plan = recovered_tap_reconcile_argv(&alloc, "eth0");
+        let invalid_prefix = argv(&["ip", "tuntap", "set"]);
+        assert!(!plan
+            .iter()
+            .any(|command| command.starts_with(&invalid_prefix)));
+    }
+
+    #[test]
+    fn recovered_tap_owner_requires_exact_uid_and_gid() {
+        let listing = r#"[{"ifname":"insta8","flags":["tap","persist"],"user":20008,"group":30008},{"ifname":"insta9","flags":["tap","persist"],"user":20009,"group":30009}]"#;
+        assert_eq!(
+            parse_tap_owner(listing, "insta9").unwrap(),
+            Some((20_009, 30_009))
+        );
+        assert_eq!(parse_tap_owner(listing, "insta7").unwrap(), None);
+        assert_eq!(
+            parse_tap_owner(
+                r#"[{"ifname":"insta9","flags":["tap","persist"],"user":20009}]"#,
+                "insta9"
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn recovered_traffic_control_validation_requires_both_directions() {
+        let quota = VmNetQuotaConfig {
+            ingress_bps_max: Some(1_000_000),
+            egress_bps_max: Some(2_000_000),
+        };
+        assert!(validate_traffic_control_output(
+            &quota,
+            "qdisc tbf 1: root\nqdisc ingress ffff: parent ffff:fff1",
+            "filter parent ffff: police rate 2Mbit",
+        )
+        .is_ok());
+        assert!(validate_traffic_control_output(
+            &quota,
+            "qdisc ingress ffff: parent ffff:fff1",
+            "filter parent ffff: police rate 2Mbit",
+        )
+        .is_err());
+        assert!(validate_traffic_control_output(&quota, "qdisc tbf 1: root", "",).is_err());
+    }
+
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
@@ -3735,7 +4135,7 @@ esac
             &comment,
         ]);
         for (kind, plan) in [
-            ("provision", tap_provision_argv(&alloc, "eth0")),
+            ("provision", tap_provision_argv(&alloc, "eth0", None)),
             ("reconcile", recovered_tap_reconcile_argv(&alloc, "eth0")),
         ] {
             let input_rules = plan
@@ -3764,7 +4164,7 @@ esac
     #[test]
     fn tap_provision_plan_hardens_before_link_is_up() {
         let alloc = NetAlloc::for_idx(0);
-        let plan = tap_provision_argv(&alloc, "eth0");
+        let plan = tap_provision_argv(&alloc, "eth0", None);
         assert_eq!(
             plan,
             vec![
@@ -4020,7 +4420,7 @@ esac
     #[test]
     fn forward_egress_guards_precede_broad_guest_allowlists() {
         let alloc = NetAlloc::for_idx(0);
-        let mut forward_rules = tap_provision_argv(&alloc, "eth0")
+        let mut forward_rules = tap_provision_argv(&alloc, "eth0", None)
             .into_iter()
             .filter(|rule| rule.get(5).is_some_and(|chain| chain == NFT_FWD_CHAIN))
             .collect::<Vec<_>>();
@@ -4172,7 +4572,7 @@ esac
     #[test]
     fn forged_source_guard_counts_before_dropping() {
         let alloc = NetAlloc::for_idx(0);
-        let source_guard = tap_provision_argv(&alloc, "eth0")
+        let source_guard = tap_provision_argv(&alloc, "eth0", None)
             .into_iter()
             .find(|argv| {
                 argv.windows(3)
@@ -4746,7 +5146,7 @@ esac
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
         std::env::set_var("TARIT_TEST_QUARANTINE", &quarantine);
-        let result = NetProvisioner::new(state_path, [vm_id]);
+        let result = NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -4812,6 +5212,7 @@ case "${0##*/}:$*" in
   "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
   "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
   "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "tc:qdisc show dev insta7") echo "qdisc noqueue 0: root refcnt 2" ;;
   "nft:-f -")
     script=$(cat)
     case "$script" in
@@ -4877,7 +5278,7 @@ case "${0##*/}:$*" in
   "nft:delete rule ip taritd_nat vm_input handle 17") rm -f "$TARIT_TEST_FAKE_STATE.policy" ;;
 esac
 "#;
-        for name in ["ip", "nft", "sysctl"] {
+        for name in ["ip", "nft", "sysctl", "tc"] {
             let path = bin.join(name);
             std::fs::write(&path, command).unwrap();
             #[cfg(unix)]
@@ -4902,8 +5303,8 @@ esac
         std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
         std::env::set_var("TARIT_TEST_OLD_VM_ID", old_vm_id.to_string());
         std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
-        let result = NetProvisioner::new(state_path.clone(), [vm_id])
-            .and_then(|_| NetProvisioner::new(state_path, [vm_id]));
+        let result = NetProvisioner::new(state_path.clone(), [vm_id], VmNetQuotaConfig::default())
+            .and_then(|_| NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default()));
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5057,6 +5458,7 @@ EOF
     ;;
   "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
   "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "tc:qdisc show dev insta7"|"tc:qdisc show dev insta8") echo "qdisc noqueue 0: root refcnt 2" ;;
   "nft:-a list chain ip taritd_nat "*)
     calls=$(cat "$TARIT_TEST_FAKE_STATE.chain-calls" 2>/dev/null || echo 0)
     calls=$((calls + 1))
@@ -5084,7 +5486,7 @@ EOF
   "nft:-f -") cat >/dev/null ;;
 esac
 "#;
-        for name in ["ip", "nft", "sysctl"] {
+        for name in ["ip", "nft", "sysctl", "tc"] {
             let path = bin.join(name);
             std::fs::write(&path, command).unwrap();
             #[cfg(unix)]
@@ -5107,6 +5509,8 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
+            recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
@@ -5205,7 +5609,7 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path, [vm_id]);
+        let result = NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5289,7 +5693,11 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path, [first_vm_id, second_vm_id]);
+        let result = NetProvisioner::new(
+            state_path,
+            [first_vm_id, second_vm_id],
+            VmNetQuotaConfig::default(),
+        );
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5370,6 +5778,7 @@ case "${0##*/}:$*" in
   "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
   "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
   "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "tc:qdisc show dev insta7"|"tc:qdisc show dev insta8") echo "qdisc noqueue 0: root refcnt 2" ;;
   "nft:-f -") cat > "$TARIT_TEST_QUARANTINE" ;;
   "nft:list tables netdev")
     [ ! -e "$TARIT_TEST_FAKE_STATE.policy7" ] || echo "table netdev taritd_ingress_7"
@@ -5419,7 +5828,7 @@ case "${0##*/}:$*" in
   "nft:delete table netdev taritd_ingress_8") touch "$TARIT_TEST_FAKE_STATE.policy8-ingress-cleaned" ;;
 esac
 "#;
-        for name in ["ip", "nft", "sysctl"] {
+        for name in ["ip", "nft", "sysctl", "tc"] {
             let path = bin.join(name);
             std::fs::write(&path, command).unwrap();
             #[cfg(unix)]
@@ -5445,7 +5854,11 @@ esac
         std::env::set_var("TARIT_TEST_QUARANTINE", &quarantine);
         std::env::set_var("TARIT_TEST_VM_7", first_vm_id.to_string());
         std::env::set_var("TARIT_TEST_VM_8", second_vm_id.to_string());
-        let result = NetProvisioner::new(state_path, [first_vm_id, second_vm_id]);
+        let result = NetProvisioner::new(
+            state_path,
+            [first_vm_id, second_vm_id],
+            VmNetQuotaConfig::default(),
+        );
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5576,7 +5989,7 @@ esac
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
         std::env::set_var("TARIT_TEST_FAKE_STATE", &fake_state);
         std::env::set_var("TARIT_TEST_VM_ID", vm_id.to_string());
-        let result = NetProvisioner::new(state_path, [vm_id]);
+        let result = NetProvisioner::new(state_path, [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5846,7 +6259,11 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path.clone(), std::iter::empty());
+        let result = NetProvisioner::new(
+            state_path.clone(),
+            std::iter::empty(),
+            VmNetQuotaConfig::default(),
+        );
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -5922,7 +6339,7 @@ esac
             ),
         );
         std::env::set_var("TARIT_TEST_COMMAND_LOG", &log);
-        let result = NetProvisioner::new(state_path.clone(), [vm_id]);
+        let result = NetProvisioner::new(state_path.clone(), [vm_id], VmNetQuotaConfig::default());
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
         } else {
@@ -6029,6 +6446,8 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
+            recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
         };
         let old_path = std::env::var_os("PATH");
@@ -6518,6 +6937,8 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
+            recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
         };
 
@@ -6634,6 +7055,8 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
+            recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
         };
 
@@ -6727,6 +7150,8 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: root.join("state.json"),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
+            recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
         };
         let alloc = NetAlloc::for_slot(Uuid::new_v4(), 7).unwrap();
@@ -6840,6 +7265,8 @@ esac
             network_transactions: NetworkTransactionLock::default(),
             state_path: state_path.clone(),
             uplink: "eth0".into(),
+            quota: VmNetQuotaConfig::default(),
+            recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
         };
 

@@ -76,6 +76,15 @@ impl VmStartupPath {
 }
 
 /// Persistent record of a VM managed by taritd.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmRuntimeLayout {
+    pub overlay_path: Option<String>,
+    pub jail_path: Option<String>,
+    #[serde(default)]
+    pub artifact_paths: Vec<String>,
+}
+
+/// Persistent record of a VM managed by taritd.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRecord {
     pub id: Uuid,
@@ -97,7 +106,16 @@ pub struct VmRecord {
     pub vcpus: u8,
     pub kernel_path: String,
     pub rootfs_path: Option<String>,
+    /// Effective guest rootfs mount mode for this VM incarnation. This is
+    /// durable so restart reconciliation and snapshots do not inherit a newer
+    /// host-wide default.
+    #[serde(default)]
+    pub rootfs_read_only: bool,
     pub cmdline: String,
+    /// Exact host paths allocated to this VM incarnation. Recovery must use
+    /// this durable layout rather than deriving protection from newer config.
+    #[serde(default, skip_serializing)]
+    pub runtime_layout: Option<VmRuntimeLayout>,
     pub socket_path: Option<String>,
     pub pid: Option<u32>,
     pub created_at: DateTime<Utc>,
@@ -632,7 +650,9 @@ mod tests {
             vcpus: 1,
             kernel_path: "/srv/private/vmlinux".into(),
             rootfs_path: Some("/srv/private/rootfs".into()),
+            rootfs_read_only: true,
             cmdline: "console=ttyS0 secret=detail".into(),
+            runtime_layout: None,
             socket_path: Some("/run/private/vm.sock".into()),
             pid: Some(42),
             created_at: now,

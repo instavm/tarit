@@ -16,7 +16,7 @@ LOG=/tmp/taritd-warmpool.log
 
 export TARIT_API_KEY="warm-e2e-key"
 export TARIT_LISTEN="127.0.0.1:8080"
-export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
+export TARIT_VMM_BIN="${TARIT_VMM_BIN:-$VMM_ROOT/target/debug/vmm}"
 export TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
 export TARIT_ROOTFS="$ROOTFS"
 # The shared host base is always immutable through per-VM CoW. Keep the guest
@@ -58,7 +58,7 @@ target = $TARGET
 restore = true
 rootfs = "$ROOTFS"
 TOML
-LABEL="1vcpu_512mib"
+LABEL_PREFIX="1vcpu_512mib_"
 
 echo "=== taritd serve (restore warm pool) ==="
 "$TARIT" serve >"$LOG" 2>&1 &
@@ -70,8 +70,9 @@ trap cleanup EXIT
 echo "=== wait for warm pool to fill via restore (target=$TARGET) ==="
 filled=0
 for i in $(seq 1 90); do
-  depth=$("$TARIT" metrics 2>/dev/null | awk -F'[ ]' "/taritd_warm_pool_depth\\{class=\"$LABEL\"\\}/{print \$2}")
-  echo "  [$i] warm_pool_depth{$LABEL}=${depth:-0}"
+  depth=$("$TARIT" metrics 2>/dev/null | awk -v prefix="$LABEL_PREFIX" \
+    '$1 ~ ("^taritd_warm_pool_depth\\{class=\"" prefix) { print $2; exit }')
+  echo "  [$i] warm_pool_depth{${LABEL_PREFIX}*}=${depth:-0}"
   if [ "${depth:-0}" -ge "$TARGET" ]; then filled=1; break; fi
   sleep 2
 done
