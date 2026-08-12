@@ -7359,13 +7359,9 @@ fn restored_guest_has_default_route(output: &str, network: RestoredGuestNetwork)
         return false;
     }
     let gateway = network.gateway.to_string();
-    let mut fields = routes[0].split_whitespace();
-    fields.next() == Some("default")
-        && fields.next() == Some("via")
-        && fields.next() == Some(gateway.as_str())
-        && fields.next() == Some("dev")
-        && fields.next() == Some("eth0")
-        && fields.next().is_none()
+    let fields = routes[0].split_whitespace().collect::<Vec<_>>();
+    fields == ["default", "via", gateway.as_str()]
+        || fields == ["default", "via", gateway.as_str(), "dev", "eth0"]
 }
 
 fn rebind_restored_guest_network(
@@ -9938,6 +9934,10 @@ mod tests {
         ));
         assert!(!restored_guest_has_default_route(
             "default via 172.16.0.1 dev eth0\n",
+            network
+        ));
+        assert!(restored_guest_has_default_route(
+            "default via 172.16.0.29\n",
             network
         ));
     }
