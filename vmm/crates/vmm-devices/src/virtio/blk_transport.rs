@@ -5,8 +5,8 @@
 //! extract the virtio_blk_req, call BlkBackend::service(), write the
 //! status byte, and update the used ring.
 
-use crate::bus::{MmioDevice, MmioReadResult, MmioWriteResult};
-use crate::persist::Persist;
+use crate::bus::{MmioDevice, MmioError, MmioReadResult, MmioWriteResult};
+use crate::persist::{Persist, PersistError};
 use crate::rate_limit::RateLimiter;
 use crate::virtio::blk::{req_type, status, BlkReqHeader};
 use crate::virtio::blk_backend::BlkBackend;
@@ -169,6 +169,87 @@ impl VirtioBlkMmio {
         self.activated.store(false, Ordering::SeqCst);
     }
 
+    fn is_failed(&self) -> bool {
+        self.status.load(Ordering::SeqCst) & (status_bits::DEVICE_NEEDS_RESET | status_bits::FAILED)
+            != 0
+    }
+
+    fn ensure_operational(&self) -> MmioWriteResult {
+        if self.is_failed() {
+            Err(MmioError::Device)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn try_lock_state<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> Result<std::sync::MutexGuard<'a, T>, MmioError> {
+        mutex.lock().map_err(|_| {
+            self.fail_device(&format!("poisoned {name} lock"));
+            MmioError::Device
+        })
+    }
+
+    fn snapshot_lock<'a, T>(
+        &self,
+        mutex: &'a Mutex<T>,
+        name: &'static str,
+    ) -> Result<std::sync::MutexGuard<'a, T>, PersistError> {
+        mutex.lock().map_err(|_| {
+            self.fail_device(&format!("poisoned {name} lock"));
+            PersistError::Unavailable(format!("virtio-blk {name} lock is poisoned"))
+        })
+    }
+
+    fn snapshot_state(&self) -> Result<VirtioBlkMmioState, PersistError> {
+        if self.is_failed() {
+            return Err(PersistError::Unavailable(
+                "virtio-blk is failed and requires reset".into(),
+            ));
+        }
+        Ok(VirtioBlkMmioState {
+            status: self.status.load(Ordering::Relaxed),
+            queue_sel: self.queue_sel.load(Ordering::Relaxed),
+            host_features_sel: self.host_features_sel.load(Ordering::Relaxed),
+            guest_features_sel: self.guest_features_sel.load(Ordering::Relaxed),
+            guest_features_low: self.guest_features_low.load(Ordering::Relaxed),
+            guest_features_high: self.guest_features_high.load(Ordering::Relaxed),
+            queues: self.snapshot_lock(&self.queues, "queues")?.clone(),
+            activated: self.activated.load(Ordering::Relaxed),
+            interrupt_status: self.interrupt_status.load(Ordering::SeqCst),
+            processor: self
+                .snapshot_lock(&self.processor, "processor")?
+                .as_ref()
+                .map(VirtQueueProcessor::save_state),
+        })
+    }
+
+    fn reset(&self) {
+        self.queues.clear_poison();
+        self.backend.clear_poison();
+        self.guest_mem.clear_poison();
+        self.host_dirty.clear_poison();
+        self.processor.clear_poison();
+        self.rate_limiter.clear_poison();
+        #[cfg(target_os = "linux")]
+        self.irq_evt.clear_poison();
+        self.status.store(0, Ordering::SeqCst);
+        self.activated.store(false, Ordering::SeqCst);
+        self.host_features_sel.store(0, Ordering::SeqCst);
+        self.guest_features_sel.store(0, Ordering::SeqCst);
+        self.guest_features_low.store(0, Ordering::SeqCst);
+        self.guest_features_high.store(0, Ordering::SeqCst);
+        self.queue_sel.store(0, Ordering::SeqCst);
+        self.interrupt_status.store(0, Ordering::SeqCst);
+        for q in self.lock_state(&self.queues, "queues").iter_mut() {
+            *q = QueueState::default();
+        }
+        *self.lock_state(&self.processor, "processor") = None;
+    }
+
     fn lock_state<'a, T>(
         &self,
         mutex: &'a Mutex<T>,
@@ -257,18 +338,20 @@ impl VirtioBlkMmio {
 
     /// Signal an interrupt to the guest.
     #[cfg(target_os = "linux")]
-    fn trigger_interrupt(&self) {
+    fn trigger_interrupt(&self) -> MmioWriteResult {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
-        if let Some(evt) = self.lock_state(&self.irq_evt, "irq_evt").as_ref() {
+        if let Some(evt) = self.try_lock_state(&self.irq_evt, "irq_evt")?.as_ref() {
             let _ = evt.write(1);
         }
+        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn trigger_interrupt(&self) {
+    fn trigger_interrupt(&self) -> MmioWriteResult {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Set the guest memory (called after KvmVm creation).
@@ -285,11 +368,16 @@ impl VirtioBlkMmio {
         *self.lock_state(&self.rate_limiter, "rate_limiter") = Some(rl);
     }
 
-    fn rate_limit_allows(&self, bytes: u64) -> bool {
-        match self.lock_state(&self.rate_limiter, "rate_limiter").as_mut() {
-            Some(rl) => rl.try_charge(1, bytes),
-            None => true,
-        }
+    fn rate_limit_allows(&self, bytes: u64) -> Result<bool, MmioError> {
+        Ok(
+            match self
+                .try_lock_state(&self.rate_limiter, "rate_limiter")?
+                .as_mut()
+            {
+                Some(rl) => rl.try_charge(1, bytes),
+                None => true,
+            },
+        )
     }
 
     fn read_descs(mem: &GuestMemoryMmap, descs: &[(u64, u32)]) -> Option<Vec<u8>> {
@@ -395,20 +483,21 @@ impl VirtioBlkMmio {
     }
 
     /// Process the virtqueue when the guest kicks (writes to QUEUE_NOTIFY).
-    fn process_queue(&self, _queue_idx: u32) {
-        let mem = match self.lock_state(&self.guest_mem, "guest_mem").clone() {
+    fn process_queue(&self, _queue_idx: u32) -> MmioWriteResult {
+        self.ensure_operational()?;
+        let mem = match self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() {
             Some(m) => m,
             None => {
                 log::debug!("BLK process_queue: guest_mem is None");
-                return;
+                return Ok(());
             }
         };
-        let dirty = self.lock_state(&self.host_dirty, "host_dirty").clone();
+        let dirty = self.try_lock_state(&self.host_dirty, "host_dirty")?.clone();
 
-        let qs = self.lock_state(&self.queues, "queues");
+        let qs = self.try_lock_state(&self.queues, "queues")?;
         let Some(q) = qs.first() else {
             log::error!("BLK process_queue: missing queue 0 in restored state");
-            return;
+            return Ok(());
         };
         if !q.ready || !q.valid_size() {
             log::debug!(
@@ -416,7 +505,7 @@ impl VirtioBlkMmio {
                 q.ready,
                 q.size
             );
-            return;
+            return Ok(());
         }
 
         let config = QueueConfig {
@@ -429,18 +518,19 @@ impl VirtioBlkMmio {
         drop(qs);
 
         // Get or create the persistent processor.
-        let mut proc_guard = self.lock_state(&self.processor, "processor");
+        let mut proc_guard = self.try_lock_state(&self.processor, "processor")?;
         if proc_guard.is_none() {
             *proc_guard = Some(VirtQueueProcessor::new(config));
         } else {
             proc_guard.as_mut().unwrap().update_config(config);
         }
 
-        let mut backend_guard = self.lock_state(&self.backend, "backend");
+        let mut backend_guard = self.try_lock_state(&self.backend, "backend")?;
         if backend_guard.is_none() {
-            return;
+            return Ok(());
         }
         let backend = backend_guard.as_mut().unwrap();
+        let mut processing_failed = false;
 
         // Process available requests until the queue is drained or the limiter
         // asks us to defer the next descriptor chain.
@@ -452,8 +542,13 @@ impl VirtioBlkMmio {
                 let readable = match Self::read_descs(&mem, readable) {
                     Some(data) => data,
                     None => {
-                        if !self.rate_limit_allows(0) {
-                            return None;
+                        match self.rate_limit_allows(0) {
+                            Ok(true) => {}
+                            Ok(false) => return None,
+                            Err(_) => {
+                                processing_failed = true;
+                                return None;
+                            }
                         }
                         Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
                         return Some(used_len);
@@ -462,8 +557,13 @@ impl VirtioBlkMmio {
 
                 // Parse the virtio-blk request header from the first readable descriptor.
                 if readable.len() < 16 {
-                    if !self.rate_limit_allows(0) {
-                        return None;
+                    match self.rate_limit_allows(0) {
+                        Ok(true) => {}
+                        Ok(false) => return None,
+                        Err(_) => {
+                            processing_failed = true;
+                            return None;
+                        }
                     }
                     Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
                     return Some(used_len);
@@ -484,8 +584,13 @@ impl VirtioBlkMmio {
                             "handler: failed to parse header, readable.len()={}",
                             readable.len()
                         );
-                        if !self.rate_limit_allows(0) {
-                            return None;
+                        match self.rate_limit_allows(0) {
+                            Ok(true) => {}
+                            Ok(false) => return None,
+                            Err(_) => {
+                                processing_failed = true;
+                                return None;
+                            }
                         }
                         Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
                         return Some(used_len);
@@ -495,15 +600,25 @@ impl VirtioBlkMmio {
                 let request_bytes = match Self::request_bytes(&header, readable.len(), writable) {
                     Some(bytes) => bytes,
                     None => {
-                        if !self.rate_limit_allows(0) {
-                            return None;
+                        match self.rate_limit_allows(0) {
+                            Ok(true) => {}
+                            Ok(false) => return None,
+                            Err(_) => {
+                                processing_failed = true;
+                                return None;
+                            }
                         }
                         Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
                         return Some(used_len);
                     }
                 };
-                if !self.rate_limit_allows(request_bytes) {
-                    return None;
+                match self.rate_limit_allows(request_bytes) {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(_) => {
+                        processing_failed = true;
+                        return None;
+                    }
                 }
 
                 // For IN (read): the writable buffer is the data buffer + status byte.
@@ -547,7 +662,12 @@ impl VirtioBlkMmio {
         // If we processed any requests, signal an interrupt to the guest.
         if _count > 0 {
             log::debug!("BLK process_queue: processed {_count} request(s)");
-            self.trigger_interrupt();
+            self.trigger_interrupt()?;
+        }
+        if processing_failed || self.is_failed() {
+            Err(MmioError::Device)
+        } else {
+            Ok(())
         }
     }
 }
@@ -556,21 +676,12 @@ impl Persist for VirtioBlkMmio {
     type State = VirtioBlkMmioState;
 
     fn save(&self) -> Self::State {
-        VirtioBlkMmioState {
-            status: self.status.load(Ordering::Relaxed),
-            queue_sel: self.queue_sel.load(Ordering::Relaxed),
-            host_features_sel: self.host_features_sel.load(Ordering::Relaxed),
-            guest_features_sel: self.guest_features_sel.load(Ordering::Relaxed),
-            guest_features_low: self.guest_features_low.load(Ordering::Relaxed),
-            guest_features_high: self.guest_features_high.load(Ordering::Relaxed),
-            queues: self.lock_state(&self.queues, "queues").clone(),
-            activated: self.activated.load(Ordering::Relaxed),
-            interrupt_status: self.interrupt_status.load(Ordering::SeqCst),
-            processor: self
-                .lock_state(&self.processor, "processor")
-                .as_ref()
-                .map(VirtQueueProcessor::save_state),
-        }
+        self.snapshot_state()
+            .expect("virtio-blk state is unavailable")
+    }
+
+    fn try_save(&self) -> Result<Self::State, PersistError> {
+        self.snapshot_state()
     }
 
     fn restore(&mut self, state: Self::State) {
@@ -604,6 +715,10 @@ impl Persist for std::sync::Arc<VirtioBlkMmio> {
 
     fn save(&self) -> Self::State {
         self.as_ref().save()
+    }
+
+    fn try_save(&self) -> Result<Self::State, PersistError> {
+        self.as_ref().try_save()
     }
 
     fn restore(&mut self, state: Self::State) {
@@ -769,24 +884,14 @@ impl MmioDevice for VirtioBlkMmio {
     fn mmio_write(&self, off: u64, val: u64, _len: u8) -> MmioWriteResult {
         let val = val as u32;
         log::debug!("BLK-W off=0x{off:x} val=0x{val:x}");
+        if self.is_failed() && !(off == reg::STATUS && val == 0) {
+            return Err(MmioError::Device);
+        }
         match off {
             reg::STATUS => {
                 self.status_writes.fetch_add(1, Ordering::Relaxed);
                 if val == 0 {
-                    // Spec §4.2.3.1: writing 0 triggers a device reset. Clear
-                    // all negotiated state so a re-probe starts clean.
-                    self.status.store(0, Ordering::SeqCst);
-                    self.activated.store(false, Ordering::SeqCst);
-                    self.host_features_sel.store(0, Ordering::SeqCst);
-                    self.guest_features_sel.store(0, Ordering::SeqCst);
-                    self.guest_features_low.store(0, Ordering::SeqCst);
-                    self.guest_features_high.store(0, Ordering::SeqCst);
-                    self.queue_sel.store(0, Ordering::SeqCst);
-                    self.interrupt_status.store(0, Ordering::SeqCst);
-                    for q in self.lock_state(&self.queues, "queues").iter_mut() {
-                        *q = QueueState::default();
-                    }
-                    *self.lock_state(&self.processor, "processor") = None;
+                    self.reset();
                     return Ok(());
                 }
                 self.status.store(val, Ordering::Relaxed);
@@ -879,7 +984,7 @@ impl MmioDevice for VirtioBlkMmio {
             reg::QUEUE_NOTIFY => {
                 // THE CRITICAL PATH: guest kicked the queue — process I/O.
                 self.notify_count.fetch_add(1, Ordering::Relaxed);
-                self.process_queue(val);
+                return self.process_queue(val);
             }
             reg::INTERRUPT_ACK => {
                 // Driver acknowledges interrupt — clear the acknowledged bits.
@@ -964,6 +1069,13 @@ mod tests {
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20_000)]).unwrap(),
         ));
         assert_ne!(dev.current_status() & status_bits::FAILED, 0);
+        assert!(dev.process_queue(0).is_err());
+        assert!(Persist::try_save(dev.as_ref()).is_err());
+        assert!(dev.mmio_write(reg::QUEUE_NOTIFY, 0, 4).is_err());
+
+        dev.mmio_write(reg::STATUS, 0, 4).unwrap();
+        assert_eq!(dev.current_status(), 0);
+        assert!(Persist::try_save(dev.as_ref()).is_ok());
 
         let _ = std::fs::remove_file(path);
     }
@@ -1120,7 +1232,7 @@ mod tests {
         configure_test_blk_queue(&dev, mem.clone());
         setup_blk_out_requests(&mem, 2);
 
-        dev.process_queue(0);
+        dev.process_queue(0).unwrap();
 
         assert_eq!(used_idx(&mem), 2);
         std::fs::remove_file(path).unwrap();
@@ -1136,14 +1248,14 @@ mod tests {
         configure_test_blk_queue(&dev, mem.clone());
         setup_blk_out_requests(&mem, 2);
 
-        dev.process_queue(0);
+        dev.process_queue(0).unwrap();
         assert_eq!(used_idx(&mem), 1);
 
-        dev.process_queue(0);
+        dev.process_queue(0).unwrap();
         assert_eq!(used_idx(&mem), 1);
 
         clock.advance(1_000_000_000);
-        dev.process_queue(0);
+        dev.process_queue(0).unwrap();
         assert_eq!(used_idx(&mem), 2);
         std::fs::remove_file(path).unwrap();
     }
@@ -1163,7 +1275,7 @@ mod tests {
             .unwrap();
         setup_blk_out_requests(&mem, 2);
 
-        dev.process_queue(0);
+        dev.process_queue(0).unwrap();
         assert_eq!(used_idx(&mem), 1);
 
         let state = dev.save();
@@ -1194,7 +1306,7 @@ mod tests {
             TEST_USED
         );
 
-        restored.process_queue(0);
+        restored.process_queue(0).unwrap();
         assert_eq!(used_idx(&mem), 2);
         std::fs::remove_file(path).unwrap();
     }
@@ -1223,7 +1335,7 @@ mod tests {
         dev.mmio_write(reg::QUEUE_READY, 1, 4).unwrap();
         dev.mmio_write(reg::STATUS, status_bits::DRIVER_OK as u64, 4)
             .unwrap();
-        dev.trigger_interrupt();
+        dev.trigger_interrupt().unwrap();
 
         let state = dev.save();
         let mut restored = VirtioBlkMmio::new_stub(5, 2);

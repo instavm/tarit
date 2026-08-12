@@ -180,19 +180,28 @@ fn run(
         }
 
         if n == 0 {
-            device.pump_host_streams();
+            if let Err(error) = device.pump_host_streams() {
+                log::error!("vsock pump: device failed: {error}");
+                break;
+            }
             continue;
         }
 
         if pfds[0].revents != 0 {
             drain_eventfd(tx_kick_fd, "tx_kick");
-            device.process_tx_queue();
+            if let Err(error) = device.process_tx_queue() {
+                log::error!("vsock pump: TX device failure: {error}");
+                break;
+            }
         }
         if pfds[1].revents != 0 {
             drain_eventfd(wake_fd, "wake");
         }
 
-        device.pump_host_streams();
+        if let Err(error) = device.pump_host_streams() {
+            log::error!("vsock pump: device failed: {error}");
+            break;
+        }
     }
 }
 

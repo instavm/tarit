@@ -534,7 +534,7 @@ impl VmmController {
             // vCPU register+MSR+LAPIC state (BSP + each AP for SMP). If nothing was
             // captured (e.g. a VM that never ran), the blob is written unchanged.
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-            capture_live_state(vm);
+            capture_live_state(vm)?;
 
             // Write guest memory. When `diff` is requested and we have a parent
             // snapshot + KVM dirty logging on, write an INCREMENTAL snapshot: only
@@ -1000,8 +1000,8 @@ impl VmmController {
             &snapshot_config,
             &quiesce,
             || {
-                Ok(capture_live_state_blob(&running, &base_blob)
-                    .unwrap_or_else(|| base_blob.clone()))
+                capture_live_state_blob(&running, &base_blob)
+                    .map(|captured| captured.unwrap_or_else(|| base_blob.clone()))
             },
         );
 
@@ -1889,16 +1889,17 @@ fn resume_running_vcpus(vm: &VmInstance) {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn capture_live_state(vm: &mut VmInstance) {
+fn capture_live_state(vm: &mut VmInstance) -> Result<()> {
     let Some(running) = vm.running.as_ref() else {
-        return;
+        return Ok(());
     };
     let Some(existing) = vm.state_blob.as_deref() else {
-        return;
+        return Ok(());
     };
-    if let Some(blob) = capture_live_state_blob(running, existing) {
+    if let Some(blob) = capture_live_state_blob(running, existing)? {
         vm.state_blob = Some(blob);
     }
+    Ok(())
 }
 
 /// Fold the vCPU registers and device state captured during the current pause
@@ -1910,13 +1911,16 @@ fn capture_live_state(vm: &mut VmInstance) {
 /// `existing` is not a parseable state blob, in which case the caller should
 /// keep using `existing` unchanged.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Option<Vec<u8>> {
-    let captured = running
+fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Option<Vec<u8>>> {
+    let Some(captured) = running
         .vcpu_thread
         .captured_state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()?;
+        .clone()
+    else {
+        return Ok(None);
+    };
     let ap_captured: Option<Vec<Vec<u8>>> = {
         let mut v = Vec::with_capacity(running.ap_threads.len());
         let mut all = true;
@@ -1942,14 +1946,18 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Option<Vec<u
         .ok()
         .and_then(|s| postcard::to_allocvec(&s).ok());
     let serial_state = vmm_devices::persist::Persist::save(&*running.vcpu_thread.serial);
-    let virtio_blk = capture_virtio_blk_states(&running.blk_devices);
-    let virtio_net = capture_virtio_net_states(&running.net_devices);
+    let virtio_blk = capture_virtio_blk_states(&running.blk_devices)?;
+    let virtio_net = capture_virtio_net_states(&running.net_devices)?;
     let vsock_state = running
         .vsock_pump
         .as_ref()
-        .map(|p| vmm_devices::persist::Persist::save(&*p.device));
+        .map(|p| vmm_devices::persist::Persist::try_save(&*p.device))
+        .transpose()
+        .map_err(|error| VmmError::Snapshot(format!("capture virtio-vsock state: {error}")))?;
 
-    let mut b = postcard::from_bytes::<StateBlob>(existing).ok()?;
+    let Ok(mut b) = postcard::from_bytes::<StateBlob>(existing) else {
+        return Ok(None);
+    };
     b.vcpu_full = Some(captured);
     b.vcpu_full_aps = ap_captured.unwrap_or_default();
     b.vm_full = vm_state;
@@ -1957,7 +1965,9 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Option<Vec<u
     b.virtio_blk = virtio_blk;
     b.virtio_net = virtio_net;
     b.vsock = vsock_state;
-    postcard::to_allocvec(&b).ok()
+    postcard::to_allocvec(&b)
+        .map(Some)
+        .map_err(|error| VmmError::Snapshot(format!("serialize live device state: {error}")))
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -1970,7 +1980,7 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
     let paused_here = pause_running_vcpus(vm);
     vm.state = VmState::Paused;
     let result = (|| -> Result<()> {
-        capture_live_state(vm);
+        capture_live_state(vm)?;
 
         let guest_mem = vm
             .guest_mem
@@ -3618,28 +3628,30 @@ fn save_vcpu_state(vcpu: &kvm_ioctls::VcpuFd) -> Result<VcpuStateSave> {
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn capture_virtio_blk_states(
     devs: &[Arc<vmm_devices::virtio::blk_transport::VirtioBlkMmio>],
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     devs.iter()
-        .map(|dev| vmm_devices::persist::Persist::save(&**dev))
-        .filter_map(
-            |state: vmm_devices::virtio::blk_transport::VirtioBlkMmioState| {
-                postcard::to_allocvec(&state).ok()
-            },
-        )
+        .map(|dev| {
+            let state = vmm_devices::persist::Persist::try_save(&**dev).map_err(|error| {
+                VmmError::Snapshot(format!("capture virtio-blk state: {error}"))
+            })?;
+            postcard::to_allocvec(&state)
+                .map_err(|error| VmmError::Snapshot(format!("serialize virtio-blk state: {error}")))
+        })
         .collect()
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn capture_virtio_net_states(
     devs: &[Arc<vmm_devices::virtio::net_transport::VirtioNetMmio>],
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>> {
     devs.iter()
-        .map(|dev| vmm_devices::persist::Persist::save(&**dev))
-        .filter_map(
-            |state: vmm_devices::virtio::net_transport::VirtioNetMmioState| {
-                postcard::to_allocvec(&state).ok()
-            },
-        )
+        .map(|dev| {
+            let state = vmm_devices::persist::Persist::try_save(&**dev).map_err(|error| {
+                VmmError::Snapshot(format!("capture virtio-net state: {error}"))
+            })?;
+            postcard::to_allocvec(&state)
+                .map_err(|error| VmmError::Snapshot(format!("serialize virtio-net state: {error}")))
+        })
         .collect()
 }
 
@@ -3894,7 +3906,9 @@ fn build_running_vm(
     // already re-accepts the new connection). Done here, post-resume, so the RX
     // completion interrupt lands on a running vCPU instead of a paused LAPIC.
     if let Some((dev, conns)) = vsock_reset {
-        let resets = dev.reset_restored_connections(&conns);
+        let resets = dev
+            .reset_restored_connections(&conns)
+            .map_err(|error| VmmError::Device(format!("reset restored vsock streams: {error}")))?;
         if resets > 0 {
             log::info!("vsock restore: injected RST for {resets} restored stream(s)");
         }
