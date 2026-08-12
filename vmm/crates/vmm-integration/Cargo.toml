@@ -71,5 +71,10 @@ required-features = ["kvm"]
 name = "virtio_net_e2e"
 path = "virtio_net_e2e.rs"
 
+[[test]]
+name = "vsock_exec_transport"
+path = "vsock_exec_transport.rs"
+required-features = ["kvm"]
+
 [lints]
 workspace = true

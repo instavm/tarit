@@ -165,6 +165,59 @@ impl OwnedScratchFile {
         &self._file
     }
 
+    /// Atomically publish this owned file at an unused `target`, updating the
+    /// tracked path while retaining ownership of the same inode.
+    pub fn rename_to(&mut self, target: impl Into<PathBuf>) -> io::Result<()> {
+        let target = target.into();
+        if self.path == target {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            sync_directory(parent)?;
+        }
+        rename_noreplace(&self.path, &target)?;
+        self.path = target;
+        if let Some(parent) = self.path.parent() {
+            sync_directory(parent)?;
+        }
+
+        #[cfg(target_os = "linux")]
+        fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+
+            let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL")
+            })?;
+            let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "target path contains NUL")
+            })?;
+            // SAFETY: both paths are valid NUL-terminated strings and renameat2 does
+            // not retain their pointers after the syscall returns.
+            let result = unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    source.as_ptr(),
+                    libc::AT_FDCWD,
+                    target.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+            fs::hard_link(source, target)?;
+            fs::remove_file(source)
+        }
+        Ok(())
+    }
+
     /// Remove the file if it still points at the inode this VM created.
     pub fn remove(&self) -> io::Result<bool> {
         if !self.still_points_to_owned_file()? {
@@ -370,6 +423,11 @@ fn file_identity(metadata: fs::Metadata) -> ScratchIdentity {
         created_secs,
         created_nanos,
     }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let dir = File::open(path)?;
+    dir.sync_all()
 }
 
 #[cfg(target_os = "linux")]

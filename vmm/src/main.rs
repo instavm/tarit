@@ -24,11 +24,28 @@
 //! the full request schema.
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod kernel_install;
 
 const DEFAULT_CPU_PERIOD_US: u64 = 100_000;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum RestoreMemoryPolicyArg {
+    Auto,
+    Eager,
+    Lazy,
+}
+
+impl From<RestoreMemoryPolicyArg> for vmm_api::types::RestoreMemoryPolicy {
+    fn from(value: RestoreMemoryPolicyArg) -> Self {
+        match value {
+            RestoreMemoryPolicyArg::Auto => Self::Auto,
+            RestoreMemoryPolicyArg::Eager => Self::Eager,
+            RestoreMemoryPolicyArg::Lazy => Self::Lazy,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -76,6 +93,14 @@ struct ServeCgroupArgs {
     #[arg(long, value_name = "N", value_parser = parse_positive_u64, requires = "cgroup")]
     cgroup_pids_max: Option<u64>,
 
+    /// io.weight limit for the served VM process.
+    #[arg(long, value_name = "WEIGHT", value_parser = parse_positive_u64, requires = "cgroup")]
+    cgroup_io_weight: Option<u64>,
+
+    /// io.max limit(s) for the served VM process, e.g. `8:0 rbps=1048576 wbps=1048576`.
+    #[arg(long, value_name = "RULE", requires = "cgroup")]
+    cgroup_io_max: Option<String>,
+
     /// cpuset.cpus limit for the served VM process, e.g. 0-3 or 0,2.
     #[arg(long, value_name = "CPUS", requires = "cgroup")]
     cpuset: Option<String>,
@@ -88,6 +113,8 @@ impl ServeCgroupArgs {
             cpuset_cpus: self.cpuset.clone(),
             memory_max: self.cgroup_memory_max,
             pids_max: self.cgroup_pids_max,
+            io_weight: self.cgroup_io_weight,
+            io_max: self.cgroup_io_max.clone(),
             ..Default::default()
         };
         (!limits.is_empty()).then_some(limits)
@@ -300,6 +327,10 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         snapshot: String,
 
+        /// Restore memory backend policy.
+        #[arg(long, default_value = "auto", value_enum)]
+        memory_policy: RestoreMemoryPolicyArg,
+
         /// Enable jailer confinement (chroot + namespaces + privilege drop).
         #[arg(long, value_name = "CHROOT_DIR")]
         jail: Option<String>,
@@ -501,10 +532,11 @@ fn main() -> Result<()> {
         ),
         Cmd::Restore {
             snapshot,
+            memory_policy,
             jail,
             uid,
             gid,
-        } => restore(snapshot, jail, uid, gid),
+        } => restore(snapshot, memory_policy, jail, uid, gid),
         Cmd::Serve {
             jail,
             uid,
@@ -981,7 +1013,13 @@ fn boot_on_kvm(
     let _ = vcpus;
     Ok(())
 }
-fn restore(snapshot: String, jail_dir: Option<String>, uid: u32, gid: u32) -> Result<()> {
+fn restore(
+    snapshot: String,
+    memory_policy: RestoreMemoryPolicyArg,
+    jail_dir: Option<String>,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
     // Apply jailer confinement before restoring, if requested.
     #[cfg(target_os = "linux")]
     if let Some(chroot_dir) = &jail_dir {
@@ -1006,7 +1044,7 @@ fn restore(snapshot: String, jail_dir: Option<String>, uid: u32, gid: u32) -> Re
     log::info!("restore: snapshot={snapshot}");
     let controller = vmm_core::VmmController::new();
     controller
-        .restore(&snapshot, None)
+        .restore_with_overrides(&snapshot, None, None, memory_policy.into())
         .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
     println!("Restored VM from {snapshot}");
     Ok(())
@@ -1537,6 +1575,10 @@ mod tests {
             "1000m",
             "--cgroup-pids-max",
             "64",
+            "--cgroup-io-weight",
+            "500",
+            "--cgroup-io-max",
+            "8:0 rbps=1048576 wbps=2097152",
             "--cpuset",
             "0-1",
         ])
@@ -1550,6 +1592,8 @@ mod tests {
                     Some(vmm_jailer::cgroups::CgroupLimits {
                         cpu_max: Some("100000 100000".into()),
                         cpuset_cpus: Some("0-1".into()),
+                        io_max: Some("8:0 rbps=1048576 wbps=2097152".into()),
+                        io_weight: Some(500),
                         memory_max: Some(536_870_912),
                         pids_max: Some(64),
                         ..Default::default()

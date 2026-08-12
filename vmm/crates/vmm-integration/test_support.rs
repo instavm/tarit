@@ -76,8 +76,8 @@ pub fn guest_stdout(controller: &VmmController, command: &str) -> String {
     let started = std::time::Instant::now();
     loop {
         match controller.exec(command, 30_000) {
-            Ok((0, output, _)) => return output,
-            Ok((code, output, stderr)) => {
+            Ok((0, output, _, _)) => return output,
+            Ok((code, output, stderr, _)) => {
                 panic!("guest command failed ({code}): {command}: {output}{stderr}")
             }
             Err(error) if started.elapsed() < std::time::Duration::from_secs(90) => {
@@ -93,8 +93,8 @@ pub fn assert_guest_exec(controller: &VmmController, command: &str, expected: &s
     let started = std::time::Instant::now();
     loop {
         match controller.exec(command, 5_000) {
-            Ok((code, output, _)) => {
-                assert_eq!(code, 0, "guest command failed: {command}: {output}");
+            Ok((code, output, stderr, _)) => {
+                assert_eq!(code, 0, "guest command failed: {command}: {output}{stderr}");
                 assert!(
                     output.contains(expected),
                     "guest command returned no {expected:?} marker: {output}"

@@ -106,15 +106,13 @@ if [[ -f "\$PID_FILE" ]]; then
 fi
 
 cd $ORCH_DIR_Q
-cargo build --release -p taritd
+cargo build --release --locked -p taritd
 
-# Ensure vmm exists (reuse or build)
-if [[ ! -x $VMM_DIR_Q/target/release/vmm ]]; then
-  (
-    cd $VMM_DIR_Q
-    cargo build --release --features boot
-  )
-fi
+# Always rebuild after rsync so E2E exercises the exact candidate source.
+(
+  cd $VMM_DIR_Q
+  cargo build --release --locked --features boot
+)
 cd $ORCH_DIR_Q
 
 export TARIT_API_KEY=$API_KEY_Q

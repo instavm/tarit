@@ -584,7 +584,7 @@ impl VmmClient {
     /// Restore a VM from a snapshot file into this (freshly spawned) `vmm serve`
     /// process, resuming it to a running state.
     pub fn restore(&self, snapshot_path: &str, overlay: Option<String>) -> Result<(), VmmError> {
-        self.restore_with_network_override(snapshot_path, overlay, None)
+        self.restore_with_options(snapshot_path, overlay, None, RestoreMemoryPolicy::Auto)
     }
 
     /// Restore while replacing every host-network binding saved in the
@@ -596,12 +596,32 @@ impl VmmClient {
         overlay: Option<String>,
         net: Option<Vec<NetConfig>>,
     ) -> Result<(), VmmError> {
+        self.restore_with_options(snapshot_path, overlay, net, RestoreMemoryPolicy::Auto)
+    }
+
+    /// Restore with an explicit memory backend policy. `auto` preserves the
+    /// historical behavior; `eager` and `lazy` force that exact restore path.
+    pub fn restore_with_options(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net: Option<Vec<NetConfig>>,
+        memory_policy: RestoreMemoryPolicy,
+    ) -> Result<(), VmmError> {
         match self.request_ok(&ApiRequest::Restore {
             snapshot_path: snapshot_path.to_string(),
             overlay,
             net,
+            memory_policy,
         })? {
             ApiResponse::Restored | ApiResponse::Ok => Ok(()),
+            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
+        }
+    }
+
+    pub fn repair_guest_network(&self, network: GuestNetworkRepair) -> Result<(), VmmError> {
+        match self.request_ok(&ApiRequest::RepairGuestNetwork { network })? {
+            ApiResponse::GuestNetworkRepaired | ApiResponse::Ok => Ok(()),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
     }
@@ -655,6 +675,26 @@ mod tests {
                 .with_request_timeout(Duration::from_millis(200))
                 .request_timeout,
             Some(Duration::from_millis(200))
+        );
+    }
+
+    #[test]
+    fn restore_request_round_trips_with_lazy_memory_policy() {
+        let req = ApiRequest::Restore {
+            snapshot_path: "/snapshots/golden.snap".into(),
+            overlay: None,
+            net: None,
+            memory_policy: RestoreMemoryPolicy::Lazy,
+        };
+
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "op": "restore",
+                "snapshot_path": "/snapshots/golden.snap",
+                "memory_policy": "lazy",
+            })
         );
     }
 
@@ -775,6 +815,7 @@ mod tests {
             snapshot_path: "/snapshots/golden.snap".into(),
             overlay: None,
             net: None,
+            memory_policy: RestoreMemoryPolicy::Auto,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -792,10 +833,12 @@ mod tests {
                 snapshot_path,
                 overlay,
                 net,
+                memory_policy,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
                 assert_eq!(overlay, None);
                 assert!(net.is_none());
+                assert_eq!(memory_policy, RestoreMemoryPolicy::Auto);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -807,6 +850,7 @@ mod tests {
             snapshot_path: "/snapshots/golden.snap".into(),
             overlay: Some("/overlays/clone.cow".into()),
             net: None,
+            memory_policy: RestoreMemoryPolicy::Auto,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -825,10 +869,12 @@ mod tests {
                 snapshot_path,
                 overlay,
                 net,
+                memory_policy,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
                 assert_eq!(overlay, Some("/overlays/clone.cow".into()));
                 assert!(net.is_none());
+                assert_eq!(memory_policy, RestoreMemoryPolicy::Auto);
             }
             other => panic!("unexpected request: {other:?}"),
         }

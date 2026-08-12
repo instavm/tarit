@@ -12,6 +12,15 @@ use serde::{Deserialize, Serialize};
 /// contract cannot drift between them.
 pub const MAX_API_FRAME_LEN: usize = 16 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreMemoryPolicy {
+    #[default]
+    Auto,
+    Eager,
+    Lazy,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmSpec {
     pub config: VmConfig,
@@ -29,6 +38,16 @@ pub struct ScratchIdentity {
     pub created_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_nanos: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestNetworkRepair {
+    pub addr: String,
+    pub prefix: u8,
+    pub gateway: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +82,14 @@ pub enum ApiRequest {
         /// preventing stale tap/IP reuse.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         net: Option<Vec<NetConfig>>,
+        /// Restore memory backend policy. `auto` prefers UFFD-lazy restore for
+        /// full snapshots and falls back to eager replay when needed; `eager`
+        /// and `lazy` require that exact behavior.
+        #[serde(default, skip_serializing_if = "is_default_restore_memory_policy")]
+        memory_policy: RestoreMemoryPolicy,
+    },
+    RepairGuestNetwork {
+        network: GuestNetworkRepair,
     },
     Stop,
     /// Execute a command in the guest.
@@ -88,6 +115,10 @@ pub enum ApiRequest {
     Status,
 }
 
+fn is_default_restore_memory_policy(policy: &RestoreMemoryPolicy) -> bool {
+    *policy == RestoreMemoryPolicy::Auto
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ApiResponse {
@@ -96,6 +127,7 @@ pub enum ApiResponse {
         path: String,
     },
     Restored,
+    GuestNetworkRepaired,
     Exec {
         exit_code: i32,
         stdout: String,
@@ -304,10 +336,12 @@ mod tests {
                 snapshot_path,
                 overlay,
                 net,
+                memory_policy,
             } => {
                 assert_eq!(snapshot_path, "/golden.snap");
                 assert_eq!(overlay, None);
                 assert!(net.is_none());
+                assert_eq!(memory_policy, RestoreMemoryPolicy::Auto);
             }
             _ => panic!("expected restore"),
         }
@@ -319,6 +353,7 @@ mod tests {
             snapshot_path: "/golden.snap".into(),
             overlay: Some("/clones/a.cow".into()),
             net: None,
+            memory_policy: RestoreMemoryPolicy::Auto,
         };
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -332,6 +367,7 @@ mod tests {
                 snapshot_path,
                 overlay: Some(overlay),
                 net: None,
+                memory_policy: RestoreMemoryPolicy::Auto,
             } if snapshot_path == "/golden.snap" && overlay == "/clones/a.cow"
         ));
     }
@@ -347,13 +383,60 @@ mod tests {
                 guest_ip: Some("10.0.0.3".into()),
                 port_forwards: Vec::new(),
             }]),
+            memory_policy: RestoreMemoryPolicy::Auto,
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             back,
-            ApiRequest::Restore { net: Some(net), .. }
+            ApiRequest::Restore {
+                net: Some(net),
+                memory_policy: RestoreMemoryPolicy::Auto,
+                ..
+            }
                 if net.len() == 1 && net[0].tap == "tap-new"
+        ));
+    }
+
+    #[test]
+    fn request_restore_round_trips_non_default_memory_policy() {
+        let r = ApiRequest::Restore {
+            snapshot_path: "/golden.snap".into(),
+            overlay: None,
+            net: None,
+            memory_policy: RestoreMemoryPolicy::Lazy,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""memory_policy":"lazy""#));
+        let back: ApiRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            ApiRequest::Restore {
+                memory_policy: RestoreMemoryPolicy::Lazy,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn request_guest_network_repair_round_trips() {
+        let request = ApiRequest::RepairGuestNetwork {
+            network: GuestNetworkRepair {
+                addr: "10.0.0.2".into(),
+                prefix: 30,
+                gateway: "10.0.0.1".into(),
+                dns_servers: vec!["1.1.1.1".into(), "8.8.8.8".into()],
+            },
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let back: ApiRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            ApiRequest::RepairGuestNetwork { network }
+                if network.addr == "10.0.0.2"
+                    && network.prefix == 30
+                    && network.gateway == "10.0.0.1"
+                    && network.dns_servers.len() == 2
         ));
     }
 
@@ -363,6 +446,7 @@ mod tests {
             ApiResponse::Ok,
             ApiResponse::Snapshot { path: "/p".into() },
             ApiResponse::Restored,
+            ApiResponse::GuestNetworkRepaired,
             ApiResponse::Err { msg: "bad".into() },
         ] {
             let s = serde_json::to_string(&r).unwrap();

@@ -221,6 +221,27 @@ fn remove_owned_scratch_file(file: &OwnedScratchFile) {
     }
 }
 
+fn replay_consumed_dirty(vm: &VmInstance, dirty: Option<&vmm_memory_backend::dirty::DirtyBitmap>) {
+    let (Some(guest_mem), Some(dirty)) = (vm.guest_mem.as_ref(), dirty) else {
+        return;
+    };
+    for pfn in dirty.dirty_pfns() {
+        guest_mem.mark_host_dirty(pfn.saturating_mul(4096), 4096);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn replay_live_snapshot_dirty(
+    controller: &VmmController,
+    generation: u64,
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+) {
+    let slot = controller.lock();
+    if let Some(vm) = slot.as_ref().filter(|vm| vm.generation == generation) {
+        replay_consumed_dirty(vm, Some(dirty));
+    }
+}
+
 #[cfg(any(
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
@@ -289,12 +310,60 @@ impl Drop for OwnedOverlayGuard {
 /// The VMM controller — owns at most one VM (1:1 process model).
 pub struct VmmController {
     vm: Arc<Mutex<Option<VmInstance>>>,
+    lifecycle: Mutex<Option<LifecycleOp>>,
+}
+
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")),
+    allow(dead_code)
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleOp {
+    Create,
+    Snapshot,
+    LiveSnapshot,
+    Restore,
+    Suspend,
+    Pause,
+    Resume,
+    Stop,
+}
+
+impl LifecycleOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Snapshot => "snapshot",
+            Self::LiveSnapshot => "live_snapshot",
+            Self::Restore => "restore",
+            Self::Suspend => "suspend",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LifecycleGuard<'a> {
+    state: &'a Mutex<Option<LifecycleOp>>,
+    op: LifecycleOp,
+}
+
+impl Drop for LifecycleGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.as_ref() == Some(&self.op) {
+            *state = None;
+        }
+    }
 }
 
 impl VmmController {
     pub fn new() -> Self {
         Self {
             vm: Arc::new(Mutex::new(None)),
+            lifecycle: Mutex::new(None),
         }
     }
 
@@ -307,8 +376,25 @@ impl VmmController {
         self.vm.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn begin_lifecycle(&self, op: LifecycleOp) -> Result<LifecycleGuard<'_>> {
+        let mut state = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(active) = *state {
+            return Err(VmmError::InvalidConfig(format!(
+                "lifecycle operation already in progress: {}",
+                active.as_str()
+            )));
+        }
+        *state = Some(op);
+        drop(state);
+        Ok(LifecycleGuard {
+            state: &self.lifecycle,
+            op,
+        })
+    }
+
     /// Boot the single VM. Error if one already exists.
     pub fn create(&self, config: VmConfig) -> Result<()> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Create)?;
         config.validate()?;
         let mut slot = self.lock();
         if slot.is_some() {
@@ -417,6 +503,7 @@ impl VmmController {
     }
 
     pub fn snapshot(&self, diff: bool) -> Result<String> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Snapshot)?;
         let mut slot = self.lock();
         let vm = slot
             .as_mut()
@@ -424,8 +511,7 @@ impl VmmController {
 
         let path_buf = unique_scratch_snapshot_path("vmm-snap")?;
         let path = path_buf.to_string_lossy().into_owned();
-        let owned_snapshot = OwnedScratchFile::create_new(&path_buf)
-            .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}")))?;
+        let mut owned_snapshot = staged_owned_output(&path_buf)?;
 
         let state_before = vm.state;
 
@@ -436,6 +522,10 @@ impl VmmController {
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let paused_here = pause_running_vcpus(vm);
 
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let mut consumed_dirty = None;
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let consumed_dirty = None;
         let snapshot_result = (|| -> Result<usize> {
             // Fold the vCPU state each thread captured during the pause above into
             // the stored state blob, so this snapshot is faithfully resumable (not
@@ -491,6 +581,7 @@ impl VmmController {
                         let host_dirty = guest_mem.drain_host_dirty();
                         dirty.merge(&host_dirty);
                     }
+                    consumed_dirty = Some(dirty.clone());
                     let parent = vm.last_snapshot.clone().unwrap_or_default();
                     write_scratch_diff_snapshot_file(
                         &owned_snapshot,
@@ -514,16 +605,19 @@ impl VmmController {
                         Some(r) => {
                             let ok = r.kvm_vm.enable_dirty_logging().is_ok();
                             if ok {
-                                let _ = r.kvm_vm.read_dirty();
+                                if let Ok(mut dirty) = r.kvm_vm.read_dirty() {
+                                    if let Some(guest_mem) = vm.guest_mem.as_ref() {
+                                        let host_dirty = guest_mem.drain_host_dirty();
+                                        dirty.merge(&host_dirty);
+                                    }
+                                    consumed_dirty = Some(dirty);
+                                }
                             }
                             ok
                         }
                         None => false,
                     };
                     if enabled {
-                        if let Some(guest_mem) = vm.guest_mem.as_ref() {
-                            let _ = guest_mem.drain_host_dirty();
-                        }
                         vm.dirty_logging = true;
                     }
                 }
@@ -540,10 +634,16 @@ impl VmmController {
         let mem_len = match snapshot_result {
             Ok(mem_len) => mem_len,
             Err(error) => {
+                replay_consumed_dirty(vm, consumed_dirty.as_ref());
                 remove_owned_scratch_file(&owned_snapshot);
                 return Err(error);
             }
         };
+        if let Err(error) = persist_owned_output(&mut owned_snapshot, &path_buf) {
+            replay_consumed_dirty(vm, consumed_dirty.as_ref());
+            remove_owned_scratch_file(&owned_snapshot);
+            return Err(error);
+        }
         vm.last_snapshot = Some(path.clone());
         vm.transient_files.add_snapshot(owned_snapshot);
         log::info!("VM: snapshot saved to {path} ({mem_len} bytes mem, diff={diff})");
@@ -568,6 +668,7 @@ impl VmmController {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub fn create_live(&self, config: VmConfig) -> Result<()> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Create)?;
         use crate::vcpu_thread::VcpuThread;
         use vmm_loader::load;
         use vmm_memory_backend::GuestMemory;
@@ -831,6 +932,7 @@ impl VmmController {
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
     pub fn create_live(&self, _config: VmConfig) -> Result<()> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Create)?;
         Err(VmmError::Kvm("create_live needs Linux+KVM+boot".into()))
     }
 
@@ -839,6 +941,7 @@ impl VmmController {
         &self,
         snapshot_config: crate::live_snapshot::LiveSnapshotConfig,
     ) -> Result<crate::live_snapshot::LiveSnapshotResult> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::LiveSnapshot)?;
         let (running, mem, base_blob, generation) = {
             let mut slot = self.lock();
             let vm = slot
@@ -925,8 +1028,7 @@ impl VmmController {
 
         let live_path = unique_scratch_snapshot_path("vmm-live")?;
         let live_path_s = live_path.to_string_lossy().into_owned();
-        let owned_live_path = OwnedScratchFile::create_new(&live_path)
-            .map_err(|e| VmmError::Snapshot(format!("create {live_path_s}: {e}")))?;
+        let mut owned_live_path = staged_owned_output(&live_path)?;
         let write = write_scratch_snapshot_file(
             &owned_live_path,
             &output.state_blob,
@@ -937,8 +1039,14 @@ impl VmmController {
         // RAM would keep the host at two copies for the caller's lifetime.
         drop(output.mem_snapshot);
         if let Err(e) = write {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
             remove_owned_scratch_file(&owned_live_path);
             return Err(e);
+        }
+        if let Err(error) = persist_owned_output(&mut owned_live_path, &live_path) {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+            remove_owned_scratch_file(&owned_live_path);
+            return Err(error);
         }
         result.snapshot_path.clone_from(&live_path_s);
 
@@ -946,8 +1054,12 @@ impl VmmController {
         {
             let mut slot = self.lock();
             if let Some(vm) = slot.as_mut().filter(|vm| vm.generation == generation) {
-                vm.transient_files
-                    .add_live_snapshot_owned(owned_live_path.take().expect("owned snapshot"));
+                let owned_live_path = owned_live_path.take().ok_or_else(|| {
+                    VmmError::Snapshot(
+                        "live snapshot ownership disappeared before registration".into(),
+                    )
+                })?;
+                vm.transient_files.add_live_snapshot_owned(owned_live_path);
                 // KVM_GET_DIRTY_LOG cleared every bit this snapshot consumed.
                 // Replay them into the host-dirty tracker, which snapshot()
                 // merges into the KVM dirty set, so a later diff snapshot still
@@ -995,7 +1107,12 @@ impl VmmController {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub fn restore(&self, snapshot_path: &str, overlay: Option<String>) -> Result<()> {
-        self.restore_with_overrides(snapshot_path, overlay, None)
+        self.restore_with_overrides(
+            snapshot_path,
+            overlay,
+            None,
+            tarit_proto::RestoreMemoryPolicy::Auto,
+        )
     }
 
     /// Restore a snapshot while explicitly replacing host-bound resources.
@@ -1008,31 +1125,13 @@ impl VmmController {
         snapshot_path: &str,
         overlay: Option<String>,
         net_override: Option<Vec<crate::config::NetConfig>>,
+        memory_policy: tarit_proto::RestoreMemoryPolicy,
     ) -> Result<()> {
         use std::time::Instant;
 
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Restore)?;
         let start = Instant::now();
-        let restored = match try_lazy_restore_full_snapshot(snapshot_path) {
-            Ok(Some(restored)) => restored,
-            Ok(None) => {
-                log::info!("restore: diff-chain tip detected; using eager snapshot replay");
-                let (mem, state_blob) = load_snapshot_chain(snapshot_path)?;
-                RestoredSnapshot {
-                    mem,
-                    state_blob,
-                    lazy_restore: None,
-                }
-            }
-            Err(e) => {
-                log::warn!("restore: lazy restore unavailable ({e}); falling back to eager");
-                let (mem, state_blob) = load_snapshot_chain(snapshot_path)?;
-                RestoredSnapshot {
-                    mem,
-                    state_blob,
-                    lazy_restore: None,
-                }
-            }
-        };
+        let restored = restore_snapshot_with_policy(snapshot_path, memory_policy)?;
         let RestoredSnapshot {
             mem,
             state_blob,
@@ -1198,11 +1297,13 @@ impl VmmController {
         _snapshot_path: &str,
         _overlay: Option<String>,
         _net_override: Option<Vec<crate::config::NetConfig>>,
+        _memory_policy: tarit_proto::RestoreMemoryPolicy,
     ) -> Result<()> {
         Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
     }
 
     pub fn suspend(&self) -> Result<()> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Suspend)?;
         let mut slot = self.lock();
         let vm = slot
             .as_mut()
@@ -1223,6 +1324,7 @@ impl VmmController {
     }
 
     pub fn pause(&self) -> Result<()> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Pause)?;
         let mut slot = self.lock();
         let vm = slot
             .as_mut()
@@ -1238,6 +1340,7 @@ impl VmmController {
     }
 
     pub fn resume(&self) -> Result<()> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Resume)?;
         let mut slot = self.lock();
         let vm = slot
             .as_mut()
@@ -1310,6 +1413,108 @@ impl VmmController {
         Err(VmmError::Kvm("AttachPty needs Linux+KVM+boot".into()))
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn repair_guest_network(&self, network: tarit_proto::GuestNetworkRepair) -> Result<()> {
+        use std::net::Ipv4Addr;
+        use std::time::{Duration, Instant};
+
+        if network.dns_servers.len() > 4 {
+            return Err(VmmError::InvalidConfig(
+                "guest network repair supports at most 4 DNS servers".into(),
+            ));
+        }
+        network.addr.parse::<Ipv4Addr>().map_err(|error| {
+            VmmError::InvalidConfig(format!("invalid guest network address: {error}"))
+        })?;
+        network.gateway.parse::<Ipv4Addr>().map_err(|error| {
+            VmmError::InvalidConfig(format!("invalid guest network gateway: {error}"))
+        })?;
+        if network.prefix > 32 {
+            return Err(VmmError::InvalidConfig(
+                "guest IPv4 network prefix must be at most 32".into(),
+            ));
+        }
+        for dns in &network.dns_servers {
+            dns.parse::<Ipv4Addr>().map_err(|error| {
+                VmmError::InvalidConfig(format!("invalid guest DNS server: {error}"))
+            })?;
+        }
+        let start = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let serial = {
+            let slot = self.lock();
+            slot.as_ref()
+                .filter(|vm| vm.state == VmState::Running)
+                .and_then(|vm| vm.running.as_ref())
+                .map(|running| running.vcpu_thread.serial.clone())
+        }
+        .ok_or_else(|| VmmError::Device("guest network repair requires a running VM".into()))?;
+
+        let _ = serial.drain_output();
+        let payload = serde_json::to_string(&network)
+            .map_err(|error| VmmError::Device(format!("encode guest network repair: {error}")))?;
+        let request = format!("\nVMM_REPAIR_NET:{payload}");
+        if !serial.send_within(request.as_bytes(), start + timeout) {
+            return Err(VmmError::Kvm(
+                "guest network repair request stalled on serial input".into(),
+            ));
+        }
+
+        let mut acc = Vec::new();
+        let mut output = Vec::new();
+        let mut truncated = false;
+        let mut started = false;
+        while start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(2));
+            let chunk = serial.drain_output();
+            if chunk.is_empty() {
+                continue;
+            }
+            acc.extend_from_slice(&chunk);
+            while let Some(pos) = acc.iter().position(|&b| b == b'\n') {
+                let mut line: Vec<u8> = acc.drain(..=pos).collect();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                let line = String::from_utf8_lossy(&line);
+                if line == "VMM_REPAIR_NET_START" {
+                    started = true;
+                    continue;
+                }
+                if started {
+                    if let Some(code) = line.strip_prefix("VMM_REPAIR_NET_EXIT=") {
+                        let exit_code: i32 = code.trim().parse().unwrap_or(1);
+                        if exit_code == 0 {
+                            return Ok(());
+                        }
+                        return Err(VmmError::Device(format!(
+                            "guest network repair failed ({exit_code}): {}",
+                            finish_exec_output(output, truncated)
+                        )));
+                    }
+                }
+                if started {
+                    append_exec_output(&mut output, line.as_bytes(), &mut truncated);
+                    append_exec_output(&mut output, b"\n", &mut truncated);
+                }
+            }
+            trim_exec_accumulator(&mut acc, started, &mut output, &mut truncated);
+        }
+
+        Err(VmmError::Device(format!(
+            "guest network repair timed out: {}",
+            finish_exec_output(output, truncated)
+        )))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn repair_guest_network(&self, _network: tarit_proto::GuestNetworkRepair) -> Result<()> {
+        Err(VmmError::Kvm(
+            "RepairGuestNetwork needs Linux+KVM+boot".into(),
+        ))
+    }
+
     ///
     /// The VM must have been created with a rootfs that runs the VMM guest
     /// agent (which reads from /dev/ttyS0). The controller sends the command
@@ -1318,7 +1523,7 @@ impl VmmController {
     /// If the VM is not running (no background vCPU thread), falls back to
     /// booting a fresh VM with the command in the cmdline.
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-    pub fn exec(&self, command: &str, timeout_ms: u64) -> Result<(i32, String, u64)> {
+    pub fn exec(&self, command: &str, timeout_ms: u64) -> Result<(i32, String, String, u64)> {
         use std::time::{Duration, Instant};
 
         let start = Instant::now();
@@ -1459,7 +1664,7 @@ impl VmmController {
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let output_str = finish_exec_output(output, truncated);
                         log::info!("exec: '{command}' → exit={exit_code} {duration_ms}ms");
-                        return Ok((exit_code, output_str, duration_ms));
+                        return Ok((exit_code, output_str, String::new(), duration_ms));
                     }
                     if confirmed {
                         append_exec_output(&mut output, &line, &mut truncated);
@@ -1473,7 +1678,7 @@ impl VmmController {
             let output_str = finish_exec_output(output, truncated);
             if confirmed {
                 log::warn!("exec: timed out after {duration_ms}ms");
-                return Ok((-1, output_str, duration_ms));
+                return Ok((-1, output_str, String::new(), duration_ms));
             }
             log::warn!("exec: '{command}' got no response from guest agent after {duration_ms}ms");
             return Err(VmmError::Kvm(format!(
@@ -1512,7 +1717,11 @@ impl VmmController {
 
     /// Fallback exec: boot a fresh VM with the command baked into cmdline.
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-    fn exec_fresh_boot(&self, command: &str, timeout_ms: u64) -> Result<(i32, String, u64)> {
+    fn exec_fresh_boot(
+        &self,
+        command: &str,
+        timeout_ms: u64,
+    ) -> Result<(i32, String, String, u64)> {
         use std::time::Instant;
         use vmm_loader::load;
         use vmm_memory_backend::GuestMemory;
@@ -1557,16 +1766,17 @@ impl VmmController {
 
         let duration_ms = start.elapsed().as_millis() as u64;
         log::info!("exec (fresh boot): '{command}' → {duration_ms}ms");
-        Ok((0, String::new(), duration_ms))
+        Ok((0, String::new(), String::new(), duration_ms))
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
-    pub fn exec(&self, _command: &str, _timeout_ms: u64) -> Result<(i32, String, u64)> {
+    pub fn exec(&self, _command: &str, _timeout_ms: u64) -> Result<(i32, String, String, u64)> {
         Err(VmmError::Kvm("exec needs Linux+KVM+boot".into()))
     }
 
     /// Stop the VM and clear the slot.
     pub fn stop(&self) -> Result<()> {
+        let _lifecycle = self.begin_lifecycle(LifecycleOp::Stop)?;
         let mut slot = self.lock();
         if let Some(vm) = slot.as_mut() {
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -1780,8 +1990,8 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         let layout = full_snapshot_layout_for_lengths(state_len, mem_len_u64)
             .ok_or_else(|| VmmError::Snapshot("suspend file layout overflow".into()))?;
         let path = unique_suspend_snapshot_path()?;
-        let owned_snapshot = OwnedScratchFile::create_new(Path::new(&path))
-            .map_err(|e| VmmError::Snapshot(format!("create {path}: {e}")))?;
+        let target_path = PathBuf::from(&path);
+        let mut owned_snapshot = staged_owned_output(&target_path)?;
 
         let mem_slice = {
             // SAFETY: guest_mem owns this mmap for the lifetime of `vm`; the vCPUs are
@@ -1793,6 +2003,10 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         {
             remove_owned_scratch_file(&owned_snapshot);
             return Err(e);
+        }
+        if let Err(error) = persist_owned_output(&mut owned_snapshot, &target_path) {
+            remove_owned_scratch_file(&owned_snapshot);
+            return Err(error);
         }
 
         let file = match owned_snapshot.file().try_clone() {
@@ -1853,7 +2067,7 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
     result
 }
 
-fn private_runtime_dir() -> Result<PathBuf> {
+pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
     // Use the system temp dir (disk-backed, large enough for multi-hundred-MB
     // snapshots), under a private per-process 0700 subdir. Never the CWD/source
     // tree, and never a small runtime tmpfs like XDG_RUNTIME_DIR (/run/user),
@@ -1884,7 +2098,7 @@ fn unique_scratch_snapshot_path(prefix: &str) -> Result<PathBuf> {
     unique_runtime_file_path(prefix, "snap")
 }
 
-fn unique_runtime_file_path(prefix: &str, suffix: &str) -> Result<PathBuf> {
+pub(crate) fn unique_runtime_file_path(prefix: &str, suffix: &str) -> Result<PathBuf> {
     static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1895,6 +2109,53 @@ fn unique_runtime_file_path(prefix: &str, suffix: &str) -> Result<PathBuf> {
         "{prefix}-{}-{ts}-{seq}.{suffix}",
         std::process::id()
     )))
+}
+
+fn staged_output_path(target: &Path) -> Result<PathBuf> {
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| VmmError::Snapshot(format!("invalid output path: {}", target.display())))?;
+    let suffix = format!(
+        "{file_name}.stage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    );
+    let parent = target.parent().ok_or_else(|| {
+        VmmError::Snapshot(format!(
+            "output path has no parent directory: {}",
+            target.display()
+        ))
+    })?;
+    Ok(parent.join(format!(".{suffix}")))
+}
+
+fn staged_owned_output(target: &Path) -> Result<OwnedScratchFile> {
+    let stage = staged_output_path(target)?;
+    OwnedScratchFile::create_new(stage).map_err(|error| {
+        VmmError::Snapshot(format!(
+            "create staged output for {}: {error}",
+            target.display()
+        ))
+    })
+}
+
+fn persist_owned_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<()> {
+    owned.file().sync_all().map_err(|error| {
+        VmmError::Snapshot(format!(
+            "sync staged output for {}: {error}",
+            target.display()
+        ))
+    })?;
+    owned.rename_to(target).map_err(|error| {
+        VmmError::Snapshot(format!(
+            "publish staged output {}: {error}",
+            target.display()
+        ))
+    })
 }
 
 #[cfg(any(
@@ -2050,12 +2311,11 @@ fn prepare_restore_overlay(config: &VmConfig, target: &str) -> Result<OwnedOverl
     let target_path = PathBuf::from(target);
     let owned = match restore_overlay_seed(config, Some(target))? {
         Some((source, target)) => seed_restore_overlay(&source, &target)?,
-        None => OwnedScratchFile::create_new(&target_path).map_err(|error| {
-            VmmError::Snapshot(format!(
-                "create private restore overlay {}: {error}",
-                target_path.display()
-            ))
-        })?,
+        None => {
+            let mut owned = staged_owned_output(&target_path)?;
+            persist_owned_output(&mut owned, &target_path)?;
+            owned
+        }
     };
     Ok(OwnedOverlayGuard::from_created(vec![owned]))
 }
@@ -2103,12 +2363,7 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
         )));
     }
 
-    let owned_target = OwnedScratchFile::create_new(target).map_err(|e| {
-        VmmError::Snapshot(format!(
-            "create private restore overlay {}: {e}",
-            target.display()
-        ))
-    })?;
+    let mut owned_target = staged_owned_output(target)?;
     let copy_result = (|| -> std::io::Result<()> {
         let source_owned = OwnedScratchFile::adopt_private(source)?;
         let mut source_file = source_owned.file().try_clone()?;
@@ -2127,6 +2382,10 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
             source.display(),
             target.display()
         )));
+    }
+    if let Err(error) = persist_owned_output(&mut owned_target, target) {
+        remove_owned_scratch_file(&owned_target);
+        return Err(error);
     }
     Ok(owned_target)
 }
@@ -2823,6 +3082,46 @@ struct RestoredSnapshot {
     mem: vmm_memory_backend::GuestMemory,
     state_blob: Vec<u8>,
     lazy_restore: Option<vmm_memory_backend::LazyRestore>,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn eager_restore_snapshot(path: &str) -> Result<RestoredSnapshot> {
+    let (mem, state_blob) = load_snapshot_chain(path)?;
+    Ok(RestoredSnapshot {
+        mem,
+        state_blob,
+        lazy_restore: None,
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn restore_snapshot_with_policy(
+    path: &str,
+    memory_policy: tarit_proto::RestoreMemoryPolicy,
+) -> Result<RestoredSnapshot> {
+    match memory_policy {
+        tarit_proto::RestoreMemoryPolicy::Auto => match try_lazy_restore_full_snapshot(path) {
+            Ok(Some(restored)) => Ok(restored),
+            Ok(None) => {
+                log::info!("restore: eager policy required for this snapshot; replaying eagerly");
+                eager_restore_snapshot(path)
+            }
+            Err(error) => {
+                log::warn!("restore: lazy restore unavailable ({error}); falling back to eager");
+                eager_restore_snapshot(path)
+            }
+        },
+        tarit_proto::RestoreMemoryPolicy::Eager => eager_restore_snapshot(path),
+        tarit_proto::RestoreMemoryPolicy::Lazy => match try_lazy_restore_full_snapshot(path) {
+            Ok(Some(restored)) => Ok(restored),
+            Ok(None) => Err(VmmError::Snapshot(
+                "lazy restore requires a full non-diff snapshot with UFFD backing".into(),
+            )),
+            Err(error) => Err(VmmError::Snapshot(format!(
+                "lazy restore requested but unavailable: {error}"
+            ))),
+        },
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -4255,6 +4554,33 @@ mod tests {
             .expect_err("overlay without a disk should fail");
 
         assert!(matches!(err, VmmError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn concurrent_lifecycle_operations_are_rejected_deterministically() {
+        let controller = VmmController::new();
+        let _guard = controller
+            .begin_lifecycle(LifecycleOp::Restore)
+            .expect("first lifecycle operation must start");
+
+        let error = controller
+            .begin_lifecycle(LifecycleOp::Snapshot)
+            .expect_err("concurrent lifecycle operation must be rejected");
+
+        assert!(error.to_string().contains("restore"));
+    }
+
+    #[test]
+    fn lifecycle_guard_releases_after_drop() {
+        let controller = VmmController::new();
+        {
+            let _guard = controller
+                .begin_lifecycle(LifecycleOp::Suspend)
+                .expect("suspend guard must start");
+        }
+        controller
+            .begin_lifecycle(LifecycleOp::Resume)
+            .expect("a later lifecycle operation must be allowed after drop");
     }
 
     #[test]
