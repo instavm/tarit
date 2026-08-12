@@ -1377,6 +1377,7 @@ mod tests {
             .unwrap()
             .join(format!("target/legacy-creating-runtime-{}", Uuid::new_v4()));
         let mut config = test_config();
+        config.vmm_bin = PathBuf::from("sh");
         config.socket_dir = root.join("sockets");
         config.db_path = root.join("fleet.db");
         config.net_state_path = root.join("net-state.json");
@@ -1435,6 +1436,7 @@ mod tests {
             .unwrap()
             .join(format!("target/legacy-layout-adoption-{}", Uuid::new_v4()));
         let mut config = test_config();
+        config.vmm_bin = PathBuf::from("sh");
         config.socket_dir = root.join("sockets");
         config.db_path = root.join("fleet.db");
         config.net_state_path = root.join("net-state.json");

@@ -63,17 +63,251 @@ fn graceful_stop_vmm(socket_path: &Path) {
         .stop();
 }
 
+fn is_process_gone(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH))
+        || error.kind() == std::io::ErrorKind::NotFound
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn tolerate_process_disappearance<T>(result: std::io::Result<T>) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if is_process_gone(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn valid_process_id(pid: u32) -> bool {
+    pid != 0 && pid <= libc::pid_t::MAX as u32
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_process_id(raw: &str) -> Option<u32> {
+    if raw.is_empty() || !raw.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    raw.parse::<u32>().ok().filter(|pid| valid_process_id(*pid))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn proc_pid_entries(proc_root: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
+    let mut processes = Vec::new();
+    for entry in std::fs::read_dir(proc_root)? {
+        let Some(entry) = tolerate_process_disappearance(entry)? else {
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(pid) = parse_process_id(name) else {
+            continue;
+        };
+        let Some(file_type) = tolerate_process_disappearance(entry.file_type())? else {
+            continue;
+        };
+        if file_type.is_dir() {
+            processes.push((pid, entry.path()));
+        }
+    }
+    Ok(processes)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_processes(contents: &str, source: &Path) -> std::io::Result<HashSet<u32>> {
+    contents
+        .lines()
+        .map(|raw| {
+            let value = raw.trim();
+            parse_process_id(value).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid positive process ID {raw:?} in {}",
+                        source.display()
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+struct ExpectedExecutable {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ExpectedExecutable {
+    fn resolve(configured: &Path) -> std::io::Result<Self> {
+        let resolved = if configured.as_os_str().as_bytes().contains(&b'/') {
+            configured.to_path_buf()
+        } else {
+            std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .map(|directory| directory.join(configured))
+                .find(|candidate| {
+                    std::fs::metadata(candidate)
+                        .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "configured VMM executable {} was not found in PATH",
+                            configured.display()
+                        ),
+                    )
+                })?
+        };
+        let metadata = std::fs::metadata(&resolved)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "configured VMM executable {} is not a regular file",
+                    resolved.display()
+                ),
+            ));
+        }
+        Ok(Self {
+            path: std::fs::canonicalize(&resolved).unwrap_or(resolved),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug)]
+enum ProcessVerificationError {
+    Gone {
+        action: String,
+        error: std::io::Error,
+    },
+    Rejected(String),
+    Inspect {
+        action: String,
+        error: std::io::Error,
+    },
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl ProcessVerificationError {
+    fn from_io(action: impl Into<String>, error: std::io::Error) -> Self {
+        let action = action.into();
+        if is_process_gone(&error) {
+            Self::Gone { action, error }
+        } else {
+            Self::Inspect { action, error }
+        }
+    }
+
+    fn is_gone(&self) -> bool {
+        matches!(self, Self::Gone { .. })
+    }
+
+    fn is_permission_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::Inspect { error, .. }
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        )
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl std::fmt::Display for ProcessVerificationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gone { action, error } | Self::Inspect { action, error } => {
+                write!(formatter, "{action}: {error}")
+            }
+            Self::Rejected(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn verified_process_cmdline(
+    pid: u32,
+    proc_dir: &Path,
+    executable: &ExpectedExecutable,
+    allowed_uids: &HashSet<u32>,
+) -> Result<Vec<u8>, ProcessVerificationError> {
+    if !valid_process_id(pid) {
+        return Err(ProcessVerificationError::Rejected(format!(
+            "invalid VMM PID {pid}"
+        )));
+    }
+    let process_metadata = std::fs::metadata(proc_dir).map_err(|error| {
+        ProcessVerificationError::from_io(format!("inspect VMM PID {pid}"), error)
+    })?;
+    let process_uid = process_metadata.uid();
+    if !allowed_uids.contains(&process_uid) {
+        return Err(ProcessVerificationError::Rejected(format!(
+            "VMM PID {pid} is owned by unexpected uid {process_uid}"
+        )));
+    }
+    let executable_path = proc_dir.join("exe");
+    let process_executable = std::fs::metadata(&executable_path).map_err(|error| {
+        ProcessVerificationError::from_io(format!("inspect executable for VMM PID {pid}"), error)
+    })?;
+    let same_file = process_executable.dev() == executable.device
+        && process_executable.ino() == executable.inode;
+    let same_path = if same_file {
+        true
+    } else {
+        let link = std::fs::read_link(&executable_path).map_err(|error| {
+            ProcessVerificationError::from_io(
+                format!("read executable link for VMM PID {pid}"),
+                error,
+            )
+        })?;
+        let raw = link.as_os_str().as_bytes();
+        let raw = raw.strip_suffix(b" (deleted)").unwrap_or(raw);
+        Path::new(std::ffi::OsStr::from_bytes(raw)) == executable.path
+    };
+    if !same_path {
+        return Err(ProcessVerificationError::Rejected(format!(
+            "VMM PID {pid} is not running configured executable {}",
+            executable.path.display()
+        )));
+    }
+    std::fs::read(proc_dir.join("cmdline")).map_err(|error| {
+        ProcessVerificationError::from_io(format!("read /proc/{pid}/cmdline"), error)
+    })
+}
+
 /// Confirm that `pid` is a live VMM process that owns `socket_path`, guarding
 /// re-adoption against PID reuse. taritd launches every VMM with
 /// `serve --socket <socket_path>`, so the socket path must appear verbatim in
 /// the process command line; a recycled PID running something else will not
 /// match and is refused rather than adopted.
-fn verify_live_vmm(pid: u32, socket_path: &Path, jail_root: Option<&Path>) -> Result<(), String> {
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-        return Err(format!("VMM PID {pid} is not alive"));
-    }
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map_err(|error| format!("read /proc/{pid}/cmdline: {error}"))?;
+#[cfg(any(target_os = "linux", test))]
+fn verify_live_vmm(
+    pid: u32,
+    socket_path: &Path,
+    jail_root: Option<&Path>,
+    vmm_bin: &Path,
+    allowed_uids: &HashSet<u32>,
+) -> Result<(), ProcessVerificationError> {
+    let executable = ExpectedExecutable::resolve(vmm_bin).map_err(|error| {
+        ProcessVerificationError::from_io(
+            format!("resolve configured VMM executable {}", vmm_bin.display()),
+            error,
+        )
+    })?;
+    let cmdline = verified_process_cmdline(
+        pid,
+        Path::new(&format!("/proc/{pid}")),
+        &executable,
+        allowed_uids,
+    )?;
     let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
     let owns_socket = args
         .iter()
@@ -83,86 +317,136 @@ fn verify_live_vmm(pid: u32, socket_path: &Path, jail_root: Option<&Path>) -> Re
                 && args.iter().any(|arg| *arg == root.as_os_str().as_bytes())
         });
     if !owns_socket {
-        return Err(format!(
+        return Err(ProcessVerificationError::Rejected(format!(
             "PID {pid} does not own control socket {}; refusing to adopt a reused PID",
             socket_path.display()
-        ));
+        )));
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn verify_legacy_nonjailed_vmm(pid: u32, socket_path: &Path) -> Result<(), String> {
-    verify_live_vmm(pid, socket_path, None)?;
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map_err(|error| format!("read /proc/{pid}/cmdline: {error}"))?;
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn verify_live_vmm(
+    _pid: u32,
+    _socket_path: &Path,
+    _jail_root: Option<&Path>,
+    _vmm_bin: &Path,
+    _allowed_uids: &HashSet<u32>,
+) -> Result<(), String> {
+    Err("live VMM verification requires Linux pidfds and /proc".into())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn verify_legacy_nonjailed_vmm(
+    pid: u32,
+    socket_path: &Path,
+    vmm_bin: &Path,
+) -> Result<(), ProcessVerificationError> {
+    let allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
+    verify_live_vmm(pid, socket_path, None, vmm_bin, &allowed_uids)?;
+    let executable = ExpectedExecutable::resolve(vmm_bin).map_err(|error| {
+        ProcessVerificationError::from_io(
+            format!("resolve configured VMM executable {}", vmm_bin.display()),
+            error,
+        )
+    })?;
+    let cmdline = verified_process_cmdline(
+        pid,
+        Path::new(&format!("/proc/{pid}")),
+        &executable,
+        &allowed_uids,
+    )?;
     let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
     if args
         .iter()
         .any(|arg| *arg == b"--jail" || *arg == b"--jail-root")
     {
-        return Err(format!(
+        return Err(ProcessVerificationError::Rejected(format!(
             "VMM PID {pid} has jail arguments and is not a legacy non-jailed runtime"
-        ));
+        )));
     }
     if !args.iter().any(|arg| *arg == b"serve") {
-        return Err(format!("VMM PID {pid} is missing the serve subcommand"));
+        return Err(ProcessVerificationError::Rejected(format!(
+            "VMM PID {pid} is missing the serve subcommand"
+        )));
     }
     let socket_args = args
         .windows(2)
         .filter_map(|pair| (pair[0] == b"--socket").then_some(pair[1]))
         .collect::<Vec<_>>();
     if socket_args.len() != 1 || socket_args[0] != socket_path.as_os_str().as_bytes() {
-        return Err(format!(
+        return Err(ProcessVerificationError::Rejected(format!(
             "VMM PID {pid} does not have one exact --socket {} argument",
             socket_path.display()
-        ));
+        )));
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn verify_owned_vmm(pid: u32, socket_path: &Path, jail_root: Option<&Path>) -> Result<(), String> {
-    let process_uid = std::fs::metadata(format!("/proc/{pid}"))
-        .map_err(|error| format!("inspect VMM PID {pid}: {error}"))?
-        .uid();
-    let service_uid = unsafe { libc::geteuid() };
-    if process_uid != service_uid {
-        return Err(format!(
-            "VMM PID {pid} is owned by uid {process_uid}, not taritd uid {service_uid}"
-        ));
-    }
+#[cfg(any(target_os = "linux", test))]
+fn verify_owned_vmm(
+    pid: u32,
+    socket_path: &Path,
+    jail_root: Option<&Path>,
+    vmm_bin: &Path,
+    jail_uid: Option<u32>,
+) -> Result<(), ProcessVerificationError> {
     let Some(jail_root) = jail_root else {
-        return verify_legacy_nonjailed_vmm(pid, socket_path);
+        return verify_legacy_nonjailed_vmm(pid, socket_path, vmm_bin);
     };
 
-    verify_live_vmm(pid, socket_path, Some(jail_root))?;
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map_err(|error| format!("read /proc/{pid}/cmdline: {error}"))?;
+    let mut allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
+    allowed_uids.extend(jail_uid);
+    verify_live_vmm(pid, socket_path, Some(jail_root), vmm_bin, &allowed_uids)?;
+    let executable = ExpectedExecutable::resolve(vmm_bin).map_err(|error| {
+        ProcessVerificationError::from_io(
+            format!("resolve configured VMM executable {}", vmm_bin.display()),
+            error,
+        )
+    })?;
+    let cmdline = verified_process_cmdline(
+        pid,
+        Path::new(&format!("/proc/{pid}")),
+        &executable,
+        &allowed_uids,
+    )?;
     let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
     if !args.iter().any(|arg| *arg == b"serve") {
-        return Err(format!("VMM PID {pid} is missing the serve subcommand"));
+        return Err(ProcessVerificationError::Rejected(format!(
+            "VMM PID {pid} is missing the serve subcommand"
+        )));
     }
     let socket_args = args
         .windows(2)
         .filter_map(|pair| (pair[0] == b"--socket").then_some(pair[1]))
         .collect::<Vec<_>>();
     if socket_args.len() != 1 || socket_args[0] != JAIL_SOCKET_PATH.as_bytes() {
-        return Err(format!(
+        return Err(ProcessVerificationError::Rejected(format!(
             "VMM PID {pid} does not have one exact --socket {JAIL_SOCKET_PATH} argument"
-        ));
+        )));
     }
     let jail_args = args
         .windows(2)
         .filter_map(|pair| (pair[0] == b"--jail" || pair[0] == b"--jail-root").then_some(pair[1]))
         .collect::<Vec<_>>();
     if jail_args.len() != 1 || jail_args[0] != jail_root.as_os_str().as_bytes() {
-        return Err(format!(
+        return Err(ProcessVerificationError::Rejected(format!(
             "VMM PID {pid} does not have one exact jail argument for {}",
             jail_root.display()
-        ));
+        )));
     }
     Ok(())
+}
+
+#[cfg(all(not(target_os = "linux"), not(test)))]
+fn verify_owned_vmm(
+    pid: u32,
+    socket_path: &Path,
+    jail_root: Option<&Path>,
+    vmm_bin: &Path,
+    _jail_uid: Option<u32>,
+) -> Result<(), String> {
+    verify_live_vmm(pid, socket_path, jail_root, vmm_bin, &HashSet::new())
 }
 
 fn legacy_layout_drain_required(record: &VmRecord, reason: impl std::fmt::Display) -> OrchError {
@@ -239,6 +523,7 @@ pub(crate) fn infer_legacy_nonjailed_runtime_layout(
         socket_path,
         runtime_root,
         socket_metadata,
+        &config.vmm_bin,
     )
     .map(Some)
 }
@@ -249,6 +534,7 @@ fn infer_legacy_nonjailed_runtime_layout_platform(
     _socket_path: PathBuf,
     _runtime_root: PathBuf,
     _socket_metadata: std::fs::Metadata,
+    _vmm_bin: &Path,
 ) -> Result<VmRuntimeLayout, OrchError> {
     Err(legacy_layout_drain_required(
         record,
@@ -262,6 +548,7 @@ fn infer_legacy_nonjailed_runtime_layout_platform(
     socket_path: PathBuf,
     runtime_root: PathBuf,
     socket_metadata: std::fs::Metadata,
+    vmm_bin: &Path,
 ) -> Result<VmRuntimeLayout, OrchError> {
     let pid = record
         .pid
@@ -287,7 +574,7 @@ fn infer_legacy_nonjailed_runtime_layout_platform(
             ),
         ));
     }
-    verify_legacy_nonjailed_vmm(pid, &socket_path)
+    verify_legacy_nonjailed_vmm(pid, &socket_path, vmm_bin)
         .map_err(|reason| legacy_layout_drain_required(record, reason))?;
 
     if record.rootfs_path.as_deref().is_some_and(str::is_empty) {
@@ -370,6 +657,12 @@ fn infer_legacy_nonjailed_runtime_layout_platform(
 #[cfg(target_os = "linux")]
 fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
     use std::os::fd::FromRawFd;
+    if !valid_process_id(pid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid positive process ID {pid}"),
+        ));
+    }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -770,6 +1063,18 @@ impl JailManager {
             .by_vm
             .keys()
             .copied()
+            .collect())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn uids(&self) -> Result<HashSet<u32>, OrchError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| OrchError::Internal("VM jail lease lock poisoned".into()))?
+            .by_vm
+            .values()
+            .map(|lease| lease.uid)
             .collect())
     }
 
@@ -4673,31 +4978,37 @@ impl VmmSupervisor {
         }
         #[cfg(target_os = "linux")]
         {
+            let executable =
+                ExpectedExecutable::resolve(&self.config.vmm_bin).map_err(|error| {
+                    OrchError::Internal(format!(
+                        "resolve configured VMM executable {} during warm VMM recovery: {error}",
+                        self.config.vmm_bin.display()
+                    ))
+                })?;
+            let mut allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
+            if let Some(jails) = &self.jails {
+                allowed_uids.extend(jails.uids()?);
+            }
             let mut proc_visibility_incomplete = false;
-            for entry in std::fs::read_dir("/proc").map_err(|error| {
+            let processes = proc_pid_entries(Path::new("/proc")).map_err(|error| {
                 OrchError::Internal(format!("scan /proc for unpersisted warm VMMs: {error}"))
-            })? {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        tracing::debug!(%error, "skip transient /proc entry during warm VMM recovery");
-                        continue;
-                    }
-                };
-                let cmdline = match std::fs::read(entry.path().join("cmdline")) {
-                    Ok(cmdline) => cmdline,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                        proc_visibility_incomplete = true;
-                        continue;
-                    }
-                    Err(error) => {
-                        return Err(OrchError::Internal(format!(
-                            "read {} during warm VMM recovery: {error}",
-                            entry.path().join("cmdline").display()
-                        )))
-                    }
-                };
+            })?;
+            for (pid, proc_dir) in processes {
+                let cmdline =
+                    match verified_process_cmdline(pid, &proc_dir, &executable, &allowed_uids) {
+                        Ok(cmdline) => cmdline,
+                        Err(error) if error.is_gone() => continue,
+                        Err(ProcessVerificationError::Rejected(_)) => continue,
+                        Err(error) if error.is_permission_denied() => {
+                            proc_visibility_incomplete = true;
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(OrchError::Internal(format!(
+                                "inspect VMM candidate {pid} during warm VMM recovery: {error}"
+                            )))
+                        }
+                    };
                 for arg in cmdline.split(|byte| *byte == 0) {
                     let path = Path::new(std::ffi::OsStr::from_bytes(arg));
                     if path.parent() != Some(self.config.socket_dir.as_path()) {
@@ -4727,22 +5038,26 @@ impl VmmSupervisor {
         let socket_path = self.socket_path_for(id);
         let legacy_socket_path = self.config.socket_dir.join(format!("{id}.sock"));
         let jail_root = self.jails.as_ref().map(|jails| jails.root_for(id));
+        let jail_uid = self.jail_identity(id)?.map(|(uid, _)| uid);
+        let mut allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
+        allowed_uids.extend(jail_uid);
+        let executable = ExpectedExecutable::resolve(&self.config.vmm_bin).map_err(|error| {
+            OrchError::Internal(format!(
+                "resolve configured VMM executable {} during VMM recovery: {error}",
+                self.config.vmm_bin.display()
+            ))
+        })?;
         let mut cgroup_pids = HashSet::new();
         if let Some(cgroup) = self.exact_vm_cgroup_path(id) {
             let procs = cgroup.join("cgroup.procs");
             match std::fs::read_to_string(&procs) {
                 Ok(contents) => {
-                    for raw in contents.lines() {
-                        let pid = raw.trim().parse::<u32>().map_err(|error| {
-                            OrchError::Internal(format!(
-                                "parse owned VM cgroup PID {raw:?} in {}: {error}",
-                                procs.display()
-                            ))
-                        })?;
-                        if pid != 0 {
-                            cgroup_pids.insert(pid);
-                        }
-                    }
+                    cgroup_pids = parse_cgroup_processes(&contents, &procs).map_err(|error| {
+                        OrchError::Internal(format!(
+                            "parse owned VM cgroup processes {}: {error}",
+                            procs.display()
+                        ))
+                    })?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -4756,35 +5071,21 @@ impl VmmSupervisor {
 
         let mut candidate_pids = cgroup_pids.clone();
         let mut proc_visibility_incomplete = false;
-        for entry in std::fs::read_dir("/proc")
-            .map_err(|error| OrchError::Internal(format!("scan /proc for owned VMMs: {error}")))?
-        {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::debug!(%error, "skip transient /proc entry during VMM recovery");
-                    continue;
-                }
-            };
-            let Some(pid) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<u32>().ok())
-            else {
-                continue;
-            };
-            let cmdline = match std::fs::read(entry.path().join("cmdline")) {
+        let processes = proc_pid_entries(Path::new("/proc"))
+            .map_err(|error| OrchError::Internal(format!("scan /proc for owned VMMs: {error}")))?;
+        for (pid, proc_dir) in processes {
+            let cmdline = match verified_process_cmdline(pid, &proc_dir, &executable, &allowed_uids)
+            {
                 Ok(cmdline) => cmdline,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    continue;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(error) if error.is_gone() => continue,
+                Err(ProcessVerificationError::Rejected(_)) => continue,
+                Err(error) if error.is_permission_denied() => {
                     proc_visibility_incomplete = true;
                     continue;
                 }
                 Err(error) => {
                     return Err(OrchError::Internal(format!(
-                        "read /proc/{pid}/cmdline during VMM recovery: {error}"
+                        "inspect VMM candidate {pid} during VMM recovery: {error}"
                     )))
                 }
             };
@@ -4813,39 +5114,59 @@ impl VmmSupervisor {
         for pid in candidate_pids {
             let pidfd = match pidfd_open(pid) {
                 Ok(pidfd) => pidfd,
-                Err(error)
-                    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) =>
-                {
-                    continue;
-                }
+                Err(error) if is_process_gone(&error) => continue,
                 Err(error) => {
                     return Err(OrchError::Internal(format!(
                         "pin owned VMM {pid} for startup reconciliation: {error}"
                     )))
                 }
             };
-            let verified = verify_owned_vmm(pid, &socket_path, jail_root.as_deref()).or_else(
-                |current_reason| {
-                    if legacy_socket_path == socket_path {
-                        Err(current_reason)
-                    } else {
-                        verify_owned_vmm(pid, &legacy_socket_path, None).map_err(|legacy_reason| {
-                            format!(
+            let verified = verify_owned_vmm(
+                pid,
+                &socket_path,
+                jail_root.as_deref(),
+                &self.config.vmm_bin,
+                jail_uid,
+            )
+            .or_else(|current_reason| {
+                if legacy_socket_path == socket_path {
+                    return Err(current_reason);
+                }
+                match current_reason {
+                    ProcessVerificationError::Rejected(_) => verify_owned_vmm(
+                        pid,
+                        &legacy_socket_path,
+                        None,
+                        &self.config.vmm_bin,
+                        None,
+                    )
+                    .map_err(|legacy_reason| {
+                        if legacy_reason.is_gone() {
+                            legacy_reason
+                        } else {
+                            ProcessVerificationError::Rejected(format!(
                                 "current-layout verification failed: {current_reason}; legacy-layout verification failed: {legacy_reason}"
-                            )
-                        })
-                    }
-                },
-            );
-            if let Err(reason) = verified {
-                if cgroup_pids.contains(&pid) {
+                            ))
+                        }
+                    }),
+                    other => Err(other),
+                }
+            });
+            match verified {
+                Ok(()) => processes.push(ManagedProcess::adopted(pid, pidfd)),
+                Err(error) if error.is_gone() => continue,
+                Err(reason) if cgroup_pids.contains(&pid) => {
                     return Err(OrchError::Internal(format!(
                         "process {pid} remains in owned cgroup for VM {id} but failed VMM ownership verification: {reason}"
-                    )));
+                    )))
                 }
-                continue;
+                Err(ProcessVerificationError::Rejected(_)) => continue,
+                Err(reason) => {
+                    return Err(OrchError::Internal(format!(
+                        "inspect pinned VMM candidate {pid} for VM {id}: {reason}"
+                    )))
+                }
             }
-            processes.push(ManagedProcess::adopted(pid, pidfd));
         }
         Ok(processes)
     }
@@ -5080,6 +5401,17 @@ impl VmmSupervisor {
                 ));
             }
         };
+        if !valid_process_id(pid) {
+            self.cleanup_uncommitted_runtime(record.id)
+                .map_err(|error| {
+                    ReadoptFailure::Fatal(format!(
+                        "persisted VM has invalid PID {pid} and owned runtime containment failed: {error}"
+                    ))
+                })?;
+            return Err(ReadoptFailure::Unadoptable(format!(
+                "persisted VM has invalid positive PID {pid}"
+            )));
+        }
         let socket_path = match record.socket_path.as_deref() {
             Some(path) => PathBuf::from(path),
             None => {
@@ -5099,9 +5431,7 @@ impl VmmSupervisor {
         // gone there is nothing to adopt.
         let pidfd = match pidfd_open(pid) {
             Ok(pidfd) => pidfd,
-            Err(error)
-                if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) =>
-            {
+            Err(error) if is_process_gone(&error) => {
                 self.cleanup_uncommitted_runtime(record.id)
                     .map_err(|cleanup| {
                         ReadoptFailure::Fatal(format!(
@@ -5125,14 +5455,20 @@ impl VmmSupervisor {
             .as_ref()
             .and_then(|layout| layout.jail_path.as_deref())
             .map(Path::new);
-        if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root) {
+        let jail_uid = self
+            .jail_identity(record.id)
+            .map_err(|error| ReadoptFailure::Fatal(error.to_string()))?
+            .map(|(uid, _)| uid);
+        if let Err(reason) =
+            verify_owned_vmm(pid, &socket_path, jail_root, &self.config.vmm_bin, jail_uid)
+        {
             self.cleanup_uncommitted_runtime(record.id)
                 .map_err(|cleanup| {
                     ReadoptFailure::Fatal(format!(
                         "{reason}; containment of any separately owned runtime failed: {cleanup}"
                     ))
                 })?;
-            return Err(ReadoptFailure::Unadoptable(reason));
+            return Err(ReadoptFailure::Unadoptable(reason.to_string()));
         }
         self.terminate_owned_processes(record.id, Some(pid))
             .map_err(|error| {
@@ -5234,24 +5570,53 @@ impl VmmSupervisor {
         let socket_path = record.socket_path.as_deref().map(Path::new).ok_or_else(|| {
             "runtime layout changed but the persisted active VM has no control socket; startup is blocked before GC because safe containment cannot be proven".to_string()
         })?;
-        let pidfd = pidfd_open(pid)
-            .map_err(|error| format!("pin layout-conflicting VMM {pid} before GC: {error}"))?;
-        verify_live_vmm(
-            pid,
-            socket_path,
-            persisted.jail_path.as_deref().map(Path::new),
-        )
-        .map_err(|error| {
-            format!(
-                "runtime layout changed and PID {pid} could not be identified safely; startup is blocked before GC: {error}"
-            )
-        })?;
-        graceful_stop_vmm(socket_path);
-        ManagedProcess::adopted(pid, pidfd)
-            .kill_wait()
-            .map_err(|error| {
-                format!("terminate layout-conflicting VMM {pid} before GC: {error}")
-            })?;
+        let jail_uid = match persisted.jail_path.as_deref().map(Path::new) {
+            Some(root) => {
+                let marker = read_jail_marker(root).map_err(|error| {
+                    format!(
+                        "read persisted jail ownership for layout-conflicting VMM {pid}: {error}"
+                    )
+                })?;
+                if marker.vm_id != record.id {
+                    return Err(format!(
+                        "persisted jail {} belongs to {}, not {}",
+                        root.display(),
+                        marker.vm_id,
+                        record.id
+                    ));
+                }
+                Some(marker.uid)
+            }
+            None => None,
+        };
+        match pidfd_open(pid) {
+            Ok(pidfd) => {
+                verify_owned_vmm(
+                    pid,
+                    socket_path,
+                    persisted.jail_path.as_deref().map(Path::new),
+                    &self.config.vmm_bin,
+                    jail_uid,
+                )
+                .map_err(|error| {
+                    format!(
+                        "runtime layout changed and PID {pid} could not be identified safely; startup is blocked before GC: {error}"
+                    )
+                })?;
+                graceful_stop_vmm(socket_path);
+                ManagedProcess::adopted(pid, pidfd)
+                    .kill_wait()
+                    .map_err(|error| {
+                        format!("terminate layout-conflicting VMM {pid} before GC: {error}")
+                    })?;
+            }
+            Err(error) if is_process_gone(&error) => {}
+            Err(error) => {
+                return Err(format!(
+                    "pin layout-conflicting VMM {pid} before GC: {error}"
+                ))
+            }
+        }
         if let Some(net) = &self.net {
             net.teardown_vm_id(record.id).map_err(|error| {
                 format!(
@@ -6662,10 +7027,14 @@ fn validate_owned_vm_cgroup(parent: &Path, path: &Path, id: Uuid, pid: u32) -> s
 
     let procs = path.join("cgroup.procs");
     validate_owned_cgroup_control(&procs)?;
-    let owns_pid = std::fs::read_to_string(&procs)?
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .any(|candidate| candidate == pid);
+    if !valid_process_id(pid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid adopted VMM PID {pid}"),
+        ));
+    }
+    let owns_pid =
+        parse_cgroup_processes(&std::fs::read_to_string(&procs)?, &procs)?.contains(&pid);
     if !owns_pid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -7175,6 +7544,7 @@ mod tests {
     #[test]
     fn verify_live_vmm_accepts_process_owning_the_socket() {
         let socket = std::env::temp_dir().join(format!("tarit-adopt-{}.sock", Uuid::new_v4()));
+        let allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
         // A shell that stays alive and carries the socket path in its argv, the
         // way taritd launches `vmm serve --socket <path>`. `read` is a builtin,
         // so the shell does not exec-optimize into another program (which would
@@ -7192,16 +7562,23 @@ mod tests {
             .expect("spawn stand-in VMM");
         // /proc/<pid>/cmdline can read empty for a brief window right after exec
         // under parallel-test load, so retry until the argv is published.
-        let mut result = Err(String::from("verify not attempted"));
+        let mut result = None;
         for _ in 0..200 {
-            result = verify_live_vmm(child.id(), &socket, None);
-            if result.is_ok() {
+            result = Some(verify_live_vmm(
+                child.id(),
+                &socket,
+                None,
+                Path::new("sh"),
+                &allowed_uids,
+            ));
+            if result.as_ref().is_some_and(Result::is_ok) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = child.kill();
         let _ = child.wait();
+        let result = result.expect("verification must be attempted");
         assert!(
             result.is_ok(),
             "owner process must be adoptable: {result:?}"
@@ -7212,6 +7589,7 @@ mod tests {
     #[test]
     fn verify_live_vmm_rejects_pid_that_does_not_own_the_socket() {
         let socket = std::env::temp_dir().join(format!("tarit-adopt-{}.sock", Uuid::new_v4()));
+        let allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
         let mut child = Command::new("sleep")
             .arg("30")
             .stdin(Stdio::null())
@@ -7219,11 +7597,43 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn unrelated process");
-        let result = verify_live_vmm(child.id(), &socket, None);
+        let result = verify_live_vmm(child.id(), &socket, None, Path::new("sleep"), &allowed_uids);
         let _ = child.kill();
         let _ = child.wait();
         let error = result.expect_err("a reused PID must not be adopted");
-        assert!(error.contains("does not own"), "unexpected error: {error}");
+        assert!(
+            error.to_string().contains("does not own"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_live_vmm_rejects_unexpected_executable() {
+        let socket = std::env::temp_dir().join(format!("tarit-adopt-{}.sock", Uuid::new_v4()));
+        let allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg(&socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn executable-mismatch stand-in");
+
+        let error = verify_live_vmm(child.id(), &socket, None, Path::new("sleep"), &allowed_uids)
+            .expect_err("a different executable must never be adopted");
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            error
+                .to_string()
+                .contains("is not running configured executable"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -7235,8 +7645,10 @@ mod tests {
         let pid = child.id();
         child.wait().expect("reap short-lived process");
         let socket = std::env::temp_dir().join("tarit-adopt-dead.sock");
-        let error = verify_live_vmm(pid, &socket, None).expect_err("dead PID must not be adopted");
-        assert!(error.contains("not alive"), "unexpected error: {error}");
+        let allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
+        let error = verify_live_vmm(pid, &socket, None, Path::new("true"), &allowed_uids)
+            .expect_err("dead PID must not be adopted");
+        assert!(error.is_gone(), "unexpected error: {error}");
     }
 
     #[cfg(target_os = "linux")]
@@ -7255,6 +7667,59 @@ mod tests {
         ManagedProcess::adopted(pid, pidfd)
             .kill_wait()
             .expect("terminating an already-exited adopted VMM must succeed");
+    }
+
+    #[test]
+    fn proc_pid_enumeration_skips_nonnumeric_entries_and_zero() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/proc-pid-enumeration-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("123")).unwrap();
+        std::fs::create_dir(root.join("0")).unwrap();
+        std::fs::create_dir(root.join("12x")).unwrap();
+        std::fs::write(root.join("fb"), b"framebuffer metadata").unwrap();
+
+        let entries = proc_pid_entries(&root).unwrap();
+
+        assert_eq!(entries, vec![(123, root.join("123"))]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transient_process_disappearance_errors_are_tolerated() {
+        for errno in [libc::ENOENT, libc::ESRCH] {
+            let result =
+                tolerate_process_disappearance::<()>(Err(std::io::Error::from_raw_os_error(errno)))
+                    .unwrap();
+            assert!(result.is_none(), "errno {errno} must be treated as gone");
+            assert!(ProcessVerificationError::from_io(
+                "inspect transient process",
+                std::io::Error::from_raw_os_error(errno),
+            )
+            .is_gone());
+        }
+
+        let denied = tolerate_process_disappearance::<()>(Err(std::io::Error::from_raw_os_error(
+            libc::EACCES,
+        )));
+        assert!(denied.is_err(), "non-transient errors must remain visible");
+        assert!(ProcessVerificationError::from_io(
+            "inspect protected process",
+            std::io::Error::from_raw_os_error(libc::EACCES),
+        )
+        .is_permission_denied());
+    }
+
+    #[test]
+    fn cgroup_pid_parsing_rejects_nonnumeric_and_nonpositive_values() {
+        let source = Path::new("cgroup.procs");
+        assert_eq!(
+            parse_cgroup_processes("12\n34\n", source).unwrap(),
+            HashSet::from([12, 34])
+        );
+        assert!(parse_cgroup_processes("12\nfb\n", source).is_err());
+        assert!(parse_cgroup_processes("0\n", source).is_err());
+        assert!(parse_cgroup_processes(&format!("{}\n", u32::MAX), source).is_err());
     }
 
     fn supervisor_config(root: &Path) -> Config {
@@ -7442,6 +7907,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn spawn_jailed_vmm_standin(jail_root: &Path) -> Child {
+        let allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("read _line")
@@ -7461,6 +7927,8 @@ mod tests {
                 child.id(),
                 &jail_root.join(JAIL_SOCKET_PATH.trim_start_matches('/')),
                 Some(jail_root),
+                Path::new("sh"),
+                &allowed_uids,
             )
             .is_ok()
             {
@@ -7480,6 +7948,7 @@ mod tests {
             .unwrap()
             .join(format!("target/startup-orphan-jail-{}", Uuid::new_v4()));
         let mut config = supervisor_config(&root);
+        config.vmm_bin = PathBuf::from("sh");
         config.vm_jail = Some(crate::config::VmJailConfig {
             base_dir: root.join("jails"),
             uid_base: 20_000,
@@ -7510,6 +7979,7 @@ mod tests {
             .unwrap()
             .join(format!("target/startup-creating-jail-{}", Uuid::new_v4()));
         let mut config = supervisor_config(&root);
+        config.vmm_bin = PathBuf::from("sh");
         config.vm_jail = Some(crate::config::VmJailConfig {
             base_dir: root.join("jails"),
             uid_base: 20_000,
@@ -7544,13 +8014,23 @@ mod tests {
         let root = std::env::current_dir()
             .unwrap()
             .join(format!("target/restart-layout-change-{}", Uuid::new_v4()));
-        let old_jail = root
-            .join("old-jails")
-            .join(format!("tarit-{}", Uuid::new_v4()));
+        let id = Uuid::new_v4();
+        let old_jail = root.join("old-jails").join(format!("tarit-{id}"));
         std::fs::create_dir_all(old_jail.join("run")).unwrap();
+        write_jail_marker(
+            &old_jail,
+            &JailMarker {
+                version: JAIL_MARKER_VERSION,
+                vm_id: id,
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+            },
+        )
+        .unwrap();
         let mut child = spawn_jailed_vmm_standin(&old_jail);
 
         let mut config = supervisor_config(&root);
+        config.vmm_bin = PathBuf::from("sh");
         config.vm_jail = Some(crate::config::VmJailConfig {
             base_dir: root.join("new-jails"),
             uid_base: 20_000,
@@ -7560,7 +8040,6 @@ mod tests {
             seccomp: true,
         });
         let supervisor = Arc::new(VmmSupervisor::new(config));
-        let id = Uuid::new_v4();
         let socket = old_jail.join(JAIL_SOCKET_PATH.trim_start_matches('/'));
         let mut record = restart_record(&supervisor, id, &socket);
         record.pid = Some(child.id());
@@ -7608,6 +8087,7 @@ mod tests {
         let cgroup_parent = root.join("cgroups");
         std::fs::create_dir_all(&cgroup_parent).unwrap();
         let mut config = supervisor_config(&root);
+        config.vmm_bin = PathBuf::from("sh");
         config.vm_cgroup_parent = Some(cgroup_parent.display().to_string());
         config.vm_jail = Some(crate::config::VmJailConfig {
             base_dir: root.join("jails"),
@@ -7894,7 +8374,9 @@ mod tests {
             stream.write_all(&encoded).unwrap();
             stream.flush().unwrap();
         });
-        let supervisor = Arc::new(VmmSupervisor::new(supervisor_config(&root)));
+        let mut config = supervisor_config(&root);
+        config.vmm_bin = PathBuf::from("sh");
+        let supervisor = Arc::new(VmmSupervisor::new(config));
 
         let good_id = Uuid::new_v4();
         let good_process = ManagedProcess::new(
@@ -7902,6 +8384,8 @@ mod tests {
                 .arg("-c")
                 .arg("read _line")
                 .arg("tarit-vmm")
+                .arg("serve")
+                .arg("--socket")
                 .arg(&good_socket)
                 .stdin(Stdio::piped())
                 .spawn()
@@ -7917,6 +8401,8 @@ mod tests {
                 .arg("-c")
                 .arg("read _line")
                 .arg("tarit-vmm")
+                .arg("serve")
+                .arg("--socket")
                 .arg(&bad_socket)
                 .stdin(Stdio::piped())
                 .spawn()
@@ -7930,7 +8416,15 @@ mod tests {
         ] {
             let mut verified = false;
             for _ in 0..200 {
-                if verify_live_vmm(pid, socket, None).is_ok() {
+                if verify_live_vmm(
+                    pid,
+                    socket,
+                    None,
+                    Path::new("sh"),
+                    &HashSet::from([unsafe { libc::geteuid() }]),
+                )
+                .is_ok()
+                {
                     verified = true;
                     break;
                 }
