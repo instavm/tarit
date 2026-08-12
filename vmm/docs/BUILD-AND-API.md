@@ -150,6 +150,8 @@ vmm serve [OPTIONS] [--socket <PATH>]
 | `--uid <UID>` | 1000 | UID to drop to when jailed |
 | `--gid <GID>` | 1000 | GID to drop to when jailed |
 | `--netns <PATH>` | none | Enter a network namespace when jailed |
+| `--isolate-network` | off | Create an empty VMM process network namespace while using inherited TAP descriptors |
+| `--pid-namespace` | off | Run the VMM child as PID 1 in a dedicated PID namespace |
 | `--seccomp` | automatic with `--jail` | Compatibility flag for the mandatory built-in profile; jail mode cannot disable seccomp |
 | `--cgroup <PATH>` | none | Apply cgroup v2 limits under this cgroup path |
 | `--cgroup-memory-max <BYTES>` | none | Set `memory.max` |

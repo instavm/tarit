@@ -344,6 +344,14 @@ export TARIT_RDS_CA_FILE="$HOME/.taritd/rds-global-bundle.pem"
 
 ## Deploy scripts
 
+For the strict jailed launch path, enable both
+`TARIT_VM_JAIL_PID_NAMESPACE=1` and
+`TARIT_VM_JAIL_NETWORK_NAMESPACE=1`. The supervised host PID is a minimal
+privilege-dropped launcher; its child is PID 1 inside the VM's PID namespace.
+The VMM process network namespace is empty. taritd keeps the TAP and host
+routing policy in the host namespace and transfers an already-open TAP queue
+descriptor to the VMM before it enters confinement.
+
 | Script | Purpose | Important inputs |
 | --- | --- | --- |
 | `deploy/c8i-deploy.sh` | Rsync this repo to an EC2 c8i host, build `taritd`, build or reuse `vmm`, start network-enabled `taritd` as root, and run `tests/e2e_c8i.sh`. | `C8I_HOST`, a 32-character `TARIT_API_KEY`, `TARIT_KERNEL`, and `TARIT_ROOTFS` are required. The host must be in `C8I_KNOWN_HOSTS`. It binds to `127.0.0.1:8080` unless `TARIT_LISTEN` is set. |

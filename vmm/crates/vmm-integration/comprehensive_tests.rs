@@ -791,6 +791,7 @@ fn jailer_escape_attempts() {
         rlimit_nofile: 1024,
         rlimit_as: 0,
         netns: "".into(),
+        isolate_network: false,
         cgroup_limits: None,
     };
     let result = vmm_jailer::jail(&bad_cfg);
@@ -804,6 +805,7 @@ fn jailer_escape_attempts() {
         rlimit_nofile: 1024,
         rlimit_as: 0,
         netns: "".into(),
+        isolate_network: false,
         cgroup_limits: None,
     };
     let result = vmm_jailer::jail(&root_cfg);

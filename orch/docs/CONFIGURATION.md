@@ -33,7 +33,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_DATABASE_URL` | string | unset | PostgreSQL fleet registry URL. Empty string is treated as unset. Setting this enables distributed fleet behavior. |
 | `TARIT_PEER_SECRET` | string | random local-only value | Key for short-lived, source/target-bound peer request HMACs. It is never sent on the wire. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
 | `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. |
-| `TARIT_PRODUCTION` | bool | `false` | Request the hostile-multi-tenant production profile. This currently fails closed because the orchestrated jail path is incomplete; see `PRODUCTION_READINESS.md`. |
+| `TARIT_PRODUCTION` | bool | `false` | Enforce the strict production configuration gates, including per-VM PID and network namespaces. This does not by itself satisfy every release gate in `PRODUCTION_READINESS.md`. |
 | `TARIT_REAP_ON_SHUTDOWN` | bool | `true` | On SIGTERM or SIGINT, stop local `vmm serve` children after HTTP drain. |
 | `TARIT_RDS_CA_FILE` | path | unset | Extra CA bundle for PostgreSQL TLS. This is read by the fleet connector, not by `Config::from_env()`. Empty string is ignored. |
 
@@ -68,6 +68,24 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_REFILL_CPU_WEIGHT` | u64 | `10` | cgroup v2 `cpu.weight` for refill children. Values are clamped to `1..=10000`. |
 
 The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = false`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
+
+## VMM jail
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_VM_JAIL_BASE` | path | unset | Absolute parent directory for private per-VM jail roots. |
+| `TARIT_VM_JAIL_UID_BASE` | positive u32 | unset | First uid in the dedicated per-VM identity range. |
+| `TARIT_VM_JAIL_GID_BASE` | positive u32 | unset | First gid in the dedicated per-VM identity range. |
+| `TARIT_VM_JAIL_ID_COUNT` | positive u32 | `TARIT_MAX_VMS` | Number of uid/gid identities reserved for VMMs. |
+| `TARIT_VM_JAIL_PROFILE` | string | `chroot-mount-uts-ipc-v1` | Supported jail profile. |
+| `TARIT_VM_JAIL_SECCOMP` | bool | `true` | Mandatory built-in VMM seccomp policy. |
+| `TARIT_VM_JAIL_PID_NAMESPACE` | bool | `false` | Launch the VMM child as PID 1 in a dedicated PID namespace. Required by `TARIT_PRODUCTION=1`. |
+| `TARIT_VM_JAIL_NETWORK_NAMESPACE` | bool | `false` | Put the VMM process in an empty network namespace. taritd passes the host-owned TAP queue as an inherited descriptor. Required by `TARIT_PRODUCTION=1`. |
+
+Network namespace isolation does not move the TAP out of the host namespace.
+The host retains the TAP, nftables, routing, and traffic-control topology;
+only the VMM process is isolated. taritd opens the provisioned TAP before
+launch and transfers that queue descriptor to the jailed VMM.
 
 ## Per-VM resource limits
 
@@ -326,7 +344,7 @@ origin and set `TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
 - API keys from all sources must not be empty or duplicated: `API keys must not be empty` and `duplicate API key configured`.
 - Tenant IDs must be non-empty and contain only ASCII letters, digits, `.`, `_`, or `-`: `tenant id must not be empty` and `tenant id may only contain ASCII letters, digits, '.', '_', or '-'`.
 - Cluster mode requires a strong peer secret: `TARIT_PEER_SECRET must be set to a strong value when TARIT_DATABASE_URL is configured for a fleet`.
-- `TARIT_PRODUCTION=1` fails startup until the mandatory per-VM jail,
-  namespace, cgroup, and path-staging boundary is implemented end to end.
+- `TARIT_PRODUCTION=1` requires the per-VM jail, PID namespace, network
+  namespace, cgroup, and path-staging controls to be enabled together.
 - Warm-pool watermarks must be ordered: `warm-pool watermarks for {vcpus} vCPU/{memory_mib} MiB must satisfy hard_floor <= low_watermark <= target <= high_watermark (got {hard_floor} <= {low_watermark} <= {target} <= {high_watermark})`.
 - A warm-pool class cannot set both `image` and `rootfs`: `warm-pool class for {vcpus} vCPU/{memory_mib} MiB cannot set both image and rootfs`.

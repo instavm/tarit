@@ -37,6 +37,10 @@ pub struct JailerConfig {
     pub rlimit_as: u64,
     /// Network namespace path (created by vmm-net).
     pub netns: String,
+    /// Create a new empty network namespace for the VMM process. Host TAP
+    /// access must be supplied through an inherited descriptor.
+    #[serde(default)]
+    pub isolate_network: bool,
 }
 
 pub struct Jailer {
@@ -77,6 +81,7 @@ mod tests {
             rlimit_nofile: 1024,
             rlimit_as: 1 << 30,
             netns: "/var/run/netns/vmm0".into(),
+            isolate_network: false,
             cgroup_limits: None,
         }
     }

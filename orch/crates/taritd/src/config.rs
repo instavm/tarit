@@ -484,6 +484,10 @@ pub struct VmJailConfig {
     pub profile: String,
     /// Per-thread seccomp is mandatory for jailed production VMMs.
     pub seccomp: bool,
+    /// Run the VMM child as PID 1 in a dedicated PID namespace.
+    pub pid_namespace: bool,
+    /// Run the VMM process in a dedicated empty network namespace.
+    pub network_namespace: bool,
 }
 
 pub const SUPPORTED_VM_JAIL_PROFILE: &str = "chroot-mount-uts-ipc-v1";
@@ -1217,10 +1221,13 @@ fn validate_production_requirements(
 }
 
 fn validate_production_jail_network_isolation(vm_jail: &VmJailConfig) -> Result<()> {
-    bail!(
-        "TARIT_PRODUCTION rejects jail profile {:?}: it retains the host network namespace; production remains unavailable until dedicated netns/veth/TAP wiring exists",
-        vm_jail.profile
-    )
+    if !vm_jail.pid_namespace {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_PID_NAMESPACE=1");
+    }
+    if !vm_jail.network_namespace {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_NETWORK_NAMESPACE=1");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1622,21 +1629,14 @@ fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
     let pid_namespace = env_bool_checked("TARIT_VM_JAIL_PID_NAMESPACE", false)?;
     let network_namespace = env_bool_checked("TARIT_VM_JAIL_NETWORK_NAMESPACE", false)?;
 
-    if pid_namespace {
-        bail!("TARIT_VM_JAIL_PID_NAMESPACE is unsupported: PID isolation requires a fork/launcher");
-    }
-    if network_namespace {
-        bail!(
-            "TARIT_VM_JAIL_NETWORK_NAMESPACE is unsupported until Tarit provides a veth/routing topology; host TAP networking requires the host network namespace"
-        );
-    }
-
     if base_dir.is_none()
         && uid_base.is_none()
         && gid_base.is_none()
         && id_count.is_none()
         && env::var("TARIT_VM_JAIL_PROFILE").is_err()
         && env::var("TARIT_VM_JAIL_SECCOMP").is_err()
+        && env::var("TARIT_VM_JAIL_PID_NAMESPACE").is_err()
+        && env::var("TARIT_VM_JAIL_NETWORK_NAMESPACE").is_err()
     {
         return Ok(None);
     }
@@ -1675,6 +1675,8 @@ fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
         id_count,
         profile,
         seccomp,
+        pid_namespace,
+        network_namespace,
     }))
 }
 
@@ -1945,24 +1947,22 @@ mod tests {
     }
 
     #[test]
-    fn vm_jail_rejects_unsupported_pid_and_network_namespaces() {
+    fn vm_jail_parses_pid_and_network_namespaces() {
         let _guard = env_lock();
-        for (key, expected) in [
-            ("TARIT_VM_JAIL_PID_NAMESPACE", "fork/launcher"),
-            ("TARIT_VM_JAIL_NETWORK_NAMESPACE", "veth/routing"),
-        ] {
-            std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
-            std::env::set_var("TARIT_VM_JAIL_UID_BASE", "200000");
-            std::env::set_var("TARIT_VM_JAIL_GID_BASE", "300000");
-            std::env::set_var(key, "1");
-            let error = parse_vm_jail_config(8).expect_err("unsupported namespace must fail");
-            assert!(error.to_string().contains(expected), "{error}");
-            std::env::remove_var(key);
-        }
+        std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
+        std::env::set_var("TARIT_VM_JAIL_UID_BASE", "200000");
+        std::env::set_var("TARIT_VM_JAIL_GID_BASE", "300000");
+        std::env::set_var("TARIT_VM_JAIL_PID_NAMESPACE", "1");
+        std::env::set_var("TARIT_VM_JAIL_NETWORK_NAMESPACE", "1");
+        let jail = parse_vm_jail_config(8).unwrap().unwrap();
+        assert!(jail.pid_namespace);
+        assert!(jail.network_namespace);
         for key in [
             "TARIT_VM_JAIL_BASE",
             "TARIT_VM_JAIL_UID_BASE",
             "TARIT_VM_JAIL_GID_BASE",
+            "TARIT_VM_JAIL_PID_NAMESPACE",
+            "TARIT_VM_JAIL_NETWORK_NAMESPACE",
         ] {
             std::env::remove_var(key);
         }
@@ -1977,10 +1977,13 @@ mod tests {
             id_count: 8,
             profile: SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: true,
+            network_namespace: false,
         };
         let error = validate_production_jail_network_isolation(&jail)
             .expect_err("host-network jail must not pass the production gate");
-        assert!(error.to_string().contains("host network namespace"));
-        assert!(error.to_string().contains("netns/veth/TAP"));
+        assert!(error
+            .to_string()
+            .contains("TARIT_VM_JAIL_NETWORK_NAMESPACE=1"));
     }
 }

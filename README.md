@@ -7,6 +7,9 @@ sandboxes, built for AI agent workloads. It boots a real hardware-virtualized VM
 in milliseconds, runs a task inside it, and tears it down. Each sandbox has a
 guest kernel rather than sharing the host kernel; production containment also
 depends on the host-side controls described in [SECURITY.md](SECURITY.md).
+Jailed orchestrated VMMs support dedicated PID and process network namespaces;
+the host-owned TAP queue is passed by descriptor so host routing and traffic
+policy remain outside the VMM namespace.
 
 It has two parts, developed together in this monorepo:
 
