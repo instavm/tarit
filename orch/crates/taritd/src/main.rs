@@ -116,6 +116,56 @@ fn persist_startup_vm_observation(
         .with_context(|| format!("{context}: {}", vm.id))
 }
 
+fn is_identityless_legacy_creating(config: &Config, record: &tarit_types::VmRecord) -> bool {
+    record.host_id == config.host_id
+        && record.status == VmStatus::Creating
+        && record.runtime_layout.is_none()
+        && record.socket_path.as_deref().is_none_or(str::is_empty)
+        && record.pid.is_none_or(|pid| pid == 0)
+}
+
+fn reconcile_legacy_creating_records(
+    config: &Config,
+    store: &Store,
+    supervisor: &VmmSupervisor,
+    records: &mut [tarit_types::VmRecord],
+) -> anyhow::Result<()> {
+    for record in records
+        .iter_mut()
+        .filter(|record| is_identityless_legacy_creating(config, record))
+    {
+        let fenced_revision = record.revision.checked_add(2).ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy Creating VM {} revision is exhausted; cleanup cannot be fenced",
+                record.id
+            )
+        })?;
+        let terminated = supervisor
+            .reconcile_legacy_creating_runtime(record.id)
+            .with_context(|| {
+                format!(
+                    "contain legacy Creating runtime and clean owned artifacts for VM {}",
+                    record.id
+                )
+            })?;
+        record.status = VmStatus::Error;
+        record.revision = fenced_revision;
+        record.updated_at = chrono::Utc::now();
+        persist_startup_vm_observation(
+            store,
+            record,
+            "persist terminal legacy Creating VM before runtime-layout backfill",
+        )?;
+        tracing::warn!(
+            vm = %record.id,
+            revision = record.revision,
+            terminated,
+            "reconciled identity-less legacy Creating VM before runtime-layout backfill"
+        );
+    }
+    Ok(())
+}
+
 fn backfill_legacy_runtime_layouts(
     config: &Config,
     store: &Store,
@@ -181,12 +231,11 @@ async fn run_server(
     let mut persisted_vms = store
         .list_vms()
         .context("load persisted VMs during startup")?;
-    backfill_legacy_runtime_layouts(&config, &store, &mut persisted_vms)
-        .context("backfill legacy active VM runtime layouts")?;
     let live_vm_ids = persisted_vms
         .iter()
         .filter(|vm| {
             vm.host_id == config.host_id
+                && !is_identityless_legacy_creating(&config, vm)
                 && matches!(
                     vm.status,
                     VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
@@ -204,6 +253,10 @@ async fn run_server(
         )
         .context("initialize fail-closed network recovery")?,
     );
+    reconcile_legacy_creating_records(&config, &store, &supervisor, &mut persisted_vms)
+        .context("reconcile legacy Creating VMs before runtime-layout backfill")?;
+    backfill_legacy_runtime_layouts(&config, &store, &mut persisted_vms)
+        .context("backfill legacy active VM runtime layouts")?;
     // Re-adopt VMs that survived this restart so the control plane can manage
     // them again. Their network policy was reconciled during supervisor
     // construction; this restores the exec/pause/snapshot/delete path. VMs that
@@ -1261,6 +1314,118 @@ mod tests {
         assert!(error.contains("drain required before upgrade"));
         assert!(error.contains("legacy UUID-scoped socket"));
         assert_eq!(store.get_vm(id).unwrap().runtime_layout, None);
+    }
+
+    #[test]
+    fn identity_less_legacy_creating_is_fenced_before_layout_backfill() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/legacy-creating-upgrade-{}", Uuid::new_v4()));
+        let mut config = test_config();
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        let supervisor = VmmSupervisor::new(config.clone());
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let overlay_path = config.socket_dir.join("overlays").join(format!("{id}.cow"));
+        std::fs::write(&socket_path, b"stale socket artifact").unwrap();
+        std::fs::write(&overlay_path, b"stale overlay artifact").unwrap();
+        let mut record = legacy_active_record(&config, id, socket_path.clone(), None);
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&record).unwrap();
+        let mut records = vec![record];
+
+        reconcile_legacy_creating_records(&config, &store, &supervisor, &mut records).unwrap();
+        backfill_legacy_runtime_layouts(&config, &store, &mut records).unwrap();
+
+        let durable = store.get_vm(id).unwrap();
+        assert_eq!(durable.status, VmStatus::Error);
+        assert_eq!(durable.revision, 9);
+        assert_eq!(durable.runtime_layout, None);
+        assert!(!socket_path.exists());
+        assert!(!overlay_path.exists());
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_less_legacy_creating_is_excluded_from_live_recovery() {
+        let config = test_config();
+        let id = Uuid::new_v4();
+        let mut record = legacy_active_record(
+            &config,
+            id,
+            config.socket_dir.join(format!("{id}.sock")),
+            None,
+        );
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+
+        assert!(is_identityless_legacy_creating(&config, &record));
+        record.host_id = "other-host".into();
+        assert!(!is_identityless_legacy_creating(&config, &record));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_less_legacy_creating_terminates_discovered_owned_runtime() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/legacy-creating-runtime-{}", Uuid::new_v4()));
+        let mut config = test_config();
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        let supervisor = VmmSupervisor::new(config.clone());
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut published = false;
+        for _ in 0..200 {
+            published =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).is_ok_and(|cmdline| {
+                    cmdline
+                        .windows(socket_path.as_os_str().as_bytes().len())
+                        .any(|window| window == socket_path.as_os_str().as_bytes())
+                });
+            if published {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "legacy VMM stand-in did not publish its argv");
+        let mut record = legacy_active_record(&config, id, socket_path.clone(), None);
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&record).unwrap();
+        let mut records = vec![record];
+
+        reconcile_legacy_creating_records(&config, &store, &supervisor, &mut records).unwrap();
+
+        child.wait().unwrap();
+        assert_eq!(store.get_vm(id).unwrap().status, VmStatus::Error);
+        assert!(!socket_path.exists());
+        drop(listener);
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]

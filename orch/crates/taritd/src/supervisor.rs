@@ -7,6 +7,7 @@ use crate::scheduler::{ReservationError, ResourceShape, Scheduler};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -49,6 +50,7 @@ const EXEC_OP_MARGIN: Duration = Duration::from_secs(10);
 /// response past the plain client's 5s per-read timeout. Give it a modest
 /// real deadline instead of surfacing EAGAIN as a 500.
 const STATUS_OP_TIMEOUT: Duration = Duration::from_secs(30);
+const RESTORE_NETWORK_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 const NORMAL_CGROUP_CPU_WEIGHT: u64 = 100;
 
 fn graceful_stop_vmm(socket_path: &Path) {
@@ -114,6 +116,50 @@ fn verify_legacy_nonjailed_vmm(pid: u32, socket_path: &Path) -> Result<(), Strin
         return Err(format!(
             "VMM PID {pid} does not have one exact --socket {} argument",
             socket_path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_owned_vmm(pid: u32, socket_path: &Path, jail_root: Option<&Path>) -> Result<(), String> {
+    let process_uid = std::fs::metadata(format!("/proc/{pid}"))
+        .map_err(|error| format!("inspect VMM PID {pid}: {error}"))?
+        .uid();
+    let service_uid = unsafe { libc::geteuid() };
+    if process_uid != service_uid {
+        return Err(format!(
+            "VMM PID {pid} is owned by uid {process_uid}, not taritd uid {service_uid}"
+        ));
+    }
+    let Some(jail_root) = jail_root else {
+        return verify_legacy_nonjailed_vmm(pid, socket_path);
+    };
+
+    verify_live_vmm(pid, socket_path, Some(jail_root))?;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map_err(|error| format!("read /proc/{pid}/cmdline: {error}"))?;
+    let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+    if !args.iter().any(|arg| *arg == b"serve") {
+        return Err(format!("VMM PID {pid} is missing the serve subcommand"));
+    }
+    let socket_args = args
+        .windows(2)
+        .filter_map(|pair| (pair[0] == b"--socket").then_some(pair[1]))
+        .collect::<Vec<_>>();
+    if socket_args.len() != 1 || socket_args[0] != JAIL_SOCKET_PATH.as_bytes() {
+        return Err(format!(
+            "VMM PID {pid} does not have one exact --socket {JAIL_SOCKET_PATH} argument"
+        ));
+    }
+    let jail_args = args
+        .windows(2)
+        .filter_map(|pair| (pair[0] == b"--jail" || pair[0] == b"--jail-root").then_some(pair[1]))
+        .collect::<Vec<_>>();
+    if jail_args.len() != 1 || jail_args[0] != jail_root.as_os_str().as_bytes() {
+        return Err(format!(
+            "VMM PID {pid} does not have one exact jail argument for {}",
+            jail_root.display()
         ));
     }
     Ok(())
@@ -3865,10 +3911,48 @@ impl VmmSupervisor {
         Ok(booted)
     }
 
+    fn require_restored_guest_ready_and_network(
+        &self,
+        booted: BootedVm,
+    ) -> Result<BootedVm, OrchError> {
+        let booted = self.require_booted_guest_ready(booted, "restore")?;
+        if !boot_can_publish(&booted.control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(
+                booted.id,
+                &booted.control,
+                &booted.vm,
+                self.shutdown_error(),
+            ));
+        }
+        if let Some(allocation) = &booted.vm.net {
+            let repaired = rebind_restored_guest_network(&booted.vm.socket_path, allocation)
+                .and_then(|()| verify_restored_guest_connectivity(allocation));
+            if let Err(error) = repaired {
+                return Err(self.cleanup_boot_failure(
+                    booted.id,
+                    &booted.control,
+                    &booted.vm,
+                    error,
+                ));
+            }
+        }
+        if !boot_can_publish(&booted.control, self.is_shutting_down()) {
+            return Err(self.cleanup_boot_failure(
+                booted.id,
+                &booted.control,
+                &booted.vm,
+                self.shutdown_error(),
+            ));
+        }
+        Ok(booted)
+    }
+
     /// Restore a VM from a node-local snapshot file: spawn a fresh `vmm serve`,
     /// send Restore, and register the resumed VM. Host network bindings are
     /// always replaced with a fresh allocation; saved tap/IP bindings are never
-    /// reused across VM incarnations.
+    /// reused across VM incarnations. Before returning a publishable VM, the
+    /// restored guest address and default route are rebound to that allocation
+    /// and both guest configuration and host-to-guest connectivity are checked.
     fn spawn_and_restore(
         &self,
         ticket: BootTicket,
@@ -3992,7 +4076,7 @@ impl VmmSupervisor {
         if !boot_can_publish(&ticket.control, self.is_shutting_down()) {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, self.shutdown_error()));
         }
-        Ok(BootedVm {
+        self.require_restored_guest_ready_and_network(BootedVm {
             id,
             vm,
             control: ticket.control,
@@ -4011,8 +4095,7 @@ impl VmmSupervisor {
             .map(PathBuf::from)
             .map(RestoreOverlay::Seeded)
             .unwrap_or(RestoreOverlay::None);
-        let booted = self.spawn_and_restore(ticket, &snapshot_path, overlay, &vm_config, shape)?;
-        self.require_booted_guest_ready(booted, "restore")
+        self.spawn_and_restore(ticket, &snapshot_path, overlay, &vm_config, shape)
     }
 
     /// Boot one warm-pool VM of `class` and park it in the warm queue. The boot
@@ -4424,31 +4507,6 @@ impl VmmSupervisor {
             }
             return Err(error);
         }
-        let socket_path = booted.vm.socket_path.clone();
-        let boot_control = Arc::clone(&booted.control);
-        let worker = Arc::clone(&self);
-        let ready = match tokio::task::spawn_blocking(move || {
-            worker.await_ready(&socket_path, &boot_control)
-        })
-        .await
-        {
-            Ok(ready) => ready,
-            Err(error) => {
-                return Err(self.cleanup_boot_failure(
-                    id,
-                    &booted.control,
-                    &booted.vm,
-                    OrchError::Internal(format!("warm restore readiness task: {error}")),
-                ));
-            }
-        };
-        if let Err(error) = ready {
-            let error = self.cleanup_boot_failure(id, &booted.control, &booted.vm, error);
-            if task.is_cancelled() && !self.has_retained_boot(id) {
-                task.mark_terminal_converged();
-            }
-            return Err(error);
-        }
         let result = self.publish_warm(booted, spec).await;
         if task.is_cancelled() && !self.has_retained_boot(id) {
             task.mark_terminal_converged();
@@ -4667,6 +4725,7 @@ impl VmmSupervisor {
     #[cfg(target_os = "linux")]
     fn owned_processes_for(&self, id: Uuid) -> Result<Vec<ManagedProcess>, OrchError> {
         let socket_path = self.socket_path_for(id);
+        let legacy_socket_path = self.config.socket_dir.join(format!("{id}.sock"));
         let jail_root = self.jails.as_ref().map(|jails| jails.root_for(id));
         let mut cgroup_pids = HashSet::new();
         if let Some(cgroup) = self.exact_vm_cgroup_path(id) {
@@ -4730,20 +4789,23 @@ impl VmmSupervisor {
                 }
             };
             let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
-            let socket_match = args
+            let current_socket_match = args
                 .iter()
                 .any(|arg| *arg == socket_path.as_os_str().as_bytes());
+            let legacy_socket_match = args
+                .iter()
+                .any(|arg| *arg == legacy_socket_path.as_os_str().as_bytes());
             let jail_match = jail_root.as_ref().is_some_and(|root| {
                 args.iter().any(|arg| *arg == JAIL_SOCKET_PATH.as_bytes())
                     && args.iter().any(|arg| *arg == root.as_os_str().as_bytes())
             });
-            if socket_match || jail_match {
+            if current_socket_match || legacy_socket_match || jail_match {
                 candidate_pids.insert(pid);
             }
         }
-        if jail_root.is_some() && proc_visibility_incomplete {
+        if proc_visibility_incomplete {
             return Err(OrchError::Internal(format!(
-                "cannot inspect every process while reconciling owned jail for VM {id}; preserving its identity lease"
+                "cannot inspect every process while reconciling owned runtime for VM {id}; preserving its artifacts and identity lease"
             )));
         }
 
@@ -4762,7 +4824,20 @@ impl VmmSupervisor {
                     )))
                 }
             };
-            if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root) {
+            let verified = verify_owned_vmm(pid, &socket_path, jail_root.as_deref()).or_else(
+                |current_reason| {
+                    if legacy_socket_path == socket_path {
+                        Err(current_reason)
+                    } else {
+                        verify_owned_vmm(pid, &legacy_socket_path, None).map_err(|legacy_reason| {
+                            format!(
+                                "current-layout verification failed: {current_reason}; legacy-layout verification failed: {legacy_reason}"
+                            )
+                        })
+                    }
+                },
+            );
+            if let Err(reason) = verified {
                 if cgroup_pids.contains(&pid) {
                     return Err(OrchError::Internal(format!(
                         "process {pid} remains in owned cgroup for VM {id} but failed VMM ownership verification: {reason}"
@@ -4811,9 +4886,26 @@ impl VmmSupervisor {
         if let Err(error) = remove_file_if_present(&self.socket_path_for(id)) {
             failures.push(format!("remove VMM socket: {error}"));
         }
+        let legacy_socket = self.config.socket_dir.join(format!("{id}.sock"));
+        if legacy_socket != self.socket_path_for(id) {
+            if let Err(error) = remove_file_if_present(&legacy_socket) {
+                failures.push(format!("remove legacy VMM socket: {error}"));
+            }
+        }
+        let overlay_path = PathBuf::from(self.overlay_path_for(id));
         if self.jails.is_none() {
-            if let Err(error) = remove_file_if_present(Path::new(&self.overlay_path_for(id))) {
+            if let Err(error) = remove_file_if_present(&overlay_path) {
                 failures.push(format!("remove VMM overlay: {error}"));
+            }
+        }
+        let legacy_overlay = self
+            .config
+            .socket_dir
+            .join("overlays")
+            .join(format!("{id}.cow"));
+        if legacy_overlay != overlay_path {
+            if let Err(error) = remove_file_if_present(&legacy_overlay) {
+                failures.push(format!("remove legacy VMM overlay: {error}"));
             }
         }
         if let Some(path) = self.exact_vm_cgroup_path(id) {
@@ -4841,6 +4933,10 @@ impl VmmSupervisor {
         } else {
             Err(OrchError::Internal(failures.join("; ")))
         }
+    }
+
+    pub(crate) fn reconcile_legacy_creating_runtime(&self, id: Uuid) -> Result<usize, OrchError> {
+        self.cleanup_uncommitted_runtime(id)
     }
 
     fn reconcile_unpersisted_owned_runtimes(
@@ -6800,6 +6896,193 @@ fn parse_self_cgroup(contents: &str) -> Option<PathBuf> {
     } else {
         Some(root.join(relative.trim_start_matches('/')))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoredGuestNetwork {
+    guest_ip: Ipv4Addr,
+    gateway: Ipv4Addr,
+    prefix: u8,
+}
+
+impl TryFrom<&NetAlloc> for RestoredGuestNetwork {
+    type Error = OrchError;
+
+    fn try_from(allocation: &NetAlloc) -> Result<Self, Self::Error> {
+        let guest_ip = allocation.guest_ip.parse::<Ipv4Addr>().map_err(|error| {
+            OrchError::Internal(format!(
+                "parse restored guest IPv4 address {:?}: {error}",
+                allocation.guest_ip
+            ))
+        })?;
+        let gateway = allocation.host_ip.parse::<Ipv4Addr>().map_err(|error| {
+            OrchError::Internal(format!(
+                "parse restored guest gateway IPv4 address {:?}: {error}",
+                allocation.host_ip
+            ))
+        })?;
+        if allocation.prefix != 30 {
+            return Err(OrchError::Internal(format!(
+                "restored guest IPv4 prefix {} does not match the allocated /30",
+                allocation.prefix
+            )));
+        }
+        if guest_ip == gateway {
+            return Err(OrchError::Internal(
+                "restored guest IPv4 address equals its gateway".into(),
+            ));
+        }
+        let mask = u32::MAX << (32 - allocation.prefix);
+        if u32::from(guest_ip) & mask != u32::from(gateway) & mask {
+            return Err(OrchError::Internal(format!(
+                "restored guest IPv4 address {guest_ip} and gateway {gateway} are not in the same /{}",
+                allocation.prefix
+            )));
+        }
+        Ok(Self {
+            guest_ip,
+            gateway,
+            prefix: allocation.prefix,
+        })
+    }
+}
+
+fn restored_guest_exec(
+    client: &VmmClient,
+    command: &str,
+    operation: &str,
+) -> Result<String, OrchError> {
+    let timeout_ms = u64::try_from(RESTORE_NETWORK_EXEC_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+    match client.exec(command, timeout_ms) {
+        Ok((0, stdout, _, _)) => Ok(stdout),
+        Ok((exit_code, _, stderr, _)) => Err(OrchError::Vmm(format!(
+            "restore guest network {operation} exited with status {exit_code}: {}",
+            stderr.trim()
+        ))),
+        Err(error) => Err(OrchError::Vmm(format!(
+            "restore guest network {operation}: {error}"
+        ))),
+    }
+}
+
+fn restored_guest_has_address(output: &str, network: RestoredGuestNetwork) -> bool {
+    let expected = format!("{}/{}", network.guest_ip, network.prefix);
+    let addresses = output
+        .lines()
+        .flat_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            fields
+                .windows(2)
+                .filter_map(|fields| (fields[0] == "inet").then_some(fields[1]))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    addresses == [expected.as_str()]
+}
+
+fn restored_guest_has_default_route(output: &str, network: RestoredGuestNetwork) -> bool {
+    let routes = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if routes.len() != 1 {
+        return false;
+    }
+    let gateway = network.gateway.to_string();
+    let mut fields = routes[0].split_whitespace();
+    fields.next() == Some("default")
+        && fields.next() == Some("via")
+        && fields.next() == Some(gateway.as_str())
+        && fields.next() == Some("dev")
+        && fields.next() == Some("eth0")
+        && fields.next().is_none()
+}
+
+fn rebind_restored_guest_network(
+    socket_path: &Path,
+    allocation: &NetAlloc,
+) -> Result<(), OrchError> {
+    let network = RestoredGuestNetwork::try_from(allocation)?;
+    let client = VmmClient::new(socket_path)
+        .with_connect_timeout(RESTORE_NETWORK_EXEC_TIMEOUT)
+        .with_request_timeout(RESTORE_NETWORK_EXEC_TIMEOUT + EXEC_OP_MARGIN);
+
+    // Exec is shell-based on this branch, so only canonical values parsed as
+    // IPv4 addresses and an integer prefix are interpolated. Every command,
+    // interface name, operator, and argument position remains fixed.
+    let configure = format!(
+        "ip -4 address flush dev eth0 && ip link set dev eth0 up && ip -4 address add {}/{} dev eth0 && ip -4 route flush default && ip -4 route add default via {} dev eth0",
+        network.guest_ip, network.prefix, network.gateway
+    );
+    restored_guest_exec(&client, &configure, "rebind")?;
+
+    let addresses =
+        restored_guest_exec(&client, "ip -4 -o address show dev eth0", "verify address")?;
+    if !restored_guest_has_address(&addresses, network) {
+        return Err(OrchError::Vmm(format!(
+            "restore guest network address verification failed: expected {}/{} on eth0, got {:?}",
+            network.guest_ip,
+            network.prefix,
+            addresses.trim()
+        )));
+    }
+
+    let routes = restored_guest_exec(
+        &client,
+        "ip -4 route show default dev eth0",
+        "verify default route",
+    )?;
+    if !restored_guest_has_default_route(&routes, network) {
+        return Err(OrchError::Vmm(format!(
+            "restore guest network route verification failed: expected default via {} dev eth0, got {:?}",
+            network.gateway,
+            routes.trim()
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn restored_guest_connectivity_command(allocation: &NetAlloc) -> Result<Command, OrchError> {
+    let network = RestoredGuestNetwork::try_from(allocation)?;
+    let mut command = Command::new("ping");
+    command
+        .args(["-4", "-n", "-c", "1", "-W", "2", "-I"])
+        .arg(&allocation.tap)
+        .arg(network.guest_ip.to_string());
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_restored_guest_connectivity(allocation: &NetAlloc) -> Result<(), OrchError> {
+    let network = RestoredGuestNetwork::try_from(allocation)?;
+    let output = restored_guest_connectivity_command(allocation)?
+        .output()
+        .map_err(|error| {
+            OrchError::Internal(format!(
+                "probe restored guest {} through {}: {error}",
+                network.guest_ip, allocation.tap
+            ))
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(OrchError::Vmm(format!(
+            "restored guest {} is unreachable through {}: {}",
+            network.guest_ip,
+            allocation.tap,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_restored_guest_connectivity(_allocation: &NetAlloc) -> Result<(), OrchError> {
+    Err(OrchError::Internal(
+        "restored guest connectivity verification requires Linux".into(),
+    ))
 }
 
 fn build_vmm_config(
@@ -9040,6 +9323,129 @@ mod tests {
         assert!(state.teardown_in_progress());
         state.complete_teardown();
         assert!(!state.teardown_in_progress());
+    }
+
+    #[test]
+    fn restored_network_rebind_uses_only_canonical_fixed_commands() {
+        let socket_path = PathBuf::from(format!(
+            "target/taritd-restore-network-{}-{}.sock",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let expected = [
+            (
+                "ip -4 address flush dev eth0 && ip link set dev eth0 up && ip -4 address add 172.16.0.30/30 dev eth0 && ip -4 route flush default && ip -4 route add default via 172.16.0.29 dev eth0",
+                "",
+            ),
+            (
+                "ip -4 -o address show dev eth0",
+                "2: eth0 inet 172.16.0.30/30 scope global eth0\n",
+            ),
+            (
+                "ip -4 route show default dev eth0",
+                "default via 172.16.0.29 dev eth0\n",
+            ),
+        ];
+        let server = thread::spawn(move || {
+            for (expected_command, stdout) in expected {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut length = [0_u8; 4];
+                stream.read_exact(&mut length).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                stream.read_exact(&mut body).unwrap();
+                let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+                match request {
+                    tarit_vmm_client::ApiRequest::Exec {
+                        command,
+                        timeout_ms,
+                    } => {
+                        assert_eq!(command, expected_command);
+                        assert_eq!(timeout_ms, RESTORE_NETWORK_EXEC_TIMEOUT.as_millis() as u64);
+                    }
+                    request => panic!("unexpected restore network request: {request:?}"),
+                }
+                let response = tarit_vmm_client::ApiResponse::Exec {
+                    exit_code: 0,
+                    stdout: stdout.into(),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                };
+                let encoded = serde_json::to_vec(&response).unwrap();
+                stream
+                    .write_all(&(encoded.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&encoded).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let allocation = NetAlloc {
+            idx: 7,
+            vm_id: Uuid::new_v4(),
+            tap: "insta7".into(),
+            host_ip: "172.16.0.29".into(),
+            guest_ip: "172.16.0.30".into(),
+            prefix: 30,
+        };
+        let connectivity = restored_guest_connectivity_command(&allocation).unwrap();
+        assert_eq!(connectivity.get_program(), "ping");
+        assert_eq!(
+            connectivity
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "-4",
+                "-n",
+                "-c",
+                "1",
+                "-W",
+                "2",
+                "-I",
+                "insta7",
+                "172.16.0.30"
+            ]
+        );
+
+        rebind_restored_guest_network(&socket_path, &allocation).unwrap();
+
+        server.join().unwrap();
+        std::fs::remove_file(socket_path).unwrap();
+    }
+
+    #[test]
+    fn restored_network_rebind_rejects_non_ip_input_before_exec() {
+        let allocation = NetAlloc {
+            idx: 7,
+            vm_id: Uuid::new_v4(),
+            tap: "insta7".into(),
+            host_ip: "172.16.0.29".into(),
+            guest_ip: "172.16.0.30; reboot".into(),
+            prefix: 30,
+        };
+
+        let error =
+            rebind_restored_guest_network(Path::new("missing.sock"), &allocation).unwrap_err();
+
+        assert!(error.to_string().contains("parse restored guest IPv4"));
+    }
+
+    #[test]
+    fn restored_network_verification_rejects_stale_guest_state() {
+        let network = RestoredGuestNetwork {
+            guest_ip: "172.16.0.30".parse().unwrap(),
+            gateway: "172.16.0.29".parse().unwrap(),
+            prefix: 30,
+        };
+
+        assert!(!restored_guest_has_address(
+            "2: eth0 inet 172.16.0.2/30 scope global eth0\n",
+            network
+        ));
+        assert!(!restored_guest_has_default_route(
+            "default via 172.16.0.1 dev eth0\n",
+            network
+        ));
     }
 
     #[test]
