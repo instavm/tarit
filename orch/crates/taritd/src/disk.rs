@@ -429,6 +429,10 @@ struct FilesystemSpace {
 }
 
 fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
+    fn stat_u64<T: TryInto<u64>>(value: T) -> u64 {
+        value.try_into().unwrap_or(u64::MAX)
+    }
+
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -441,14 +445,16 @@ fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
         return Err(std::io::Error::last_os_error());
     }
     let stats = unsafe { stats.assume_init() };
-    let used_blocks = u64::from(stats.f_blocks.saturating_sub(stats.f_bavail));
-    let used_bytes = stats.f_frsize.saturating_mul(used_blocks);
-    let used_inodes = u64::from(stats.f_files.saturating_sub(stats.f_favail));
+    let block_size = stat_u64(stats.f_frsize);
+    let available_blocks = stat_u64(stats.f_bavail);
+    let used_blocks = stat_u64(stats.f_blocks.saturating_sub(stats.f_bavail));
+    let used_bytes = block_size.saturating_mul(used_blocks);
+    let used_inodes = stat_u64(stats.f_files.saturating_sub(stats.f_favail));
     Ok(FilesystemSpace {
         used_bytes,
         used_inodes,
-        available_bytes: stats.f_frsize.saturating_mul(u64::from(stats.f_bavail)),
-        available_inodes: u64::from(stats.f_favail),
+        available_bytes: block_size.saturating_mul(available_blocks),
+        available_inodes: stat_u64(stats.f_favail),
     })
 }
 
