@@ -712,6 +712,7 @@ fn read_text_line(stream: &mut UnixStream, timeout: Duration) -> std::io::Result
     }
 }
 
+#[cfg(test)]
 fn write_exec_frame(
     stream: &mut UnixStream,
     kind: ExecFrameKind,
