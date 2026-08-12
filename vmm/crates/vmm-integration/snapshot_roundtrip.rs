@@ -97,7 +97,7 @@ fn restored_clones_get_private_rootfs_overlays() {
     golden
         .create_live(config(&golden_overlay))
         .expect("boot golden");
-    let (code, _, _) = golden
+    let (code, _, _, _) = golden
         .exec("true", 30_000)
         .expect("golden must be command-ready before snapshot");
     assert_eq!(code, 0, "golden readiness command must succeed");
@@ -116,7 +116,7 @@ fn restored_clones_get_private_rootfs_overlays() {
     clone_a
         .restore(&snap_path, Some(overlay_a.to_string_lossy().into_owned()))
         .expect("restore clone A");
-    let (code, _, _) = clone_a
+    let (code, _, _, _) = clone_a
         .exec(&format!("sh -c 'echo clone-a > {marker} && sync'"), 30_000)
         .expect("write marker in clone A");
     assert_eq!(code, 0, "clone A marker write must succeed");
@@ -126,7 +126,7 @@ fn restored_clones_get_private_rootfs_overlays() {
     clone_b
         .restore(&snap_path, Some(overlay_b.to_string_lossy().into_owned()))
         .expect("restore clone B");
-    let (code, out, _) = clone_b
+    let (code, out, _, _) = clone_b
         .exec(
             &format!("sh -c 'test ! -e {marker} && echo isolated'"),
             30_000,
@@ -134,7 +134,7 @@ fn restored_clones_get_private_rootfs_overlays() {
         .expect("read marker state in clone B");
     assert_eq!(code, 0, "clone B must not see clone A marker: {out}");
     assert!(out.contains("isolated"));
-    let (code, out, _) = clone_b
+    let (code, out, _, _) = clone_b
         .exec("printf clone-b", 30_000)
         .expect("execute command in clone B");
     assert_eq!(code, 0, "clone B command must succeed: {out}");

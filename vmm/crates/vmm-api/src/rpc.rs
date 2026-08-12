@@ -670,15 +670,25 @@ fn shutdown_signal_set() -> std::io::Result<libc::sigset_t> {
 /// Stop the VM cleanly and remove the socket file. Split out from the signal
 /// thread so it is unit-testable without raising a real signal.
 fn graceful_teardown(controller: &VmmController, socket_path: &str) {
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
     if let Err(e) = remove_stale_socket(socket_path) {
         log::warn!("shutdown: socket cleanup returned: {e}");
     }
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
     loop {
         match controller.stop() {
             Ok(()) => break,
             Err(vmm_core::error::VmmError::InvalidConfig(message))
                 if message.starts_with("lifecycle operation already in progress:") =>
             {
+                if Instant::now() >= deadline {
+                    log::error!(
+                        "shutdown: lifecycle operation did not finish within {:?}",
+                        SHUTDOWN_GRACE
+                    );
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
@@ -700,12 +710,47 @@ fn encode_response_for_frame(resp: &ApiResponse) -> Vec<u8> {
     if encoded.len() <= MAX_FRAME_BYTES {
         return encoded;
     }
+    if let ApiResponse::Exec {
+        exit_code,
+        stdout,
+        stderr,
+        duration_ms,
+    } = resp
+    {
+        let mut budget = MAX_FRAME_BYTES / 2;
+        while budget > 0 {
+            let truncated = ApiResponse::Exec {
+                exit_code: *exit_code,
+                stdout: output_tail(stdout, budget),
+                stderr: output_tail(stderr, budget),
+                duration_ms: *duration_ms,
+            };
+            let encoded = encode_response(&truncated);
+            if encoded.len() <= MAX_FRAME_BYTES {
+                return encoded;
+            }
+            budget /= 2;
+        }
+    }
     encode_response(&ApiResponse::Err {
         msg: format!(
             "response exceeds {} MiB control-frame limit",
             MAX_FRAME_BYTES / (1024 * 1024)
         ),
     })
+}
+
+fn output_tail(output: &str, max_bytes: usize) -> String {
+    const MARKER: &str = "[output truncated]\n";
+    if output.len() <= max_bytes {
+        return output.to_owned();
+    }
+    let tail_budget = max_bytes.saturating_sub(MARKER.len());
+    let mut start = output.len().saturating_sub(tail_budget);
+    while start < output.len() && !output.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARKER}{}", &output[start..])
 }
 
 #[cfg(test)]
@@ -757,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_response_becomes_a_framed_error() {
+    fn oversized_exec_response_is_truncated_to_a_frame() {
         let encoded = encode_response_for_frame(&ApiResponse::Exec {
             exit_code: 0,
             stdout: "x".repeat(MAX_FRAME_BYTES),
@@ -768,7 +813,7 @@ mod tests {
         let response: ApiResponse = serde_json::from_slice(&encoded).unwrap();
         assert!(matches!(
             response,
-            ApiResponse::Err { msg } if msg.contains("control-frame limit")
+            ApiResponse::Exec { stdout, .. } if stdout.starts_with("[output truncated]")
         ));
     }
 

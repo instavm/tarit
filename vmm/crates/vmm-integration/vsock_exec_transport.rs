@@ -168,9 +168,9 @@ fn channel_reconnects_after_ambiguous_timeout() {
 }
 
 #[test]
-fn channel_spools_output_larger_than_legacy_frame_limit() {
+fn channel_spools_output_larger_than_memory_limit() {
     const CHUNK: usize = 64 * 1024;
-    const OUTPUT_LEN: usize = 17 * 1024 * 1024;
+    const OUTPUT_LEN: usize = 2 * 1024 * 1024;
 
     let socket = socket_path("large-output");
     let channel = VsockExecChannel::bind(&socket).unwrap();

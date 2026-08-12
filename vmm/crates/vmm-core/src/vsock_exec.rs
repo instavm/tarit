@@ -33,7 +33,9 @@ const EXEC_FRAME_HEADER_LEN: usize = 10;
 const EXEC_FRAME_MAX_PAYLOAD: usize = 1024 * 1024;
 const EXEC_CHUNK_MAX_BYTES: usize = 64 * 1024;
 const EXEC_SPOOL_MEMORY_CAP: usize = 512 * 1024;
-const EXEC_OUTPUT_MAX_BYTES: usize = 32 * 1024 * 1024;
+// JSON can escape one output byte as six bytes. Keep enough headroom for the
+// response envelope so every successful aggregated Exec response is frameable.
+const EXEC_OUTPUT_MAX_BYTES: usize = (tarit_proto::MAX_API_FRAME_LEN - 64 * 1024) / 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecProtocol {

@@ -171,44 +171,61 @@ pub fn create_cow_overlay(base_path: &str, overlay_path: &str) -> Result<(), Str
         .open(&stage_path)
         .map_err(|e| format!("create staged overlay {}: {e}", stage_path.display()))?;
 
-    let src_size = src.metadata().map_err(|e| format!("metadata: {e}"))?.len();
+    let result = (|| {
+        let src_size = src.metadata().map_err(|e| format!("metadata: {e}"))?.len();
 
-    // Use copy_file_range for efficient CoW on supported filesystems.
-    // SAFETY: `src` and `dst` are valid file descriptors, offsets are null so
-    // the kernel uses and updates each fd's current offset, and `src_size` comes
-    // from the source file metadata.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_copy_file_range,
-            src.as_raw_fd(),
-            std::ptr::null::<i64>(),
-            dst.as_raw_fd(),
-            std::ptr::null::<i64>(),
-            src_size as usize,
-            0u32,
-        )
+        // Use copy_file_range for efficient CoW on supported filesystems.
+        // SAFETY: `src` and `dst` are valid file descriptors, offsets are null so
+        // the kernel uses and updates each fd's current offset, and `src_size` comes
+        // from the source file metadata.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                src.as_raw_fd(),
+                std::ptr::null::<i64>(),
+                dst.as_raw_fd(),
+                std::ptr::null::<i64>(),
+                src_size as usize,
+                0u32,
+            )
+        };
+
+        if ret < 0 {
+            // Fallback: regular copy.
+            let mut src = fs::File::open(base_path).map_err(|e| format!("reopen: {e}"))?;
+            std::io::copy(
+                &mut src,
+                &mut dst
+                    .try_clone()
+                    .map_err(|e| format!("clone staged overlay: {e}"))?,
+            )
+            .map_err(|e| format!("copy: {e}"))?;
+        }
+        dst.sync_all()
+            .map_err(|e| format!("sync staged overlay {}: {e}", stage_path.display()))?;
+        fs::rename(&stage_path, &overlay_path).map_err(|e| {
+            format!(
+                "publish staged overlay {} -> {}: {e}",
+                stage_path.display(),
+                overlay_path.display()
+            )
+        })?;
+        Ok::<u64, String>(src_size)
+    })();
+    let src_size = match result {
+        Ok(src_size) => src_size,
+        Err(error) => {
+            if let Err(cleanup_error) = fs::remove_file(&stage_path) {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "{error}; cleanup staged overlay {}: {cleanup_error}",
+                        stage_path.display()
+                    ));
+                }
+            }
+            return Err(error);
+        }
     };
-
-    if ret < 0 {
-        // Fallback: regular copy.
-        let mut src = fs::File::open(base_path).map_err(|e| format!("reopen: {e}"))?;
-        std::io::copy(
-            &mut src,
-            &mut dst
-                .try_clone()
-                .map_err(|e| format!("clone staged overlay: {e}"))?,
-        )
-        .map_err(|e| format!("copy: {e}"))?;
-    }
-    dst.sync_all()
-        .map_err(|e| format!("sync staged overlay {}: {e}", stage_path.display()))?;
-    fs::rename(&stage_path, &overlay_path).map_err(|e| {
-        format!(
-            "publish staged overlay {} -> {}: {e}",
-            stage_path.display(),
-            overlay_path.display()
-        )
-    })?;
 
     log::info!(
         "CoW overlay: {base_path} → {} ({src_size} bytes)",
