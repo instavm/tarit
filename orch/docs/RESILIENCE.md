@@ -129,7 +129,7 @@ Result: `NET_SCALE_PASS`.
 | Scenario | Expected behavior | Validation |
 | --- | --- | --- |
 | Per-VM cgroup limits | taritd derives and applies CPU, memory, and PID limits to cold, restored, and recovered VMs | c8i KVM e2e + VMM `cgroup-validate.sh` |
-| Multi-device I/O limits | `io.max` covers each distinct rootfs/overlay backing device and resolves partitions to parent block devices | c8i KVM e2e with loop-backed rootfs and NVMe-backed overlay |
+| Multi-device I/O limits | `io.max` covers each distinct rootfs/overlay backing device, resolves partitions to parent block devices, and resets obsolete limits after restart | c8i KVM e2e with loop-backed rootfs and NVMe-backed overlay; crash/restart limit-removal gate |
 | Network quota recovery | TAP shaping is reapplied after restart and obsolete qdiscs and policers are removed when configuration changes | c8i KVM crash/restart e2e |
 | Disk pressure | Create, snapshot, and warm refill stop above the high watermark and recover only below the low watermark | c8i KVM e2e |
 | CPU/memory overcommit | Guest RAM is demand-paged (`MAP_NORESERVE`); idle vCPUs block near 0% CPU, so IO/network-bound VMs pack densely | design (memory backend + vcpu thread) |

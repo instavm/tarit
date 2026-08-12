@@ -944,12 +944,8 @@ impl JailManager {
                     config.base_dir.display()
                 ))
             })?;
-            let Some(vm_id) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_prefix("tarit-"))
-                .and_then(|id| Uuid::parse_str(id).ok())
-            else {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
                 continue;
             };
             let file_type = entry.file_type().map_err(|error| {
@@ -958,6 +954,31 @@ impl JailManager {
                     entry.path().display()
                 ))
             })?;
+            if name
+                .strip_prefix(".tarit-stage-")
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some()
+            {
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    return Err(OrchError::Internal(format!(
+                        "VM jail staging entry {} must be a real directory, not a symlink",
+                        entry.path().display()
+                    )));
+                }
+                std::fs::remove_dir_all(entry.path()).map_err(|error| {
+                    OrchError::Internal(format!(
+                        "remove interrupted VM jail staging entry {}: {error}",
+                        entry.path().display()
+                    ))
+                })?;
+                continue;
+            }
+            let Some(vm_id) = name
+                .strip_prefix("tarit-")
+                .and_then(|id| Uuid::parse_str(id).ok())
+            else {
+                continue;
+            };
             if !file_type.is_dir() || file_type.is_symlink() {
                 return Err(OrchError::Internal(format!(
                     "VM jail entry {} must be a real directory, not a symlink",
@@ -1030,15 +1051,29 @@ impl JailManager {
             .checked_add(slot)
             .ok_or_else(|| OrchError::Internal("VM jail GID lease overflow".into()))?;
         let root = self.root_for(id);
-        std::fs::create_dir(&root).map_err(|error| {
-            OrchError::Internal(format!("create VM jail {}: {error}", root.display()))
-        })?;
-        if let Err(error) = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755))
-        {
-            let _ = std::fs::remove_dir(&root);
+        if root.exists() {
             return Err(OrchError::Internal(format!(
-                "protect VM jail {}: {error}",
+                "VM jail {} already exists without an active lease",
                 root.display()
+            )));
+        }
+        let staging = self
+            .config
+            .base_dir
+            .join(format!(".tarit-stage-{}", Uuid::new_v4()));
+        std::fs::create_dir(&staging).map_err(|error| {
+            OrchError::Internal(format!(
+                "create VM jail staging directory {}: {error}",
+                staging.display()
+            ))
+        })?;
+        if let Err(error) =
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
+        {
+            let _ = std::fs::remove_dir(&staging);
+            return Err(OrchError::Internal(format!(
+                "protect VM jail staging directory {}: {error}",
+                staging.display()
             )));
         }
         let marker = JailMarker {
@@ -1047,9 +1082,26 @@ impl JailManager {
             uid,
             gid,
         };
-        if let Err(error) = write_jail_marker(&root, &marker) {
-            let _ = std::fs::remove_dir_all(&root);
+        if let Err(error) = write_jail_marker(&staging, &marker) {
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&staging, &root) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(OrchError::Internal(format!(
+                "publish VM jail {}: {error}",
+                root.display()
+            )));
+        }
+        if let Err(error) =
+            File::open(&self.config.base_dir).and_then(|directory| directory.sync_all())
+        {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(OrchError::Internal(format!(
+                "sync VM jail base {} after publishing {}: {error}",
+                self.config.base_dir.display(),
+                root.display()
+            )));
         }
         let lease = JailLease { root, uid, gid };
         state.by_slot.insert(slot, id);
@@ -7113,6 +7165,9 @@ fn validate_owned_cgroup_control(path: &Path) -> std::io::Result<()> {
 #[cfg(any(target_os = "linux", test))]
 fn apply_and_verify_cgroup_limits(cgroup: &Path, plan: &CgroupLimitPlan) -> std::io::Result<()> {
     for (key, expected) in plan.entries() {
+        if key == "io.max" {
+            continue;
+        }
         let path = cgroup.join(key);
         validate_owned_cgroup_control(&path).map_err(|error| {
             std::io::Error::new(
@@ -7120,27 +7175,12 @@ fn apply_and_verify_cgroup_limits(cgroup: &Path, plan: &CgroupLimitPlan) -> std:
                 format!("validate cgroup control {}: {error}", path.display()),
             )
         })?;
-        if key == "io.max" {
-            for command in expected
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-            {
-                write_single_file(&path, command).map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("write cgroup control {}: {error}", path.display()),
-                    )
-                })?;
-            }
-        } else {
-            write_single_file(&path, &expected).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("write cgroup control {}: {error}", path.display()),
-                )
-            })?;
-        }
+        write_single_file(&path, &expected).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("write cgroup control {}: {error}", path.display()),
+            )
+        })?;
         let actual = std::fs::read_to_string(&path).map_err(|error| {
             std::io::Error::new(
                 error.kind(),
@@ -7152,6 +7192,53 @@ fn apply_and_verify_cgroup_limits(cgroup: &Path, plan: &CgroupLimitPlan) -> std:
                 "verification failed for {key}: expected {expected:?}, read {actual:?}"
             )));
         }
+    }
+    let io_max = cgroup.join("io.max");
+    if plan.io_max.is_some() || io_max.exists() {
+        validate_owned_cgroup_control(&io_max).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("validate cgroup control {}: {error}", io_max.display()),
+            )
+        })?;
+        apply_and_verify_io_limits(&io_max, plan.io_max.as_deref().unwrap_or(""))?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn apply_and_verify_io_limits(path: &Path, expected: &str) -> std::io::Result<()> {
+    let current = std::fs::read_to_string(path)?;
+    let current_limits = parse_io_limits(&current);
+    let expected_limits = parse_io_limits(expected);
+    for (device, limits) in &current_limits {
+        let resets = limits
+            .keys()
+            .filter(|key| {
+                expected_limits
+                    .get(device)
+                    .and_then(|expected| expected.get(*key))
+                    .is_none()
+            })
+            .map(|key| format!("{key}=max"))
+            .collect::<Vec<_>>();
+        if !resets.is_empty() {
+            write_single_file(path, &format!("{device} {}", resets.join(" ")))?;
+        }
+    }
+    for command in expected
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        write_single_file(path, command)?;
+    }
+
+    let actual = std::fs::read_to_string(path)?;
+    if !io_limits_match_exact(expected, &actual) {
+        return Err(std::io::Error::other(format!(
+            "verification failed for io.max: expected {expected:?}, read {actual:?}"
+        )));
     }
     Ok(())
 }
@@ -7167,16 +7254,7 @@ fn apply_and_verify_cgroup_limits(_cgroup: &Path, _plan: &CgroupLimitPlan) -> st
 #[cfg(any(target_os = "linux", test))]
 fn cgroup_value_matches(key: &str, expected: &str, actual: &str) -> bool {
     if key == "io.max" {
-        let actual = parse_io_limits(actual);
-        return parse_io_limits(expected)
-            .into_iter()
-            .all(|(device, limits)| {
-                actual.get(&device).is_some_and(|actual_limits| {
-                    limits
-                        .iter()
-                        .all(|(limit, value)| actual_limits.get(limit) == Some(value))
-                })
-            });
+        return io_limits_match_exact(expected, actual);
     }
     if key == "io.weight" {
         return actual
@@ -7185,6 +7263,29 @@ fn cgroup_value_matches(key: &str, expected: &str, actual: &str) -> bool {
             .is_some_and(|value| value == expected.trim());
     }
     expected.split_whitespace().eq(actual.split_whitespace())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn io_limits_match_exact(expected: &str, actual: &str) -> bool {
+    let expected = parse_io_limits(expected);
+    let actual = parse_io_limits(actual);
+    let expected_present = expected.iter().all(|(device, limits)| {
+        actual.get(device).is_some_and(|actual_limits| {
+            limits
+                .iter()
+                .all(|(limit, value)| actual_limits.get(limit) == Some(value))
+        })
+    });
+    expected_present
+        && actual.iter().all(|(device, limits)| {
+            limits.iter().all(|(limit, value)| {
+                value == "max"
+                    || expected
+                        .get(device)
+                        .and_then(|expected_limits| expected_limits.get(limit))
+                        == Some(value)
+            })
+        })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -7851,6 +7952,29 @@ mod tests {
         assert!(!first.root.exists());
         recovered.release(second_id).unwrap();
         assert!(!root.join(format!("tarit-{second_id}")).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jail_startup_removes_interrupted_staging_directories() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/jail-stage-recovery-{}", Uuid::new_v4()));
+        let config = crate::config::VmJailConfig {
+            base_dir: root.clone(),
+            uid_base: 20_000,
+            gid_base: 30_000,
+            id_count: 4,
+            profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        };
+        JailManager::new(config.clone()).unwrap();
+        let staging = root.join(format!(".tarit-stage-{}", Uuid::new_v4()));
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("partial"), b"incomplete").unwrap();
+
+        JailManager::new(config).unwrap();
+        assert!(!staging.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -8904,6 +9028,36 @@ mod tests {
             let actual = std::fs::read_to_string(root.join(key)).unwrap();
             assert!(cgroup_value_matches(key, &expected, &actual));
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cgroup_recovery_clears_obsolete_io_limits() {
+        let root = PathBuf::from(format!("target/cgroup-readopt-clear-io-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (key, value) in [
+            ("cpu.max", "200000 100000"),
+            ("cpu.weight", "100"),
+            ("memory.max", "1073741824"),
+            ("pids.max", "128"),
+            ("io.max", "8:0 rbps=1048576 wbps=2097152"),
+        ] {
+            std::fs::write(root.join(key), value).unwrap();
+        }
+        let plan = CgroupLimitPlan {
+            cpu_max: Some("200000 100000".into()),
+            cpu_weight: Some(100),
+            memory_max: Some(1_073_741_824),
+            pids_max: Some(128),
+            ..CgroupLimitPlan::default()
+        };
+
+        apply_and_verify_cgroup_limits(&root, &plan).unwrap();
+
+        let io_max = std::fs::read_to_string(root.join("io.max")).unwrap();
+        assert!(io_max.contains("rbps=max"));
+        assert!(io_max.contains("wbps=max"));
+        assert!(io_limits_match_exact("", &io_max));
         std::fs::remove_dir_all(root).unwrap();
     }
 

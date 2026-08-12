@@ -92,7 +92,8 @@ writing `io.max`. Any configured I/O limit requires
 The CPU limit is derived from the reserved vCPU count. The memory limit is the
 guest memory plus 50 percent and 256 MiB for VMM overhead. Reconciliation
 rewrites and verifies the expected cgroup and traffic-control state after a
-taritd restart, including removal of obsolete network limits.
+taritd restart, including reset of obsolete `io.max` entries and removal of
+obsolete network limits.
 
 ## Disk pressure and artifact GC
 
