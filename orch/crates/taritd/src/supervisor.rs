@@ -6922,7 +6922,51 @@ where
 fn cgroup_device_number(metadata: &std::fs::Metadata) -> Result<String, OrchError> {
     let device = libc::dev_t::try_from(metadata.dev())
         .map_err(|_| OrchError::Internal("filesystem device number does not fit dev_t".into()))?;
-    Ok(format!("{}:{}", libc::major(device), libc::minor(device)))
+    let device = format!("{}:{}", libc::major(device), libc::minor(device));
+    #[cfg(target_os = "linux")]
+    {
+        resolve_cgroup_block_device(&device, Path::new("/sys/dev/block"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(device)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_cgroup_block_device(device: &str, sys_block: &Path) -> Result<String, OrchError> {
+    let sys_device = std::fs::canonicalize(sys_block.join(device)).map_err(|error| {
+        OrchError::Internal(format!(
+            "resolve filesystem block device {device} for cgroup io.max: {error}"
+        ))
+    })?;
+    if !sys_device.join("partition").exists() {
+        return Ok(device.to_string());
+    }
+
+    let parent = sys_device.parent().ok_or_else(|| {
+        OrchError::Internal(format!(
+            "partition block device {device} has no parent device in sysfs"
+        ))
+    })?;
+    let parent_device = std::fs::read_to_string(parent.join("dev"))
+        .map_err(|error| {
+            OrchError::Internal(format!(
+                "read parent block device for partition {device}: {error}"
+            ))
+        })?
+        .trim()
+        .to_string();
+    let valid = parent_device
+        .split_once(':')
+        .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
+        .is_some();
+    if !valid {
+        return Err(OrchError::Internal(format!(
+            "invalid parent block device {parent_device:?} for partition {device}"
+        )));
+    }
+    Ok(parent_device)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -8436,6 +8480,32 @@ mod tests {
         assert!(validate_network_startup_mode(false, &[]).is_ok());
         assert!(validate_network_startup_mode(false, &["insta7".into()]).is_err());
         assert!(validate_network_startup_mode(true, &["insta7".into()]).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_io_resolves_partitions_to_parent_block_devices() {
+        use std::os::unix::fs::symlink;
+
+        let root = PathBuf::from(format!("target/taritd-sysfs-{}", Uuid::new_v4()));
+        let sys_block = root.join("dev/block");
+        let disk = root.join("devices/pci/block/nvme0n1");
+        let partition = disk.join("nvme0n1p1");
+        std::fs::create_dir_all(&sys_block).unwrap();
+        std::fs::create_dir_all(&partition).unwrap();
+        std::fs::write(disk.join("dev"), "259:0\n").unwrap();
+        std::fs::write(partition.join("partition"), "1\n").unwrap();
+        symlink(
+            std::fs::canonicalize(&partition).unwrap(),
+            sys_block.join("259:1"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_cgroup_block_device("259:1", &sys_block).unwrap(),
+            "259:0"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
