@@ -446,9 +446,9 @@ impl PtyRegistry {
             return Err(OrchError::Conflict("PTY session already connected".into()));
         }
 
-        // Validate the one-time credential first, then atomically reserve every
+        // Validate the reconnect credential first, then atomically reserve every
         // active-connection scope before marking the session active. Capacity
-        // exhaustion therefore cannot burn a valid token.
+        // exhaustion therefore leaves a valid session available for retry.
         let permit = self.try_acquire_connection(&session.owner.tenant, vm_id)?;
         let session = sessions
             .get_mut(&pty_id)
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_capacity_is_reserved_before_consuming_the_token() {
+    fn connection_capacity_is_reserved_before_marking_the_session_active() {
         let registry = registry_with_limits(3, 2, 1);
         let first_vm = Uuid::new_v4();
         let first = registry
