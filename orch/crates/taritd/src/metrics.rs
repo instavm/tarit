@@ -833,6 +833,7 @@ mod tests {
                 vcpus: 1,
                 kernel_path: "kernel".into(),
                 rootfs_path: None,
+                rootfs_read_only: false,
                 cmdline: "console=ttyS0".into(),
                 socket_path: Some("socket".into()),
                 pid: Some(std::process::id()),

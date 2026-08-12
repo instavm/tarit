@@ -5143,6 +5143,7 @@ case "${0##*/}:$*" in
   "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
   "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
   "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "tc:qdisc show dev insta7") echo "qdisc noqueue 0: root refcnt 2" ;;
   "nft:-f -")
     script=$(cat)
     case "$script" in
@@ -5208,7 +5209,7 @@ case "${0##*/}:$*" in
   "nft:delete rule ip taritd_nat vm_input handle 17") rm -f "$TARIT_TEST_FAKE_STATE.policy" ;;
 esac
 "#;
-        for name in ["ip", "nft", "sysctl"] {
+        for name in ["ip", "nft", "sysctl", "tc"] {
             let path = bin.join(name);
             std::fs::write(&path, command).unwrap();
             #[cfg(unix)]
@@ -5388,6 +5389,7 @@ EOF
     ;;
   "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
   "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "tc:qdisc show dev insta7"|"tc:qdisc show dev insta8") echo "qdisc noqueue 0: root refcnt 2" ;;
   "nft:-a list chain ip taritd_nat "*)
     calls=$(cat "$TARIT_TEST_FAKE_STATE.chain-calls" 2>/dev/null || echo 0)
     calls=$((calls + 1))
@@ -5415,7 +5417,7 @@ EOF
   "nft:-f -") cat >/dev/null ;;
 esac
 "#;
-        for name in ["ip", "nft", "sysctl"] {
+        for name in ["ip", "nft", "sysctl", "tc"] {
             let path = bin.join(name);
             std::fs::write(&path, command).unwrap();
             #[cfg(unix)]
@@ -5707,6 +5709,7 @@ case "${0##*/}:$*" in
   "nft:-j list chain ip taritd_nat vm_input") echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
   "sysctl:-qn net.ipv6.conf.insta7.forwarding"|"sysctl:-qn net.ipv6.conf.insta7.accept_ra"|"sysctl:-qn net.ipv6.conf.insta7.autoconf"|"sysctl:-qn net.ipv6.conf.insta7.accept_redirects") echo 0 ;;
   "sysctl:-qn net.ipv6.conf.insta7.disable_ipv6"|"sysctl:-qn net.ipv4.conf.insta7.rp_filter") echo 1 ;;
+  "tc:qdisc show dev insta7"|"tc:qdisc show dev insta8") echo "qdisc noqueue 0: root refcnt 2" ;;
   "nft:-f -") cat > "$TARIT_TEST_QUARANTINE" ;;
   "nft:list tables netdev")
     [ ! -e "$TARIT_TEST_FAKE_STATE.policy7" ] || echo "table netdev taritd_ingress_7"
@@ -5756,7 +5759,7 @@ case "${0##*/}:$*" in
   "nft:delete table netdev taritd_ingress_8") touch "$TARIT_TEST_FAKE_STATE.policy8-ingress-cleaned" ;;
 esac
 "#;
-        for name in ["ip", "nft", "sysctl"] {
+        for name in ["ip", "nft", "sysctl", "tc"] {
             let path = bin.join(name);
             std::fs::write(&path, command).unwrap();
             #[cfg(unix)]

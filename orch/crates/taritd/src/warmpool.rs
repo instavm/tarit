@@ -10,7 +10,7 @@
 
 use crate::config::Config;
 use crate::scheduler::Scheduler;
-use crate::supervisor::{VmSpawnConfig, VmmSupervisor};
+use crate::supervisor::{GoldenBundle, VmSpawnConfig, VmmSupervisor};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -130,9 +130,10 @@ pub(crate) fn spawn_replenisher(
         "warm pool enabled"
     );
 
-    let golden_snapshots = Arc::new(tokio::sync::Mutex::new(
-        HashMap::<VmSpawnConfig, String>::new(),
-    ));
+    let golden_snapshots = Arc::new(tokio::sync::Mutex::new(HashMap::<
+        VmSpawnConfig,
+        GoldenBundle,
+    >::new()));
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let children = Arc::new(BlockingChildren::default());
@@ -196,7 +197,7 @@ pub(crate) fn spawn_replenisher(
                     }
                     if class.restore {
                         let key = VmSpawnConfig::from_warm_class(&config, class);
-                        let snapshot_path = {
+                        let golden_bundle = {
                             let mut golden = golden_snapshots.lock().await;
                             if let Some(path) = golden.get(&key).cloned() {
                                 Some(path)
@@ -223,7 +224,7 @@ pub(crate) fn spawn_replenisher(
                                 )
                                 .await
                                 {
-                                    Ok(Ok(path)) => {
+                                    Ok(Ok(bundle)) => {
                                         if worker_cancelled.load(Ordering::Acquire) {
                                             continue;
                                         }
@@ -232,10 +233,11 @@ pub(crate) fn spawn_replenisher(
                                             vcpus = key.vcpus,
                                             memory_mib = key.memory_mib,
                                             rootfs = ?key.rootfs_path.as_ref(),
-                                            snapshot_path = %path,
+                                            snapshot_path = %bundle.snapshot_path(),
+                                            overlay_path = ?bundle.overlay_path(),
                                             "warm golden snapshot created"
                                         );
-                                        golden.insert(key, path);
+                                        golden.insert(key, bundle);
                                     }
                                     Ok(Err(e)) => {
                                         tracing::warn!("warm golden create failed: {e}");
@@ -247,7 +249,7 @@ pub(crate) fn spawn_replenisher(
                                 None
                             }
                         };
-                        let Some(snapshot_path) = snapshot_path else {
+                        let Some(golden_bundle) = golden_bundle else {
                             continue;
                         };
                         let have = {
@@ -281,14 +283,14 @@ pub(crate) fn spawn_replenisher(
                             spawned += 1;
                             let sup = Arc::clone(&sup);
                             let class = class.clone();
-                            let snapshot_path = snapshot_path.clone();
+                            let golden_bundle = golden_bundle.clone();
                             let cancelled = Arc::clone(&worker_cancelled);
                             set.push(
                                 worker_children
                                     .spawn(move || {
                                         if cancelled.load(Ordering::Acquire) {
                                         } else if let Err(e) = tokio::runtime::Handle::current()
-                                            .block_on(sup.spawn_warm_restore(class, snapshot_path))
+                                            .block_on(sup.spawn_warm_restore(class, golden_bundle))
                                         {
                                             tracing::warn!("warm restore spawn failed: {e}");
                                         }

@@ -154,7 +154,7 @@ async fn run_server(
             vm.host_id == config.host_id
                 && matches!(
                     vm.status,
-                    VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                    VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
                 )
         })
         .map(|vm| vm.id)
@@ -169,21 +169,6 @@ async fn run_server(
         )
         .context("initialize fail-closed network recovery")?,
     );
-    let startup_references = artifact_references(
-        &persisted_vms,
-        &store
-            .list_snapshots()
-            .context("load durable snapshot references for startup GC")?,
-    );
-    let startup_gc = supervisor
-        .sweep_owned_artifacts(startup_references)
-        .context("sweep owned artifacts during startup")?;
-    tracing::info!(
-        removed_files = startup_gc.removed_files,
-        removed_jails = startup_gc.removed_jails,
-        "startup owned-artifact sweep completed"
-    );
-
     // Re-adopt VMs that survived this restart so the control plane can manage
     // them again. Their network policy was reconciled during supervisor
     // construction; this restores the exec/pause/snapshot/delete path. VMs that
@@ -251,6 +236,23 @@ async fn run_server(
             }
         }
     }
+    // Only sweep after every durable Creating/live record and every owned
+    // unpersisted jail/cgroup runtime has been adopted or confirmed dead.
+    // Otherwise GC could remove a live jail or free its UID/GID lease.
+    let startup_references = artifact_references(
+        &persisted_vms,
+        &store
+            .list_snapshots()
+            .context("load durable snapshot references for startup GC")?,
+    );
+    let startup_gc = supervisor
+        .sweep_owned_artifacts(startup_references)
+        .context("sweep owned artifacts during startup")?;
+    tracing::info!(
+        removed_files = startup_gc.removed_files,
+        removed_jails = startup_gc.removed_jails,
+        "startup owned-artifact sweep completed"
+    );
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio
     // context panics on current tokio ("Cannot drop a runtime ... from within

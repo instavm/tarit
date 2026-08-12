@@ -852,6 +852,7 @@ fn creating_record(
             .rootfs_path
             .as_ref()
             .map(|path| path.display().to_string()),
+        rootfs_read_only: spawn_cfg.read_only,
         cmdline: spawn_cfg.cmdline.clone(),
         socket_path: None,
         pid: None,
@@ -1319,6 +1320,7 @@ async fn restore_local_owned(
         vcpus,
         kernel_path,
         rootfs_path: snapshot.rootfs_path,
+        rootfs_read_only: restore_config.read_only,
         cmdline,
         socket_path: None,
         pid: None,
@@ -1640,9 +1642,10 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     )?;
     let resume_after = vm.status == VmStatus::Running;
     let has_overlay = vm.rootfs_path.is_some();
+    let memory_mib = vm.memory_mib;
     let sup = Arc::clone(&state.supervisor);
     let bundle = tokio::task::spawn_blocking(move || {
-        sup.snapshot_bundle_vm(id, diff, resume_after, has_overlay)
+        sup.snapshot_bundle_vm(id, diff, resume_after, has_overlay, memory_mib)
     })
     .await;
     let bundle = match bundle {
@@ -1674,7 +1677,7 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
         vcpus: Some(vm.vcpus),
         kernel_path: Some(vm.kernel_path.clone()),
         rootfs_path: vm.rootfs_path.clone(),
-        rootfs_read_only: Some(state.config.rootfs_read_only),
+        rootfs_read_only: Some(vm.rootfs_read_only),
         cmdline: Some(vm.cmdline.clone()),
         created_at: Utc::now(),
     };
@@ -3170,6 +3173,7 @@ mod tests {
                 vcpus: 1,
                 kernel_path: "kernel".into(),
                 rootfs_path: None,
+                rootfs_read_only: false,
                 cmdline: "console=ttyS0".into(),
                 socket_path: None,
                 pid: None,

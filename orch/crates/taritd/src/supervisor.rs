@@ -1,9 +1,11 @@
 use crate::config::{Config, WarmClass};
-use crate::disk::{ArtifactReferences, DiskPressure, DiskPressureSnapshot, GcReport};
+use crate::disk::{
+    ArtifactReferences, DiskPressure, DiskPressureSnapshot, DiskReservation, GcReport,
+};
 use crate::net::{NetAlloc, NetProvisioner};
 use crate::scheduler::{ReservationError, ResourceShape, Scheduler};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
@@ -482,6 +484,17 @@ impl JailManager {
             .map(|lease| (lease.uid, lease.gid)))
     }
 
+    fn ids(&self) -> Result<Vec<Uuid>, OrchError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| OrchError::Internal("VM jail lease lock poisoned".into()))?
+            .by_vm
+            .keys()
+            .copied()
+            .collect())
+    }
+
     fn release(&self, id: Uuid) -> Result<(), OrchError> {
         let lease = self
             .state
@@ -678,6 +691,22 @@ impl OwnedArtifact {
             Err(error) => Err(error),
         }
     }
+
+    fn publish(&mut self, destination: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, destination)?;
+        self.path = destination.to_path_buf();
+        let parent = destination.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} has no parent directory", destination.display()),
+            )
+        })?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(parent)?.sync_all()
+    }
 }
 
 /// A RAM snapshot and its snapshot-owned disk upper. Open descriptors pin the
@@ -687,11 +716,38 @@ pub(crate) struct SnapshotBundle {
     snapshot_path: String,
     overlay_path: Option<String>,
     artifacts: Vec<OwnedArtifact>,
+    in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
+    registered_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GoldenBundle {
+    snapshot_path: String,
+    overlay_path: Option<String>,
+}
+
+impl GoldenBundle {
+    pub(crate) fn snapshot_path(&self) -> &str {
+        &self.snapshot_path
+    }
+
+    pub(crate) fn overlay_path(&self) -> Option<&str> {
+        self.overlay_path.as_deref()
+    }
+
+    fn into_restore_parts(self) -> (String, RestoreOverlay) {
+        let overlay = self
+            .overlay_path
+            .map(PathBuf::from)
+            .map(RestoreOverlay::Seeded)
+            .unwrap_or(RestoreOverlay::None);
+        (self.snapshot_path, overlay)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum RestoreOverlay {
     None,
-    Fresh,
     Seeded(PathBuf),
 }
 
@@ -705,6 +761,12 @@ impl SnapshotBundle {
     }
 
     pub(crate) fn persist(mut self) {
+        // Keep successfully published paths in the process registry. A GC pass
+        // may have loaded durable snapshot rows just before this transaction
+        // committed; retaining the publication fence prevents that stale pass
+        // from deleting files now referenced by durable metadata. Restart
+        // rebuilds the fence from the snapshot table.
+        self.registered_paths.clear();
         self.artifacts.clear();
     }
 
@@ -715,6 +777,15 @@ impl SnapshotBundle {
                     path = %artifact.path().display(),
                     "remove uncommitted snapshot artifact failed: {error}"
                 );
+            }
+        }
+        self.unregister();
+    }
+
+    fn unregister(&mut self) {
+        if let Ok(mut registered) = self.in_progress_artifacts.lock() {
+            for path in self.registered_paths.drain(..) {
+                registered.remove(&path);
             }
         }
     }
@@ -1242,6 +1313,7 @@ pub struct VmmSupervisor {
     spawn_attachment_pause: Mutex<Option<SpawnAttachmentPause>>,
     scheduler: Arc<Scheduler>,
     golden_artifacts: Mutex<Vec<OwnedArtifact>>,
+    in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
     unexpected_exits: Mutex<VecDeque<UnexpectedVmmExit>>,
     net: Option<NetProvisioner>,
     jails: Option<JailManager>,
@@ -1395,10 +1467,14 @@ impl VmmSupervisor {
         )?;
         let live_vm_ids = live_vm_ids.into_iter().collect::<Vec<_>>();
         let jails = config.vm_jail.clone().map(JailManager::new).transpose()?;
+        let mut pressure_roots = vec![config.socket_dir.clone()];
+        if let Some(jail) = &config.vm_jail {
+            pressure_roots.push(jail.base_dir.clone());
+        }
         let disk_pressure = Arc::new(DiskPressure::new(
             config.disk_pressure.clone(),
-            config.socket_dir.clone(),
-        ));
+            pressure_roots,
+        )?);
         validate_network_startup_mode(config.enable_net, preflight_taps, live_vm_ids.len())?;
         let net = if config.enable_net {
             let mut tap_owners = HashMap::new();
@@ -1432,6 +1508,7 @@ impl VmmSupervisor {
             spawn_attachment_pause: Mutex::new(None),
             scheduler,
             golden_artifacts: Mutex::new(Vec::new()),
+            in_progress_artifacts: Arc::new(Mutex::new(HashSet::new())),
             unexpected_exits: Mutex::new(VecDeque::new()),
             net,
             jails,
@@ -1472,11 +1549,25 @@ impl VmmSupervisor {
             .join(format!("{}.cow", Uuid::new_v4()))
     }
 
+    fn snapshot_overlay_staging_path(&self) -> PathBuf {
+        self.config
+            .socket_dir
+            .join("snapshots")
+            .join(format!(".stage-{}.cow", Uuid::new_v4()))
+    }
+
     fn snapshot_ram_path(&self) -> PathBuf {
         self.config
             .socket_dir
             .join("snapshots")
             .join(format!("bundle-{}.ram", Uuid::new_v4()))
+    }
+
+    fn snapshot_ram_staging_path(&self) -> PathBuf {
+        self.config
+            .socket_dir
+            .join("snapshots")
+            .join(format!(".stage-{}.ram", Uuid::new_v4()))
     }
 
     fn prepare_runtime(
@@ -1844,10 +1935,49 @@ impl VmmSupervisor {
         self.disk_pressure.sweep_interval()
     }
 
+    fn reserve_snapshot_space(
+        &self,
+        id: Uuid,
+        memory_mib: u64,
+        has_overlay: bool,
+    ) -> Result<DiskReservation, OrchError> {
+        let ram_bytes = memory_mib
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| OrchError::BadRequest("snapshot RAM estimate overflow".into()))?;
+        let overlay_bytes = if has_overlay {
+            let path = PathBuf::from(self.overlay_path_for(id));
+            match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.blocks().saturating_mul(512),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => {
+                    return Err(OrchError::Internal(format!(
+                        "estimate snapshot overlay {}: {error}",
+                        path.display()
+                    )))
+                }
+            }
+        } else {
+            0
+        };
+        self.disk_pressure.reserve(
+            "VM snapshot",
+            ram_bytes.saturating_add(overlay_bytes),
+            if has_overlay { 4 } else { 3 },
+        )
+    }
+
     pub(crate) fn sweep_owned_artifacts(
         &self,
         mut references: ArtifactReferences,
     ) -> Result<GcReport, OrchError> {
+        // Publication holds this registry while staging names are atomically
+        // renamed into the GC namespace. Holding the same lock through the
+        // sweep closes the rename-to-registration race.
+        let in_progress = self
+            .in_progress_artifacts
+            .lock()
+            .map_err(|_| OrchError::Internal("artifact publication registry poisoned".into()))?;
+        references.runtime_paths.extend(in_progress.iter().cloned());
         if let Ok(running) = self.running.lock() {
             references.active_vm_ids.extend(running.keys().copied());
             references.runtime_paths.extend(
@@ -1891,6 +2021,33 @@ impl VmmSupervisor {
         self.disk_pressure.record_sweep(&report);
         self.disk_pressure.refresh()?;
         Ok(report)
+    }
+
+    fn publish_artifacts(
+        &self,
+        artifacts: &mut [(OwnedArtifact, PathBuf)],
+    ) -> Result<Vec<PathBuf>, OrchError> {
+        let mut registered = self
+            .in_progress_artifacts
+            .lock()
+            .map_err(|_| OrchError::Internal("artifact publication registry poisoned".into()))?;
+        let paths = artifacts
+            .iter()
+            .map(|(_, destination)| destination.clone())
+            .collect::<Vec<_>>();
+        registered.extend(paths.iter().cloned());
+        for (artifact, destination) in artifacts.iter_mut() {
+            if let Err(error) = artifact.publish(destination) {
+                for path in &paths {
+                    registered.remove(path);
+                }
+                return Err(OrchError::Internal(format!(
+                    "publish snapshot artifact {}: {error}",
+                    destination.display()
+                )));
+            }
+        }
+        Ok(paths)
     }
 
     #[cfg(test)]
@@ -2969,10 +3126,6 @@ impl VmmSupervisor {
         // is never reopened.
         let overlay = match overlay {
             RestoreOverlay::None => None,
-            RestoreOverlay::Fresh => runtime
-                .guest_overlay
-                .clone()
-                .or_else(|| Some(self.overlay_path_for(id))),
             RestoreOverlay::Seeded(source) => {
                 let destination = runtime
                     .host_overlay
@@ -3200,7 +3353,7 @@ impl VmmSupervisor {
     pub(crate) async fn create_golden(
         self: Arc<Self>,
         class: WarmClass,
-    ) -> Result<String, OrchError> {
+    ) -> Result<GoldenBundle, OrchError> {
         let id = Uuid::new_v4();
         let worker = Arc::clone(&self);
         self.run_owned_task(id, SpawnPurpose::Refill, move |task| async move {
@@ -3214,7 +3367,7 @@ impl VmmSupervisor {
         id: Uuid,
         class: WarmClass,
         task: &OwnedTaskControl,
-    ) -> Result<String, OrchError> {
+    ) -> Result<GoldenBundle, OrchError> {
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
         let ticket = self
             .begin_boot_with_registration(
@@ -3285,6 +3438,13 @@ impl VmmSupervisor {
             }
             return Err(error);
         }
+        let _reservation =
+            match self.reserve_snapshot_space(id, spec.memory_mib, spec.rootfs_path.is_some()) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    return Err(self.cleanup_boot_failure(id, &booted.control, &booted.vm, error));
+                }
+            };
         let socket_path = booted.vm.socket_path.clone();
         let snapshot_vmm_path = match tokio::task::spawn_blocking(move || {
             VmmClient::new(&socket_path)
@@ -3318,22 +3478,27 @@ impl VmmSupervisor {
             .jail_identity(id)?
             .map(|(uid, _)| uid)
             .unwrap_or_else(|| unsafe { libc::geteuid() });
+        let durable_snapshot_staging = self.snapshot_ram_staging_path();
         let durable_snapshot_path = self.snapshot_ram_path();
-        let durable_snapshot =
-            copy_private_artifact_owned(&snapshot_host_path, &durable_snapshot_path, expected_uid)
-                .map_err(|error| {
-                    self.cleanup_boot_failure(
-                        id,
-                        &booted.control,
-                        &booted.vm,
-                        OrchError::Internal(format!("copy golden RAM snapshot: {error}")),
-                    )
-                })?;
+        let durable_snapshot = copy_private_artifact_owned(
+            &snapshot_host_path,
+            &durable_snapshot_staging,
+            expected_uid,
+        )
+        .map_err(|error| {
+            self.cleanup_boot_failure(
+                id,
+                &booted.control,
+                &booted.vm,
+                OrchError::Internal(format!("copy golden RAM snapshot: {error}")),
+            )
+        })?;
         let durable_overlay = match self.overlay_path_for_config(id, &spec) {
             Some(source) => {
+                let staging = self.snapshot_overlay_staging_path();
                 let destination = self.snapshot_overlay_path();
-                match copy_private_artifact_owned(Path::new(&source), &destination, expected_uid) {
-                    Ok(artifact) => Some(artifact),
+                match copy_private_artifact_owned(Path::new(&source), &staging, expected_uid) {
+                    Ok(artifact) => Some((artifact, destination)),
                     Err(error) => {
                         let _ = durable_snapshot.remove();
                         return Err(self.cleanup_boot_failure(
@@ -3347,16 +3512,19 @@ impl VmmSupervisor {
             }
             None => None,
         };
-        let mut artifacts = vec![durable_snapshot];
-        artifacts.extend(durable_overlay);
+        let overlay_path = durable_overlay
+            .as_ref()
+            .map(|(_, path)| path.display().to_string());
+        let mut publications = vec![(durable_snapshot, durable_snapshot_path.clone())];
+        publications.extend(durable_overlay);
         if task.is_cancelled() {
-            cleanup_golden_artifacts(artifacts);
+            cleanup_golden_artifacts(publications.into_iter().map(|(artifact, _)| artifact));
             return Err(self.discard_booted_vm(booted));
         }
         let client = VmmClient::new(&booted.vm.socket_path);
         if let Err(error) = client.release_scratch(&snapshot_vmm_path, scratch_snapshot.identity())
         {
-            cleanup_golden_artifacts(artifacts);
+            cleanup_golden_artifacts(publications.into_iter().map(|(artifact, _)| artifact));
             return Err(self.cleanup_boot_failure(
                 id,
                 &booted.control,
@@ -3372,30 +3540,44 @@ impl VmmSupervisor {
                 "released golden snapshot scratch cleanup failed: {error}"
             );
         }
+        let registered_paths = match self.publish_artifacts(&mut publications) {
+            Ok(paths) => paths,
+            Err(error) => {
+                cleanup_golden_artifacts(publications.into_iter().map(|(artifact, _)| artifact));
+                return Err(self.cleanup_boot_failure(id, &booted.control, &booted.vm, error));
+            }
+        };
+        let mut artifacts = publications
+            .into_iter()
+            .map(|(artifact, _)| artifact)
+            .collect::<Vec<_>>();
         let artifact_keys = artifacts
             .iter()
             .map(|artifact| (artifact.path.clone(), artifact.identity()))
             .collect::<Vec<_>>();
-        self.remember_golden_artifacts(&mut artifacts)?;
+        self.remember_golden_artifacts(&mut artifacts, &registered_paths);
         if task.is_cancelled() {
             cleanup_golden_artifacts(self.take_golden_artifacts(&artifact_keys));
             return Err(self.discard_booted_vm(booted));
         }
         self.finish_booted_vm(id, booted.control, &booted.vm)?;
-        Ok(durable_snapshot_path.display().to_string())
+        Ok(GoldenBundle {
+            snapshot_path: durable_snapshot_path.display().to_string(),
+            overlay_path,
+        })
     }
 
     /// Restore one warm-pool VM from an existing golden snapshot and park it.
     pub(crate) async fn spawn_warm_restore(
         self: Arc<Self>,
         class: WarmClass,
-        snapshot_path: String,
+        bundle: GoldenBundle,
     ) -> Result<(), OrchError> {
         let id = Uuid::new_v4();
         let worker = Arc::clone(&self);
         self.run_owned_task(id, SpawnPurpose::Refill, move |task| async move {
             worker
-                .spawn_warm_restore_owned(id, class, snapshot_path, &task)
+                .spawn_warm_restore_owned(id, class, bundle, &task)
                 .await
         })
         .await
@@ -3405,11 +3587,10 @@ impl VmmSupervisor {
         self: Arc<Self>,
         id: Uuid,
         class: WarmClass,
-        snapshot_path: String,
+        bundle: GoldenBundle,
         task: &OwnedTaskControl,
     ) -> Result<(), OrchError> {
         let spec = VmSpawnConfig::from_warm_class(&self.config, &class);
-        let overlay = self.overlay_path_for_config(id, &spec);
         let ticket = self
             .begin_boot_with_registration(
                 id,
@@ -3427,11 +3608,7 @@ impl VmmSupervisor {
         let shape = spec.resource_shape();
         let restore_spec = spec.clone();
         let booted = tokio::task::spawn_blocking(move || {
-            let overlay = if overlay.is_some() {
-                RestoreOverlay::Fresh
-            } else {
-                RestoreOverlay::None
-            };
+            let (snapshot_path, overlay) = bundle.into_restore_parts();
             worker.spawn_and_restore(ticket, &snapshot_path, overlay, &restore_spec, shape)
         })
         .await;
@@ -3575,13 +3752,23 @@ impl VmmSupervisor {
     fn remember_golden_artifacts(
         &self,
         artifacts: &mut Vec<OwnedArtifact>,
-    ) -> Result<(), OrchError> {
-        let mut registered = self
-            .golden_artifacts
+        registered_paths: &[PathBuf],
+    ) {
+        let mut in_progress = self
+            .in_progress_artifacts
             .lock()
-            .map_err(|_| OrchError::Internal("golden artifact lock poisoned".into()))?;
+            .unwrap_or_else(|poisoned| {
+                tracing::error!("artifact publication registry poisoned while committing golden");
+                poisoned.into_inner()
+            });
+        let mut registered = self.golden_artifacts.lock().unwrap_or_else(|poisoned| {
+            tracing::error!("golden artifact lock poisoned while committing golden");
+            poisoned.into_inner()
+        });
         registered.append(artifacts);
-        Ok(())
+        for path in registered_paths {
+            in_progress.remove(path);
+        }
     }
 
     fn take_golden_artifacts(&self, keys: &[(PathBuf, ScratchIdentity)]) -> Vec<OwnedArtifact> {
@@ -3601,6 +3788,284 @@ impl VmmSupervisor {
             .any(|artifact| artifact.path() == path))
     }
 
+    fn owned_runtime_ids(&self) -> Result<HashSet<Uuid>, OrchError> {
+        let mut ids = HashSet::new();
+        if let Some(jails) = &self.jails {
+            ids.extend(jails.ids()?);
+        }
+        if let Some(parent) = self.config.vm_cgroup_parent.as_ref().map(Path::new) {
+            if parent.exists() {
+                for entry in std::fs::read_dir(parent).map_err(|error| {
+                    OrchError::Internal(format!(
+                        "scan configured VM cgroup parent {}: {error}",
+                        parent.display()
+                    ))
+                })? {
+                    let entry = entry.map_err(|error| {
+                        OrchError::Internal(format!(
+                            "scan configured VM cgroup parent {}: {error}",
+                            parent.display()
+                        ))
+                    })?;
+                    if let Some(id) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.strip_prefix("tarit-"))
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                    {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut proc_visibility_incomplete = false;
+            for entry in std::fs::read_dir("/proc").map_err(|error| {
+                OrchError::Internal(format!("scan /proc for unpersisted warm VMMs: {error}"))
+            })? {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        tracing::debug!(%error, "skip transient /proc entry during warm VMM recovery");
+                        continue;
+                    }
+                };
+                let cmdline = match std::fs::read(entry.path().join("cmdline")) {
+                    Ok(cmdline) => cmdline,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        proc_visibility_incomplete = true;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(OrchError::Internal(format!(
+                            "read {} during warm VMM recovery: {error}",
+                            entry.path().join("cmdline").display()
+                        )))
+                    }
+                };
+                for arg in cmdline.split(|byte| *byte == 0) {
+                    let path = Path::new(std::ffi::OsStr::from_bytes(arg));
+                    if path.parent() != Some(self.config.socket_dir.as_path()) {
+                        continue;
+                    }
+                    if let Some(id) = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_suffix(".sock"))
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                    {
+                        ids.insert(id);
+                    }
+                }
+            }
+            if self.config.warm_pool.enabled && proc_visibility_incomplete {
+                return Err(OrchError::Internal(
+                    "cannot inspect every process while reconciling unpersisted warm VMMs".into(),
+                ));
+            }
+        }
+        Ok(ids)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owned_processes_for(&self, id: Uuid) -> Result<Vec<ManagedProcess>, OrchError> {
+        let socket_path = self.socket_path_for(id);
+        let jail_root = self.jails.as_ref().map(|jails| jails.root_for(id));
+        let mut cgroup_pids = HashSet::new();
+        if let Some(cgroup) = self.exact_vm_cgroup_path(id) {
+            let procs = cgroup.join("cgroup.procs");
+            match std::fs::read_to_string(&procs) {
+                Ok(contents) => {
+                    for raw in contents.lines() {
+                        let pid = raw.trim().parse::<u32>().map_err(|error| {
+                            OrchError::Internal(format!(
+                                "parse owned VM cgroup PID {raw:?} in {}: {error}",
+                                procs.display()
+                            ))
+                        })?;
+                        if pid != 0 {
+                            cgroup_pids.insert(pid);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(OrchError::Internal(format!(
+                        "read owned VM cgroup processes {}: {error}",
+                        procs.display()
+                    )))
+                }
+            }
+        }
+
+        let mut candidate_pids = cgroup_pids.clone();
+        let mut proc_visibility_incomplete = false;
+        for entry in std::fs::read_dir("/proc")
+            .map_err(|error| OrchError::Internal(format!("scan /proc for owned VMMs: {error}")))?
+        {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::debug!(%error, "skip transient /proc entry during VMM recovery");
+                    continue;
+                }
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let cmdline = match std::fs::read(entry.path().join("cmdline")) {
+                Ok(cmdline) => cmdline,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    proc_visibility_incomplete = true;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(OrchError::Internal(format!(
+                        "read /proc/{pid}/cmdline during VMM recovery: {error}"
+                    )))
+                }
+            };
+            let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+            let socket_match = args
+                .iter()
+                .any(|arg| *arg == socket_path.as_os_str().as_bytes());
+            let jail_match = jail_root.as_ref().is_some_and(|root| {
+                args.iter().any(|arg| *arg == JAIL_SOCKET_PATH.as_bytes())
+                    && args.iter().any(|arg| *arg == root.as_os_str().as_bytes())
+            });
+            if socket_match || jail_match {
+                candidate_pids.insert(pid);
+            }
+        }
+        if jail_root.is_some() && proc_visibility_incomplete {
+            return Err(OrchError::Internal(format!(
+                "cannot inspect every process while reconciling owned jail for VM {id}; preserving its identity lease"
+            )));
+        }
+
+        let mut processes = Vec::new();
+        for pid in candidate_pids {
+            let pidfd = match pidfd_open(pid) {
+                Ok(pidfd) => pidfd,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(OrchError::Internal(format!(
+                        "pin owned VMM {pid} for startup reconciliation: {error}"
+                    )))
+                }
+            };
+            if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root.as_deref()) {
+                if cgroup_pids.contains(&pid) {
+                    return Err(OrchError::Internal(format!(
+                        "process {pid} remains in owned cgroup for VM {id} but failed VMM ownership verification: {reason}"
+                    )));
+                }
+                continue;
+            }
+            processes.push(ManagedProcess::adopted(pid, pidfd));
+        }
+        Ok(processes)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn owned_processes_for(&self, _id: Uuid) -> Result<Vec<ManagedProcess>, OrchError> {
+        Ok(Vec::new())
+    }
+
+    fn terminate_owned_processes(
+        &self,
+        id: Uuid,
+        keep_pid: Option<u32>,
+    ) -> Result<usize, OrchError> {
+        let processes = self.owned_processes_for(id)?;
+        let mut terminated = 0;
+        for process in processes {
+            if keep_pid == Some(process.pid) {
+                continue;
+            }
+            process.kill_wait()?;
+            terminated += 1;
+        }
+        Ok(terminated)
+    }
+
+    fn cleanup_uncommitted_runtime(&self, id: Uuid) -> Result<usize, OrchError> {
+        let terminated = self.terminate_owned_processes(id, None)?;
+        let remaining = self.owned_processes_for(id)?;
+        if !remaining.is_empty() {
+            return Err(OrchError::Internal(format!(
+                "owned VMM processes for {id} remain alive after startup termination"
+            )));
+        }
+
+        let mut failures = Vec::new();
+        if let Err(error) = remove_file_if_present(&self.socket_path_for(id)) {
+            failures.push(format!("remove VMM socket: {error}"));
+        }
+        if self.jails.is_none() {
+            if let Err(error) = remove_file_if_present(Path::new(&self.overlay_path_for(id))) {
+                failures.push(format!("remove VMM overlay: {error}"));
+            }
+        }
+        if let Some(path) = self.exact_vm_cgroup_path(id) {
+            if let Err(error) = remove_dir_if_present(&path) {
+                failures.push(format!(
+                    "remove exact VM cgroup {} after confirmed death: {error}",
+                    path.display()
+                ));
+            }
+        }
+        if let Err(error) = self.release_jail(id) {
+            failures.push(format!(
+                "release VM jail identity after confirmed death: {error}"
+            ));
+        }
+        if let Some(net) = &self.net {
+            if let Err(error) = net.teardown_vm_id(id) {
+                failures.push(format!("teardown recovered network allocation: {error}"));
+            }
+        }
+        self.scheduler.release(id);
+        if failures.is_empty() {
+            Ok(terminated)
+        } else {
+            Err(OrchError::Internal(failures.join("; ")))
+        }
+    }
+
+    fn reconcile_unpersisted_owned_runtimes(
+        &self,
+        durable_active_ids: &HashSet<Uuid>,
+    ) -> Result<(), OrchError> {
+        for id in self
+            .owned_runtime_ids()?
+            .difference(durable_active_ids)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            let terminated = self.cleanup_uncommitted_runtime(id)?;
+            tracing::warn!(
+                vm = %id,
+                terminated,
+                "removed unpersisted owned VMM runtime before artifact GC"
+            );
+        }
+        Ok(())
+    }
+
     /// Re-adopt VMs that were left running when this taritd instance restarted
     /// (reap disabled). `NetProvisioner` recovery already reconciled their
     /// network policy; this restores the control-plane handle so exec, pause,
@@ -3613,8 +4078,22 @@ impl VmmSupervisor {
         self: &Arc<Self>,
         records: &mut [VmRecord],
     ) -> Result<Vec<ReadoptWarning>, OrchError> {
+        let durable_active_ids = records
+            .iter()
+            .filter(|record| {
+                record.host_id == self.config.host_id
+                    && matches!(
+                        record.status,
+                        VmStatus::Creating
+                            | VmStatus::Running
+                            | VmStatus::Paused
+                            | VmStatus::Suspended
+                    )
+            })
+            .map(|record| record.id)
+            .collect::<HashSet<_>>();
         let mut failed = Vec::new();
-        for record in records {
+        for record in records.iter_mut() {
             match self.readopt_one(record).await {
                 Ok(true) => {
                     tracing::info!(vm = %record.id, pid = record.pid.unwrap_or(0),
@@ -3623,21 +4102,7 @@ impl VmmSupervisor {
                 Ok(false) => {}
                 Err(ReadoptFailure::Unadoptable(reason)) => {
                     tracing::warn!(vm = %record.id, reason = %reason,
-                        "cannot re-adopt VM after restart; tearing down its network and marking it failed");
-                    if let Some(net) = &self.net {
-                        if let Err(error) = net.teardown_vm_id(record.id) {
-                            return Err(OrchError::Internal(format!(
-                                "startup reconciliation could not clean owned network for VM {}: {reason}; {error}",
-                                record.id
-                            )));
-                        }
-                    }
-                    if let Err(error) = self.release_jail(record.id) {
-                        return Err(OrchError::Internal(format!(
-                            "startup reconciliation could not remove owned jail for VM {}: {reason}; {error}",
-                            record.id
-                        )));
-                    }
+                        "cannot re-adopt VM after restart; owned runtime was contained and the record will be marked failed");
                     failed.push(ReadoptWarning {
                         id: record.id,
                         reason,
@@ -3651,6 +4116,7 @@ impl VmmSupervisor {
                 }
             }
         }
+        self.reconcile_unpersisted_owned_runtimes(&durable_active_ids)?;
         Ok(failed)
     }
 
@@ -3660,31 +4126,97 @@ impl VmmSupervisor {
     /// VMM is positively identified as ours but cannot be managed, it is
     /// terminated through its pinned pidfd so no unmanaged VMM is left running.
     async fn readopt_one(self: &Arc<Self>, record: &mut VmRecord) -> Result<bool, ReadoptFailure> {
-        if record.host_id != self.config.host_id
-            || !matches!(
-                record.status,
-                VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
-            )
-        {
+        if record.host_id != self.config.host_id {
             return Ok(false);
         }
-        let pid = record
-            .pid
-            .ok_or_else(|| ReadoptFailure::Unadoptable("persisted VM has no PID".into()))?;
-        let socket_path = PathBuf::from(record.socket_path.as_deref().ok_or_else(|| {
-            ReadoptFailure::Unadoptable("persisted VM has no control socket path".into())
-        })?);
+        if record.status == VmStatus::Creating {
+            let terminated = self
+                .cleanup_uncommitted_runtime(record.id)
+                .map_err(|error| {
+                    ReadoptFailure::Fatal(format!(
+                        "contain interrupted Creating runtime before identity release: {error}"
+                    ))
+                })?;
+            return Err(ReadoptFailure::Unadoptable(format!(
+                "creating lifecycle was interrupted before publication; terminated {terminated} owned VMM process(es)"
+            )));
+        }
+        if !matches!(
+            record.status,
+            VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        ) {
+            return Ok(false);
+        }
+        let pid = match record.pid {
+            Some(pid) => pid,
+            None => {
+                self.cleanup_uncommitted_runtime(record.id)
+                    .map_err(|error| {
+                        ReadoptFailure::Fatal(format!(
+                            "persisted VM has no PID and owned runtime containment failed: {error}"
+                        ))
+                    })?;
+                return Err(ReadoptFailure::Unadoptable(
+                    "persisted VM has no PID".into(),
+                ));
+            }
+        };
+        let socket_path = match record.socket_path.as_deref() {
+            Some(path) => PathBuf::from(path),
+            None => {
+                self.cleanup_uncommitted_runtime(record.id)
+                    .map_err(|error| {
+                        ReadoptFailure::Fatal(format!(
+                            "persisted VM has no control socket and owned runtime containment failed: {error}"
+                        ))
+                    })?;
+                return Err(ReadoptFailure::Unadoptable(
+                    "persisted VM has no control socket path".into(),
+                ));
+            }
+        };
         // Pin the process before any /proc inspection so the PID cannot be
         // recycled between verification and adoption. If the process is already
         // gone there is nothing to adopt.
-        let pidfd = pidfd_open(pid).map_err(|error| {
-            ReadoptFailure::Unadoptable(format!("pin VMM {pid} for adoption: {error}"))
-        })?;
+        let pidfd = match pidfd_open(pid) {
+            Ok(pidfd) => pidfd,
+            Err(error)
+                if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) =>
+            {
+                self.cleanup_uncommitted_runtime(record.id)
+                    .map_err(|cleanup| {
+                        ReadoptFailure::Fatal(format!(
+                            "persisted VMM {pid} is gone but owned runtime containment failed: {cleanup}"
+                        ))
+                    })?;
+                return Err(ReadoptFailure::Unadoptable(format!(
+                    "pin VMM {pid} for adoption: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(ReadoptFailure::Fatal(format!(
+                    "cannot pin possibly-live VMM {pid}; preserving its identity lease: {error}"
+                )))
+            }
+        };
         // Confirm identity while pinned. A failure here means the process is not
         // our VMM (or is already gone), so it must not be signalled.
         let jail_root = self.jails.as_ref().map(|jails| jails.root_for(record.id));
-        verify_live_vmm(pid, &socket_path, jail_root.as_deref())
-            .map_err(ReadoptFailure::Unadoptable)?;
+        if let Err(reason) = verify_live_vmm(pid, &socket_path, jail_root.as_deref()) {
+            self.cleanup_uncommitted_runtime(record.id)
+                .map_err(|cleanup| {
+                    ReadoptFailure::Fatal(format!(
+                        "{reason}; containment of any separately owned runtime failed: {cleanup}"
+                    ))
+                })?;
+            return Err(ReadoptFailure::Unadoptable(reason));
+        }
+        self.terminate_owned_processes(record.id, Some(pid))
+            .map_err(|error| {
+                ReadoptFailure::Fatal(format!(
+                    "terminate duplicate owned VMM processes while preserving PID {pid}: {error}"
+                ))
+            })?;
         let process = ManagedProcess::adopted(pid, pidfd);
         // Identity is confirmed. Any failure below leaves a live, taritd-owned
         // VMM that the control plane cannot manage, so terminate it through the
@@ -4116,7 +4648,9 @@ impl VmmSupervisor {
         diff: bool,
         resume_after: bool,
         has_overlay: bool,
+        memory_mib: u64,
     ) -> Result<SnapshotBundle, OrchError> {
+        let _reservation = self.reserve_snapshot_space(id, memory_mib, has_overlay)?;
         let client = self.lifecycle_client_for(id)?;
         if resume_after {
             // Pause is synchronous: it returns only after every vCPU has left
@@ -4160,9 +4694,10 @@ impl VmmSupervisor {
             .unwrap_or_else(|| unsafe { libc::geteuid() });
         let overlay_artifact = if has_overlay {
             let source = PathBuf::from(self.overlay_path_for(id));
+            let staging = self.snapshot_overlay_staging_path();
             let destination = self.snapshot_overlay_path();
-            match copy_private_artifact_owned(&source, &destination, expected_uid) {
-                Ok(artifact) => Some(artifact),
+            match copy_private_artifact_owned(&source, &staging, expected_uid) {
+                Ok(artifact) => Some((artifact, destination)),
                 Err(error) => {
                     return Err(compensate_snapshot_pause(
                         &client,
@@ -4177,7 +4712,7 @@ impl VmmSupervisor {
 
         if resume_after {
             if let Err(error) = client.resume() {
-                if let Some(artifact) = overlay_artifact {
+                if let Some((artifact, _)) = overlay_artifact {
                     let _ = artifact.remove();
                 }
                 return Err(OrchError::Vmm(format!(
@@ -4193,15 +4728,16 @@ impl VmmSupervisor {
             );
         }
 
+        let ram_staging = self.snapshot_ram_staging_path();
         let ram_destination = self.snapshot_ram_path();
         let ram_artifact = match copy_private_artifact_owned(
             &scratch_snapshot_host_path,
-            &ram_destination,
+            &ram_staging,
             expected_uid,
         ) {
             Ok(artifact) => artifact,
             Err(error) => {
-                if let Some(artifact) = overlay_artifact {
+                if let Some((artifact, _)) = overlay_artifact {
                     let _ = artifact.remove();
                 }
                 return Err(OrchError::Internal(format!(
@@ -4213,7 +4749,7 @@ impl VmmSupervisor {
             client.release_scratch(&scratch_snapshot_path, scratch_ram_artifact.identity())
         {
             let _ = ram_artifact.remove();
-            if let Some(artifact) = overlay_artifact {
+            if let Some((artifact, _)) = overlay_artifact {
                 let _ = artifact.remove();
             }
             return Err(OrchError::Vmm(format!("claim RAM snapshot: {error}")));
@@ -4232,13 +4768,27 @@ impl VmmSupervisor {
 
         let overlay_path = overlay_artifact
             .as_ref()
-            .map(|artifact| artifact.path().display().to_string());
-        let mut artifacts = vec![ram_artifact];
-        artifacts.extend(overlay_artifact);
+            .map(|(_, destination)| destination.display().to_string());
+        let mut publications = vec![(ram_artifact, ram_destination.clone())];
+        publications.extend(overlay_artifact);
+        let registered_paths = match self.publish_artifacts(&mut publications) {
+            Ok(paths) => paths,
+            Err(error) => {
+                for (artifact, _) in publications {
+                    let _ = artifact.remove();
+                }
+                return Err(error);
+            }
+        };
         let bundle = SnapshotBundle {
             snapshot_path: ram_destination.display().to_string(),
             overlay_path,
-            artifacts,
+            artifacts: publications
+                .into_iter()
+                .map(|(artifact, _)| artifact)
+                .collect(),
+            in_progress_artifacts: Arc::clone(&self.in_progress_artifacts),
+            registered_paths,
         };
         Ok(bundle)
     }
@@ -5407,6 +5957,142 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    fn spawn_jailed_vmm_standin(jail_root: &Path) -> Child {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg("serve")
+            .arg("--socket")
+            .arg(JAIL_SOCKET_PATH)
+            .arg("--jail-root")
+            .arg(jail_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn jailed VMM stand-in");
+        for _ in 0..200 {
+            if verify_live_vmm(
+                child.id(),
+                &jail_root.join(JAIL_SOCKET_PATH.trim_start_matches('/')),
+                Some(jail_root),
+            )
+            .is_ok()
+            {
+                return child;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("jailed VMM stand-in did not publish its argv");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_reconciliation_terminates_unpersisted_jailed_vmm() {
+        let root = PathBuf::from(format!("target/startup-orphan-jail-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.vm_jail = Some(crate::config::VmJailConfig {
+            base_dir: root.join("jails"),
+            uid_base: 20_000,
+            gid_base: 30_000,
+            id_count: 4,
+            profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        });
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let id = Uuid::new_v4();
+        let lease = supervisor.jails.as_ref().unwrap().lease(id).unwrap();
+        let mut child = spawn_jailed_vmm_standin(&lease.root);
+
+        let warnings = test_runtime()
+            .block_on(supervisor.readopt_running_vms(&mut []))
+            .unwrap();
+        assert!(warnings.is_empty());
+        child.wait().expect("reap terminated stand-in");
+        assert!(!lease.root.exists());
+        assert_eq!(supervisor.jail_identity(id).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_reconciliation_contains_durable_creating_runtime() {
+        let root = PathBuf::from(format!("target/startup-creating-jail-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.vm_jail = Some(crate::config::VmJailConfig {
+            base_dir: root.join("jails"),
+            uid_base: 20_000,
+            gid_base: 30_000,
+            id_count: 4,
+            profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        });
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let id = Uuid::new_v4();
+        let lease = supervisor.jails.as_ref().unwrap().lease(id).unwrap();
+        let mut child = spawn_jailed_vmm_standin(&lease.root);
+        let mut record = restart_record(id, &supervisor.socket_path_for(id));
+        record.status = VmStatus::Creating;
+        record.pid = None;
+        record.socket_path = None;
+
+        let warnings = test_runtime()
+            .block_on(supervisor.readopt_running_vms(std::slice::from_mut(&mut record)))
+            .unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].id, id);
+        child.wait().expect("reap terminated stand-in");
+        assert!(!lease.root.exists());
+        assert_eq!(supervisor.jail_identity(id).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unverified_cgroup_process_retains_jail_identity() {
+        let root = PathBuf::from(format!(
+            "target/startup-unverified-cgroup-{}",
+            Uuid::new_v4()
+        ));
+        let cgroup_parent = root.join("cgroups");
+        std::fs::create_dir_all(&cgroup_parent).unwrap();
+        let mut config = supervisor_config(&root);
+        config.vm_cgroup_parent = Some(cgroup_parent.display().to_string());
+        config.vm_jail = Some(crate::config::VmJailConfig {
+            base_dir: root.join("jails"),
+            uid_base: 20_000,
+            gid_base: 30_000,
+            id_count: 4,
+            profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+        });
+        let supervisor = VmmSupervisor::new(config);
+        let id = Uuid::new_v4();
+        let lease = supervisor.jails.as_ref().unwrap().lease(id).unwrap();
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        let cgroup = cgroup_parent.join(format!("tarit-{id}"));
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), unrelated.id().to_string()).unwrap();
+
+        let error = supervisor
+            .cleanup_uncommitted_runtime(id)
+            .expect_err("unverified process must fail closed");
+        assert!(error
+            .to_string()
+            .contains("failed VMM ownership verification"));
+        assert!(unrelated.try_wait().unwrap().is_none());
+        assert!(lease.root.exists());
+        assert!(supervisor.jail_identity(id).unwrap().is_some());
+
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn test_supervisor() -> Arc<VmmSupervisor> {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -5479,6 +6165,7 @@ mod tests {
             vcpus: 1,
             kernel_path: "kernel".into(),
             rootfs_path: Some("rootfs".into()),
+            rootfs_read_only: true,
             cmdline: DEFAULT_CMDLINE.into(),
             socket_path: Some(socket_path.display().to_string()),
             pid: None,
@@ -5539,6 +6226,10 @@ mod tests {
         server.join().unwrap();
         assert_eq!(record.status, VmStatus::Paused);
         assert_eq!(record.revision, 9);
+        assert!(
+            record.rootfs_read_only,
+            "restart reconciliation must preserve the VM's effective mount mode instead of the current host default"
+        );
         assert!(record.updated_at >= previous_updated_at);
         supervisor.stop_vm(id).unwrap();
         assert!(supervisor.scheduler.release(id));
@@ -6286,9 +6977,7 @@ mod tests {
         std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
         std::fs::write(&overlay, b"golden upper").unwrap();
         let mut artifacts = vec![OwnedArtifact::capture(&overlay).unwrap()];
-        supervisor
-            .remember_golden_artifacts(&mut artifacts)
-            .unwrap();
+        supervisor.remember_golden_artifacts(&mut artifacts, &[]);
 
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         let vm = RunningVm::new(process.pid, PathBuf::new(), process, None);
@@ -6309,6 +6998,17 @@ mod tests {
             !scratch.exists(),
             "a non-golden overlay is removed on teardown"
         );
+    }
+
+    #[test]
+    fn golden_bundle_restores_from_its_captured_disk_upper() {
+        let (snapshot, overlay) = GoldenBundle {
+            snapshot_path: "golden.ram".into(),
+            overlay_path: Some("golden.cow".into()),
+        }
+        .into_restore_parts();
+        assert_eq!(snapshot, "golden.ram");
+        assert_eq!(overlay, RestoreOverlay::Seeded(PathBuf::from("golden.cow")));
     }
 
     #[test]
@@ -6365,7 +7065,13 @@ mod tests {
             .unwrap();
         let caller = runtime.spawn(async move {
             caller_supervisor
-                .spawn_warm_restore(class, "golden.snap".into())
+                .spawn_warm_restore(
+                    class,
+                    GoldenBundle {
+                        snapshot_path: "golden.snap".into(),
+                        overlay_path: Some("golden.cow".into()),
+                    },
+                )
                 .await
         });
         let wait_pause = pause.clone();
@@ -7184,5 +7890,61 @@ mod tests {
 
         assert_eq!(std::fs::read(&snapshot).unwrap(), b"replacement");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn published_snapshot_is_gc_protected_until_registration_finishes() {
+        let root = PathBuf::from(format!(
+            "target/snapshot-publication-registry-{}",
+            Uuid::new_v4()
+        ));
+        let mut config = supervisor_config(&root);
+        config.disk_pressure.artifact_min_age_secs = 0;
+        let supervisor = VmmSupervisor::new(config);
+        let staging = supervisor.snapshot_ram_staging_path();
+        let destination = supervisor.snapshot_ram_path();
+        let artifact = OwnedArtifact::create_private(&staging).unwrap();
+        artifact._file.write_all_at(b"snapshot", 0).unwrap();
+        artifact._file.sync_all().unwrap();
+        let mut publications = vec![(artifact, destination.clone())];
+
+        let registered = supervisor.publish_artifacts(&mut publications).unwrap();
+        let report = supervisor
+            .sweep_owned_artifacts(ArtifactReferences::default())
+            .unwrap();
+        assert_eq!(report.removed_files, 0);
+        assert!(destination.exists());
+        SnapshotBundle {
+            snapshot_path: destination.display().to_string(),
+            overlay_path: None,
+            artifacts: publications
+                .into_iter()
+                .map(|(artifact, _)| artifact)
+                .collect(),
+            in_progress_artifacts: Arc::clone(&supervisor.in_progress_artifacts),
+            registered_paths: registered.clone(),
+        }
+        .persist();
+        assert!(
+            supervisor
+                .in_progress_artifacts
+                .lock()
+                .unwrap()
+                .contains(&destination),
+            "durable publication fence must survive a GC pass with stale metadata"
+        );
+
+        {
+            let mut in_progress = supervisor.in_progress_artifacts.lock().unwrap();
+            for path in registered {
+                in_progress.remove(&path);
+            }
+        }
+        let report = supervisor
+            .sweep_owned_artifacts(ArtifactReferences::default())
+            .unwrap();
+        assert_eq!(report.removed_files, 1);
+        assert!(!destination.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

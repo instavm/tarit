@@ -115,7 +115,7 @@ pub fn apply_limits(cgroup_path: &str, limits: &CgroupLimits) -> Result<(), Cgro
             )));
         }
         for command in limit_write_commands(key, &val)? {
-            match fs::write(&file_path, command.as_bytes()) {
+            match write_one_command(&file_path, command) {
                 Ok(()) => {
                     log::info!("cgroup: {key}={command} → {}", file_path.display());
                 }
@@ -130,6 +130,22 @@ pub fn apply_limits(cgroup_path: &str, limits: &CgroupLimits) -> Result<(), Cgro
         }
     }
     Ok(())
+}
+
+fn write_one_command(path: &Path, command: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).open(path)?;
+    let written = file.write(command.as_bytes())?;
+    if written == command.len() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            format!(
+                "short cgroup command write: wrote {written}/{} bytes",
+                command.len()
+            ),
+        ))
+    }
 }
 
 fn limit_write_commands<'a>(key: &str, value: &'a str) -> Result<Vec<&'a str>, CgroupError> {

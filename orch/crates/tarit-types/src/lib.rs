@@ -97,6 +97,11 @@ pub struct VmRecord {
     pub vcpus: u8,
     pub kernel_path: String,
     pub rootfs_path: Option<String>,
+    /// Effective guest rootfs mount mode for this VM incarnation. This is
+    /// durable so restart reconciliation and snapshots do not inherit a newer
+    /// host-wide default.
+    #[serde(default)]
+    pub rootfs_read_only: bool,
     pub cmdline: String,
     pub socket_path: Option<String>,
     pub pid: Option<u32>,
@@ -632,6 +637,7 @@ mod tests {
             vcpus: 1,
             kernel_path: "/srv/private/vmlinux".into(),
             rootfs_path: Some("/srv/private/rootfs".into()),
+            rootfs_read_only: true,
             cmdline: "console=ttyS0 secret=detail".into(),
             socket_path: Some("/run/private/vm.sock".into()),
             pid: Some(42),

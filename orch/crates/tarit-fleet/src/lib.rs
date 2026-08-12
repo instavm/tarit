@@ -67,6 +67,7 @@ impl PostgresFleet {
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS api_key_id TEXT;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS startup_path TEXT;
+             ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS rootfs_read_only BOOLEAN NOT NULL DEFAULT FALSE;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
              CREATE INDEX IF NOT EXISTS fleet_vms_owner_status ON fleet_vms (owner_key, status);
              CREATE TABLE IF NOT EXISTS fleet_schema_migrations (
@@ -149,8 +150,9 @@ impl PostgresFleet {
             .query_opt(
                 "INSERT INTO fleet_vms (
                    id, host_id, owner_key, api_key_id, status, revision, startup_path, memory_mib, vcpus,
-                   kernel_path, rootfs_path, cmdline, created_at, updated_at, generation
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,1)
+                   kernel_path, rootfs_path, rootfs_read_only, cmdline, created_at, updated_at,
+                   generation
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,1)
                  ON CONFLICT (id) DO UPDATE SET
                    owner_key = EXCLUDED.owner_key,
                    api_key_id = EXCLUDED.api_key_id,
@@ -161,6 +163,7 @@ impl PostgresFleet {
                    vcpus = EXCLUDED.vcpus,
                    kernel_path = EXCLUDED.kernel_path,
                    rootfs_path = EXCLUDED.rootfs_path,
+                   rootfs_read_only = EXCLUDED.rootfs_read_only,
                    cmdline = EXCLUDED.cmdline,
                    updated_at = EXCLUDED.updated_at,
                    generation = fleet_vms.generation + 1
@@ -181,6 +184,7 @@ impl PostgresFleet {
                     &(vm.vcpus as i16),
                     &vm.kernel_path,
                     &vm.rootfs_path,
+                    &vm.rootfs_read_only,
                     &vm.cmdline,
                     &vm.created_at,
                     &vm.updated_at,
@@ -193,8 +197,8 @@ impl PostgresFleet {
                 let existing = tx
                     .query_opt(
                         "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                                memory_mib, vcpus, kernel_path, rootfs_path, cmdline,
-                                created_at, updated_at, generation
+                                memory_mib, vcpus, kernel_path, rootfs_path, rootfs_read_only,
+                                cmdline, created_at, updated_at, generation
                            FROM fleet_vms WHERE id = $1",
                         &[&vm.id],
                     )
@@ -217,7 +221,7 @@ impl PostgresFleet {
                     )));
                 }
                 tx.commit().await?;
-                return u64::try_from(existing.get::<_, i64>(14))
+                return u64::try_from(existing.get::<_, i64>(15))
                     .map_err(|_| FleetError::Config("negative VM generation".into()));
             }
         };
@@ -239,7 +243,8 @@ impl PostgresFleet {
         let rows = client
             .query(
                 "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                        memory_mib, vcpus, kernel_path, rootfs_path, cmdline, created_at, updated_at
+                        memory_mib, vcpus, kernel_path, rootfs_path, rootfs_read_only, cmdline,
+                        created_at, updated_at
                    FROM fleet_vms
                  WHERE ($1::TEXT IS NULL OR owner_key = $1)
                    AND status <> 'stopped'
@@ -826,6 +831,7 @@ CREATE TABLE IF NOT EXISTS fleet_vms (
   vcpus SMALLINT NOT NULL,
   kernel_path TEXT NOT NULL,
   rootfs_path TEXT,
+  rootfs_read_only BOOLEAN NOT NULL DEFAULT FALSE,
   cmdline TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL,
@@ -931,13 +937,14 @@ fn row_to_vm(row: &tokio_postgres::Row) -> Result<VmRecord, FleetError> {
         vcpus,
         kernel_path: row.get(9),
         rootfs_path: row.get(10),
-        cmdline: row.get(11),
+        rootfs_read_only: row.get(11),
+        cmdline: row.get(12),
         // Process handles are node-local and must never be reconstructed from
         // the global ownership index.
         socket_path: None,
         pid: None,
-        created_at: row.get(12),
-        updated_at: row.get(13),
+        created_at: row.get(13),
+        updated_at: row.get(14),
     })
 }
 
@@ -1143,6 +1150,7 @@ mod tests {
             vcpus: 1,
             kernel_path: "/opt/tarit/vmlinux".into(),
             rootfs_path: Some("/opt/tarit/rootfs.ext4".into()),
+            rootfs_read_only: true,
             cmdline: "console=ttyS0".into(),
             socket_path: None,
             pid: None,

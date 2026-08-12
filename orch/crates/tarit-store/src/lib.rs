@@ -110,6 +110,7 @@ impl Store {
                vcpus INTEGER NOT NULL,
                kernel_path TEXT NOT NULL,
                rootfs_path TEXT,
+               rootfs_read_only INTEGER NOT NULL DEFAULT 0,
                cmdline TEXT NOT NULL,
                socket_path TEXT,
                pid INTEGER,
@@ -231,6 +232,12 @@ impl Store {
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
         ensure_column(&conn, "vms", "startup_path", "TEXT")?;
+        ensure_column(
+            &conn,
+            "vms",
+            "rootfs_read_only",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
         ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
@@ -249,8 +256,9 @@ impl Store {
         let changed = self.conn.execute(
             "INSERT INTO vms (
               id, host_id, owner_key, api_key_id, status, revision, startup_path, memory_mib,
-              vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+              vcpus, kernel_path, rootfs_path, rootfs_read_only, cmdline, socket_path, pid,
+              created_at, updated_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
              ON CONFLICT(id) DO UPDATE SET
                owner_key = excluded.owner_key,
                api_key_id = excluded.api_key_id,
@@ -261,6 +269,7 @@ impl Store {
                vcpus = excluded.vcpus,
                kernel_path = excluded.kernel_path,
                rootfs_path = excluded.rootfs_path,
+               rootfs_read_only = excluded.rootfs_read_only,
                cmdline = excluded.cmdline,
                socket_path = excluded.socket_path,
                pid = excluded.pid,
@@ -280,6 +289,7 @@ impl Store {
                 vm.vcpus,
                 vm.kernel_path,
                 vm.rootfs_path,
+                vm.rootfs_read_only,
                 vm.cmdline,
                 vm.socket_path,
                 vm.pid,
@@ -311,8 +321,8 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                        memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
-                        created_at, updated_at
+                        memory_mib, vcpus, kernel_path, rootfs_path, rootfs_read_only, cmdline,
+                        socket_path, pid, created_at, updated_at
                  FROM vms WHERE id = ?1",
                 params![id.to_string()],
                 row_to_vm,
@@ -501,8 +511,8 @@ impl Store {
     pub fn list_vms(&self) -> Result<Vec<VmRecord>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, host_id, owner_key, api_key_id, status, revision, startup_path,
-                    memory_mib, vcpus, kernel_path, rootfs_path, cmdline, socket_path, pid,
-                    created_at, updated_at
+                    memory_mib, vcpus, kernel_path, rootfs_path, rootfs_read_only, cmdline,
+                    socket_path, pid, created_at, updated_at
              FROM vms ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_vm)?;
@@ -1025,8 +1035,8 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
     let revision = u64::try_from(revision_i64)
         .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, revision_i64))?;
     let startup_path: Option<String> = row.get(6)?;
-    let created_at: String = row.get(14)?;
-    let updated_at: String = row.get(15)?;
+    let created_at: String = row.get(15)?;
+    let updated_at: String = row.get(16)?;
     Ok(VmRecord {
         id: parse_uuid_col(&id, 0)?,
         host_id: row.get(1)?,
@@ -1039,9 +1049,10 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
         vcpus: row.get(8)?,
         kernel_path: row.get(9)?,
         rootfs_path: row.get(10)?,
-        cmdline: row.get(11)?,
-        socket_path: row.get(12)?,
-        pid: row.get(13)?,
+        rootfs_read_only: row.get(11)?,
+        cmdline: row.get(12)?,
+        socket_path: row.get(13)?,
+        pid: row.get(14)?,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
     })
@@ -1708,6 +1719,7 @@ mod tests {
             vcpus: 1,
             kernel_path: "vmlinux".into(),
             rootfs_path: Some("rootfs.ext4".into()),
+            rootfs_read_only: true,
             cmdline: "console=ttyS0".into(),
             socket_path: Some("vm.sock".into()),
             pid: Some(42),
@@ -1720,6 +1732,7 @@ mod tests {
             store.get_vm(vm.id).unwrap().api_key_id,
             Some("api-key-a".into())
         );
+        assert!(store.get_vm(vm.id).unwrap().rootfs_read_only);
 
         let mut updated = vm.clone();
         updated.api_key_id = Some("api-key-b".into());

@@ -649,6 +649,7 @@ mod tests {
             vcpus: 1,
             kernel_path: "/tmp/vmlinux".into(),
             rootfs_path: Some("/tmp/rootfs.ext4".into()),
+            rootfs_read_only: true,
             cmdline: "console=ttyS0".into(),
             socket_path: Some("/run/taritd/vm.sock".into()),
             pid: Some(42),

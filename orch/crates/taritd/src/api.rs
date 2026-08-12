@@ -1376,6 +1376,7 @@ pub(crate) fn running_record(
             .rootfs_path
             .as_ref()
             .map(|p| p.display().to_string()),
+        rootfs_read_only: spawn_cfg.read_only,
         cmdline: spawn_cfg.cmdline.clone(),
         socket_path: Some(socket_path.display().to_string()),
         pid: Some(pid),
@@ -2206,6 +2207,9 @@ async fn warm_pool_status(
             "active": disk_pressure.pressured,
             "used_bytes": disk_pressure.used_bytes,
             "used_inodes": disk_pressure.used_inodes,
+            "reserved_bytes": disk_pressure.reserved_bytes,
+            "reserved_inodes": disk_pressure.reserved_inodes,
+            "roots": disk_pressure.roots,
             "last_removed_files": disk_pressure.last_removed_files,
             "last_removed_jails": disk_pressure.last_removed_jails,
         },
@@ -3875,6 +3879,7 @@ mod tests {
             vcpus: 1,
             kernel_path: "kernel".into(),
             rootfs_path: None,
+            rootfs_read_only: false,
             cmdline: "console=ttyS0".into(),
             socket_path: None,
             pid: None,

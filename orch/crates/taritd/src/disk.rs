@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tarit_types::OrchError;
 use uuid::Uuid;
@@ -15,8 +15,21 @@ pub(crate) struct DiskPressureSnapshot {
     pub(crate) pressured: bool,
     pub(crate) used_bytes: u64,
     pub(crate) used_inodes: u64,
+    pub(crate) reserved_bytes: u64,
+    pub(crate) reserved_inodes: u64,
+    pub(crate) roots: Vec<DiskPressureRootSnapshot>,
     pub(crate) last_removed_files: u64,
     pub(crate) last_removed_jails: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DiskPressureRootSnapshot {
+    pub(crate) path: String,
+    pub(crate) pressured: bool,
+    pub(crate) used_bytes: u64,
+    pub(crate) used_inodes: u64,
+    pub(crate) reserved_bytes: u64,
+    pub(crate) reserved_inodes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -41,19 +54,64 @@ impl PressureLatch {
 
 pub(crate) struct DiskPressure {
     config: DiskPressureConfig,
-    filesystem_path: PathBuf,
-    latch: Mutex<PressureLatch>,
+    roots: Mutex<Vec<PressureRoot>>,
     snapshot: Mutex<DiskPressureSnapshot>,
 }
 
+#[derive(Debug)]
+struct PressureRoot {
+    path: PathBuf,
+    device: u64,
+    latch: PressureLatch,
+    reserved_bytes: u64,
+    reserved_inodes: u64,
+}
+
+pub(crate) struct DiskReservation {
+    pressure: Arc<DiskPressure>,
+    bytes: u64,
+    inodes: u64,
+    released: bool,
+}
+
 impl DiskPressure {
-    pub(crate) fn new(config: DiskPressureConfig, filesystem_path: PathBuf) -> Self {
-        Self {
-            config,
-            filesystem_path,
-            latch: Mutex::new(PressureLatch::default()),
-            snapshot: Mutex::new(DiskPressureSnapshot::default()),
+    pub(crate) fn new(
+        config: DiskPressureConfig,
+        filesystem_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, OrchError> {
+        let mut roots = Vec::new();
+        for path in filesystem_paths {
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                OrchError::Internal(format!(
+                    "inspect disk-pressure root {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let device = metadata.dev();
+            if roots
+                .iter()
+                .any(|root: &PressureRoot| root.device == device)
+            {
+                continue;
+            }
+            roots.push(PressureRoot {
+                path,
+                device,
+                latch: PressureLatch::default(),
+                reserved_bytes: 0,
+                reserved_inodes: 0,
+            });
         }
+        if roots.is_empty() {
+            return Err(OrchError::Internal(
+                "disk pressure requires at least one owned-artifact filesystem".into(),
+            ));
+        }
+        Ok(Self {
+            config,
+            roots: Mutex::new(roots),
+            snapshot: Mutex::new(DiskPressureSnapshot::default()),
+        })
     }
 
     pub(crate) fn sweep_interval(&self) -> Duration {
@@ -65,25 +123,51 @@ impl DiskPressure {
     }
 
     pub(crate) fn refresh(&self) -> Result<DiskPressureSnapshot, OrchError> {
-        let (used_bytes, used_inodes) =
-            filesystem_usage(&self.filesystem_path).map_err(|error| {
+        let mut roots = self
+            .roots
+            .lock()
+            .map_err(|_| OrchError::Internal("disk pressure roots poisoned".into()))?;
+        let mut root_snapshots = Vec::with_capacity(roots.len());
+        for root in roots.iter_mut() {
+            let (used_bytes, used_inodes) = filesystem_usage(&root.path).map_err(|error| {
                 OrchError::Internal(format!(
                     "measure disk pressure at {}: {error}",
-                    self.filesystem_path.display()
+                    root.path.display()
                 ))
             })?;
-        let pressured = self
-            .latch
-            .lock()
-            .map_err(|_| OrchError::Internal("disk pressure latch poisoned".into()))?
-            .update(&self.config, used_bytes, used_inodes);
+            let pressured = root.latch.update(
+                &self.config,
+                used_bytes.saturating_add(root.reserved_bytes),
+                used_inodes.saturating_add(root.reserved_inodes),
+            );
+            root_snapshots.push(DiskPressureRootSnapshot {
+                path: root.path.display().to_string(),
+                pressured,
+                used_bytes,
+                used_inodes,
+                reserved_bytes: root.reserved_bytes,
+                reserved_inodes: root.reserved_inodes,
+            });
+        }
+        drop(roots);
         let mut snapshot = self
             .snapshot
             .lock()
             .map_err(|_| OrchError::Internal("disk pressure state poisoned".into()))?;
-        snapshot.pressured = pressured;
-        snapshot.used_bytes = used_bytes;
-        snapshot.used_inodes = used_inodes;
+        snapshot.pressured = root_snapshots.iter().any(|root| root.pressured);
+        snapshot.used_bytes = root_snapshots
+            .iter()
+            .fold(0u64, |total, root| total.saturating_add(root.used_bytes));
+        snapshot.used_inodes = root_snapshots
+            .iter()
+            .fold(0u64, |total, root| total.saturating_add(root.used_inodes));
+        snapshot.reserved_bytes = root_snapshots.iter().fold(0u64, |total, root| {
+            total.saturating_add(root.reserved_bytes)
+        });
+        snapshot.reserved_inodes = root_snapshots.iter().fold(0u64, |total, root| {
+            total.saturating_add(root.reserved_inodes)
+        });
+        snapshot.roots = root_snapshots;
         Ok(snapshot.clone())
     }
 
@@ -99,14 +183,83 @@ impl DiskPressure {
         if snapshot.pressured {
             Err(OrchError::Overloaded {
                 message: format!(
-                    "node disk pressure blocks {operation} (used_bytes={}, used_inodes={})",
-                    snapshot.used_bytes, snapshot.used_inodes
+                    "node disk pressure blocks {operation} on {}",
+                    pressured_roots(&snapshot)
                 ),
                 retry_after_secs: self.config.sweep_interval_secs.max(1),
             })
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        operation: &str,
+        bytes: u64,
+        inodes: u64,
+    ) -> Result<DiskReservation, OrchError> {
+        let mut roots = self
+            .roots
+            .lock()
+            .map_err(|_| OrchError::Internal("disk pressure roots poisoned".into()))?;
+        for root in roots.iter() {
+            let space = filesystem_space(&root.path).map_err(|error| {
+                OrchError::Internal(format!(
+                    "measure disk pressure at {}: {error}",
+                    root.path.display()
+                ))
+            })?;
+            let projected_bytes = space
+                .used_bytes
+                .saturating_add(root.reserved_bytes)
+                .saturating_add(bytes);
+            let projected_inodes = space
+                .used_inodes
+                .saturating_add(root.reserved_inodes)
+                .saturating_add(inodes);
+            let exceeds_reservable_space = root.reserved_bytes.saturating_add(bytes)
+                > space.available_bytes
+                || root.reserved_inodes.saturating_add(inodes) > space.available_inodes;
+            if exceeds_reservable_space
+                || self
+                    .config
+                    .bytes_high
+                    .is_some_and(|high| projected_bytes >= high)
+                || self
+                    .config
+                    .inodes_high
+                    .is_some_and(|high| projected_inodes >= high)
+            {
+                return Err(OrchError::Overloaded {
+                    message: format!(
+                        "node disk pressure blocks {operation} at {} (projected_bytes={projected_bytes}, projected_inodes={projected_inodes})",
+                        root.path.display()
+                    ),
+                    retry_after_secs: self.config.sweep_interval_secs.max(1),
+                });
+            }
+        }
+        for root in roots.iter_mut() {
+            root.reserved_bytes = root.reserved_bytes.saturating_add(bytes);
+            root.reserved_inodes = root.reserved_inodes.saturating_add(inodes);
+        }
+        drop(roots);
+        if let Err(error) = self.refresh() {
+            if let Ok(mut roots) = self.roots.lock() {
+                for root in roots.iter_mut() {
+                    root.reserved_bytes = root.reserved_bytes.saturating_sub(bytes);
+                    root.reserved_inodes = root.reserved_inodes.saturating_sub(inodes);
+                }
+            }
+            return Err(error);
+        }
+        Ok(DiskReservation {
+            pressure: Arc::clone(self),
+            bytes,
+            inodes,
+            released: false,
+        })
     }
 
     pub(crate) fn record_sweep(&self, report: &GcReport) {
@@ -117,7 +270,57 @@ impl DiskPressure {
     }
 }
 
-fn filesystem_usage(path: &Path) -> std::io::Result<(u64, u64)> {
+impl DiskReservation {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Ok(mut roots) = self.pressure.roots.lock() {
+            for root in roots.iter_mut() {
+                root.reserved_bytes = root.reserved_bytes.saturating_sub(self.bytes);
+                root.reserved_inodes = root.reserved_inodes.saturating_sub(self.inodes);
+            }
+        }
+        if let Err(error) = self.pressure.refresh() {
+            tracing::warn!(%error, "refresh disk pressure after reservation release failed");
+        }
+    }
+}
+
+impl Drop for DiskReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn pressured_roots(snapshot: &DiskPressureSnapshot) -> String {
+    snapshot
+        .roots
+        .iter()
+        .filter(|root| root.pressured)
+        .map(|root| {
+            format!(
+                "{} (used_bytes={}, reserved_bytes={}, used_inodes={}, reserved_inodes={})",
+                root.path,
+                root.used_bytes,
+                root.reserved_bytes,
+                root.used_inodes,
+                root.reserved_inodes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+struct FilesystemSpace {
+    used_bytes: u64,
+    used_inodes: u64,
+    available_bytes: u64,
+    available_inodes: u64,
+}
+
+fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
     let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -133,7 +336,17 @@ fn filesystem_usage(path: &Path) -> std::io::Result<(u64, u64)> {
     let used_blocks = u64::from(stats.f_blocks.saturating_sub(stats.f_bavail));
     let used_bytes = stats.f_frsize.saturating_mul(used_blocks);
     let used_inodes = u64::from(stats.f_files.saturating_sub(stats.f_favail));
-    Ok((used_bytes, used_inodes))
+    Ok(FilesystemSpace {
+        used_bytes,
+        used_inodes,
+        available_bytes: stats.f_frsize.saturating_mul(u64::from(stats.f_bavail)),
+        available_inodes: u64::from(stats.f_favail),
+    })
+}
+
+fn filesystem_usage(path: &Path) -> std::io::Result<(u64, u64)> {
+    let space = filesystem_space(path)?;
+    Ok((space.used_bytes, space.used_inodes))
 }
 
 #[derive(Debug, Default)]
@@ -381,12 +594,47 @@ mod tests {
                 sweep_interval_secs: 1,
                 artifact_min_age_secs: 1,
             },
-            root.clone(),
-        );
+            [root.clone()],
+        )
+        .unwrap();
         assert!(matches!(
             pressure.ensure_admission("VM create"),
             Err(OrchError::Overloaded { .. })
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reservation_checks_and_reports_each_distinct_artifact_filesystem() {
+        let root = test_root("reservation");
+        let same_device = root.join("jails");
+        std::fs::create_dir_all(&same_device).unwrap();
+        let (used_bytes, _) = filesystem_usage(&root).unwrap();
+        let pressure = Arc::new(
+            DiskPressure::new(
+                DiskPressureConfig {
+                    bytes_high: Some(used_bytes.saturating_add(1024 * 1024 * 1024)),
+                    bytes_low: Some(used_bytes),
+                    inodes_high: None,
+                    inodes_low: None,
+                    sweep_interval_secs: 1,
+                    artifact_min_age_secs: 1,
+                },
+                [root.clone(), same_device],
+            )
+            .unwrap(),
+        );
+        let reservation = pressure.reserve("snapshot", 400 * 1024 * 1024, 2).unwrap();
+        let snapshot = pressure.snapshot();
+        assert_eq!(
+            snapshot.roots.len(),
+            1,
+            "same-device roots are deduplicated"
+        );
+        assert_eq!(snapshot.reserved_bytes, 400 * 1024 * 1024);
+        assert!(pressure.reserve("snapshot", 700 * 1024 * 1024, 2).is_err());
+        drop(reservation);
+        assert_eq!(pressure.snapshot().reserved_bytes, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -402,9 +650,10 @@ mod tests {
 
         let stale = overlays.join(format!("{}.cow", Uuid::new_v4()));
         let referenced = snapshots.join(format!("bundle-{}.ram", Uuid::new_v4()));
+        let staging = snapshots.join(format!(".stage-{}.ram", Uuid::new_v4()));
         let arbitrary = snapshots.join("customer-data");
         let unsafe_link = overlays.join(format!("{}.cow", Uuid::new_v4()));
-        for path in [&stale, &referenced, &arbitrary] {
+        for path in [&stale, &referenced, &staging, &arbitrary] {
             std::fs::write(path, b"x").unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
@@ -425,6 +674,10 @@ mod tests {
         assert!(
             referenced.exists(),
             "durable snapshot references must be preserved"
+        );
+        assert!(
+            staging.exists(),
+            "in-progress staging names must never be GC eligible"
         );
         assert!(arbitrary.exists(), "unknown names must never be removed");
         assert_eq!(report.removed_files, 0);
