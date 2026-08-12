@@ -513,13 +513,6 @@ impl VmmClient {
         }
     }
 
-    pub fn repair_guest_network(&self, network: GuestNetworkRepair) -> Result<(), VmmError> {
-        match self.request_ok(&ApiRequest::RepairGuestNetwork { network })? {
-            ApiResponse::GuestNetworkRepaired => Ok(()),
-            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
-        }
-    }
-
     pub fn update_egress(
         &self,
         allowlist: Vec<String>,
