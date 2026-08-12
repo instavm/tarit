@@ -13,7 +13,7 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
-hmac = "0.12"
+hmac = "0.13"
 # MIT OR Apache-2.0 licensed — validated IP network parser
 ipnet = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
