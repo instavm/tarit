@@ -1,10 +1,10 @@
 # Production readiness
 
 Tarit is not yet approved for hostile multi-tenant production use.
-`TARIT_PRODUCTION=1` intentionally fails closed while the mandatory isolation
-path listed below is incomplete. This document records what this hardening
-change proves and what remains a release blocker; billing and product-layer
-concerns are outside its scope.
+`TARIT_PRODUCTION=1` enforces the implemented isolation and durability
+configuration gates. This document records what the hardening work proves and
+what remains a release blocker; billing and product-layer concerns are outside
+its scope.
 
 ## Implemented and testable
 
@@ -14,6 +14,15 @@ concerns are outside its scope.
   incarnations, and fence ownership deletion.
 - Every guest receives a private CoW rootfs overlay. Guest read-only mount
   semantics are independent from host-side base-image immutability.
+- Every orchestrated jailed VMM can run as PID 1 in a dedicated PID namespace
+  and in an empty process network namespace. taritd retains the host TAP
+  topology and passes a validated TAP queue descriptor into the isolated VMM.
+- Restored guests receive typed, validated address, route, gateway, and DNS
+  repair instead of interpolated shell input. Restore readiness verifies the
+  resulting guest address and default route.
+- Per-VM cgroup I/O limits and TAP ingress/egress limits are applied on boot,
+  restore, and recovery. Reconciliation removes obsolete limits instead of
+  leaving stale throttles in place.
 - Peer RPC uses short-lived HMACs bound to method, canonical path, payload hash,
   nonce, source host, and target host. The shared key is never sent. Replay
   caches are bounded per source and globally, and legacy bearer-secret headers
@@ -61,27 +70,18 @@ not executed on the persistent privileged runner.
 
 ## Stop-ship items
 
-1. Route every orchestrated VMM through a unique per-VM uid/gid jail with
-   private staged assets, mount and PID namespaces, mandatory cgroup placement,
-   cleanup, and coordinator-thread seccomp. The optional jailer is not yet the
-   standard `taritd` launch path.
-2. Move peer routes to a separate listener with mandatory mTLS, certificate
+1. Move peer routes to a separate listener with mandatory mTLS, certificate
    rotation, and host-session fencing. Heartbeat rows currently identify a host
    by a reusable string rather than an authenticated boot/session lease.
-3. Replace public snapshot paths and host ids with opaque artifact handles backed
+2. Replace public snapshot paths and host ids with opaque artifact handles backed
    by durable, authenticated storage and a fleet-wide artifact index. Add
    cryptographic measurements or fs-verity/Merkle metadata so lazy restore can
    avoid a full memory scan without weakening integrity.
-4. Replace shell-based resumed-guest network repair with a typed guest-agent
-   operation covering address, route, gateway, and DNS state. Gate it with a
-   real KVM restore test that proves DNS and outbound connectivity.
-5. Replicate kernels, rootfs images, snapshots, and required guest-agent
+3. Replicate kernels, rootfs images, snapshots, and required guest-agent
    artifacts across failure domains; node-local paths are not an HA substrate.
-6. Resolve images to immutable digests and enforce signature/provenance policy
+4. Resolve images to immutable digests and enforce signature/provenance policy
    before admission. Mutable OCI tags are insufficient for production rollout
    or rollback guarantees.
-7. Enforce per-tenant and per-VM I/O and network bandwidth quotas in addition to
-   CPU, memory, process, and VM-count limits.
 
 These are security or correctness boundaries, not optional roadmap features.
 

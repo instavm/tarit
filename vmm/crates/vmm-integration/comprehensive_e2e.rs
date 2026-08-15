@@ -269,6 +269,7 @@ fn comprehensive_all_features_and_edge_cases() {
         rlimit_nofile: 1024,
         rlimit_as: 1 << 30,
         netns: "".into(),
+        isolate_network: false,
         cgroup_limits: None,
     };
     check!(

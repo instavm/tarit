@@ -12,6 +12,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -52,6 +54,64 @@ const EXEC_OP_MARGIN: Duration = Duration::from_secs(10);
 const STATUS_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const RESTORE_NETWORK_EXEC_TIMEOUT: Duration = Duration::from_secs(5);
 const NORMAL_CGROUP_CPU_WEIGHT: u64 = 100;
+#[cfg(target_os = "linux")]
+const TUNSETIFF: libc::c_ulong = 0x400454ca;
+#[cfg(target_os = "linux")]
+const IFF_TAP: u16 = 0x0002;
+#[cfg(target_os = "linux")]
+const IFF_NO_PI: u16 = 0x1000;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct TapIfreq {
+    name: [u8; 16],
+    flags: u16,
+    _pad: [u8; 22],
+}
+
+#[cfg(target_os = "linux")]
+fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
+    if tap_name.is_empty() || tap_name.len() > 15 || tap_name.as_bytes().contains(&0) {
+        return Err(OrchError::Internal(format!(
+            "invalid TAP name for inherited descriptor: {tap_name:?}"
+        )));
+    }
+    let path = std::ffi::CString::new("/dev/net/tun").expect("static TUN path");
+    let raw_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if raw_fd < 0 {
+        return Err(OrchError::Internal(format!(
+            "open /dev/net/tun for {tap_name}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: ownership of the successfully opened descriptor is transferred
+    // exactly once to OwnedFd.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut ifreq = TapIfreq {
+        name: [0; 16],
+        flags: IFF_TAP | IFF_NO_PI,
+        _pad: [0; 22],
+    };
+    ifreq.name[..tap_name.len()].copy_from_slice(tap_name.as_bytes());
+    if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &mut ifreq) } < 0 {
+        return Err(OrchError::Internal(format!(
+            "attach inherited TAP queue for {tap_name}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_cloexec_for_child(fd: libc::c_int) -> std::io::Result<()> {
+    let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if descriptor_flags < 0
+        || unsafe { libc::fcntl(fd, libc::F_SETFD, descriptor_flags & !libc::FD_CLOEXEC) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 fn graceful_stop_vmm(socket_path: &Path) {
     if socket_path.as_os_str().is_empty() || !socket_path.exists() {
@@ -141,6 +201,33 @@ fn parse_cgroup_processes(contents: &str, source: &Path) -> std::io::Result<Hash
             })
         })
         .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_process_parent(contents: &str, source: &Path) -> std::io::Result<u32> {
+    let raw = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .map(str::trim)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("missing PPid in {}", source.display()),
+            )
+        })?;
+    raw.parse::<u32>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid PPid {raw:?} in {}", source.display()),
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pid(pid: u32) -> std::io::Result<u32> {
+    let path = PathBuf::from(format!("/proc/{pid}/status"));
+    let contents = std::fs::read_to_string(&path)?;
+    parse_process_parent(&contents, &path)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -3765,6 +3852,44 @@ impl VmmSupervisor {
         }
     }
 
+    fn cleanup_boot_failure_without_process(
+        &self,
+        id: Uuid,
+        control: &Arc<BootControl>,
+        cause: OrchError,
+    ) -> OrchError {
+        let mut cleanup_failures = Vec::new();
+        if let Some(net) = &self.net {
+            if let Err(error) = net.teardown_vm_id(id) {
+                cleanup_failures.push(format!("teardown network allocation: {error}"));
+            }
+        }
+        if let Err(error) = self.release_jail(id) {
+            cleanup_failures.push(format!("release staged jail: {error}"));
+        }
+        if cleanup_failures.is_empty() {
+            self.complete_booting(id, control, Ok(()));
+            let _ = self.release_artifact_owner(id);
+            if control.purpose == SpawnPurpose::Refill {
+                self.release_reservation_after_cleanup(id);
+            }
+            cause
+        } else {
+            let cleanup = cleanup_failures.join("; ");
+            let error = OrchError::Internal(format!(
+                "{cause}; cleanup retained booting VM {id} for retry: {cleanup}"
+            ));
+            self.complete_booting(
+                id,
+                control,
+                Err(OrchError::Internal(format!(
+                    "boot cleanup retained resources for retry: {cleanup}"
+                ))),
+            );
+            error
+        }
+    }
+
     pub(crate) fn cleanup_boot_join_failure(
         &self,
         id: Uuid,
@@ -4087,6 +4212,7 @@ impl VmmSupervisor {
         &self,
         ticket: &BootTicket,
         runtime: &PreparedRuntime,
+        net_alloc: Option<NetAlloc>,
     ) -> Result<RunningVm, OrchError> {
         let id = ticket.id;
         let socket_path = runtime.host_socket.clone();
@@ -4103,22 +4229,11 @@ impl VmmSupervisor {
                 .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control));
         if !can_start {
             drop(boot_gate);
-            match self.release_jail(id) {
-                Ok(()) => {
-                    self.complete_booting(id, &ticket.control, Ok(()));
-                    let _ = self.release_artifact_owner(id);
-                }
-                Err(error) => {
-                    self.complete_booting(
-                        id,
-                        &ticket.control,
-                        Err(OrchError::Internal(format!(
-                            "cancelled boot retained staged jail: {error}"
-                        ))),
-                    );
-                }
-            }
-            return Err(self.shutdown_error());
+            return Err(self.cleanup_boot_failure_without_process(
+                id,
+                &ticket.control,
+                self.shutdown_error(),
+            ));
         }
         let mut command = Command::new(&self.config.vmm_bin);
         command
@@ -4135,6 +4250,36 @@ impl VmmSupervisor {
                 .arg("--gid")
                 .arg(jail.gid.to_string())
                 .arg("--seccomp");
+            if let Some(jail_config) = &self.config.vm_jail {
+                if jail_config.pid_namespace {
+                    command.arg("--pid-namespace");
+                }
+                if jail_config.network_namespace {
+                    command.arg("--isolate-network");
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let inherited_tap = match net_alloc
+            .as_ref()
+            .map(|allocation| open_inherited_tap(&allocation.tap))
+            .transpose()
+        {
+            Ok(fd) => fd,
+            Err(error) => {
+                drop(boot_gate);
+                return Err(self.cleanup_boot_failure_without_process(id, &ticket.control, error));
+            }
+        };
+        #[cfg(target_os = "linux")]
+        if let (Some(allocation), Some(fd)) = (&net_alloc, &inherited_tap) {
+            let raw_fd = fd.as_raw_fd();
+            command.env("VMM_TAP_FDS", format!("{}={raw_fd}", allocation.tap));
+            // SAFETY: this runs after fork in the VMM child. It changes only
+            // the explicitly inherited TAP descriptor before exec.
+            unsafe {
+                command.pre_exec(move || clear_cloexec_for_child(raw_fd));
+            }
         }
         let child = match command
             .stdin(Stdio::null())
@@ -4148,28 +4293,11 @@ impl VmmSupervisor {
             Ok(child) => child,
             Err(error) => {
                 drop(boot_gate);
-                let jail_cleanup = self.release_jail(id).err();
-                if jail_cleanup.is_none() {
-                    self.complete_booting(id, &ticket.control, Ok(()));
-                    let _ = self.release_artifact_owner(id);
-                    if ticket.control.purpose == SpawnPurpose::Refill {
-                        self.release_reservation_after_cleanup(id);
-                    }
-                } else {
-                    self.complete_booting(
-                        id,
-                        &ticket.control,
-                        Err(OrchError::Internal(
-                            "spawn failure retained staged jail for retry".into(),
-                        )),
-                    );
-                }
-                return Err(OrchError::Internal(match jail_cleanup {
-                    Some(cleanup) => {
-                        format!("spawn vmm: {error}; remove staged jail: {cleanup}")
-                    }
-                    None => format!("spawn vmm: {error}"),
-                }));
+                return Err(self.cleanup_boot_failure_without_process(
+                    id,
+                    &ticket.control,
+                    OrchError::Internal(format!("spawn vmm: {error}")),
+                ));
             }
         };
 
@@ -4201,7 +4329,7 @@ impl VmmSupervisor {
                 }
             });
         drop(boot_gate);
-        let vm = RunningVm::new(pid, socket_path, process, None);
+        let vm = RunningVm::new(pid, socket_path, process, net_alloc);
         if let Err(error) = attached {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, error));
         }
@@ -4227,7 +4355,26 @@ impl VmmSupervisor {
                 return Err(error);
             }
         };
-        let base_vm = self.spawn_server_for_boot(&ticket, &runtime)?;
+        let net_alloc = match &self.net {
+            Some(provisioner) => {
+                match provisioner.provision_with_owner(id, self.jail_identity(id)?) {
+                    Ok(allocation) => Some(allocation),
+                    Err(error) => {
+                        let cause = match error {
+                            error @ OrchError::Overloaded { .. } => error,
+                            error => OrchError::Internal(format!("net provision: {error}")),
+                        };
+                        return Err(self.cleanup_boot_failure_without_process(
+                            id,
+                            &ticket.control,
+                            cause,
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -4250,25 +4397,7 @@ impl VmmSupervisor {
             ));
         }
 
-        // Provision per-VM host networking (tap + /30 + NAT) if enabled. The
-        // guest auto-configures eth0 from the kernel `ip=` cmdline we append.
-        let net_alloc = match &self.net {
-            Some(p) => match p.provision_with_owner(id, self.jail_identity(id)?) {
-                Ok(a) => Some(a),
-                Err(error) => {
-                    let cause = match error {
-                        error @ OrchError::Overloaded { .. } => error,
-                        error => OrchError::Internal(format!("net provision: {error}")),
-                    };
-                    return Err(self.cleanup_boot_failure(id, &ticket.control, &base_vm, cause));
-                }
-            },
-            None => None,
-        };
-        let vm = RunningVm {
-            net: net_alloc,
-            ..base_vm
-        };
+        let vm = base_vm;
         if !boot_can_publish(&ticket.control, self.is_shutting_down()) {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, self.shutdown_error()));
         }
@@ -4387,7 +4516,22 @@ impl VmmSupervisor {
                 return Err(error);
             }
         };
-        let base_vm = self.spawn_server_for_boot(&ticket, &runtime)?;
+        let net_alloc = match &self.net {
+            Some(provisioner) => {
+                match provisioner.provision_with_owner(id, self.jail_identity(id)?) {
+                    Ok(allocation) => Some(allocation),
+                    Err(error) => {
+                        return Err(self.cleanup_boot_failure_without_process(
+                            id,
+                            &ticket.control,
+                            error,
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -4446,26 +4590,7 @@ impl VmmSupervisor {
             }
         };
 
-        let net_alloc = match &self.net {
-            Some(provisioner) => {
-                match provisioner.provision_with_owner(id, self.jail_identity(id)?) {
-                    Ok(allocation) => Some(allocation),
-                    Err(error) => {
-                        return Err(self.cleanup_boot_failure(
-                            id,
-                            &ticket.control,
-                            &base_vm,
-                            error,
-                        ));
-                    }
-                }
-            }
-            None => None,
-        };
-        let vm = RunningVm {
-            net: net_alloc,
-            ..base_vm
-        };
+        let vm = base_vm;
         let net_override = vm
             .net
             .as_ref()
@@ -5270,6 +5395,27 @@ impl VmmSupervisor {
             if keep_pid == Some(process.pid) {
                 continue;
             }
+            #[cfg(target_os = "linux")]
+            if self
+                .config
+                .vm_jail
+                .as_ref()
+                .is_some_and(|jail| jail.pid_namespace)
+            {
+                if let Some(launcher_pid) = keep_pid {
+                    match process_parent_pid(process.pid) {
+                        Ok(parent_pid) if parent_pid == launcher_pid => continue,
+                        Ok(_) => {}
+                        Err(error) if is_process_gone(&error) => continue,
+                        Err(error) => {
+                            return Err(OrchError::Internal(format!(
+                                "inspect owned VMM {} parent process: {error}",
+                                process.pid
+                            )));
+                        }
+                    }
+                }
+            }
             process.kill_wait()?;
             terminated += 1;
         }
@@ -5313,7 +5459,7 @@ impl VmmSupervisor {
             }
         }
         if let Some(path) = self.exact_vm_cgroup_path(id) {
-            if let Err(error) = remove_dir_if_present(&path) {
+            if let Err(error) = remove_cgroup_dir_after_exit(&path) {
                 failures.push(format!(
                     "remove exact VM cgroup {} after confirmed death: {error}",
                     path.display()
@@ -6428,7 +6574,7 @@ impl VmmSupervisor {
         // operator-owned parent cgroup.
         if process_exited {
             if let Some(path) = self.exact_vm_cgroup_path(id) {
-                if let Err(error) = remove_dir_if_present(&path) {
+                if let Err(error) = remove_cgroup_dir_after_exit(&path) {
                     failures.push(format!(
                         "remove exact VM cgroup {}: {error}",
                         path.display()
@@ -6890,6 +7036,21 @@ fn remove_dir_if_present(path: &Path) -> Result<(), std::io::Error> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+fn remove_cgroup_dir_after_exit(path: &Path) -> Result<(), std::io::Error> {
+    let deadline = Instant::now() + TEARDOWN_STOP_TIMEOUT;
+    loop {
+        match remove_dir_if_present(path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.raw_os_error() == Some(libc::EBUSY) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -7713,6 +7874,37 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn tap_descriptor_becomes_inheritable_only_in_the_vmm_child() {
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 returned two new owned descriptors.
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        let raw_fd = read_fd.as_raw_fd();
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("test -e /proc/self/fd/{raw_fd}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the closure changes only the test descriptor after fork.
+        unsafe {
+            command.pre_exec(move || clear_cloexec_for_child(raw_fd));
+        }
+        assert!(command.status().unwrap().success());
+
+        let parent_flags = unsafe { libc::fcntl(read_fd.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(parent_flags & libc::FD_CLOEXEC, 0);
+        drop(write_fd);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn verify_live_vmm_accepts_process_owning_the_socket() {
         let socket = std::env::temp_dir().join(format!("tarit-adopt-{}.sock", Uuid::new_v4()));
         let allowed_uids = HashSet::from([unsafe { libc::geteuid() }]);
@@ -7894,6 +8086,17 @@ mod tests {
         assert!(parse_cgroup_processes(&format!("{}\n", u32::MAX), source).is_err());
     }
 
+    #[test]
+    fn process_parent_parsing_reads_proc_status_ppid() {
+        let source = Path::new("/proc/42/status");
+        assert_eq!(
+            parse_process_parent("Name:\tvmm\nPPid:\t17\nUid:\t1000\n", source).unwrap(),
+            17
+        );
+        assert!(parse_process_parent("Name:\tvmm\n", source).is_err());
+        assert!(parse_process_parent("PPid:\tnot-a-pid\n", source).is_err());
+    }
+
     fn supervisor_config(root: &Path) -> Config {
         Config {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -7974,6 +8177,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: false,
+            network_namespace: false,
         };
         let first_id = Uuid::new_v4();
         let second_id = Uuid::new_v4();
@@ -8010,6 +8215,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: false,
+            network_namespace: false,
         };
         JailManager::new(config.clone()).unwrap();
         let staging = root.join(format!(".tarit-stage-{}", Uuid::new_v4()));
@@ -8151,6 +8358,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: false,
+            network_namespace: false,
         });
         let supervisor = Arc::new(VmmSupervisor::new(config));
         let id = Uuid::new_v4();
@@ -8182,6 +8391,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: false,
+            network_namespace: false,
         });
         let supervisor = Arc::new(VmmSupervisor::new(config));
         let id = Uuid::new_v4();
@@ -8233,6 +8444,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: false,
+            network_namespace: false,
         });
         let supervisor = Arc::new(VmmSupervisor::new(config));
         let socket = old_jail.join(JAIL_SOCKET_PATH.trim_start_matches('/'));
@@ -8291,6 +8504,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: false,
+            network_namespace: false,
         });
         let supervisor = VmmSupervisor::new(config);
         let id = Uuid::new_v4();
@@ -8888,6 +9103,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: true,
+            network_namespace: true,
         });
         let supervisor = VmmSupervisor::new(config);
         let id = Uuid::new_v4();
@@ -9315,7 +9532,7 @@ mod tests {
                 .prepare_runtime(id, &worker_cfg, None)
                 .unwrap();
             done_tx
-                .send(worker_supervisor.spawn_server_for_boot(&ticket, &runtime))
+                .send(worker_supervisor.spawn_server_for_boot(&ticket, &runtime, None))
                 .unwrap();
         });
 
@@ -9790,6 +10007,8 @@ mod tests {
             id_count: 4,
             profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
             seccomp: true,
+            pid_namespace: false,
+            network_namespace: false,
         });
         let supervisor = Arc::new(VmmSupervisor::new(config));
         let id = Uuid::new_v4();

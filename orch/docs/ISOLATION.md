@@ -31,11 +31,13 @@ and restored again without aliasing the source disk.
 
 ## Production confinement gate
 
-`TARIT_PRODUCTION=1` currently fails closed because the supported development
-jail retains the host network namespace. Non-production mode may use that jail
-for trusted local development, but it is not a hostile multi-tenant boundary.
-Production mode remains unavailable until dedicated netns/veth/TAP wiring is
-implemented, together with the following complete launch boundary:
+`TARIT_PRODUCTION=1` fails closed unless the per-VM jail, cgroup, PID namespace,
+and process network namespace are enabled together. taritd keeps each TAP,
+routing policy, nftables state, and traffic control in the host namespace. It
+opens the TAP queue before launch and passes the validated descriptor to the
+VMM child after that child enters an otherwise empty network namespace.
+
+The launch boundary:
 
 - allocate a unique nonzero UID/GID and a private PID, mount and network
   namespace for every VM;
@@ -47,14 +49,14 @@ implemented, together with the following complete launch boundary:
   host-relative path;
 - apply mandatory cgroup v2 CPU, memory, swap, PIDs and I/O limits before guest
   code runs, then verify the child is in the intended cgroup and namespaces;
-- install coordinator/API-thread seccomp before accepting guest-controlled work,
-  in addition to the vCPU and device-thread profiles; and
 - retain mount, namespace, pidfd and artifact ownership in the supervisor until
   confirmed process exit, then unmount and remove them in a retryable cleanup
   path.
 
 Partial staging must fail the VM spawn. Falling back to an unjailed process is
-never a production recovery path.
+never a production recovery path. The privilege-dropped launcher remains in the
+host PID and network namespaces only to supervise the namespace child; it holds
+no Linux capabilities and does not process guest requests.
 
 ## Verified (bare metal, c8i.metal-48xl)
 

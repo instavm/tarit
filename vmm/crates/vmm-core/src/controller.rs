@@ -4030,7 +4030,9 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         let irq = 5 + slot as u32;
         let mmio_base = MMIO_START + (slot as u64) * 0x1000;
         let mac = parse_guest_mac(net.guest_mac.as_deref(), j);
-        let tap = vmm_net::tap::Tap::create(&net.tap)
+        let tap = inherited_tap_fd(&net.tap)?
+            .map(|fd| vmm_net::tap::Tap::from_inherited_fd(fd, &net.tap))
+            .unwrap_or_else(|| vmm_net::tap::Tap::create(&net.tap))
             .map_err(|e| VmmError::Device(format!("tap {}: {e}", net.tap)))?;
         let dev = Arc::new(VirtioNetMmio::new(irq, mac));
         dev.set_guest_memory(gm.clone());
@@ -4140,6 +4142,31 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
 
 /// Parse a `xx:xx:xx:xx:xx:xx` MAC, falling back to a deterministic locally
 /// administered address (02:00:00:00:00:NN) if absent or malformed.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn inherited_tap_fd(tap_name: &str) -> Result<Option<i32>> {
+    let Some(spec) = std::env::var_os("VMM_TAP_FDS") else {
+        return Ok(None);
+    };
+    let spec = spec
+        .into_string()
+        .map_err(|_| VmmError::Device("VMM_TAP_FDS is not valid UTF-8".into()))?;
+    let mut matched = None;
+    for entry in spec.split(',').filter(|entry| !entry.is_empty()) {
+        let (name, raw_fd) = entry
+            .split_once('=')
+            .ok_or_else(|| VmmError::Device(format!("invalid VMM_TAP_FDS entry {entry:?}")))?;
+        let fd = raw_fd
+            .parse::<i32>()
+            .map_err(|_| VmmError::Device(format!("invalid inherited TAP fd in {entry:?}")))?;
+        if name == tap_name && matched.replace(fd).is_some() {
+            return Err(VmmError::Device(format!(
+                "duplicate inherited TAP mapping for {tap_name}"
+            )));
+        }
+    }
+    Ok(matched)
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn parse_guest_mac(spec: Option<&str>, index: usize) -> [u8; 6] {
     let default = [0x02, 0x00, 0x00, 0x00, 0x00, (index as u8).wrapping_add(1)];

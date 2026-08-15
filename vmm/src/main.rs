@@ -422,6 +422,14 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         netns: Option<String>,
 
+        /// Create an empty network namespace while retaining inherited TAP fds.
+        #[arg(long, requires = "jail", conflicts_with = "netns")]
+        isolate_network: bool,
+
+        /// Run the VMM child as PID 1 in a new PID namespace.
+        #[arg(long, requires = "jail")]
+        pid_namespace: bool,
+
         /// Select the mandatory built-in seccomp profile for a jailed VMM.
         ///
         /// This compatibility flag is optional: --jail enables the profile
@@ -608,9 +616,23 @@ fn main() -> Result<()> {
             uid,
             gid,
             netns,
+            isolate_network,
+            pid_namespace,
             seccomp,
             cgroup,
-        } => serve(&cli.socket, jail, uid, gid, netns, seccomp, cgroup),
+        } => serve(
+            &cli.socket,
+            ServeJailOptions {
+                jail_dir: jail,
+                uid,
+                gid,
+                netns,
+                isolate_network,
+                pid_namespace,
+                seccomp,
+            },
+            cgroup,
+        ),
         Cmd::Snapshot { diff, live } => api_snapshot(&cli.socket, diff, live),
         Cmd::Create {
             kernel,
@@ -710,6 +732,7 @@ fn run(
             rlimit_nofile: 4096,
             rlimit_as,
             netns: String::new(),
+            isolate_network: false,
         };
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
@@ -1099,6 +1122,7 @@ fn restore(
             rlimit_nofile: 4096,
             rlimit_as: 0,
             netns: String::new(),
+            isolate_network: false,
         };
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
@@ -1117,15 +1141,26 @@ fn restore(
     Ok(())
 }
 
-fn serve(
-    socket: &str,
+struct ServeJailOptions {
     jail_dir: Option<String>,
     uid: u32,
     gid: u32,
     netns: Option<String>,
+    isolate_network: bool,
+    pid_namespace: bool,
     seccomp: bool,
-    cgroup: ServeCgroupArgs,
-) -> Result<()> {
+}
+
+fn serve(socket: &str, jail: ServeJailOptions, cgroup: ServeCgroupArgs) -> Result<()> {
+    let ServeJailOptions {
+        jail_dir,
+        uid,
+        gid,
+        netns,
+        isolate_network,
+        pid_namespace,
+        seccomp,
+    } = jail;
     // Apply jailer confinement before serving, if requested. The RPC server
     // binds the Unix socket after chroot, so `socket` is interpreted inside the
     // jail; the orchestrator must make <chroot>/<socket> reachable externally.
@@ -1149,7 +1184,22 @@ fn serve(
             rlimit_nofile: 4096,
             rlimit_as: 0,
             netns: netns.clone().unwrap_or_default(),
+            isolate_network,
         };
+        if pid_namespace {
+            if !cfg.cgroup.is_empty() {
+                vmm_jailer::cgroups::apply_current_process(&cfg.cgroup, cfg.cgroup_limits.as_ref())
+                    .map_err(|e| anyhow::anyhow!("PID namespace launcher cgroup: {e}"))?;
+            }
+            match vmm_jailer::launch_pid_namespace(uid, gid)
+                .map_err(|e| anyhow::anyhow!("PID namespace launcher: {e}"))?
+            {
+                vmm_jailer::PidNamespaceRole::Child => {}
+                vmm_jailer::PidNamespaceRole::ParentExit(code) => {
+                    std::process::exit(code);
+                }
+            }
+        }
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
         netns_entered = netns.is_some();
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
@@ -1172,7 +1222,17 @@ fn serve(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (jail_dir, uid, gid, netns, seccomp, cgroup, cgroup_limits);
+        let _ = (
+            jail_dir,
+            uid,
+            gid,
+            netns,
+            isolate_network,
+            pid_namespace,
+            seccomp,
+            cgroup,
+            cgroup_limits,
+        );
     }
 
     log::info!("serve: API on {socket}");
