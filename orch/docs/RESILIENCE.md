@@ -145,6 +145,7 @@ sshd or network service.
 | --- | --- | --- |
 | `ssh <vm_id>@gateway` | The embedded SSH gateway authenticates by registered key and bridges to the guest PTY over vsock | e2e: `e2e_ssh_pty.sh` |
 | WebSocket PTY | `WS /v1/vms/{id}/pty/{pty_id}/connect` relays raw bytes and JSON resize/exit frames to the same guest PTY | e2e: `e2e_ssh_pty.sh` |
+| PTY reconnect and VM cleanup | A session rejects concurrent attaches, remains reconnectable for five minutes after disconnect, and is removed when its VM stops or exits | unit + c8i KVM e2e |
 | Terminal resize and clean exit | Window-change maps to `TIOCSWINSZ`; child exit propagates an exit code | e2e: VMM `pty-validate.sh` (`stty size` reflects resize, exit 0) |
 
 ## 9. Port-share gateway

@@ -102,9 +102,10 @@ ssh -p 2222 "$vm"@<taritd-host>
 
 The same PTY stream is available over WebSocket at
 `WS /v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` (binary frames are
-raw bytes, text frames are JSON `resize`/`exit`). The one-time `connect_token`
-comes from the `POST /v1/vms/{id}/pty/sessions` response and expires after 5
-minutes.
+raw bytes, text frames are JSON `resize`/`exit`). The session `connect_token`
+comes from the `POST /v1/vms/{id}/pty/sessions` response. One connection may be
+active at a time, and the session remains reconnectable for five minutes after
+disconnect.
 
 ## 5. Cluster mode (optional)
 

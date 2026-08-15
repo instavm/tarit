@@ -1502,6 +1502,7 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     tokio::task::spawn_blocking(move || sup.stop_vm(id))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+    state.pty_registry.close_vm_sessions(id);
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await
 }
@@ -1530,6 +1531,7 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
             tracing::error!(vm = %exit.id, pid = exit.pid, %cleanup_error, "dead VMM left resources requiring operator reconciliation");
         }
         let result = async {
+            state.pty_registry.close_vm_sessions(exit.id);
             if matches!(
                 lifecycle_state(state, exit.id)?,
                 Some(LifecycleState::Publishing { .. })

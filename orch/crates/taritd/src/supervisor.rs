@@ -7549,15 +7549,14 @@ fn rebind_restored_guest_network(
     let client = VmmClient::new(socket_path)
         .with_connect_timeout(RESTORE_NETWORK_EXEC_TIMEOUT)
         .with_request_timeout(RESTORE_NETWORK_EXEC_TIMEOUT + EXEC_OP_MARGIN);
-
-    // Exec is shell-based on this branch, so only canonical values parsed as
-    // IPv4 addresses and an integer prefix are interpolated. Every command,
-    // interface name, operator, and argument position remains fixed.
-    let configure = format!(
-        "ip -4 address flush dev eth0 && ip link set dev eth0 up && ip -4 address add {}/{} dev eth0 && ip -4 route flush default && ip -4 route add default via {} dev eth0",
-        network.guest_ip, network.prefix, network.gateway
-    );
-    restored_guest_exec(&client, &configure, "rebind")?;
+    client
+        .repair_guest_network(tarit_vmm_client::GuestNetworkRepair {
+            addr: network.guest_ip.to_string(),
+            prefix: network.prefix,
+            gateway: network.gateway.to_string(),
+            dns_servers: Vec::new(),
+        })
+        .map_err(|error| OrchError::Vmm(format!("restore guest network rebind: {error}")))?;
 
     let addresses =
         restored_guest_exec(&client, "ip -4 -o address show dev eth0", "verify address")?;
@@ -10100,18 +10099,15 @@ mod tests {
     }
 
     #[test]
-    fn restored_network_rebind_uses_only_canonical_fixed_commands() {
+    fn restored_network_rebind_uses_typed_repair_and_fixed_verification() {
         let socket_path = PathBuf::from(format!(
             "target/taritd-restore-network-{}-{}.sock",
             std::process::id(),
             Uuid::new_v4()
         ));
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let expected = [
-            (
-                "ip -4 address flush dev eth0 && ip link set dev eth0 up && ip -4 address add 172.16.0.30/30 dev eth0 && ip -4 route flush default && ip -4 route add default via 172.16.0.29 dev eth0",
-                "",
-            ),
             (
                 "ip -4 -o address show dev eth0",
                 "2: eth0 inet 172.16.0.30/30 scope global eth0\n",
@@ -10122,6 +10118,33 @@ mod tests {
             ),
         ];
         let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(
+                request,
+                tarit_vmm_client::ApiRequest::RepairGuestNetwork {
+                    network: tarit_vmm_client::GuestNetworkRepair {
+                        ref addr,
+                        prefix: 30,
+                        ref gateway,
+                        ref dns_servers,
+                    }
+                } if addr == "172.16.0.30"
+                    && gateway == "172.16.0.29"
+                    && dns_servers.is_empty()
+            ));
+            let response = tarit_vmm_client::ApiResponse::GuestNetworkRepaired;
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+
             for (expected_command, stdout) in expected {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut length = [0_u8; 4];
