@@ -138,6 +138,7 @@ pub(crate) struct PtySession {
     /// access when the WebSocket connects.
     owner: ApiIdentity,
     connect_token_expires_at: DateTime<Utc>,
+    active_connection: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +275,7 @@ impl PtyRegistry {
             connect_token: generate_connect_token(),
             owner,
             connect_token_expires_at: Utc::now() + ChronoDuration::seconds(CONNECT_TOKEN_TTL_SECS),
+            active_connection: false,
         };
         sessions.insert(session.pty_id, session.clone());
         Ok(session)
@@ -306,36 +308,6 @@ impl PtyRegistry {
             .ok_or_else(|| OrchError::NotFound(format!("pty session {pty_id} not found")))
     }
 
-    #[cfg(test)]
-    pub(crate) fn consume_connect_token(
-        &self,
-        vm_id: Uuid,
-        pty_id: Uuid,
-        provided: &str,
-    ) -> Result<PtySession, OrchError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| OrchError::Internal("pty registry lock".into()))?;
-        purge_expired_sessions(&mut sessions);
-        let Some(session) = sessions
-            .get(&pty_id)
-            .filter(|session| session.vm_id == vm_id)
-        else {
-            return Err(OrchError::Unauthorized);
-        };
-        if Utc::now() > session.connect_token_expires_at {
-            sessions.remove(&pty_id);
-            return Err(OrchError::Unauthorized);
-        }
-        if provided.is_empty() || !connect_token_matches(provided, &session.connect_token) {
-            return Err(OrchError::Unauthorized);
-        }
-        Ok(sessions
-            .remove(&pty_id)
-            .expect("session exists after token validation"))
-    }
-
     pub(crate) fn delete(&self, vm_id: Uuid, pty_id: Uuid) -> Result<(), OrchError> {
         let mut sessions = self
             .sessions
@@ -343,6 +315,9 @@ impl PtyRegistry {
             .map_err(|_| OrchError::Internal("pty registry lock".into()))?;
         match sessions.get(&pty_id) {
             Some(session) if session.vm_id == vm_id => {
+                if session.active_connection {
+                    return Err(OrchError::Conflict("PTY session is connected".into()));
+                }
                 sessions.remove(&pty_id);
                 Ok(())
             }
@@ -371,6 +346,30 @@ impl PtyRegistry {
         session.cols = cols;
         session.rows = rows;
         Ok(session.clone())
+    }
+
+    pub(crate) fn finish_connection(&self, vm_id: Uuid, pty_id: Uuid) {
+        let mut sessions = match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(session) = sessions
+            .get_mut(&pty_id)
+            .filter(|session| session.vm_id == vm_id)
+        {
+            session.active_connection = false;
+            session.connect_token_expires_at =
+                Utc::now() + ChronoDuration::seconds(CONNECT_TOKEN_TTL_SECS);
+        }
+        purge_expired_sessions(&mut sessions);
+    }
+
+    pub(crate) fn close_vm_sessions(&self, vm_id: Uuid) {
+        let mut sessions = match self.sessions.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sessions.retain(|_, session| session.vm_id != vm_id);
     }
 
     fn try_acquire_connection(
@@ -443,21 +442,41 @@ impl PtyRegistry {
         if provided.is_empty() || !connect_token_matches(provided, &session.connect_token) {
             return Err(OrchError::Unauthorized);
         }
+        if session.active_connection {
+            return Err(OrchError::Conflict("PTY session already connected".into()));
+        }
 
-        // Validate the one-time credential first, then atomically reserve every
-        // active-connection scope before removing the session. Capacity
-        // exhaustion therefore cannot burn a valid token.
+        // Validate the reconnect credential first, then atomically reserve every
+        // active-connection scope before marking the session active. Capacity
+        // exhaustion therefore leaves a valid session available for retry.
         let permit = self.try_acquire_connection(&session.owner.tenant, vm_id)?;
         let session = sessions
-            .remove(&pty_id)
+            .get_mut(&pty_id)
             .expect("session exists while its registry lock is held");
+        session.active_connection = true;
+        session.connect_token_expires_at =
+            Utc::now() + ChronoDuration::seconds(CONNECT_TOKEN_TTL_SECS);
+        let session = session.clone();
         Ok((session, permit))
+    }
+}
+
+struct PtyConnectionState {
+    registry: Arc<PtyRegistry>,
+    vm_id: Uuid,
+    pty_id: Uuid,
+}
+
+impl Drop for PtyConnectionState {
+    fn drop(&mut self) {
+        self.registry.finish_connection(self.vm_id, self.pty_id);
     }
 }
 
 fn purge_expired_sessions(sessions: &mut HashMap<Uuid, PtySession>) {
     let now = Utc::now();
-    sessions.retain(|_, session| session.connect_token_expires_at >= now);
+    sessions
+        .retain(|_, session| session.active_connection || session.connect_token_expires_at >= now);
 }
 
 pub(crate) async fn create_session(
@@ -543,11 +562,24 @@ pub(crate) async fn connect_ws(
     let provided = query.token.unwrap_or_default();
     let (session, connection_permit) =
         state.pty_registry.admit_connect(vm_id, pty_id, &provided)?;
+    let connection_state = PtyConnectionState {
+        registry: Arc::clone(&state.pty_registry),
+        vm_id,
+        pty_id,
+    };
     Ok(ws
         .max_frame_size(MAX_FRAME_LEN)
         .max_message_size(MAX_FRAME_LEN)
         .on_upgrade(move |socket| {
-            handle_ws(socket, state, vm_id, pty_id, session, connection_permit)
+            handle_ws(
+                socket,
+                state,
+                vm_id,
+                pty_id,
+                session,
+                connection_permit,
+                connection_state,
+            )
         }))
 }
 
@@ -558,8 +590,9 @@ async fn handle_ws(
     pty_id: Uuid,
     session: PtySession,
     _connection_permit: PtyConnectionPermit,
+    _connection_state: PtyConnectionState,
 ) {
-    // Authenticate the upgrade with a one-time per-session connect token, not the
+    // Authenticate the upgrade with a per-session connect token, not the
     // caller's long-lived API key. The token was handed to the authenticated
     // creator of this session, so we authorize against that recorded identity.
     let identity = session.owner.clone();
@@ -607,6 +640,7 @@ async fn handle_ws(
 
     let (mut vmm_reader, mut vmm_writer) = stream.into_split();
     let (mut ws_sender, mut ws_receiver) = socket.split();
+    let resize_registry = Arc::clone(&state.pty_registry);
     let (activity_tx, mut activity_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let vmm_activity = activity_tx.clone();
     let ws_activity = activity_tx.clone();
@@ -664,6 +698,7 @@ async fn handle_ws(
                     if let Ok(WsControl::Resize { cols, rows }) =
                         serde_json::from_str::<WsControl>(text.as_str())
                     {
+                        let _ = resize_registry.resize(vm_id, pty_id, cols, rows);
                         write_vmm_stream_frame(&mut vmm_writer, &resize_frame(cols, rows)).await?;
                     }
                 }
@@ -1017,20 +1052,25 @@ mod tests {
     }
 
     #[test]
-    fn connect_token_can_only_be_consumed_once() {
+    fn finished_connection_can_reconnect_with_the_same_session() {
         let registry = PtyRegistry::default();
         let vm_id = Uuid::new_v4();
         let session = registry
             .create(vm_id, 80, 24, None, test_identity())
             .unwrap();
 
-        assert!(registry
-            .consume_connect_token(vm_id, session.pty_id, &session.connect_token)
-            .is_ok());
+        let (_connected, permit) = registry
+            .admit_connect(vm_id, session.pty_id, &session.connect_token)
+            .unwrap();
         assert!(matches!(
-            registry.consume_connect_token(vm_id, session.pty_id, &session.connect_token),
-            Err(OrchError::Unauthorized)
+            registry.admit_connect(vm_id, session.pty_id, &session.connect_token),
+            Err(OrchError::Conflict(_))
         ));
+        drop(permit);
+        registry.finish_connection(vm_id, session.pty_id);
+        assert!(registry
+            .admit_connect(vm_id, session.pty_id, &session.connect_token)
+            .is_ok());
     }
 
     #[test]
@@ -1051,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_capacity_is_reserved_before_consuming_the_token() {
+    fn connection_capacity_is_reserved_before_marking_the_session_active() {
         let registry = registry_with_limits(3, 2, 1);
         let first_vm = Uuid::new_v4();
         let first = registry
@@ -1085,11 +1125,14 @@ mod tests {
         ));
         assert_eq!(registry.connection_stats().rejected_global, 1);
         drop(third_permit);
+        registry.finish_connection(third_vm, third.pty_id);
         assert!(registry
             .admit_connect(waiting_vm, waiting.pty_id, &waiting.connect_token)
             .is_ok());
         drop(first_permit);
+        registry.finish_connection(first_vm, first.pty_id);
         drop(second_permit);
+        registry.finish_connection(second_vm, second.pty_id);
     }
 
     #[test]
@@ -1141,17 +1184,22 @@ mod tests {
         assert_eq!(stats.rejected_tenant, 1);
 
         drop(a1_permit);
+        registry.finish_connection(vm_a1, a1.pty_id);
         let (_, same_vm_permit) = registry
             .admit_connect(vm_a1, same_vm.pty_id, &same_vm.connect_token)
             .expect("VM capacity release must preserve the rejected token");
         drop(same_vm_permit);
+        registry.finish_connection(vm_a1, same_vm.pty_id);
         let (_, a3_permit) = registry
             .admit_connect(vm_a3, a3.pty_id, &a3.connect_token)
             .expect("tenant capacity release must preserve the rejected token");
 
         drop(a2_permit);
+        registry.finish_connection(vm_a2, a2.pty_id);
         drop(a3_permit);
+        registry.finish_connection(vm_a3, a3.pty_id);
         drop(b_permit);
+        registry.finish_connection(vm_b, b.pty_id);
         assert_eq!(registry.connection_stats().active, 0);
 
         let fresh = registry
@@ -1161,7 +1209,34 @@ mod tests {
             .admit_connect(vm_a1, fresh.pty_id, &fresh.connect_token)
             .expect("dropping leases must release global, tenant, and VM scopes");
         drop(fresh_permit);
+        registry.finish_connection(vm_a1, fresh.pty_id);
         assert_eq!(registry.connection_stats().active, 0);
+    }
+
+    #[test]
+    fn closing_vm_sessions_reaps_pending_and_connected_sessions() {
+        let registry = PtyRegistry::default();
+        let vm_id = Uuid::new_v4();
+        let other_vm_id = Uuid::new_v4();
+        let connected = registry
+            .create(vm_id, 80, 24, None, test_identity())
+            .unwrap();
+        let pending = registry
+            .create(vm_id, 100, 30, None, test_identity())
+            .unwrap();
+        let other = registry
+            .create(other_vm_id, 80, 24, None, test_identity())
+            .unwrap();
+        let (_session, permit) = registry
+            .admit_connect(vm_id, connected.pty_id, &connected.connect_token)
+            .unwrap();
+
+        registry.close_vm_sessions(vm_id);
+        drop(permit);
+
+        assert!(registry.get(vm_id, connected.pty_id).is_err());
+        assert!(registry.get(vm_id, pending.pty_id).is_err());
+        assert!(registry.get(other_vm_id, other.pty_id).is_ok());
     }
 
     #[test]
@@ -1194,7 +1269,7 @@ mod tests {
             .connect_token_expires_at = Utc::now() - chrono::Duration::seconds(1);
 
         assert!(matches!(
-            registry.consume_connect_token(vm_id, session.pty_id, &session.connect_token),
+            registry.admit_connect(vm_id, session.pty_id, &session.connect_token),
             Err(OrchError::Unauthorized)
         ));
         assert!(matches!(
