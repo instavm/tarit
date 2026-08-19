@@ -214,6 +214,8 @@ sudo target/release/vmm restore --snapshot /path/to/snapshot.snap
 | `--uid <UID>` | `1000` | UID to drop to when jailed. |
 | `--gid <GID>` | `1000` | GID to drop to when jailed. |
 | `--netns <PATH>` | none | Network namespace path to enter when jailed. |
+| `--isolate-network` | off | Create an empty VMM process network namespace. Host networking must be supplied through inherited TAP descriptors. |
+| `--pid-namespace` | off | Fork the VMM child as PID 1 in a new PID namespace while a privilege-dropped launcher remains visible to the host supervisor. |
 | `--seccomp` | automatic with `--jail` | Compatibility flag for the mandatory built-in profile; jail mode cannot disable seccomp. |
 | `--cgroup <PATH>` | none | cgroup v2 path for the served VMM process. |
 | `--cgroup-memory-max <BYTES>` | none | Set `memory.max`. Accepts bytes or K/M/G/T suffixes. Requires `--cgroup`. |

@@ -9,6 +9,9 @@ use crate::jailer::{JailerConfig, JailerError};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+static LAUNCHER_LIVENESS_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// Execute the jailer: set up namespaces, chroot, cgroups, drop privs,
 /// then return (the caller exec's the VMM or runs it in-process).
@@ -53,10 +56,16 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
         apply_cgroup(cfg)?;
     }
 
-    // 2. Enter an explicitly assigned network namespace. An empty path retains
-    // the current namespace so orchestrators using host-owned TAP devices can
-    // jail the process without pretending a veth/routing topology exists.
-    if !cfg.netns.is_empty() {
+    if cfg.isolate_network && !cfg.netns.is_empty() {
+        return Err(JailerError::Namespace(
+            "cannot both create and enter a network namespace".into(),
+        ));
+    }
+    // 2. Enter an assigned namespace or create an empty process namespace.
+    // Host TAP traffic remains available through an inherited queue fd.
+    if cfg.isolate_network {
+        unshare_network_namespace()?;
+    } else if !cfg.netns.is_empty() {
         enter_netns(&cfg.netns)?;
     } else {
         log::info!("jail: network namespace isolation disabled");
@@ -84,6 +93,7 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
     // 7. Clear and verify every remaining capability set after setresuid.
     clear_process_capabilities()?;
     verify_confinement(cfg.uid, cfg.gid, last_capability)?;
+    arm_launcher_parent_death_signal()?;
 
     // Files created after confinement must never be group/world accessible,
     // even if a caller inherited a permissive umask.
@@ -91,6 +101,135 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
     unsafe { libc::umask(0o077) };
 
     log::info!("jail: all confinement applied successfully");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidNamespaceRole {
+    Child,
+    ParentExit(i32),
+}
+
+/// Fork the VMM into a fresh PID namespace. The child becomes namespace PID 1;
+/// the launcher drops privilege and waits so the orchestrator retains a stable
+/// host PID. The child is killed if that launcher disappears.
+pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, JailerError> {
+    if uid == 0 || gid == 0 {
+        return Err(JailerError::PrivDrop(
+            "PID namespace launcher requires non-root uid and gid".into(),
+        ));
+    }
+    let mut launcher_liveness = [-1; 2];
+    // The pipe closes atomically with launcher death and closes on any later
+    // exec, providing a race-free check around PR_SET_PDEATHSIG installation.
+    if unsafe {
+        libc::pipe2(
+            launcher_liveness.as_mut_ptr(),
+            libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(JailerError::Namespace(format!(
+            "create PID namespace launcher liveness pipe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: unshare and fork take no pointer arguments. This runs before any
+    // VMM worker threads are created.
+    if unsafe { libc::unshare(libc::CLONE_NEWPID) } < 0 {
+        unsafe {
+            libc::close(launcher_liveness[0]);
+            libc::close(launcher_liveness[1]);
+        }
+        return Err(JailerError::Namespace(format!(
+            "unshare PID namespace: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        unsafe {
+            libc::close(launcher_liveness[0]);
+            libc::close(launcher_liveness[1]);
+        }
+        return Err(JailerError::Namespace(format!(
+            "fork PID namespace child: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if child == 0 {
+        unsafe { libc::close(launcher_liveness[1]) };
+        LAUNCHER_LIVENESS_FD.store(launcher_liveness[0], Ordering::Release);
+        return Ok(PidNamespaceRole::Child);
+    }
+
+    unsafe { libc::close(launcher_liveness[0]) };
+    let last_capability = read_last_capability()?;
+    set_no_new_privileges()?;
+    drop_capability_bounding_set(last_capability)?;
+    clear_ambient_capabilities()?;
+    drop_privileges(uid, gid)?;
+    // setresuid clears effective and permitted capabilities when keepcaps is
+    // not enabled. Verify the launcher's final state directly; some kernels
+    // reject a redundant capset from the CLONE_NEWPID parent with EINVAL.
+    verify_confinement(uid, gid, last_capability)?;
+
+    let mut status = 0;
+    loop {
+        let waited = unsafe { libc::waitpid(child, &mut status, 0) };
+        if waited == child {
+            break;
+        }
+        if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        if waited < 0 {
+            unsafe { libc::close(launcher_liveness[1]) };
+            return Err(JailerError::Setup(format!(
+                "wait for PID namespace child: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    unsafe { libc::close(launcher_liveness[1]) };
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    };
+    Ok(PidNamespaceRole::ParentExit(code))
+}
+
+fn arm_launcher_parent_death_signal() -> Result<(), JailerError> {
+    let fd = LAUNCHER_LIVENESS_FD.swap(-1, Ordering::AcqRel);
+    if fd < 0 {
+        return Ok(());
+    }
+    // Credential changes clear PDEATHSIG, so arm it only after the final
+    // setresuid/setresgid transition.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
+        unsafe { libc::close(fd) };
+        return Err(JailerError::Namespace(format!(
+            "set PID namespace parent-death signal: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut byte = 0u8;
+    let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), std::mem::size_of::<u8>()) };
+    unsafe { libc::close(fd) };
+    if read == 0 {
+        return Err(JailerError::Namespace(
+            "PID namespace launcher exited before confinement completed".into(),
+        ));
+    }
+    if read < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+        return Err(JailerError::Namespace(format!(
+            "check PID namespace launcher liveness: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     Ok(())
 }
 
@@ -157,6 +296,7 @@ fn enter_netns(path: &str) -> Result<(), JailerError> {
             std::io::Error::last_os_error()
         )));
     }
+
     // SAFETY: `fd` is an open network-namespace file descriptor and no pointer
     // arguments are passed to `setns`.
     let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
@@ -170,6 +310,18 @@ fn enter_netns(path: &str) -> Result<(), JailerError> {
         )));
     }
     log::info!("jail: entered netns {path}");
+    Ok(())
+}
+
+fn unshare_network_namespace() -> Result<(), JailerError> {
+    // SAFETY: unshare is called with a namespace flag and no pointer arguments.
+    if unsafe { libc::unshare(libc::CLONE_NEWNET) } < 0 {
+        return Err(JailerError::Namespace(format!(
+            "unshare network namespace: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    log::info!("jail: created isolated network namespace");
     Ok(())
 }
 
@@ -566,7 +718,7 @@ mod tests {
 
     #[test]
     fn capability_v3_abi_is_supported() {
-        let header = CapUserHeader {
+        let mut header = CapUserHeader {
             version: LINUX_CAPABILITY_VERSION_3,
             pid: 0,
         };
@@ -578,7 +730,7 @@ mod tests {
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_capget,
-                &header as *const CapUserHeader,
+                &mut header as *mut CapUserHeader,
                 data.as_mut_ptr(),
             )
         };
@@ -596,6 +748,7 @@ mod tests {
             rlimit_nofile: 1024,
             rlimit_as: 1 << 30,
             netns: "/var/run/netns/vmm0".into(),
+            isolate_network: false,
         };
         assert_eq!(cfg.uid, 1000);
         assert_eq!(cfg.rlimit_nofile, 1024);
@@ -612,6 +765,7 @@ mod tests {
             rlimit_nofile: 1024,
             rlimit_as: 0,
             netns: "".into(),
+            isolate_network: false,
             cgroup_limits: None,
         };
         let result = jail(&cfg);
@@ -639,6 +793,7 @@ mod tests {
             rlimit_nofile: 1024,
             rlimit_as: 0,
             netns: "".into(),
+            isolate_network: false,
             cgroup_limits: None,
         };
         let result = jail(&cfg);
@@ -656,6 +811,7 @@ mod tests {
             rlimit_nofile: 1024,
             rlimit_as: 0,
             netns: "".into(),
+            isolate_network: false,
             cgroup_limits: None,
         };
         let result = jail(&cfg);

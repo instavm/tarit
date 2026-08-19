@@ -19,7 +19,7 @@ pub mod profile;
 pub mod seccomp;
 
 #[cfg(target_os = "linux")]
-pub use executor::jail;
+pub use executor::{jail, launch_pid_namespace, PidNamespaceRole};
 pub use jailer::Jailer;
 pub use profile::{audit_profile, VmmSeccompProfiles};
 pub use seccomp::{SeccompProfile, ThreadKind};
