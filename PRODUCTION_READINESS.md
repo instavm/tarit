@@ -88,11 +88,14 @@ cross-node replication, and immutable signed-image stop-ships now have focused
 implementation and c8i evidence recorded in the September roadmap. They remain
 regression gates, but the following unresolved items now block release:
 
-1. Extend the implemented clone-generation path into application-specific
-   cached-PRNG, nonce, token, and session repair tests under concurrent ingress.
-   Linux 6.6 VMGenID notification and the mandatory userspace repair barrier,
-   plus the Linux 5.10 barrier-only compatibility path, remain required
-   regression gates before HTTP, PTY, SSH, share, or exec admission.
+1. Extend the passing application-token repair race into concurrent PTY, SSH,
+   HTTP-share, and mixed-ingress tests for application-owned PRNG, nonce, token,
+   and session caches. The current gate holds the child in its repair hook while
+   eight exec requests race the durable `creating` record; every request is
+   rejected or observes only repaired state, and no inherited-token marker is
+   created. Linux 6.6 VMGenID notification and the mandatory userspace repair
+   barrier, plus the Linux 5.10 barrier-only compatibility path, remain required
+   regression gates before any ingress is admitted.
 2. Pass the remaining phase-by-phase kill, cancellation, dirty-rate
    non-convergence, corruption, and near-ENOSPC rollback tests without source
    pause leaks, duplicate writers, terminal-ID resurrection, or staged files.

@@ -281,7 +281,7 @@ PY
     # live fork, private disk CoW, clone identity, and scale-to-zero resume.
     if [ "$name" = ubuntu2404 ] || [ "$name" = alpine320 ]; then
       wait_exec_success "$CURRENT_VM" \
-        "mkdir -p /usr/libexec/tarit /run/tarit; printf '%s\\n' '#!/bin/sh' 'set -eu' 'test \"\$TARIT_POST_FORK\" = 1' 'test \"\${#TARIT_CLONE_ID}\" -eq 32' 'printf \"%s\\n\" \"\$TARIT_CLONE_ID\" > /run/tarit/hook-observed' 'rm -f /run/tarit/cached-token' 'printf \"repaired:%s\\n\" \"\$TARIT_CLONE_ID\" > /run/tarit/userspace-token' > /usr/libexec/tarit/post-fork; chmod 0755 /usr/libexec/tarit/post-fork; printf cloned-token > /run/tarit/cached-token" \
+        "mkdir -p /usr/libexec/tarit /run/tarit; printf '%s\\n' '#!/bin/sh' 'set -eu' 'test \"\$TARIT_POST_FORK\" = 1' 'test \"\${#TARIT_CLONE_ID}\" -eq 32' 'test -f /run/tarit/cached-token' 'printf started > /run/tarit/hook-started' 'sleep 2' 'printf \"%s\\n\" \"\$TARIT_CLONE_ID\" > /run/tarit/hook-observed' 'rm -f /run/tarit/cached-token' 'printf \"repaired:%s\\n\" \"\$TARIT_CLONE_ID\" > /run/tarit/userspace-token' > /usr/libexec/tarit/post-fork; chmod 0755 /usr/libexec/tarit/post-fork; printf cloned-token > /run/tarit/cached-token" \
         "$DIR/hook-setup-$name.json"
       wait_exec_success "$CURRENT_VM" \
         "printf source-before-fork > /root/tarit-oci-fork-state; sync" \
@@ -300,8 +300,75 @@ import uuid
 print(uuid.uuid4())
 PY
 )
-      api POST "$BASE_URL/v1/vms/$CURRENT_VM/fork" \
-        "{\"id\":\"$REQUESTED_CHILD_ID\"}" >"$DIR/fork-$name.json"
+      (
+        curl -sS --max-time 180 -o "$DIR/fork-$name.json" -w '%{http_code}' \
+          -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+          -d "{\"id\":\"$REQUESTED_CHILD_ID\"}" \
+          "$BASE_URL/v1/vms/$CURRENT_VM/fork" >"$DIR/fork-$name.status"
+      ) &
+      FORK_REQUEST_PID=$!
+
+      CREATING_OBSERVED=0
+      for _ in $(seq 1 300); do
+        CHILD_STATUS=$(python3 - "$DIR/fleet.db" "$REQUESTED_CHILD_ID" <<'PY'
+import sqlite3,sys
+with sqlite3.connect(sys.argv[1]) as db:
+    row=db.execute("select status from vms where id=?", (sys.argv[2],)).fetchone()
+print(row[0] if row else "")
+PY
+)
+        if [ "$CHILD_STATUS" = creating ]; then
+          CREATING_OBSERVED=1
+          break
+        fi
+        kill -0 "$FORK_REQUEST_PID" 2>/dev/null || break
+        sleep 0.01
+      done
+      [ "$CREATING_OBSERVED" -eq 1 ] || {
+        echo "FAIL: $name fork did not expose the creating-state repair window" >&2
+        wait "$FORK_REQUEST_PID" || true
+        exit 1
+      }
+
+      INGRESS_PIDS=()
+      for index in $(seq 1 8); do
+        INGRESS_BODY=$(python3 -c \
+          'import json,sys; print(json.dumps({"vm_id":sys.argv[1],"command":sys.argv[2],"timeout_ms":30000}))' \
+          "$REQUESTED_CHILD_ID" \
+          "if [ -e /run/tarit/cached-token ]; then printf unrepaired > /run/tarit/ingress-before-repair; echo UNREPAIRED; exit 97; fi; echo REPAIRED-$index")
+        (
+          curl -sS --max-time 90 -o "$DIR/fork-ingress-$name-$index.json" \
+            -w '%{http_code}' -X POST -H "X-API-Key: $KEY" \
+            -H 'Content-Type: application/json' -d "$INGRESS_BODY" \
+            "$BASE_URL/v1/execute" >"$DIR/fork-ingress-$name-$index.status"
+        ) &
+        INGRESS_PIDS+=("$!")
+      done
+
+      wait "$FORK_REQUEST_PID"
+      for ingress_pid in "${INGRESS_PIDS[@]}"; do
+        wait "$ingress_pid"
+      done
+      [ "$(cat "$DIR/fork-$name.status")" = 201 ] || {
+        echo "FAIL: $name fork returned HTTP $(cat "$DIR/fork-$name.status")" >&2
+        cat "$DIR/fork-$name.json" >&2
+        exit 1
+      }
+      python3 - "$DIR" "$name" <<'PY'
+import json, pathlib, sys
+root=pathlib.Path(sys.argv[1]); name=sys.argv[2]
+for index in range(1, 9):
+    status=(root / f"fork-ingress-{name}-{index}.status").read_text().strip()
+    body=json.loads((root / f"fork-ingress-{name}-{index}.json").read_text())
+    if status == "200":
+        assert body.get("status") in {"completed", "failed"}, body
+        if body["status"] == "completed":
+            assert body.get("exit_code") == 0, body
+            assert "REPAIRED-" in body.get("stdout", ""), body
+            assert "UNREPAIRED" not in body.get("stdout", ""), body
+    else:
+        assert status in {"404", "409", "503"}, (status, body)
+PY
       FORK_END=$(now_ms)
       CURRENT_CHILD=$(python3 - "$DIR/fork-$name.json" <<'PY'
 import json,sys
@@ -343,7 +410,7 @@ PY
         exit 1
       }
       wait_exec_success "$CURRENT_CHILD" \
-        'grep -qx source-before-fork /root/tarit-oci-fork-state && test ! -e /run/tarit/cached-token && cmp -s /run/tarit/hook-observed /run/tarit/clone-id' \
+        'grep -qx source-before-fork /root/tarit-oci-fork-state && test ! -e /run/tarit/cached-token && test ! -e /run/tarit/ingress-before-repair && cmp -s /run/tarit/hook-observed /run/tarit/clone-id' \
         "$DIR/fork-ready-$name.json"
       wait_exec_success "$CURRENT_VM" \
         'grep -qx cloned-token /run/tarit/cached-token' \
