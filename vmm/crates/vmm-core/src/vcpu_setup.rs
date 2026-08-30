@@ -80,6 +80,11 @@ pub fn setup_cpuid(vcpu: &VcpuFd) -> Result<()> {
 }
 
 pub(crate) fn setup_cpuid_with_template(vcpu: &VcpuFd, template: &CpuTemplate) -> Result<()> {
+    // Populate the process-wide snapshot MSR policy before this vCPU is handed
+    // to its seccomp-confined run thread. KVM_GET_MSR_INDEX_LIST is a system
+    // ioctl and opening /dev/kvm is intentionally forbidden in that thread.
+    let _ = snapshot_msr_indices()?;
+
     let cpuid = {
         let mut guard = CACHED_CPUID.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
@@ -569,6 +574,10 @@ pub(crate) fn apply_boot_cpuid_with_template(
     apic_id: u8,
     template: &CpuTemplate,
 ) -> Result<()> {
+    // Initial boot uses this path directly (rather than setup_cpuid), so warm
+    // the MSR policy here as well, before the vCPU enters its seccomp profile.
+    let _ = snapshot_msr_indices()?;
+
     let kvm =
         kvm_ioctls::Kvm::new().map_err(|e| VmmError::Kvm(format!("Kvm::new for cpuid: {e}")))?;
     let mut cpuid = kvm
@@ -870,9 +879,15 @@ pub struct VcpuFullState {
     pub msrs: Vec<(u32, u64)>,
 }
 
-/// MSRs we save/restore: TSC, syscall/segment bases, sysenter, misc-enable and
-/// TSC-deadline — the set that matters for a correct x86_64 resume.
-const SNAPSHOT_MSRS: &[u32] = &[
+/// Architectural MSRs required for the Linux configuration Tarit exposes.
+///
+/// KVM paravirtual MSRs are selected separately from KVM_GET_MSR_INDEX_LIST.
+/// Keeping that selection dynamic is important: Linux can add state inside
+/// KVM's reserved custom range without changing Tarit (async-PF INT/ACK are a
+/// concrete example). The exact selected indices are serialized, so a
+/// destination can reject an incompatible snapshot before partially restoring
+/// a vCPU.
+const SNAPSHOT_ARCH_MSRS: &[u32] = &[
     0x0000_0010, // IA32_TSC
     0x0000_0174, // IA32_SYSENTER_CS
     0x0000_0175, // IA32_SYSENTER_ESP
@@ -889,19 +904,114 @@ const SNAPSHOT_MSRS: &[u32] = &[
     0xc000_0102, // KERNEL_GS_BASE
 ];
 
+const KVM_CUSTOM_MSR_START: u32 = 0x4b56_4d00;
+const KVM_CUSTOM_MSR_END: u32 = 0x4b56_4dff;
+const MSR_KVM_ASYNC_PF_EN: u32 = 0x4b56_4d02;
+const MSR_KVM_ASYNC_PF_INT: u32 = 0x4b56_4d06;
+const MSR_IA32_TSC: u32 = 0x0000_0010;
+const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06e0;
+
+static CACHED_SNAPSHOT_MSRS: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+
+fn select_snapshot_msr_indices(supported: &[u32]) -> Vec<u32> {
+    // KVM_GET_MSR_INDEX_LIST is authoritative for KVM's dynamically evolving
+    // custom range, but is not an exhaustive list of architectural MSRs that
+    // KVM_GET_MSRS accepts (for example, c8i KVM omits IA32_EFER here). The
+    // fixed architectural set remains guarded by strict GET/SET counts.
+    let mut selected = SNAPSHOT_ARCH_MSRS.to_vec();
+    selected.extend(
+        supported
+            .iter()
+            .copied()
+            .filter(|index| (KVM_CUSTOM_MSR_START..=KVM_CUSTOM_MSR_END).contains(index)),
+    );
+    selected.sort_unstable();
+    selected.dedup();
+    selected
+}
+
+fn snapshot_msr_indices() -> Result<Vec<u32>> {
+    let mut guard = CACHED_SNAPSHOT_MSRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(indices) = guard.as_ref() {
+        return Ok(indices.clone());
+    }
+
+    let kvm = kvm_ioctls::Kvm::new()
+        .map_err(|e| VmmError::Kvm(format!("Kvm::new for snapshot MSRs: {e}")))?;
+    let supported = kvm
+        .get_msr_index_list()
+        .map_err(|e| VmmError::Kvm(format!("KVM_GET_MSR_INDEX_LIST: {e}")))?;
+    let indices = select_snapshot_msr_indices(supported.as_slice());
+    *guard = Some(indices.clone());
+    Ok(indices)
+}
+
+fn capture_msrs(vcpu: &VcpuFd, indices: &[u32]) -> Result<Vec<(u32, u64)>> {
+    let mut values = Vec::with_capacity(indices.len());
+    for chunk in indices.chunks(kvm_bindings::KVM_MAX_MSR_ENTRIES) {
+        let entries: Vec<kvm_bindings::kvm_msr_entry> = chunk
+            .iter()
+            .map(|&index| kvm_bindings::kvm_msr_entry {
+                index,
+                ..Default::default()
+            })
+            .collect();
+        let mut msrs = kvm_bindings::Msrs::from_entries(&entries)
+            .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries(snapshot): {e:?}")))?;
+        get_msrs_checked(vcpu, &mut msrs, "KVM_GET_MSRS(snapshot)")?;
+        values.extend(
+            msrs.as_slice()
+                .iter()
+                .map(|entry| (entry.index, entry.data)),
+        );
+    }
+    Ok(values)
+}
+
+fn msr_restore_priority(index: u32) -> u8 {
+    match index {
+        // The async-PF interrupt vector must be installed before async-PF is
+        // enabled or KVM may inject vector 0 into the restored guest.
+        MSR_KVM_ASYNC_PF_INT => 0,
+        MSR_IA32_TSC => 1,
+        MSR_KVM_ASYNC_PF_EN => 2,
+        // KVM primes the deadline using the current TSC.
+        MSR_IA32_TSC_DEADLINE => 3,
+        _ => 1,
+    }
+}
+
+fn restore_msrs(vcpu: &VcpuFd, saved: &[(u32, u64)]) -> Result<()> {
+    let supported = snapshot_msr_indices()?;
+    if let Some(&(index, _)) = saved.iter().find(|(index, _)| !supported.contains(index)) {
+        return Err(VmmError::Kvm(format!(
+            "snapshot requires unsupported destination MSR {index:#010x}"
+        )));
+    }
+
+    let mut ordered = saved.to_vec();
+    ordered.sort_by_key(|&(index, _)| msr_restore_priority(index));
+    for chunk in ordered.chunks(kvm_bindings::KVM_MAX_MSR_ENTRIES) {
+        let entries: Vec<kvm_bindings::kvm_msr_entry> = chunk
+            .iter()
+            .map(|&(index, data)| kvm_bindings::kvm_msr_entry {
+                index,
+                data,
+                ..Default::default()
+            })
+            .collect();
+        let msrs = kvm_bindings::Msrs::from_entries(&entries)
+            .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries(restore): {e:?}")))?;
+        set_msrs_checked(vcpu, &msrs, "KVM_SET_MSRS(restore)")?;
+    }
+    Ok(())
+}
+
 /// Capture the full vCPU state. Call with the vCPU stopped (paused).
 pub fn capture_vcpu_full_state(vcpu: &VcpuFd) -> Result<VcpuFullState> {
-    let entries: Vec<kvm_bindings::kvm_msr_entry> = SNAPSHOT_MSRS
-        .iter()
-        .map(|&index| kvm_bindings::kvm_msr_entry {
-            index,
-            ..Default::default()
-        })
-        .collect();
-    let mut msrs = kvm_bindings::Msrs::from_entries(&entries)
-        .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries: {e:?}")))?;
-    get_msrs_checked(vcpu, &mut msrs, "KVM_GET_MSRS(snapshot)")?;
-    let msr_vals: Vec<(u32, u64)> = msrs.as_slice().iter().map(|e| (e.index, e.data)).collect();
+    let msr_vals = capture_msrs(vcpu, &snapshot_msr_indices()?)?;
 
     Ok(VcpuFullState {
         regs: vcpu
@@ -939,21 +1049,7 @@ pub fn restore_vcpu_full_state(vcpu: &VcpuFd, s: &VcpuFullState) -> Result<()> {
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_XSAVE: {e}")))?;
     vcpu.set_xcrs(&s.xcrs)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_XCRS: {e}")))?;
-    // Set IA32_TSC before IA32_TSC_DEADLINE (KVM primes the deadline off the
-    // current TSC), hence the deferred-MSR ordering below.
-    let mut ordered = s.msrs.clone();
-    ordered.sort_by_key(|&(index, _)| u8::from(index == 0x0000_06e0));
-    let entries: Vec<kvm_bindings::kvm_msr_entry> = ordered
-        .iter()
-        .map(|&(index, data)| kvm_bindings::kvm_msr_entry {
-            index,
-            data,
-            ..Default::default()
-        })
-        .collect();
-    let msrs = kvm_bindings::Msrs::from_entries(&entries)
-        .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries: {e:?}")))?;
-    set_msrs_checked(vcpu, &msrs, "KVM_SET_MSRS(restore)")?;
+    restore_msrs(vcpu, &s.msrs)?;
     vcpu.set_lapic(&s.lapic)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_LAPIC: {e}")))?;
     vcpu.set_vcpu_events(&s.vcpu_events)
@@ -961,4 +1057,42 @@ pub fn restore_vcpu_full_state(vcpu: &VcpuFd, s: &VcpuFullState) -> Result<()> {
     vcpu.set_mp_state(s.mp_state)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_MP_STATE: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_msr_tests {
+    use super::*;
+
+    #[test]
+    fn selection_includes_supported_full_kvm_custom_range() {
+        let mut supported = SNAPSHOT_ARCH_MSRS.to_vec();
+        supported.extend([
+            KVM_CUSTOM_MSR_START,
+            MSR_KVM_ASYNC_PF_EN,
+            MSR_KVM_ASYNC_PF_INT,
+            KVM_CUSTOM_MSR_END,
+            0xdead_beef,
+        ]);
+        let selected = select_snapshot_msr_indices(&supported);
+        assert!(selected.contains(&KVM_CUSTOM_MSR_START));
+        assert!(selected.contains(&MSR_KVM_ASYNC_PF_INT));
+        assert!(selected.contains(&KVM_CUSTOM_MSR_END));
+        assert!(!selected.contains(&0xdead_beef));
+    }
+
+    #[test]
+    fn architectural_set_does_not_depend_on_kvm_index_enumeration() {
+        let selected = select_snapshot_msr_indices(&[]);
+        for required in SNAPSHOT_ARCH_MSRS {
+            assert!(selected.contains(required));
+        }
+    }
+
+    #[test]
+    fn restore_order_satisfies_async_pf_and_tsc_dependencies() {
+        assert!(
+            msr_restore_priority(MSR_KVM_ASYNC_PF_INT) < msr_restore_priority(MSR_KVM_ASYNC_PF_EN)
+        );
+        assert!(msr_restore_priority(MSR_IA32_TSC) < msr_restore_priority(MSR_IA32_TSC_DEADLINE));
+    }
 }
