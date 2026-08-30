@@ -458,19 +458,37 @@ pub fn start_lazy_restore_with_integrity(
     let snapshot_len_clone = snapshot_payload_len;
     let pages_clone = pages_served.clone();
     let shutdown_clone = shutdown.clone();
+    let handler_shutdown = shutdown.clone();
     let handler_discarded_pages = discarded_pages.clone();
     let handler_thread = std::thread::spawn(move || {
-        fault_handler_loop(FaultHandlerContext {
-            uffd_fd_raw,
-            snapshot_ptr: snapshot_ptr_val,
-            snapshot_len: snapshot_len_clone,
-            guest_base: guest_base_val,
-            pages_served: pages_clone,
-            shutdown: shutdown_clone,
-            host_dirty,
-            chunk_integrity,
-            discarded_pages: handler_discarded_pages,
-        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fault_handler_loop(FaultHandlerContext {
+                uffd_fd_raw,
+                snapshot_ptr: snapshot_ptr_val,
+                snapshot_len: snapshot_len_clone,
+                guest_base: guest_base_val,
+                pages_served: pages_clone,
+                shutdown: shutdown_clone,
+                host_dirty,
+                chunk_integrity,
+                discarded_pages: handler_discarded_pages,
+            });
+        }));
+        if !handler_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            let reason = if outcome.is_err() {
+                "panicked"
+            } else {
+                "exited"
+            };
+            eprintln!("SECURITY: userfaultfd handler {reason} unexpectedly; terminating VMM");
+            log::error!("userfaultfd handler {reason} unexpectedly");
+            // An absent UFFD handler leaves guest accesses blocked forever.
+            // This process owns one VM, so fail closed and let the orchestrator
+            // reconcile the exit instead of retaining an unresponsive VM.
+            // SAFETY: `_exit` terminates the current VMM without running
+            // destructors that may themselves touch the unresolved mapping.
+            unsafe { libc::_exit(78) }
+        }
     });
 
     log::info!("UFFD lazy restore started: {guest_mem_len} bytes registered");
@@ -584,15 +602,18 @@ fn fault_handler_loop(context: FaultHandlerContext) {
         // writes within that single element during the call.
         let timeout_ms = if pending_faults.is_empty() { 500 } else { 0 };
         let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if prc <= 0 {
-            if prc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+        if prc < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            if pending_faults.is_empty() {
-                continue; // timeout — loop back, check shutdown
-            }
+            log::error!("userfaultfd poll failed: {error}");
+            break;
         }
-        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        if prc == 0 && pending_faults.is_empty() {
+            continue; // timeout — loop back, check shutdown
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             break; // fd closed — exit
         }
         if prc > 0 && pfd.revents & libc::POLLIN != 0 {
@@ -662,6 +683,15 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             }
         }
 
+        #[cfg(feature = "test-failpoints")]
+        if !pending_faults.is_empty()
+            && std::env::var_os("TARIT_TEST_UFFD_HANDLER_FAILURE").as_deref()
+                == Some(std::ffi::OsStr::new("after_event"))
+        {
+            log::error!("test failpoint: forcing userfaultfd handler exit");
+            return;
+        }
+
         let Some(fault_addr) = pending_faults.pop_front() else {
             continue;
         };
@@ -670,16 +700,16 @@ fn fault_handler_loop(context: FaultHandlerContext) {
         // address down to its page, source the matching page from the snapshot
         // mapping, and resolve the whole page in one copy.
         let Ok(fault_addr_usize) = usize::try_from(fault_addr) else {
-            log::warn!("UFFD fault address 0x{fault_addr:x} overflows usize");
-            continue;
+            log::error!("UFFD fault address 0x{fault_addr:x} overflows usize");
+            break;
         };
         let Some(guest_end) = guest_base.checked_add(snapshot_len) else {
             log::warn!("UFFD guest range overflows: base=0x{guest_base:x} len={snapshot_len}");
             break;
         };
         if fault_addr_usize < guest_base || fault_addr_usize >= guest_end {
-            log::warn!("UFFD fault address 0x{fault_addr:x} outside registered guest range");
-            continue;
+            log::error!("UFFD fault address 0x{fault_addr:x} outside registered guest range");
+            break;
         }
         let guest_offset = fault_addr_usize - guest_base;
         let page_offset = guest_offset & !(PAGE_SIZE - 1);
@@ -690,22 +720,22 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             integrity.chunk_size.min(snapshot_len - copy_offset)
         });
         let Some(copy_end) = copy_offset.checked_add(copy_len) else {
-            log::warn!("UFFD copy offset overflows: 0x{copy_offset:x}");
-            continue;
+            log::error!("UFFD copy offset overflows: 0x{copy_offset:x}");
+            break;
         };
         if copy_end > snapshot_len || !copy_len.is_multiple_of(PAGE_SIZE) {
-            log::warn!("UFFD copy range 0x{copy_offset:x}..0x{copy_end:x} is invalid");
-            continue;
+            log::error!("UFFD copy range 0x{copy_offset:x}..0x{copy_end:x} is invalid");
+            break;
         }
         let Some(dst_usize) = guest_base.checked_add(copy_offset) else {
-            log::warn!(
+            log::error!(
                 "UFFD destination address overflows: base=0x{guest_base:x} offset=0x{copy_offset:x}"
             );
-            continue;
+            break;
         };
         let Ok(dst) = u64::try_from(dst_usize) else {
-            log::warn!("UFFD destination address 0x{dst_usize:x} overflows u64");
-            continue;
+            log::error!("UFFD destination address 0x{dst_usize:x} overflows u64");
+            break;
         };
         // A discard racing a fault must either happen after this copy (and
         // madvise it away), or be reflected as zeroes in the bytes below.
@@ -858,6 +888,66 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::io::Write;
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn forced_handler_failure_child() {
+        if std::env::var_os("TARIT_TEST_UFFD_CHILD").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return;
+        }
+
+        const LEN: usize = 4096;
+        let file = tempfile::tempfile().expect("create snapshot file");
+        file.set_len(LEN as u64).expect("size snapshot file");
+        // SAFETY: creates one private page-aligned mapping which the process
+        // owns until the fail-closed child exits.
+        let guest = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest, libc::MAP_FAILED);
+        let _lazy = match start_lazy_restore(guest.cast(), LEN, &file, 0, LEN as u64, None) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                // GitHub-hosted Linux runners commonly deny unprivileged UFFD.
+                // SAFETY: this dedicated subprocess has no cleanup to preserve.
+                unsafe { libc::_exit(77) }
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
+        // The handler consumes this event and then takes the test-only failure
+        // path. The parent requires the process-wide fail-closed exit code.
+        // SAFETY: `guest` is the live UFFD-registered mapping above.
+        let _ = unsafe { std::ptr::read_volatile(guest.cast::<u8>()) };
+        panic!("fault unexpectedly resolved after forced handler failure");
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn unexpected_handler_exit_terminates_the_vmm_process() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "uffd_restore::tests::forced_handler_failure_child",
+                "--nocapture",
+            ])
+            .env("TARIT_TEST_UFFD_CHILD", "1")
+            .env("TARIT_TEST_UFFD_HANDLER_FAILURE", "after_event")
+            .status()
+            .expect("run UFFD failure subprocess");
+        if status.code() == Some(77) {
+            return;
+        }
+        assert_eq!(status.code(), Some(78));
+    }
 
     #[test]
     fn authenticated_chunk_rejects_single_byte_corruption() {

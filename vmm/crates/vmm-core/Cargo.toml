@@ -9,7 +9,7 @@ authors.workspace = true
 default = []
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "vmm-memory-backend/kvm"]
 boot = ["kvm"]
-test-failpoints = []
+test-failpoints = ["vmm-memory-backend/test-failpoints"]
 
 [dependencies]
 tarit-proto = { path = "../../../proto" }

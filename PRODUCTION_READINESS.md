@@ -94,11 +94,13 @@ regression gates, but the following unresolved items now block release:
    plus the Linux 5.10 barrier-only compatibility path, remain required
    regression gates before HTTP, PTY, SSH, share, or exec admission.
 2. Pass phase-by-phase kill, cancellation, dirty-rate non-convergence, UFFD
-   handler death, corruption, and near-ENOSPC rollback tests without source
-   pause leaks, duplicate writers, terminal-ID resurrection, or staged files;
-   the fixed vCPU MSR omission is repaired, but the dynamic KVM custom-MSR set
-   still needs the cross-kernel/build pvclock, PV-EOI, steal-time, and async-PF
-   enabled/disabled compatibility matrix.
+   UNMAP/remap and registration-disconnect, corruption, and near-ENOSPC rollback
+   tests without source pause leaks, duplicate writers, terminal-ID
+   resurrection, or staged files. Forced UFFD-handler death now fails the VMM
+   closed and preserves retryable hibernated state across the Ubuntu/Alpine and
+   Linux 6.6/5.10 c8i matrix. The fixed vCPU MSR omission is repaired, but the
+   dynamic KVM custom-MSR set still needs the cross-kernel/build pvclock, PV-EOI,
+   steal-time, and async-PF enabled/disabled compatibility matrix.
 3. Qualify shared/cloud volume durability and failure recovery, including NFS
    server loss/restart with protected transport and object-store interruption,
    rather than extrapolating from local-block tests.

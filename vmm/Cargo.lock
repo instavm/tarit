@@ -977,6 +977,7 @@ dependencies = [
  "log",
  "serde",
  "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "vm-memory 0.18.0",
  "vmm-sys-util 0.12.1",

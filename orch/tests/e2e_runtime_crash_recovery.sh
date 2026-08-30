@@ -261,6 +261,36 @@ echo "== hibernate and HTTP-resume the re-adopted runtime =="
 api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/hibernate" | grep -q '"status":"hibernated"'
 wait_pid_gone "$READOPTED_PID" || { echo "FAIL: re-adopted VMM survived hibernate" >&2; exit 1; }
 [ -z "$(vmm_pid_for_id "$VM_ID")" ] || { echo "FAIL: hibernated VM retained a PID" >&2; exit 1; }
+
+if [ "${TARIT_E2E_UFFD_HANDLER_FAILURE:-0}" = 1 ]; then
+  echo "== force lazy-restore handler failure and preserve retryable state =="
+  exec_request "$VM_ID" 'cat /root/tarit-crash-proof' >"$DIR/uffd-failure.response"
+  python3 - "$DIR/uffd-failure.response" <<'PY'
+import json,sys
+with open(sys.argv[1], encoding="utf-8") as response:
+    row=json.load(response)
+assert row["status"] == "failed", row
+assert row["exit_code"] is None, row
+assert row["stdout"] is None and row["stderr"] is None, row
+PY
+  wait_vm_status "$VM_ID" hibernated || {
+    echo "FAIL: forced UFFD failure did not preserve hibernated state" >&2
+    api "$BASE_URL/v1/vms/$VM_ID" >&2 || true
+    exit 1
+  }
+  [ -z "$(vmm_pid_for_id "$VM_ID")" ] || {
+    echo "FAIL: forced UFFD failure retained a VMM PID" >&2
+    exit 1
+  }
+
+  kill -TERM -- "-$TARITD_PGID"
+  wait "$TARITD_PID"
+  TARITD_PID=""
+  TARITD_PGID=""
+  unset TARIT_TEST_UFFD_HANDLER_FAILURE
+  start_taritd
+fi
+
 expect_exec "$VM_ID" 'cat /root/tarit-crash-proof' crash-recovery-proof
 RESUMED_PID=$(vmm_pid_for_id "$VM_ID")
 [ -n "$RESUMED_PID" ] && kill -0 "$RESUMED_PID"

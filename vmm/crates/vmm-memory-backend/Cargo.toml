@@ -8,6 +8,7 @@ authors.workspace = true
 [features]
 default = []
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings"]
+test-failpoints = []
 
 [dependencies]
 vm-memory.workspace = true
@@ -20,6 +21,9 @@ sha2.workspace = true
 
 kvm-ioctls = { workspace = true, optional = true }
 kvm-bindings = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
