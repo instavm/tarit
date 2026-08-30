@@ -1133,7 +1133,7 @@ fn restore(
     uid: u32,
     gid: u32,
 ) -> Result<()> {
-    if std::path::Path::new(socket).exists() {
+    if api_socket_is_listening(socket)? {
         anyhow::ensure!(
             jail_dir.is_none(),
             "--jail is available only for standalone restore without a running API socket"
@@ -1179,6 +1179,33 @@ fn restore(
         .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
     println!("Restored VM from {snapshot}");
     Ok(())
+}
+
+fn api_socket_is_listening(socket: &str) -> Result<bool> {
+    use std::os::unix::fs::FileTypeExt as _;
+    use std::os::unix::net::UnixStream;
+
+    let path = std::path::Path::new(socket);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_socket() {
+        return Ok(false);
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 struct ServeJailOptions {
@@ -1617,6 +1644,21 @@ fn send_raw(socket: &str, body: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_socket_probe_distinguishes_live_stale_and_regular_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("vmm.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(api_socket_is_listening(socket.to_str().unwrap()).unwrap());
+
+        drop(listener);
+        assert!(!api_socket_is_listening(socket.to_str().unwrap()).unwrap());
+
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::write(&socket, b"not a socket").unwrap();
+        assert!(!api_socket_is_listening(socket.to_str().unwrap()).unwrap());
+    }
 
     #[test]
     fn cli_accepts_overlay_for_volume() {
