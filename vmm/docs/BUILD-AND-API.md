@@ -427,7 +427,9 @@ the built-in 30 second timeout.
 }
 ```
 The address and gateway must be IPv4 addresses, the prefix must be `0..=32`,
-and each DNS entry must be an IP address.
+and each DNS entry must be an IP address. The guest agent applies and verifies
+the address, netmask, link state, and single default route directly through the
+Linux network API. Restore does not require `iproute2` in the guest image.
 
 #### `attach_pty`: Attach an interactive PTY stream
 ```json

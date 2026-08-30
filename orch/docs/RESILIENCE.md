@@ -97,6 +97,7 @@ calls a provider command, so it works behind an ASG, MIG, or Terraform. See
 | Suspend frees RAM | Suspend = snapshot + userfaultfd arm + `madvise(DONTNEED)`; RSS drops (226 MB -> 10 MB) and resume is byte-identical (SHA256) | e2e: VMM `suspend-validate.sh` |
 | Snapshot and overlay GC | Scratch snapshots/overlays are removed on stop; user snapshots are preserved; `vmm gc` sweeps leftovers | e2e: VMM `gc-validate.sh` |
 | Live snapshot consistency | Full-restore, diff-restore, and suspend all restore to a SHA256-consistent guest | e2e: VMM `livesnap-gate.sh` (full + diff + suspend) |
+| Hibernated ingress burst | Concurrent exec, PTY, SSH, and public-share requests join one registered restore; no request reaches the guest before userspace clone repair completes | c8i KVM: `e2e_live_fork_hibernate.sh`, Linux 6.6 and 5.10 |
 
 ## 5. Networking at scale
 

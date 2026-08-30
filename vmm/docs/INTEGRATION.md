@@ -149,7 +149,10 @@ Set `diff` to `true` to request an incremental snapshot when the VMM has a previ
 
 This validates the supplied IP configuration and reapplies the guest `eth0`
 address, default route, and optional DNS servers through the guest agent. taritd
-uses it after restoring a snapshot into a new TAP allocation.
+uses it after restoring a snapshot into a new TAP allocation. The agent uses
+Linux network ioctls and verifies the resulting address, netmask, link state,
+and default route before acknowledging the request; no guest `ip` command is
+required.
 
 ### `attach_pty`
 

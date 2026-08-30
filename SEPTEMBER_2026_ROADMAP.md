@@ -883,6 +883,23 @@ passing focused gate does not waive an item in the final column.
   1,079 ms. Share ingress is not claimed for these two Alpine runs because an
   unrelated host process owns the shared nftables tables; its earlier dedicated
   gate remains separate.
+- Hibernated activation is now single-flight across exec, PTY, SSH, and public
+  HTTP-share ingress. A duplicate activation joins the exact registered boot
+  instead of replacing its lifecycle owner or returning a transient boot-
+  reservation conflict. The mixed c8i gate holds guest token and HTTP state in
+  a two-second post-fork repair hook, starts all four ingress classes
+  concurrently, and requires repaired output from every completed channel,
+  exactly one VMM, and no inherited token. The complete lifecycle gate passed
+  twice with Ubuntu 24.04 on Linux 6.6.155 and once on Linux 5.10.230. The
+  post-fix runs measured fork-to-ready at 4,879/4,878 ms and HTTP wake at
+  1,193/1,171 ms on Linux 6.6; Linux 5.10 measured 4,976 ms and 1,152 ms.
+  During qualification, the minimal Ubuntu OCI fixture exposed an undeclared
+  `iproute2` dependency in restored-network repair and verification. The guest
+  agent now applies and verifies the address, netmask, link state, and single
+  default route directly through the Linux network API, while taritd retains
+  the host-to-guest reachability check. Restore therefore works without guest
+  network utilities. Application-specific long-lived PRNG, TLS-session,
+  nonce-allocation, and framework-session-cache repair workloads remain open.
 - Explicit live-fork ids are now durable operation identities rather than only
   caller-selected VM ids. SQLite and PostgreSQL persist the tenant, source VM,
   source host, target host, `preparing`/`committed` phase, and exact child

@@ -10,6 +10,19 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Hibernated exec, PTY, SSH, and public-share requests now join the same
+  registered activation instead of competing for or replacing its boot
+  reservation.
+- Guest IPv4 restore repair is applied and verified through the Linux network
+  API, removing the `iproute2` dependency from minimal OCI guests.
+
+### Fixed
+
+- Duplicate activation can no longer replace an in-flight boot registration;
+  waiters observe the result of the exact registered incarnation.
+
 ## [0.1.2] - 2026-08-07
 
 ### Added

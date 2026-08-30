@@ -274,6 +274,11 @@ When enabled, `taritd`:
    VM pool; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
+Snapshot restore assigns a new host TAP allocation. Before publishing the VM,
+taritd sends a typed IPv4 repair request to the guest agent and verifies
+host-to-guest reachability. The agent applies and checks the configuration
+through the kernel, so minimal OCI images do not need `iproute2` for restore.
+
 Before loading configuration, opening a database, resolving images, or looking
 up VMs, `taritd` enumerates strict `insta<N>` names with structured `ip -j
 link` output and lowers them. A containment, VM-list, or recovery error is

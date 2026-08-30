@@ -5,7 +5,7 @@ Emulates an actual terminal and sends an SSH exec request. Command mode avoids
 depending on a particular guest shell prompt while still exercising Tarit's
 authenticated SSH-to-guest-PTY bridge.
 
-Usage: ssh_pty_test.py KEYFILE PORT VM_ID HOST
+Usage: ssh_pty_test.py KEYFILE PORT VM_ID HOST [COMMAND [EXPECTED_MARKER]]
 """
 import fcntl
 import os
@@ -19,6 +19,8 @@ import time
 
 def main() -> int:
     keyfile, port, user, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+    command = sys.argv[5] if len(sys.argv) > 5 else "echo SSH_GW_OK_MARK; id -u"
+    expected_marker = sys.argv[6] if len(sys.argv) > 6 else "SSH_GW_OK_MARK"
     argv = [
         "ssh", "-tt", "-p", port, "-i", keyfile,
         "-o", "StrictHostKeyChecking=no",
@@ -27,7 +29,7 @@ def main() -> int:
         "-o", "IdentitiesOnly=yes",
         "-o", "LogLevel=VERBOSE",
         f"{user}@{host}",
-        "echo SSH_GW_OK_MARK; id -u",
+        command,
     ]
 
     pid, fd = pty.fork()
@@ -81,7 +83,7 @@ def main() -> int:
 
     text = out.decode(errors="replace")
     sys.stdout.write(text)
-    ok = "SSH_GW_OK_MARK" in text
+    ok = expected_marker in text
     sys.stdout.write("\n---\nSSH_GW_PASS\n" if ok else "\n---\nSSH_GW_FAIL\n")
     return 0 if ok else 1
 

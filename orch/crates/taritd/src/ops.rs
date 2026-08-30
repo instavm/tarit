@@ -2384,7 +2384,7 @@ async fn resume_hibernated_local(
             .is_some_and(|policy| policy.allow_existing),
         data_volumes: data_volumes.clone(),
     };
-    let ticket = state
+    let ticket = match state
         .supervisor
         .begin_boot_with_registration(
             id,
@@ -2392,7 +2392,24 @@ async fn resume_hibernated_local(
             restore_config.resource_shape(),
             || async { Ok(()) },
         )
-        .await?;
+        .await
+    {
+        Ok(ticket) => ticket,
+        Err(error @ OrchError::Conflict(_)) => {
+            if !state.supervisor.wait_for_registered_boot(id).await? {
+                return Err(error);
+            }
+            let joined = vm_get(state, id)?;
+            if joined.status == VmStatus::Running {
+                return Ok(joined);
+            }
+            return Err(OrchError::Conflict(format!(
+                "registered activation for VM {id} completed in {}",
+                joined.status.as_str()
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     let path = hibernation.snapshot_path.clone();
     let shape = restore_config.resource_shape();
     let supervisor = Arc::clone(&state.supervisor);

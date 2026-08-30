@@ -334,7 +334,7 @@ p=json.load(sys.stdin)
 assert p["revision"] == 3 and p["allowlist"] == ["1.1.1.1:443/tcp"] and p["allow_existing"] is True, p
 '
   expect_exec "$PARENT_ID" \
-    "python3 -c 'import socket; s=socket.create_connection((\"1.1.1.1\",443),5); print(\"EGRESS_ALLOWED\"); s.close()'" \
+    "if command -v busybox >/dev/null 2>&1; then busybox nc -w 5 1.1.1.1 443 </dev/null; elif command -v python3 >/dev/null 2>&1; then python3 -c 'import socket; s=socket.create_connection((\"1.1.1.1\",443),5); s.close()'; else timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'; fi; echo EGRESS_ALLOWED" \
     'EGRESS_ALLOWED'
   python3 - "$DIR/fleet.db" "$PARENT_ID" <<'PY'
 import json,sqlite3,sys
@@ -471,37 +471,70 @@ with sqlite3.connect(sys.argv[1]) as db:
 assert count == 0, count
 PY
 
-echo "== SSH gateway is an authenticated activation source =="
-api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$RECOVERY_ID/hibernate" | grep -q '"status":"hibernated"'
-[ -z "$(vmm_pids_for_id "$RECOVERY_ID")" ] || { echo "FAIL: SSH fixture VMM survived hibernate"; exit 1; }
-if ! SSH_OUTPUT=$(python3 "$ROOT/orch/tests/ssh_pty_test.py" \
-  "$DIR/ssh-client-ed25519" "$SSH_PORT" "$RECOVERY_ID" 127.0.0.1 2>&1); then
-  echo "FAIL: SSH activation probe failed:" >&2
-  printf '%s\n' "$SSH_OUTPUT" >&2
-  grep -aiE 'ssh|gateway|auth|pty|activation|request failed' "$DIR/taritd.log" | tail -80 >&2 || true
-  exit 1
-fi
-printf '%s\n' "$SSH_OUTPUT" | grep -q 'SSH_GW_PASS'
-api "$BASE_URL/v1/vms/$RECOVERY_ID" | grep -q '"status":"running"'
-[ "$(vmm_pids_for_id "$RECOVERY_ID" | sed '/^$/d' | wc -l)" -eq 1 ]
-expect_exec "$RECOVERY_ID" "printf 'post-ssh-agent-ok\\n'" 'post-ssh-agent-ok'
-
 if [ "${TARIT_TEST_SHARE:-0}" = 1 ]; then
-  echo "== public share HTTP ingress is an activation source =="
+  echo "== concurrent exec, PTY, SSH, and share ingress wait for clone repair =="
   expect_exec "$RECOVERY_ID" \
-    "sh -c 'command -v python3; command -v setsid; mkdir -p /tmp/tarit-share; echo share-wake-ok > /tmp/tarit-share/index.html; cd /tmp/tarit-share; setsid -f python3 -m http.server 18080 --bind 0.0.0.0 >/tmp/tarit-share.log 2>&1 </dev/null; echo share-server-started'" \
-    'share-server-started'
+    "command -v busybox >/dev/null; mkdir -p /usr/libexec/tarit /run/tarit /tmp/tarit-share; printf '%s\\n' '#!/bin/sh' 'set -eu' 'test \"\$TARIT_POST_FORK\" = 1' 'test -f /run/tarit/cached-token' 'printf started > /run/tarit/mixed-hook-started' 'sleep 2' 'rm -f /run/tarit/cached-token' 'printf \"repaired:%s\\n\" \"\$TARIT_CLONE_ID\" > /run/tarit/mixed-userspace-token' 'printf REPAIRED_SHARE > /tmp/tarit-share/index.html' > /usr/libexec/tarit/post-fork; chmod 0755 /usr/libexec/tarit/post-fork; printf inherited-token > /run/tarit/cached-token; printf UNREPAIRED_SHARE > /tmp/tarit-share/index.html; busybox httpd -f -p 18080 -h /tmp/tarit-share >/tmp/tarit-share.log 2>&1 & echo mixed-ingress-ready" \
+    'mixed-ingress-ready'
   SHARE_JSON=$(api -H 'Content-Type: application/json' \
     -d "{\"vm_id\":\"$RECOVERY_ID\",\"guest_port\":18080,\"visibility\":\"public\"}" \
     "$BASE_URL/v1/shares")
   SHARE_SLUG=$(printf '%s' "$SHARE_JSON" | json_field slug)
   api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$RECOVERY_ID/hibernate" | grep -q '"status":"hibernated"'
-  [ -z "$(vmm_pids_for_id "$RECOVERY_ID")" ] || { echo "FAIL: share fixture VMM survived hibernate"; exit 1; }
-  SHARE_OUTPUT=$(curl -fsS --max-time 90 -H "Host: $SHARE_SLUG.shares.e2e.test" \
-    "http://127.0.0.1:$SHARE_PORT/")
-  printf '%s' "$SHARE_OUTPUT" | grep -q 'share-wake-ok'
+  [ -z "$(vmm_pids_for_id "$RECOVERY_ID")" ] || { echo "FAIL: mixed-ingress fixture VMM survived hibernate"; exit 1; }
+
+  MIXED_PIDS=()
+  for index in $(seq 1 4); do
+    (expect_exec "$RECOVERY_ID" \
+      "if [ -e /run/tarit/cached-token ]; then echo UNREPAIRED_EXEC; exit 97; fi; echo REPAIRED_EXEC_$index" \
+      "REPAIRED_EXEC_$index" >"$DIR/mixed-exec-$index.log" 2>&1) &
+    MIXED_PIDS+=("$!")
+  done
+  (api -H 'Content-Type: application/json' -d '{"cols":80,"rows":24}' \
+    "$BASE_URL/v1/vms/$RECOVERY_ID/pty/sessions" >"$DIR/mixed-pty.json") &
+  MIXED_PIDS+=("$!")
+  (python3 "$ROOT/orch/tests/ssh_pty_test.py" \
+    "$DIR/ssh-client-ed25519" "$SSH_PORT" "$RECOVERY_ID" 127.0.0.1 \
+    'if [ -e /run/tarit/cached-token ]; then echo UNREPAIRED_SSH; exit 97; fi; echo REPAIRED_SSH' \
+    REPAIRED_SSH >"$DIR/mixed-ssh.log" 2>&1) &
+  MIXED_PIDS+=("$!")
+  (curl -fsS --max-time 90 -H "Host: $SHARE_SLUG.shares.e2e.test" \
+    "http://127.0.0.1:$SHARE_PORT/" >"$DIR/mixed-share.out") &
+  MIXED_PIDS+=("$!")
+
+  MIXED_FAILED=0
+  for mixed_pid in "${MIXED_PIDS[@]}"; do
+    wait "$mixed_pid" || MIXED_FAILED=1
+  done
+  if [ "$MIXED_FAILED" -ne 0 ]; then
+    echo "FAIL: one or more concurrent repair-barrier ingress requests failed" >&2
+    grep -aiE 'ssh|gateway|pty|share|activation|repair|request failed' "$DIR/taritd.log" | tail -120 >&2 || true
+    exit 1
+  fi
+  grep -q '"pty_id"' "$DIR/mixed-pty.json"
+  grep -q REPAIRED_SSH "$DIR/mixed-ssh.log"
+  ! grep -q UNREPAIRED_SSH "$DIR/mixed-ssh.log"
+  grep -qx REPAIRED_SHARE "$DIR/mixed-share.out"
   api "$BASE_URL/v1/vms/$RECOVERY_ID" | grep -q '"status":"running"'
   [ "$(vmm_pids_for_id "$RECOVERY_ID" | sed '/^$/d' | wc -l)" -eq 1 ]
+  expect_exec "$RECOVERY_ID" \
+    'test ! -e /run/tarit/cached-token && grep -q "^repaired:" /run/tarit/mixed-userspace-token && test -e /run/tarit/mixed-hook-started' \
+    ''
+else
+  echo "== SSH gateway is an authenticated activation source =="
+  api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$RECOVERY_ID/hibernate" | grep -q '"status":"hibernated"'
+  [ -z "$(vmm_pids_for_id "$RECOVERY_ID")" ] || { echo "FAIL: SSH fixture VMM survived hibernate"; exit 1; }
+  if ! SSH_OUTPUT=$(python3 "$ROOT/orch/tests/ssh_pty_test.py" \
+    "$DIR/ssh-client-ed25519" "$SSH_PORT" "$RECOVERY_ID" 127.0.0.1 2>&1); then
+    echo "FAIL: SSH activation probe failed:" >&2
+    printf '%s\n' "$SSH_OUTPUT" >&2
+    grep -aiE 'ssh|gateway|auth|pty|activation|request failed' "$DIR/taritd.log" | tail -80 >&2 || true
+    exit 1
+  fi
+  printf '%s\n' "$SSH_OUTPUT" | grep -q 'SSH_GW_PASS'
+  api "$BASE_URL/v1/vms/$RECOVERY_ID" | grep -q '"status":"running"'
+  [ "$(vmm_pids_for_id "$RECOVERY_ID" | sed '/^$/d' | wc -l)" -eq 1 ]
+  expect_exec "$RECOVERY_ID" "printf 'post-ssh-agent-ok\\n'" 'post-ssh-agent-ok'
 fi
 
 grep -q 'adopted VMM live integrity sidecar without rereading RAM' "$DIR/taritd.log" || {

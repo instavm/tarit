@@ -20,6 +20,8 @@
 #include <termios.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <net/if.h>
+#include <net/route.h>
 #include <linux/random.h>
 #include <linux/vm_sockets.h>
 #include <poll.h>
@@ -1014,22 +1016,6 @@ static size_t json_get_string_array(const char *json, const char *key, char out[
     }
 }
 
-static int run_argv_and_stream_output(int serial_fd, char *const argv[]) {
-    pid_t pid = fork();
-    if (pid < 0) {
-        serial_printf(serial_fd, "fork failed: %s\n", strerror(errno));
-        return 127;
-    }
-    if (pid == 0) {
-        if (dup2(serial_fd, STDOUT_FILENO) < 0 || dup2(serial_fd, STDERR_FILENO) < 0) {
-            _exit(127);
-        }
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    return wait_for_child(pid);
-}
-
 static int write_resolv_conf(char dns[][64], size_t dns_count) {
     int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -1047,6 +1033,193 @@ static int write_resolv_conf(char dns[][64], size_t dns_count) {
     }
     return close(fd);
 }
+
+#ifdef __linux__
+static void init_ipv4_sockaddr(struct sockaddr *address, struct in_addr ipv4) {
+    struct sockaddr_in *inet = (struct sockaddr_in *)address;
+    memset(address, 0, sizeof(*address));
+    inet->sin_family = AF_INET;
+    inet->sin_addr = ipv4;
+}
+
+static int remove_default_routes(int socket_fd) {
+    FILE *routes = fopen("/proc/net/route", "re");
+    if (routes == NULL) {
+        return -1;
+    }
+
+    char line[512];
+    if (fgets(line, sizeof(line), routes) == NULL) {
+        fclose(routes);
+        errno = EIO;
+        return -1;
+    }
+    while (fgets(line, sizeof(line), routes) != NULL) {
+        char interface[IFNAMSIZ];
+        unsigned long destination;
+        unsigned long gateway;
+        unsigned int flags;
+        unsigned long mask;
+        int matched = sscanf(line, "%15s %lx %lx %x %*u %*u %*u %lx",
+                             interface, &destination, &gateway, &flags, &mask);
+        if (matched != 5 || strcmp(interface, "eth0") != 0 || destination != 0 || mask != 0) {
+            continue;
+        }
+
+        struct rtentry route;
+        memset(&route, 0, sizeof(route));
+        struct in_addr zero = {.s_addr = 0};
+        struct in_addr gateway_addr = {.s_addr = (in_addr_t)gateway};
+        init_ipv4_sockaddr(&route.rt_dst, zero);
+        init_ipv4_sockaddr(&route.rt_genmask, zero);
+        init_ipv4_sockaddr(&route.rt_gateway, gateway_addr);
+        route.rt_flags = (unsigned short)(flags | RTF_UP);
+        route.rt_dev = interface;
+        if (ioctl(socket_fd, SIOCDELRT, &route) < 0 && errno != ESRCH && errno != ENOENT) {
+            int saved_errno = errno;
+            fclose(routes);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    return fclose(routes);
+}
+
+static int default_route_matches(struct in_addr expected_gateway) {
+    FILE *routes = fopen("/proc/net/route", "re");
+    if (routes == NULL) {
+        return -1;
+    }
+    char line[512];
+    if (fgets(line, sizeof(line), routes) == NULL) {
+        fclose(routes);
+        errno = EIO;
+        return -1;
+    }
+
+    size_t matches = 0;
+    size_t defaults = 0;
+    while (fgets(line, sizeof(line), routes) != NULL) {
+        char interface[IFNAMSIZ];
+        unsigned long destination;
+        unsigned long gateway;
+        unsigned int flags;
+        unsigned long mask;
+        int matched = sscanf(line, "%15s %lx %lx %x %*u %*u %*u %lx",
+                             interface, &destination, &gateway, &flags, &mask);
+        if (matched != 5 || destination != 0 || mask != 0) {
+            continue;
+        }
+        defaults++;
+        if (strcmp(interface, "eth0") == 0 &&
+            (in_addr_t)gateway == expected_gateway.s_addr &&
+            (flags & (RTF_UP | RTF_GATEWAY)) == (RTF_UP | RTF_GATEWAY)) {
+            matches++;
+        }
+    }
+    if (fclose(routes) < 0) {
+        return -1;
+    }
+    if (defaults != 1 || matches != 1) {
+        errno = EADDRNOTAVAIL;
+        return -1;
+    }
+    return 0;
+}
+
+static int guest_ipv4_matches(int socket_fd, struct in_addr expected_address,
+                              struct in_addr expected_netmask,
+                              struct in_addr expected_gateway) {
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", "eth0");
+    if (ioctl(socket_fd, SIOCGIFADDR, &request) < 0 ||
+        ((struct sockaddr_in *)&request.ifr_addr)->sin_addr.s_addr != expected_address.s_addr) {
+        errno = EADDRNOTAVAIL;
+        return -1;
+    }
+    if (ioctl(socket_fd, SIOCGIFNETMASK, &request) < 0 ||
+        ((struct sockaddr_in *)&request.ifr_netmask)->sin_addr.s_addr != expected_netmask.s_addr) {
+        errno = EADDRNOTAVAIL;
+        return -1;
+    }
+    if (ioctl(socket_fd, SIOCGIFFLAGS, &request) < 0 || (request.ifr_flags & IFF_UP) == 0) {
+        errno = ENETDOWN;
+        return -1;
+    }
+    return default_route_matches(expected_gateway);
+}
+
+static int configure_guest_ipv4(const char *addr, uint16_t prefix, const char *gateway) {
+    struct in_addr address;
+    struct in_addr gateway_addr;
+    if (inet_pton(AF_INET, addr, &address) != 1 ||
+        inet_pton(AF_INET, gateway, &gateway_addr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) {
+        return -1;
+    }
+
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", "eth0");
+    init_ipv4_sockaddr(&request.ifr_addr, address);
+    if (ioctl(socket_fd, SIOCSIFADDR, &request) < 0) {
+        goto fail;
+    }
+
+    uint32_t mask_bits = prefix == 0 ? 0U : UINT32_MAX << (32U - prefix);
+    struct in_addr netmask = {.s_addr = htonl(mask_bits)};
+    init_ipv4_sockaddr(&request.ifr_netmask, netmask);
+    if (ioctl(socket_fd, SIOCSIFNETMASK, &request) < 0) {
+        goto fail;
+    }
+
+    if (ioctl(socket_fd, SIOCGIFFLAGS, &request) < 0) {
+        goto fail;
+    }
+    request.ifr_flags = (short)(request.ifr_flags | IFF_UP);
+    if (ioctl(socket_fd, SIOCSIFFLAGS, &request) < 0 || remove_default_routes(socket_fd) < 0) {
+        goto fail;
+    }
+
+    struct rtentry route;
+    memset(&route, 0, sizeof(route));
+    struct in_addr zero = {.s_addr = 0};
+    init_ipv4_sockaddr(&route.rt_dst, zero);
+    init_ipv4_sockaddr(&route.rt_genmask, zero);
+    init_ipv4_sockaddr(&route.rt_gateway, gateway_addr);
+    route.rt_flags = RTF_UP | RTF_GATEWAY;
+    route.rt_dev = request.ifr_name;
+    if (ioctl(socket_fd, SIOCADDRT, &route) < 0) {
+        goto fail;
+    }
+    if (guest_ipv4_matches(socket_fd, address, netmask, gateway_addr) < 0) {
+        goto fail;
+    }
+
+    return close(socket_fd);
+
+fail: {
+        int saved_errno = errno;
+        close(socket_fd);
+        errno = saved_errno;
+        return -1;
+    }
+}
+#else
+static int configure_guest_ipv4(const char *addr, uint16_t prefix, const char *gateway) {
+    (void)addr;
+    (void)prefix;
+    (void)gateway;
+    errno = ENOTSUP;
+    return -1;
+}
+#endif
 
 static void run_guest_network_repair(int serial_fd, const char *json) {
     char addr[64];
@@ -1080,36 +1253,9 @@ static void run_guest_network_repair(int serial_fd, const char *json) {
         }
     }
 
-    char prefix[4];
-    snprintf(prefix, sizeof(prefix), "%u", (unsigned)prefix_u16);
-    char cidr[80];
-    snprintf(cidr, sizeof(cidr), "%s/%s", addr, prefix);
-
-    char *flush_argv[] = {"ip", "addr", "flush", "dev", "eth0", "scope", "global", NULL};
-    int exit_code = run_argv_and_stream_output(serial_fd, flush_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
-        return;
-    }
-
-    char *addr_argv[] = {"ip", "addr", "add", cidr, "dev", "eth0", NULL};
-    exit_code = run_argv_and_stream_output(serial_fd, addr_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
-        return;
-    }
-
-    char *link_argv[] = {"ip", "link", "set", "eth0", "up", NULL};
-    exit_code = run_argv_and_stream_output(serial_fd, link_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
-        return;
-    }
-
-    char *route_argv[] = {"ip", "route", "replace", "default", "via", gateway, NULL};
-    exit_code = run_argv_and_stream_output(serial_fd, route_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
+    if (configure_guest_ipv4(addr, prefix_u16, gateway) < 0) {
+        serial_printf(serial_fd, "guest IPv4 repair failed: %s\n", strerror(errno));
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", 71);
         return;
     }
 

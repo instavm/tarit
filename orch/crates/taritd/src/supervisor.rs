@@ -4129,6 +4129,17 @@ impl VmmSupervisor {
             return Err(self.shutdown_error());
         }
 
+        if self
+            .booting
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?
+            .contains_key(&id)
+        {
+            return Err(OrchError::Conflict(format!(
+                "VM {id} already has a registered boot"
+            )));
+        }
+
         let control = Arc::new(BootControl::new(purpose));
         let socket_path = self.socket_path_for(id);
         self.register_artifact_owner(id)?;
@@ -4185,6 +4196,25 @@ impl VmmSupervisor {
             purpose,
             shape,
         })
+    }
+
+    /// Wait for a boot already registered for this VM. The boot entry and its
+    /// completion signal share one control object, so callers cannot mistake a
+    /// replaced or stale scheduler reservation for the in-flight incarnation.
+    pub(crate) async fn wait_for_registered_boot(&self, id: Uuid) -> Result<bool, OrchError> {
+        let control = self
+            .booting
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?
+            .get(&id)
+            .map(|booting| Arc::clone(&booting.control));
+        let Some(control) = control else {
+            return Ok(false);
+        };
+        tokio::task::spawn_blocking(move || control.wait_for_completion())
+            .await
+            .map_err(|error| OrchError::Internal(format!("wait for registered boot: {error}")))??;
+        Ok(true)
     }
 
     /// Register an operation before spawning its async worker. The API/refill
@@ -8687,57 +8717,6 @@ impl TryFrom<&NetAlloc> for RestoredGuestNetwork {
     }
 }
 
-fn restored_guest_exec(
-    client: &VmmClient,
-    command: &str,
-    operation: &str,
-) -> Result<String, OrchError> {
-    let timeout_ms = u64::try_from(RESTORE_NETWORK_EXEC_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
-    match client.exec(command, timeout_ms) {
-        Ok((0, stdout, _, _)) => Ok(stdout),
-        Ok((exit_code, _, stderr, _)) => Err(OrchError::Vmm(format!(
-            "restore guest network {operation} exited with status {exit_code}: {}",
-            stderr.trim()
-        ))),
-        Err(error) => Err(OrchError::Vmm(format!(
-            "restore guest network {operation}: {error}"
-        ))),
-    }
-}
-
-fn restored_guest_has_address(output: &str, network: RestoredGuestNetwork) -> bool {
-    let expected = format!("{}/{}", network.guest_ip, network.prefix);
-    let addresses = output
-        .lines()
-        .flat_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            fields
-                .windows(2)
-                .filter_map(|fields| (fields[0] == "inet").then_some(fields[1]))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    addresses == [expected.as_str()]
-}
-
-fn restored_guest_has_default_route(output: &str, network: RestoredGuestNetwork) -> bool {
-    let routes = output
-        .lines()
-        .map(str::trim)
-        // Serial console messages can be interleaved after the agent's command
-        // output. Only an exact `ip route` record is relevant; still reject
-        // duplicate or unexpected default-route records fail-closed.
-        .filter(|line| line.split_whitespace().next() == Some("default"))
-        .collect::<Vec<_>>();
-    if routes.len() != 1 {
-        return false;
-    }
-    let gateway = network.gateway.to_string();
-    let fields = routes[0].split_whitespace().collect::<Vec<_>>();
-    fields == ["default", "via", gateway.as_str()]
-        || fields == ["default", "via", gateway.as_str(), "dev", "eth0"]
-}
-
 fn rebind_restored_guest_network(
     socket_path: &Path,
     allocation: &NetAlloc,
@@ -8754,30 +8733,6 @@ fn rebind_restored_guest_network(
             dns_servers: Vec::new(),
         })
         .map_err(|error| OrchError::Vmm(format!("restore guest network rebind: {error}")))?;
-
-    let addresses =
-        restored_guest_exec(&client, "ip -4 -o address show dev eth0", "verify address")?;
-    if !restored_guest_has_address(&addresses, network) {
-        return Err(OrchError::Vmm(format!(
-            "restore guest network address verification failed: expected {}/{} on eth0, got {:?}",
-            network.guest_ip,
-            network.prefix,
-            addresses.trim()
-        )));
-    }
-
-    let routes = restored_guest_exec(
-        &client,
-        "ip -4 route show default dev eth0",
-        "verify default route",
-    )?;
-    if !restored_guest_has_default_route(&routes, network) {
-        return Err(OrchError::Vmm(format!(
-            "restore guest network route verification failed: expected default via {} dev eth0, got {:?}",
-            network.gateway,
-            routes.trim()
-        )));
-    }
 
     Ok(())
 }
@@ -10772,6 +10727,45 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_boot_registration_joins_without_replacing_the_owner() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let ticket = test_runtime()
+            .block_on(supervisor.begin_boot_with_registration(
+                id,
+                SpawnPurpose::Live,
+                ResourceShape::new(1, 1),
+                || async { Ok(()) },
+            ))
+            .unwrap();
+
+        let duplicate = test_runtime().block_on(supervisor.begin_boot_with_registration(
+            id,
+            SpawnPurpose::Live,
+            ResourceShape::new(1, 1),
+            || async { Ok(()) },
+        ));
+        assert!(matches!(duplicate, Err(OrchError::Conflict(_))));
+        assert!(supervisor
+            .booting
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|booting| Arc::ptr_eq(&booting.control, &ticket.control)));
+
+        let waiting_supervisor = Arc::clone(&supervisor);
+        let waiter = thread::spawn(move || {
+            test_runtime().block_on(waiting_supervisor.wait_for_registered_boot(id))
+        });
+        ticket.control.complete(Ok(()));
+        assert!(waiter.join().unwrap().unwrap());
+
+        supervisor.complete_booting(id, &ticket.control, Ok(()));
+        supervisor.release_reservation_after_terminal(id).unwrap();
+        assert!(!supervisor.has_retained_boot(id));
+    }
+
+    #[test]
     fn capacity_rejection_never_runs_durable_registration() {
         let supervisor = test_supervisor();
         for _ in 0..supervisor.config.max_vms {
@@ -11456,7 +11450,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_network_rebind_uses_typed_repair_and_fixed_verification() {
+    fn restored_network_rebind_uses_typed_agent_repair() {
         let socket_path = PathBuf::from(format!(
             "target/taritd-restore-network-{}-{}.sock",
             std::process::id(),
@@ -11464,16 +11458,6 @@ mod tests {
         ));
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let expected = [
-            (
-                "ip -4 -o address show dev eth0",
-                "2: eth0 inet 172.16.0.30/30 scope global eth0\n",
-            ),
-            (
-                "ip -4 route show default dev eth0",
-                "default via 172.16.0.29 dev eth0\n",
-            ),
-        ];
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut length = [0_u8; 4];
@@ -11501,37 +11485,6 @@ mod tests {
                 .unwrap();
             stream.write_all(&encoded).unwrap();
             stream.flush().unwrap();
-
-            for (expected_command, stdout) in expected {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut length = [0_u8; 4];
-                stream.read_exact(&mut length).unwrap();
-                let mut body = vec![0; u32::from_be_bytes(length) as usize];
-                stream.read_exact(&mut body).unwrap();
-                let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
-                match request {
-                    tarit_vmm_client::ApiRequest::Exec {
-                        command,
-                        timeout_ms,
-                    } => {
-                        assert_eq!(command, expected_command);
-                        assert_eq!(timeout_ms, RESTORE_NETWORK_EXEC_TIMEOUT.as_millis() as u64);
-                    }
-                    request => panic!("unexpected restore network request: {request:?}"),
-                }
-                let response = tarit_vmm_client::ApiResponse::Exec {
-                    exit_code: 0,
-                    stdout: stdout.into(),
-                    stderr: String::new(),
-                    duration_ms: 1,
-                };
-                let encoded = serde_json::to_vec(&response).unwrap();
-                stream
-                    .write_all(&(encoded.len() as u32).to_be_bytes())
-                    .unwrap();
-                stream.write_all(&encoded).unwrap();
-                stream.flush().unwrap();
-            }
         });
         let allocation = NetAlloc {
             idx: 7,
@@ -11582,36 +11535,6 @@ mod tests {
             rebind_restored_guest_network(Path::new("missing.sock"), &allocation).unwrap_err();
 
         assert!(error.to_string().contains("parse restored guest IPv4"));
-    }
-
-    #[test]
-    fn restored_network_verification_rejects_stale_guest_state() {
-        let network = RestoredGuestNetwork {
-            guest_ip: "172.16.0.30".parse().unwrap(),
-            gateway: "172.16.0.29".parse().unwrap(),
-            prefix: 30,
-        };
-
-        assert!(!restored_guest_has_address(
-            "2: eth0 inet 172.16.0.2/30 scope global eth0\n",
-            network
-        ));
-        assert!(!restored_guest_has_default_route(
-            "default via 172.16.0.1 dev eth0\n",
-            network
-        ));
-        assert!(restored_guest_has_default_route(
-            "default via 172.16.0.29\n",
-            network
-        ));
-        assert!(restored_guest_has_default_route(
-            "default via 172.16.0.29 dev eth0\n[  OK  ] Started network dispatcher\n",
-            network
-        ));
-        assert!(!restored_guest_has_default_route(
-            "default via 172.16.0.29 dev eth0\ndefault via 172.16.0.1 dev eth0\n",
-            network
-        ));
     }
 
     #[test]

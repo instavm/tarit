@@ -18,8 +18,9 @@ its scope.
   and in an empty process network namespace. taritd retains the host TAP
   topology and passes a validated TAP queue descriptor into the isolated VMM.
 - Restored guests receive typed, validated address, route, gateway, and DNS
-  repair instead of interpolated shell input. Restore readiness verifies the
-  resulting guest address and default route.
+  repair instead of interpolated shell input. The guest agent applies and
+  verifies IPv4 state through the kernel without depending on image-provided
+  network tools, and restore readiness verifies host-to-guest reachability.
 - Per-VM cgroup I/O limits and TAP ingress/egress limits are applied on boot,
   restore, and recovery. Reconciliation removes obsolete limits instead of
   leaving stale throttles in place.
@@ -88,14 +89,15 @@ cross-node replication, and immutable signed-image stop-ships now have focused
 implementation and c8i evidence recorded in the September roadmap. They remain
 regression gates, but the following unresolved items now block release:
 
-1. Extend the passing application-token repair race into concurrent PTY, SSH,
-   HTTP-share, and mixed-ingress tests for application-owned PRNG, nonce, token,
-   and session caches. The current gate holds the child in its repair hook while
-   eight exec requests race the durable `creating` record; every request is
-   rejected or observes only repaired state, and no inherited-token marker is
-   created. Linux 6.6 VMGenID notification and the mandatory userspace repair
-   barrier, plus the Linux 5.10 barrier-only compatibility path, remain required
-   regression gates before any ingress is admitted.
+1. Add application-specific repair workloads for long-lived PRNG state, TLS
+   session keys, nonce allocators, and framework session caches. The current
+   c8i gate holds a hibernated guest in its post-fork hook while exec, PTY, SSH,
+   and public-share requests race activation. All callers join one registered
+   restore and observe only repaired token and HTTP state. This passed twice on
+   Linux 6.6.155 and once on Linux 5.10.230. Linux 6.6 VMGenID notification and
+   the mandatory userspace repair barrier, plus the Linux 5.10 barrier-only
+   compatibility path, remain required regression gates before ingress is
+   admitted.
 2. Pass the remaining phase-by-phase kill, cancellation, dirty-rate
    non-convergence, corruption, and near-ENOSPC rollback tests without source
    pause leaks, duplicate writers, terminal-ID resurrection, or staged files.
