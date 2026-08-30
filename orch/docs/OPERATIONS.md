@@ -8,7 +8,8 @@ This guide covers building, running, clustering, load balancing, deployment help
 - Rust stable toolchain.
 - The rust-vmm based `vmm` binary from the sibling VMM repository.
 - The release ELF `vmlinux` and optional rootfs image readable by `taritd`.
-- `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`.
+- `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`;
+  `cosign` is additionally required when provenance verification is configured.
 - PostgreSQL for distributed cluster mode.
 - `CAP_NET_ADMIN` or root only if `TARIT_ENABLE_NET=true`.
 
@@ -413,3 +414,22 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 | `spawn vmm` fails | Wrong `TARIT_VMM_BIN` or missing execute bit. | Verify path and permissions. |
 | `wait for socket` times out | VMM child failed to create UDS. | Check VMM logs, kernel/rootfs paths, and KVM availability. |
 | Network provisioning fails | Missing privileges or `ip`/`nft`. | Run with required capabilities and verify host networking tools. |
+## OCI image admission and provenance
+
+`taritd image build` resolves a registry tag once with `skopeo inspect`, verifies
+the resulting digest reference with `cosign verify` when a trusted key is
+configured, and passes only that immutable digest reference to the OCI pull.
+The image row records the registry manifest, generated ext4, injected agent,
+and provenance-key SHA-256 digests. VM admission rehashes the rootfs and rejects
+legacy, truncated, substituted, tag-only, or policy-mismatched records before
+the VMM starts.
+
+Production nodes must set both `TARIT_IMAGE_REQUIRE_SIGNATURE=1` and
+`TARIT_IMAGE_COSIGN_KEY=/absolute/path/to/cosign.pub`. Rotate policy by admitting
+the desired images with the new key before removing the old policy. Restoring
+the prior trusted key permits rollback to a previously admitted digest; Tarit
+never resolves its old mutable tag again.
+
+Use `taritd image verify NAME[:TAG]` during rollout and rollback to rehash the
+published ext4 and confirm that the record was admitted by the currently
+trusted provenance key before directing tenant traffic to it.

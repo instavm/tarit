@@ -418,6 +418,328 @@ fn live_snapshot_captures_device_dma() {
     eprintln!("live snapshot device DMA: PASS");
 }
 
+#[cfg(feature = "test-failpoints")]
+struct LiveSnapshotFailpointGuard;
+
+#[cfg(feature = "test-failpoints")]
+impl LiveSnapshotFailpointGuard {
+    fn arm(phase: &str) -> Self {
+        std::env::set_var("TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE", phase);
+        Self
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for LiveSnapshotFailpointGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE");
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+fn regular_file_count(path: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                regular_file_count(&path)
+            } else {
+                usize::from(path.is_file())
+            }
+        })
+        .sum()
+}
+
+/// Every injected failure must resume the authoritative source and remove all
+/// partially written RAM, disk-upper, and integrity artifacts. This is a real
+/// KVM gate rather than a mocked state-machine assertion.
+#[cfg(feature = "test-failpoints")]
+#[test]
+#[ignore = "needs Linux+KVM + reflink storage and an OCI guest fixture"]
+fn live_snapshot_phase_failures_resume_source_and_remove_artifacts() {
+    const PHASES: &[&str] = &[
+        "dirty_logging",
+        "bulk",
+        "dirty_round",
+        "final_pause",
+        "state_capture",
+        "precopy_complete",
+        "snapshot_written",
+        "snapshot_published",
+        "integrity_written",
+        "integrity_published",
+    ];
+
+    let runtime_dir = std::env::temp_dir()
+        .join(".vmm-runtime")
+        .join(format!("vmm-{}", std::process::id()));
+    let overlay_dir = std::env::var_os("VMM_TEST_OVERLAY_DIR")
+        .map(PathBuf::from)
+        .expect("VMM_TEST_OVERLAY_DIR must select reflink storage")
+        .join(std::process::id().to_string());
+
+    for phase in PHASES {
+        let controller = VmmController::new();
+        controller
+            .create_live(agent_vm_config(256))
+            .unwrap_or_else(|error| panic!("create source for {phase}: {error}"));
+        assert_guest_exec(&controller, "printf before-failure", "before-failure");
+        let runtime_before = regular_file_count(&runtime_dir);
+        let overlay_before = regular_file_count(&overlay_dir);
+
+        let failpoint = LiveSnapshotFailpointGuard::arm(phase);
+        let error = controller
+            .live_snapshot(LiveSnapshotConfig::default())
+            .expect_err("phase injection must fail the snapshot");
+        drop(failpoint);
+        assert!(
+            error.to_string().contains(phase),
+            "wrong error for {phase}: {error}"
+        );
+        assert_guest_exec(
+            &controller,
+            &format!("printf source-alive-{phase}"),
+            &format!("source-alive-{phase}"),
+        );
+        assert_eq!(
+            regular_file_count(&runtime_dir),
+            runtime_before,
+            "runtime artifact leaked after {phase}"
+        );
+        assert_eq!(
+            regular_file_count(&overlay_dir),
+            overlay_before,
+            "disk-upper artifact leaked after {phase}"
+        );
+        controller
+            .stop()
+            .unwrap_or_else(|error| panic!("stop source after {phase}: {error}"));
+        eprintln!("live snapshot injected phase {phase}: PASS");
+    }
+}
+
+/// A deliberately non-convergent live snapshot on a guest larger than the
+/// ordinary 256/512 MiB correctness fixtures. The source must resume after a
+/// bounded final stop, and the restored guest must retain data outside the
+/// continuously dirtied working set.
+#[test]
+#[ignore = "needs Linux+KVM + reflink storage and a large OCI guest fixture"]
+fn live_snapshot_large_memory_high_dirty() {
+    let memory_mib = std::env::var("VMM_TEST_LARGE_MEMORY_MIB")
+        .ok()
+        .map(|value| value.parse::<u64>().expect("VMM_TEST_LARGE_MEMORY_MIB"))
+        .unwrap_or(1024);
+    assert!(
+        (1024..=vmm_core::config::MAX_MEMORY_MIB).contains(&memory_mib),
+        "large-memory gate must exercise a supported guest of at least 1 GiB"
+    );
+    let churn_mib = (memory_mib / 2).min(1024);
+
+    let controller = VmmController::new();
+    controller
+        .create_live(agent_vm_config(memory_mib))
+        .expect("create large live VM");
+    assert_guest_exec(
+        &controller,
+        "printf large-source-ready",
+        "large-source-ready",
+    );
+    guest_stdout(
+        &controller,
+        &format!(
+            "mkdir -p {GUEST_RAM_DIR}; mount -t tmpfs -o size={}m tmpfs {GUEST_RAM_DIR}; \
+             dd if=/dev/urandom of={GUEST_RAM_DIR}/immutable bs=1M count=16 status=none; \
+             dd if=/dev/zero of={GUEST_RAM_DIR}/churn bs=1M count={churn_mib} status=none; sync",
+            churn_mib + 64
+        ),
+    );
+    let source_digest = guest_stdout(
+        &controller,
+        &format!("sha256sum {GUEST_RAM_DIR}/immutable | cut -d' ' -f1"),
+    )
+    .trim()
+    .to_owned();
+    assert_eq!(source_digest.len(), 64, "unexpected source digest");
+
+    guest_stdout(
+        &controller,
+        &format!(
+            "nohup sh -c 'while [ ! -f {GUEST_RAM_DIR}/stop-churn ]; do \
+             dd if=/dev/zero of={GUEST_RAM_DIR}/churn bs=1M count={churn_mib} \
+             conv=notrunc status=none; done' </dev/null >/dev/null 2>&1 & \
+             echo $! >{GUEST_RAM_DIR}/churn.pid; printf churn-started"
+        ),
+    );
+
+    let config = LiveSnapshotConfig {
+        target_downtime_us: 500,
+        max_rounds: 8,
+        timeout_secs: 30,
+    };
+    let result = controller
+        .live_snapshot(config.clone())
+        .expect("bounded high-dirty live snapshot");
+    eprintln!(
+        "large high-dirty snapshot: memory={}MiB rounds={} pages={} residual={} decision={:?} termination={:?} downtime={:?} elapsed={:?}",
+        memory_mib,
+        result.rounds,
+        result.pages_copied,
+        result.final_dirty_pages,
+        result.final_decision,
+        result.termination,
+        result.downtime,
+        result.elapsed
+    );
+    assert_eq!(result.mem_bytes, memory_mib << 20);
+    assert!(result.rounds >= 2, "pre-copy did not sample dirtying");
+    assert!(
+        matches!(
+            result.termination,
+            vmm_core::LiveSnapshotTermination::Diverging
+                | vmm_core::LiveSnapshotTermination::Timeout
+                | vmm_core::LiveSnapshotTermination::MaxRounds
+        ),
+        "the sustained tmpfs rewrite unexpectedly converged: {:?}",
+        result.termination
+    );
+    assert!(
+        result.final_dirty_pages >= 256,
+        "high-dirty final stop copied less than 1 MiB; workload was ineffective"
+    );
+    assert!(
+        result.elapsed <= std::time::Duration::from_secs(config.timeout_secs + 5),
+        "high-dirty snapshot exceeded its hard bound: {:?}",
+        result.elapsed
+    );
+    assert!(
+        result.downtime < std::time::Duration::from_secs(2),
+        "bounded final stop took {:?}",
+        result.downtime
+    );
+
+    let source_after = guest_stdout(
+        &controller,
+        &format!(
+            "touch {GUEST_RAM_DIR}/stop-churn; sha256sum {GUEST_RAM_DIR}/immutable | cut -d' ' -f1"
+        ),
+    );
+    assert_eq!(
+        source_after.trim(),
+        source_digest,
+        "source changed or stalled"
+    );
+
+    let restore_controller = VmmController::new();
+    restore_controller
+        .restore(
+            &result.snapshot_path,
+            Some(
+                private_overlay_path("large-high-dirty-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore large high-dirty snapshot");
+    let restored_digest = guest_stdout(
+        &restore_controller,
+        &format!(
+            "touch {GUEST_RAM_DIR}/stop-churn; sha256sum {GUEST_RAM_DIR}/immutable | cut -d' ' -f1"
+        ),
+    );
+    assert_eq!(
+        restored_digest.trim(),
+        source_digest,
+        "large high-dirty restore corrupted immutable guest memory"
+    );
+    restore_controller.stop().expect("stop restored VM");
+    controller.stop().expect("stop source VM");
+    eprintln!("large high-dirty live snapshot: PASS");
+}
+
+/// Prove that configured RAM beyond the x86 MMIO aperture is present in a
+/// second KVM slot, remains packed in the VMSN artifact, and survives lazy
+/// restore. This is separate from the high-dirty latency gate so storage speed
+/// cannot obscure the address-layout invariant.
+#[test]
+#[ignore = "needs Linux+KVM + reflink storage and a 4 GiB OCI guest fixture"]
+fn split_memory_above_mmio_gap_live_snapshot_restore() {
+    let memory_mib = std::env::var("VMM_TEST_SPLIT_MEMORY_MIB")
+        .ok()
+        .map(|value| value.parse::<u64>().expect("VMM_TEST_SPLIT_MEMORY_MIB"))
+        .unwrap_or(4096);
+    assert!(
+        memory_mib > 3328 && memory_mib <= vmm_core::config::MAX_MEMORY_MIB,
+        "split-memory gate must cross the 3.25 GiB aperture"
+    );
+
+    let controller = VmmController::new();
+    controller
+        .create_live(agent_vm_config(memory_mib))
+        .expect("boot split-memory VM");
+    let mem_total_kib = guest_stdout(
+        &controller,
+        "awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo",
+    )
+    .trim()
+    .parse::<u64>()
+    .expect("numeric guest MemTotal");
+    assert!(
+        mem_total_kib > 3_500_000,
+        "guest lost high memory: MemTotal={mem_total_kib} KiB"
+    );
+    assert_guest_exec(
+        &controller,
+        "awk '$1 ~ /^100000000-/ && /System RAM/ { found=1 } END { if (found) print \"high-ram-ok\"; else exit 1 }' /proc/iomem",
+        "high-ram-ok",
+    );
+    assert_guest_exec(
+        &controller,
+        "mkdir -p /run/split-memory; mount -t tmpfs -o size=64m tmpfs /run/split-memory; dd if=/dev/urandom of=/run/split-memory/proof bs=1M count=32 status=none; sha256sum /run/split-memory/proof > /run/split-memory/proof.sha256; echo split-proof-ready",
+        "split-proof-ready",
+    );
+
+    let result = controller
+        .live_snapshot(LiveSnapshotConfig {
+            target_downtime_us: 2_000,
+            max_rounds: 8,
+            timeout_secs: 60,
+        })
+        .expect("live snapshot split-memory VM");
+    assert_eq!(result.mem_bytes, memory_mib << 20);
+    assert_guest_exec(
+        &controller,
+        "printf split-source-alive",
+        "split-source-alive",
+    );
+
+    let restored = VmmController::new();
+    restored
+        .restore(
+            &result.snapshot_path,
+            Some(
+                private_overlay_path("split-memory-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("lazy restore split-memory snapshot");
+    assert_guest_exec(
+        &restored,
+        "sha256sum -c /run/split-memory/proof.sha256 && awk '$1 ~ /^100000000-/ && /System RAM/ { found=1 } END { if (found) print \"split-restore-ok\"; else exit 1 }' /proc/iomem",
+        "split-restore-ok",
+    );
+    restored.stop().expect("stop split-memory restore");
+    controller.stop().expect("stop split-memory source");
+    eprintln!(
+        "split memory live snapshot/restore: PASS ({} MiB, {:?} downtime)",
+        memory_mib, result.downtime
+    );
+}
+
 /// Performance gates.
 /// Cold boot latency (p50/p99), restore latency, snapshot latency.
 #[test]
@@ -936,17 +1258,18 @@ fn cold_boot_benchmark_100() {
 fn oci_cold_boot_pull_pipeline() {
     use vmm_core::oci::{pull_and_convert, OciImageRef};
 
-    // Pick alpine:3 — ~5 MB, single layer, fastest to validate the pipeline.
-    // (Debian:slim is ~30 MB; we don't need apt-get for this gate, only that
-    // pull+convert produces a bootable ext4 image.)
+    // Exercise the production-default distro rather than a tiny synthetic
+    // image. CI may override the immutable reference for a pinned mirror.
+    let reference = std::env::var("VMM_TEST_OCI_IMAGE")
+        .unwrap_or_else(|_| "docker://docker.io/library/ubuntu:24.04".into());
     let image = OciImageRef {
-        reference: "docker://docker.io/library/alpine:3".into(),
+        reference,
         auth_file: None,
     };
-    let out = std::env::temp_dir().join("vmm-oci-bench-alpine.ext4");
+    let out = std::env::temp_dir().join("vmm-oci-pipeline.ext4");
 
     let t0 = Instant::now();
-    let result = pull_and_convert(&image, &out, 256).expect("OCI pull and conversion must succeed");
+    let result = pull_and_convert(&image, &out, 512).expect("OCI pull and conversion must succeed");
     let pull_ms = t0.elapsed().as_millis();
 
     eprintln!(

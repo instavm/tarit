@@ -64,13 +64,17 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
-use tarit_store::Store;
+use tarit_store::{Store, VolumeTransition};
 use tarit_types::{
-    AuditEvent, CreateShareRequest, CreateVmRequest, EgressUpdateRequest, ErrorBody,
-    ExecuteRequest, ExecutionRecord, ExecutionStatus, OrchError, PublicVmRecord, ShareRecord,
-    ShareTokenResponse, ShareVisibility, SnapshotRequest, UpdateShareRequest, UsageEvent,
-    UsageSummary, VmRecord, VmStatus,
+    AuditEvent, BranchRecord, CreateBranchRequest, CreateShareRequest, CreateVmRequest,
+    CreateVolumeRequest, EgressPolicyRecord, EgressUpdateRequest, ErrorBody, ExecuteRequest,
+    ExecutionRecord, ExecutionStatus, ForkVmRequest, ForkVmResponse, OrchError, PublicVmRecord,
+    PublicVolumeRecord, PutEgressPolicyRequest, RestoreBranchRequest, ShareRecord,
+    ShareTokenResponse, ShareVisibility, SnapshotRequest, SnapshotResponse,
+    UpdateBranchHeadRequest, UpdateShareRequest, UsageEvent, UsageSummary, VmRecord, VmStatus,
+    VolumeCapabilities, VolumeRecord, VolumeStatus, VolumeStorageClass,
 };
+use tarit_volume::{VolumeError, MIN_BLOCK_VOLUME_BYTES};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -219,6 +223,10 @@ pub struct AppState {
     /// Creating records before VMM work; this map then owns publication and
     /// terminal retry progress until reservations can be released.
     pub(crate) lifecycle: Arc<Mutex<HashMap<Uuid, LifecycleState>>>,
+    /// One async mutex per logical VM serializes hibernation activation. All
+    /// ingress paths share this gate so an HTTP/PTY/SSH burst starts exactly
+    /// one replacement VMM and the remaining callers await its publication.
+    pub(crate) activation_gates: Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
     #[cfg(test)]
     pub(crate) lifecycle_faults: Arc<Mutex<Vec<LifecycleFault>>>,
     #[cfg(test)]
@@ -488,6 +496,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vms", post(create_vm).get(list_vms))
         .route("/v1/vms/{id}", get(get_vm).delete(delete_vm))
         .route("/v1/vms/{id}/status", get(vm_status))
+        .route("/v1/vms/{id}/balloon", get(get_balloon).put(set_balloon))
         .route(
             "/v1/vms/{id}/pty/sessions",
             post(crate::pty::create_session).get(crate::pty::list_sessions),
@@ -502,13 +511,30 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/vms/{id}/pause", post(pause_vm))
         .route("/v1/vms/{id}/suspend", post(suspend_vm))
+        .route("/v1/vms/{id}/hibernate", post(hibernate_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
         .route("/v1/vms/{id}/snapshot", post(snapshot_vm))
+        .route("/v1/vms/{id}/fork", post(fork_vm))
         .route("/v1/restore", post(restore_vm))
         .route("/v1/execute_async", post(execute_async))
         .route("/v1/execute", post(execute))
         .route("/v1/executions/{id}", get(get_execution))
+        .route("/v1/volumes", post(create_volume).get(list_volumes))
+        .route("/v1/volumes/{id}", get(get_volume).delete(delete_volume))
         .route("/v1/egress/vm/{id}", patch(update_egress))
+        .route("/v1/branches", post(create_branch).get(list_branches))
+        .route(
+            "/v1/branches/{id}",
+            get(get_branch)
+                .put(update_branch_head)
+                .delete(delete_branch),
+        )
+        .route("/v1/branches/{id}/restore", post(restore_branch))
+        .route("/v1/branches/{id}/fork", post(restore_branch))
+        .route(
+            "/v1/vms/{id}/egress-policy",
+            get(get_egress_policy).put(put_egress_policy),
+        )
         .route("/v1/shares", post(create_share).get(list_shares))
         .route(
             "/v1/shares/{id}",
@@ -1088,6 +1114,502 @@ fn record_share_audit(
         .map_err(|_| ShareApiError::audit_unavailable(action))
 }
 
+fn validate_volume_name(name: &str) -> Result<(), OrchError> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(OrchError::BadRequest(
+            "volume name must be 1..=128 ASCII [A-Za-z0-9._-] bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn volume_provider_error(id: Uuid, error: VolumeError) -> OrchError {
+    match error {
+        VolumeError::Invalid(message) => OrchError::BadRequest(message),
+        VolumeError::NotFound => OrchError::NotFound(format!("volume {id}")),
+        VolumeError::Conflict => OrchError::Conflict(format!(
+            "volume {id} has different immutable provider properties"
+        )),
+        VolumeError::Unsupported(message) => OrchError::Unprocessable(message),
+        VolumeError::IdentityMismatch => {
+            tracing::error!(volume_id = %id, "volume provider identity/generation mismatch");
+            OrchError::Conflict(format!("volume {id} attachment identity changed"))
+        }
+        VolumeError::Busy => OrchError::Conflict(format!("volume {id} is busy")),
+        VolumeError::Timeout => OrchError::Unavailable(format!("volume {id} provider timed out")),
+        VolumeError::UnsafeObject | VolumeError::Io(_) => {
+            tracing::error!(volume_id = %id, %error, "volume provider failed closed");
+            OrchError::Internal("volume provider operation failed".into())
+        }
+    }
+}
+
+fn public_volume(record: VolumeRecord) -> PublicVolumeRecord {
+    PublicVolumeRecord::from(record)
+}
+
+pub(crate) fn volume_fleet_err(error: tarit_fleet::FleetError) -> OrchError {
+    match error {
+        tarit_fleet::FleetError::NotFound => OrchError::NotFound("volume not found".into()),
+        tarit_fleet::FleetError::Conflict(message) => OrchError::Conflict(message),
+        other => OrchError::Internal(format!("fleet volume operation: {other}")),
+    }
+}
+
+async fn create_volume(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(request): Json<CreateVolumeRequest>,
+) -> Result<(StatusCode, Json<PublicVolumeRecord>), ApiError> {
+    validate_volume_name(&request.name)?;
+    let max_size_bytes = crate::volume_provider::max_size_bytes(&state.config, &request.provider)
+        .ok_or_else(|| {
+        OrchError::Unprocessable(format!(
+            "volume provider {:?} is not configured on this host",
+            request.provider
+        ))
+    })?;
+    if !(MIN_BLOCK_VOLUME_BYTES..=max_size_bytes).contains(&request.size_bytes) {
+        return Err(OrchError::BadRequest(format!(
+            "block volume size must be between {MIN_BLOCK_VOLUME_BYTES} and {max_size_bytes} bytes"
+        ))
+        .into());
+    }
+    let id = request.id.unwrap_or_else(Uuid::new_v4);
+    let provider = crate::volume_provider::open(&state.config, &request.provider)?;
+    let placement = crate::volume_provider::placement(&state.config, &request.provider)?;
+    let capabilities = provider.capabilities();
+    let now = Utc::now();
+    let desired = VolumeRecord {
+        id,
+        owner_key: identity.tenant.clone(),
+        name: request.name,
+        provider: provider.provider_name().into(),
+        storage_class: VolumeStorageClass::Block,
+        size_bytes: request.size_bytes,
+        status: VolumeStatus::Creating,
+        capabilities: VolumeCapabilities {
+            read_only_many: capabilities.read_only_many,
+            read_write_once: capabilities.read_write_once,
+            read_write_many: capabilities.read_write_many,
+            snapshots: capabilities.snapshots,
+            clones: capabilities.clones,
+        },
+        host_id: placement.host_id,
+        region: placement.region,
+        zone: placement.zone,
+        generation: 1,
+        revision: 1,
+        last_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let (fleet_persisted, existed) = if let Some(fleet) = &state.fleet {
+        let existed = fleet.get_volume(&identity.tenant, id).await.is_ok();
+        let persisted = fleet
+            .insert_volume(&desired)
+            .await
+            .map_err(volume_fleet_err)?;
+        (Some(persisted), existed)
+    } else {
+        (None, false)
+    };
+    let (local_persisted, local_existed) = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock".into()))?;
+        let existed = store.get_volume(&identity.tenant, id).is_ok();
+        let persisted = store.insert_volume(&desired).map_err(store_err)?;
+        (persisted, existed)
+    };
+    let persisted = fleet_persisted.unwrap_or_else(|| local_persisted.clone());
+    let existed = if state.fleet.is_some() {
+        existed
+    } else {
+        local_existed
+    };
+    if persisted.status == VolumeStatus::Deleting {
+        return Err(OrchError::Conflict(format!("volume {id} is deleting")).into());
+    }
+
+    let size_bytes = persisted.size_bytes;
+    let provider_result = tokio::task::spawn_blocking(move || provider.create(id, size_bytes))
+        .await
+        .map_err(|error| OrchError::Internal(format!("volume provider join: {error}")))?;
+    let record = match provider_result {
+        Ok(_) => {
+            let authoritative = if persisted.status == VolumeStatus::Available {
+                persisted
+            } else if let Some(fleet) = &state.fleet {
+                fleet
+                    .transition_volume(
+                        &identity.tenant,
+                        id,
+                        VolumeTransition {
+                            expected_status: persisted.status,
+                            expected_revision: persisted.revision,
+                            status: VolumeStatus::Available,
+                            last_error: None,
+                            updated_at: Utc::now(),
+                        },
+                    )
+                    .await
+                    .map_err(volume_fleet_err)?
+            } else {
+                state
+                    .store
+                    .lock()
+                    .map_err(|_| OrchError::Internal("store lock".into()))?
+                    .transition_volume(
+                        &identity.tenant,
+                        id,
+                        VolumeTransition {
+                            expected_status: persisted.status,
+                            expected_revision: persisted.revision,
+                            status: VolumeStatus::Available,
+                            last_error: None,
+                            updated_at: Utc::now(),
+                        },
+                    )
+                    .map_err(store_err)?
+            };
+            if state.fleet.is_some() && local_persisted.status != VolumeStatus::Available {
+                state
+                    .store
+                    .lock()
+                    .map_err(|_| OrchError::Internal("store lock".into()))?
+                    .transition_volume(
+                        &identity.tenant,
+                        id,
+                        VolumeTransition {
+                            expected_status: local_persisted.status,
+                            expected_revision: local_persisted.revision,
+                            status: VolumeStatus::Available,
+                            last_error: None,
+                            updated_at: Utc::now(),
+                        },
+                    )
+                    .map_err(store_err)?;
+            }
+            authoritative
+        }
+        Err(error) => {
+            let safe_error = error.to_string();
+            if persisted.status != VolumeStatus::Error {
+                if let Some(fleet) = &state.fleet {
+                    if let Err(transition_error) = fleet
+                        .transition_volume(
+                            &identity.tenant,
+                            id,
+                            VolumeTransition {
+                                expected_status: persisted.status,
+                                expected_revision: persisted.revision,
+                                status: VolumeStatus::Error,
+                                last_error: Some(&safe_error),
+                                updated_at: Utc::now(),
+                            },
+                        )
+                        .await
+                    {
+                        tracing::error!(volume_id = %id, %transition_error,
+                            "failed to persist fleet volume provider error");
+                    }
+                }
+                let transition_result = state
+                    .store
+                    .lock()
+                    .map_err(|_| OrchError::Internal("store lock".into()))?
+                    .transition_volume(
+                        &identity.tenant,
+                        id,
+                        VolumeTransition {
+                            expected_status: persisted.status,
+                            expected_revision: persisted.revision,
+                            status: VolumeStatus::Error,
+                            last_error: Some(&safe_error),
+                            updated_at: Utc::now(),
+                        },
+                    );
+                if let Err(transition_error) = transition_result {
+                    tracing::error!(volume_id = %id, %transition_error,
+                        "failed to persist volume provider error");
+                }
+            }
+            return Err(volume_provider_error(id, error).into());
+        }
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::CREATE_VOLUME,
+        None,
+        audit_outcome::OK,
+        None,
+    );
+    let status = if existed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(public_volume(record))))
+}
+
+async fn list_volumes(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> Result<Json<Vec<PublicVolumeRecord>>, ApiError> {
+    let records = if let Some(fleet) = &state.fleet {
+        fleet
+            .list_volumes(&identity.tenant)
+            .await
+            .map_err(volume_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock".into()))?
+            .list_volumes(&identity.tenant)
+            .map_err(store_err)?
+    };
+    Ok(Json(records.into_iter().map(public_volume).collect()))
+}
+
+async fn get_volume(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PublicVolumeRecord>, ApiError> {
+    let record = if let Some(fleet) = &state.fleet {
+        fleet
+            .get_volume(&identity.tenant, id)
+            .await
+            .map_err(volume_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock".into()))?
+            .get_volume(&identity.tenant, id)
+            .map_err(store_err)?
+    };
+    Ok(Json(public_volume(record)))
+}
+
+async fn delete_volume(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(fleet) = &state.fleet {
+        let current = fleet
+            .get_volume(&identity.tenant, id)
+            .await
+            .map_err(volume_fleet_err)?;
+        if current
+            .host_id
+            .as_deref()
+            .is_some_and(|host_id| host_id != state.config.host_id)
+        {
+            let host_id = current
+                .host_id
+                .ok_or_else(|| OrchError::Conflict(format!("volume {id} has no owning host")))?;
+            let target = cluster::peer_rpc(&state, &host_id)
+                .await?
+                .ok_or_else(|| OrchError::Unavailable(format!("volume host {host_id} is down")))?;
+            let peer = Arc::clone(&state.peer);
+            tokio::task::spawn_blocking(move || peer.delete_volume_remote(&target, id, &identity))
+                .await
+                .map_err(|error| OrchError::Internal(format!("volume delete join: {error}")))??;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+    }
+    delete_volume_local(&state, &identity, id).await
+}
+
+pub(crate) async fn delete_volume_local(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> Result<StatusCode, ApiError> {
+    let current = if let Some(fleet) = &state.fleet {
+        fleet
+            .get_volume(&identity.tenant, id)
+            .await
+            .map_err(volume_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock".into()))?
+            .get_volume(&identity.tenant, id)
+            .map_err(store_err)?
+    };
+    let attachment_count = if let Some(fleet) = &state.fleet {
+        fleet
+            .volume_attachment_count(&identity.tenant, id)
+            .await
+            .map_err(volume_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock".into()))?
+            .volume_attachment_count(&identity.tenant, id)
+            .map_err(store_err)?
+    };
+    if attachment_count != 0 {
+        return Err(OrchError::Conflict(format!(
+            "volume {id} is attached to {attachment_count} VM(s)"
+        ))
+        .into());
+    }
+    let deleting = match current.status {
+        VolumeStatus::Deleting => current,
+        VolumeStatus::Available | VolumeStatus::Error => {
+            if let Some(fleet) = &state.fleet {
+                fleet
+                    .begin_volume_delete(
+                        &identity.tenant,
+                        id,
+                        current.status,
+                        current.revision,
+                        Utc::now(),
+                    )
+                    .await
+                    .map_err(volume_fleet_err)?
+            } else {
+                state
+                    .store
+                    .lock()
+                    .map_err(|_| OrchError::Internal("store lock".into()))?
+                    .begin_volume_delete(
+                        &identity.tenant,
+                        id,
+                        current.status,
+                        current.revision,
+                        Utc::now(),
+                    )
+                    .map_err(store_err)?
+            }
+        }
+        VolumeStatus::Creating => {
+            return Err(OrchError::Conflict(format!("volume {id} is creating")).into())
+        }
+    };
+    if state.fleet.is_some() {
+        let local = {
+            let store = state
+                .store
+                .lock()
+                .map_err(|_| OrchError::Internal("store lock".into()))?;
+            match store.get_volume(&identity.tenant, id) {
+                Ok(local) => local,
+                Err(tarit_store::StoreError::NotFound) => {
+                    store.insert_volume(&deleting).map_err(store_err)?
+                }
+                Err(error) => return Err(store_err(error).into()),
+            }
+        };
+        if local.status != VolumeStatus::Deleting {
+            state
+                .store
+                .lock()
+                .map_err(|_| OrchError::Internal("store lock".into()))?
+                .begin_volume_delete(
+                    &identity.tenant,
+                    id,
+                    local.status,
+                    local.revision,
+                    Utc::now(),
+                )
+                .map_err(store_err)?;
+        }
+    }
+    let provider = crate::volume_provider::open(&state.config, &deleting.provider)?;
+    let provider_result = tokio::task::spawn_blocking(move || provider.delete(id))
+        .await
+        .map_err(|error| OrchError::Internal(format!("volume provider join: {error}")))?;
+    if let Err(error) = provider_result {
+        if !matches!(error, VolumeError::NotFound) {
+            let safe_error = error.to_string();
+            if let Some(fleet) = &state.fleet {
+                if let Err(transition_error) = fleet
+                    .transition_volume(
+                        &identity.tenant,
+                        id,
+                        VolumeTransition {
+                            expected_status: VolumeStatus::Deleting,
+                            expected_revision: deleting.revision,
+                            status: VolumeStatus::Error,
+                            last_error: Some(&safe_error),
+                            updated_at: Utc::now(),
+                        },
+                    )
+                    .await
+                {
+                    tracing::error!(volume_id = %id, %transition_error,
+                        "failed to persist fleet volume deletion error");
+                }
+            }
+            let transition_result = state
+                .store
+                .lock()
+                .map_err(|_| OrchError::Internal("store lock".into()))?
+                .transition_volume(
+                    &identity.tenant,
+                    id,
+                    VolumeTransition {
+                        expected_status: VolumeStatus::Deleting,
+                        expected_revision: deleting.revision,
+                        status: VolumeStatus::Error,
+                        last_error: Some(&safe_error),
+                        updated_at: Utc::now(),
+                    },
+                );
+            if let Err(transition_error) = transition_result {
+                tracing::error!(volume_id = %id, %transition_error,
+                    "failed to persist volume deletion error");
+            }
+            return Err(volume_provider_error(id, error).into());
+        }
+    }
+    let local_delete = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock".into()))?;
+        store
+            .get_volume(&identity.tenant, id)
+            .and_then(|local| store.delete_volume_metadata(&identity.tenant, id, local.revision))
+    };
+    if let Err(error) = local_delete {
+        if !matches!(error, tarit_store::StoreError::NotFound) {
+            return Err(store_err(error).into());
+        }
+    }
+    if let Some(fleet) = &state.fleet {
+        fleet
+            .delete_volume_metadata(&identity.tenant, id, deleting.revision)
+            .await
+            .map_err(volume_fleet_err)?;
+    }
+    audit::record(
+        state,
+        identity,
+        audit_action::DELETE_VOLUME,
+        None,
+        audit_outcome::OK,
+        None,
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn metrics_handler(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
@@ -1143,6 +1665,7 @@ async fn create_vm_impl(
     req.api_key_id = Some(identity.api_key_id.clone());
     let id = *req.id.get_or_insert_with(Uuid::new_v4);
     enforce_create_path_policy(identity, &req)?;
+    enforce_image_admission_policy(identity, &req, &state.config.image_admission_policy)?;
     match cluster::resolve_owner(state, id).await {
         Ok(_) => {
             return Err(OrchError::Conflict(format!("vm {id} already exists")).into());
@@ -1161,11 +1684,46 @@ async fn create_vm_impl(
     result
 }
 
+fn enforce_image_admission_policy(
+    identity: &ApiIdentity,
+    request: &CreateVmRequest,
+    policy: &crate::image::ImageAdmissionPolicy,
+) -> Result<(), OrchError> {
+    if policy.require_signature && !identity.is_admin() && request.image.is_none() {
+        return Err(OrchError::Unprocessable(
+            "production admission requires an OCI image verified by the configured provenance key"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn create_vm_after_quota(
     state: &AppState,
     identity: &ApiIdentity,
     req: CreateVmRequest,
 ) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
+    let exact_volume_host = requested_volume_host(state, identity, &req).await?;
+    if let Some(target_host) = exact_volume_host.as_deref() {
+        if target_host != state.config.host_id {
+            let target = cluster::peer_rpc(state, target_host)
+                .await?
+                .ok_or_else(|| {
+                    OrchError::Unavailable(format!(
+                        "persistent-volume host {target_host} is not healthy"
+                    ))
+                })?;
+            let peer = Arc::clone(&state.peer);
+            let forwarded = req.clone();
+            let identity = identity.clone();
+            let record = tokio::task::spawn_blocking(move || {
+                peer.create_remote(&target, &forwarded, &identity)
+            })
+            .await
+            .map_err(|error| OrchError::Internal(format!("volume placement join: {error}")))??;
+            return Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record))));
+        }
+    }
     // Cluster admission: place locally (warm/cold) if this node has room; else
     // spill to ANY peer that has capacity (exhaustive). Only if the WHOLE
     // cluster is full do we wait for a slot to free, and only after the
@@ -1178,6 +1736,16 @@ async fn create_vm_after_quota(
             Err(OrchError::Overloaded { message, .. }) => message, // local full — try the rest of the fleet
             Err(e) => return Err(e.into()),
         };
+
+        if exact_volume_host.is_some() {
+            return Err(OrchError::Overloaded {
+                message: format!(
+                    "the exact host for local persistent volumes is at capacity: {last_overloaded}"
+                ),
+                retry_after_secs: 1,
+            }
+            .into());
+        }
 
         if state.fleet.is_some() {
             if let Some(record) = place_on_peer(state, &req, identity).await? {
@@ -1206,6 +1774,45 @@ async fn create_vm_after_quota(
         }
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
+}
+
+/// Resolve the exact host required by any node-local block volumes. Shared
+/// regional block volumes do not constrain cluster placement; mixed local and
+/// shared requests follow the local volume's host.
+async fn requested_volume_host(
+    state: &AppState,
+    identity: &ApiIdentity,
+    request: &CreateVmRequest,
+) -> Result<Option<String>, OrchError> {
+    if request.volumes.is_empty() {
+        return Ok(None);
+    }
+    let Some(fleet) = &state.fleet else {
+        return Ok(Some(state.config.host_id.clone()));
+    };
+    let mut target = None;
+    let mut seen = std::collections::HashSet::new();
+    for requested in &request.volumes {
+        if !seen.insert(requested.volume_id) {
+            return Err(OrchError::BadRequest(format!(
+                "volume {} is attached more than once",
+                requested.volume_id
+            )));
+        }
+        let volume = fleet
+            .get_volume(&identity.tenant, requested.volume_id)
+            .await
+            .map_err(volume_fleet_err)?;
+        if let Some(host) = crate::volume_provider::placement_target(&state.config, &volume)? {
+            if target.as_ref().is_some_and(|current| current != &host) {
+                return Err(OrchError::Conflict(
+                    "requested local block volumes are pinned to different hosts".into(),
+                ));
+            }
+            target = Some(host);
+        }
+    }
+    Ok(target)
 }
 
 pub(crate) fn enforce_create_path_policy(
@@ -1287,18 +1894,16 @@ fn is_network_pool_exhausted(message: &str) -> bool {
 async fn restore_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
-    Json(mut req): Json<RestoreRequest>,
+    Json(req): Json<RestoreRequest>,
 ) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
-    req.owner_key = Some(identity.tenant.clone());
-    req.api_key_id = Some(identity.api_key_id.clone());
-    let id = *req.id.get_or_insert_with(Uuid::new_v4);
+    let id = req.id.unwrap_or_else(Uuid::new_v4);
     match cluster::resolve_owner(&state, id).await {
         Ok(_) => return Err(OrchError::Conflict(format!("vm {id} already exists")).into()),
         Err(OrchError::NotFound(_)) => {}
         Err(error) => return Err(error.into()),
     }
     let reserved = reserve_vm_quota(&state, &identity, id).await?;
-    let result = restore_vm_after_quota(&state, &identity, req).await;
+    let result = restore_vm_after_quota(&state, &identity, req.snapshot_id, id).await;
     if reserved {
         if let Err(error) = release_vm_quota(&state, &identity, id).await {
             tracing::warn!(vm = %id, tenant = %identity.tenant, %error,
@@ -1311,28 +1916,32 @@ async fn restore_vm(
 async fn restore_vm_after_quota(
     state: &AppState,
     identity: &ApiIdentity,
-    req: RestoreRequest,
+    snapshot_id: Uuid,
+    id: Uuid,
 ) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
-    let on_peer = match &req.host_id {
-        Some(h) if *h != state.config.host_id => cluster::peer_rpc(state, h).await?,
-        _ => None,
+    let (host_id, snapshot_path) = resolve_snapshot_locator(state, identity, snapshot_id).await?;
+    let on_peer = if host_id != state.config.host_id {
+        cluster::peer_rpc(state, &host_id).await?
+    } else {
+        None
     };
     let record = match on_peer {
         Some(rpc) => {
             let peer = Arc::clone(&state.peer);
-            let req = req.clone();
             let identity = identity.clone();
-            tokio::task::spawn_blocking(move || peer.restore_remote(&rpc, &req, &identity))
-                .await
-                .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+            tokio::task::spawn_blocking(move || {
+                peer.restore_remote(&rpc, &snapshot_path, id, &identity)
+            })
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))??
         }
         None => {
             ops::restore_local(
                 state,
-                &req.snapshot_path,
-                req.id,
-                req.owner_key,
-                req.api_key_id,
+                &snapshot_path,
+                Some(id),
+                Some(identity.tenant.clone()),
+                Some(identity.api_key_id.clone()),
                 identity.is_admin(),
             )
             .await?
@@ -1347,6 +1956,38 @@ async fn restore_vm_after_quota(
         None,
     );
     Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record))))
+}
+
+async fn resolve_snapshot_locator(
+    state: &AppState,
+    identity: &ApiIdentity,
+    snapshot_id: Uuid,
+) -> Result<(String, String), ApiError> {
+    let local = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .get_snapshot_by_id(snapshot_id)
+        .map_err(store_err)?;
+    if let Some(snapshot) = local {
+        if !identity.is_admin() && snapshot.owner_key.as_deref() != Some(&identity.tenant) {
+            return Err(OrchError::NotFound("snapshot not found".into()).into());
+        }
+        return Ok((snapshot.host_id, snapshot.path));
+    }
+    if let Some(fleet) = state.fleet.as_ref() {
+        if let Some(snapshot) = fleet
+            .get_snapshot_location(snapshot_id)
+            .await
+            .map_err(|error| OrchError::Internal(format!("fleet snapshot lookup: {error}")))?
+        {
+            if !identity.is_admin() && snapshot.owner_key != identity.tenant {
+                return Err(OrchError::NotFound("snapshot not found".into()).into());
+            }
+            return Ok((snapshot.host_id, snapshot.snapshot_path));
+        }
+    }
+    Err(OrchError::NotFound("snapshot not found".into()).into())
 }
 
 /// Build a `VmRecord` for an already-running VM (warm-pool hand-out).
@@ -1528,7 +2169,11 @@ fn tenant_active_vm_count_local(state: &AppState, tenant: &str) -> usize {
 fn is_active_vm_status(status: VmStatus) -> bool {
     matches!(
         status,
-        VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        VmStatus::Creating
+            | VmStatus::Running
+            | VmStatus::Paused
+            | VmStatus::Suspended
+            | VmStatus::Hibernated
     )
 }
 
@@ -1606,6 +2251,83 @@ async fn vm_status(
         }
     };
     Ok(Json(public_vm_runtime_status(status)?))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BalloonTargetRequest {
+    pub target_mib: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct PublicBalloonState {
+    pub target_mib: u64,
+    pub actual_mib: u64,
+    pub target_pages: u32,
+    pub actual_pages: u32,
+}
+
+pub(crate) fn public_balloon(values: (u64, u64, u32, u32)) -> PublicBalloonState {
+    PublicBalloonState {
+        target_mib: values.0,
+        actual_mib: values.1,
+        target_pages: values.2,
+        actual_pages: values.3,
+    }
+}
+
+async fn get_balloon(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PublicBalloonState>, ApiError> {
+    let balloon = match cluster::resolve_owner(&state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(&state, id)?;
+            ensure_vm_access(&identity, &vm)?;
+            public_balloon(ops::balloon_local(&state, id).await?)
+        }
+        Owner::Remote(target) => {
+            let peer = Arc::clone(&state.peer);
+            tokio::task::spawn_blocking(move || peer.balloon_remote(&target, id, &identity))
+                .await
+                .map_err(|error| OrchError::Internal(format!("balloon join: {error}")))??
+        }
+    };
+    Ok(Json(balloon))
+}
+
+async fn set_balloon(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<BalloonTargetRequest>,
+) -> Result<Json<PublicBalloonState>, ApiError> {
+    let balloon = match cluster::resolve_owner(&state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(&state, id)?;
+            ensure_vm_access(&identity, &vm)?;
+            public_balloon(ops::set_balloon_local(&state, id, request.target_mib).await?)
+        }
+        Owner::Remote(target) => {
+            let peer = Arc::clone(&state.peer);
+            let peer_identity = identity.clone();
+            tokio::task::spawn_blocking(move || {
+                peer.set_balloon_remote(&target, id, request.target_mib, &peer_identity)
+            })
+            .await
+            .map_err(|error| OrchError::Internal(format!("balloon join: {error}")))??
+        }
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::SET_BALLOON,
+        Some(id),
+        audit_outcome::OK,
+        Some(format!("target_mib={}", request.target_mib)),
+    );
+    Ok(Json(balloon))
 }
 
 async fn delete_vm(
@@ -1698,7 +2420,7 @@ async fn suspend_vm(
     Ok(Json(PublicVmRecord::from(vm)))
 }
 
-async fn resume_vm(
+async fn hibernate_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
@@ -1707,9 +2429,49 @@ async fn resume_vm(
         Owner::Local => {
             let vm = ops::get_local(&state, id)?;
             ensure_vm_access(&identity, &vm)?;
-            ops::resume_local(&state, id).await?
+            ops::hibernate_local(&state, id, &identity).await?
         }
         Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.hibernate_remote(&rpc, id, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+        }
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::HIBERNATE,
+        Some(id),
+        audit_outcome::OK,
+        None,
+    );
+    Ok(Json(PublicVmRecord::from(vm)))
+}
+
+async fn resume_vm(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PublicVmRecord>, ApiError> {
+    let owner = cluster::resolve_owner(&state, id).await;
+    let vm = match owner {
+        Err(OrchError::Unavailable(_)) => {
+            ops::recover_hibernated_on_stale_owner(&state, id, &identity).await?
+        }
+        Err(error) => return Err(error.into()),
+        Ok(Owner::Local) => match ops::get_local(&state, id) {
+            Ok(vm) => {
+                ensure_vm_access(&identity, &vm)?;
+                ops::resume_local(&state, id).await?
+            }
+            Err(OrchError::NotFound(_)) => {
+                ops::recover_hibernated_on_stale_owner(&state, id, &identity).await?
+            }
+            Err(error) => return Err(error.into()),
+        },
+        Ok(Owner::Remote(rpc)) => {
             let peer = Arc::clone(&state.peer);
             let identity = identity.clone();
             tokio::task::spawn_blocking(move || peer.resume_remote(&rpc, id, &identity))
@@ -1733,14 +2495,22 @@ async fn snapshot_vm(
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<SnapshotRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<SnapshotResponse>, ApiError> {
     let out = match cluster::resolve_owner(&state, id).await? {
         Owner::Local => {
             let vm = ops::get_local(&state, id)?;
             ensure_vm_access(&identity, &vm)?;
             let path = ops::snapshot_local(&state, id, body.diff).await?;
-            // Return the owning node so a later restore routes to the file.
-            serde_json::json!({ "path": path, "host_id": state.config.host_id })
+            let snapshot = state
+                .store
+                .lock()
+                .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+                .get_snapshot(&path)
+                .map_err(store_err)?
+                .ok_or_else(|| OrchError::Internal("snapshot publication missing".into()))?;
+            SnapshotResponse {
+                snapshot_id: snapshot.snapshot_id,
+            }
         }
         Owner::Remote(rpc) => {
             let diff = body.diff;
@@ -1760,6 +2530,146 @@ async fn snapshot_vm(
         Some(format!("diff={}", body.diff)),
     );
     Ok(Json(out))
+}
+
+async fn fork_vm(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(source_id): Path<Uuid>,
+    Json(mut body): Json<ForkVmRequest>,
+) -> Result<(StatusCode, Json<ForkVmResponse>), ApiError> {
+    let owner = cluster::resolve_owner(&state, source_id).await?;
+    let (source, remote_source) = match &owner {
+        Owner::Local => {
+            let source = ops::get_local(&state, source_id)?;
+            ensure_vm_access(&identity, &source)?;
+            (source, None)
+        }
+        Owner::Remote(rpc) => {
+            if state.fleet.is_none() {
+                return Err(OrchError::Unavailable(
+                    "cross-node fork requires durable fleet storage".into(),
+                )
+                .into());
+            }
+            let peer = Arc::clone(&state.peer);
+            let target = rpc.clone();
+            let request_identity = identity.clone();
+            let source = tokio::task::spawn_blocking(move || {
+                peer.get_remote(&target, source_id, &request_identity)
+            })
+            .await
+            .map_err(|error| {
+                OrchError::Internal(format!("cross-node fork lookup join: {error}"))
+            })??;
+            (source, Some(rpc.clone()))
+        }
+    };
+    if source.status != VmStatus::Running {
+        return Err(OrchError::Conflict(format!(
+            "vm {source_id} must be running to use the atomic live-fork path"
+        ))
+        .into());
+    }
+    let child_id = *body.id.get_or_insert_with(Uuid::new_v4);
+    match cluster::resolve_owner(&state, child_id).await {
+        Ok(_) => {
+            return Err(OrchError::Conflict(format!("vm {child_id} already exists")).into());
+        }
+        Err(OrchError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let reserved = reserve_vm_quota(&state, &identity, child_id).await?;
+    let result = async {
+        let (child, source_host) = if let Some(remote_source) = remote_source {
+            // The target contains the source host's current boot session. Every
+            // request below is signed for that exact source/target session pair,
+            // so an owner restart or stale fleet route fails closed.
+            let peer = Arc::clone(&state.peer);
+            let target = remote_source.clone();
+            let request_identity = identity.clone();
+            let snapshot = tokio::task::spawn_blocking(move || {
+                peer.snapshot_remote(&target, source_id, false, &request_identity)
+            })
+            .await
+            .map_err(|error| {
+                OrchError::Internal(format!("cross-node fork snapshot join: {error}"))
+            })??;
+            let fleet = state.fleet.as_ref().ok_or_else(|| {
+                OrchError::Unavailable("cross-node fork requires durable fleet storage".into())
+            })?;
+            let artifact = fleet
+                .get_artifact(&identity.tenant, snapshot.snapshot_id)
+                .await
+                .map_err(branch_fleet_err)?;
+            let snapshot_path =
+                ops::localize_branch_artifact(&state, &artifact, &identity, false).await?;
+            let replicated = fleet
+                .get_artifact(&identity.tenant, snapshot.snapshot_id)
+                .await
+                .map_err(branch_fleet_err)?;
+            if replicated.status != tarit_types::ArtifactStatus::Available
+                || replicated.replication_state != tarit_types::ArtifactReplicationState::Ready
+            {
+                return Err(OrchError::Unavailable(
+                    "cross-node fork snapshot has not satisfied the configured replication policy"
+                        .into(),
+                ));
+            }
+            let child = ops::restore_local_from_surviving_artifact(
+                &state,
+                &snapshot_path,
+                Some(child_id),
+                Some(identity.tenant.clone()),
+                Some(identity.api_key_id.clone()),
+                identity.is_admin(),
+            )
+            .await?;
+            (child, Some(remote_source.host_id))
+        } else {
+            let snapshot_path = ops::snapshot_local(&state, source_id, false).await?;
+            let child = ops::restore_local(
+                &state,
+                &snapshot_path,
+                Some(child_id),
+                Some(identity.tenant.clone()),
+                Some(identity.api_key_id.clone()),
+                identity.is_admin(),
+            )
+            .await?;
+            (child, None)
+        };
+        audit::record(
+            &state,
+            &identity,
+            audit_action::FORK,
+            Some(source_id),
+            audit_outcome::OK,
+            Some(match source_host {
+                Some(source_host) => format!(
+                    "child_vm_id={child_id};source_host={source_host};target_host={}",
+                    state.config.host_id
+                ),
+                None => format!("child_vm_id={child_id}"),
+            }),
+        );
+        Ok::<_, OrchError>((
+            StatusCode::CREATED,
+            Json(ForkVmResponse {
+                source_vm_id: source_id,
+                vm: PublicVmRecord::from(child),
+            }),
+        ))
+    }
+    .await;
+    if reserved {
+        if let Err(error) = release_vm_quota(&state, &identity, child_id).await {
+            tracing::warn!(vm = %child_id, tenant = %identity.tenant, %error,
+                "failed to release fork quota reservation; TTL cleanup will retry implicitly");
+        }
+    }
+    result.map_err(ApiError::from)
 }
 
 async fn authorize_vm_action(
@@ -1804,7 +2714,7 @@ async fn execute_async_impl(
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
     // Locate the VM anywhere in the cluster; the exec runs on its owning node.
     // (Resolving here also validates existence for a clean 404.)
-    let owner = cluster::resolve_owner(&state, req.vm_id).await?;
+    let owner = ops::resolve_owner_for_activation(&state, req.vm_id, &identity).await?;
     authorize_vm_action(&state, &owner, req.vm_id, &identity).await?;
 
     let now = Utc::now();
@@ -1941,7 +2851,7 @@ async fn execute_impl(
     identity: &ApiIdentity,
     req: ExecuteRequest,
 ) -> Result<Json<ExecutionRecord>, ApiError> {
-    let owner = cluster::resolve_owner(state, req.vm_id).await?;
+    let owner = ops::resolve_owner_for_activation(state, req.vm_id, identity).await?;
     authorize_vm_action(state, &owner, req.vm_id, identity).await?;
     let now = Utc::now();
     let exec_id = Uuid::new_v4();
@@ -2103,6 +3013,398 @@ async fn update_egress(
         Some(format!("rules={rule_count}")),
     );
     Ok(Json(out))
+}
+
+async fn get_egress_policy(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<EgressPolicyRecord>, ApiError> {
+    let policy = match cluster::resolve_owner(&state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(&state, id)?;
+            ensure_vm_access(&identity, &vm)?;
+            let owner = vm.owner_key.ok_or_else(|| {
+                OrchError::BadRequest("admin-owned VM has no durable tenant policy".into())
+            })?;
+            ops::get_egress_policy_local(&state, id, &owner)?
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.get_egress_policy_remote(&rpc, id, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+        }
+    };
+    Ok(Json(policy))
+}
+
+async fn put_egress_policy(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PutEgressPolicyRequest>,
+) -> Result<Json<EgressPolicyRecord>, ApiError> {
+    let rule_count = body.allowlist.len();
+    let policy = match cluster::resolve_owner(&state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(&state, id)?;
+            ensure_vm_access(&identity, &vm)?;
+            let owner = vm.owner_key.ok_or_else(|| {
+                OrchError::BadRequest("admin-owned VM has no durable tenant policy".into())
+            })?;
+            ops::put_egress_policy_local(
+                &state,
+                id,
+                &owner,
+                body.expected_revision,
+                body.allowlist,
+                body.allow_existing,
+            )
+            .await?
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || {
+                peer.put_egress_policy_remote(&rpc, id, &body, &identity)
+            })
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+        }
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::UPDATE_EGRESS,
+        Some(id),
+        audit_outcome::OK,
+        Some(format!("rules={rule_count};revision={}", policy.revision)),
+    );
+    Ok(Json(policy))
+}
+
+async fn create_branch(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(request): Json<CreateBranchRequest>,
+) -> Result<(StatusCode, Json<BranchRecord>), ApiError> {
+    request.validate()?;
+    let branch_id = request.branch_id.unwrap_or_else(Uuid::new_v4);
+    let now = Utc::now();
+    let proposed = BranchRecord {
+        branch_id,
+        owner_key: identity.tenant.clone(),
+        name: request.name,
+        head_artifact_id: request.head_artifact_id,
+        source_vm_id: request.source_vm_id,
+        source_branch_id: request.source_branch_id,
+        revision: 1,
+        created_at: now,
+        updated_at: now,
+    };
+    let (status, branch) = if let Some(fleet) = state.fleet.as_ref() {
+        ensure_artifact_replication_ready(&state, &identity, proposed.head_artifact_id).await?;
+        let existed = match fleet.get_branch(&identity.tenant, branch_id).await {
+            Ok(_) => true,
+            Err(tarit_fleet::FleetError::NotFound) => false,
+            Err(error) => return Err(branch_fleet_err(error).into()),
+        };
+        let branch = fleet
+            .insert_branch(&proposed)
+            .await
+            .map_err(branch_fleet_err)?;
+        (
+            if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            branch,
+        )
+    } else {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+        let existing = store.get_branch(&identity.tenant, branch_id).ok();
+        store.insert_branch(&proposed).map_err(store_err)?;
+        let branch = store
+            .get_branch(&identity.tenant, branch_id)
+            .map_err(store_err)?;
+        (
+            if existing.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            },
+            branch,
+        )
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::CREATE_BRANCH,
+        None,
+        audit_outcome::OK,
+        Some(format!("branch_id={branch_id}")),
+    );
+    Ok((status, Json(branch)))
+}
+
+pub(crate) async fn ensure_artifact_replication_ready(
+    state: &AppState,
+    identity: &ApiIdentity,
+    artifact_id: Uuid,
+) -> Result<(), OrchError> {
+    let Some(fleet) = state.fleet.as_ref() else {
+        return Ok(());
+    };
+    let artifact = fleet
+        .get_artifact(&identity.tenant, artifact_id)
+        .await
+        .map_err(branch_fleet_err)?;
+    if artifact.status == tarit_types::ArtifactStatus::Available
+        && artifact.replication_state == tarit_types::ArtifactReplicationState::Ready
+    {
+        return Ok(());
+    }
+    let candidates = cluster::place_candidates(state, 1, 1).await;
+    let mut failures = Vec::new();
+    let tenant = identity.tenant.clone();
+    for candidate in candidates {
+        let peer = Arc::clone(&state.peer);
+        let request_identity = identity.clone();
+        let attempt = candidate.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            peer.localize_artifact_remote(&attempt, artifact_id, &request_identity)
+        })
+        .await
+        .map_err(|error| OrchError::Internal(format!("artifact localization join: {error}")))?;
+        match result {
+            Ok(()) => {
+                let refreshed = fleet
+                    .get_artifact(&tenant, artifact_id)
+                    .await
+                    .map_err(branch_fleet_err)?;
+                if refreshed.status == tarit_types::ArtifactStatus::Available
+                    && refreshed.replication_state == tarit_types::ArtifactReplicationState::Ready
+                {
+                    return Ok(());
+                }
+            }
+            Err(error) => failures.push(format!("{}: {error}", candidate.host_id)),
+        }
+    }
+    tracing::warn!(
+        artifact = %artifact_id,
+        attempted = failures.len(),
+        "artifact did not satisfy replication policy: {}",
+        failures.join("; ")
+    );
+    Err(OrchError::Unavailable(
+        "artifact has not satisfied the configured replication policy".into(),
+    ))
+}
+
+async fn list_branches(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> Result<Json<Vec<BranchRecord>>, ApiError> {
+    let branches = if let Some(fleet) = state.fleet.as_ref() {
+        fleet
+            .list_branches(&identity.tenant)
+            .await
+            .map_err(branch_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .list_branches(&identity.tenant)
+            .map_err(store_err)?
+    };
+    Ok(Json(branches))
+}
+
+async fn get_branch(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<BranchRecord>, ApiError> {
+    let branch = if let Some(fleet) = state.fleet.as_ref() {
+        fleet
+            .get_branch(&identity.tenant, id)
+            .await
+            .map_err(branch_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .get_branch(&identity.tenant, id)
+            .map_err(store_err)?
+    };
+    Ok(Json(branch))
+}
+
+async fn update_branch_head(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpdateBranchHeadRequest>,
+) -> Result<Json<BranchRecord>, ApiError> {
+    if request.expected_revision == 0 {
+        return Err(OrchError::BadRequest("expected_revision must be positive".into()).into());
+    }
+    let branch = if let Some(fleet) = state.fleet.as_ref() {
+        fleet
+            .update_branch_head(
+                &identity.tenant,
+                id,
+                request.expected_revision,
+                request.head_artifact_id,
+                Utc::now(),
+            )
+            .await
+            .map_err(branch_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .update_branch_head(
+                &identity.tenant,
+                id,
+                request.expected_revision,
+                request.head_artifact_id,
+                Utc::now(),
+            )
+            .map_err(store_err)?
+    };
+    audit::record(
+        &state,
+        &identity,
+        audit_action::UPDATE_BRANCH,
+        None,
+        audit_outcome::OK,
+        Some(format!("branch_id={id};revision={}", branch.revision)),
+    );
+    Ok(Json(branch))
+}
+
+async fn delete_branch(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(fleet) = state.fleet.as_ref() {
+        fleet
+            .delete_branch(&identity.tenant, id)
+            .await
+            .map_err(branch_fleet_err)?;
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .delete_branch(&identity.tenant, id)
+            .map_err(store_err)?;
+    }
+    audit::record(
+        &state,
+        &identity,
+        audit_action::DELETE_BRANCH,
+        None,
+        audit_outcome::OK,
+        Some(format!("branch_id={id}")),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn restore_branch(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(branch_id): Path<Uuid>,
+    Json(request): Json<RestoreBranchRequest>,
+) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
+    let (branch, artifact) = if let Some(fleet) = state.fleet.as_ref() {
+        let branch = fleet
+            .get_branch(&identity.tenant, branch_id)
+            .await
+            .map_err(branch_fleet_err)?;
+        let artifact = fleet
+            .get_artifact(&identity.tenant, branch.head_artifact_id)
+            .await
+            .map_err(branch_fleet_err)?;
+        (branch, artifact)
+    } else {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+        let branch = store
+            .get_branch(&identity.tenant, branch_id)
+            .map_err(store_err)?;
+        let artifact = store
+            .get_artifact(&identity.tenant, branch.head_artifact_id)
+            .map_err(store_err)?;
+        (branch, artifact)
+    };
+    if artifact.status != tarit_types::ArtifactStatus::Available {
+        return Err(OrchError::Unavailable("branch head artifact is unavailable".into()).into());
+    }
+    let child_id = request.id.unwrap_or_else(Uuid::new_v4);
+    match cluster::resolve_owner(&state, child_id).await {
+        Ok(_) => return Err(OrchError::Conflict(format!("vm {child_id} already exists")).into()),
+        Err(OrchError::NotFound(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let reserved = reserve_vm_quota(&state, &identity, child_id).await?;
+    let result = async {
+        let snapshot_path =
+            ops::localize_branch_artifact(&state, &artifact, &identity, false).await?;
+        let child = ops::restore_local_from_surviving_artifact(
+            &state,
+            &snapshot_path,
+            Some(child_id),
+            Some(identity.tenant.clone()),
+            Some(identity.api_key_id.clone()),
+            identity.is_admin(),
+        )
+        .await?;
+        audit::record(
+            &state,
+            &identity,
+            audit_action::RESTORE,
+            Some(child_id),
+            audit_outcome::OK,
+            Some(format!(
+                "branch_id={branch_id};head_artifact_id={}",
+                branch.head_artifact_id
+            )),
+        );
+        Ok::<_, OrchError>((StatusCode::CREATED, Json(PublicVmRecord::from(child))))
+    }
+    .await;
+    if reserved {
+        if let Err(error) = release_vm_quota(&state, &identity, child_id).await {
+            tracing::warn!(vm = %child_id, tenant = %identity.tenant, %error,
+                "failed to release branch-restore quota reservation; TTL cleanup will retry");
+        }
+    }
+    result.map_err(ApiError::from)
+}
+
+fn branch_fleet_err(error: tarit_fleet::FleetError) -> OrchError {
+    match error {
+        tarit_fleet::FleetError::NotFound => {
+            OrchError::NotFound("branch or artifact not found".into())
+        }
+        tarit_fleet::FleetError::Conflict(message) => OrchError::Conflict(message),
+        error => OrchError::Internal(format!("branch store: {error}")),
+    }
 }
 
 /// Cluster-wide capacity + health view. Serves as both an observability
@@ -2405,6 +3707,157 @@ mod tests {
     }
 
     #[test]
+    fn branch_api_is_idempotent_tenant_scoped_cas_and_reference_safe() {
+        fn artifact(
+            owner: &str,
+            state: tarit_types::ArtifactReplicationState,
+        ) -> tarit_types::ArtifactRecord {
+            let now = Utc::now();
+            tarit_types::ArtifactRecord {
+                artifact_id: Uuid::new_v4(),
+                owner_key: owner.into(),
+                host_id: "test-host".into(),
+                storage_locator: format!("/private/{}", Uuid::new_v4()),
+                kind: tarit_types::ArtifactKind::VmSnapshot,
+                status: tarit_types::ArtifactStatus::Available,
+                content_digest: format!("sha256:{}", "1".repeat(64)),
+                size_bytes: 4096,
+                immutable_image_digest: format!("sha256:{}", "2".repeat(64)),
+                agent_digest: format!("sha256:{}", "3".repeat(64)),
+                boot_manifest_digest: format!("sha256:{}", "5".repeat(64)),
+                parent_artifact_id: None,
+                source_vm_id: None,
+                creation_revision: 1,
+                integrity_manifest_digest: format!("sha256:{}", "4".repeat(64)),
+                chunk_size_bytes: 65536,
+                chunk_count: 1,
+                replication_state: state,
+                reference_count: 0,
+                created_at: now,
+                updated_at: now,
+            }
+        }
+
+        let state = test_state();
+        let first = artifact("tenant-a", tarit_types::ArtifactReplicationState::Ready);
+        let second = artifact("tenant-a", tarit_types::ArtifactReplicationState::Ready);
+        let pending = artifact("tenant-a", tarit_types::ArtifactReplicationState::Pending);
+        let foreign = artifact("tenant-b", tarit_types::ArtifactReplicationState::Ready);
+        {
+            let store = state.store.lock().unwrap();
+            for artifact in [&first, &second, &pending, &foreign] {
+                store.insert_artifact(artifact).unwrap();
+            }
+        }
+        let branch_id = Uuid::new_v4();
+        let body = serde_json::json!({
+            "branch_id": branch_id,
+            "name": "main",
+            "head_artifact_id": first.artifact_id,
+        });
+        let runtime = test_runtime();
+        let app = router(state.clone());
+        let created = runtime.block_on(request_json(
+            app.clone(),
+            "POST",
+            "/v1/branches",
+            "tenant-a-key",
+            body.clone(),
+        ));
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = runtime.block_on(response_json(created));
+        assert_eq!(created["branch_id"], branch_id.to_string());
+        assert!(created.get("owner_key").is_none());
+
+        let replay = runtime.block_on(request_json(
+            app.clone(),
+            "POST",
+            "/v1/branches",
+            "tenant-a-key",
+            body,
+        ));
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .get_artifact("tenant-a", first.artifact_id)
+                .unwrap()
+                .reference_count,
+            1
+        );
+
+        let foreign_get = runtime.block_on(request_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/branches/{branch_id}"),
+            "tenant-b-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(foreign_get.status(), StatusCode::NOT_FOUND);
+
+        for (artifact_id, revision, expected) in [
+            (foreign.artifact_id, 1, StatusCode::NOT_FOUND),
+            (pending.artifact_id, 1, StatusCode::NOT_FOUND),
+            (second.artifact_id, 0, StatusCode::BAD_REQUEST),
+            (second.artifact_id, 1, StatusCode::OK),
+            (first.artifact_id, 1, StatusCode::CONFLICT),
+        ] {
+            let response = runtime.block_on(request_json(
+                app.clone(),
+                "PUT",
+                &format!("/v1/branches/{branch_id}"),
+                "tenant-a-key",
+                serde_json::json!({
+                    "expected_revision": revision,
+                    "head_artifact_id": artifact_id,
+                }),
+            ));
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .get_artifact("tenant-a", first.artifact_id)
+                .unwrap()
+                .reference_count,
+            0
+        );
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .get_artifact("tenant-a", second.artifact_id)
+                .unwrap()
+                .reference_count,
+            1
+        );
+
+        let deleted = runtime.block_on(request_json(
+            app,
+            "DELETE",
+            &format!("/v1/branches/{branch_id}"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .get_artifact("tenant-a", second.artifact_id)
+                .unwrap()
+                .reference_count,
+            0
+        );
+    }
+
+    #[test]
     fn share_request_json_content_type_accepts_case_insensitive_media_type() {
         let request = Request::builder()
             .header(header::CONTENT_TYPE, "Application/JSON; charset=utf-8")
@@ -2433,6 +3886,108 @@ mod tests {
     }
 
     #[test]
+    fn volume_api_is_idempotent_tenant_scoped_private_and_physically_deletes() {
+        let state = test_state();
+        let app = router(state.clone());
+        let runtime = test_runtime();
+        let id = Uuid::new_v4();
+        let body = serde_json::json!({
+            "id": id,
+            "name": format!("workspace-{}", id.simple()),
+            "size_bytes": 4 * 1024 * 1024,
+            "provider": "local_block",
+        });
+
+        let created = runtime.block_on(request_json(
+            app.clone(),
+            "POST",
+            "/v1/volumes",
+            "tenant-a-key",
+            body.clone(),
+        ));
+        let created_status = created.status();
+        let created = runtime.block_on(response_json(created));
+        assert_eq!(created_status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["id"], id.to_string());
+        assert_eq!(created["status"], "available");
+        assert_eq!(created["storage_class"], "block");
+        for private in ["owner_key", "host_id", "last_error", "private_path"] {
+            assert!(
+                created.get(private).is_none(),
+                "public volume leaked {private}"
+            );
+        }
+
+        let replay = runtime.block_on(request_json(
+            app.clone(),
+            "POST",
+            "/v1/volumes",
+            "tenant-a-key",
+            body,
+        ));
+        assert_eq!(replay.status(), StatusCode::OK);
+
+        let foreign = runtime.block_on(request_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/volumes/{id}"),
+            "tenant-b-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+        let foreign_delete = runtime.block_on(request_json(
+            app.clone(),
+            "DELETE",
+            &format!("/v1/volumes/{id}"),
+            "tenant-b-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(foreign_delete.status(), StatusCode::NOT_FOUND);
+
+        let private_path = state
+            .config
+            .images_dir
+            .join("volumes")
+            .join(format!("{id}.block"));
+        assert!(private_path.is_file());
+        let deleted = runtime.block_on(request_json(
+            app.clone(),
+            "DELETE",
+            &format!("/v1/volumes/{id}"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert!(!private_path.exists());
+        assert!(matches!(
+            state.store.lock().unwrap().get_volume("tenant-a", id),
+            Err(tarit_store::StoreError::NotFound)
+        ));
+
+        let invalid_id = Uuid::new_v4();
+        let invalid = runtime.block_on(request_json(
+            app,
+            "POST",
+            "/v1/volumes",
+            "tenant-a-key",
+            serde_json::json!({
+                "id": invalid_id,
+                "name": "too-small",
+                "size_bytes": 4096,
+            }),
+        ));
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(matches!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .get_volume("tenant-a", invalid_id),
+            Err(tarit_store::StoreError::NotFound)
+        ));
+    }
+
+    #[test]
     fn unknown_api_key_returns_401() {
         let app = router(test_state());
         let rt = test_runtime();
@@ -2450,6 +4005,35 @@ mod tests {
         drop(rt);
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn live_fork_rejects_foreign_and_nonrunning_sources_before_vmm_access() {
+        let state = test_state();
+        let foreign = Uuid::new_v4();
+        let paused = Uuid::new_v4();
+        insert_vm(&state, foreign, "tenant-b", VmStatus::Running);
+        insert_vm(&state, paused, "tenant-a", VmStatus::Paused);
+        let app = router(state);
+        let rt = test_runtime();
+
+        let foreign_response = rt.block_on(request_json(
+            app.clone(),
+            "POST",
+            &format!("/v1/vms/{foreign}/fork"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(foreign_response.status(), StatusCode::FORBIDDEN);
+
+        let paused_response = rt.block_on(request_json(
+            app,
+            "POST",
+            &format!("/v1/vms/{paused}/fork"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(paused_response.status(), StatusCode::CONFLICT);
     }
 
     #[test]
@@ -2853,6 +4437,7 @@ mod tests {
             image: None,
             rootfs_path: None,
             cmdline: None,
+            volumes: Vec::new(),
         };
         assert!(matches!(
             enforce_create_path_policy(&user, &req),
@@ -2870,6 +4455,19 @@ mod tests {
         req.rootfs_path = None;
         req.image = Some("node20".into());
         assert!(enforce_create_path_policy(&user, &req).is_ok());
+
+        let signed_policy = crate::image::ImageAdmissionPolicy {
+            require_signature: true,
+            cosign_key: Some("trusted.pub".into()),
+        };
+        req.image = None;
+        assert!(matches!(
+            enforce_image_admission_policy(&user, &req, &signed_policy),
+            Err(OrchError::Unprocessable(_))
+        ));
+        assert!(enforce_image_admission_policy(&admin, &req, &signed_policy).is_ok());
+        req.image = Some("ubuntu:24.04".into());
+        assert!(enforce_image_admission_policy(&user, &req, &signed_policy).is_ok());
     }
 
     #[test]
@@ -3778,6 +5376,9 @@ mod tests {
     }
 
     fn test_state_with_audit() -> (AppState, tokio::sync::mpsc::Receiver<StoreWrite>) {
+        let test_root = PathBuf::from(format!("target/taritd-api-test-{}", unsafe {
+            libc::geteuid()
+        }));
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             api_keys: ApiKeyRegistry::from_plaintext_entries(vec![
@@ -3787,17 +5388,22 @@ mod tests {
             ])
             .unwrap(),
             host_id: "test-host".into(),
-            vmm_bin: PathBuf::from("target/taritd-api-test/vmm"),
-            kernel: PathBuf::from("target/taritd-api-test/kernel"),
-            rootfs: PathBuf::from("target/taritd-api-test/rootfs"),
-            socket_dir: PathBuf::from("target/taritd-api-test/sockets"),
-            db_path: PathBuf::from("target/taritd-api-test/fleet.db"),
-            net_state_path: PathBuf::from("target/taritd-api-test/net-state.json"),
-            images_dir: PathBuf::from("target/taritd-api-test/images"),
+            host_session_id: Uuid::nil(),
+            vmm_bin: test_root.join("vmm"),
+            kernel: test_root.join("kernel"),
+            rootfs: test_root.join("rootfs"),
+            socket_dir: test_root.join("sockets"),
+            db_path: test_root.join("fleet.db"),
+            net_state_path: test_root.join("net-state.json"),
+            images_dir: test_root.join("images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
@@ -3823,7 +5429,7 @@ mod tests {
             autoscale: AutoscaleConfig::default(),
             ssh_gateway_enabled: false,
             ssh_gateway_addr: "127.0.0.1:0".parse().unwrap(),
-            ssh_gateway_host_key_path: PathBuf::from("target/taritd-api-test/ssh_host"),
+            ssh_gateway_host_key_path: test_root.join("ssh_host"),
             share_listen: None,
             share_domain: None,
             share_token_key: None,
@@ -3843,6 +5449,7 @@ mod tests {
                 vm_cache: Arc::new(RwLock::new(HashMap::new())),
                 store_tx,
                 lifecycle: Arc::new(Mutex::new(HashMap::new())),
+                activation_gates: Arc::new(Mutex::new(HashMap::new())),
                 lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
                 lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
                 terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),

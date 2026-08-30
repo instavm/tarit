@@ -535,6 +535,15 @@ pub struct DiskPressureConfig {
     pub artifact_min_age_secs: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerTlsConfig {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
+    /// PEM bundle of trusted peer certificate authorities. Multiple active CA
+    /// certificates permit a bounded overlap window during rotation.
+    pub client_ca_bundle: PathBuf,
+}
+
 impl Default for DiskPressureConfig {
     fn default() -> Self {
         Self {
@@ -554,11 +563,50 @@ impl DiskPressureConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedBlockProviderKind {
+    NfsV4_1,
+}
+
+impl SharedBlockProviderKind {
+    pub fn provider_name(self) -> &'static str {
+        match self {
+            Self::NfsV4_1 => "nfs_v4_1_block",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedBlockConfig {
+    pub kind: SharedBlockProviderKind,
+    pub endpoint: String,
+    pub export: String,
+    pub mount_root: PathBuf,
+    pub max_size_bytes: u64,
+    pub operation_timeout_ms: u64,
+}
+
+impl fmt::Debug for SharedBlockConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedBlockConfig")
+            .field("kind", &self.kind)
+            .field("endpoint", &"[REDACTED]")
+            .field("export", &"[REDACTED]")
+            .field("mount_root", &self.mount_root)
+            .field("max_size_bytes", &self.max_size_bytes)
+            .field("operation_timeout_ms", &self.operation_timeout_ms)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
     pub api_keys: ApiKeyRegistry,
     pub host_id: String,
+    /// Random per-process boot identity used to fence stale peer requests.
+    pub host_session_id: Uuid,
     pub vmm_bin: PathBuf,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
@@ -568,11 +616,20 @@ pub struct Config {
     /// to TARIT_DB so restarts recover tap/IP ownership before allocating.
     pub net_state_path: PathBuf,
     pub images_dir: PathBuf,
+    /// Optional shared NFS-backed raw block provider. Endpoint and export are
+    /// private host configuration and never enter public volume records.
+    pub shared_block: Option<SharedBlockConfig>,
+    /// Immutable OCI admission and signature policy captured at startup.
+    pub image_admission_policy: crate::image::ImageAdmissionPolicy,
     /// Max concurrent sandboxes on this host (placement guard).
     pub max_vms: usize,
     pub max_vcpus: u64,
     pub max_memory_mib: u64,
     pub peer_secret: String,
+    /// Dedicated internal RPC listener. Internal routes are never installed on
+    /// the public control listener.
+    pub peer_listen: Option<SocketAddr>,
+    pub peer_tls: Option<PeerTlsConfig>,
     /// Optional Postgres URL for global fleet sync (`tokio-postgres`, MIT/Apache-2.0).
     pub database_url: Option<String>,
     /// HTTPS origin advertised to fleet peers. Plain HTTP is available only
@@ -712,6 +769,7 @@ impl Config {
         let api_keys = load_api_keys(file_config.as_ref())?;
 
         let host_id = env::var("TARIT_HOST_ID").unwrap_or_else(|_| default_hostname());
+        let host_session_id = Uuid::new_v4();
 
         let vmm_bin = expand_path(&env::var("TARIT_VMM_BIN").unwrap_or_else(|_| "vmm".into()));
         let kernel = expand_path(
@@ -731,6 +789,8 @@ impl Config {
         let images_dir = expand_path(
             &env::var("TARIT_IMAGES_DIR").unwrap_or_else(|_| "~/.taritd/images".into()),
         );
+        let shared_block = parse_shared_block_config()?;
+        let image_admission_policy = crate::image::ImageAdmissionPolicy::from_env()?;
 
         let max_vms = env_positive_usize("TARIT_MAX_VMS", 32)?;
         let max_vcpus_env = env_optional_positive_u64("TARIT_MAX_VCPUS")?;
@@ -744,6 +804,27 @@ impl Config {
             .unwrap_or_else(|_| format!("http://{}:{}", listen.ip(), listen.port()));
         let allow_insecure_peer_http = env_bool_checked("TARIT_ALLOW_INSECURE_PEER_HTTP", false)?;
         let production_mode = env_bool_checked("TARIT_PRODUCTION", false)?;
+        let peer_listen = env::var("TARIT_PEER_LISTEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<SocketAddr>()
+                    .context("TARIT_PEER_LISTEN must be a valid socket address")
+            })
+            .transpose()?;
+        let peer_tls = parse_peer_tls_config(
+            env::var("TARIT_PEER_TLS_CERT").ok(),
+            env::var("TARIT_PEER_TLS_KEY").ok(),
+            env::var("TARIT_PEER_TLS_CLIENT_CA").ok(),
+        )?;
+        validate_peer_listener_config(
+            database_url.is_some(),
+            production_mode,
+            allow_insecure_peer_http,
+            peer_listen,
+            peer_tls.as_ref(),
+        )?;
         validate_rpc_addr(
             &rpc_addr,
             database_url.is_some(),
@@ -855,6 +936,9 @@ impl Config {
         )?;
 
         if production_mode {
+            if !image_admission_policy.require_signature {
+                bail!("TARIT_PRODUCTION requires TARIT_IMAGE_REQUIRE_SIGNATURE=1");
+            }
             validate_production_requirements(
                 database_url.as_deref(),
                 &vmm_bin,
@@ -874,6 +958,7 @@ impl Config {
             listen,
             api_keys,
             host_id,
+            host_session_id,
             vmm_bin,
             kernel,
             rootfs,
@@ -881,10 +966,14 @@ impl Config {
             db_path,
             net_state_path,
             images_dir,
+            shared_block,
+            image_admission_policy,
             max_vms,
             max_vcpus,
             max_memory_mib,
             peer_secret,
+            peer_listen,
+            peer_tls,
             database_url,
             rpc_addr,
             allow_insecure_peer_http,
@@ -927,6 +1016,7 @@ impl fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("api_keys", &self.api_keys)
             .field("host_id", &self.host_id)
+            .field("host_session_id", &self.host_session_id)
             .field("vmm_bin", &self.vmm_bin)
             .field("kernel", &self.kernel)
             .field("rootfs", &self.rootfs)
@@ -934,10 +1024,14 @@ impl fmt::Debug for Config {
             .field("db_path", &self.db_path)
             .field("net_state_path", &self.net_state_path)
             .field("images_dir", &self.images_dir)
+            .field("shared_block", &self.shared_block)
+            .field("image_admission_policy", &self.image_admission_policy)
             .field("max_vms", &self.max_vms)
             .field("max_vcpus", &self.max_vcpus)
             .field("max_memory_mib", &self.max_memory_mib)
             .field("peer_secret", &"[REDACTED]")
+            .field("peer_listen", &self.peer_listen)
+            .field("peer_tls", &self.peer_tls)
             .field(
                 "database_url",
                 &self.database_url.as_ref().map(|_| "[REDACTED]"),
@@ -1108,6 +1202,61 @@ fn load_peer_secret_for_mode(raw: Option<String>, cluster_mode: bool) -> Result<
         ),
         None => Ok(format!("local-{}", Uuid::new_v4().simple())),
     }
+}
+
+fn parse_peer_tls_config(
+    certificate_chain: Option<String>,
+    private_key: Option<String>,
+    client_ca_bundle: Option<String>,
+) -> Result<Option<PeerTlsConfig>> {
+    match (certificate_chain, private_key, client_ca_bundle) {
+        (None, None, None) => Ok(None),
+        (Some(certificate_chain), Some(private_key), Some(client_ca_bundle)) => {
+            let config = PeerTlsConfig {
+                certificate_chain: expand_path(certificate_chain.trim()),
+                private_key: expand_path(private_key.trim()),
+                client_ca_bundle: expand_path(client_ca_bundle.trim()),
+            };
+            for (name, path) in [
+                ("TARIT_PEER_TLS_CERT", &config.certificate_chain),
+                ("TARIT_PEER_TLS_KEY", &config.private_key),
+                ("TARIT_PEER_TLS_CLIENT_CA", &config.client_ca_bundle),
+            ] {
+                if path.as_os_str().is_empty() {
+                    bail!("{name} must not be empty");
+                }
+            }
+            Ok(Some(config))
+        }
+        _ => bail!(
+            "TARIT_PEER_TLS_CERT, TARIT_PEER_TLS_KEY, and TARIT_PEER_TLS_CLIENT_CA must be configured together"
+        ),
+    }
+}
+
+fn validate_peer_listener_config(
+    cluster_mode: bool,
+    production_mode: bool,
+    allow_insecure_http: bool,
+    peer_listen: Option<SocketAddr>,
+    peer_tls: Option<&PeerTlsConfig>,
+) -> Result<()> {
+    if cluster_mode && peer_listen.is_none() {
+        bail!("fleet mode requires a dedicated TARIT_PEER_LISTEN");
+    }
+    if peer_tls.is_some() && peer_listen.is_none() {
+        bail!("peer TLS requires TARIT_PEER_LISTEN");
+    }
+    if cluster_mode && !allow_insecure_http && peer_tls.is_none() {
+        bail!("fleet peer RPC requires mutual TLS certificate, key, and client CA configuration");
+    }
+    if production_mode && peer_tls.is_none() {
+        bail!("TARIT_PRODUCTION requires mutual TLS on the dedicated peer listener");
+    }
+    if peer_tls.is_some() && allow_insecure_http {
+        bail!("TARIT_ALLOW_INSECURE_PEER_HTTP cannot be combined with peer TLS");
+    }
+    Ok(())
 }
 
 fn validate_rpc_addr(
@@ -1318,6 +1467,34 @@ mod security_tests {
         assert!(validate_rpc_addr("https://node-a.example:8443", true, false, false).is_ok());
         assert!(validate_rpc_addr("https://node-a.example/path", true, false, false).is_err());
         assert!(validate_rpc_addr("https://node-a.example:8443", true, true, true).is_err());
+    }
+
+    #[test]
+    fn fleet_peer_listener_requires_complete_mutual_tls_configuration() {
+        let address = Some("127.0.0.1:8443".parse().unwrap());
+        assert!(validate_peer_listener_config(true, false, false, None, None).is_err());
+        assert!(validate_peer_listener_config(true, false, false, address, None).is_err());
+
+        let tls = PeerTlsConfig {
+            certificate_chain: "node.pem".into(),
+            private_key: "node-key.pem".into(),
+            client_ca_bundle: "peer-ca.pem".into(),
+        };
+        assert!(validate_peer_listener_config(true, false, false, address, Some(&tls)).is_ok());
+        assert!(validate_peer_listener_config(true, false, true, address, Some(&tls)).is_err());
+        assert!(validate_peer_listener_config(false, false, true, address, None).is_ok());
+    }
+
+    #[test]
+    fn peer_tls_paths_are_all_or_nothing() {
+        assert!(parse_peer_tls_config(Some("node.pem".into()), None, None).is_err());
+        assert!(parse_peer_tls_config(
+            Some("node.pem".into()),
+            Some("node-key.pem".into()),
+            Some("peer-ca.pem".into()),
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
@@ -1614,6 +1791,67 @@ fn env_optional_positive_u32(key: &str) -> Result<Option<u32>> {
         .transpose()
 }
 
+fn parse_shared_block_config() -> Result<Option<SharedBlockConfig>> {
+    const RELATED: &[&str] = &[
+        "TARIT_SHARED_BLOCK_ENDPOINT",
+        "TARIT_SHARED_BLOCK_EXPORT",
+        "TARIT_SHARED_BLOCK_MOUNT_ROOT",
+        "TARIT_SHARED_BLOCK_MAX_BYTES",
+        "TARIT_SHARED_BLOCK_TIMEOUT_MS",
+    ];
+    let provider = env::var("TARIT_SHARED_BLOCK_PROVIDER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(provider) = provider else {
+        if RELATED.iter().any(|key| env::var(key).is_ok()) {
+            bail!("TARIT_SHARED_BLOCK_PROVIDER is required when shared-block settings are present");
+        }
+        return Ok(None);
+    };
+    let kind = match provider.as_str() {
+        "nfs_v4_1_block" => SharedBlockProviderKind::NfsV4_1,
+        _ => bail!(
+            "unsupported TARIT_SHARED_BLOCK_PROVIDER={provider:?}; supported provider is nfs_v4_1_block"
+        ),
+    };
+    let endpoint = env::var("TARIT_SHARED_BLOCK_ENDPOINT")
+        .context("TARIT_SHARED_BLOCK_ENDPOINT must be set")?;
+    let export =
+        env::var("TARIT_SHARED_BLOCK_EXPORT").context("TARIT_SHARED_BLOCK_EXPORT must be set")?;
+    tarit_volume::NfsProvider::new(
+        tarit_volume::NfsDialect::GenericV4_1,
+        endpoint.clone(),
+        export.clone(),
+        None,
+        None,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid shared-block NFS configuration: {error}"))?;
+    let mount_root = expand_path(
+        &env::var("TARIT_SHARED_BLOCK_MOUNT_ROOT")
+            .context("TARIT_SHARED_BLOCK_MOUNT_ROOT must be set")?,
+    );
+    if !mount_root.is_absolute() {
+        bail!("TARIT_SHARED_BLOCK_MOUNT_ROOT must be an absolute path");
+    }
+    let max_size_bytes =
+        env_positive_u64("TARIT_SHARED_BLOCK_MAX_BYTES", 1024 * 1024 * 1024 * 1024)?;
+    if max_size_bytes < tarit_volume::MIN_BLOCK_VOLUME_BYTES {
+        bail!(
+            "TARIT_SHARED_BLOCK_MAX_BYTES must be at least {}",
+            tarit_volume::MIN_BLOCK_VOLUME_BYTES
+        );
+    }
+    Ok(Some(SharedBlockConfig {
+        kind,
+        endpoint,
+        export,
+        mount_root,
+        max_size_bytes,
+        operation_timeout_ms: env_positive_u64("TARIT_SHARED_BLOCK_TIMEOUT_MS", 20_000)?,
+    }))
+}
+
 fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
     let base_dir = env::var("TARIT_VM_JAIL_BASE")
         .ok()
@@ -1767,6 +2005,71 @@ mod tests {
 
     fn parse_reap(raw: Option<&str>) -> bool {
         raw.and_then(parse_bool).unwrap_or(true)
+    }
+
+    const SHARED_BLOCK_ENV: &[&str] = &[
+        "TARIT_SHARED_BLOCK_PROVIDER",
+        "TARIT_SHARED_BLOCK_ENDPOINT",
+        "TARIT_SHARED_BLOCK_EXPORT",
+        "TARIT_SHARED_BLOCK_MOUNT_ROOT",
+        "TARIT_SHARED_BLOCK_MAX_BYTES",
+        "TARIT_SHARED_BLOCK_TIMEOUT_MS",
+    ];
+
+    fn clear_shared_block_env() {
+        for key in SHARED_BLOCK_ENV {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn shared_block_config_is_all_or_none() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        assert!(parse_shared_block_config().unwrap().is_none());
+
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "127.0.0.1");
+        let error = parse_shared_block_config().expect_err("partial config must fail closed");
+        assert!(error.to_string().contains("TARIT_SHARED_BLOCK_PROVIDER"));
+        clear_shared_block_env();
+    }
+
+    #[test]
+    fn shared_block_config_parses_validated_nfs_profile() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        std::env::set_var("TARIT_SHARED_BLOCK_PROVIDER", "nfs_v4_1_block");
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "127.0.0.1");
+        std::env::set_var("TARIT_SHARED_BLOCK_EXPORT", "/srv/tarit");
+        std::env::set_var("TARIT_SHARED_BLOCK_MOUNT_ROOT", "/run/tarit/shared-block");
+        std::env::set_var("TARIT_SHARED_BLOCK_MAX_BYTES", "8388608");
+        std::env::set_var("TARIT_SHARED_BLOCK_TIMEOUT_MS", "30000");
+
+        let config = parse_shared_block_config().unwrap().unwrap();
+        assert_eq!(config.kind, SharedBlockProviderKind::NfsV4_1);
+        assert_eq!(config.endpoint, "127.0.0.1");
+        assert_eq!(config.export, "/srv/tarit");
+        assert_eq!(config.mount_root, PathBuf::from("/run/tarit/shared-block"));
+        assert_eq!(config.max_size_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.operation_timeout_ms, 30_000);
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("127.0.0.1"));
+        assert!(!debug.contains("/srv/tarit"));
+        clear_shared_block_env();
+    }
+
+    #[test]
+    fn shared_block_config_rejects_too_small_volume_ceiling() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        std::env::set_var("TARIT_SHARED_BLOCK_PROVIDER", "nfs_v4_1_block");
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "127.0.0.1");
+        std::env::set_var("TARIT_SHARED_BLOCK_EXPORT", "/srv/tarit");
+        std::env::set_var("TARIT_SHARED_BLOCK_MOUNT_ROOT", "/run/tarit/shared-block");
+        std::env::set_var("TARIT_SHARED_BLOCK_MAX_BYTES", "1024");
+        let error = parse_shared_block_config().expect_err("undersized ceiling must fail");
+        assert!(error.to_string().contains("must be at least"));
+        clear_shared_block_env();
     }
 
     #[test]

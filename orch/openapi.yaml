@@ -16,6 +16,61 @@ components:
       name: X-API-Key
       description: API key mapped by taritd to a tenant and role (admin or user).
   schemas:
+    Branch:
+      type: object
+      required: [branch_id, name, head_artifact_id, revision, created_at, updated_at]
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        head_artifact_id:
+          type: string
+          format: uuid
+        source_vm_id:
+          type: string
+          format: uuid
+        source_branch_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: uint64
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    EgressPolicy:
+      type: object
+      required: [vm_id, revision, allowlist, allow_existing, created_at, updated_at]
+      properties:
+        vm_id:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          format: uint64
+          minimum: 1
+        allowlist:
+          type: array
+          maxItems: 256
+          items:
+            type: string
+            maxLength: 128
+        allow_existing:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
     VmRecord:
       type: object
       description: Tenant-safe VM record. Host identity, filesystem paths, VMM socket, process id, boot arguments, and ownership metadata are never exposed.
@@ -26,7 +81,7 @@ components:
           format: uuid
         status:
           type: string
-          enum: [creating, running, paused, suspended, stopped, error]
+          enum: [creating, running, paused, suspended, hibernated, stopped, error]
         revision:
           type: integer
           format: uint64
@@ -45,9 +100,36 @@ components:
         updated_at:
           type: string
           format: date-time
+    BalloonTargetRequest:
+      type: object
+      additionalProperties: false
+      required: [target_mib]
+      properties:
+        target_mib:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Requested guest memory to return to the host; the VMM rejects targets larger than guest RAM.
+    BalloonState:
+      type: object
+      required: [target_mib, actual_mib, target_pages, actual_pages]
+      properties:
+        target_mib:
+          type: integer
+          format: uint64
+        actual_mib:
+          type: integer
+          format: uint64
+        target_pages:
+          type: integer
+          format: uint32
+        actual_pages:
+          type: integer
+          format: uint32
     CreateVmRequest:
       type: object
-      description: All fields optional; defaults come from node configuration. Non-admin API keys cannot set `kernel_path` or `rootfs_path`; they must use node defaults or `image` (JSON alias `image_ref`). `image` resolves through the node-local image registry and cannot be combined with `rootfs_path`.
+      additionalProperties: false
+      description: All fields optional; defaults come from node configuration. Persistent block attachments are explicit, ordered after the root disk, exact-host constrained for local_block, and remain external across snapshot/hibernate operations.
       properties:
         id:
           type: string
@@ -66,20 +148,144 @@ components:
           type: string
         cmdline:
           type: string
+        volumes:
+          type: array
+          maxItems: 15
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/VmVolumeAttachmentRequest"
+    VmVolumeAttachmentRequest:
+      type: object
+      additionalProperties: false
+      required: [volume_id, mode]
+      properties:
+        volume_id:
+          type: string
+          format: uuid
+        mode:
+          type: string
+          enum: [read_only, read_write]
+    VolumeCapabilities:
+      type: object
+      additionalProperties: false
+      required: [read_only_many, read_write_once, read_write_many, snapshots, clones]
+      properties:
+        read_only_many:
+          type: boolean
+        read_write_once:
+          type: boolean
+        read_write_many:
+          type: boolean
+        snapshots:
+          type: boolean
+        clones:
+          type: boolean
+    Volume:
+      type: object
+      additionalProperties: false
+      description: Tenant-safe persistent-volume record. Host identity, device paths, provider locators, credentials, and private errors are never exposed.
+      required: [id, name, provider, storage_class, size_bytes, status, capabilities, generation, revision, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9._-]+$"
+        provider:
+          type: string
+          enum: [local_block]
+        storage_class:
+          type: string
+          enum: [block, filesystem, object]
+        size_bytes:
+          type: integer
+          format: uint64
+          minimum: 1048576
+        status:
+          type: string
+          enum: [creating, available, deleting, error]
+        capabilities:
+          $ref: "#/components/schemas/VolumeCapabilities"
+        region:
+          type: ["string", "null"]
+        zone:
+          type: ["string", "null"]
+        generation:
+          type: integer
+          format: uint64
+          minimum: 1
+        revision:
+          type: integer
+          format: uint64
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateVolumeRequest:
+      type: object
+      additionalProperties: false
+      required: [name, size_bytes]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Optional client-selected identity for idempotent replay.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9._-]+$"
+        size_bytes:
+          type: integer
+          format: uint64
+          minimum: 1048576
+          maximum: 1099511627776
+        provider:
+          type: string
+          enum: [local_block]
+          default: local_block
     RestoreRequest:
       type: object
-      required: [snapshot_path]
+      required: [snapshot_id]
       properties:
-        snapshot_path:
+        snapshot_id:
           type: string
-          description: Snapshot file path on the node that took it.
-        host_id:
-          type: string
-          description: Node that holds the snapshot file, as returned by the snapshot call. The restore routes there; omit to restore on the receiving node.
+          format: uuid
+          description: Opaque snapshot handle. Physical storage paths and host placement are never public.
         id:
           type: string
           format: uuid
           description: Optional id for the restored VM; generated when omitted.
+    RestoreBranchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Optional id for the isolated restored VM; generated when omitted.
+    ForkVmRequest:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Optional child VM id; generated when omitted.
+    ForkVmResponse:
+      type: object
+      required: [source_vm_id, vm]
+      properties:
+        source_vm_id:
+          type: string
+          format: uuid
+        vm:
+          $ref: "#/components/schemas/VmRecord"
     ExecuteRequest:
       type: object
       required: [vm_id, command]
@@ -191,7 +397,7 @@ components:
           format: uuid
         action:
           type: string
-          enum: [create, delete, pause, suspend, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token]
+          enum: [create, delete, pause, suspend, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token, create_volume, delete_volume]
         outcome:
           type: string
           enum: [attempt, ok, denied, error]
@@ -288,6 +494,7 @@ components:
 paths:
   /openapi.yaml:
     get:
+      operationId: getOpenapiSpec
       summary: OpenAPI specification (YAML)
       security: []
       responses:
@@ -299,6 +506,7 @@ paths:
                 type: string
   /docs:
     get:
+      operationId: getApiDocs
       summary: Interactive API documentation (Swagger UI)
       security: []
       responses:
@@ -310,6 +518,7 @@ paths:
                 type: string
   /health:
     get:
+      operationId: getHealth
       summary: Health check for external load balancer
       security: []
       responses:
@@ -317,6 +526,7 @@ paths:
           description: OK
   /metrics:
     get:
+      operationId: getMetrics
       summary: Prometheus operational metrics
       description: Admin-only Prometheus metrics. Tenant and VM labels are hashed unless explicitly configured otherwise. PTY metrics expose active connections, configured global/tenant/VM limits, and bounded-scope admission rejection counters without tenant or VM identifiers.
       responses:
@@ -330,8 +540,90 @@ paths:
           description: Missing or invalid API key
         "403":
           description: API key is not an admin key
+  /v1/volumes:
+    post:
+      operationId: createVolume
+      summary: Create a persistent volume
+      description: Creates an opaque tenant-owned volume. Exact replay with the same id and immutable properties is idempotent. The initial local-block provider is exact-host constrained; provider paths are private.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVolumeRequest"
+      responses:
+        "201":
+          description: Volume created and provider storage durable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "200":
+          description: Exact idempotent replay
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "400":
+          description: Invalid name or size
+        "401":
+          description: Missing or invalid API key
+        "409":
+          description: Identity/name conflict or deletion in progress
+        "422":
+          description: Requested provider is not configured
+    get:
+      operationId: listVolumes
+      summary: List tenant volumes
+      responses:
+        "200":
+          description: Tenant-scoped volume list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Volume"
+        "401":
+          description: Missing or invalid API key
+  /v1/volumes/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getVolume
+      summary: Get a tenant volume
+      responses:
+        "200":
+          description: Tenant-safe volume record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Volume absent or belongs to another tenant
+    delete:
+      operationId: deleteVolume
+      summary: Delete an unattached tenant volume
+      description: Atomically verifies the volume is unattached and fences metadata before removing the exact provider object, fsyncing its parent, then removing metadata. Provider failure remains retryable.
+      responses:
+        "204":
+          description: Provider object and metadata deleted
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Volume absent or belongs to another tenant
+        "409":
+          description: Volume transition conflicts with another operation
   /v1/vms:
     get:
+      operationId: listVms
       summary: List sandboxes
       description: User keys list their tenant's live or recoverable VMs; admin keys list all such records. Successfully deleted VMs are not returned.
       responses:
@@ -346,8 +638,9 @@ paths:
         "401":
           description: Missing or invalid API key
     post:
+      operationId: createVm
       summary: Create sandbox
-      description: Creates a VM owned by the caller's tenant. Non-admin callers may set `image` (`name[:tag]`) or omit paths for node defaults, but cannot set raw `kernel_path` or `rootfs_path`. Per-tenant max_vms quotas return 403 when reached.
+      description: Creates a VM owned by the caller's tenant. Persistent volumes are acquired before VMM startup with an exclusive durable writer fence; local volumes pin placement to this exact host and bypass warm-pool reuse. Non-admin callers may set `image` (`name[:tag]`) or omit paths for node defaults outside production, but cannot set raw `kernel_path` or `rootfs_path`.
       requestBody:
         required: true
         content:
@@ -368,7 +661,9 @@ paths:
         "403":
           description: Tenant VM quota reached
         "409":
-          description: Conflict, such as a duplicate requested VM id
+          description: Conflict, such as a duplicate VM id, unavailable/foreign volume, stale generation, or occupied writer attachment
+        "422":
+          description: The image is legacy, mutable, corrupt, or was admitted under a different provenance policy
         "429":
           description: Capacity exhausted or admission timed out
           headers:
@@ -379,6 +674,7 @@ paths:
                 minimum: 1
   /v1/vms/{id}:
     get:
+      operationId: getVm
       summary: Get sandbox
       description: Returns a tenant-safe stored VM record. Host ids, paths, boot arguments, VMM sockets, and process ids are intentionally omitted.
       parameters:
@@ -404,6 +700,7 @@ paths:
         "503":
           description: Owning host is unhealthy, stale, or unavailable
     delete:
+      operationId: deleteVm
       summary: Stop and remove sandbox
       description: User keys can delete only their tenant's VMs; admin keys can delete any VM.
       parameters:
@@ -424,6 +721,7 @@ paths:
           description: VM not found
   /v1/vms/{id}/status:
     get:
+      operationId: getVmStatus
       summary: Get live sandbox status
       description: Queries the owning VMM for a sanitized live runtime status. Host paths and device configuration remain internal. User keys can access only their tenant's VMs.
       parameters:
@@ -471,8 +769,69 @@ paths:
           description: VM is stopped
         "503":
           description: Owning host is unhealthy, stale, or unavailable
+  /v1/vms/{id}/balloon:
+    get:
+      operationId: getVmBalloon
+      summary: Get virtio-balloon target and guest-reported size
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Balloon state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalloonState"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+        "404":
+          description: VM not found
+        "409":
+          description: VM is not running or paused
+    put:
+      operationId: setVmBalloon
+      summary: Set virtio-balloon target
+      description: Audited and routed to the owning node. The target cannot exceed configured guest RAM.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BalloonTargetRequest"
+      responses:
+        "200":
+          description: Updated balloon state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalloonState"
+        "400":
+          description: Target exceeds guest RAM or request is invalid
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+        "404":
+          description: VM not found
+        "409":
+          description: VM is not running or paused
   /v1/vms/{id}/pty/sessions:
     post:
+      operationId: createPtySession
       summary: Create PTY session
       description: Registers an interactive PTY session for the VM. Tokens are one-time and expire after five minutes. At most 32 pending sessions may exist per VM. PTY routes operate on the VM's owning node only; on a non-owner node they return 409.
       parameters:
@@ -531,6 +890,7 @@ paths:
         "429":
           description: Pending or active PTY capacity is exhausted
     get:
+      operationId: listPtySessions
       summary: List PTY sessions
       description: Lists PTY sessions registered for the VM on this node.
       parameters:
@@ -563,6 +923,7 @@ paths:
           description: VM is owned by another node; connect to the owner
   /v1/vms/{id}/pty/sessions/{pty_id}:
     get:
+      operationId: getPtySession
       summary: Get PTY session
       parameters:
         - name: id
@@ -593,6 +954,7 @@ paths:
         "409":
           description: VM is owned by another node; connect to the owner
     delete:
+      operationId: deletePtySession
       summary: Delete PTY session
       parameters:
         - name: id
@@ -620,6 +982,7 @@ paths:
           description: VM is owned by another node; connect to the owner
   /v1/vms/{id}/pty/sessions/{pty_id}/resize:
     post:
+      operationId: resizePtySession
       summary: Resize PTY session
       parameters:
         - name: id
@@ -676,6 +1039,7 @@ paths:
           description: VM is owned by another node; connect to the owner
   /v1/vms/{id}/pty/{pty_id}/connect:
     get:
+      operationId: connectPty
       summary: Attach to PTY session (WebSocket)
       description: Upgrades to a WebSocket bridged to the guest PTY. Authenticates with the `token` query parameter carrying the one-time `connect_token` from the create-session response, not the X-API-Key header. Tokens expire after 5 minutes or on first successful connect. Global, authenticated-tenant, and VM active-connection limits are reserved before upgrade; a capacity rejection does not consume a valid token. Binary messages carry raw PTY bytes; text messages are JSON controls (client-to-server `{"type":"resize","cols":N,"rows":N}`, server-to-client `{"type":"exit","exit_code":N}`).
       security: []
@@ -707,6 +1071,7 @@ paths:
           description: Global, tenant, or VM active PTY capacity is exhausted; a valid token remains usable for retry
   /v1/vms/{id}/pause:
     post:
+      operationId: pauseVm
       summary: Pause sandbox
       description: User keys can pause only their tenant's VMs; admin keys can pause any VM.
       parameters:
@@ -733,6 +1098,7 @@ paths:
           description: VM is stopped
   /v1/vms/{id}/resume:
     post:
+      operationId: resumeVm
       summary: Resume sandbox
       description: User keys can resume only their tenant's VMs; admin keys can resume any VM.
       parameters:
@@ -759,6 +1125,7 @@ paths:
           description: VM is stopped
   /v1/vms/{id}/suspend:
     post:
+      operationId: suspendVm
       summary: Suspend sandbox
       description: Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause operations.
       parameters:
@@ -783,10 +1150,40 @@ paths:
           description: VM not found
         "409":
           description: VM is not running
+  /v1/vms/{id}/hibernate:
+    post:
+      operationId: hibernateVm
+      summary: Hibernate sandbox and release host capacity
+      description: Atomically captures an authenticated live RAM/device/disk snapshot, stops the resident VMM, releases CPU, memory, cgroup, network, and scheduler capacity, and retains a tenant-owned logical VM record for secure resume.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Hibernated VM record with no resident runtime allocation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRecord"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+        "404":
+          description: VM not found
+        "409":
+          description: VM is not running
+        "503":
+          description: Remote hibernation is unavailable until fenced peer lifecycle routing is enabled
   /v1/vms/{id}/snapshot:
     post:
+      operationId: snapshotVm
       summary: Snapshot sandbox
-      description: User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. Snapshot files are node-local; keep the returned `host_id` and pass it to `POST /v1/restore`.
+      description: User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses the bounded live pre-copy path; RAM, device state, and the private disk upper are captured at one atomic final-stop boundary. The response is an opaque handle; paths and physical host identity remain private.
       parameters:
         - name: id
           in: path
@@ -807,17 +1204,16 @@ paths:
                   description: Must be false. Incremental orchestrator snapshots are disabled until durable parent-chain relocation is available.
       responses:
         "200":
-          description: Snapshot path and host_id
+          description: Opaque snapshot handle
           content:
             application/json:
               schema:
                 type: object
-                required: [path, host_id]
+                required: [snapshot_id]
                 properties:
-                  path:
+                  snapshot_id:
                     type: string
-                  host_id:
-                    type: string
+                    format: uuid
         "401":
           description: Missing or invalid API key
         "403":
@@ -828,10 +1224,48 @@ paths:
           description: Incremental snapshots are disabled; retry with `diff=false`.
         "409":
           description: VM is stopped
+  /v1/vms/{id}/fork:
+    post:
+      operationId: forkVm
+      summary: Atomically fork a running sandbox
+      description: Takes a bounded live snapshot of the running source, including RAM, device state, and its private disk upper at one fork point, then restores an isolated child with lazy UFFD memory and a new writable disk overlay. In fleet mode, a request received by a healthy non-owner node securely snapshots the source through session-fenced mTLS, localizes and verifies the artifact, requires the configured replica policy, and starts the child on that receiving node. Placement identifiers and host paths are never caller-controlled or returned. The source and child must belong to the authenticated tenant.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkVmRequest"
+      responses:
+        "201":
+          description: Ready isolated child VM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForkVmResponse"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: Source VM belongs to a different tenant or tenant quota is reached
+        "404":
+          description: Source VM not found
+        "409":
+          description: Source is not running or the requested child id already exists
+        "429":
+          description: Host capacity is unavailable
+        "503":
+          description: A source peer/session, durable fleet, verified artifact replica, or configured replication policy is unavailable
   /v1/restore:
     post:
+      operationId: restoreVm
       summary: Restore sandbox from a snapshot
-      description: Restores a VM from a snapshot file. When `host_id` names another node, the request routes to it; no snapshot bytes are copied between nodes. Tenant VM quotas apply.
+      description: Restores a VM from an opaque snapshot handle. The control plane resolves its private host and storage locator; tenant VM quotas apply.
       requestBody:
         required: true
         content:
@@ -850,7 +1284,7 @@ paths:
         "403":
           description: Tenant VM quota reached
         "404":
-          description: host_id not found in the fleet
+          description: Snapshot handle or owning host not found
         "429":
           description: Selected node is at capacity
           headers:
@@ -861,6 +1295,7 @@ paths:
                 minimum: 1
   /v1/execute:
     post:
+      operationId: execute
       summary: Execute command in sandbox (synchronous)
       description: Runs the command and returns the finished execution record in one request, no polling. The record is `completed` or `failed`; an exec that could not run at all is still a 200 with `status:"failed"` and `error` set. User keys can execute only in their tenant's VMs.
       requestBody:
@@ -884,6 +1319,7 @@ paths:
           description: VM not found
   /v1/execute_async:
     post:
+      operationId: executeAsync
       summary: Execute command in sandbox (async)
       description: User keys can execute only in their tenant's VMs; admin keys can execute in any VM. Poll the record with GET /v1/executions/{id} on the same node.
       requestBody:
@@ -907,6 +1343,7 @@ paths:
           description: VM not found
   /v1/executions/{id}:
     get:
+      operationId: getExecution
       summary: Get execution status
       description: Returns execution status only if the caller can access the VM associated with the execution.
       parameters:
@@ -931,6 +1368,7 @@ paths:
           description: Execution not found
   /v1/egress/vm/{id}:
     patch:
+      operationId: patchVmEgressPolicy
       summary: Update egress allowlist
       description: User keys can update egress only for their tenant's VMs; admin keys can update any VM.
       parameters:
@@ -975,8 +1413,286 @@ paths:
           description: VM not found
         "409":
           description: VM is stopped
+  /v1/vms/{id}/egress-policy:
+    get:
+      operationId: getVmEgressPolicy
+      summary: Read durable desired egress policy
+      description: Returns the tenant-scoped policy that survives hibernation. A VM with no explicit policy has revision 1 and default-deny semantics.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Current desired policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EgressPolicy"
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+        "404":
+          description: VM not found
+    put:
+      operationId: setVmEgressPolicy
+      summary: Compare-and-swap durable desired egress policy
+      description: Persists the policy before applying it. For a hibernated VM it is installed during network provisioning before the resumed guest starts.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision, allowlist]
+              properties:
+                expected_revision:
+                  type: integer
+                  format: uint64
+                  minimum: 1
+                allowlist:
+                  type: array
+                  maxItems: 256
+                  items:
+                    type: string
+                    maxLength: 128
+                allow_existing:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: Persisted desired policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EgressPolicy"
+        "400":
+          description: Invalid or excessive rule syntax
+        "401":
+          description: Missing or invalid API key
+        "403":
+          description: VM belongs to a different tenant
+        "404":
+          description: VM not found
+        "409":
+          description: Revision mismatch or invalid lifecycle state
+  /v1/branches:
+    get:
+      operationId: listBranches
+      summary: List tenant branches
+      responses:
+        "200":
+          description: Tenant-scoped branch records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Branch"
+        "401":
+          description: Missing or invalid API key
+    post:
+      operationId: createBranch
+      summary: Create a tenant branch
+      description: The optional caller-generated branch ID makes an identical replay idempotent. The head artifact and optional source identities must belong to the same tenant; only available, replication-ready artifacts can become branch heads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, head_artifact_id]
+              properties:
+                branch_id:
+                  type: string
+                  format: uuid
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                head_artifact_id:
+                  type: string
+                  format: uuid
+                source_vm_id:
+                  type: string
+                  format: uuid
+                source_branch_id:
+                  type: string
+                  format: uuid
+      responses:
+        "201":
+          description: Branch created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Branch"
+        "200":
+          description: Identical caller-ID replay
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Branch"
+        "400":
+          description: Invalid branch name
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Tenant-owned head artifact or source not found
+        "409":
+          description: Branch ID or name conflicts with another branch
+  /v1/branches/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getBranch
+      summary: Get a tenant branch
+      responses:
+        "200":
+          description: Branch record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Branch"
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Branch not found for this tenant
+    put:
+      operationId: updateBranch
+      summary: Compare-and-swap a branch head
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_revision, head_artifact_id]
+              properties:
+                expected_revision:
+                  type: integer
+                  format: uint64
+                  minimum: 1
+                head_artifact_id:
+                  type: string
+                  format: uuid
+      responses:
+        "200":
+          description: Updated branch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Branch"
+        "400":
+          description: Invalid revision
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Branch or tenant-owned replication-ready artifact not found
+        "409":
+          description: Stale branch revision
+    delete:
+      operationId: deleteBranch
+      summary: Delete a tenant branch and release its artifact reference
+      responses:
+        "204":
+          description: Branch deleted
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Branch not found for this tenant
+  /v1/branches/{id}/restore:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      operationId: restoreBranch
+      summary: Restore an isolated VM from a branch head
+      description: Restores the immutable branch-head artifact on this node. In clustered mode, a missing local replica is streamed from a healthy verified peer over authenticated mTLS, fully integrity-verified, and published into the fleet replica index before boot.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreBranchRequest"
+      responses:
+        "201":
+          description: Restored VM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRecord"
+        "400":
+          description: Malformed request
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Branch or artifact not found for this tenant
+        "409":
+          description: Requested VM id already exists
+        "429":
+          description: Tenant quota or node disk pressure prevents restore
+        "503":
+          description: No healthy verified artifact replica is reachable or replication policy is not satisfied
+  /v1/branches/{id}/fork:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      operationId: forkBranch
+      summary: Fork an isolated VM from a branch head
+      description: Alias of branch restore for clients expressing branch lineage as a fork. The child receives a new VM identity and isolated writable state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreBranchRequest"
+      responses:
+        "201":
+          description: Forked VM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmRecord"
+        "400":
+          description: Malformed request
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Branch or artifact not found for this tenant
+        "409":
+          description: Requested VM id already exists
+        "429":
+          description: Tenant quota or node disk pressure prevents fork
+        "503":
+          description: No healthy verified artifact replica is reachable or replication policy is not satisfied
   /v1/shares:
     get:
+      operationId: listShares
       summary: List port shares
       description: Lists shares owned by the caller's tenant. This control-plane route uses `X-API-Key`; it is not the guest share gateway.
       responses:
@@ -1001,6 +1717,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorBody"
     post:
+      operationId: createShare
       summary: Create port share
       description: Creates a share for a running VM owned by the caller. `visibility` defaults to `private`.
       requestBody:
@@ -1061,6 +1778,7 @@ paths:
           type: string
           format: uuid
     get:
+      operationId: getShare
       summary: Get port share
       responses:
         "200":
@@ -1100,6 +1818,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorBody"
     patch:
+      operationId: updateShare
       summary: Update port share
       description: Changes one or more share fields. Changing `vm_id`, `guest_port`, or `visibility` invalidates previously issued private-share tokens.
       requestBody:
@@ -1152,6 +1871,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorBody"
     delete:
+      operationId: deleteShare
       summary: Revoke port share
       description: Revokes the share and invalidates issued private-share tokens. Repeating a successful revocation returns `204`.
       responses:
@@ -1195,6 +1915,7 @@ paths:
                 $ref: "#/components/schemas/ErrorBody"
   /v1/shares/{id}/tokens:
     post:
+      operationId: createShareToken
       summary: Issue private-share token
       description: Issues a temporary token only for an active private share. Send it to the gateway in `X-Tarit-Share-Token`; do not use query parameters.
       parameters:
@@ -1243,6 +1964,7 @@ paths:
                 $ref: "#/components/schemas/ErrorBody"
   /v1/ssh-keys:
     post:
+      operationId: createSshKey
       summary: Register SSH public key
       description: Registers an OpenSSH public key for the caller's tenant. RSA keys remain valid for guest authorized-key injection but cannot authenticate to the SSH gateway.
       requestBody:
@@ -1268,6 +1990,7 @@ paths:
         "401":
           description: Missing or invalid API key
     get:
+      operationId: listSshKeys
       summary: List SSH keys
       description: Lists SSH keys registered for the caller's tenant.
       responses:
@@ -1287,6 +2010,7 @@ paths:
           description: Missing or invalid API key
   /v1/ssh-keys/{key_id}:
     delete:
+      operationId: deleteSshKey
       summary: Delete SSH key
       description: Deletes an SSH key belonging to the caller's tenant.
       parameters:
@@ -1305,6 +2029,7 @@ paths:
           description: SSH key not found
   /v1/cluster:
     get:
+      operationId: getCluster
       summary: Cluster capacity and health
       description: Admin-only cluster status and capacity summary.
       responses:
@@ -1358,6 +2083,7 @@ paths:
           description: Admin role required
   /v1/usage:
     get:
+      operationId: getUsage
       summary: Aggregated usage stats per API key
       description: Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
       parameters:
@@ -1396,6 +2122,7 @@ paths:
           description: No fleet database configured, or store failure
   /v1/audit:
     get:
+      operationId: listAuditEvents
       summary: Recent audit trail
       description: Audited actions from the primary store, newest first; requires a fleet database (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
       parameters:

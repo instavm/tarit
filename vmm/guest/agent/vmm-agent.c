@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -19,15 +20,20 @@
 #include <termios.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <linux/random.h>
 #include <linux/vm_sockets.h>
 #include <poll.h>
 #include <pty.h>
 #include <sys/mount.h>
+#include <sys/random.h>
 #include <sys/sysmacros.h>
+#include <sys/vfs.h>
 #endif
 
 #define EXEC_PREFIX "VMM_EXEC:"
 #define EXEC_PREFIX_LEN 9
+#define PROBE_PREFIX "VMM_PROBE:"
+#define PROBE_PREFIX_LEN 10
 #define REPAIR_NET_PREFIX "VMM_REPAIR_NET:"
 #define REPAIR_NET_PREFIX_LEN 15
 
@@ -61,6 +67,13 @@
 #define EXEC_FRAME_MAX_PAYLOAD (1024U * 1024U)
 #define EXEC_STREAM_CHUNK_BYTES (16U * 1024U)
 #define EXEC_PROTOCOL_LINE "VMM_VSOCK_EXEC_PROTO=2\n"
+#define CLONE_REPAIR_PREFIX "__TARIT_CLONE_REPAIR_V2__"
+#define CLONE_REPAIR_PREFIX_LEN (sizeof(CLONE_REPAIR_PREFIX) - 1U)
+#define CLONE_REPAIR_SEED_BYTES 32U
+#define CLONE_REPAIR_ID_BYTES 16U
+#define CLONE_REPAIR_NONCE_BYTES (CLONE_REPAIR_SEED_BYTES + CLONE_REPAIR_ID_BYTES)
+#define CLONE_REPAIR_OK "TARIT_CLONE_REPAIR_V2_OK"
+#define POST_FORK_HOOK_PATH "/usr/libexec/tarit/post-fork"
 
 /* A sane default PATH so commands (node, python, ...) resolve when we run as
  * init on an OCI-derived rootfs where no login shell exported one. */
@@ -93,6 +106,197 @@ static int write_all(int fd, const void *buf, size_t len) {
     }
     return 0;
 }
+
+#ifdef __linux__
+static int hex_nibble(unsigned char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static int decode_clone_repair_nonce(const char *command,
+                                     unsigned char nonce[CLONE_REPAIR_NONCE_BYTES]) {
+    size_t prefix_len = strlen(CLONE_REPAIR_PREFIX);
+    size_t expected_len = prefix_len + CLONE_REPAIR_NONCE_BYTES * 2U;
+    if (prefix_len != CLONE_REPAIR_PREFIX_LEN || strlen(command) != expected_len ||
+        memcmp(command, CLONE_REPAIR_PREFIX, prefix_len) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t i = 0; i < CLONE_REPAIR_NONCE_BYTES; i++) {
+        int high = hex_nibble((unsigned char)command[prefix_len + i * 2U]);
+        int low = hex_nibble((unsigned char)command[prefix_len + i * 2U + 1U]);
+        if (high < 0 || low < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        nonce[i] = (unsigned char)((high << 4) | low);
+    }
+    return 0;
+}
+
+static int run_post_fork_hook(const char *clone_id) {
+    struct stat st;
+    int hook_fd = open(POST_FORK_HOOK_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (hook_fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (fstat(hook_fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        (st.st_mode & 0022) != 0 || (st.st_mode & 0111) == 0) {
+        close(hook_fd);
+        errno = EPERM;
+        return -1;
+    }
+    if (fcntl(hook_fd, F_SETFD, 0) < 0) {
+        close(hook_fd);
+        return -1;
+    }
+
+    char fd_path[64];
+    char clone_env[64];
+    int fd_path_len = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", hook_fd);
+    int clone_env_len = snprintf(clone_env, sizeof(clone_env), "TARIT_CLONE_ID=%s", clone_id);
+    if (fd_path_len <= 0 || (size_t)fd_path_len >= sizeof(fd_path) || clone_env_len != 47) {
+        close(hook_fd);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    char *const argv[] = { (char *)POST_FORK_HOOK_PATH, NULL };
+    char *const envp[] = {
+        clone_env,
+        (char *)"TARIT_POST_FORK=1",
+        (char *)"PATH=" DEFAULT_PATH,
+        NULL,
+    };
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(hook_fd);
+        return -1;
+    }
+    if (child == 0) {
+        int null_fd = open("/dev/null", O_RDWR);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDIN_FILENO);
+            (void)dup2(null_fd, STDOUT_FILENO);
+            (void)dup2(null_fd, STDERR_FILENO);
+        }
+        for (int fd = 3; fd < 1024; fd++) {
+            if (fd != hook_fd) close(fd);
+        }
+        execve(fd_path, argv, envp);
+        _exit(126);
+    }
+    close(hook_fd);
+
+    int status;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        errno = ECANCELED;
+        return -1;
+    }
+    return 0;
+}
+
+static int repair_clone_entropy(const char *command, char clone_id[33]) {
+    unsigned char nonce[CLONE_REPAIR_NONCE_BYTES];
+    struct {
+        int entropy_count;
+        int buf_size;
+        unsigned char buf[CLONE_REPAIR_SEED_BYTES];
+    } pool;
+    int random_fd = -1;
+    int marker = -1;
+    int boot_id_file = -1;
+    int rc = -1;
+
+    if (decode_clone_repair_nonce(command, nonce) < 0) {
+        goto out;
+    }
+
+    pool.entropy_count = (int)(CLONE_REPAIR_SEED_BYTES * 8U);
+    pool.buf_size = (int)CLONE_REPAIR_SEED_BYTES;
+    memcpy(pool.buf, nonce, CLONE_REPAIR_SEED_BYTES);
+    random_fd = open("/dev/random", O_RDWR | O_CLOEXEC);
+    if (random_fd < 0 || ioctl(random_fd, RNDADDENTROPY, &pool) < 0 ||
+        ioctl(random_fd, RNDRESEEDCRNG, 0) < 0) {
+        goto out;
+    }
+    close(random_fd);
+    random_fd = -1;
+
+    /* The clone ID is a separate, non-secret part of the host nonce. Echoing
+     * it proves that the exact repair request was consumed before admission. */
+    for (size_t i = 0; i < CLONE_REPAIR_ID_BYTES; i++) {
+        static const char hex[] = "0123456789abcdef";
+        unsigned char value = nonce[CLONE_REPAIR_SEED_BYTES + i];
+        clone_id[i * 2] = hex[value >> 4];
+        clone_id[i * 2 + 1] = hex[value & 0x0fU];
+    }
+    clone_id[32] = '\0';
+
+    if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) {
+        goto out;
+    }
+    marker = open("/run/tarit/clone-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (marker < 0 || write_all(marker, clone_id, 32) < 0 || write_all(marker, "\n", 1) < 0) {
+        goto out;
+    }
+    close(marker);
+    marker = -1;
+
+    char boot_id[38];
+    int boot_id_len = snprintf(boot_id, sizeof(boot_id),
+                               "%.8s-%.4s-%.4s-%.4s-%.12s\n", clone_id,
+                               clone_id + 8, clone_id + 12, clone_id + 16,
+                               clone_id + 20);
+    if (boot_id_len != 37) {
+        errno = EOVERFLOW;
+        goto out;
+    }
+    boot_id_file = open("/run/tarit/boot-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0444);
+    if (boot_id_file < 0 || write_all(boot_id_file, boot_id, (size_t)boot_id_len) < 0 ||
+        fsync(boot_id_file) < 0) {
+        goto out;
+    }
+    close(boot_id_file);
+    boot_id_file = -1;
+
+    /* A kernel boot_id is immutable and remains captured in VM RAM. Overlay it
+     * with this incarnation ID before admission. On descendants the existing
+     * bind mount observes the rewritten tmpfs inode, so mounts do not stack. */
+    char current_boot_id[38];
+    int current = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+    ssize_t current_len = current >= 0 ? read(current, current_boot_id, sizeof(current_boot_id)) : -1;
+    if (current >= 0) close(current);
+    if (current_len != boot_id_len || memcmp(current_boot_id, boot_id, (size_t)boot_id_len) != 0) {
+        if (mount("/run/tarit/boot-id", "/proc/sys/kernel/random/boot_id", NULL, MS_BIND, NULL) < 0 ||
+            mount(NULL, "/proc/sys/kernel/random/boot_id", NULL,
+                  MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
+            goto out;
+        }
+    }
+    if (run_post_fork_hook(clone_id) < 0) {
+        goto out;
+    }
+    rc = 0;
+
+out:
+    {
+        int saved_errno = errno;
+        if (random_fd >= 0) close(random_fd);
+        if (marker >= 0) close(marker);
+        if (boot_id_file >= 0) close(boot_id_file);
+        memset(nonce, 0, sizeof(nonce));
+        memset(&pool, 0, sizeof(pool));
+        errno = saved_errno;
+    }
+    return rc;
+}
+#endif
 
 static int serial_write(int fd, const void *buf, size_t len) {
     if (write_all(fd, buf, len) < 0) {
@@ -143,6 +347,51 @@ static void ensure_node(const char *path, mode_t mode, unsigned major, unsigned 
     (void)mknod(path, mode, makedev(major, minor));
 }
 
+/* Some small kernels expose the block devices through sysfs but provide only
+ * a plain tmpfs at /dev. devtmpfs and tmpfs have the same statfs magic, so the
+ * fallback above cannot safely infer that device nodes were populated. Build
+ * the missing block nodes from the kernel-owned sysfs class instead. */
+static void ensure_block_nodes(void) {
+    DIR *directory = opendir("/sys/class/block");
+    if (directory == NULL) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        const char *name = entry->d_name;
+        if (name[0] == '.' || strchr(name, '/') != NULL || strlen(name) > 127U) {
+            continue;
+        }
+        char sysfs_path[256];
+        char device_path[256];
+        if (snprintf(sysfs_path, sizeof(sysfs_path), "/sys/class/block/%s/dev", name) < 0 ||
+            snprintf(device_path, sizeof(device_path), "/dev/%s", name) < 0) {
+            continue;
+        }
+        FILE *device = fopen(sysfs_path, "re");
+        if (device == NULL) {
+            continue;
+        }
+        unsigned device_major = 0;
+        unsigned device_minor = 0;
+        int parsed = fscanf(device, "%u:%u", &device_major, &device_minor);
+        fclose(device);
+        if (parsed == 2) {
+            ensure_node(device_path, S_IFBLK | 0600, device_major, device_minor);
+        }
+    }
+    closedir(directory);
+}
+
+/* devtmpfs and tmpfs share TMPFS_MAGIC. At this early PID-1 boundary, an
+ * existing tmpfs mount on /dev is the kernel's CONFIG_DEVTMPFS_MOUNT result;
+ * the OCI rootfs cannot have established a mount before init runs. */
+static bool dev_filesystem_is_mounted(void) {
+    struct statfs state;
+    return statfs("/dev", &state) == 0 &&
+           (unsigned long)state.f_type == 0x01021994UL;
+}
+
 /* PID 1 setup for booting an OCI-derived (initless) rootfs directly: bring up
  * the pseudo-filesystems a normal init would, so /dev/urandom, /dev/null, /proc
  * etc. exist for the workload (node reads /dev/urandom at startup). Must run
@@ -153,17 +402,19 @@ static void setup_as_init(void) {
     /* devtmpfs auto-populates /dev with the kernel's device nodes (ttyS0,
      * null, urandom, ...). If the kernel lacks devtmpfs, fall back to a tmpfs
      * plus the handful of nodes programs actually need. */
-    if (mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755") != 0) {
+    if (mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755") != 0 &&
+        !dev_filesystem_is_mounted()) {
         mount_pseudo("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755");
-        ensure_node("/dev/null", S_IFCHR | 0666, 1, 3);
-        ensure_node("/dev/zero", S_IFCHR | 0666, 1, 5);
-        ensure_node("/dev/full", S_IFCHR | 0666, 1, 7);
-        ensure_node("/dev/random", S_IFCHR | 0666, 1, 8);
-        ensure_node("/dev/urandom", S_IFCHR | 0666, 1, 9);
-        ensure_node("/dev/tty", S_IFCHR | 0666, 5, 0);
-        ensure_node("/dev/console", S_IFCHR | 0600, 5, 1);
-        ensure_node("/dev/ttyS0", S_IFCHR | 0660, 4, 64);
     }
+    ensure_node("/dev/null", S_IFCHR | 0666, 1, 3);
+    ensure_node("/dev/zero", S_IFCHR | 0666, 1, 5);
+    ensure_node("/dev/full", S_IFCHR | 0666, 1, 7);
+    ensure_node("/dev/random", S_IFCHR | 0666, 1, 8);
+    ensure_node("/dev/urandom", S_IFCHR | 0666, 1, 9);
+    ensure_node("/dev/tty", S_IFCHR | 0666, 5, 0);
+    ensure_node("/dev/console", S_IFCHR | 0600, 5, 1);
+    ensure_node("/dev/ttyS0", S_IFCHR | 0660, 4, 64);
+    ensure_block_nodes();
     mount_pseudo("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
     mount_pseudo("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755");
     mount_pseudo("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777");
@@ -341,6 +592,27 @@ static void run_command(int serial_fd, const char *command) {
 
     (void)serial_write(serial_fd, "VMM_EXEC_START\n", 15);
 
+    /* An empty command is the transport-level readiness probe. It proves the
+     * agent can receive and answer requests without requiring /bin/sh, which
+     * intentionally does not exist in distroless OCI images. */
+    if (command[0] == '\0') {
+        serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 0);
+        return;
+    }
+#ifdef __linux__
+    if (strncmp(command, CLONE_REPAIR_PREFIX, CLONE_REPAIR_PREFIX_LEN) == 0) {
+        char clone_id[33];
+        if (repair_clone_entropy(command, clone_id) == 0) {
+            serial_printf(serial_fd, "%s %s\n", CLONE_REPAIR_OK, clone_id);
+            serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 0);
+        } else {
+            serial_printf(serial_fd, "vmm-agent: clone repair failed: %s\n", strerror(errno));
+            serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 1);
+        }
+        return;
+    }
+#endif
+
     if (pipe(pipefd) < 0) {
         serial_printf(serial_fd, "vmm-agent: pipe failed: %s\n", strerror(errno));
         serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 127);
@@ -393,6 +665,19 @@ static void run_command(int serial_fd, const char *command) {
         (void)serial_write(serial_fd, "\n", 1);
     }
     serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", exit_code);
+}
+
+static void run_probe(int serial_fd, const char *token) {
+    if (strlen(token) != 16U) {
+        return;
+    }
+    for (size_t i = 0; i < 16U; i++) {
+        unsigned char c = (unsigned char)token[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return;
+        }
+    }
+    serial_printf(serial_fd, "VMM_PROBE_OK:%s\n", token);
 }
 
 #ifdef __linux__
@@ -510,6 +795,32 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
     if (send_exec_start(fd, request_id) < 0) {
+        return;
+    }
+    /* Keep readiness independent of guest shell/userspace availability. */
+    if (command[0] == '\0') {
+        (void)send_exec_exit(fd, request_id, 0);
+        return;
+    }
+    if (strncmp(command, CLONE_REPAIR_PREFIX, CLONE_REPAIR_PREFIX_LEN) == 0) {
+        char clone_id[33];
+        if (repair_clone_entropy(command, clone_id) == 0) {
+            char response[96];
+            int len = snprintf(response, sizeof(response), "%s %s\n", CLONE_REPAIR_OK, clone_id);
+            if (len > 0 && (size_t)len < sizeof(response)) {
+                (void)send_exec_chunk(fd, EXEC_FRAME_STDOUT, request_id, response, (uint32_t)len);
+                (void)send_exec_exit(fd, request_id, 0);
+                return;
+            }
+            errno = EOVERFLOW;
+        }
+        char message[160];
+        int len = snprintf(message, sizeof(message), "vmm-agent: clone repair failed: %s\n",
+                           strerror(errno));
+        if (len > 0 && (size_t)len < sizeof(message)) {
+            (void)send_exec_chunk(fd, EXEC_FRAME_STDERR, request_id, message, (uint32_t)len);
+        }
+        (void)send_exec_exit(fd, request_id, 1);
         return;
     }
     if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
@@ -1349,6 +1660,8 @@ static void serve_vsock_forever(void) {
             }
             if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
                 run_command(fd, line + EXEC_PREFIX_LEN);
+            } else if (strncmp(line, PROBE_PREFIX, PROBE_PREFIX_LEN) == 0) {
+                run_probe(fd, line + PROBE_PREFIX_LEN);
             } else if (strncmp(line, REPAIR_NET_PREFIX, REPAIR_NET_PREFIX_LEN) == 0) {
                 run_guest_network_repair(fd, line + REPAIR_NET_PREFIX_LEN);
             }
@@ -1417,6 +1730,8 @@ int main(void) {
         }
         if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
             run_command(serial_fd, line + EXEC_PREFIX_LEN);
+        } else if (strncmp(line, PROBE_PREFIX, PROBE_PREFIX_LEN) == 0) {
+            run_probe(serial_fd, line + PROBE_PREFIX_LEN);
         } else if (strncmp(line, REPAIR_NET_PREFIX, REPAIR_NET_PREFIX_LEN) == 0) {
             run_guest_network_repair(serial_fd, line + REPAIR_NET_PREFIX_LEN);
         }

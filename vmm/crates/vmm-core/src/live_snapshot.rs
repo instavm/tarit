@@ -12,6 +12,8 @@
 use crate::error::{Result, VmmError};
 use crate::kvm::KvmVm;
 use crate::vcpu_thread::VcpuThread;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::time::{Duration, Instant};
 use vmm_memory_backend::dirty::DirtyBitmap;
 use vmm_memory_backend::GuestMemory;
@@ -31,6 +33,23 @@ const DEFAULT_COPY_BANDWIDTH_BPS: u64 = 500_000_000;
 /// Pause between pre-copy rounds, so a guest that is dirtying very little
 /// does not turn the loop into a `KVM_GET_DIRTY_LOG` spin.
 const ROUND_IDLE_SLEEP: Duration = Duration::from_millis(10);
+
+#[cfg(feature = "test-failpoints")]
+fn inject_live_snapshot_failure(phase: &str) -> Result<()> {
+    if std::env::var_os("TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE").as_deref()
+        == Some(std::ffi::OsStr::new(phase))
+    {
+        return Err(VmmError::Snapshot(format!(
+            "injected live snapshot failure at {phase}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-failpoints"))]
+fn inject_live_snapshot_failure(_phase: &str) -> Result<()> {
+    Ok(())
+}
 
 struct VcpuPauseGuard<'a> {
     vcpu_thread: &'a VcpuThread,
@@ -70,6 +89,46 @@ struct IoQuiesceGuard<'a> {
     armed: bool,
 }
 
+/// KVM_GET_DIRTY_LOG clears the bits it returns. If any later snapshot step
+/// fails, replay all consumed pages into the host tracker so a subsequent diff
+/// cannot silently omit writes observed by this attempt.
+struct DirtyReplayGuard<'a> {
+    mem: &'a GuestMemory,
+    dirty: DirtyBitmap,
+    armed: bool,
+}
+
+impl<'a> DirtyReplayGuard<'a> {
+    fn new(mem: &'a GuestMemory) -> Self {
+        Self {
+            mem,
+            dirty: DirtyBitmap::new(),
+            armed: true,
+        }
+    }
+
+    fn merge(&mut self, dirty: &DirtyBitmap) {
+        self.dirty.merge(dirty);
+    }
+
+    fn disarm(mut self) -> DirtyBitmap {
+        self.armed = false;
+        std::mem::replace(&mut self.dirty, DirtyBitmap::new())
+    }
+}
+
+impl Drop for DirtyReplayGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for pfn in self.dirty.dirty_pfns() {
+            self.mem
+                .mark_host_dirty(pfn.saturating_mul(PAGE_SIZE), PAGE_SIZE);
+        }
+    }
+}
+
 impl<'a> IoQuiesceGuard<'a> {
     fn engage(quiesce: &'a dyn Fn(bool)) -> Self {
         quiesce(true);
@@ -102,7 +161,9 @@ pub struct LiveSnapshotConfig {
     pub target_downtime_us: u64,
     /// Max pre-copy rounds before forcing stop.
     pub max_rounds: u32,
-    /// Time budget for the entire live snapshot (hard limit).
+    /// Time budget for background pre-copy. Once exhausted, the state machine
+    /// enters the coherent final stop; residual copy and durable writeback are
+    /// measured separately rather than hidden inside this budget.
     pub timeout_secs: u64,
 }
 
@@ -132,6 +193,9 @@ pub struct LiveSnapshotResult {
     pub downtime: Duration,
     /// The decision that ended the pre-copy loop.
     pub final_decision: RoundDecision,
+    /// Why pre-copy stopped. This is distinct from `final_decision` so timeout
+    /// and max-round exits cannot masquerade as convergence.
+    pub termination: LiveSnapshotTermination,
     /// Size of the captured memory image. The image itself is streamed to
     /// `snapshot_path` and freed, so a live snapshot does not pin a second
     /// copy of guest RAM for the caller's lifetime.
@@ -139,14 +203,25 @@ pub struct LiveSnapshotResult {
     /// On-disk path where the controller persisted this live snapshot (a
     /// private per-process scratch path). Empty until the controller sets it.
     pub snapshot_path: String,
+    /// Optional private disk upper captured during the same final stop as RAM
+    /// and device state. Empty until the controller performs that capture.
+    pub overlay_path: Option<String>,
+    /// Chunk-integrity sidecar generated while assembling the live snapshot.
+    pub integrity_path: Option<String>,
 }
 
-/// Everything a live snapshot produces. The controller consumes `mem_snapshot`
-/// and `state_blob` to write the on-disk artifact, then drops them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSnapshotTermination {
+    Converged,
+    Diverging,
+    Timeout,
+    MaxRounds,
+}
+
+/// Everything a live snapshot produces. Guest RAM is already in the caller's
+/// private staging file; only bounded metadata remains in memory here.
 pub struct LiveSnapshotOutput {
     pub result: LiveSnapshotResult,
-    /// The captured guest memory image.
-    pub mem_snapshot: Vec<u8>,
     /// State blob captured during the final stop, carrying the vCPU registers,
     /// VM (irqchip/PIT/clock), serial and virtio state as of the blackout.
     pub state_blob: Vec<u8>,
@@ -156,35 +231,86 @@ pub struct LiveSnapshotOutput {
     pub consumed_dirty: DirtyBitmap,
 }
 
-/// Copy one guest page into `dest`. Returns false if the page lies outside
-/// guest RAM (a stale bit for a region that is no longer registered).
-fn copy_page(mem: &GuestMemory, dest: &mut [u8], gpa: u64) -> bool {
-    let Ok(offset) = usize::try_from(gpa) else {
-        return false;
-    };
-    let Some(end) = offset.checked_add(PAGE_SIZE as usize) else {
-        return false;
-    };
-    if end > dest.len() {
-        return false;
+/// Copy one contiguous half-open PFN run. Dirty bitmaps are ordered, so a
+/// guest rewriting a large buffer should cost one positioned write per run,
+/// not one syscall and one filesystem extent update per 4 KiB page.
+fn copy_page_run(mem: &GuestMemory, dest: &File, start_pfn: u64, end_pfn: u64) -> Result<u64> {
+    let pages = end_pfn
+        .checked_sub(start_pfn)
+        .ok_or_else(|| VmmError::Memory("dirty page run is reversed".into()))?;
+    let gpa = start_pfn
+        .checked_mul(PAGE_SIZE)
+        .ok_or_else(|| VmmError::Memory("dirty page offset overflow".into()))?;
+    let len = pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or_else(|| VmmError::Memory("dirty page run length overflow".into()))?;
+    let end = gpa
+        .checked_add(len)
+        .ok_or_else(|| VmmError::Memory("dirty page run end overflow".into()))?;
+    if end > mem.size_bytes {
+        return Err(VmmError::Memory(format!(
+            "dirty page run {gpa:#x}..{end:#x} exceeds guest RAM"
+        )));
     }
-    // SAFETY: `mem.as_ptr()` is valid for reads of `mem.size_bytes` bytes for
-    // as long as `mem` lives (GuestMemory's documented contract), and `end` is
-    // bounds-checked against `dest.len() == mem.size_bytes` above.
-    let src = unsafe { std::slice::from_raw_parts(mem.as_ptr().add(offset), PAGE_SIZE as usize) };
-    dest[offset..end].copy_from_slice(src);
-    true
+    let offset = usize::try_from(gpa)
+        .map_err(|_| VmmError::Memory("guest page offset does not fit usize".into()))?;
+    let len = usize::try_from(len)
+        .map_err(|_| VmmError::Memory("dirty page run length does not fit usize".into()))?;
+    // SAFETY: GuestMemory guarantees this mapping for `size_bytes`; the range
+    // was checked above and the file write does not retain the pointer.
+    let src = unsafe { std::slice::from_raw_parts(mem.as_ptr().add(offset), len) };
+    dest.write_all_at(src, gpa)
+        .map_err(|error| VmmError::Snapshot(format!("write staged RAM at {gpa:#x}: {error}")))?;
+    Ok(pages)
 }
 
-/// Copy every page named by `dirty` into `dest`, returning the pages copied.
-fn copy_dirty_pages(mem: &GuestMemory, dest: &mut [u8], dirty: &DirtyBitmap) -> u64 {
+/// Copy every page named by `dirty` into the staged file.
+fn copy_dirty_pages(mem: &GuestMemory, dest: &File, dirty: &DirtyBitmap) -> Result<u64> {
     let mut copied = 0u64;
-    for pfn in dirty.dirty_pfns() {
-        if copy_page(mem, dest, pfn.saturating_mul(PAGE_SIZE)) {
-            copied += 1;
+    let max_pfn = mem.size_bytes / PAGE_SIZE;
+    let mut run_start = None;
+    let mut run_end = 0u64;
+    let mut pfns = dirty
+        .dirty_pfns()
+        .iter()
+        .copied()
+        .filter(|pfn| *pfn < max_pfn)
+        .collect::<Vec<_>>();
+    pfns.sort_unstable();
+    for pfn in pfns {
+        match run_start {
+            Some(_) if pfn == run_end => run_end += 1,
+            Some(start) => {
+                copied += copy_page_run(mem, dest, start, run_end)?;
+                run_start = Some(pfn);
+                run_end = pfn + 1;
+            }
+            None => {
+                run_start = Some(pfn);
+                run_end = pfn + 1;
+            }
         }
     }
-    copied
+    if let Some(start) = run_start {
+        copied += copy_page_run(mem, dest, start, run_end)?;
+    }
+    Ok(copied)
+}
+
+fn drop_staged_cache(file: &File, len: u64) {
+    use std::os::fd::AsRawFd;
+
+    let Ok(len) = libc::off_t::try_from(len) else {
+        return;
+    };
+    // SAFETY: the fd remains open and the numeric range fits off_t.
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, len, libc::POSIX_FADV_DONTNEED) };
+    if rc != 0 {
+        log::warn!(
+            "live_snapshot: drop staged RAM cache failed: {}",
+            std::io::Error::from_raw_os_error(rc)
+        );
+    }
 }
 
 /// Bytes/sec implied by copying `bytes` in `elapsed`, or `None` when the
@@ -241,6 +367,7 @@ pub fn live_snapshot<F>(
     mem: &GuestMemory,
     vcpu_thread: &VcpuThread,
     config: &LiveSnapshotConfig,
+    memory_file: &File,
     quiesce_io: &dyn Fn(bool),
     capture_state: F,
 ) -> Result<LiveSnapshotOutput>
@@ -254,10 +381,13 @@ where
     if mem_size == 0 {
         return Err(VmmError::Memory("guest memory is empty".into()));
     }
+    memory_file
+        .set_len(mem.size_bytes)
+        .map_err(|error| VmmError::Snapshot(format!("size staged RAM image: {error}")))?;
 
     // Step 1: enable dirty logging with the vCPU paused. Re-registering memory
     // regions under a running vCPU races with in-flight guest accesses.
-    let mut consumed_dirty = DirtyBitmap::new();
+    let mut consumed_dirty = DirtyReplayGuard::new(mem);
     let baseline_pages;
     {
         let pause_guard = VcpuPauseGuard::pause(vcpu_thread);
@@ -293,14 +423,31 @@ where
     log::info!(
         "live_snapshot: dirty logging active ({baseline_pages} baseline pages), vCPU resumed"
     );
+    inject_live_snapshot_failure("dirty_logging")?;
 
     // Step 2: bulk round — copy all of guest RAM while the guest runs. This is
     // also the bandwidth sample that drives the convergence decision.
-    let mut dest = vec![0u8; mem_size];
     let bulk_start = Instant::now();
-    // SAFETY: `mem.as_ptr()` is valid for reads of `mem.size_bytes` bytes for
-    // as long as `mem` lives; `dest` was sized from that same value.
-    dest.copy_from_slice(unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem_size) });
+    let lazy_fence = mem.lazy_snapshot_fence();
+    let _bulk_read_guard = lazy_fence.as_ref().map(|fence| {
+        fence
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    });
+    // SAFETY: GuestMemory guarantees the mapping for `size_bytes`; the
+    // positioned write copies it immediately and retains no pointer.
+    let source = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem_size) };
+    memory_file
+        .write_all_at(source, 0)
+        .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?;
+    drop(_bulk_read_guard);
+    // Bulk writeback and cache eviction happen while the guest is running.
+    // This keeps the staging image reclaimable instead of pinning a second
+    // anonymous copy of guest RAM until publication.
+    memory_file
+        .sync_data()
+        .map_err(|error| VmmError::Snapshot(format!("sync bulk staged RAM: {error}")))?;
+    drop_staged_cache(memory_file, mem.size_bytes);
     let bulk_elapsed = bulk_start.elapsed();
     let mut total_pages_copied = mem.size_bytes / PAGE_SIZE;
     let mut copy_bandwidth_bps =
@@ -309,6 +456,7 @@ where
         "live_snapshot: bulk copy of {} bytes in {bulk_elapsed:?} ({copy_bandwidth_bps} B/s)",
         mem.size_bytes
     );
+    inject_live_snapshot_failure("bulk")?;
 
     // Step 3: pre-copy rounds.
     let mut rounds = 1u32;
@@ -316,14 +464,13 @@ where
         round: 1,
         dirty_bytes: mem.size_bytes,
     };
+    let mut termination = LiveSnapshotTermination::MaxRounds;
+    let mut pending_final_dirty = DirtyBitmap::new();
 
     for round in 2..=config.max_rounds.max(2) {
         if start.elapsed() > timeout {
             log::warn!("live_snapshot: timeout after {:?}", start.elapsed());
-            final_decision = RoundDecision::FinalStop {
-                round,
-                dirty_bytes: 0,
-            };
+            termination = LiveSnapshotTermination::Timeout;
             rounds = round;
             break;
         }
@@ -339,14 +486,46 @@ where
         let since_last_read = last_read.elapsed();
         last_read = Instant::now();
         consumed_dirty.merge(&dirty);
+        inject_live_snapshot_failure("dirty_round")?;
 
         let dirty_pages = dirty.len() as u64;
         let dirty_bytes = dirty_pages * PAGE_SIZE;
 
+        // Do not begin a round that the measured copy bandwidth says cannot
+        // fit in the remaining pre-copy budget. KVM already cleared these
+        // bits, so carry them into the final residual set; the final stop will
+        // merge them with writes that occur after this read.
+        let projected_copy =
+            Duration::from_secs_f64(dirty_bytes as f64 / copy_bandwidth_bps.max(1) as f64);
+        if start.elapsed().saturating_add(projected_copy) >= timeout {
+            log::warn!(
+                "live_snapshot: round {round} would exceed timeout: elapsed={:?} projected_copy={projected_copy:?}",
+                start.elapsed()
+            );
+            pending_final_dirty.merge(&dirty);
+            final_decision = RoundDecision::FinalStop { round, dirty_bytes };
+            termination = LiveSnapshotTermination::Timeout;
+            rounds = round;
+            break;
+        }
+
         // Always copy what we just read. KVM cleared these bits, so leaving
         // them uncopied would drop those pages from the image entirely.
         let copy_start = Instant::now();
-        let copied = copy_dirty_pages(mem, &mut dest, &dirty);
+        let lazy_fence = mem.lazy_snapshot_fence();
+        let _dirty_read_guard = lazy_fence.as_ref().map(|fence| {
+            fence
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let copied = copy_dirty_pages(mem, memory_file, &dirty)?;
+        drop(_dirty_read_guard);
+        if copied > 0 {
+            memory_file.sync_data().map_err(|error| {
+                VmmError::Snapshot(format!("sync pre-copy staged RAM: {error}"))
+            })?;
+            drop_staged_cache(memory_file, mem.size_bytes);
+        }
         let copy_elapsed = copy_start.elapsed();
         total_pages_copied += copied;
         if let Some(sample) = bandwidth_sample(copied * PAGE_SIZE, copy_elapsed) {
@@ -371,10 +550,18 @@ where
         final_decision = decision;
 
         match decision {
-            RoundDecision::Continue { .. } => continue,
-            RoundDecision::FinalStop { .. } => break,
+            RoundDecision::Continue { .. } if round < config.max_rounds.max(2) => continue,
+            RoundDecision::Continue { .. } => {
+                termination = LiveSnapshotTermination::MaxRounds;
+                break;
+            }
+            RoundDecision::FinalStop { .. } => {
+                termination = LiveSnapshotTermination::Converged;
+                break;
+            }
             RoundDecision::Diverging { .. } => {
                 log::warn!("live_snapshot: diverging at round {round}; forcing final stop");
+                termination = LiveSnapshotTermination::Diverging;
                 break;
             }
         }
@@ -398,15 +585,25 @@ where
     let io_guard = IoQuiesceGuard::engage(quiesce_io);
     let final_stop_start = Instant::now();
     let final_pause_guard = VcpuPauseGuard::pause(vcpu_thread);
+    inject_live_snapshot_failure("final_pause")?;
 
     let mut final_dirty = kvm_vm.read_dirty()?;
     final_dirty.merge(&mem.drain_host_dirty());
+    final_dirty.merge(&pending_final_dirty);
     let final_dirty_pages = final_dirty.len() as u64;
     consumed_dirty.merge(&final_dirty);
-    total_pages_copied += copy_dirty_pages(mem, &mut dest, &final_dirty);
+    let lazy_fence = mem.lazy_snapshot_fence();
+    let _final_read_guard = lazy_fence.as_ref().map(|fence| {
+        fence
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    });
+    total_pages_copied += copy_dirty_pages(mem, memory_file, &final_dirty)?;
+    drop(_final_read_guard);
     // The vCPU is paused, so the registers and device state captured here are
     // coherent with the memory image assembled above.
     let state_blob = capture_state()?;
+    inject_live_snapshot_failure("state_capture")?;
 
     final_pause_guard.resume();
     // `resume()` only requests the resume; wait for the vCPU to actually
@@ -415,6 +612,12 @@ where
     vcpu_thread.wait_resumed();
     let downtime = final_stop_start.elapsed();
     io_guard.disengage();
+    // Final residual pages entered the page cache during blackout, but durable
+    // writeback is not part of guest downtime.
+    memory_file
+        .sync_data()
+        .map_err(|error| VmmError::Snapshot(format!("sync final staged RAM: {error}")))?;
+    drop_staged_cache(memory_file, mem.size_bytes);
     log::info!("live_snapshot: final stop took {downtime:?}, residual {final_dirty_pages} pages");
 
     let elapsed = start.elapsed();
@@ -431,12 +634,14 @@ where
             elapsed,
             downtime,
             final_decision,
+            termination,
             mem_bytes: mem.size_bytes,
             snapshot_path: String::new(),
+            overlay_path: None,
+            integrity_path: None,
         },
-        mem_snapshot: dest,
         state_blob,
-        consumed_dirty,
+        consumed_dirty: consumed_dirty.disarm(),
     })
 }
 
@@ -450,6 +655,61 @@ mod tests {
         assert_eq!(c.target_downtime_us, 500);
         assert_eq!(c.max_rounds, 20);
         assert_eq!(c.timeout_secs, 30);
+    }
+
+    #[test]
+    fn failed_snapshot_replays_consumed_dirty_pages() {
+        let mem = GuestMemory::new(2 * PAGE_SIZE).unwrap();
+        let mut dirty = DirtyBitmap::new();
+        dirty.mark(PAGE_SIZE);
+        {
+            let mut guard = DirtyReplayGuard::new(&mem);
+            guard.merge(&dirty);
+        }
+        let replayed = mem.drain_host_dirty();
+        assert!(replayed.contains(PAGE_SIZE));
+        assert_eq!(replayed.len(), 1);
+    }
+
+    #[test]
+    fn successful_snapshot_returns_dirty_pages_without_replay() {
+        let mem = GuestMemory::new(2 * PAGE_SIZE).unwrap();
+        let mut dirty = DirtyBitmap::new();
+        dirty.mark(PAGE_SIZE);
+        let returned = {
+            let mut guard = DirtyReplayGuard::new(&mem);
+            guard.merge(&dirty);
+            guard.disarm()
+        };
+        assert!(returned.contains(PAGE_SIZE));
+        assert!(mem.drain_host_dirty().is_empty());
+    }
+
+    #[test]
+    fn dirty_page_copy_preserves_sorted_contiguous_runs_and_ignores_stale_bits() {
+        let mem = GuestMemory::new(4 * PAGE_SIZE).unwrap();
+        let mem_len = usize::try_from(mem.size_bytes).unwrap();
+        // SAFETY: the test owns the guest mapping for its full declared size.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_len) };
+        bytes[PAGE_SIZE as usize..(2 * PAGE_SIZE) as usize].fill(0x11);
+        bytes[(2 * PAGE_SIZE) as usize..(3 * PAGE_SIZE) as usize].fill(0x22);
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(mem.size_bytes).unwrap();
+        let mut dirty = DirtyBitmap::new();
+        dirty.mark(2 * PAGE_SIZE);
+        dirty.mark(PAGE_SIZE);
+        dirty.mark(9 * PAGE_SIZE);
+
+        assert_eq!(copy_dirty_pages(&mem, &file, &dirty).unwrap(), 2);
+        let mut copied = vec![0u8; (2 * PAGE_SIZE) as usize];
+        file.read_exact_at(&mut copied, PAGE_SIZE).unwrap();
+        assert!(copied[..PAGE_SIZE as usize]
+            .iter()
+            .all(|byte| *byte == 0x11));
+        assert!(copied[PAGE_SIZE as usize..]
+            .iter()
+            .all(|byte| *byte == 0x22));
     }
 
     #[test]

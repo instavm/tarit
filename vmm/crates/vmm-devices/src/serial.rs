@@ -48,11 +48,16 @@ impl Write for SerialOut {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         {
             let mut buf = self.buf.lock().unwrap();
-            buf.extend_from_slice(bytes);
-            let len = buf.len();
-            if len > MAX_OUTPUT {
-                buf.drain(0..len - MAX_OUTPUT);
+            let retained = if bytes.len() > MAX_OUTPUT {
+                &bytes[bytes.len() - MAX_OUTPUT..]
+            } else {
+                bytes
+            };
+            let required = buf.len().saturating_add(retained.len());
+            if required > MAX_OUTPUT {
+                buf.drain(0..required - MAX_OUTPUT);
             }
+            buf.extend_from_slice(retained);
         }
         io::stdout().write_all(bytes)?;
         io::stdout().flush()?;
@@ -105,7 +110,10 @@ pub struct Serial {
 
 impl Serial {
     pub fn new(irq_evt: EventFd) -> Self {
-        let out_buf = Arc::new(Mutex::new(Vec::new()));
+        // Guest console writes run on the seccomp-confined vCPU thread. Keep a
+        // fixed-capacity capture buffer so normal boot output never asks the
+        // allocator to open glibc tuning files after the filter is installed.
+        let out_buf = Arc::new(Mutex::new(Vec::with_capacity(MAX_OUTPUT)));
         let out = SerialOut {
             buf: out_buf.clone(),
         };
@@ -177,8 +185,13 @@ impl Serial {
     }
 
     pub fn drain_output(&self) -> Vec<u8> {
+        // Allocate the replacement on the unrestricted control thread before
+        // taking the old buffer. `mem::take` would leave capacity zero and the
+        // next guest byte could trigger a forbidden allocator-side openat in
+        // the vCPU thread.
+        let replacement = Vec::with_capacity(MAX_OUTPUT);
         let mut buf = self.out_buf.lock().unwrap();
-        std::mem::take(&mut *buf)
+        std::mem::replace(&mut *buf, replacement)
     }
 }
 
@@ -236,6 +249,14 @@ mod tests {
         serial.write(0, b'x');
 
         assert_eq!(serial.drain_output(), b"x");
+    }
+
+    #[test]
+    fn draining_preserves_preallocated_vcpu_output_capacity() {
+        let serial = Serial::new(test_eventfd());
+        serial.write(0, b'x');
+        assert_eq!(serial.drain_output(), b"x");
+        assert!(serial.out_buf.lock().unwrap().capacity() >= MAX_OUTPUT);
     }
 
     #[test]

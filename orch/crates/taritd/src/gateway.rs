@@ -18,7 +18,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::api::{store_err, AppState};
-use crate::cluster::{self, Owner};
+use crate::cluster::Owner;
+use crate::config::{ApiIdentity, ApiRole};
+use crate::ops;
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -463,7 +465,13 @@ async fn attach_authorized_pty(
     rows: u16,
     shell: Option<String>,
 ) -> Result<std::os::unix::net::UnixStream, String> {
-    match cluster::resolve_owner(state, auth.vm_id).await {
+    let identity = ApiIdentity {
+        tenant: auth.owner_key.clone(),
+        role: ApiRole::User,
+        max_vms: None,
+        api_key_id: format!("ssh:{}", auth.fingerprint),
+    };
+    match ops::resolve_owner_for_activation(state, auth.vm_id, &identity).await {
         Ok(Owner::Local) => {}
         Ok(Owner::Remote(rpc)) => {
             return Err(format!(
@@ -483,6 +491,10 @@ async fn attach_authorized_pty(
         );
         return Err("authenticated SSH key does not own the requested VM".into());
     }
+
+    crate::ops::ensure_active_local(state, auth.vm_id)
+        .await
+        .map_err(|error| format!("activate VM for SSH: {error}"))?;
 
     let supervisor = Arc::clone(&state.supervisor);
     let vm_id = auth.vm_id;
@@ -795,6 +807,7 @@ mod tests {
             ])
             .unwrap(),
             host_id: "test-host".into(),
+            host_session_id: Uuid::nil(),
             vmm_bin: PathBuf::from("target/taritd-gateway-test/vmm"),
             kernel: PathBuf::from("target/taritd-gateway-test/kernel"),
             rootfs: PathBuf::from("target/taritd-gateway-test/rootfs"),
@@ -802,10 +815,14 @@ mod tests {
             db_path: PathBuf::from("target/taritd-gateway-test/fleet.db"),
             net_state_path: PathBuf::from("target/taritd-gateway-test/net-state.json"),
             images_dir: PathBuf::from("target/taritd-gateway-test/images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
@@ -850,6 +867,7 @@ mod tests {
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            activation_gates: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
             lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),

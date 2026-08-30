@@ -817,9 +817,13 @@ impl VirtioVsockMmio {
         for packet in packets {
             self.enqueue_rx(packet)?;
         }
-        if queued > 0 {
-            self.process_rx_queue()?;
-        }
+        // Retry the RX queue even when no established host stream produced
+        // bytes in this iteration. A host-initiated connection starts as an
+        // unestablished REQUEST; after restore the guest may publish its next
+        // RX descriptor just after connect_guest_stream's immediate attempt.
+        // Without this retry the REQUEST remains pending forever because an
+        // unestablished connection contributes no stream bytes to `packets`.
+        self.process_rx_queue()?;
         if self.is_failed() {
             Err(MmioError::Device)
         } else {
@@ -1907,6 +1911,36 @@ mod tests {
         let mut got = [0u8; 2];
         host.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_initiated_request_is_retried_when_rx_buffer_appears_late() {
+        let mem = new_mem();
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        setup_queues(&dev, &mem, 0);
+
+        let _host = dev.connect_guest_stream(1025).unwrap();
+        assert_eq!(dev.pending_rx.lock().unwrap().len(), 1);
+
+        mem.write_obj(
+            Descriptor {
+                addr: RX_BUF,
+                len: 0x1000,
+                flags: desc_flags::WRITE,
+                next: 0,
+            },
+            GuestAddress(RX_DESC),
+        )
+        .unwrap();
+        mem.write_obj(0u16, GuestAddress(RX_AVAIL + 4)).unwrap();
+        mem.write_obj(1u16, GuestAddress(RX_AVAIL + 2)).unwrap();
+
+        assert_eq!(dev.pump_host_streams().unwrap(), 0);
+        let request = read_rx_packet(&mem, RX_BUF);
+        assert_eq!(request.header.op, op::REQUEST);
+        assert_eq!(request.header.dst_port, 1025);
+        assert!(dev.pending_rx.lock().unwrap().is_empty());
     }
 
     #[test]

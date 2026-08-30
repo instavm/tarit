@@ -5,7 +5,8 @@
 //! - Independent memory (UFFD lazy fault from the shared snapshot mmap)
 //! - Independent disk (sparse CoW overlay)
 //! - Independent network (unique MAC + netns + tap)
-//! - Independent PRNG (virtio-rng re-seeds from /dev/urandom)
+//! - Fresh entropy device (cryptographic clone uniqueness additionally needs a
+//!   generation notification and userspace repair barrier)
 //! - Independent clock (fresh kvmclock base)
 //!
 //! Target: <10ms per clone for the hand-off (UFFD returns immediately;
@@ -80,7 +81,8 @@ pub fn build_clone_specs(
 /// Clone fan-out: restore N instances from a base snapshot.
 ///
 /// This is the PaaS "burst of 100" path. Each clone:
-/// 1. Creates a fresh KvmVm (new kvmclock → clock reset → CRNG re-seed)
+/// 1. Creates a fresh KvmVm (fresh clock/device instances; this alone does not
+///    reseed cloned kernel or userspace PRNG state)
 /// 2. UFFD-registers the memory with the snapshot file (lazy fault-in)
 /// 3. Creates a sparse CoW overlay for the disk
 /// 4. Sets up a unique tap + netns
@@ -102,9 +104,9 @@ pub fn clone_fanout(
         // sparse CoW overlay when `overlay_path` is set, so the clone never
         // reuses the golden snapshot's saved upper layer.
         //
-        // Each restore also creates a fresh
-        // KvmVm with its own kvmclock → the guest detects the clock jump
-        // and re-seeds its CRNG from virtio-rng.
+        // Each restore also creates fresh KVM clock and device instances. Do
+        // not infer cryptographic uniqueness from that: clone admission still
+        // needs a generation notification and userspace repair barrier.
         match controller.restore(&spec.snapshot_path, spec.overlay_path.clone()) {
             Ok(()) => {
                 log::info!(

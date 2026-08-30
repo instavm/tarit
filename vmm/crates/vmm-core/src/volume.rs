@@ -1,11 +1,28 @@
 //! Volume backend selection shared by controller and CLI boot wiring.
 
+use std::fs::File;
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 
 use crate::config::VolumeConfig;
 use vmm_devices::virtio::blk_backend::{BlkBackend, BlkBackendError};
 
 pub fn open_volume_backend(vol: &VolumeConfig) -> Result<BlkBackend, BlkBackendError> {
+    if let Some(fd) = vol.inherited_fd {
+        if vol.overlay.is_some() {
+            return Err(BlkBackendError::Validation(
+                "inherited volume descriptor cannot use a path overlay".into(),
+            ));
+        }
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned exclusively
+        // by this File.
+        let file = unsafe { File::from_raw_fd(duplicate) };
+        return BlkBackend::from_file(file, vol.read_only, &vol.path);
+    }
     let path = PathBuf::from(&vol.path);
     match vol.overlay.as_deref() {
         Some(overlay) => BlkBackend::open_cow(&path, &PathBuf::from(overlay)),
@@ -17,6 +34,7 @@ pub fn open_volume_backend(vol: &VolumeConfig) -> Result<BlkBackend, BlkBackendE
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::fd::AsRawFd;
     use std::time::{SystemTime, UNIX_EPOCH};
     use vmm_devices::virtio::blk::{req_type, status, BlkReqHeader};
 
@@ -47,6 +65,7 @@ mod tests {
             path: path.to_string_lossy().into_owned(),
             read_only: true,
             overlay: None,
+            inherited_fd: None,
         };
 
         let backend = open_volume_backend(&vol).unwrap();
@@ -67,6 +86,7 @@ mod tests {
             path: base.to_string_lossy().into_owned(),
             read_only: true,
             overlay: Some(overlay.to_string_lossy().into_owned()),
+            inherited_fd: None,
         };
 
         let mut backend = open_volume_backend(&vol).unwrap();
@@ -93,5 +113,54 @@ mod tests {
         assert!(overlay.exists());
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inherited_volume_uses_descriptor_not_diagnostic_path() {
+        let dir = local_test_dir("inherited-volume");
+        let path = dir.join("disk.img");
+        fs::write(&path, [0xA5; 512]).unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let original_fd = file.as_raw_fd();
+        let vol = VolumeConfig {
+            path: "/does/not/exist-and-must-not-be-resolved".into(),
+            read_only: false,
+            overlay: None,
+            inherited_fd: Some(original_fd),
+        };
+
+        let backend = open_volume_backend(&vol).unwrap();
+        assert_eq!(backend.sectors, 1);
+        assert_ne!(backend.fd(), original_fd);
+        drop(file);
+        assert!(unsafe { libc::fcntl(backend.fd(), libc::F_GETFD) } >= 0);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inherited_volume_rejects_overlay_and_closed_descriptor() {
+        let overlay = VolumeConfig {
+            path: "data".into(),
+            read_only: false,
+            overlay: Some("/tmp/overlay".into()),
+            inherited_fd: Some(3),
+        };
+        assert!(open_volume_backend(&overlay).is_err());
+
+        let closed = unsafe { libc::dup(libc::STDIN_FILENO) };
+        assert!(closed >= 0);
+        assert_eq!(unsafe { libc::close(closed) }, 0);
+        let vol = VolumeConfig {
+            path: "data".into(),
+            read_only: true,
+            overlay: None,
+            inherited_fd: Some(closed),
+        };
+        assert!(open_volume_backend(&vol).is_err());
     }
 }

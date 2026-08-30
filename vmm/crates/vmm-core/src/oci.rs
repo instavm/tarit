@@ -88,12 +88,13 @@ pub fn pull_and_convert(
 
 /// Like [`pull_and_convert`], but also injects the guest exec agent as the
 /// image's init when `agent_path` is given. OCI/Docker images ship only a root
-/// filesystem — no kernel, no init system (the container runtime runs the
-/// entrypoint as PID 1). To boot one as a microVM we supply the kernel and drop
-/// in the agent as `/usr/sbin/vmm-agent`, pointing `/sbin/init` at it (unless
-/// the image already has an init). Booted with the agent as PID 1 it mounts the
-/// pseudo-filesystems and serves the exec channel, so `node:20`, `python:3` and
-/// friends become directly runnable sandboxes.
+/// filesystem — no kernel, and their configured entrypoint is normally started
+/// by a container runtime. To boot one as a microVM we supply the kernel, install
+/// the agent at `/usr/sbin/vmm-agent`, and atomically point `/sbin/init` at it.
+/// This deliberately replaces an image-provided init: otherwise images such as
+/// Alpine try to start an incomplete OpenRC userspace and never expose the exec
+/// channel. Booted with the agent as PID 1, app images become directly runnable
+/// sandboxes.
 pub fn pull_and_convert_with_agent(
     image: &OciImageRef,
     output_path: &Path,
@@ -304,7 +305,25 @@ fn inject_agent_init_unix(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
     }
 
     let usr = open_or_create_directory_at(&root, "usr")?;
-    let usr_sbin = open_or_create_directory_at(&usr, "sbin")?;
+    let usr_sbin = match entry_kind_at(&usr, "sbin")? {
+        None => open_or_create_directory_at(&usr, "sbin")?,
+        Some(EntryKind::Directory) => open_directory_at(&usr, "sbin")?,
+        Some(EntryKind::Symlink) => {
+            let target = read_link_at(&usr, "sbin")?;
+            if target.as_bytes() != b"bin" && target.as_bytes() != b"/usr/bin" {
+                return Err(OciError::UnsafePath(format!(
+                    "unsupported /usr/sbin symlink target {:?}; expected bin",
+                    target
+                )));
+            }
+            open_directory_at(&usr, "bin")?
+        }
+        Some(EntryKind::Other) => {
+            return Err(OciError::UnsafePath(
+                "/usr/sbin exists but is neither a directory nor a safe symlink".into(),
+            ))
+        }
+    };
     install_agent_at(&usr_sbin, agent)?;
 
     let init_dir = match entry_kind_at(&root, "sbin")? {
@@ -533,15 +552,38 @@ fn install_agent_at(destination_dir: &File, agent: &Path) -> Result<(), OciError
 
 #[cfg(unix)]
 fn ensure_init_link_at(sbin_dir: &File) -> Result<(), OciError> {
-    if entry_kind_at(sbin_dir, "init")?.is_some() {
-        return Ok(());
-    }
+    static INIT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let target = c_name("/usr/sbin/vmm-agent")?;
     let init = c_name("init")?;
+    let sequence = INIT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary_name = format!(".tarit-init-{}-{sequence}.tmp", std::process::id());
+    let temporary = c_name(&temporary_name)?;
     // SAFETY: target and leaf name are valid for symlinkat and the held fd
-    // confines creation to the image's /sbin directory.
-    if unsafe { libc::symlinkat(target.as_ptr(), sbin_dir.as_raw_fd(), init.as_ptr()) } < 0 {
+    // confines creation to the image's /sbin directory. O_EXCL-like behavior
+    // from symlinkat prevents an image-controlled temporary leaf from being
+    // followed or overwritten.
+    if unsafe { libc::symlinkat(target.as_ptr(), sbin_dir.as_raw_fd(), temporary.as_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: both names are leaf components relative to the held /sbin fd.
+    // renameat atomically replaces a regular file or symlink without following
+    // it. A hostile directory at /sbin/init is rejected by the kernel.
+    if unsafe {
+        libc::renameat(
+            sbin_dir.as_raw_fd(),
+            temporary.as_ptr(),
+            sbin_dir.as_raw_fd(),
+            init.as_ptr(),
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: this is the exact private leaf just created above.
+        unsafe {
+            libc::unlinkat(sbin_dir.as_raw_fd(), temporary.as_ptr(), 0);
+        }
+        return Err(error.into());
     }
     #[cfg(target_os = "linux")]
     sbin_dir.sync_all()?;
@@ -633,7 +675,8 @@ mod tests {
     fn agent_injection_uses_fd_relative_paths_and_supports_usrmerge() {
         let temp = tempfile::tempdir().unwrap();
         let rootfs = temp.path().join("rootfs");
-        std::fs::create_dir(&rootfs).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("bin", rootfs.join("usr/sbin")).unwrap();
         std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
         let agent = test_agent(temp.path());
 
@@ -698,6 +741,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn agent_injection_replaces_existing_image_init_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let sbin = rootfs.join("sbin");
+        std::fs::create_dir_all(&sbin).unwrap();
+        let victim = temp.path().join("image-init");
+        std::fs::write(&victim, b"original-init").unwrap();
+        std::os::unix::fs::symlink(&victim, sbin.join("init")).unwrap();
+        let agent = test_agent(temp.path());
+
+        inject_agent_init(&rootfs, &agent).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original-init");
+        assert_eq!(
+            std::fs::read_link(sbin.join("init")).unwrap(),
+            Path::new("/usr/sbin/vmm-agent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn agent_injection_rejects_unsafe_sbin_symlink_target() {
         let temp = tempfile::tempdir().unwrap();
         let rootfs = temp.path().join("rootfs");
@@ -707,6 +771,23 @@ mod tests {
 
         let error = inject_agent_init(&rootfs, &agent).unwrap_err();
         assert!(matches!(error, OciError::UnsafePath(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_rejects_unsafe_usr_sbin_symlink_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(rootfs.join("usr")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("usr/sbin")).unwrap();
+        std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
+        let agent = test_agent(temp.path());
+
+        let error = inject_agent_init(&rootfs, &agent).unwrap_err();
+        assert!(matches!(error, OciError::UnsafePath(_)));
+        assert!(!outside.join("vmm-agent").exists());
     }
 
     #[cfg(unix)]

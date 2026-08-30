@@ -284,7 +284,9 @@ vmm pull ghcr.io/owner/repo:tag --output app.ext4 --auth ~/.docker/auth.json \
 ```
 
 With `--agent`, the pull path installs the guest exec agent at
-`/usr/sbin/vmm-agent` and points `/sbin/init` at it when the image has no init.
+`/usr/sbin/vmm-agent` and atomically points `/sbin/init` at it. This intentionally
+replaces an OCI image's init because Tarit boots the injected agent as PID 1;
+the image's container entrypoint and init system are not started automatically.
 
 | Flag | Default | Description |
 |---|---|---|

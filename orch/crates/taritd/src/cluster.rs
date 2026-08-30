@@ -37,6 +37,7 @@ pub enum Owner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerTarget {
     pub host_id: String,
+    pub boot_session_id: Uuid,
     pub rpc_addr: String,
 }
 
@@ -65,6 +66,7 @@ pub(crate) fn set_test_authoritative_owner(
             (host_id.to_string(), id),
             PeerTarget {
                 host_id: target_host_id.to_string(),
+                boot_session_id: Uuid::nil(),
                 rpc_addr,
             },
         );
@@ -91,11 +93,15 @@ pub async fn resolve_owner(state: &AppState, id: Uuid) -> Result<Owner, OrchErro
                 OrchError::Unavailable(format!("owner host {host_id} is not registered"))
             })?;
         ensure_routable_host(&host, "VM owner")?;
+        let boot_session_id = host.boot_session_id.ok_or_else(|| {
+            OrchError::Unavailable(format!("owner host {host_id} has no boot session"))
+        })?;
         return host
             .rpc_addr
             .map(|rpc_addr| {
                 Owner::Remote(PeerTarget {
                     host_id: host_id.clone(),
+                    boot_session_id,
                     rpc_addr,
                 })
             })
@@ -154,6 +160,7 @@ pub async fn place_candidates(state: &AppState, vcpus: u8, mem_mib: u64) -> Vec<
             h.host_id != state.config.host_id
                 && h.healthy
                 && h.rpc_addr.is_some()
+                && h.boot_session_id.is_some()
                 && (now - h.last_heartbeat)
                     .to_std()
                     .map(|d| d < HOST_STALE_AFTER)
@@ -171,8 +178,10 @@ pub async fn place_candidates(state: &AppState, vcpus: u8, mem_mib: u64) -> Vec<
     candidates
         .into_iter()
         .filter_map(|host| {
+            let boot_session_id = host.boot_session_id?;
             host.rpc_addr.map(|rpc_addr| PeerTarget {
                 host_id: host.host_id,
+                boot_session_id,
                 rpc_addr,
             })
         })
@@ -188,10 +197,14 @@ pub async fn peer_rpc(state: &AppState, host_id: &str) -> Result<Option<PeerTarg
     match fleet.get_host(host_id).await {
         Ok(Some(h)) => {
             ensure_routable_host(&h, "snapshot owner")?;
+            let boot_session_id = h.boot_session_id.ok_or_else(|| {
+                OrchError::Unavailable(format!("snapshot owner host {host_id} has no boot session"))
+            })?;
             h.rpc_addr
                 .map(|rpc_addr| {
                     Some(PeerTarget {
                         host_id: h.host_id,
+                        boot_session_id,
                         rpc_addr,
                     })
                 })
@@ -269,6 +282,8 @@ mod tests {
     fn host(last_heartbeat: chrono::DateTime<chrono::Utc>, healthy: bool) -> HostRecord {
         HostRecord {
             host_id: "node-a".into(),
+            boot_session_id: Some(Uuid::nil()),
+            peer_certificate_sha256: None,
             rpc_addr: Some("https://node-a.internal".into()),
             sandbox_count: 0,
             free_vcpus: 8,

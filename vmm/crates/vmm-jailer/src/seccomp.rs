@@ -45,12 +45,22 @@ impl SeccompProfile {
                 // glibc lazy-loads thread-local storage and may madvise
                 // the stack on the first `thread::sleep` call.
                 "madvise".into(),
+                // A restored guest's virtio-balloon MMIO notification is
+                // processed on this thread. Lazy-page discard checks
+                // residency before MADV_DONTNEED so it never waits on an
+                // unresolved UFFD fault.
+                "mincore".into(),
                 // virtio-blk MMIO exits are handled in the vCPU thread.
                 // The backend does pread64/pwrite64/lseek for file I/O.
                 "pread64".into(),
                 "pwrite64".into(),
                 "lseek".into(),
                 "fdatasync".into(),
+                // Rust's owned-fd drop path checks that the KVM vCPU fd is
+                // still valid with fcntl(F_GETFD) immediately before close.
+                // Permit only that read-only query; general fcntl operations
+                // (duplication, flag mutation, and locking) stay denied.
+                "fcntl".into(),
                 // CoW-overlay and plain-blk FLUSH call File::sync_all() = fsync
                 // for durability; without it the first FLUSH on a write-heavy
                 // guest rootfs kills the vCPU thread with SIGSYS (seccomp).
@@ -202,6 +212,13 @@ impl SeccompProfile {
                 0xae00,
             )
             .map_err(|e| format!("ioctl condition: {e}"))?],
+            (ThreadKind::Vcpu, "fcntl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::F_GETFD as u64,
+            )
+            .map_err(|e| format!("fcntl condition: {e}"))?],
             // Rust may OR CLOEXEC/NONBLOCK into the socket type, so mask only
             // the low socket-type nibble and separately require AF_UNIX and
             // protocol 0. This prevents the guest-facing pump from creating
@@ -278,6 +295,7 @@ impl SeccompProfile {
             "nanosleep" => Ok(libc::SYS_nanosleep),
             "clock_nanosleep" => Ok(libc::SYS_clock_nanosleep),
             "madvise" => Ok(libc::SYS_madvise),
+            "mincore" => Ok(libc::SYS_mincore),
             "lseek" => Ok(libc::SYS_lseek),
             "fdatasync" => Ok(libc::SYS_fdatasync),
             "fsync" => Ok(libc::SYS_fsync),
@@ -353,6 +371,13 @@ mod tests {
             1
         );
         assert_eq!(
+            SeccompProfile::vcpu()
+                .rules_for_syscall("fcntl")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
             SeccompProfile::vsock()
                 .rules_for_syscall("socket")
                 .unwrap()
@@ -388,9 +413,12 @@ mod tests {
     }
 
     #[test]
-    fn vcpu_profile_allows_ioctl() {
+    fn vcpu_profile_covers_kvm_and_lazy_balloon_syscalls() {
         let p = SeccompProfile::vcpu();
-        assert!(p.allow.contains(&"ioctl".to_string()));
+        for syscall in ["ioctl", "fcntl", "madvise", "mincore"] {
+            assert!(p.allow.contains(&syscall.to_string()), "{syscall}");
+            assert!(p.syscall_nr(syscall).is_ok(), "{syscall}");
+        }
     }
 
     #[test]

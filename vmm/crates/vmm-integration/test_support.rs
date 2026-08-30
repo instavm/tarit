@@ -29,9 +29,16 @@ pub fn rootfs_path() -> PathBuf {
 
 pub fn private_overlay_path(label: &str) -> PathBuf {
     let overlay_id = NEXT_OVERLAY.fetch_add(1, Ordering::Relaxed);
-    let overlay_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/vmm-integration-overlays")
-        .join(std::process::id().to_string());
+    // Live snapshots require FICLONE for the disk upper and intentionally fail
+    // closed when the backing filesystem cannot provide it.  CI hosts often
+    // keep the source tree on ext4 while mounting a dedicated btrfs/XFS test
+    // volume, so allow the harness (not production code) to select that volume.
+    let overlay_root = std::env::var_os("VMM_TEST_OVERLAY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/vmm-integration-overlays")
+        });
+    let overlay_dir = overlay_root.join(std::process::id().to_string());
     std::fs::create_dir_all(&overlay_dir).expect("create private test overlay directory");
     #[cfg(unix)]
     {
@@ -64,6 +71,7 @@ pub fn agent_vm_config(memory_mib: u64) -> VmConfig {
                     .to_string_lossy()
                     .into_owned(),
             ),
+            inherited_fd: None,
         }],
         net: vec![],
     }

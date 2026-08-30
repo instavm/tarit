@@ -68,7 +68,7 @@ local APIC, causing the kernel to think there's no FPU.
 
 ## CPUID
 
-### Choice: Host passthrough with x2APIC masked
+### Choice: Host passthrough with nested virtualization and x2APIC masked
 
 **Alternatives:**
 1. **Safe minimal CPUID**: mask off all extended features, keep only
@@ -80,8 +80,11 @@ local APIC, causing the kernel to think there's no FPU.
 **Why host passthrough:** The safe minimal CPUID caused triple-faults
 because it masked MTRR and PAT, which the kernel's early boot code
 requires. Host passthrough gives the kernel all the features it
-expects. We mask only x2APIC (ECX[21]) because it causes issues on
-nested virt.
+expects. We mask x2APIC (leaf 1 ECX[21]) because it causes issues on
+nested virt. We also always mask Intel VMX (leaf 1 ECX[5]) and AMD SVM
+(leaf `0x80000001` ECX[2]). The worker keeps `/dev/kvm` and nested
+virtualization, but a customer sandbox cannot advertise or initialize another
+hardware-virtualized layer. Tarit does not pass `/dev/kvm` into the guest.
 
 **Why not full normalization:** Normalization is
 complex (sets APIC ID, topology, masks features based on CPU template).
@@ -108,20 +111,22 @@ that's a display issue, not a correctness issue.
 
 ## Memory Layout
 
-### Choice: Single contiguous region at GPA 0
+### Choice: Packed host RAM with split KVM GPA slots
 
 **Alternatives:**
-1. **Single region at GPA 0**: one mmap, one KVM slot.
-2. **Multiple regions with MMIO gap**: split RAM around the PCI hole
-   (0x10000000-0x80000000).
-3. **Multi-region layout with ACPI area**: multiple regions for the
-   MMIO gap + ACPI area.
+1. **Single KVM region at GPA 0**: simple, but overlaps the device aperture
+   once a guest exceeds 3.25 GiB.
+2. **Gapped host and snapshot mappings**: mirrors GPA layout but wastes 768 MiB
+   per artifact and complicates lazy restore.
+3. **Packed host mapping with split KVM slots**: low RAM ends at
+   `0xd0000000`; remaining RAM starts at GPA `0x100000000`.
 
-**Why single region:** We're MMIO-only (no PCI), so there's no need
-for a PCI hole. The E820 map marks 0xA0000-0x100000 as reserved (VGA +
-BIOS area) and 0x10000000-0x80000000 as reserved (MMIO gap), but the
-actual memory is one contiguous mmap. This is simpler and faster (one
-KVM slot, one mmap).
+**Why packed/split:** Tarit's virtio devices occupy the 3.25–4 GiB aperture,
+so KVM and E820 must leave that GPA range reserved. The VMM still owns one
+contiguous host mapping: the high KVM slot points into the packed bytes after
+the low slot. VMSN files and UFFD therefore remain compact and contiguous.
+Dirty-log PFNs and guest-physical DMA/balloon ranges are translated at the
+slot boundary. Guests at or below 3.25 GiB retain the one-slot fast path.
 
 ## Snapshot Format
 

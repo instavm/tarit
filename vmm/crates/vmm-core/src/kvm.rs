@@ -12,6 +12,7 @@
 use crate::cpu_template::CpuTemplate;
 use crate::error::{Result, VmmError};
 use kvm_ioctls::{IoEventAddress, VcpuFd, VmFd};
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use vmm_devices::bus::{MmioBus, MmioRange};
 use vmm_loader::LoadedKernel;
@@ -20,6 +21,45 @@ use vmm_sys_util::eventfd::EventFd;
 
 /// Cached KVM fd — opened once, reused for every VM.
 static CACHED_KVM: std::sync::Mutex<Option<kvm_ioctls::Kvm>> = std::sync::Mutex::new(None);
+
+/// Adopt the orchestrator-opened KVM descriptor when present. Mandatory jail
+/// identities can be denied a fresh device open by host device policy even
+/// when the staged node has safe DAC ownership, so the privileged launcher
+/// resolves the device once and the confined VMM only duplicates that
+/// capability.
+pub(crate) fn open_kvm() -> Result<kvm_ioctls::Kvm> {
+    let Some(raw) = std::env::var_os("VMM_KVM_FD") else {
+        return kvm_ioctls::Kvm::new()
+            .map_err(|error| VmmError::Kvm(format!("open /dev/kvm: {error}")));
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| VmmError::Kvm("VMM_KVM_FD is not valid UTF-8".into()))?
+        .parse::<i32>()
+        .map_err(|_| VmmError::Kvm("VMM_KVM_FD is not a descriptor".into()))?;
+    if raw < 3 {
+        return Err(VmmError::Kvm(
+            "VMM_KVM_FD must not alias a standard descriptor".into(),
+        ));
+    }
+    let duplicate = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(VmmError::Kvm(format!(
+            "duplicate inherited KVM descriptor: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned exclusively by
+    // this Kvm object.
+    let kvm = unsafe { kvm_ioctls::Kvm::from_raw_fd(duplicate) };
+    let api_version = kvm.get_api_version();
+    if api_version != 12 {
+        return Err(VmmError::Kvm(format!(
+            "inherited descriptor is not a compatible KVM device (API version {api_version})"
+        )));
+    }
+    Ok(kvm)
+}
 
 /// A live KVM VM: the VM fd + the guest memory + the MMIO bus.
 pub struct KvmVm {
@@ -42,6 +82,15 @@ pub struct VmFullState {
     pub irqchips: Vec<Vec<u8>>,
     pub pit: Vec<u8>,
     pub clock: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn normalize_restored_clock(clock: &mut kvm_bindings::kvm_clock_data) {
+    // A clone/restore must continue from the snapshotted guest clock, not add
+    // the host wall time elapsed while it was stopped. Linux KVM interprets
+    // KVM_CLOCK_REALTIME as an explicit request for that jump. It is unsafe as
+    // an inherited snapshot flag, so Tarit keeps the no-jump policy fixed.
+    clock.flags &= !kvm_bindings::KVM_CLOCK_REALTIME;
 }
 
 /// Copy a POD KVM struct to a byte vector.
@@ -103,10 +152,7 @@ impl KvmVm {
         let vm_fd = {
             let mut guard = CACHED_KVM.lock().unwrap_or_else(|e| e.into_inner());
             if guard.is_none() {
-                *guard = Some(
-                    kvm_ioctls::Kvm::new()
-                        .map_err(|e| VmmError::Kvm(format!("open /dev/kvm: {e}")))?,
-                );
+                *guard = Some(open_kvm()?);
             }
             let kvm = guard
                 .as_ref()
@@ -296,6 +342,34 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Register a level-triggered irqfd and its guest-EOI resample event.
+    pub fn register_irqfd_with_resample(
+        &self,
+        evt: &EventFd,
+        resample_evt: &EventFd,
+        gsi: u32,
+    ) -> Result<()> {
+        self.vm_fd
+            .register_irqfd_with_resample(evt, resample_evt, gsi)
+            .map_err(|e| VmmError::Kvm(format!("register_irqfd_with_resample({gsi}): {e}")))?;
+
+        let mut entry = kvm_bindings::kvm_irq_routing_entry {
+            gsi,
+            type_: kvm_bindings::KVM_IRQ_ROUTING_IRQCHIP,
+            ..Default::default()
+        };
+        entry.u.irqchip.irqchip = kvm_bindings::KVM_IRQCHIP_IOAPIC;
+        entry.u.irqchip.pin = gsi;
+
+        let mut entries = self
+            .routing_entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        entries.push(entry);
+        self.apply_gsi_routing(&entries)?;
+        Ok(())
+    }
+
     /// Capture VM-level (not per-vCPU) state for a faithful resume: the
     /// in-kernel interrupt controllers (PIC master/slave + IOAPIC), the PIT, and
     /// the kvmclock. Without these, a restored VM gets a *fresh* IOAPIC whose
@@ -359,12 +433,22 @@ impl KvmVm {
         }
         if !s.clock.is_empty() {
             // SAFETY: `pod_from_bytes` verifies the serialized clock blob length.
-            let clock: kvm_bindings::kvm_clock_data = unsafe { pod_from_bytes(&s.clock)? };
+            let mut clock: kvm_bindings::kvm_clock_data = unsafe { pod_from_bytes(&s.clock)? };
+            normalize_restored_clock(&mut clock);
             self.vm_fd
                 .set_clock(&clock)
                 .map_err(|e| VmmError::Kvm(format!("KVM_SET_CLOCK: {e}")))?;
         }
         Ok(())
+    }
+
+    /// Notify a restored vCPU that its KVM clock was paused before it enters
+    /// KVM_RUN. Guest watchdog/clock code consumes this notification when it
+    /// reconciles the restored clock state.
+    #[cfg(target_arch = "x86_64")]
+    pub fn notify_restored_clock(&self, vcpu: &VcpuFd) -> Result<()> {
+        vcpu.kvmclock_ctrl()
+            .map_err(|e| VmmError::Kvm(format!("KVM_KVMCLOCK_CTRL: {e}")))
     }
 
     /// Apply the accumulated GSI routing table to KVM.
@@ -774,4 +858,21 @@ fn find_substring(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     }
     let last = haystack.len() - needle.len();
     (0..=last).find(|&i| haystack[i..i + needle.len()] == *needle)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::normalize_restored_clock;
+
+    #[test]
+    fn restore_clock_never_inherits_elapsed_realtime_policy() {
+        let preserved_flag = 1u32 << 31;
+        let mut clock = kvm_bindings::kvm_clock_data {
+            flags: kvm_bindings::KVM_CLOCK_REALTIME | preserved_flag,
+            ..Default::default()
+        };
+        normalize_restored_clock(&mut clock);
+        assert_eq!(clock.flags & kvm_bindings::KVM_CLOCK_REALTIME, 0);
+        assert_ne!(clock.flags & preserved_flag, 0);
+    }
 }

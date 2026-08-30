@@ -14,7 +14,7 @@
 use crate::backend::GuestMemory;
 use crate::dirty::DirtyBitmap;
 use kvm_ioctls::VmFd;
-use vm_memory::{Address, GuestMemoryBackend as _, GuestMemoryRegion};
+use vm_memory::{GuestMemoryBackend as _, GuestMemoryRegion};
 
 /// Errors from KVM dirty-log operations.
 #[derive(Debug, thiserror::Error)]
@@ -38,9 +38,9 @@ pub fn read_dirty_log(
     slots: &[u32],
 ) -> Result<DirtyBitmap, KvmDirtyError> {
     let mut bitmap = DirtyBitmap::new();
+    let mut packed_region_start = 0u64;
     for (slot_idx, region) in mem.inner.iter().enumerate() {
         let slot = slots.get(slot_idx).copied().unwrap_or(slot_idx as u32);
-        let region_start = region.start_addr().raw_value();
         let region_len = region.len();
 
         // KVM_GET_DIRTY_LOG returns a bitmap with one bit per page (4 KiB).
@@ -61,11 +61,12 @@ pub fn read_dirty_log(
             for bit in 0..64 {
                 if w & (1u64 << bit) != 0 {
                     let pfn_offset = (word_idx * 64 + bit) as u64;
-                    let gpa = region_start + pfn_offset * 4096;
-                    bitmap.mark(gpa);
+                    let offset = packed_region_start + pfn_offset * 4096;
+                    bitmap.mark(offset);
                 }
             }
         }
+        packed_region_start += region_len;
     }
     Ok(bitmap)
 }

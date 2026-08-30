@@ -37,6 +37,10 @@ pub struct RunningVm {
     pub net_io_loops: Vec<vmm_devices::virtio::net_io_loop::NetIoLoop>,
     pub blk_devices: Vec<Arc<vmm_devices::virtio::blk_transport::VirtioBlkMmio>>,
     pub net_devices: Vec<Arc<vmm_devices::virtio::net_transport::VirtioNetMmio>>,
+    pub balloon_device: Option<Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>>,
+    /// Reasserts the balloon's level IRQ after guest EOI when another virtio
+    /// cause arrived during the interrupt-service window.
+    pub balloon_irq_resample: Option<BalloonIrqResample>,
     /// TAP devices backing the virtio-net loops; closed after the loops stop.
     pub taps: Vec<vmm_net::tap::Tap>,
     /// virtio-vsock host pump thread (host→guest RX). Dropped before the irqfds.
@@ -713,6 +717,7 @@ impl VmmController {
             nets,
             rng_irq,
             vsock,
+            balloon,
         } = build_devices(&config, &mem)?;
         let mut irq_evts: Vec<vmm_sys_util::eventfd::EventFd> = blk_irq_evts;
 
@@ -746,6 +751,13 @@ impl VmmController {
         let kvm_vm =
             crate::kvm::KvmVm::new_with_options(mem.clone(), devices, template, full_boot)?;
 
+        // Expose a fresh generation value from the first boot. The eventfd is
+        // registered now and kept alive for the VM lifetime; it is triggered
+        // only when a snapshot is restored into a new VM incarnation.
+        let vmgenid = crate::vmgenid::VmGenId::new(&mem)?;
+        kvm_vm.register_irqfd(vmgenid.eventfd(), crate::vmgenid::VMGENID_GSI)?;
+        let vmgenid_evt = vmgenid.into_eventfd();
+
         // Register irqfds (no ioeventfds for block — QUEUE_NOTIFY traps to userspace).
         for (i, evt) in irq_evts.iter().enumerate() {
             let irq = 5 + i as u32;
@@ -753,6 +765,10 @@ impl VmmController {
                 log::warn!("irqfd for volume {i} (gsi={irq}): {e}");
             }
         }
+        // Keep the VM Generation ID eventfd alive, but only after the block
+        // loop above. It has its own fixed GSI and must never be enumerated as
+        // a volume interrupt.
+        irq_evts.push(vmgenid_evt);
 
         // i8042 irqfd for full boot. Kept alive in RunningVm.keep_alive_fds so
         // it survives for the VM's lifetime and is closed when the VM stops.
@@ -821,6 +837,28 @@ impl VmmController {
             }
             irq_evts.push(evt);
         }
+
+        let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
+        let balloon_irq_resample = match balloon {
+            Some(wired) => {
+                kvm_vm.register_irqfd_with_resample(
+                    &wired.irq_evt,
+                    &wired.resample_evt,
+                    wired.irq,
+                )?;
+                let loop_handle = BalloonIrqResample::spawn(
+                    wired.device,
+                    wired
+                        .irq_evt
+                        .try_clone()
+                        .map_err(|error| VmmError::Kvm(format!("balloon irq clone: {error}")))?,
+                    wired.resample_evt,
+                )?;
+                irq_evts.push(wired.irq_evt);
+                Some(loop_handle)
+            }
+            None => None,
+        };
 
         // Wire the virtio-vsock exec channel: register its irqfd, bind the
         // control socket the guest agent dials into, and start the host→guest
@@ -917,6 +955,8 @@ impl VmmController {
                 net_io_loops,
                 blk_devices: blks,
                 net_devices,
+                balloon_device,
+                balloon_irq_resample,
                 taps,
                 vsock_pump,
                 vsock_exec,
@@ -942,7 +982,7 @@ impl VmmController {
         snapshot_config: crate::live_snapshot::LiveSnapshotConfig,
     ) -> Result<crate::live_snapshot::LiveSnapshotResult> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::LiveSnapshot)?;
-        let (running, mem, base_blob, generation) = {
+        let (running, mem, base_blob, generation, overlay_source) = {
             let mut slot = self.lock();
             let vm = slot
                 .as_mut()
@@ -962,7 +1002,26 @@ impl VmmController {
                 .running
                 .take()
                 .ok_or_else(|| VmmError::InvalidConfig("VM not running".into()))?;
-            (running, mem, base_blob, vm.generation)
+            let overlay_sources = vm
+                .config
+                .volumes
+                .iter()
+                .filter_map(|volume| volume.overlay.clone())
+                .collect::<Vec<_>>();
+            if overlay_sources.len() > 1 {
+                vm.running = Some(running);
+                return Err(VmmError::Snapshot(
+                    "atomic live snapshot currently supports at most one writable disk overlay"
+                        .into(),
+                ));
+            }
+            (
+                running,
+                mem,
+                base_blob,
+                vm.generation,
+                overlay_sources.into_iter().next(),
+            )
         };
 
         // The controller lock is released for the whole pre-copy loop so other
@@ -993,13 +1052,55 @@ impl VmmController {
                 }
             }
         };
+        let memory_stage_path = match unique_scratch_snapshot_path("vmm-live-memory") {
+            Ok(path) => path,
+            Err(error) => {
+                let mut slot = self.lock();
+                if let Some(vm) = slot
+                    .as_mut()
+                    .filter(|vm| vm.generation == generation && vm.running.is_none())
+                {
+                    vm.running = Some(running);
+                }
+                return Err(error);
+            }
+        };
+        let memory_stage = match staged_owned_output(&memory_stage_path) {
+            Ok(stage) => stage,
+            Err(error) => {
+                let mut slot = self.lock();
+                if let Some(vm) = slot
+                    .as_mut()
+                    .filter(|vm| vm.generation == generation && vm.running.is_none())
+                {
+                    vm.running = Some(running);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = prepare_live_snapshot_stage(memory_stage.file()) {
+            remove_owned_scratch_file(&memory_stage);
+            let mut slot = self.lock();
+            if let Some(vm) = slot
+                .as_mut()
+                .filter(|vm| vm.generation == generation && vm.running.is_none())
+            {
+                vm.running = Some(running);
+            }
+            return Err(error);
+        }
+        let mut live_overlay = None;
         let snap_result = crate::live_snapshot::live_snapshot(
             &running.kvm_vm,
             &mem,
             &running.vcpu_thread,
             &snapshot_config,
+            memory_stage.file(),
             &quiesce,
             || {
+                if let Some(source) = overlay_source.as_deref() {
+                    live_overlay = Some(capture_live_overlay(Path::new(source))?);
+                }
                 capture_live_state_blob(&running, &base_blob)
                     .map(|captured| captured.unwrap_or_else(|| base_blob.clone()))
             },
@@ -1023,34 +1124,150 @@ impl VmmController {
         // Dropping the stale `RunningVm` stops its vCPU and I/O threads.
         drop(reclaimed);
 
-        let output = snap_result?;
+        let output = match snap_result {
+            Ok(output) => output,
+            Err(error) => {
+                remove_owned_scratch_file(&memory_stage);
+                if let Some(overlay) = live_overlay.as_ref() {
+                    remove_owned_scratch_file(overlay);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = inject_live_snapshot_controller_failure("precopy_complete") {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+            remove_owned_scratch_file(&memory_stage);
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
+            return Err(error);
+        }
         let mut result = output.result;
+        result.overlay_path = live_overlay
+            .as_ref()
+            .map(|overlay| overlay.path().to_string_lossy().into_owned());
 
-        let live_path = unique_scratch_snapshot_path("vmm-live")?;
+        let live_path = unique_scratch_snapshot_path("vmm-live").inspect_err(|_| {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
+        })?;
         let live_path_s = live_path.to_string_lossy().into_owned();
-        let mut owned_live_path = staged_owned_output(&live_path)?;
-        let write = write_scratch_snapshot_file(
-            &owned_live_path,
-            &output.state_blob,
-            &output.mem_snapshot,
-            false,
-        );
-        // Free the memory image before returning: holding it alongside guest
-        // RAM would keep the host at two copies for the caller's lifetime.
-        drop(output.mem_snapshot);
-        if let Err(e) = write {
+        let mut owned_live_path = staged_owned_output(&live_path).inspect_err(|_| {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
+        })?;
+        prepare_live_snapshot_stage(owned_live_path.file()).inspect_err(|_| {
             replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
             remove_owned_scratch_file(&owned_live_path);
-            return Err(e);
-        }
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
+        })?;
+        let write = write_scratch_snapshot_file_from_memory_file(
+            &owned_live_path,
+            &output.state_blob,
+            memory_stage.file(),
+            result.mem_bytes,
+            false,
+        )
+        .and_then(|manifest| {
+            inject_live_snapshot_controller_failure("snapshot_written")?;
+            Ok(manifest)
+        });
+        remove_owned_scratch_file(&memory_stage);
+        let manifest = match write {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+                remove_owned_scratch_file(&owned_live_path);
+                if let Some(overlay) = live_overlay.as_ref() {
+                    remove_owned_scratch_file(overlay);
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = persist_owned_output(&mut owned_live_path, &live_path) {
             replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
             remove_owned_scratch_file(&owned_live_path);
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
+            return Err(error);
+        }
+        if let Err(error) = inject_live_snapshot_controller_failure("snapshot_published") {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+            remove_owned_scratch_file(&owned_live_path);
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
             return Err(error);
         }
         result.snapshot_path.clone_from(&live_path_s);
 
+        let integrity_path = match unique_scratch_snapshot_path("vmm-live-integrity") {
+            Ok(path) => path,
+            Err(error) => {
+                replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+                remove_owned_scratch_file(&owned_live_path);
+                if let Some(overlay) = live_overlay.as_ref() {
+                    remove_owned_scratch_file(overlay);
+                }
+                return Err(error);
+            }
+        };
+        let mut owned_integrity_path = match staged_owned_output(&integrity_path) {
+            Ok(path) => path,
+            Err(error) => {
+                replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+                remove_owned_scratch_file(&owned_live_path);
+                if let Some(overlay) = live_overlay.as_ref() {
+                    remove_owned_scratch_file(overlay);
+                }
+                return Err(error);
+            }
+        };
+        let encoded_manifest = manifest.encode().map_err(|error| {
+            VmmError::Snapshot(format!("encode live snapshot integrity: {error}"))
+        });
+        let write_integrity = encoded_manifest.and_then(|encoded| {
+            use std::io::Write as _;
+            owned_integrity_path
+                .file()
+                .try_clone()
+                .and_then(|mut file| file.write_all(&encoded).and_then(|()| file.sync_all()))
+                .map_err(|error| {
+                    VmmError::Snapshot(format!("write live snapshot integrity: {error}"))
+                })?;
+            inject_live_snapshot_controller_failure("integrity_written")
+        });
+        if let Err(error) = write_integrity
+            .and_then(|()| persist_owned_output(&mut owned_integrity_path, &integrity_path))
+        {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+            remove_owned_scratch_file(&owned_integrity_path);
+            remove_owned_scratch_file(&owned_live_path);
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
+            return Err(error);
+        }
+        if let Err(error) = inject_live_snapshot_controller_failure("integrity_published") {
+            replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
+            remove_owned_scratch_file(&owned_integrity_path);
+            remove_owned_scratch_file(&owned_live_path);
+            if let Some(overlay) = live_overlay.as_ref() {
+                remove_owned_scratch_file(overlay);
+            }
+            return Err(error);
+        }
+        result.integrity_path = Some(integrity_path.to_string_lossy().into_owned());
+
         let mut owned_live_path = Some(owned_live_path);
+        let mut owned_integrity_path = Some(owned_integrity_path);
         {
             let mut slot = self.lock();
             if let Some(vm) = slot.as_mut().filter(|vm| vm.generation == generation) {
@@ -1060,6 +1277,16 @@ impl VmmController {
                     )
                 })?;
                 vm.transient_files.add_live_snapshot_owned(owned_live_path);
+                let owned_integrity_path = owned_integrity_path.take().ok_or_else(|| {
+                    VmmError::Snapshot(
+                        "live snapshot integrity ownership disappeared before registration".into(),
+                    )
+                })?;
+                vm.transient_files
+                    .add_live_snapshot_owned(owned_integrity_path);
+                if let Some(overlay) = live_overlay.take() {
+                    vm.transient_files.add_live_snapshot_owned(overlay);
+                }
                 // KVM_GET_DIRTY_LOG cleared every bit this snapshot consumed.
                 // Replay them into the host-dirty tracker, which snapshot()
                 // merges into the KVM dirty set, so a later diff snapshot still
@@ -1081,11 +1308,18 @@ impl VmmController {
         if let Some(owned_live_path) = owned_live_path {
             remove_owned_scratch_file(&owned_live_path);
         }
+        if let Some(owned_integrity_path) = owned_integrity_path {
+            remove_owned_scratch_file(&owned_integrity_path);
+        }
+        if let Some(overlay) = live_overlay.as_ref() {
+            remove_owned_scratch_file(overlay);
+        }
         log::info!(
-            "VM: live snapshot — {} rounds, {} pages copied, {} residual, {:?} downtime, {:?} total",
+            "VM: live snapshot — {} rounds, {} pages copied, {} residual, {:?} termination, {:?} downtime, {:?} total",
             result.rounds,
             result.pages_copied,
             result.final_dirty_pages,
+            result.termination,
             result.downtime,
             result.elapsed
         );
@@ -1100,8 +1334,27 @@ impl VmmController {
             .map(|result| result.snapshot_path)
     }
 
+    /// API-facing atomic live snapshot paths. When the VM has a writable disk
+    /// upper it is reflinked during the same final stop as RAM and device state.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn live_snapshot_to_paths(&self) -> Result<(String, Option<String>, Option<String>)> {
+        self.live_snapshot(crate::live_snapshot::LiveSnapshotConfig::default())
+            .map(|result| {
+                (
+                    result.snapshot_path,
+                    result.overlay_path,
+                    result.integrity_path,
+                )
+            })
+    }
+
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
     pub fn live_snapshot_to_path(&self) -> Result<String> {
+        Err(VmmError::Kvm("live snapshot needs Linux+KVM+boot".into()))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn live_snapshot_to_paths(&self) -> Result<(String, Option<String>, Option<String>)> {
         Err(VmmError::Kvm("live snapshot needs Linux+KVM+boot".into()))
     }
 
@@ -1127,11 +1380,44 @@ impl VmmController {
         net_override: Option<Vec<crate::config::NetConfig>>,
         memory_policy: tarit_proto::RestoreMemoryPolicy,
     ) -> Result<()> {
+        self.restore_with_integrity(snapshot_path, overlay, net_override, memory_policy, None)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn restore_with_integrity(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net_override: Option<Vec<crate::config::NetConfig>>,
+        memory_policy: tarit_proto::RestoreMemoryPolicy,
+        memory_integrity: Option<tarit_proto::MemoryIntegrity>,
+    ) -> Result<()> {
+        self.restore_with_resource_overrides(
+            snapshot_path,
+            overlay,
+            net_override,
+            None,
+            memory_policy,
+            memory_integrity,
+        )
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn restore_with_resource_overrides(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net_override: Option<Vec<crate::config::NetConfig>>,
+        volume_override: Option<Vec<crate::config::VolumeConfig>>,
+        memory_policy: tarit_proto::RestoreMemoryPolicy,
+        memory_integrity: Option<tarit_proto::MemoryIntegrity>,
+    ) -> Result<()> {
         use std::time::Instant;
 
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Restore)?;
         let start = Instant::now();
-        let restored = restore_snapshot_with_policy(snapshot_path, memory_policy)?;
+        let restored =
+            restore_snapshot_with_policy(snapshot_path, memory_policy, memory_integrity.as_ref())?;
         let RestoredSnapshot {
             mem,
             state_blob,
@@ -1143,7 +1429,9 @@ impl VmmController {
         // Deserialize the state blob (shared owned `StateBlob`) to recover the
         // kernel path/cmdline/vcpus, the attached volumes/net, and any captured
         // vCPU state for a faithful resume.
-        let mut saved = postcard::from_bytes::<StateBlob>(&state_blob).ok();
+        let (mut saved, balloon_state) = decode_state_blob(&state_blob)
+            .map(|(saved, balloon)| (Some(saved), balloon))
+            .unwrap_or((None, None));
 
         let (kernel_path, cmdline, vcpus, volumes, net) = saved
             .as_ref()
@@ -1215,6 +1503,7 @@ impl VmmController {
             net,
         };
         apply_restore_network_override(&mut config, net_override)?;
+        apply_restore_volume_override(&mut config, volume_override)?;
         let overlay_guard = match overlay.as_deref() {
             Some(target) => prepare_restore_overlay(&config, target)?,
             None => OwnedOverlayGuard::from_created(Vec::new()),
@@ -1229,7 +1518,7 @@ impl VmmController {
         let state_blob = if let Some(saved) = saved.as_mut() {
             saved.volumes = config.volumes.clone();
             saved.net = config.net.clone();
-            postcard::to_allocvec(saved).unwrap_or_else(|_| state_blob.clone())
+            encode_state_blob(saved, balloon_state.as_ref()).unwrap_or_else(|_| state_blob.clone())
         } else {
             state_blob
         };
@@ -1248,6 +1537,7 @@ impl VmmController {
                     virtio_blk: &virtio_blk,
                     virtio_net: &virtio_net,
                     vsock: vsock_state.as_ref(),
+                    balloon: balloon_state.as_ref(),
                 };
                 match build_running_vm(mem.clone(), &config, restored, entry) {
                     Ok(r) => (Some(r), VmState::Running),
@@ -1278,6 +1568,17 @@ impl VmmController {
             lazy_restore,
             running,
         });
+        drop(slot);
+        if resumed {
+            if let Err(error) = await_clone_repair_barrier(self) {
+                // A clone whose kernel/userspace state was not repaired must
+                // never become externally usable. Taking the instance drops
+                // its vCPUs, devices, lazy handler, and private overlays.
+                let failed = self.lock().take();
+                drop(failed);
+                return Err(error);
+            }
+        }
         log::info!(
             "VM restored in {:?} ({})",
             start.elapsed(),
@@ -1292,12 +1593,37 @@ impl VmmController {
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn restore_with_resource_overrides(
+        &self,
+        _snapshot_path: &str,
+        _overlay: Option<String>,
+        _net_override: Option<Vec<crate::config::NetConfig>>,
+        _volume_override: Option<Vec<crate::config::VolumeConfig>>,
+        _memory_policy: tarit_proto::RestoreMemoryPolicy,
+        _memory_integrity: Option<tarit_proto::MemoryIntegrity>,
+    ) -> Result<()> {
+        Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
     pub fn restore_with_overrides(
         &self,
         _snapshot_path: &str,
         _overlay: Option<String>,
         _net_override: Option<Vec<crate::config::NetConfig>>,
         _memory_policy: tarit_proto::RestoreMemoryPolicy,
+    ) -> Result<()> {
+        Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn restore_with_integrity(
+        &self,
+        _snapshot_path: &str,
+        _overlay: Option<String>,
+        _net_override: Option<Vec<crate::config::NetConfig>>,
+        _memory_policy: tarit_proto::RestoreMemoryPolicy,
+        _memory_integrity: Option<tarit_proto::MemoryIntegrity>,
     ) -> Result<()> {
         Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
     }
@@ -1380,6 +1706,54 @@ impl VmmController {
             kernel: vm.config.kernel.path.clone(),
             vcpu_alive,
         })
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn set_balloon_target_mib(&self, target_mib: u64) -> Result<(u32, u32)> {
+        let pages = target_mib
+            .checked_mul(crate::config::MIB / 4096)
+            .and_then(|pages| u32::try_from(pages).ok())
+            .ok_or_else(|| VmmError::InvalidConfig("balloon target overflows u32 pages".into()))?;
+        let slot = self.lock();
+        let vm = slot
+            .as_ref()
+            .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        let device = vm
+            .running
+            .as_ref()
+            .and_then(|running| running.balloon_device.as_ref())
+            .ok_or_else(|| VmmError::InvalidConfig("VM has no active balloon device".into()))?;
+        device
+            .set_target_pages(pages)
+            .map_err(VmmError::InvalidConfig)?;
+        Ok((device.target_pages(), device.actual_pages()))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn set_balloon_target_mib(&self, _target_mib: u64) -> Result<(u32, u32)> {
+        Err(VmmError::Device(
+            "virtio-balloon needs Linux+KVM+boot".into(),
+        ))
+    }
+
+    pub fn balloon_state(&self) -> Result<(u32, u32)> {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        {
+            let slot = self.lock();
+            let vm = slot
+                .as_ref()
+                .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+            let device = vm
+                .running
+                .as_ref()
+                .and_then(|running| running.balloon_device.as_ref())
+                .ok_or_else(|| VmmError::InvalidConfig("VM has no active balloon device".into()))?;
+            Ok((device.target_pages(), device.actual_pages()))
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        Err(VmmError::Device(
+            "virtio-balloon needs Linux+KVM+boot".into(),
+        ))
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -1547,7 +1921,17 @@ impl VmmController {
                     .and_then(|r| r.vsock_exec.clone())
             };
             if let Some(vx) = vsock_channel {
-                match vx.exec(command, timeout) {
+                // A fresh guest announces serial readiness before its virtio
+                // worker necessarily finishes dialing the framed vsock exec
+                // channel. For the first real command only, allow that channel
+                // a short bounded grace period. Empty commands are readiness
+                // probes and deliberately keep using the short UART protocol.
+                if !command.is_empty() {
+                    let remaining = timeout.saturating_sub(start.elapsed());
+                    let _ = vx.wait_for_initial_connection(remaining.min(Duration::from_secs(2)));
+                }
+                let remaining = timeout.saturating_sub(start.elapsed());
+                match vx.exec(command, remaining) {
                     Some(Ok(r)) => {
                         log::info!("exec '{command}' via vsock → exit={}", r.0);
                         return Ok(r);
@@ -1582,6 +1966,53 @@ impl VmmController {
             // response.
             let _ = serial.drain_output();
 
+            // A readiness probe must not depend on `/bin/sh` and must stay
+            // short enough to cross the UART while a freshly booted 8250
+            // driver switches modes. The nonce prevents a stale reply from a
+            // prior timed-out probe from being accepted as current readiness.
+            if command.is_empty() {
+                static PROBE_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let token = format!(
+                    "{:08x}{:08x}",
+                    std::process::id(),
+                    PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32
+                );
+                let expected = format!("VMM_PROBE_OK:{token}");
+                let probe = format!("\n\n\n\nVMM_PROBE:{token}\n");
+                if !serial.send_within(probe.as_bytes(), start + timeout) {
+                    return Err(VmmError::Kvm(
+                        "readiness probe: guest serial input stalled".into(),
+                    ));
+                }
+                let mut acc = Vec::new();
+                while start.elapsed() < timeout {
+                    std::thread::sleep(Duration::from_millis(2));
+                    acc.extend_from_slice(&serial.drain_output());
+                    while let Some(pos) = acc.iter().position(|&byte| byte == b'\n') {
+                        let mut line: Vec<u8> = acc.drain(..=pos).collect();
+                        line.pop();
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        if line == expected.as_bytes() {
+                            return Ok((
+                                0,
+                                String::new(),
+                                String::new(),
+                                start.elapsed().as_millis() as u64,
+                            ));
+                        }
+                    }
+                    if acc.len() > 4096 {
+                        acc.drain(..acc.len() - 4096);
+                    }
+                }
+                return Err(VmmError::Kvm(format!(
+                    "readiness probe timed out after {timeout:?}"
+                )));
+            }
+
             // Tag the exec with a nonce echoed by the guest shell before the
             // command runs. A previously timed-out exec keeps running in the
             // guest and emits VMM_EXEC_START/VMM_EXEC_EXIT= markers later;
@@ -1600,7 +2031,11 @@ impl VmmController {
             // be swallowed by a parse error in the command itself; exit code
             // and output semantics are unchanged.
             let quoted = command.replace('\'', "'\\''");
-            let cmd = format!("\nVMM_EXEC:echo {nonce}; sh -c '{quoted}'");
+            // A freshly opened Linux 8250 consumer can absorb a few pending RX
+            // bytes while switching the tty to raw mode. Pad with ignored empty
+            // lines so that startup loss cannot eat the protocol prefix (seen
+            // on c8i as `M_EXEC:` and a guaranteed first-command timeout).
+            let cmd = format!("\n\n\n\n\n\n\n\nVMM_EXEC:echo {nonce}; sh -c '{quoted}'");
 
             // The emulated UART RX FIFO holds 64 bytes; a one-shot enqueue
             // silently truncates longer commands (the un-terminated fragment
@@ -1789,6 +2224,91 @@ impl VmmController {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
+    use std::fmt::Write as _;
+    use std::time::{Duration, Instant};
+
+    const COMMAND_PREFIX: &str = "__TARIT_CLONE_REPAIR_V2__";
+    const RESPONSE: &str = "TARIT_CLONE_REPAIR_V2_OK";
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Generate this after restore on the host. Guest hwrng buffers and the
+    // kernel CRNG are part of the captured RAM image, so neither is a safe
+    // source of the first post-clone uniqueness input.
+    let mut nonce = [0u8; 48];
+    crate::vmgenid::fill_random(&mut nonce)?;
+    // The public incarnation identifier doubles as the guest-visible boot ID.
+    // Set RFC 4122 version/variant bits while retaining 122 random bits.
+    nonce[32 + 6] = (nonce[32 + 6] & 0x0f) | 0x40;
+    nonce[32 + 8] = (nonce[32 + 8] & 0x3f) | 0x80;
+    let mut command = String::with_capacity(COMMAND_PREFIX.len() + nonce.len() * 2);
+    command.push_str(COMMAND_PREFIX);
+    for byte in &nonce {
+        write!(command, "{byte:02x}").expect("writing hex to a String cannot fail");
+    }
+    let expected_clone_id = command[command.len() - 32..].to_owned();
+    nonce.fill(0);
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let channel = {
+            let slot = controller.lock();
+            slot.as_ref()
+                .and_then(|vm| vm.running.as_ref())
+                .and_then(|running| running.vsock_exec.clone())
+        }
+        .ok_or_else(|| VmmError::Device("restored VM has no clone repair channel".into()))?;
+
+        if channel.is_connected() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match channel.exec(&command, remaining) {
+                Some(Ok((0, stdout, _, _))) => {
+                    let mut fields = stdout.split_whitespace();
+                    let marker = fields.next();
+                    let clone_id = fields.next();
+                    let valid_id = clone_id.is_some_and(|id| {
+                        id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    });
+                    if marker == Some(RESPONSE)
+                        && valid_id
+                        && clone_id == Some(expected_clone_id.as_str())
+                        && fields.next().is_none()
+                    {
+                        log::info!("clone entropy repair barrier completed");
+                        return Ok(());
+                    }
+                    return Err(VmmError::Device(
+                        "guest agent returned an invalid clone repair acknowledgement".into(),
+                    ));
+                }
+                Some(Ok((exit_code, _, stderr, _))) => {
+                    return Err(VmmError::Device(format!(
+                        "guest clone repair failed with status {exit_code}: {stderr}"
+                    )));
+                }
+                Some(Err(error)) => {
+                    return Err(VmmError::Device(format!(
+                        "guest clone repair exchange failed: {error}"
+                    )));
+                }
+                None => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    Err(VmmError::Device(
+        "guest did not complete clone entropy repair before admission".into(),
+    ))
+}
+
 impl Default for VmmController {
     fn default() -> Self {
         Self::new()
@@ -1948,6 +2468,10 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Optio
     let serial_state = vmm_devices::persist::Persist::save(&*running.vcpu_thread.serial);
     let virtio_blk = capture_virtio_blk_states(&running.blk_devices)?;
     let virtio_net = capture_virtio_net_states(&running.net_devices)?;
+    let balloon = running
+        .balloon_device
+        .as_ref()
+        .map(|device| vmm_devices::persist::Persist::save(&**device));
     let vsock_state = running
         .vsock_pump
         .as_ref()
@@ -1955,7 +2479,7 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Optio
         .transpose()
         .map_err(|error| VmmError::Snapshot(format!("capture virtio-vsock state: {error}")))?;
 
-    let Ok(mut b) = postcard::from_bytes::<StateBlob>(existing) else {
+    let Some((mut b, _previous_balloon)) = decode_state_blob(existing) else {
         return Ok(None);
     };
     b.vcpu_full = Some(captured);
@@ -1965,7 +2489,7 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Optio
     b.virtio_blk = virtio_blk;
     b.virtio_net = virtio_net;
     b.vsock = vsock_state;
-    postcard::to_allocvec(&b)
+    encode_state_blob(&b, balloon.as_ref())
         .map(Some)
         .map_err(|error| VmmError::Snapshot(format!("serialize live device state: {error}")))
 }
@@ -2050,6 +2574,7 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
                 return Err(VmmError::Snapshot(format!("UFFD suspend restore: {e}")));
             }
         };
+        guest_mem.set_lazy_page_discard(lazy_restore.page_discard());
 
         if let Err(e) = vmm_memory_backend::madvise_dontneed(mem_ptr, mem_len) {
             drop(lazy_restore);
@@ -2104,6 +2629,68 @@ pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+#[cfg(feature = "test-failpoints")]
+fn inject_live_snapshot_controller_failure(phase: &str) -> Result<()> {
+    if std::env::var_os("TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE").as_deref()
+        == Some(std::ffi::OsStr::new(phase))
+    {
+        return Err(VmmError::Snapshot(format!(
+            "injected live snapshot failure at {phase}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-failpoints"))]
+fn inject_live_snapshot_controller_failure(_phase: &str) -> Result<()> {
+    Ok(())
+}
+
+/// Btrfs CoW turns the final residual's 4 KiB positioned updates into extent
+/// splitting and can stretch guest downtime from milliseconds to minutes.
+/// Mark the still-empty private stage NOCOW; Btrfs continues to permit the
+/// aligned FICLONERANGE used when the finished image is published.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn prepare_live_snapshot_stage(file: &std::fs::File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683E_u32 as libc::c_long;
+    const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601;
+    const FS_IOC_SETFLAGS: libc::Ioctl = 0x4008_6602;
+    const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
+
+    // SAFETY: statfs only writes the provided initialized structure and the
+    // descriptor remains live for the duration of the call.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } != 0 {
+        return Err(VmmError::Snapshot(format!(
+            "inspect live snapshot staging filesystem: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if fs.f_type != BTRFS_SUPER_MAGIC {
+        return Ok(());
+    }
+
+    let mut flags: libc::c_long = 0;
+    // SAFETY: these filesystem ioctls read/write one machine-word flag value;
+    // the file is private, empty, and remains open throughout both calls.
+    if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) } != 0 {
+        return Err(VmmError::Snapshot(format!(
+            "read Btrfs live snapshot staging flags: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    flags |= FS_NOCOW_FL;
+    if unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_SETFLAGS, &flags) } != 0 {
+        return Err(VmmError::Snapshot(format!(
+            "enable NOCOW for Btrfs live snapshot staging: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 fn unique_scratch_snapshot_path(prefix: &str) -> Result<PathBuf> {
     unique_runtime_file_path(prefix, "snap")
 }
@@ -2119,6 +2706,27 @@ pub(crate) fn unique_runtime_file_path(prefix: &str, suffix: &str) -> Result<Pat
         "{prefix}-{}-{ts}-{seq}.{suffix}",
         std::process::id()
     )))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn unique_runtime_socket_path() -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // sockaddr_un::sun_path is 108 bytes on Linux. Keep the per-process name
+    // compact: timestamp-heavy scratch names can cross that limit when TMPDIR
+    // is nested under a test, jail, or container runtime directory.
+    const SUN_PATH_BYTES: usize = 108;
+    static SOCKET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SOCKET_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = private_runtime_dir()?.join(format!("vs-{seq:x}.sock"));
+    if path.as_os_str().as_bytes().len() >= SUN_PATH_BYTES {
+        return Err(VmmError::Device(format!(
+            "runtime Unix socket path is too long ({} bytes, maximum 107): {}",
+            path.as_os_str().as_bytes().len(),
+            path.display()
+        )));
+    }
+    Ok(path)
 }
 
 fn staged_output_path(target: &Path) -> Result<PathBuf> {
@@ -2168,6 +2776,63 @@ fn persist_owned_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<(
     })
 }
 
+/// Capture the writable disk upper inside a live snapshot's final stop.
+///
+/// This path deliberately requires FICLONE. Falling back to an extent or dense
+/// copy while vCPUs are paused would make blackout proportional to disk dirtied
+/// bytes and defeat the live-fork latency contract.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn capture_live_overlay(source: &Path) -> Result<OwnedScratchFile> {
+    use std::os::fd::AsRawFd;
+
+    const FICLONE: libc::Ioctl = 0x4004_9409;
+    let source_owned = OwnedScratchFile::adopt_private(source).map_err(|error| {
+        VmmError::Snapshot(format!(
+            "adopt live overlay {} for atomic snapshot: {error}",
+            source.display()
+        ))
+    })?;
+    source_owned.file().sync_all().map_err(|error| {
+        VmmError::Snapshot(format!(
+            "sync live overlay {} before atomic snapshot: {error}",
+            source.display()
+        ))
+    })?;
+    // Reflinks cannot cross filesystem boundaries. Place the VMM-owned scratch
+    // beside the live upper so this remains O(1) even when TMPDIR is on the
+    // host root filesystem and VM storage is on a dedicated CoW volume.
+    let target = crate::gc::owned_overlay_path(
+        source.parent().ok_or_else(|| {
+            VmmError::Snapshot(format!(
+                "live overlay has no parent directory: {}",
+                source.display()
+            ))
+        })?,
+        0,
+    );
+    let mut captured = staged_owned_output(&target)?;
+    let cloned = unsafe {
+        libc::ioctl(
+            captured.file().as_raw_fd(),
+            FICLONE,
+            source_owned.file().as_raw_fd(),
+        )
+    };
+    if cloned != 0 {
+        let error = std::io::Error::last_os_error();
+        remove_owned_scratch_file(&captured);
+        return Err(VmmError::Snapshot(format!(
+            "atomic live disk snapshot requires reflink/FICLONE for {}: {error}",
+            source.display()
+        )));
+    }
+    if let Err(error) = persist_owned_output(&mut captured, &target) {
+        remove_owned_scratch_file(&captured);
+        return Err(error);
+    }
+    Ok(captured)
+}
+
 #[cfg(any(
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
@@ -2198,11 +2863,11 @@ fn drop_file_cache(file: &std::fs::File, offset: u64, len: u64) {
     use std::os::fd::AsRawFd;
 
     let Ok(offset) = libc::off_t::try_from(offset) else {
-        log::warn!("suspend: cannot fadvise file cache; offset too large");
+        log::warn!("snapshot: cannot fadvise file cache; offset too large");
         return;
     };
     let Ok(len) = libc::off_t::try_from(len) else {
-        log::warn!("suspend: cannot fadvise file cache; length too large");
+        log::warn!("snapshot: cannot fadvise file cache; length too large");
         return;
     };
     // SAFETY: `file.as_raw_fd()` is a valid open fd, and offset/len were checked
@@ -2211,7 +2876,7 @@ fn drop_file_cache(file: &std::fs::File, offset: u64, len: u64) {
         unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_DONTNEED) };
     if rc != 0 {
         log::warn!(
-            "suspend: POSIX_FADV_DONTNEED failed: {}",
+            "snapshot: POSIX_FADV_DONTNEED failed: {}",
             std::io::Error::from_raw_os_error(rc)
         );
     }
@@ -2269,6 +2934,53 @@ fn apply_restore_network_override(
             Ok(())
         }
     }
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn apply_restore_volume_override(
+    config: &mut VmConfig,
+    volume_override: Option<Vec<crate::config::VolumeConfig>>,
+) -> Result<()> {
+    let saved_indices = config
+        .volumes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, volume)| volume.inherited_fd.map(|_| index))
+        .collect::<Vec<_>>();
+    let Some(replacement) = volume_override else {
+        return if saved_indices.is_empty() {
+            Ok(())
+        } else {
+            Err(VmmError::InvalidConfig(
+                "snapshot restore requires replacement descriptors for inherited volumes".into(),
+            ))
+        };
+    };
+    if replacement.len() != saved_indices.len() {
+        return Err(VmmError::InvalidConfig(format!(
+            "restore volume replacement count {} does not match inherited device count {}",
+            replacement.len(),
+            saved_indices.len()
+        )));
+    }
+    for (index, replacement) in saved_indices.into_iter().zip(replacement) {
+        let saved = &config.volumes[index];
+        if replacement.inherited_fd.is_none()
+            || replacement.overlay.is_some()
+            || replacement.path != saved.path
+            || replacement.read_only != saved.read_only
+        {
+            return Err(VmmError::InvalidConfig(format!(
+                "restore volume replacement for device {index} changes immutable identity or lacks an inherited descriptor"
+            )));
+        }
+        config.volumes[index] = replacement;
+    }
+    config.validate()?;
+    Ok(())
 }
 
 #[cfg(any(
@@ -2616,6 +3328,205 @@ fn write_scratch_snapshot_file(
     diff: bool,
 ) -> Result<()> {
     write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, diff)
+}
+
+/// Assemble a full snapshot from a file-backed live pre-copy without ever
+/// allocating a second guest-RAM-sized buffer. The CRC field is patched before
+/// the private staged artifact is synced and atomically published.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_scratch_snapshot_file_from_memory_file(
+    owned_file: &OwnedScratchFile,
+    state_blob: &[u8],
+    memory_file: &std::fs::File,
+    mem_len: u64,
+    diff: bool,
+) -> Result<tarit_proto::IntegrityManifest> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    const MAGIC: &[u8; 4] = b"VMSN";
+    const VERSION: u16 = 1;
+    const MEM_CRC_OFFSET: u64 = 28;
+    const COPY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+    const WRITEBACK_INTERVAL: u64 = 32 * 1024 * 1024;
+    const REFLINK_ALIGNMENT: u64 = 4096;
+    const INTEGRITY_CHUNK_BYTES: usize = tarit_proto::INTEGRITY_CHUNK_SIZE as usize;
+    const _: () = assert!(COPY_BUFFER_BYTES.is_multiple_of(INTEGRITY_CHUNK_BYTES));
+
+    #[repr(C)]
+    struct FileCloneRange {
+        src_fd: i64,
+        src_offset: u64,
+        src_length: u64,
+        dest_offset: u64,
+    }
+
+    const FICLONERANGE: libc::Ioctl = 0x4020_940D;
+
+    let source_len = memory_file
+        .metadata()
+        .map_err(|error| VmmError::Snapshot(format!("stat staged RAM: {error}")))?
+        .len();
+    if source_len != mem_len {
+        return Err(VmmError::Snapshot(format!(
+            "staged RAM length mismatch: got {source_len}, expected {mem_len}"
+        )));
+    }
+
+    let state_len = u64::try_from(state_blob.len())
+        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+    let unaligned_mem_offset = FULL_SNAPSHOT_HEADER_LEN
+        .checked_add(state_len)
+        .ok_or_else(|| VmmError::Snapshot("snapshot memory offset overflow".into()))?;
+    let mem_offset = unaligned_mem_offset
+        .checked_add(REFLINK_ALIGNMENT - 1)
+        .map(|value| value / REFLINK_ALIGNMENT * REFLINK_ALIGNMENT)
+        .ok_or_else(|| VmmError::Snapshot("snapshot memory offset overflow".into()))?;
+    let padded_state_len = mem_offset - FULL_SNAPSHOT_HEADER_LEN;
+    let padded_state_capacity = usize::try_from(padded_state_len)
+        .map_err(|_| VmmError::Snapshot("padded state blob too large".into()))?;
+    let mut padded_state = Vec::with_capacity(padded_state_capacity);
+    padded_state.extend_from_slice(state_blob);
+    padded_state.resize(padded_state_capacity, 0);
+    let final_len = mem_offset
+        .checked_add(mem_len)
+        .ok_or_else(|| VmmError::Snapshot("snapshot length overflow".into()))?;
+    let state_crc = crc32fast::hash(&padded_state);
+    let flags: u16 = if diff { 1 } else { 0 };
+
+    let mut output = owned_file
+        .file()
+        .try_clone()
+        .map_err(|error| VmmError::Snapshot(format!("clone snapshot output: {error}")))?;
+    output
+        .set_len(0)
+        .map_err(|error| VmmError::Snapshot(format!("truncate snapshot output: {error}")))?;
+    output
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| VmmError::Snapshot(format!("seek snapshot output: {error}")))?;
+    output
+        .write_all(MAGIC)
+        .and_then(|()| output.write_all(&VERSION.to_le_bytes()))
+        .and_then(|()| output.write_all(&flags.to_le_bytes()))
+        .and_then(|()| output.write_all(&padded_state_len.to_le_bytes()))
+        .and_then(|()| output.write_all(&state_crc.to_le_bytes()))
+        .and_then(|()| output.write_all(&mem_len.to_le_bytes()))
+        .and_then(|()| output.write_all(&0u32.to_le_bytes()))
+        .and_then(|()| output.write_all(&padded_state))
+        .map_err(|error| VmmError::Snapshot(format!("write snapshot metadata: {error}")))?;
+
+    output
+        .set_len(final_len)
+        .map_err(|error| VmmError::Snapshot(format!("size streamed snapshot: {error}")))?;
+    let clone_range = FileCloneRange {
+        src_fd: i64::from(memory_file.as_raw_fd()),
+        src_offset: 0,
+        src_length: mem_len,
+        dest_offset: mem_offset,
+    };
+    // On a CoW filesystem publication should share the staged RAM extents,
+    // not allocate and write a second guest-RAM-sized file just to prepend
+    // snapshot metadata. The private stage remains owned until publication.
+    let reflinked = unsafe {
+        libc::ioctl(
+            output.as_raw_fd(),
+            FICLONERANGE,
+            &clone_range as *const FileCloneRange,
+        ) == 0
+    };
+    if !reflinked {
+        let error = std::io::Error::last_os_error();
+        log::warn!(
+            "live_snapshot: RAM range reflink unavailable ({error}); using streamed publication"
+        );
+        output
+            .seek(SeekFrom::Start(mem_offset))
+            .map_err(|error| VmmError::Snapshot(format!("seek snapshot RAM: {error}")))?;
+    }
+
+    let mut source = memory_file
+        .try_clone()
+        .map_err(|error| VmmError::Snapshot(format!("clone staged RAM: {error}")))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| VmmError::Snapshot(format!("seek staged RAM: {error}")))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut memory_chunk_hashes = Vec::new();
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    let mut copied = 0u64;
+    let mut synced = 0u64;
+    while copied < mem_len {
+        let chunk = (mem_len - copied).min(buffer.len() as u64) as usize;
+        source
+            .read_exact(&mut buffer[..chunk])
+            .map_err(|error| VmmError::Snapshot(format!("read staged RAM: {error}")))?;
+        hasher.update(&buffer[..chunk]);
+        memory_chunk_hashes.extend(
+            buffer[..chunk]
+                .chunks(INTEGRITY_CHUNK_BYTES)
+                .map(|bytes| -> [u8; 32] { Sha256::digest(bytes).into() }),
+        );
+        if !reflinked {
+            output
+                .write_all(&buffer[..chunk])
+                .map_err(|error| VmmError::Snapshot(format!("stream snapshot RAM: {error}")))?;
+        }
+        let chunk_u64 = chunk as u64;
+        drop_file_cache(memory_file, copied, chunk_u64);
+        copied += chunk_u64;
+
+        if !reflinked && copied - synced >= WRITEBACK_INTERVAL {
+            output
+                .sync_data()
+                .map_err(|error| VmmError::Snapshot(format!("write back snapshot RAM: {error}")))?;
+            drop_file_cache(&output, mem_offset + synced, copied - synced);
+            synced = copied;
+        }
+    }
+
+    let mem_crc = hasher.finalize();
+    output
+        .seek(SeekFrom::Start(MEM_CRC_OFFSET))
+        .and_then(|_| output.write_all(&mem_crc.to_le_bytes()))
+        .map_err(|error| VmmError::Snapshot(format!("patch snapshot RAM CRC: {error}")))?;
+    output
+        .sync_data()
+        .map_err(|error| VmmError::Snapshot(format!("sync streamed snapshot: {error}")))?;
+    if !reflinked && copied > synced {
+        drop_file_cache(&output, mem_offset + synced, copied - synced);
+    }
+    let metadata_capacity = (FULL_SNAPSHOT_HEADER_LEN as usize)
+        .checked_add(padded_state.len())
+        .ok_or_else(|| VmmError::Snapshot("snapshot metadata length overflow".into()))?;
+    let mut metadata = Vec::with_capacity(metadata_capacity);
+    metadata.extend_from_slice(MAGIC);
+    metadata.extend_from_slice(&VERSION.to_le_bytes());
+    metadata.extend_from_slice(&flags.to_le_bytes());
+    metadata.extend_from_slice(&padded_state_len.to_le_bytes());
+    metadata.extend_from_slice(&state_crc.to_le_bytes());
+    metadata.extend_from_slice(&mem_len.to_le_bytes());
+    metadata.extend_from_slice(&mem_crc.to_le_bytes());
+    metadata.extend_from_slice(&padded_state);
+    let metadata_chunk_hashes = metadata
+        .chunks(INTEGRITY_CHUNK_BYTES)
+        .map(|bytes| -> [u8; 32] { Sha256::digest(bytes).into() })
+        .collect();
+    Ok(tarit_proto::IntegrityManifest {
+        chunk_size: tarit_proto::INTEGRITY_CHUNK_SIZE,
+        artifacts: vec![
+            tarit_proto::ArtifactIntegrity {
+                kind: tarit_proto::ArtifactKind::SnapshotMetadata,
+                len: mem_offset,
+                chunk_hashes: metadata_chunk_hashes,
+            },
+            tarit_proto::ArtifactIntegrity {
+                kind: tarit_proto::ArtifactKind::Ram,
+                len: mem_len,
+                chunk_hashes: memory_chunk_hashes,
+            },
+        ],
+    })
 }
 
 #[cfg(any(
@@ -3088,6 +3999,120 @@ fn crc32_file_range(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn load_authenticated_memory_manifest(
+    anchor: &tarit_proto::MemoryIntegrity,
+    header: &[u8; FULL_SNAPSHOT_REST_HEADER_LEN],
+    state_blob: &[u8],
+    memory_len: u64,
+) -> Result<vmm_memory_backend::ChunkIntegrity> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let expected = anchor
+        .manifest_sha256
+        .strip_prefix("sha256:")
+        .ok_or_else(|| VmmError::Snapshot("invalid integrity manifest digest scheme".into()))?;
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(VmmError::Snapshot(
+            "invalid integrity manifest SHA-256".into(),
+        ));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&anchor.manifest_path)
+        .map_err(|error| {
+            VmmError::Snapshot(format!(
+                "open integrity manifest {}: {error}",
+                anchor.manifest_path
+            ))
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| VmmError::Snapshot(format!("stat integrity manifest: {error}")))?;
+    if !metadata.is_file() || metadata.len() > 128 * 1024 * 1024 {
+        return Err(VmmError::Snapshot(
+            "unsafe or oversized integrity manifest".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| VmmError::Snapshot(format!("read integrity manifest: {error}")))?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if !constant_time_ascii_eq(actual.as_bytes(), expected.to_ascii_lowercase().as_bytes()) {
+        return Err(VmmError::Snapshot(
+            "integrity manifest authentication failed".into(),
+        ));
+    }
+    let manifest = tarit_proto::IntegrityManifest::decode(&bytes)
+        .map_err(|error| VmmError::Snapshot(format!("parse integrity manifest: {error}")))?;
+    let memory = manifest
+        .artifact(tarit_proto::ArtifactKind::Ram)
+        .ok_or_else(|| VmmError::Snapshot("integrity manifest has no RAM artifact".into()))?;
+    if memory.len != memory_len {
+        return Err(VmmError::Snapshot(
+            "integrity manifest RAM length mismatch".into(),
+        ));
+    }
+    let metadata_integrity = manifest
+        .artifact(tarit_proto::ArtifactKind::SnapshotMetadata)
+        .ok_or_else(|| VmmError::Snapshot("integrity manifest has no snapshot metadata".into()))?;
+    let mut snapshot_metadata = Vec::with_capacity(4 + header.len() + state_blob.len());
+    snapshot_metadata.extend_from_slice(b"VMSN");
+    snapshot_metadata.extend_from_slice(header);
+    snapshot_metadata.extend_from_slice(state_blob);
+    verify_integrity_chunks(
+        &snapshot_metadata,
+        manifest.chunk_size as usize,
+        metadata_integrity,
+        "snapshot metadata",
+    )?;
+    Ok(vmm_memory_backend::ChunkIntegrity {
+        chunk_size: manifest.chunk_size as usize,
+        chunk_hashes: memory.chunk_hashes.clone(),
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn verify_integrity_chunks(
+    bytes: &[u8],
+    chunk_size: usize,
+    expected: &tarit_proto::ArtifactIntegrity,
+    what: &str,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    if expected.len != bytes.len() as u64
+        || expected.chunk_hashes.len() != bytes.len().div_ceil(chunk_size)
+    {
+        return Err(VmmError::Snapshot(format!(
+            "integrity manifest {what} shape mismatch"
+        )));
+    }
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        let actual: [u8; 32] = Sha256::digest(chunk).into();
+        if actual != expected.chunk_hashes[index] {
+            return Err(VmmError::Snapshot(format!(
+                "integrity verification failed for {what} chunk {index}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn constant_time_ascii_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 struct RestoredSnapshot {
     mem: vmm_memory_backend::GuestMemory,
     state_blob: Vec<u8>,
@@ -3108,34 +4133,55 @@ fn eager_restore_snapshot(path: &str) -> Result<RestoredSnapshot> {
 fn restore_snapshot_with_policy(
     path: &str,
     memory_policy: tarit_proto::RestoreMemoryPolicy,
+    memory_integrity: Option<&tarit_proto::MemoryIntegrity>,
 ) -> Result<RestoredSnapshot> {
     match memory_policy {
-        tarit_proto::RestoreMemoryPolicy::Auto => match try_lazy_restore_full_snapshot(path) {
-            Ok(Some(restored)) => Ok(restored),
-            Ok(None) => {
-                log::info!("restore: eager policy required for this snapshot; replaying eagerly");
-                eager_restore_snapshot(path)
+        tarit_proto::RestoreMemoryPolicy::Auto => {
+            match try_lazy_restore_full_snapshot(path, memory_integrity) {
+                Ok(Some(restored)) => Ok(restored),
+                Ok(None) if memory_integrity.is_none() => {
+                    log::info!(
+                        "restore: eager policy required for this snapshot; replaying eagerly"
+                    );
+                    eager_restore_snapshot(path)
+                }
+                Ok(None) => Err(VmmError::Snapshot(
+                    "authenticated snapshot is not eligible for lazy restore".into(),
+                )),
+                Err(error) if memory_integrity.is_none() => {
+                    log::warn!(
+                        "restore: lazy restore unavailable ({error}); falling back to eager"
+                    );
+                    eager_restore_snapshot(path)
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => {
-                log::warn!("restore: lazy restore unavailable ({error}); falling back to eager");
-                eager_restore_snapshot(path)
-            }
-        },
+        }
+        tarit_proto::RestoreMemoryPolicy::Eager if memory_integrity.is_some() => {
+            Err(VmmError::Snapshot(
+                "authenticated snapshots require chunk-verified lazy restore".into(),
+            ))
+        }
         tarit_proto::RestoreMemoryPolicy::Eager => eager_restore_snapshot(path),
-        tarit_proto::RestoreMemoryPolicy::Lazy => match try_lazy_restore_full_snapshot(path) {
-            Ok(Some(restored)) => Ok(restored),
-            Ok(None) => Err(VmmError::Snapshot(
-                "lazy restore requires a full non-diff snapshot with UFFD backing".into(),
-            )),
-            Err(error) => Err(VmmError::Snapshot(format!(
-                "lazy restore requested but unavailable: {error}"
-            ))),
-        },
+        tarit_proto::RestoreMemoryPolicy::Lazy => {
+            match try_lazy_restore_full_snapshot(path, memory_integrity) {
+                Ok(Some(restored)) => Ok(restored),
+                Ok(None) => Err(VmmError::Snapshot(
+                    "lazy restore requires a full non-diff snapshot with UFFD backing".into(),
+                )),
+                Err(error) => Err(VmmError::Snapshot(format!(
+                    "lazy restore requested but unavailable: {error}"
+                ))),
+            }
+        }
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn try_lazy_restore_full_snapshot(path: &str) -> Result<Option<RestoredSnapshot>> {
+fn try_lazy_restore_full_snapshot(
+    path: &str,
+    memory_integrity: Option<&tarit_proto::MemoryIntegrity>,
+) -> Result<Option<RestoredSnapshot>> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = open_snapshot_input(Path::new(path))?;
@@ -3183,26 +4229,38 @@ fn try_lazy_restore_full_snapshot(path: &str) -> Result<Option<RestoredSnapshot>
             header.state_crc
         )));
     }
-    let actual_mem_crc =
-        crc32_file_range(&mut file, path, layout.mem_offset, layout.mem_len, "mem")?;
-    if actual_mem_crc != header.mem_crc {
-        return Err(VmmError::Snapshot(format!(
-            "memory CRC mismatch in {path}: got {actual_mem_crc:#010x}, expected {:#010x}",
-            header.mem_crc
-        )));
-    }
+    let chunk_integrity = if let Some(anchor) = memory_integrity {
+        Some(load_authenticated_memory_manifest(
+            anchor,
+            &hdr,
+            &state_blob,
+            layout.mem_len,
+        )?)
+    } else {
+        let actual_mem_crc =
+            crc32_file_range(&mut file, path, layout.mem_offset, layout.mem_len, "mem")?;
+        if actual_mem_crc != header.mem_crc {
+            return Err(VmmError::Snapshot(format!(
+                "memory CRC mismatch in {path}: got {actual_mem_crc:#010x}, expected {:#010x}",
+                header.mem_crc
+            )));
+        }
+        None
+    };
 
     let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
         .map_err(|e| VmmError::Memory(e.to_string()))?;
-    let lazy_restore = vmm_memory_backend::start_lazy_restore(
+    let lazy_restore = vmm_memory_backend::start_lazy_restore_with_integrity(
         mem.as_ptr() as *mut u8,
         mem_len,
         &file,
         layout.mem_offset,
         layout.mem_len,
         Some(mem.host_dirty_tracker()),
+        chunk_integrity,
     )
     .map_err(|e| VmmError::Snapshot(format!("UFFD lazy restore: {e}")))?;
+    mem.set_lazy_page_discard(lazy_restore.page_discard());
 
     log::info!(
         "restore: UFFD lazy full snapshot armed (mem_offset={}, mem_len={})",
@@ -3604,6 +4662,60 @@ pub struct StateBlob {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const BALLOON_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTBLN01";
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn decode_state_blob(
+    bytes: &[u8],
+) -> Option<(
+    StateBlob,
+    Option<vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
+)> {
+    let (blob, trailing) = postcard::take_from_bytes::<StateBlob>(bytes).ok()?;
+    // Full live snapshots may pad the state area with zeroes so the following
+    // RAM extent is block-aligned and can be range-reflinked from the pre-copy
+    // stage. Zero padding is semantically empty and covered by the state CRC.
+    if trailing.iter().all(|byte| *byte == 0) {
+        return Some((blob, None));
+    }
+    if trailing.len() < BALLOON_STATE_TRAILER_MAGIC.len() + 4
+        || &trailing[..BALLOON_STATE_TRAILER_MAGIC.len()] != BALLOON_STATE_TRAILER_MAGIC
+    {
+        return None;
+    }
+    let length_offset = BALLOON_STATE_TRAILER_MAGIC.len();
+    let payload_len =
+        u32::from_le_bytes(trailing[length_offset..length_offset + 4].try_into().ok()?) as usize;
+    let payload_and_padding = trailing.get(length_offset + 4..)?;
+    let payload = payload_and_padding.get(..payload_len)?;
+    if !payload_and_padding[payload_len..]
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return None;
+    }
+    let balloon = postcard::from_bytes(payload).ok()?;
+    Some((blob, Some(balloon)))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn encode_state_blob(
+    blob: &StateBlob,
+    balloon: Option<&vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
+) -> std::result::Result<Vec<u8>, postcard::Error> {
+    let mut bytes = postcard::to_allocvec(blob)?;
+    if let Some(balloon) = balloon {
+        let payload = postcard::to_allocvec(balloon)?;
+        let payload_len =
+            u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
+        bytes.extend_from_slice(BALLOON_STATE_TRAILER_MAGIC);
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+    Ok(bytes)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 #[allow(dead_code)] // retained for the fast-boot path; live snapshots use the vCPU thread capture
 fn save_vcpu_state(vcpu: &kvm_ioctls::VcpuFd) -> Result<VcpuStateSave> {
     let regs = vcpu
@@ -3718,6 +4830,7 @@ struct RestoredRuntimeState<'a> {
     virtio_blk: &'a [Vec<u8>],
     virtio_net: &'a [Vec<u8>],
     vsock: Option<&'a vmm_devices::virtio::vsock::VirtioVsockMmioState>,
+    balloon: Option<&'a vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -3728,6 +4841,8 @@ fn build_running_vm(
     entry: u64,
 ) -> Result<RunningVm> {
     use crate::vcpu_thread::VcpuThread;
+
+    crate::vmgenid::require_snapshot_support(&mem)?;
 
     let full_boot = true;
     // Recreate the same devices at the same deterministic MMIO/IRQ layout
@@ -3742,14 +4857,23 @@ fn build_running_vm(
         nets,
         rng_irq,
         vsock,
+        balloon,
     } = build_devices(config, &mem)?;
     restore_virtio_blk_states(&mut blks, restored.virtio_blk);
     let mut net_devices: Vec<_> = nets.iter().map(|n| n.dev.clone()).collect();
     restore_virtio_net_states(&mut net_devices, restored.virtio_net);
+    let mut balloon = balloon;
+    if let (Some(wired), Some(state)) = (balloon.as_mut(), restored.balloon) {
+        vmm_devices::persist::Persist::restore(&mut wired.device, state.clone());
+    }
     let mut irq_evts: Vec<vmm_sys_util::eventfd::EventFd> = blk_irq_evts;
 
     let template = crate::cpu_template::CpuTemplate::bare();
     let kvm_vm = crate::kvm::KvmVm::new_with_options(mem, devices, template, full_boot)?;
+
+    // Replace the snapshot's generation value before any restored vCPU can
+    // execute. Old snapshots without the ACPI device were rejected above.
+    let vmgenid = crate::vmgenid::VmGenId::new(&kvm_vm.mem)?;
 
     // Re-apply the guest's in-kernel IRQCHIP/PIT/clock over the freshly-created
     // ones, so the restored guest keeps its interrupt routing (a fresh IOAPIC
@@ -3759,6 +4883,8 @@ fn build_running_vm(
     if let Some(vm_state) = restored.vm {
         kvm_vm.restore_vm_state(vm_state)?;
     }
+
+    kvm_vm.register_irqfd(vmgenid.eventfd(), crate::vmgenid::VMGENID_GSI)?;
 
     for (i, evt) in irq_evts.iter().enumerate() {
         let irq = 5 + i as u32;
@@ -3829,6 +4955,23 @@ fn build_running_vm(
         }
         irq_evts.push(evt);
     }
+    let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
+    let balloon_irq_resample = match balloon {
+        Some(wired) => {
+            kvm_vm.register_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)?;
+            let loop_handle = BalloonIrqResample::spawn(
+                wired.device,
+                wired
+                    .irq_evt
+                    .try_clone()
+                    .map_err(|error| VmmError::Kvm(format!("balloon irq clone: {error}")))?,
+                wired.resample_evt,
+            )?;
+            irq_evts.push(wired.irq_evt);
+            Some(loop_handle)
+        }
+        None => None,
+    };
 
     // Wire the virtio-vsock exec channel (matching create_live), so a restored
     // VM re-establishes exec-over-vsock when the guest agent re-dials.
@@ -3860,11 +5003,18 @@ fn build_running_vm(
             let pump_wake = pump.as_ref().and_then(|p| p.wake_evt().ok());
             let pty_wake = pump.as_ref().and_then(|p| p.wake_evt().ok());
             irq_evts.push(wv.io_evt);
-            let exec = crate::vsock_exec::VsockExecChannel::bind_with_pump_wake(
-                &wv.control_socket,
-                pump_wake,
-            )
-            .ok();
+            let exec = Some(
+                crate::vsock_exec::VsockExecChannel::bind_with_pump_wake(
+                    &wv.control_socket,
+                    pump_wake,
+                )
+                .map_err(|error| {
+                    VmmError::Device(format!(
+                        "bind restored vsock exec socket {}: {error}",
+                        wv.control_socket.display()
+                    ))
+                })?,
+            );
             let pty = pump
                 .as_ref()
                 .map(|_| crate::vsock_pty::VsockPtyChannel::new(device, pty_wake));
@@ -3880,6 +5030,12 @@ fn build_running_vm(
     kvm_vm.setup_cpuid(&vcpu)?;
     crate::vcpu_setup::restore_vcpu_full_state(&vcpu, restored.vcpu)?;
     kvm_vm.apply_cpu_template_msrs(&vcpu)?;
+    if let Err(error) = kvm_vm.notify_restored_clock(&vcpu) {
+        // KVM documents this as meaningful only for guests using kvm-clock;
+        // other clock sources may reject it. The notification is a watchdog
+        // safety hint, not a reason to discard an otherwise valid restore.
+        log::warn!("restored BSP clock notification unavailable: {error}");
+    }
     let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
 
     // SMP restore (phase B): recreate each AP (id 1..N) and re-apply its captured
@@ -3893,12 +5049,23 @@ fn build_running_vm(
         kvm_vm.apply_boot_cpuid(&ap, id)?;
         crate::vcpu_setup::restore_vcpu_full_state(&ap, ap_state)?;
         kvm_vm.apply_cpu_template_msrs(&ap)?;
+        if let Err(error) = kvm_vm.notify_restored_clock(&ap) {
+            log::warn!("restored AP {id} clock notification unavailable: {error}");
+        }
         ap_threads.push(VcpuThread::spawn(
             ap,
             kvm_vm.mmio_bus.clone(),
             serial.clone(),
         ));
     }
+
+    // Notify only after the restored vCPUs are live. Injecting a GED edge into
+    // a paused LAPIC can be lost, while injecting during early cold boot can
+    // reach a kernel whose interrupt handlers are not ready. The synchronous
+    // guest repair barrier still prevents workload admission until entropy is
+    // repaired, so there is no race with customer code here.
+    vmgenid.notify_after_restore()?;
+    irq_evts.push(vmgenid.into_eventfd());
 
     // The guest vCPU(s) are live again. Inject an RST for each connection that
     // was open at snapshot time so the guest's vsock layer tears the stale
@@ -3922,6 +5089,8 @@ fn build_running_vm(
         net_io_loops,
         blk_devices: blks,
         net_devices,
+        balloon_device,
+        balloon_irq_resample,
         taps,
         vsock_pump,
         vsock_exec,
@@ -3946,7 +5115,7 @@ struct WiredDevices {
         vmm_devices::bus::MmioRange,
         Box<dyn vmm_devices::bus::MmioDevice>,
     )>,
-    acpi_devices: Vec<(u64, u64, u32)>,
+    acpi_devices: Vec<(u64, u64, u32, bool)>,
     blks: Vec<Arc<vmm_devices::virtio::blk_transport::VirtioBlkMmio>>,
     blk_irq_evts: Vec<vmm_sys_util::eventfd::EventFd>,
     nets: Vec<WiredNet>,
@@ -3954,6 +5123,7 @@ struct WiredDevices {
     rng_irq: Option<(u32, vmm_sys_util::eventfd::EventFd)>,
     /// virtio-vsock exec device (pump + control-socket accept wired by caller).
     vsock: Option<WiredVsock>,
+    balloon: Option<WiredBalloon>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -3982,6 +5152,72 @@ struct WiredVsock {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+struct WiredBalloon {
+    device: Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>,
+    irq_evt: vmm_sys_util::eventfd::EventFd,
+    resample_evt: vmm_sys_util::eventfd::EventFd,
+    irq: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+pub struct BalloonIrqResample {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+impl BalloonIrqResample {
+    fn spawn(
+        device: Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>,
+        irq_evt: vmm_sys_util::eventfd::EventFd,
+        resample_evt: vmm_sys_util::eventfd::EventFd,
+    ) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("balloon-irq-resample".into())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Acquire) {
+                    let mut pollfd = libc::pollfd {
+                        fd: resample_evt.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // SAFETY: pollfd points to one initialized entry and the
+                    // thread owns the eventfd for its entire lifetime.
+                    let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+                    if ready <= 0 {
+                        continue;
+                    }
+                    let _ = resample_evt.read();
+                    if device.has_pending_interrupt() {
+                        let _ = irq_evt.write(1);
+                    }
+                }
+            })
+            .map_err(|error| VmmError::Kvm(format!("spawn balloon IRQ resample: {error}")))?;
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+impl Drop for BalloonIrqResample {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Result<WiredDevices> {
     use vmm_devices::bus::{MmioDevice, MmioRange};
     use vmm_devices::virtio::blk_transport::VirtioBlkMmio;
@@ -3993,7 +5229,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     let gm = mem.inner.clone();
     let host_dirty = mem.host_dirty_tracker();
     let mut devices: Vec<(MmioRange, Box<dyn MmioDevice>)> = Vec::new();
-    let mut acpi_devices: Vec<(u64, u64, u32)> = Vec::new();
+    let mut acpi_devices: Vec<(u64, u64, u32, bool)> = Vec::new();
     let mut blks: Vec<Arc<VirtioBlkMmio>> = Vec::new();
     let mut blk_irq_evts: Vec<vmm_sys_util::eventfd::EventFd> = Vec::new();
     let mut nets: Vec<WiredNet> = Vec::new();
@@ -4019,7 +5255,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
             MmioRange::new(mmio_base, 0x1000),
             Box::new(transport.clone()),
         ));
-        acpi_devices.push((mmio_base, 0x1000, irq));
+        acpi_devices.push((mmio_base, 0x1000, irq, true));
         blks.push(transport);
         blk_irq_evts.push(irq_evt);
         log::info!("volume {i}: {} at mmio 0x{mmio_base:x} irq {irq}", vol.path);
@@ -4048,7 +5284,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
                 .map_err(|e| VmmError::Kvm(format!("EventFd clone: {e}")))?,
         );
         devices.push((MmioRange::new(mmio_base, 0x1000), Box::new(dev.clone())));
-        acpi_devices.push((mmio_base, 0x1000, irq));
+        acpi_devices.push((mmio_base, 0x1000, irq, true));
         log::info!(
             "net {j}: tap={} mac={:02x?} at mmio 0x{mmio_base:x} irq {irq}",
             net.tap,
@@ -4083,7 +5319,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
             .map_err(|e| VmmError::Kvm(format!("EventFd clone: {e}")))?,
     );
     devices.push((MmioRange::new(rng_mmio, 0x1000), Box::new(rng_dev)));
-    acpi_devices.push((rng_mmio, 0x1000, rng_irq_num));
+    acpi_devices.push((rng_mmio, 0x1000, rng_irq_num, true));
     log::info!("virtio-rng at mmio 0x{rng_mmio:x} irq {rng_irq_num}");
 
     // virtio-vsock: the exec channel. Placed at the slot after rng. The guest
@@ -4095,7 +5331,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     let vsock_slot = rng_slot + 1;
     let vsock_irq = 5 + vsock_slot as u32;
     let vsock_mmio = MMIO_START + (vsock_slot as u64) * 0x1000;
-    let control_socket = unique_runtime_file_path("vmm-vsock", "sock")?;
+    let control_socket = unique_runtime_socket_path()?;
     let _ = std::fs::remove_file(&control_socket);
     let vsock_dev = Arc::new(VirtioVsockMmio::new(vsock_irq, VSOCK_GUEST_CID));
     vsock_dev.set_guest_memory(gm.clone());
@@ -4116,11 +5352,40 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         MmioRange::new(vsock_mmio, 0x1000),
         Box::new(vsock_dev.clone()),
     ));
-    acpi_devices.push((vsock_mmio, 0x1000, vsock_irq));
+    acpi_devices.push((vsock_mmio, 0x1000, vsock_irq, true));
     log::info!(
         "virtio-vsock at mmio 0x{vsock_mmio:x} irq {vsock_irq} guest_cid {VSOCK_GUEST_CID} → {}",
         control_socket.display()
     );
+
+    // Keep the established block/net/rng/vsock slots stable for snapshot
+    // compatibility. Balloon is appended after vsock and starts at target 0;
+    // the control API can change the target after boot.
+    use vmm_devices::virtio::balloon::VirtioBalloonMmio;
+    let balloon_slot = vsock_slot + 1;
+    let balloon_irq = 5 + balloon_slot as u32;
+    let balloon_mmio = MMIO_START + (balloon_slot as u64) * 0x1000;
+    let balloon_device = Arc::new(
+        VirtioBalloonMmio::new(balloon_irq, mem.clone(), 0)
+            .map_err(|error| VmmError::Device(format!("virtio-balloon: {error}")))?,
+    );
+    let balloon_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+        .map_err(|error| VmmError::Kvm(format!("balloon EventFd: {error}")))?;
+    let balloon_resample_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+        .map_err(|error| VmmError::Kvm(format!("balloon resample EventFd: {error}")))?;
+    balloon_device.set_irq_evt(
+        balloon_evt
+            .try_clone()
+            .map_err(|error| VmmError::Kvm(format!("balloon EventFd clone: {error}")))?,
+    );
+    devices.push((
+        MmioRange::new(balloon_mmio, 0x1000),
+        Box::new(balloon_device.clone()),
+    ));
+    // Virtio-mmio interrupts are active-high level interrupts. Balloon needs
+    // this particularly because config and used-ring causes can overlap.
+    acpi_devices.push((balloon_mmio, 0x1000, balloon_irq, false));
+    log::info!("virtio-balloon at mmio 0x{balloon_mmio:x} irq {balloon_irq}");
 
     Ok(WiredDevices {
         devices,
@@ -4136,6 +5401,12 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
             io_evt: vsock_io_evt,
             mmio_base: vsock_mmio,
             control_socket,
+        }),
+        balloon: Some(WiredBalloon {
+            device: balloon_device,
+            irq_evt: balloon_evt,
+            resample_evt: balloon_resample_evt,
+            irq: balloon_irq,
         }),
     })
 }
@@ -4216,7 +5487,7 @@ fn serialize_state_blob(
         vsock: None,
     };
 
-    postcard::to_allocvec(&blob).unwrap_or_default()
+    encode_state_blob(&blob, None).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -4281,6 +5552,51 @@ mod tests {
         .unwrap();
         assert_eq!(config.net[0].tap, "tap-new");
         assert_eq!(config.net[0].guest_ip.as_deref(), Some("10.0.0.3"));
+    }
+
+    #[test]
+    fn restore_inherited_volumes_require_exact_fresh_descriptors() {
+        let mut config = cfg();
+        config.volumes = vec![
+            VolumeConfig {
+                path: "/base/rootfs.ext4".into(),
+                read_only: false,
+                overlay: Some("/golden/rootfs.cow".into()),
+                inherited_fd: None,
+            },
+            VolumeConfig {
+                path: "volume:data".into(),
+                read_only: false,
+                overlay: None,
+                inherited_fd: Some(41),
+            },
+        ];
+
+        assert!(apply_restore_volume_override(&mut config.clone(), None).is_err());
+        assert!(apply_restore_volume_override(&mut config.clone(), Some(Vec::new())).is_err());
+        assert!(apply_restore_volume_override(
+            &mut config.clone(),
+            Some(vec![VolumeConfig {
+                path: "volume:other".into(),
+                read_only: false,
+                overlay: None,
+                inherited_fd: Some(52),
+            }])
+        )
+        .is_err());
+
+        apply_restore_volume_override(
+            &mut config,
+            Some(vec![VolumeConfig {
+                path: "volume:data".into(),
+                read_only: false,
+                overlay: None,
+                inherited_fd: Some(52),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(config.volumes[0].inherited_fd, None);
+        assert_eq!(config.volumes[1].inherited_fd, Some(52));
     }
 
     #[test]
@@ -4374,6 +5690,7 @@ mod tests {
             path: "/base/rootfs.ext4".into(),
             read_only: true,
             overlay: Some("/golden/rootfs.overlay".into()),
+            inherited_fd: None,
         }];
 
         assert_eq!(
@@ -4520,6 +5837,7 @@ mod tests {
             path: "/base/rootfs.ext4".into(),
             read_only: true,
             overlay: Some(missing_source.display().to_string()),
+            inherited_fd: None,
         }];
         let guard = prepare_restore_overlay(&config, target.to_str().unwrap())
             .expect("adopt the orchestrator-preseeded target");
@@ -4556,6 +5874,7 @@ mod tests {
             path: "/base/rootfs.ext4".into(),
             read_only: true,
             overlay: Some(golden.display().to_string()),
+            inherited_fd: None,
         }];
 
         let err = match prepare_restore_overlay(&config, golden.to_str().unwrap()) {
@@ -4577,6 +5896,7 @@ mod tests {
             path: "/base/rootfs.ext4".into(),
             read_only: false,
             overlay: None,
+            inherited_fd: None,
         }];
 
         apply_restore_overlay(&mut config, Some("/clones/b.overlay".into())).unwrap();
@@ -4691,6 +6011,88 @@ mod tests {
         assert_eq!(layout.mem_len, 2 * 4096);
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn streamed_live_memory_snapshot_preserves_layout_and_crc() {
+        use std::io::Write;
+
+        let dir = private_runtime_dir().unwrap();
+        let nonce = format!(
+            "streamed-live-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source_path = dir.join(format!("{nonce}-memory.raw"));
+        let output_path = dir.join(format!("{nonce}-snapshot.snap"));
+        let source = OwnedScratchFile::create_new(&source_path).unwrap();
+        let output = OwnedScratchFile::create_new(&output_path).unwrap();
+        let memory: Vec<u8> = (0..(2 * 1024 * 1024 + 37))
+            .map(|index| (index as u8).wrapping_mul(31))
+            .collect();
+        let state = b"coherent live state";
+        source
+            .file()
+            .try_clone()
+            .unwrap()
+            .write_all(&memory)
+            .unwrap();
+
+        let manifest = write_scratch_snapshot_file_from_memory_file(
+            &output,
+            state,
+            source.file(),
+            memory.len() as u64,
+            false,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&output_path).unwrap();
+        assert_eq!(&bytes[..4], b"VMSN");
+        let padded_state_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mem_offset = 32 + padded_state_len;
+        assert_eq!(
+            mem_offset % 4096,
+            0,
+            "live RAM extent must be range-reflink aligned"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            crc32fast::hash(&bytes[32..mem_offset])
+        );
+        assert_eq!(
+            u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+            memory.len() as u64
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            crc32fast::hash(&memory)
+        );
+        assert_eq!(&bytes[32..32 + state.len()], state);
+        assert!(bytes[32 + state.len()..mem_offset]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(&bytes[mem_offset..], memory);
+        let metadata = manifest
+            .artifact(tarit_proto::ArtifactKind::SnapshotMetadata)
+            .unwrap();
+        let ram = manifest.artifact(tarit_proto::ArtifactKind::Ram).unwrap();
+        assert_eq!(metadata.len, mem_offset as u64);
+        assert_eq!(ram.len, memory.len() as u64);
+        for (chunk, expected) in memory
+            .chunks(tarit_proto::INTEGRITY_CHUNK_SIZE as usize)
+            .zip(&ram.chunk_hashes)
+        {
+            use sha2::{Digest as _, Sha256};
+            assert_eq!(*expected, <[u8; 32]>::from(Sha256::digest(chunk)));
+        }
+
+        remove_owned_scratch_file(&source);
+        remove_owned_scratch_file(&output);
+    }
+
     #[test]
     fn suspend_image_path_is_process_local_and_private() {
         let path = PathBuf::from(unique_suspend_snapshot_path().unwrap());
@@ -4700,6 +6102,63 @@ mod tests {
         assert!(name.ends_with(".snap"));
         assert!(path.is_absolute());
         assert!(path.components().any(|c| c.as_os_str() == ".vmm-runtime"));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn state_blob_without_balloon_field_remains_decodable() {
+        #[derive(serde::Serialize)]
+        struct LegacyStateBlob {
+            entry: u64,
+            mem_size: u64,
+            vcpu: VcpuStateSave,
+            kernel_path: String,
+            cmdline: String,
+            vcpus: u64,
+            volumes: Vec<crate::config::VolumeConfig>,
+            net: Vec<crate::config::NetConfig>,
+            vcpu_full: Option<Vec<u8>>,
+            vcpu_full_aps: Vec<Vec<u8>>,
+            vm_full: Option<Vec<u8>>,
+            serial: vmm_devices::serial::SerialState,
+            virtio_blk: Vec<Vec<u8>>,
+            virtio_net: Vec<Vec<u8>>,
+            vsock: Option<vmm_devices::virtio::vsock::VirtioVsockMmioState>,
+        }
+
+        let bytes = postcard::to_allocvec(&LegacyStateBlob {
+            entry: 0x100000,
+            mem_size: 128 * crate::config::MIB,
+            vcpu: VcpuStateSave::default(),
+            kernel_path: "kernel".into(),
+            cmdline: "console=ttyS0".into(),
+            vcpus: 1,
+            volumes: Vec::new(),
+            net: Vec::new(),
+            vcpu_full: None,
+            vcpu_full_aps: Vec::new(),
+            vm_full: None,
+            serial: Default::default(),
+            virtio_blk: Vec::new(),
+            virtio_net: Vec::new(),
+            vsock: None,
+        })
+        .unwrap();
+        let (decoded, balloon) = decode_state_blob(&bytes).unwrap();
+        assert_eq!(decoded.kernel_path, "kernel");
+        assert!(balloon.is_none());
+        let mut zero_padded = bytes.clone();
+        zero_padded.resize(4096, 0);
+        let (decoded_padded, padded_balloon) = decode_state_blob(&zero_padded).unwrap();
+        assert_eq!(decoded_padded.kernel_path, "kernel");
+        assert!(padded_balloon.is_none());
+
+        let balloon_state = vmm_devices::virtio::balloon::VirtioBalloonMmioState::default();
+        let mut encoded = encode_state_blob(&decoded, Some(&balloon_state)).unwrap();
+        encoded.resize(4096, 0);
+        let (decoded_with_trailer, decoded_balloon) = decode_state_blob(&encoded).unwrap();
+        assert_eq!(decoded_with_trailer.kernel_path, "kernel");
+        assert_eq!(decoded_balloon, Some(balloon_state));
     }
 
     // Incremental diff-chain round trip. Boot-gated because it uses the
@@ -4837,4 +6296,16 @@ mod tests {
         let _ = std::fs::remove_file(base_s);
         let _ = std::fs::remove_file(diff_s);
     }
+}
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[test]
+fn vsock_runtime_path_fits_sockaddr_un() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = unique_runtime_socket_path().unwrap();
+    assert!(
+        path.as_os_str().as_bytes().len() < 108,
+        "{}",
+        path.display()
+    );
 }

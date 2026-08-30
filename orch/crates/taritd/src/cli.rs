@@ -101,6 +101,8 @@ pub enum ImageCommand {
     List,
     #[command(name = "rm", about = "Remove an unreferenced image")]
     Remove(ImageRemoveArgs),
+    #[command(about = "Reverify an admitted image against content and current provenance policy")]
+    Verify(ImageRemoveArgs),
     #[command(about = "Remove unreferenced images older than a threshold")]
     Gc(ImageGcArgs),
 }
@@ -155,7 +157,7 @@ pub struct VmSnapshotArgs {
 
 #[derive(Debug, Args)]
 pub struct RestoreArgs {
-    snapshot_path: PathBuf,
+    snapshot_id: Uuid,
 }
 
 #[derive(Debug, Args)]
@@ -421,12 +423,30 @@ fn image(command: ImageCommand, json_output: bool) -> Result<()> {
         ImageCommand::Build(args) => image_build(args, json_output),
         ImageCommand::List => image_list(json_output),
         ImageCommand::Remove(args) => image_remove(args, json_output),
+        ImageCommand::Verify(args) => image_verify(args, json_output),
         ImageCommand::Gc(args) => image_gc(args, json_output),
     }
 }
 
+fn image_verify(args: ImageRemoveArgs, json_output: bool) -> Result<()> {
+    let config = crate::image::LocalImageConfig::from_env()?;
+    let image_ref = crate::image::parse_image_ref(&args.name)?;
+    let image = crate::image::verify_registered_image(&config, &image_ref)?;
+    if json_output {
+        println!("{}", image_json(&image));
+    } else {
+        println!(
+            "verified {}:{} {}",
+            image.name,
+            image.tag,
+            image.source_digest.as_deref().unwrap_or("missing-digest")
+        );
+    }
+    Ok(())
+}
+
 fn image_build(args: ImageBuildArgs, json_output: bool) -> Result<()> {
-    let config = crate::image::LocalImageConfig::from_env();
+    let config = crate::image::LocalImageConfig::from_env()?;
     let image_ref = crate::image::parse_image_ref(&args.name)?;
     let image = crate::image::build_image(crate::image::BuildImageOptions {
         oci_ref: args.oci,
@@ -435,6 +455,7 @@ fn image_build(args: ImageBuildArgs, json_output: bool) -> Result<()> {
         vmm_agent: config.vmm_agent,
         db_path: config.db_path,
         images_dir: config.images_dir,
+        admission_policy: config.admission_policy,
     })?;
     if json_output {
         println!("{}", image_json(&image));
@@ -451,7 +472,7 @@ fn image_build(args: ImageBuildArgs, json_output: bool) -> Result<()> {
 }
 
 fn image_list(json_output: bool) -> Result<()> {
-    let config = crate::image::LocalImageConfig::from_env();
+    let config = crate::image::LocalImageConfig::from_env()?;
     let images = crate::image::list_images(&config)?;
     if json_output {
         let values = images.iter().map(image_json).collect::<Vec<_>>();
@@ -476,7 +497,7 @@ fn image_list(json_output: bool) -> Result<()> {
 }
 
 fn image_remove(args: ImageRemoveArgs, json_output: bool) -> Result<()> {
-    let config = crate::image::LocalImageConfig::from_env();
+    let config = crate::image::LocalImageConfig::from_env()?;
     let image_ref = crate::image::parse_image_ref(&args.name)?;
     let image = crate::image::remove_image(&config, &image_ref)?;
     if json_output {
@@ -488,7 +509,7 @@ fn image_remove(args: ImageRemoveArgs, json_output: bool) -> Result<()> {
 }
 
 fn image_gc(args: ImageGcArgs, json_output: bool) -> Result<()> {
-    let config = crate::image::LocalImageConfig::from_env();
+    let config = crate::image::LocalImageConfig::from_env()?;
     let plan = crate::image::gc_images(
         &config,
         args.older_than_days,
@@ -595,7 +616,7 @@ async fn restore(client: &ClientConfig, args: RestoreArgs) -> Result<()> {
         .json(
             Method::POST,
             "/v1/restore",
-            Some(json!({ "snapshot_path": args.snapshot_path.to_string_lossy() })),
+            Some(json!({ "snapshot_id": args.snapshot_id })),
         )
         .await?;
     if client.json {
@@ -859,6 +880,11 @@ fn image_json(image: &tarit_store::ImageRecord) -> Value {
         "created_at": image.created_at,
         "size_bytes": image.size_bytes,
         "source_ref": image.source_ref,
+        "source_digest": image.source_digest,
+        "rootfs_digest": image.rootfs_digest,
+        "agent_digest": image.agent_digest,
+        "provenance_key_digest": image.provenance_key_digest,
+        "provenance_verified_at": image.provenance_verified_at,
         "golden_snapshot_path": image.golden_snapshot_path,
     })
 }

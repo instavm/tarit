@@ -7,6 +7,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::dirty::SoftwareDirtyBitmap;
+use sha2::{Digest, Sha256};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use thiserror::Error;
 
@@ -32,6 +33,121 @@ pub struct LazyRestore {
     handler_thread: Option<std::thread::JoinHandle<()>>,
     pages_served: std::sync::Arc<std::sync::atomic::AtomicU64>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    page_discard: LazyPageDiscard,
+}
+
+/// Coordinates an intentional guest-page discard with the UFFD fault handler.
+/// Without this fence a later missing-page fault would resurrect snapshot data
+/// that virtio-balloon had explicitly returned to the host.
+#[derive(Clone)]
+pub struct LazyPageDiscard {
+    guest_base: usize,
+    guest_len: usize,
+    discarded_pages: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    // Excludes MADV_DONTNEED while a host-side snapshot reader is walking the
+    // UFFD-backed range. The fault handler intentionally does not take this
+    // fence: it must always remain able to resolve the snapshot reader's
+    // missing-page fault.
+    snapshot_fence: std::sync::Arc<std::sync::RwLock<()>>,
+}
+
+impl LazyPageDiscard {
+    pub fn snapshot_fence(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
+        self.snapshot_fence.clone()
+    }
+
+    pub fn discard(&self, offset: usize, len: usize) -> Result<(), UffdRestoreError> {
+        const PAGE_SIZE: usize = 4096;
+        if len == 0
+            || !offset.is_multiple_of(PAGE_SIZE)
+            || !len.is_multiple_of(PAGE_SIZE)
+            || offset
+                .checked_add(len)
+                .is_none_or(|end| end > self.guest_len)
+        {
+            return Err(UffdRestoreError::Uffd(
+                "discard range must be non-empty, page-aligned, and inside guest memory".into(),
+            ));
+        }
+        let _snapshot_exclusion = self
+            .snapshot_fence
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut discarded = self
+            .discarded_pages
+            .lock()
+            .map_err(|_| UffdRestoreError::Uffd("discard bitmap lock poisoned".into()))?;
+        let page_range = offset / PAGE_SIZE..(offset + len) / PAGE_SIZE;
+        for page in page_range.clone() {
+            discarded[page] = true;
+        }
+        // Do not hold the bitmap mutex through MADV_DONTNEED. More
+        // importantly, never madvise a missing page: the kernel call may wait
+        // for its UFFD fault while the handler is concurrently resolving that
+        // same range. Missing pages already consume no resident RAM and the
+        // bitmap makes their eventual fault resolve to zero. `mincore` lets us
+        // reclaim only pages that are presently resident.
+        //
+        // * copy first -> discard marks and removes the copied page;
+        // * discard first -> the handler observes the bit and copies zeroes.
+        //
+        // A failed madvise deliberately leaves the bit set. Rolling it back
+        // could resurrect snapshot bytes on a later fault after the guest has
+        // already relinquished the page.
+        drop(discarded);
+        let address = self
+            .guest_base
+            .checked_add(offset)
+            .ok_or_else(|| UffdRestoreError::Uffd("discard address overflows".into()))?;
+        for page_offset in (0..len).step_by(PAGE_SIZE) {
+            let page_address = address
+                .checked_add(page_offset)
+                .ok_or_else(|| UffdRestoreError::Uffd("discard page overflows".into()))?;
+            let mut residency = 0u8;
+            // SAFETY: this page-aligned page is inside the validated live mmap;
+            // mincore writes exactly one residency byte for one page.
+            let rc = unsafe {
+                libc::mincore(page_address as *mut libc::c_void, PAGE_SIZE, &mut residency)
+            };
+            if rc < 0 {
+                return Err(UffdRestoreError::Uffd(format!(
+                    "mincore before balloon discard: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if residency & 1 == 0 {
+                continue;
+            }
+            // SAFETY: the resident page is inside the guest mmap. Missing
+            // pages are skipped above, preventing a UFFD/madvise wait cycle.
+            let rc = unsafe {
+                libc::madvise(
+                    page_address as *mut libc::c_void,
+                    PAGE_SIZE,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if rc < 0 {
+                return Err(UffdRestoreError::Uffd(format!(
+                    "madvise balloon discard: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LazyRestore {
+    pub fn page_discard(&self) -> LazyPageDiscard {
+        self.page_discard.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkIntegrity {
+    pub chunk_size: usize,
+    pub chunk_hashes: Vec<[u8; 32]>,
 }
 
 // SAFETY: `LazyRestore` owns the UFFD fd and mmap lifetime, and the raw mmap
@@ -93,7 +209,11 @@ const UFFDIO: u8 = 0xAA;
 const UFFDIO_API: u32 = iowr(UFFDIO, 0x3F, std::mem::size_of::<UffdioApi>());
 const UFFDIO_REGISTER: u32 = iowr(UFFDIO, 0x00, std::mem::size_of::<UffdioRegister>());
 const UFFDIO_COPY: u32 = iowr(UFFDIO, 0x03, std::mem::size_of::<UffdioCopy>());
-const UFFD_FEATURE_MISSING: u64 = 1;
+// Ask the kernel to report MADV_DONTNEED/MADV_REMOVE operations. A pending
+// REMOVE event makes UFFDIO_COPY return EAGAIN, so a production handler must
+// drain these events and retry deferred faults rather than losing the fault and
+// hanging the caller forever.
+const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
 
 #[repr(C)]
@@ -135,10 +255,13 @@ struct UffdioApi {
 const UFFD_MSG_SIZE: usize = 32;
 const UFFD_MSG_EVENT_OFFSET: usize = 0;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
+const UFFD_EVENT_REMOVE: u8 = 0x15;
 /// Absolute byte offset of `arg.pagefault.address` within the 32-byte
 /// `uffd_msg`: event at 0, the arg union at 8, `pagefault.flags` at 8, and
 /// `pagefault.address` at 16.
 const UFFD_PAGEFAULT_ADDRESS_OFFSET: usize = 16;
+const UFFD_REMOVE_START_OFFSET: usize = 8;
+const UFFD_REMOVE_END_OFFSET: usize = 16;
 
 pub fn start_lazy_restore(
     guest_mem_ptr: *mut u8,
@@ -147,6 +270,26 @@ pub fn start_lazy_restore(
     snapshot_offset: u64,
     snapshot_len: u64,
     host_dirty: Option<SoftwareDirtyBitmap>,
+) -> Result<LazyRestore, UffdRestoreError> {
+    start_lazy_restore_with_integrity(
+        guest_mem_ptr,
+        guest_mem_len,
+        snapshot_file,
+        snapshot_offset,
+        snapshot_len,
+        host_dirty,
+        None,
+    )
+}
+
+pub fn start_lazy_restore_with_integrity(
+    guest_mem_ptr: *mut u8,
+    guest_mem_len: usize,
+    snapshot_file: &std::fs::File,
+    snapshot_offset: u64,
+    snapshot_len: u64,
+    host_dirty: Option<SoftwareDirtyBitmap>,
+    chunk_integrity: Option<ChunkIntegrity>,
 ) -> Result<LazyRestore, UffdRestoreError> {
     if guest_mem_ptr.is_null() || guest_mem_len == 0 {
         return Err(UffdRestoreError::Uffd("guest memory range is empty".into()));
@@ -172,6 +315,12 @@ pub fn start_lazy_restore(
 
     let pages_served = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let discarded_pages = std::sync::Arc::new(std::sync::Mutex::new(vec![
+        false;
+        guest_mem_len
+            .div_ceil(4096)
+    ]));
+    let snapshot_fence = std::sync::Arc::new(std::sync::RwLock::new(()));
 
     // 1. mmap the snapshot file read-only.
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no memory-safety preconditions and
@@ -189,6 +338,23 @@ pub fn start_lazy_restore(
         return Err(UffdRestoreError::Uffd(format!(
             "guest memory range must be page-aligned: ptr={guest_mem_ptr:p} len={guest_mem_len}"
         )));
+    }
+    if let Some(integrity) = chunk_integrity.as_ref() {
+        if integrity.chunk_size < page_size_usize
+            || !integrity.chunk_size.is_power_of_two()
+            || !integrity.chunk_size.is_multiple_of(page_size_usize)
+        {
+            return Err(UffdRestoreError::Uffd(
+                "integrity chunk size must be a page-aligned power of two".into(),
+            ));
+        }
+        let expected_chunks = guest_mem_len.div_ceil(integrity.chunk_size);
+        if integrity.chunk_hashes.len() != expected_chunks {
+            return Err(UffdRestoreError::Uffd(format!(
+                "integrity manifest has {} chunks, expected {expected_chunks}",
+                integrity.chunk_hashes.len()
+            )));
+        }
     }
 
     let snapshot_mmap_offset = snapshot_offset / page_size * page_size;
@@ -245,7 +411,7 @@ pub fn start_lazy_restore(
     // 3. UFFDIO_API.
     let mut api = UffdioApi {
         api: UFFD_API,
-        features: UFFD_FEATURE_MISSING,
+        features: UFFD_FEATURE_EVENT_REMOVE,
         ioctls: 0,
     };
     // SAFETY: `uffd_fd` is a valid userfaultfd and `api` points to an initialized
@@ -291,16 +457,19 @@ pub fn start_lazy_restore(
     let snapshot_len_clone = snapshot_payload_len;
     let pages_clone = pages_served.clone();
     let shutdown_clone = shutdown.clone();
+    let handler_discarded_pages = discarded_pages.clone();
     let handler_thread = std::thread::spawn(move || {
-        fault_handler_loop(
+        fault_handler_loop(FaultHandlerContext {
             uffd_fd_raw,
-            snapshot_ptr_val as *const u8,
-            snapshot_len_clone,
-            guest_base_val,
-            pages_clone,
-            shutdown_clone,
+            snapshot_ptr: snapshot_ptr_val,
+            snapshot_len: snapshot_len_clone,
+            guest_base: guest_base_val,
+            pages_served: pages_clone,
+            shutdown: shutdown_clone,
             host_dirty,
-        );
+            chunk_integrity,
+            discarded_pages: handler_discarded_pages,
+        });
     });
 
     log::info!("UFFD lazy restore started: {guest_mem_len} bytes registered");
@@ -312,6 +481,12 @@ pub fn start_lazy_restore(
         handler_thread: Some(handler_thread),
         pages_served,
         shutdown,
+        page_discard: LazyPageDiscard {
+            guest_base: guest_mem_ptr as usize,
+            guest_len: guest_mem_len,
+            discarded_pages,
+            snapshot_fence,
+        },
     })
 }
 
@@ -361,16 +536,33 @@ pub fn madvise_dontneed(
     Ok(())
 }
 
-fn fault_handler_loop(
-    uffd_fd: RawFd,
-    snapshot_ptr: *const u8,
+struct FaultHandlerContext {
+    uffd_fd_raw: RawFd,
+    snapshot_ptr: usize,
     snapshot_len: usize,
     guest_base: usize,
     pages_served: std::sync::Arc<std::sync::atomic::AtomicU64>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     host_dirty: Option<SoftwareDirtyBitmap>,
-) {
+    chunk_integrity: Option<ChunkIntegrity>,
+    discarded_pages: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+fn fault_handler_loop(context: FaultHandlerContext) {
     const PAGE_SIZE: usize = 4096;
+    let FaultHandlerContext {
+        uffd_fd_raw: uffd_fd,
+        snapshot_ptr,
+        snapshot_len,
+        guest_base,
+        pages_served,
+        shutdown,
+        host_dirty,
+        chunk_integrity,
+        discarded_pages,
+    } = context;
+    let snapshot_ptr = snapshot_ptr as *const u8;
+    let mut pending_faults = std::collections::VecDeque::<u64>::new();
 
     loop {
         // Check shutdown flag first.
@@ -378,9 +570,10 @@ fn fault_handler_loop(
             break;
         }
 
-        let mut msg_buf = [0u8; UFFD_MSG_SIZE];
-
-        // Use poll with a 500ms timeout so we can check shutdown flag.
+        // Drain every currently queued event before issuing UFFDIO_COPY. Linux
+        // returns EAGAIN from all UFFD ioctls while a REMOVE event is pending;
+        // servicing a pagefault before draining the causally related REMOVE is
+        // therefore both incorrect and capable of hanging the faulting thread.
         let mut pfd = libc::pollfd {
             fd: uffd_fd,
             events: libc::POLLIN,
@@ -388,42 +581,89 @@ fn fault_handler_loop(
         };
         // SAFETY: `pfd` points to one initialized `pollfd`; the kernel only
         // writes within that single element during the call.
-        let prc = unsafe { libc::poll(&mut pfd, 1, 500) };
+        let timeout_ms = if pending_faults.is_empty() { 500 } else { 0 };
+        let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if prc <= 0 {
             if prc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            continue; // timeout — loop back, check shutdown
+            if pending_faults.is_empty() {
+                continue; // timeout — loop back, check shutdown
+            }
         }
         if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
             break; // fd closed — exit
         }
+        if prc > 0 && pfd.revents & libc::POLLIN != 0 {
+            loop {
+                let mut msg_buf = [0u8; UFFD_MSG_SIZE];
+                // SAFETY: the UFFD is nonblocking and `msg_buf` is exactly one
+                // kernel `uffd_msg`; repeated reads drain the ready queue.
+                let n = unsafe { libc::read(uffd_fd, msg_buf.as_mut_ptr().cast(), UFFD_MSG_SIZE) };
+                if n < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EAGAIN) {
+                        break;
+                    }
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    log::error!("userfaultfd read failed: {error}");
+                    return;
+                }
+                if n == 0 {
+                    return;
+                }
+                if n as usize != UFFD_MSG_SIZE {
+                    log::error!("partial userfaultfd read: {n} of {UFFD_MSG_SIZE} bytes");
+                    return;
+                }
 
-        // SAFETY: `msg_buf` is a valid writable buffer of `UFFD_MSG_SIZE`
-        // bytes and `uffd_fd` is polled readable before attempting the read.
-        let n = unsafe { libc::read(uffd_fd, msg_buf.as_mut_ptr() as *mut _, UFFD_MSG_SIZE) };
-
-        if n <= 0 {
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
-                continue;
+                match msg_buf[UFFD_MSG_EVENT_OFFSET] {
+                    UFFD_EVENT_PAGEFAULT => {
+                        let mut bytes = [0u8; 8];
+                        bytes.copy_from_slice(
+                            &msg_buf
+                                [UFFD_PAGEFAULT_ADDRESS_OFFSET..UFFD_PAGEFAULT_ADDRESS_OFFSET + 8],
+                        );
+                        pending_faults.push_back(u64::from_ne_bytes(bytes));
+                    }
+                    UFFD_EVENT_REMOVE => {
+                        // Drain REMOVE before retrying UFFDIO_COPY, but do not
+                        // infer zero-on-refault from the kernel event alone.
+                        // Tarit uses MADV_DONTNEED both for balloon discard
+                        // (zero semantics, explicitly pre-marked by
+                        // LazyPageDiscard) and for suspend eviction (rehydrate
+                        // from the new image). Conflating them corrupts every
+                        // suspended guest by restoring all-zero RAM.
+                        let mut start_bytes = [0u8; 8];
+                        let mut end_bytes = [0u8; 8];
+                        start_bytes.copy_from_slice(
+                            &msg_buf[UFFD_REMOVE_START_OFFSET..UFFD_REMOVE_START_OFFSET + 8],
+                        );
+                        end_bytes.copy_from_slice(
+                            &msg_buf[UFFD_REMOVE_END_OFFSET..UFFD_REMOVE_END_OFFSET + 8],
+                        );
+                        let start = u64::from_ne_bytes(start_bytes) as usize;
+                        let end = u64::from_ne_bytes(end_bytes) as usize;
+                        let Some(guest_end) = guest_base.checked_add(snapshot_len) else {
+                            log::error!("UFFD guest range overflow while handling REMOVE");
+                            return;
+                        };
+                        if start >= end || start < guest_base || end > guest_end {
+                            log::warn!(
+                                "UFFD REMOVE range 0x{start:x}..0x{end:x} outside guest memory"
+                            );
+                        }
+                    }
+                    event => log::warn!("unexpected userfaultfd event 0x{event:02x}"),
+                }
             }
-            break;
-        }
-        if n as usize != UFFD_MSG_SIZE {
-            log::warn!("partial userfaultfd read: {n} of {UFFD_MSG_SIZE} bytes");
-            continue;
         }
 
-        // Only pagefault events carry a fault address; skip anything else
-        // (fork/remap/unmap events) rather than misparsing it as an address.
-        if msg_buf[UFFD_MSG_EVENT_OFFSET] != UFFD_EVENT_PAGEFAULT {
+        let Some(fault_addr) = pending_faults.pop_front() else {
             continue;
-        }
-        let mut fault_addr_bytes = [0u8; 8];
-        fault_addr_bytes.copy_from_slice(
-            &msg_buf[UFFD_PAGEFAULT_ADDRESS_OFFSET..UFFD_PAGEFAULT_ADDRESS_OFFSET + 8],
-        );
-        let fault_addr = u64::from_le_bytes(fault_addr_bytes);
+        };
 
         // UFFDIO_COPY requires a page-aligned destination. Align the faulting
         // address down to its page, source the matching page from the snapshot
@@ -442,17 +682,23 @@ fn fault_handler_loop(
         }
         let guest_offset = fault_addr_usize - guest_base;
         let page_offset = guest_offset & !(PAGE_SIZE - 1);
-        let Some(page_end) = page_offset.checked_add(PAGE_SIZE) else {
-            log::warn!("UFFD page offset overflows: 0x{page_offset:x}");
+        let copy_offset = chunk_integrity.as_ref().map_or(page_offset, |integrity| {
+            page_offset & !(integrity.chunk_size - 1)
+        });
+        let copy_len = chunk_integrity.as_ref().map_or(PAGE_SIZE, |integrity| {
+            integrity.chunk_size.min(snapshot_len - copy_offset)
+        });
+        let Some(copy_end) = copy_offset.checked_add(copy_len) else {
+            log::warn!("UFFD copy offset overflows: 0x{copy_offset:x}");
             continue;
         };
-        if page_end > snapshot_len {
-            log::warn!("UFFD page offset 0x{page_offset:x} beyond snapshot length {snapshot_len}");
+        if copy_end > snapshot_len || !copy_len.is_multiple_of(PAGE_SIZE) {
+            log::warn!("UFFD copy range 0x{copy_offset:x}..0x{copy_end:x} is invalid");
             continue;
         }
-        let Some(dst_usize) = guest_base.checked_add(page_offset) else {
+        let Some(dst_usize) = guest_base.checked_add(copy_offset) else {
             log::warn!(
-                "UFFD destination address overflows: base=0x{guest_base:x} page=0x{page_offset:x}"
+                "UFFD destination address overflows: base=0x{guest_base:x} offset=0x{copy_offset:x}"
             );
             continue;
         };
@@ -460,28 +706,138 @@ fn fault_handler_loop(
             log::warn!("UFFD destination address 0x{dst_usize:x} overflows u64");
             continue;
         };
-        // SAFETY: `page_offset..page_offset + PAGE_SIZE` was checked to be
-        // within the snapshot mapping, and `snapshot_ptr` points at its payload.
-        let src = unsafe { snapshot_ptr.add(page_offset) };
+        // A discard racing a fault must either happen after this copy (and
+        // madvise it away), or be reflected as zeroes in the bytes below.
+        let discarded = match discarded_pages.lock() {
+            Ok(discarded) => discarded,
+            Err(_) => {
+                log::error!("UFFD discard bitmap lock poisoned");
+                break;
+            }
+        };
+
+        // Authenticated restores copy the complete chunk into private memory,
+        // hash those stable bytes, and only then hand that same buffer to the
+        // kernel. This closes the mmap hash/copy TOCTOU and amortizes one
+        // verification across every page prefetched by UFFDIO_COPY.
+        let mut owned_chunk = chunk_integrity.as_ref().map(|integrity| {
+            // SAFETY: the checked copy range is inside the read-only mapping.
+            let source =
+                unsafe { std::slice::from_raw_parts(snapshot_ptr.add(copy_offset), copy_len) };
+            let bytes = source.to_vec();
+            let chunk_index = copy_offset / integrity.chunk_size;
+            if !chunk_sha256_matches(&bytes, &integrity.chunk_hashes[chunk_index]) {
+                eprintln!(
+                    "SECURITY: snapshot integrity failure at chunk {chunk_index} (offset 0x{copy_offset:x}); terminating VMM"
+                );
+                log::error!(
+                    "snapshot integrity failure at chunk {chunk_index} (offset 0x{copy_offset:x})"
+                );
+                // There is no safe byte sequence with which to resolve this
+                // fault. Terminate the compromised VMM rather than hang a vCPU
+                // or let unverified state execute.
+                // SAFETY: `_exit` terminates the current VMM process without
+                // running destructors; the orchestrator reconciles the exit.
+                unsafe { libc::_exit(78) }
+            }
+            bytes
+        });
+        let first_page = copy_offset / PAGE_SIZE;
+        let page_count = copy_len / PAGE_SIZE;
+        let has_discarded_page = (first_page..first_page + page_count)
+            .any(|page| discarded.get(page).copied().unwrap_or(false));
+        if has_discarded_page {
+            let bytes = owned_chunk.get_or_insert_with(|| {
+                // SAFETY: the checked copy range is inside the read-only
+                // snapshot mapping and is copied before the mapping can drop.
+                unsafe { std::slice::from_raw_parts(snapshot_ptr.add(copy_offset), copy_len) }
+                    .to_vec()
+            });
+            for relative_page in 0..page_count {
+                if discarded
+                    .get(first_page + relative_page)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    let start = relative_page * PAGE_SIZE;
+                    bytes[start..start + PAGE_SIZE].fill(0);
+                }
+            }
+        }
+        // SAFETY: the checked copy range is inside the read-only mapping. For
+        // authenticated restores the owned Vec remains live through ioctl.
+        let src = owned_chunk.as_ref().map_or_else(
+            || unsafe { snapshot_ptr.add(copy_offset) },
+            |bytes| bytes.as_ptr(),
+        );
 
         let copy = UffdioCopy {
             dst,
             src: src as u64,
-            len: PAGE_SIZE as u64,
+            len: copy_len as u64,
             mode: 0,
             copy: 0,
         };
 
         // SAFETY: `copy` references a page-aligned destination inside the
         // registered guest range and a page inside the read-only snapshot mmap.
-        let rc = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY as _, &copy) };
+        let mut rc = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY as _, &copy) };
+        let mut resolved_offset = copy_offset;
+        let mut resolved_len = copy_len;
+        if rc < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+            && copy_len > PAGE_SIZE
+        {
+            // Chunk prefetch is an optimization, not an atomic replacement of
+            // mixed-residency memory. If any page in the chunk already exists,
+            // Linux rejects the whole UFFDIO_COPY with EEXIST and leaves the
+            // actual missing page blocked. The full chunk has already been
+            // authenticated above, so safely fall back to copying only the
+            // faulting page from those same verified bytes.
+            let fallback_src = unsafe { src.add(page_offset - copy_offset) };
+            let fallback = UffdioCopy {
+                dst: (guest_base + page_offset) as u64,
+                src: fallback_src as u64,
+                len: PAGE_SIZE as u64,
+                mode: 0,
+                copy: 0,
+            };
+            // SAFETY: fallback covers exactly the page containing the checked
+            // fault address, and its source is within the verified chunk.
+            rc = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY as _, &fallback) };
+            resolved_offset = page_offset;
+            resolved_len = PAGE_SIZE;
+        }
         if rc < 0 {
-            log::warn!("UFFDIO_COPY failed at 0x{fault_addr:x}");
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                // A REMOVE event raced the queue drain. Preserve the fault and
+                // retry only after the next iteration drains that event.
+                Some(libc::EAGAIN) => pending_faults.push_back(fault_addr),
+                // Another fault for the prefetched chunk may have populated
+                // this page already; the blocked access is no longer pending.
+                Some(libc::EEXIST) => {}
+                // Dropping an unresolved fault would hang the vCPU/control
+                // thread forever. Fail closed so the orchestrator can reap and
+                // retry the VM instead of leaving an immortal half-VM.
+                _ => {
+                    eprintln!(
+                        "SECURITY: unrecoverable UFFDIO_COPY failure at 0x{fault_addr:x}: {error}"
+                    );
+                    log::error!("UFFDIO_COPY failed at 0x{fault_addr:x}: {error}");
+                    // SAFETY: unresolved UFFD faults cannot be recovered by
+                    // this handler; immediate process exit avoids deadlock.
+                    unsafe { libc::_exit(78) }
+                }
+            }
         } else {
             if let Some(dirty) = host_dirty.as_ref() {
-                dirty.mark_range(page_offset as u64, PAGE_SIZE as u64);
+                dirty.mark_range(resolved_offset as u64, resolved_len as u64);
             }
-            pages_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            pages_served.fetch_add(
+                (resolved_len / PAGE_SIZE) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -491,9 +847,95 @@ fn fault_handler_loop(
     );
 }
 
+fn chunk_sha256_matches(bytes: &[u8], expected: &[u8; 32]) -> bool {
+    let actual: [u8; 32] = Sha256::digest(bytes).into();
+    actual == *expected
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    #[test]
+    fn authenticated_chunk_rejects_single_byte_corruption() {
+        let original = vec![0x5a; 64 * 1024];
+        let expected: [u8; 32] = Sha256::digest(&original).into();
+        assert!(chunk_sha256_matches(&original, &expected));
+        let mut corrupted = original;
+        corrupted[32 * 1024] ^= 1;
+        assert!(!chunk_sha256_matches(&corrupted, &expected));
+    }
+
+    #[test]
+    fn discarded_lazy_page_is_zero_and_never_resurrected_by_chunk_prefetch() {
+        const PAGE: usize = 4096;
+        const LEN: usize = PAGE * 2;
+        let path = std::env::temp_dir().join(format!(
+            "tarit-uffd-discard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let snapshot = vec![0x5a; LEN];
+        file.write_all(&snapshot).unwrap();
+        file.sync_all().unwrap();
+
+        // SAFETY: this creates one private, page-aligned anonymous mapping,
+        // checked against MAP_FAILED and unmapped exactly once below.
+        let guest = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest, libc::MAP_FAILED);
+        let hash: [u8; 32] = Sha256::digest(&snapshot).into();
+        let lazy = start_lazy_restore_with_integrity(
+            guest.cast(),
+            LEN,
+            &file,
+            0,
+            LEN as u64,
+            None,
+            Some(ChunkIntegrity {
+                chunk_size: LEN,
+                chunk_hashes: vec![hash],
+            }),
+        )
+        .unwrap();
+        // Faulting page zero prefetches the authenticated two-page chunk, then
+        // discard a now-resident page. MADV_DONTNEED queues UFFD_EVENT_REMOVE;
+        // the following refault proves that the handler drains REMOVE, retries
+        // any EAGAIN-deferred PAGEFAULT, and returns zero rather than hanging or
+        // resurrecting snapshot bytes.
+        // SAFETY: `guest` remains mapped and UFFD-registered for both reads.
+        let first = unsafe { std::ptr::read_volatile(guest.cast::<u8>()) };
+        lazy.page_discard().discard(PAGE, PAGE).unwrap();
+        let second = unsafe { std::ptr::read_volatile(guest.cast::<u8>().add(PAGE)) };
+        assert_eq!(first, 0x5a);
+        assert_eq!(second, 0);
+
+        drop(lazy);
+        // SAFETY: `guest` is the live mapping returned above and has not yet
+        // been unmapped.
+        assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn uffdio_api_constant_matches_kernel() {

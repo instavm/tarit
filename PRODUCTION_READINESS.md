@@ -70,20 +70,35 @@ not executed on the persistent privileged runner.
 
 ## Stop-ship items
 
-1. Move peer routes to a separate listener with mandatory mTLS, certificate
-   rotation, and host-session fencing. Heartbeat rows currently identify a host
-   by a reusable string rather than an authenticated boot/session lease.
-2. Replace public snapshot paths and host ids with opaque artifact handles backed
-   by durable, authenticated storage and a fleet-wide artifact index. Add
-   cryptographic measurements or fs-verity/Merkle metadata so lazy restore can
-   avoid a full memory scan without weakening integrity.
-3. Replicate kernels, rootfs images, snapshots, and required guest-agent
-   artifacts across failure domains; node-local paths are not an HA substrate.
-4. Resolve images to immutable digests and enforce signature/provenance policy
-   before admission. Mutable OCI tags are insufficient for production rollout
-   or rollback guarantees.
+The earlier peer-mTLS/session-fencing, opaque authenticated artifact,
+cross-node replication, and immutable signed-image stop-ships now have focused
+implementation and c8i evidence recorded in the September roadmap. They remain
+regression gates, but the following unresolved items now block release:
+
+1. Implement a real clone-generation notification (VMGenID or an equally
+   strong mechanism) before cloned vCPUs resume, plus a mandatory userspace
+   post-fork repair/readiness barrier. A fresh virtio-rng device and clock jump
+   do not invalidate cloned kernel/userspace PRNG state, cached nonces, tokens,
+   or sessions.
+2. Pass phase-by-phase kill, cancellation, dirty-rate non-convergence, UFFD
+   handler death, corruption, and near-ENOSPC rollback tests without source
+   pause leaks, duplicate writers, terminal-ID resurrection, or staged files;
+   the fixed vCPU MSR omission is repaired, but the dynamic KVM custom-MSR set
+   still needs the cross-kernel/build pvclock, PV-EOI, steal-time, and async-PF
+   enabled/disabled compatibility matrix.
+3. Qualify shared/cloud volume durability and failure recovery, including NFS
+   server loss/restart with protected transport and object-store interruption,
+   rather than extrapolating from local-block tests.
+4. Extend the now-passing c8i stable-seed lifecycle matrix into a sustained
+   balloon-after-restore kernel-liveness soak, complete the cross-build/
+   CPU-template rejection matrix, and record 100-sample fork/snapshot/restore
+   latency distributions on a larger reflink-capable fixture.
+5. Run the full protected release workflow from an immutable source revision
+   and retain its binaries, hashes, configuration, logs, and cleanup audit.
 
 These are security or correctness boundaries, not optional roadmap features.
+The source-derived threat and regression map is
+[`docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md`](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md).
 
 ## PaaS capability gaps (non-billing)
 

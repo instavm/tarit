@@ -37,6 +37,8 @@ and `create` commands offer that install when `--kernel` is omitted.
 - Restore with optional CoW overlays for clone-style workflows.
 - Guest exec and interactive PTY through the guest agent and vsock path.
 - Host TAP backed virtio-net plus live egress rule updates.
+- Virtio-balloon memory reclaim with bounded guest requests and snapshot/restore
+  state preservation.
 - Jailer, cgroup, network namespace, uid, gid, and cpuset confinement flags.
 - OCI image pull and ext4 conversion with optional guest agent injection.
 
@@ -58,5 +60,4 @@ and `create` commands offer that install when `--kernel` is omitted.
 
 - Running guests requires x86_64 Linux with KVM. macOS is useful for development and non-KVM checks only.
 - aarch64 guest boot is not implemented.
-- virtio-balloon is not implemented.
 - The API is local UDS framing, not REST or HTTP.

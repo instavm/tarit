@@ -26,6 +26,7 @@ env_logger = "0.10"
 
 [features]
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vmm-core", "dep:vmm-snapshot", "dep:postcard", "dep:vmm-migration", "vmm-core/kvm", "vmm-core/boot"]
+test-failpoints = ["vmm-core/test-failpoints"]
 
 [[test]]
 name = "boot_smoke"

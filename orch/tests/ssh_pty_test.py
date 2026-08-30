@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Drive `ssh` through a real PTY to test the taritd SSH gateway interactively.
+"""Drive `ssh` through a real PTY to test the taritd SSH gateway.
 
-Emulates an actual terminal (real winsize, interactive session) instead of a
-piped/batch stdin, which is the real use case for `ssh vm_id@gateway`.
+Emulates an actual terminal and sends an SSH exec request. Command mode avoids
+depending on a particular guest shell prompt while still exercising Tarit's
+authenticated SSH-to-guest-PTY bridge.
 
 Usage: ssh_pty_test.py KEYFILE PORT VM_ID HOST
 """
@@ -24,8 +25,9 @@ def main() -> int:
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "PreferredAuthentications=publickey",
         "-o", "IdentitiesOnly=yes",
-        "-o", "LogLevel=ERROR",
+        "-o", "LogLevel=VERBOSE",
         f"{user}@{host}",
+        "echo SSH_GW_OK_MARK; id -u",
     ]
 
     pid, fd = pty.fork()
@@ -39,7 +41,7 @@ def main() -> int:
         os._exit(127)
 
     out = b""
-    sent = False
+    sent = True
     deadline = time.time() + 30
     while time.time() < deadline:
         r, _, _ = select.select([fd], [], [], 0.5)
@@ -58,9 +60,23 @@ def main() -> int:
             os.write(fd, b"echo SSH_GW_OK_MARK; id -u; exit\n")
             sent = True
 
+    # Never let a broken gateway/client handshake turn this bounded acceptance
+    # probe into an unbounded CI hang. Reap a completed child, otherwise
+    # terminate it and escalate after a short grace period.
     try:
-        os.waitpid(pid, 0)
-    except OSError:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+        if waited == 0:
+            os.kill(pid, 15)
+            grace = time.time() + 2
+            while time.time() < grace:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+                if waited == pid:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+    except (ChildProcessError, ProcessLookupError, OSError):
         pass
 
     text = out.decode(errors="replace")

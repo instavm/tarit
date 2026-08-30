@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vmm_sys_util::eventfd::EventFd;
@@ -78,11 +78,13 @@ struct ExecConnection {
 /// agent has dialed) and re-accepts on reconnect.
 pub struct VsockExecChannel {
     stream: Arc<Mutex<Option<ExecConnection>>>,
+    connected: Arc<Condvar>,
     stop: Arc<AtomicBool>,
     pump_wake: Option<EventFd>,
     handle: Mutex<Option<JoinHandle<()>>>,
     exec_gate: Mutex<()>,
     next_request_id: AtomicU64,
+    initial_connect_waited: AtomicBool,
 }
 
 /// Why a vsock exec did not return a result. The split matters because exec is
@@ -257,9 +259,11 @@ impl VsockExecChannel {
         listener.set_nonblocking(true)?;
 
         let stream = Arc::new(Mutex::new(None));
+        let connected = Arc::new(Condvar::new());
         let stop = Arc::new(AtomicBool::new(false));
         let next_connection_id = Arc::new(AtomicU64::new(1));
         let stream_t = Arc::clone(&stream);
+        let connected_t = Arc::clone(&connected);
         let stop_t = Arc::clone(&stop);
         let next_connection_id_t = Arc::clone(&next_connection_id);
 
@@ -289,6 +293,7 @@ impl VsockExecChannel {
                                         connection.id
                                     );
                                     *stream_t.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection);
+                                    connected_t.notify_all();
                                 }
                                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                                 Err(error) => {
@@ -304,11 +309,13 @@ impl VsockExecChannel {
 
         Ok(Arc::new(Self {
             stream,
+            connected,
             stop,
             pump_wake,
             handle: Mutex::new(Some(handle)),
             exec_gate: Mutex::new(()),
             next_request_id: AtomicU64::new(1),
+            initial_connect_waited: AtomicBool::new(false),
         }))
     }
 
@@ -317,6 +324,26 @@ impl VsockExecChannel {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
+    }
+
+    /// Give a newly booted guest one bounded opportunity to establish its
+    /// framed exec channel before callers fall back to the boot UART. The wait
+    /// is consumed at most once per VM, so an older agent that never dials
+    /// vsock does not add latency to every command.
+    pub fn wait_for_initial_connection(&self, timeout: Duration) -> bool {
+        if self.is_connected() {
+            return true;
+        }
+        if self.initial_connect_waited.swap(true, Ordering::AcqRel) {
+            return self.is_connected();
+        }
+
+        let guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = self
+            .connected
+            .wait_timeout_while(guard, timeout, |connection| connection.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        guard.is_some()
     }
 
     pub fn exec(
@@ -469,6 +496,15 @@ fn run_exec_marker_v1(
     let mut buf = [0u8; 4096];
 
     while start.elapsed() < timeout {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        if let Err(error) = stream.set_read_timeout(Some(remaining.min(EXEC_IO_TIMEOUT))) {
+            return RunExecOutcome::TransportFailed(format!(
+                "set vsock exec read timeout: {error}"
+            ));
+        }
         match stream.read(&mut buf) {
             Ok(0) => return RunExecOutcome::TransportFailed("vsock exec: peer closed".into()),
             Ok(read) => acc.extend_from_slice(&buf[..read]),
@@ -516,6 +552,14 @@ fn run_exec_marker_v1(
             }
         }
         if let Err(error) = trim_exec_accumulator(&mut acc, started, &mut outputs) {
+            return RunExecOutcome::TransportFailed(error.to_string());
+        }
+    }
+    // Preserve a final unterminated output fragment on timeout. Once START was
+    // observed, the accumulator contains guest stdout rather than control
+    // protocol, and dropping it makes timeout diagnostics incomplete.
+    if started && !acc.is_empty() {
+        if let Err(error) = outputs.stdout(&acc) {
             return RunExecOutcome::TransportFailed(error.to_string());
         }
     }
@@ -921,6 +965,19 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    fn disconnected_channel() -> Arc<VsockExecChannel> {
+        Arc::new(VsockExecChannel {
+            stream: Arc::new(Mutex::new(None)),
+            connected: Arc::new(Condvar::new()),
+            stop: Arc::new(AtomicBool::new(false)),
+            pump_wake: None,
+            handle: Mutex::new(None),
+            exec_gate: Mutex::new(()),
+            next_request_id: AtomicU64::new(1),
+            initial_connect_waited: AtomicBool::new(false),
+        })
+    }
+
     fn exec_request(stream: &mut UnixStream) -> (u64, String) {
         let frame = read_exec_frame_before(stream, Instant::now() + Duration::from_secs(1))
             .expect("frame read")
@@ -948,6 +1005,34 @@ mod tests {
         payload.extend_from_slice(&request_id.to_be_bytes());
         payload.extend_from_slice(&exit_code.to_be_bytes());
         write_exec_frame(stream, ExecFrameKind::Exit, &payload).unwrap();
+    }
+
+    #[test]
+    fn initial_connection_wait_wakes_when_guest_connects() {
+        let channel = disconnected_channel();
+        let connector = Arc::clone(&channel);
+        let (_guest, host) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            *connector.stream.lock().unwrap() = Some(ExecConnection {
+                id: 1,
+                protocol: ExecProtocol::ChunkedV2,
+                stream: host,
+            });
+            connector.connected.notify_all();
+        });
+
+        assert!(channel.wait_for_initial_connection(Duration::from_secs(1)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn initial_connection_wait_is_only_paid_once() {
+        let channel = disconnected_channel();
+        assert!(!channel.wait_for_initial_connection(Duration::from_millis(10)));
+        let start = Instant::now();
+        assert!(!channel.wait_for_initial_connection(Duration::from_secs(1)));
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
@@ -982,9 +1067,9 @@ mod tests {
     }
 
     #[test]
-    fn chunked_exec_streams_more_than_sixteen_mib_losslessly() {
+    fn chunked_exec_spools_more_than_the_memory_cap_losslessly() {
         let (mut host, guest) = UnixStream::pair().unwrap();
-        let total = 17 * 1024 * 1024;
+        let total = EXEC_SPOOL_MEMORY_CAP + 2 * EXEC_CHUNK_MAX_BYTES;
         let server = std::thread::spawn(move || {
             let mut guest = guest;
             let (request_id, _) = exec_request(&mut guest);

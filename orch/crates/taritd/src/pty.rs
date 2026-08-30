@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{ensure_vm_access, ApiError, AppState},
-    cluster::{self, Owner},
+    cluster::Owner,
     config::{ApiIdentity, PtyConnectionLimits},
     ops,
 };
@@ -771,10 +771,12 @@ async fn ensure_local_vm_for_pty(
     vm_id: Uuid,
     identity: &ApiIdentity,
 ) -> Result<(), OrchError> {
-    match cluster::resolve_owner(state, vm_id).await? {
+    match ops::resolve_owner_for_activation(state, vm_id, identity).await? {
         Owner::Local => {
             let vm = ops::get_local(state, vm_id)?;
-            ensure_vm_access(identity, &vm)
+            ensure_vm_access(identity, &vm)?;
+            ops::ensure_active_local(state, vm_id).await?;
+            Ok(())
         }
         // TODO: proxy the WebSocket to the peer returned here once the internal
         // peer API grows an upgrade/stream forwarding path.

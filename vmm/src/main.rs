@@ -501,6 +501,13 @@ enum Cmd {
     #[command(alias = "info")]
     Status,
 
+    /// Get or update the virtio-balloon target (via the API).
+    Balloon {
+        /// New balloon target in MiB. Omit to query current target/actual size.
+        #[arg(long, value_name = "MIB")]
+        target: Option<u64>,
+    },
+
     /// Update egress policy on the running VM (via the API).
     #[command(alias = "egress")]
     UpdateEgress {
@@ -610,7 +617,7 @@ fn main() -> Result<()> {
             jail,
             uid,
             gid,
-        } => restore(snapshot, memory_policy, jail, uid, gid),
+        } => restore(&cli.socket, snapshot, memory_policy, jail, uid, gid),
         Cmd::Serve {
             jail,
             uid,
@@ -668,6 +675,12 @@ fn main() -> Result<()> {
         Cmd::Suspend => api_request(&cli.socket, &vmm_api::types::ApiRequest::Suspend),
         Cmd::Resume => api_request(&cli.socket, &vmm_api::types::ApiRequest::Resume),
         Cmd::Status => api_request(&cli.socket, &vmm_api::types::ApiRequest::Status),
+        Cmd::Balloon { target } => api_request(
+            &cli.socket,
+            &target.map_or(vmm_api::types::ApiRequest::Balloon, |target_mib| {
+                vmm_api::types::ApiRequest::SetBalloon { target_mib }
+            }),
+        ),
         Cmd::UpdateEgress {
             allow,
             allow_existing,
@@ -866,6 +879,7 @@ fn build_volume_configs(
             path: rfs.into(),
             read_only: false,
             overlay: None,
+            inherited_fd: None,
         });
     }
 
@@ -888,6 +902,7 @@ fn parse_volume_spec(spec: &str) -> vmm_core::config::VolumeConfig {
         path: path.into(),
         read_only,
         overlay: None,
+        inherited_fd: None,
     }
 }
 
@@ -1013,14 +1028,14 @@ fn boot_on_kvm(
     if full_boot {
         // Build the device list for ACPI DSDT: each volume + net gets
         // a virtio-mmio device entry at its MMIO address with its GSI.
-        let mut acpi_devices: Vec<(u64, u64, u32)> = Vec::new();
+        let mut acpi_devices: Vec<(u64, u64, u32, bool)> = Vec::new();
         let mut acpi_mmio = 0xd000_0000u64;
         for i in 0..volumes.len() {
-            acpi_devices.push((acpi_mmio, 0x1000, 5 + i as u32));
+            acpi_devices.push((acpi_mmio, 0x1000, 5 + i as u32, true));
             acpi_mmio += 0x1000;
         }
         if net_spec.is_some() {
-            acpi_devices.push((acpi_mmio, 0x1000, 5 + volumes.len() as u32));
+            acpi_devices.push((acpi_mmio, 0x1000, 5 + volumes.len() as u32, true));
         }
         vmm_core::vcpu_setup::write_acpi_tables_with_devices(mem, vcpus, &acpi_devices)?;
     }
@@ -1028,6 +1043,13 @@ fn boot_on_kvm(
     let template = vmm_core::cpu_template::CpuTemplate::bare();
     let vm = KvmVm::new_with_options(mem.clone(), devices, template, full_boot)
         .map_err(|e| anyhow::anyhow!("KvmVm: {e}"))?;
+
+    // Even the direct CLI boot path exposes a non-zero generation value. The
+    // controller restore path additionally queues a change notification before
+    // any restored vCPU enters KVM_RUN.
+    let vmgenid = vmm_core::vmgenid::VmGenId::new(mem)?;
+    vm.register_irqfd(vmgenid.eventfd(), vmm_core::vmgenid::VMGENID_GSI)
+        .map_err(|e| anyhow::anyhow!("VM Generation ID irqfd: {e}"))?;
 
     // Register irqfds + ioeventfds with KVM.
     for (i, evt) in irq_evts.iter().enumerate() {
@@ -1104,12 +1126,30 @@ fn boot_on_kvm(
     Ok(())
 }
 fn restore(
+    socket: &str,
     snapshot: String,
     memory_policy: RestoreMemoryPolicyArg,
     jail_dir: Option<String>,
     uid: u32,
     gid: u32,
 ) -> Result<()> {
+    if std::path::Path::new(socket).exists() {
+        anyhow::ensure!(
+            jail_dir.is_none(),
+            "--jail is available only for standalone restore without a running API socket"
+        );
+        return api_request(
+            socket,
+            &vmm_api::types::ApiRequest::Restore {
+                snapshot_path: snapshot,
+                memory_integrity: None,
+                overlay: None,
+                net: None,
+                volumes: None,
+                memory_policy: memory_policy.into(),
+            },
+        );
+    }
     // Apply jailer confinement before restoring, if requested.
     #[cfg(target_os = "linux")]
     if let Some(chroot_dir) = &jail_dir {
@@ -1263,23 +1303,38 @@ fn api_snapshot(socket: &str, diff: bool, live: bool) -> Result<()> {
     let body = serde_json::to_vec(&request)?;
     let response = send_raw(socket, &body)?;
     let response: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;
-    let path = match &response {
-        vmm_api::types::ApiResponse::Snapshot { path } => path,
+    let (path, overlay_path, integrity_path) = match &response {
+        vmm_api::types::ApiResponse::Snapshot {
+            path,
+            overlay_path,
+            integrity_path,
+            ..
+        } => (path, overlay_path, integrity_path),
         vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("snapshot failed: {msg}"),
         other => anyhow::bail!("unexpected snapshot response: {other:?}"),
     };
-    let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
-        .map_err(|error| anyhow::anyhow!("capture snapshot identity {path}: {error}"))?;
-    let release = vmm_api::types::ApiRequest::ReleaseScratch {
-        path: path.clone(),
-        identity,
-    };
-    let release = serde_json::to_vec(&release)?;
-    let release = send_raw(socket, &release)?;
-    match serde_json::from_slice::<vmm_api::types::ApiResponse>(&release)? {
-        vmm_api::types::ApiResponse::Ok => {}
-        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("release snapshot: {msg}"),
-        other => anyhow::bail!("unexpected release response: {other:?}"),
+    for owned_path in std::iter::once(path)
+        .chain(overlay_path.iter())
+        .chain(integrity_path.iter())
+    {
+        let identity =
+            vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(owned_path))
+                .map_err(|error| {
+                    anyhow::anyhow!("capture snapshot identity {owned_path}: {error}")
+                })?;
+        let release = vmm_api::types::ApiRequest::ReleaseScratch {
+            path: owned_path.clone(),
+            identity,
+        };
+        let release = serde_json::to_vec(&release)?;
+        let release = send_raw(socket, &release)?;
+        match serde_json::from_slice::<vmm_api::types::ApiResponse>(&release)? {
+            vmm_api::types::ApiResponse::Ok => {}
+            vmm_api::types::ApiResponse::Err { msg } => {
+                anyhow::bail!("release snapshot artifact: {msg}")
+            }
+            other => anyhow::bail!("unexpected release response: {other:?}"),
+        }
     }
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -1289,6 +1344,9 @@ fn api_request(socket: &str, req: &vmm_api::types::ApiRequest) -> Result<()> {
     let body = serde_json::to_vec(req)?;
     let resp = send_raw(socket, &body)?;
     let resp: vmm_api::types::ApiResponse = serde_json::from_slice(&resp)?;
+    if let vmm_api::types::ApiResponse::Err { msg } = &resp {
+        anyhow::bail!(msg.clone());
+    }
     println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }

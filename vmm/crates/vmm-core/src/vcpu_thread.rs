@@ -148,6 +148,14 @@ impl VcpuThread {
                     }
                     // Check control channel.
                     if ctrl.load(Ordering::Relaxed) {
+                        // Tell KVM that userspace deliberately paused this
+                        // vCPU. A kvm-clock guest consumes the flag to avoid a
+                        // false watchdog soft-lockup after a long pause. The
+                        // ioctl is optional for guests using another clock
+                        // source, so rejection is diagnostic rather than fatal.
+                        if let Err(error) = vcpu.kvmclock_ctrl() {
+                            log::debug!("KVM_KVMCLOCK_CTRL on pause unavailable: {error}");
+                        }
                         // Guest is stopped here — capture the full vCPU state
                         // for a faithful snapshot. All the ioctls (KVM_GET_*),
                         // the futex (Mutex), and the allocation (mmap/brk) used
