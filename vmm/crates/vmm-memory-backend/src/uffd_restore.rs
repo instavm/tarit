@@ -13,6 +13,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum UffdRestoreError {
+    #[error("userfaultfd syscall: {0}")]
+    Userfaultfd(#[source] std::io::Error),
     #[error("userfaultfd: {0}")]
     Uffd(String),
     #[error("mmap: {0}")]
@@ -399,10 +401,9 @@ pub fn start_lazy_restore_with_integrity(
         // SAFETY: `snapshot_mmap` is the successful `mmap` result above with
         // length `snapshot_mmap_len`, and has not been unmapped yet.
         unsafe { libc::munmap(snapshot_mmap, snapshot_mmap_len) };
-        return Err(UffdRestoreError::Uffd(format!(
-            "userfaultfd: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(UffdRestoreError::Userfaultfd(
+            std::io::Error::last_os_error(),
+        ));
     }
     // SAFETY: `uffd_raw` is a fresh fd returned by `userfaultfd` and is not
     // aliased by any other `OwnedFd`.
@@ -904,7 +905,7 @@ mod tests {
         };
         assert_ne!(guest, libc::MAP_FAILED);
         let hash: [u8; 32] = Sha256::digest(&snapshot).into();
-        let lazy = start_lazy_restore_with_integrity(
+        let lazy = match start_lazy_restore_with_integrity(
             guest.cast(),
             LEN,
             &file,
@@ -915,8 +916,21 @@ mod tests {
                 chunk_size: LEN,
                 chunk_hashes: vec![hash],
             }),
-        )
-        .unwrap();
+        ) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                // Some CI kernels disable unprivileged userfaultfd. The real
+                // UFFD path remains mandatory on the c8i promotion runner.
+                // SAFETY: `guest` is the live mapping created above.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                drop(file);
+                std::fs::remove_file(path).unwrap();
+                return;
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
         // Faulting page zero prefetches the authenticated two-page chunk, then
         // discard a now-resident page. MADV_DONTNEED queues UFFD_EVENT_REMOVE;
         // the following refault proves that the handler drains REMOVE, retries
