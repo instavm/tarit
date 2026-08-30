@@ -5421,6 +5421,11 @@ fn inherited_tap_fd(tap_name: &str) -> Result<Option<i32>> {
     let spec = spec
         .into_string()
         .map_err(|_| VmmError::Device("VMM_TAP_FDS is not valid UTF-8".into()))?;
+    parse_inherited_tap_fd(tap_name, &spec).map(Some)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn parse_inherited_tap_fd(tap_name: &str, spec: &str) -> Result<i32> {
     let mut matched = None;
     for entry in spec.split(',').filter(|entry| !entry.is_empty()) {
         let (name, raw_fd) = entry
@@ -5435,7 +5440,11 @@ fn inherited_tap_fd(tap_name: &str) -> Result<Option<i32>> {
             )));
         }
     }
-    Ok(matched)
+    matched.ok_or_else(|| {
+        VmmError::Device(format!(
+            "VMM_TAP_FDS is set but has no inherited descriptor for {tap_name}"
+        ))
+    })
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5493,6 +5502,22 @@ fn serialize_state_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn inherited_tap_mapping_requires_the_requested_tap() {
+        let error = parse_inherited_tap_fd("tap-wanted", "tap-other=17").unwrap_err();
+        assert!(error.to_string().contains("tap-wanted"));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn inherited_tap_mapping_returns_the_exact_descriptor() {
+        assert_eq!(
+            parse_inherited_tap_fd("tap-wanted", "tap-other=17,tap-wanted=23").unwrap(),
+            23
+        );
+    }
     use crate::config::{
         KernelConfig, MemoryConfig, NetConfig, VcpuConfig, VmConfig, VolumeConfig,
     };

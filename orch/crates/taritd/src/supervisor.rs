@@ -79,6 +79,8 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
         )));
     }
     let path = std::ffi::CString::new("/dev/net/tun").expect("static TUN path");
+    // SAFETY: `path` is a valid NUL-terminated string and `open` does not
+    // retain the pointer after returning.
     let raw_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if raw_fd < 0 {
         return Err(OrchError::Internal(format!(
@@ -95,6 +97,8 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
         _pad: [0; 22],
     };
     ifreq.name[..tap_name.len()].copy_from_slice(tap_name.as_bytes());
+    // SAFETY: `fd` is an open TUN descriptor and `ifreq` is a valid writable
+    // TUNSETIFF request that remains alive for the duration of the ioctl.
     if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &mut ifreq) } < 0 {
         return Err(OrchError::Internal(format!(
             "attach inherited TAP queue for {tap_name}: {}",
