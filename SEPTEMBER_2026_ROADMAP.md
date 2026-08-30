@@ -368,7 +368,7 @@ OCI input was Ubuntu.
 
 | Capability | Current evidence | Remaining release work |
 | --- | --- | --- |
-| Live fork and lazy CoW | Atomic live snapshot, authenticated lazy RAM, private disk overlays, sibling isolation, high-dirty workloads, rollback failpoints, and forced UFFD-handler failure pass on c8i | UFFD UNMAP/remap and registration-disconnect handling, cancellation across every distributed phase, and 100-sample latency distributions |
+| Live fork and lazy CoW | Atomic live snapshot, authenticated lazy RAM, private disk overlays, sibling isolation, high-dirty workloads, rollback failpoints, and fail-closed UFFD handler exit, descriptor loss, UNMAP, and REMAP handling pass on c8i | Cancellation across every distributed phase and 100-sample latency distributions |
 | Scale-to-zero and activation | Hibernation releases the VMM and scheduler capacity; HTTP, PTY, SSH, and share activation single-flight through the same restore gate | Long-hibernation timer/watchdog/lease qualification and sustained contention testing |
 | Clone identity | Linux 6.6 VMGenID notification and the mandatory userspace repair barrier pass; Linux 5.10 passes through the barrier-only compatibility path | Application-owned cached PRNG, nonce, token, and session repair under concurrent ingress |
 | Security and isolation | Guest VMX/SVM and `/dev/kvm` are hidden while worker KVM remains enabled; jail, seccomp, cgroups, mTLS peer identity, opaque artifacts, signed-image admission, and tenant fences pass focused gates | Continued kernel/microcode qualification and the remaining adversarial release matrix |

@@ -144,6 +144,11 @@ impl LazyRestore {
     pub fn page_discard(&self) -> LazyPageDiscard {
         self.page_discard.clone()
     }
+
+    #[cfg(all(feature = "test-failpoints", test))]
+    fn close_uffd_for_test(&mut self) {
+        self.uffd_fd.take();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +221,10 @@ const UFFDIO_COPY: u32 = iowr(UFFDIO, 0x03, std::mem::size_of::<UffdioCopy>());
 // drain these events and retry deferred faults rather than losing the fault and
 // hanging the caller forever.
 const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
+const UFFD_FEATURE_EVENT_REMAP: u64 = 1 << 2;
+const UFFD_FEATURE_EVENT_UNMAP: u64 = 1 << 6;
+const UFFD_REQUIRED_EVENT_FEATURES: u64 =
+    UFFD_FEATURE_EVENT_REMAP | UFFD_FEATURE_EVENT_REMOVE | UFFD_FEATURE_EVENT_UNMAP;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
 
 #[repr(C)]
@@ -257,7 +266,9 @@ struct UffdioApi {
 const UFFD_MSG_SIZE: usize = 32;
 const UFFD_MSG_EVENT_OFFSET: usize = 0;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
+const UFFD_EVENT_REMAP: u8 = 0x14;
 const UFFD_EVENT_REMOVE: u8 = 0x15;
+const UFFD_EVENT_UNMAP: u8 = 0x16;
 /// Absolute byte offset of `arg.pagefault.address` within the 32-byte
 /// `uffd_msg`: event at 0, the arg union at 8, `pagefault.flags` at 8, and
 /// `pagefault.address` at 16.
@@ -412,7 +423,7 @@ pub fn start_lazy_restore_with_integrity(
     // 3. UFFDIO_API.
     let mut api = UffdioApi {
         api: UFFD_API,
-        features: UFFD_FEATURE_EVENT_REMOVE,
+        features: UFFD_REQUIRED_EVENT_FEATURES,
         ioctls: 0,
     };
     // SAFETY: `uffd_fd` is a valid userfaultfd and `api` points to an initialized
@@ -424,6 +435,14 @@ pub fn start_lazy_restore_with_integrity(
         return Err(UffdRestoreError::Uffd(format!(
             "UFFDIO_API: {}",
             std::io::Error::last_os_error()
+        )));
+    }
+    if api.features & UFFD_REQUIRED_EVENT_FEATURES != UFFD_REQUIRED_EVENT_FEATURES {
+        // SAFETY: `snapshot_mmap` is still mapped with `snapshot_mmap_len`.
+        unsafe { libc::munmap(snapshot_mmap, snapshot_mmap_len) };
+        return Err(UffdRestoreError::Uffd(format!(
+            "kernel omitted required userfaultfd event features: requested={UFFD_REQUIRED_EVENT_FEATURES:#x} available={:#x}",
+            api.features
         )));
     }
 
@@ -460,36 +479,49 @@ pub fn start_lazy_restore_with_integrity(
     let shutdown_clone = shutdown.clone();
     let handler_shutdown = shutdown.clone();
     let handler_discarded_pages = discarded_pages.clone();
-    let handler_thread = std::thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fault_handler_loop(FaultHandlerContext {
-                uffd_fd_raw,
-                snapshot_ptr: snapshot_ptr_val,
-                snapshot_len: snapshot_len_clone,
-                guest_base: guest_base_val,
-                pages_served: pages_clone,
-                shutdown: shutdown_clone,
-                host_dirty,
-                chunk_integrity,
-                discarded_pages: handler_discarded_pages,
-            });
-        }));
-        if !handler_shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            let reason = if outcome.is_err() {
-                "panicked"
-            } else {
-                "exited"
-            };
-            eprintln!("SECURITY: userfaultfd handler {reason} unexpectedly; terminating VMM");
-            log::error!("userfaultfd handler {reason} unexpectedly");
-            // An absent UFFD handler leaves guest accesses blocked forever.
-            // This process owns one VM, so fail closed and let the orchestrator
-            // reconcile the exit instead of retaining an unresponsive VM.
-            // SAFETY: `_exit` terminates the current VMM without running
-            // destructors that may themselves touch the unresolved mapping.
-            unsafe { libc::_exit(78) }
+    let handler_thread = match std::thread::Builder::new()
+        .name("uffd-restore".into())
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fault_handler_loop(FaultHandlerContext {
+                    uffd_fd_raw,
+                    snapshot_ptr: snapshot_ptr_val,
+                    snapshot_len: snapshot_len_clone,
+                    guest_base: guest_base_val,
+                    pages_served: pages_clone,
+                    shutdown: shutdown_clone,
+                    host_dirty,
+                    chunk_integrity,
+                    discarded_pages: handler_discarded_pages,
+                });
+            }));
+            if !handler_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                let reason = if outcome.is_err() {
+                    "panicked"
+                } else {
+                    "exited"
+                };
+                eprintln!("SECURITY: userfaultfd handler {reason} unexpectedly; terminating VMM");
+                log::error!("userfaultfd handler {reason} unexpectedly");
+                // An absent UFFD handler leaves guest accesses blocked forever.
+                // This process owns one VM, so fail closed and let the orchestrator
+                // reconcile the exit instead of retaining an unresponsive VM.
+                // SAFETY: `_exit` terminates the current VMM without running
+                // destructors that may themselves touch the unresolved mapping.
+                unsafe { libc::_exit(78) }
+            }
+        }) {
+        Ok(thread) => thread,
+        Err(error) => {
+            // SAFETY: the mapping is live and has not been transferred into a
+            // `LazyRestore` because the handler thread could not be created.
+            unsafe { libc::munmap(snapshot_mmap, snapshot_mmap_len) };
+            return Err(UffdRestoreError::Io(error));
         }
-    });
+    };
+
+    #[cfg(feature = "test-failpoints")]
+    trigger_registered_mapping_event_for_test(guest_mem_ptr, guest_mem_len);
 
     log::info!("UFFD lazy restore started: {guest_mem_len} bytes registered");
 
@@ -507,6 +539,76 @@ pub fn start_lazy_restore_with_integrity(
             snapshot_fence,
         },
     })
+}
+
+#[cfg(feature = "test-failpoints")]
+fn trigger_registered_mapping_event_for_test(guest_mem_ptr: *mut u8, guest_mem_len: usize) {
+    match std::env::var("TARIT_TEST_UFFD_MAPPING_EVENT").as_deref() {
+        Ok("unmap") => {
+            // SAFETY: the production-disabled failpoint intentionally unmaps
+            // the complete validated guest range to exercise UFFD_EVENT_UNMAP.
+            if unsafe { libc::munmap(guest_mem_ptr.cast(), guest_mem_len) } != 0 {
+                eprintln!(
+                    "test failpoint: munmap registered guest memory failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: the test VMM cannot continue with an indeterminate
+                // mapping and uses a distinct code for harness diagnosis.
+                unsafe { libc::_exit(76) }
+            }
+        }
+        Ok("remap") => {
+            // SAFETY: creates a distinct process-private destination mapping.
+            let destination = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    guest_mem_len,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if destination == libc::MAP_FAILED || destination == guest_mem_ptr.cast() {
+                eprintln!(
+                    "test failpoint: reserve remap destination failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: this is a dedicated test VMM process.
+                unsafe { libc::_exit(76) }
+            }
+            // SAFETY: source and destination are distinct, page-aligned,
+            // process-owned VMAs with the validated guest-memory length.
+            let moved = unsafe {
+                libc::mremap(
+                    guest_mem_ptr.cast::<libc::c_void>(),
+                    guest_mem_len,
+                    guest_mem_len,
+                    libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+                    destination,
+                )
+            };
+            if moved != destination {
+                eprintln!(
+                    "test failpoint: mremap registered guest memory failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                // SAFETY: this is a dedicated test VMM process.
+                unsafe { libc::_exit(76) }
+            }
+        }
+        Ok(action) => {
+            eprintln!("test failpoint: unsupported UFFD mapping event {action}");
+            // SAFETY: a malformed test configuration must not run a VM.
+            unsafe { libc::_exit(76) }
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => {
+            eprintln!("test failpoint: invalid UFFD mapping event: {error}");
+            // SAFETY: a malformed test configuration must not run a VM.
+            unsafe { libc::_exit(76) }
+        }
+    }
 }
 
 /// Alias for callers that arm UFFD over an already-live guest memory mapping.
@@ -673,12 +775,43 @@ fn fault_handler_loop(context: FaultHandlerContext) {
                             return;
                         };
                         if start >= end || start < guest_base || end > guest_end {
-                            log::warn!(
+                            log::error!(
                                 "UFFD REMOVE range 0x{start:x}..0x{end:x} outside guest memory"
                             );
+                            return;
                         }
                     }
-                    event => log::warn!("unexpected userfaultfd event 0x{event:02x}"),
+                    UFFD_EVENT_REMAP => {
+                        let mut from_bytes = [0u8; 8];
+                        let mut to_bytes = [0u8; 8];
+                        let mut len_bytes = [0u8; 8];
+                        from_bytes.copy_from_slice(&msg_buf[8..16]);
+                        to_bytes.copy_from_slice(&msg_buf[16..24]);
+                        len_bytes.copy_from_slice(&msg_buf[24..32]);
+                        let from = u64::from_ne_bytes(from_bytes);
+                        let to = u64::from_ne_bytes(to_bytes);
+                        let len = u64::from_ne_bytes(len_bytes);
+                        log::error!(
+                            "UFFD registered guest memory remapped: 0x{from:x} -> 0x{to:x} ({len} bytes)"
+                        );
+                        return;
+                    }
+                    UFFD_EVENT_UNMAP => {
+                        let mut start_bytes = [0u8; 8];
+                        let mut end_bytes = [0u8; 8];
+                        start_bytes.copy_from_slice(&msg_buf[8..16]);
+                        end_bytes.copy_from_slice(&msg_buf[16..24]);
+                        let start = u64::from_ne_bytes(start_bytes);
+                        let end = u64::from_ne_bytes(end_bytes);
+                        log::error!(
+                            "UFFD registered guest memory unmapped: 0x{start:x}..0x{end:x}"
+                        );
+                        return;
+                    }
+                    event => {
+                        log::error!("unexpected userfaultfd event 0x{event:02x}");
+                        return;
+                    }
                 }
             }
         }
@@ -891,7 +1024,7 @@ mod tests {
 
     #[cfg(feature = "test-failpoints")]
     #[test]
-    fn forced_handler_failure_child() {
+    fn fatal_uffd_event_child() {
         if std::env::var_os("TARIT_TEST_UFFD_CHILD").as_deref() != Some(std::ffi::OsStr::new("1")) {
             return;
         }
@@ -912,7 +1045,7 @@ mod tests {
             )
         };
         assert_ne!(guest, libc::MAP_FAILED);
-        let _lazy = match start_lazy_restore(guest.cast(), LEN, &file, 0, LEN as u64, None) {
+        let mut lazy = match start_lazy_restore(guest.cast(), LEN, &file, 0, LEN as u64, None) {
             Ok(lazy) => lazy,
             Err(UffdRestoreError::Userfaultfd(error))
                 if error.raw_os_error() == Some(libc::EPERM) =>
@@ -923,30 +1056,101 @@ mod tests {
             }
             Err(error) => panic!("start lazy restore: {error}"),
         };
-        // The handler consumes this event and then takes the test-only failure
-        // path. The parent requires the process-wide fail-closed exit code.
-        // SAFETY: `guest` is the live UFFD-registered mapping above.
-        let _ = unsafe { std::ptr::read_volatile(guest.cast::<u8>()) };
-        panic!("fault unexpectedly resolved after forced handler failure");
+        match std::env::var("TARIT_TEST_UFFD_CHILD_ACTION").as_deref() {
+            Ok("after_event") => {
+                std::env::set_var("TARIT_TEST_UFFD_HANDLER_FAILURE", "after_event");
+                // The handler consumes this event and then takes the test-only
+                // failure path. The parent requires fail-closed exit code 78.
+                // SAFETY: `guest` is the live UFFD-registered mapping above.
+                let _ = unsafe { std::ptr::read_volatile(guest.cast::<u8>()) };
+            }
+            Ok("unmap") => {
+                // SAFETY: unmaps the complete live registered mapping exactly
+                // once, causing the negotiated UFFD_EVENT_UNMAP notification.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+            }
+            Ok("remap") => {
+                // Reserve a distinct destination so MREMAP_FIXED must move the
+                // complete registered VMA and emit UFFD_EVENT_REMAP.
+                // SAFETY: creates one private page-aligned reservation.
+                let destination = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        LEN,
+                        libc::PROT_NONE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(destination, libc::MAP_FAILED);
+                assert_ne!(destination, guest);
+                // SAFETY: source and destination are distinct, page-aligned,
+                // process-owned VMAs of the checked size.
+                let moved = unsafe {
+                    libc::mremap(
+                        guest,
+                        LEN,
+                        LEN,
+                        libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+                        destination,
+                    )
+                };
+                assert_eq!(moved, destination);
+            }
+            Ok("descriptor_close") => {
+                lazy.close_uffd_for_test();
+            }
+            action => panic!("unknown UFFD child action: {action:?}"),
+        }
+
+        // Give the handler a bounded interval to consume the lifecycle event.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        drop(lazy);
+        // SAFETY: this dedicated subprocess has no cleanup to preserve.
+        unsafe { libc::_exit(75) }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    fn assert_uffd_child_fails_closed(action: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "uffd_restore::tests::fatal_uffd_event_child",
+                "--nocapture",
+            ])
+            .env("TARIT_TEST_UFFD_CHILD", "1")
+            .env("TARIT_TEST_UFFD_CHILD_ACTION", action)
+            .status()
+            .expect("run UFFD lifecycle subprocess");
+        if status.code() == Some(77) {
+            return;
+        }
+        assert_eq!(status.code(), Some(78));
     }
 
     #[cfg(feature = "test-failpoints")]
     #[test]
     fn unexpected_handler_exit_terminates_the_vmm_process() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "uffd_restore::tests::forced_handler_failure_child",
-                "--nocapture",
-            ])
-            .env("TARIT_TEST_UFFD_CHILD", "1")
-            .env("TARIT_TEST_UFFD_HANDLER_FAILURE", "after_event")
-            .status()
-            .expect("run UFFD failure subprocess");
-        if status.code() == Some(77) {
-            return;
-        }
-        assert_eq!(status.code(), Some(78));
+        assert_uffd_child_fails_closed("after_event");
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn registered_memory_unmap_terminates_the_vmm_process() {
+        assert_uffd_child_fails_closed("unmap");
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn registered_memory_remap_terminates_the_vmm_process() {
+        assert_uffd_child_fails_closed("remap");
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn unexpected_uffd_descriptor_loss_terminates_the_vmm_process() {
+        assert_uffd_child_fails_closed("descriptor_close");
     }
 
     #[test]
