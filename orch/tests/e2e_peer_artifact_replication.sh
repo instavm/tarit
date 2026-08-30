@@ -34,9 +34,14 @@ C_PID=""
 SOURCE_VM=""
 RESTORED_VM=""
 CROSS_NODE_FORK_VM=""
+B_FORK_PAUSE_MS=0
+if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
+  B_FORK_PAUSE_MS=30000
+fi
 VOLUME_VM=""
 VOLUME_ID=""
 LAST_PID=""
+FIRST_FORK_CURL_PID=""
 NFS_UNIT=""
 NFS_WAS_ACTIVE=0
 NFS_EXPORTED=0
@@ -61,6 +66,10 @@ C_PEER=$(port)
 
 cleanup() {
   local status=$?
+  if [ -n "$FIRST_FORK_CURL_PID" ] && kill -0 "$FIRST_FORK_CURL_PID" 2>/dev/null; then
+    kill -TERM "$FIRST_FORK_CURL_PID" 2>/dev/null || true
+    wait "$FIRST_FORK_CURL_PID" 2>/dev/null || true
+  fi
   if [ "$status" -ne 0 ]; then
     echo "FAIL: preserving diagnostics before peer artifact cleanup (status $status)" >&2
     tail -120 "$DIR"/*.log 2>/dev/null || true
@@ -173,11 +182,15 @@ make_leaf node-c
 start_node() {
   local name=$1 zone=$2 control=$3 peer=$4 log=$5
   local node_kernel=$KERNEL
+  local fork_pause_ms=0
   # Peers deliberately start with a different readable kernel. Artifact
   # localization must fetch the authenticated source kernel rather than rely
   # on a shared host path or manual pre-provisioning.
   if [ "$name" != node-a ]; then
     node_kernel=/bin/true
+  fi
+  if [ "$name" = node-b ]; then
+    fork_pause_ms=$B_FORK_PAUSE_MS
   fi
   install -d -m 0700 "$DIR/$name/sockets" "$DIR/$name/images"
   install -d -m 0700 "$DIR/$name/nfs-mounts"
@@ -220,6 +233,7 @@ start_node() {
     TARIT_ARTIFACT_GC_INTERVAL_SECS=1 \
     TARIT_ARTIFACT_GC_MIN_AGE_SECS=1 \
     TARIT_REAP_ON_SHUTDOWN=false \
+    TARIT_TEST_FORK_PAUSE_AFTER_CHILD_MS="$fork_pause_ms" \
     RUST_LOG=info \
     "$TARITD" serve >"$log" 2>&1 &
   LAST_PID=$!
@@ -326,8 +340,54 @@ import json,sys
 row=json.load(open(sys.argv[1]))
 assert row.get("exit_code") == 0 and "fork-source-ready" in row.get("stdout", ""), row
 PY
-CROSS_NODE_FORK_RESPONSE=$(api_json POST \
-  "http://127.0.0.1:$B_CONTROL/v1/vms/$SOURCE_VM/fork" '{}')
+REQUESTED_CROSS_NODE_FORK_VM=$(python3 -c 'import uuid; print(uuid.uuid4())')
+FORK_REQUEST_BODY="{\"id\":\"$REQUESTED_CROSS_NODE_FORK_VM\"}"
+if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
+  curl -sS --max-time 180 -o "$DIR/cross-node-first-fork.json" -w '%{http_code}' \
+    -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+    -d "$FORK_REQUEST_BODY" \
+    "http://127.0.0.1:$B_CONTROL/v1/vms/$SOURCE_VM/fork" \
+    >"$DIR/cross-node-first-fork-status" &
+  FIRST_FORK_CURL_PID=$!
+  FORK_PAUSED=0
+  for _ in $(seq 1 1800); do
+    operation_state=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+      "select status from fleet_vm_fork_operations where child_vm_id='$REQUESTED_CROSS_NODE_FORK_VM'" 2>/dev/null || true)
+    child_state=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+      "select status from fleet_vms where id='$REQUESTED_CROSS_NODE_FORK_VM'" 2>/dev/null || true)
+    if [ "$operation_state:$child_state" = preparing:running ] && \
+       grep -q 'test fork paused after child persistence' "$DIR/node-b.log"; then
+      FORK_PAUSED=1
+      break
+    fi
+    sleep 0.1
+  done
+  [ "$FORK_PAUSED" = 1 ] || {
+    echo 'FAIL: cross-node fork did not reach the post-child failpoint' >&2
+    exit 1
+  }
+  kill -KILL "$B_PID"
+  wait "$B_PID" 2>/dev/null || true
+  wait "$FIRST_FORK_CURL_PID" 2>/dev/null || true
+  FIRST_FORK_CURL_PID=""
+  B_PID=""
+  B_FORK_PAUSE_MS=0
+  start_node node-b zone-b "$B_CONTROL" "$B_PEER" "$DIR/node-b.log"
+  B_PID=$LAST_PID
+  wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
+fi
+
+CROSS_NODE_FORK_STATUS=$(curl -sS --max-time 180 \
+  -o "$DIR/cross-node-fork-response.json" -w '%{http_code}' \
+  -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d "$FORK_REQUEST_BODY" \
+  "http://127.0.0.1:$B_CONTROL/v1/vms/$SOURCE_VM/fork")
+if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
+  [ "$CROSS_NODE_FORK_STATUS" = 200 ]
+else
+  [ "$CROSS_NODE_FORK_STATUS" = 201 ]
+fi
+CROSS_NODE_FORK_RESPONSE=$(cat "$DIR/cross-node-fork-response.json")
 CROSS_NODE_FORK_VM=$(printf '%s' "$CROSS_NODE_FORK_RESPONSE" | python3 -c '
 import json,sys
 row=json.load(sys.stdin)
@@ -335,6 +395,36 @@ assert row["source_vm_id"] == sys.argv[1], row
 assert row["vm"]["status"] == "running" and row["vm"]["startup_path"] == "snapshot_restore", row
 print(row["vm"]["id"])
 ' "$SOURCE_VM")
+[ "$CROSS_NODE_FORK_VM" = "$REQUESTED_CROSS_NODE_FORK_VM" ]
+RETRY_CROSS_NODE_FORK_STATUS=$(curl -sS --max-time 30 \
+  -o "$DIR/cross-node-fork-retry.json" -w '%{http_code}' \
+  -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d "$FORK_REQUEST_BODY" \
+  "http://127.0.0.1:$B_CONTROL/v1/vms/$SOURCE_VM/fork")
+[ "$RETRY_CROSS_NODE_FORK_STATUS" = 200 ]
+python3 - "$DIR/cross-node-fork-retry.json" "$SOURCE_VM" "$CROSS_NODE_FORK_VM" <<'PY'
+import json,sys
+row=json.load(open(sys.argv[1]))
+assert row.get("source_vm_id") == sys.argv[2], row
+assert row.get("vm", {}).get("id") == sys.argv[3], row
+PY
+WRONG_CROSS_NODE_SOURCE=$(python3 -c 'import uuid; print(uuid.uuid4())')
+WRONG_CROSS_NODE_STATUS=$(curl -sS --max-time 30 \
+  -o "$DIR/cross-node-fork-wrong-source.json" -w '%{http_code}' \
+  -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d "$FORK_REQUEST_BODY" \
+  "http://127.0.0.1:$B_CONTROL/v1/vms/$WRONG_CROSS_NODE_SOURCE/fork")
+[ "$WRONG_CROSS_NODE_STATUS" = 409 ]
+PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+  "select source_vm_id || ':' || source_host_id || ':' || target_host_id || ':' || status
+     from fleet_vm_fork_operations where child_vm_id='$CROSS_NODE_FORK_VM'" | \
+  grep -qx "$SOURCE_VM:node-a:node-b:committed"
+PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+  "select count(*) from fleet_vm_fork_operations f join fleet_vms v
+     on v.id=f.child_vm_id
+    where f.child_vm_id='$CROSS_NODE_FORK_VM'
+      and date_trunc('microseconds', f.child_created_at)=date_trunc('microseconds', v.created_at)" | \
+  grep -qx 1
 wait_exec_ubuntu "http://127.0.0.1:$B_CONTROL" "$CROSS_NODE_FORK_VM"
 assert_nested_virtualization_hidden "http://127.0.0.1:$B_CONTROL" "$CROSS_NODE_FORK_VM"
 api_json POST "http://127.0.0.1:$B_CONTROL/v1/execute" \

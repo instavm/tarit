@@ -364,7 +364,7 @@ not a valid ingress test kernel. Ubuntu identity must be asserted in the guest;
 an ext4 superblock or successful boot alone is insufficient evidence that the
 OCI input was Ubuntu.
 
-### Focused c8i evidence recorded through 2026-08-30
+### Focused c8i evidence recorded through 2026-08-31
 
 - The vCPU snapshot format no longer stops at the historical fixed 14-MSR
   architectural set. Tarit now filters `KVM_GET_MSR_INDEX_LIST` across KVM's
@@ -892,8 +892,21 @@ OCI input was Ubuntu.
   1,792/1,777 ms. The 399-test taritd suite, all workspace tests, and strict
   all-target/all-feature Clippy pass. The same source-bound claim/resume/commit,
   wrong-source rejection, and terminal id-reuse fence also passed against a
-  disposable real PostgreSQL database on c8i. Cross-node process-death phase
-  injection remains open.
+  disposable real PostgreSQL database on c8i. The PostgreSQL+mTLS cross-node
+  gate now kills node B after the child is durable and running but before the
+  fork operation commits or acknowledges the caller. After restart, the exact
+  retry returns HTTP 200 with the same child, an immediate replay remains
+  idempotent, a different source receives HTTP 409, and the durable
+  source/host/target binding and child-incarnation fence remain intact. The
+  test then completes stale-owner wake, shared-volume recovery, independent
+  branch restore, replica repair, and physical GC. This passed with the Ubuntu
+  24.04 OCI fixture on Linux 6.6.155 and 5.10.230. The test-failpoint taritd
+  SHA-256 was
+  `76fef90dd6037b4e7c05f14458e1e5520e5216fcf8d3e40a1b674a84fa158777`;
+  the VMM SHA-256 was
+  `a13f8d7e70112739a610432bb73ef3cd69eb2e5113ba6ec36b87b179bbd96528`.
+  Physical multi-host failure and additional transfer/publication phase
+  injection remain open.
 - A bounded mixed-OCI soak gate now runs isolated longer state-machine rounds
   across explicit kernel/rootfs cases, rotates deterministic seeds, retains the
   exact failing log, rejects leaked candidate VMM/taritd processes or lifecycle

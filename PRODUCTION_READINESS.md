@@ -75,11 +75,11 @@ cross-node replication, and immutable signed-image stop-ships now have focused
 implementation and c8i evidence recorded in the September roadmap. They remain
 regression gates, but the following unresolved items now block release:
 
-1. Implement a real clone-generation notification (VMGenID or an equally
-   strong mechanism) before cloned vCPUs resume, plus a mandatory userspace
-   post-fork repair/readiness barrier. A fresh virtio-rng device and clock jump
-   do not invalidate cloned kernel/userspace PRNG state, cached nonces, tokens,
-   or sessions.
+1. Extend the implemented clone-generation path into application-specific
+   cached-PRNG, nonce, token, and session repair tests under concurrent ingress.
+   Linux 6.6 VMGenID notification and the mandatory userspace repair barrier,
+   plus the Linux 5.10 barrier-only compatibility path, remain required
+   regression gates before HTTP, PTY, SSH, share, or exec admission.
 2. Pass phase-by-phase kill, cancellation, dirty-rate non-convergence, UFFD
    handler death, corruption, and near-ENOSPC rollback tests without source
    pause leaks, duplicate writers, terminal-ID resurrection, or staged files;
