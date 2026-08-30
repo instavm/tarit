@@ -71,15 +71,18 @@ produced through the OCI image pipeline.
   so stale-owner recovery on another node restores the same desired policy.
 - Orchestrated snapshots are full-only. Incremental snapshot chains remain a
   local VMM facility until parent relocation and manifest integrity are durable.
+- The shipped Linux 6.12 guest kernel is checksum-pinned and reproducibly built.
+  Virtio balloon, virtio entropy, block, network, vsock, and serial drivers are
+  built in; unused legacy hardware entropy drivers remain disabled.
 - The protected-main KVM release workflow is specified but still needs a
   registered `self-hosted`, `linux`, `x64`, `kvm` runner.
 
 ## The seven stop-ship items
 
-The original readiness list contained seven items. The current candidate has
-five fully implemented rows and two partially complete rows. The September gate
-covers all seven; completion means new evidence for resolved items as well as
-code for every remaining partial aspect.
+The original readiness list contained seven items. The current candidate
+implements all seven foundations and has focused c8i evidence for each. They
+remain mandatory regression gates; broader release qualification is tracked in
+`PRODUCTION_READINESS.md` and is not implied by implementation status.
 
 | Historical item | Current state | September evidence or deliverable |
 | --- | --- | --- |
@@ -91,8 +94,9 @@ code for every remaining partial aspect.
 | Immutable image digests and signature/provenance admission | Implemented | `skopeo inspect` resolves a tag once; only the resulting digest reference reaches the pull. Admission stores the OCI manifest, generated ext4, injected agent, and trusted-key digests; `cosign verify` is mandatory in production; VM and warm-pool admission rehash content and fence legacy or policy-mismatched rows. The c8i gate rejected unsigned Ubuntu, admitted an actually signed OCI image, rejected it after trusted-key rotation, and revalidated the identical pinned digest after rollback. |
 | Per-tenant/per-VM I/O and network limits | Implemented | Boot/restore/recovery enforcement; multi-device `io.max`; TAP ingress/egress shaping; stale-limit cleanup; tenant aggregate abuse test |
 
-No hostile multi-tenant production claim is permitted until all seven rows have
-passing evidence.
+No hostile multi-tenant production claim is permitted until the complete release
+gate, including the unresolved adversarial and durability work, has passing
+evidence.
 
 ## API and data model decisions
 
@@ -346,16 +350,12 @@ strict cold, snapshot-restore, and suspend/resume measurements.
 
 ## c8i validation plan
 
-The c8i qualification worker is a `c8i.xlarge` with two vCPUs,
-7.6 GiB RAM, working read/write `/dev/kvm`, and low current load. Both NVMe and
-the guest partition table report a 50 GiB root volume, not 200 GiB. Obsolete
-Cargo targets from three old validation trees were cleaned without removing
-source, recovering the host from 100 percent usage to 14 GiB free (72 percent
-used). It is
-appropriate for functional KVM and low-concurrency failure testing after disk
-remediation, but not for the
-headline concurrency or p99 release claims previously measured on
-`c8i.metal-48xl`.
+The functional qualification worker is a `c8i.xlarge` with two vCPUs, 7.6 GiB
+RAM, and read/write `/dev/kvm`. It currently exposes one 50 GiB root volume and
+no independent reflink-capable test SSD. This host is suitable for functional
+KVM and low-concurrency failure testing, but not for headline concurrency or
+p99 release claims. Those gates require dedicated metal and an independent
+storage fixture.
 
 The guest kernel used for SSH, PTY, and share activation must enable
 `CONFIG_VSOCKETS`, `CONFIG_VIRTIO_VSOCKETS`, and
@@ -364,7 +364,22 @@ not a valid ingress test kernel. Ubuntu identity must be asserted in the guest;
 an ext4 superblock or successful boot alone is insufficient evidence that the
 OCI input was Ubuntu.
 
-### Focused c8i evidence recorded through 2026-08-31
+### Current qualification summary
+
+| Capability | Current evidence | Remaining release work |
+| --- | --- | --- |
+| Live fork and lazy CoW | Atomic live snapshot, authenticated lazy RAM, private disk overlays, sibling isolation, high-dirty workloads, and rollback failpoints pass on c8i | Forced UFFD-handler death, UNMAP/remap, cancellation across every distributed phase, and 100-sample latency distributions |
+| Scale-to-zero and activation | Hibernation releases the VMM and scheduler capacity; HTTP, PTY, SSH, and share activation single-flight through the same restore gate | Long-hibernation timer/watchdog/lease qualification and sustained contention testing |
+| Clone identity | Linux 6.6 VMGenID notification and the mandatory userspace repair barrier pass; Linux 5.10 passes through the barrier-only compatibility path | Application-owned cached PRNG, nonce, token, and session repair under concurrent ingress |
+| Security and isolation | Guest VMX/SVM and `/dev/kvm` are hidden while worker KVM remains enabled; jail, seccomp, cgroups, mTLS peer identity, opaque artifacts, signed-image admission, and tenant fences pass focused gates | Continued kernel/microcode qualification and the remaining adversarial release matrix |
+| Persistent volumes | Local and NFS-backed raw block volumes pass attach, fsync, hibernate, cross-node recovery, busy-detach, and deletion across Ubuntu/Alpine and Linux 6.6/5.10 | Managed EFS/Azure qualification, protected NFS transport, physical host loss, and backend-native snapshot/clone support |
+| OCI and kernels | Ubuntu 24.04 and Alpine 3.20 cover the lifecycle matrix on Linux 6.6 and 5.10; the broader seven-image compatibility gate passes on both kernels | Decompression/inode exhaustion and interrupted registry-transfer qualification |
+| Release artifacts | The Linux 6.12 production guest kernel is checksum-pinned, config-verified, and reproducibly built with required virtio drivers | Protected-main KVM runner execution and retained release evidence |
+
+The rows above distinguish implemented behavior from release qualification. A
+passing focused gate does not waive an item in the final column.
+
+### Detailed c8i qualification record through 2026-08-31
 
 - The vCPU snapshot format no longer stops at the historical fixed 14-MSR
   architectural set. Tarit now filters `KVM_GET_MSR_INDEX_LIST` across KVM's

@@ -40,6 +40,16 @@ its scope.
 - Suspend is distinct from pause: it retains ownership and scheduler quota,
   releases resident guest memory, and requires successful rehydration before
   resume returns.
+- Hibernation releases the VMM and scheduler allocation. HTTP, PTY, SSH, and
+  share ingress activate a hibernated VM through a single-flight restore gate;
+  failed activation leaves a retryable hibernated record instead of a second
+  VMM or leaked capacity.
+- Live fork takes one memory, device, and disk boundary, publishes authenticated
+  artifacts, and restores each child with independent lazy RAM and a private
+  disk overlay. VMGenID notification on supported kernels is paired with a
+  mandatory userspace repair barrier; older kernels use the barrier-only path.
+- Provider-neutral local and NFS-backed raw block volumes are generation-fenced,
+  tenant-scoped, and ordered with hibernate, resume, recovery, and deletion.
 - Snapshot files are opened without following symlinks and validated before
   restore. VMM control frames have absolute deadlines, and OCI extraction uses
   private workspaces and no-follow file access.
@@ -48,6 +58,9 @@ its scope.
   chain; direct VMM incremental snapshots remain available for local testing.
 - Release workflows pin third-party actions, publish checksums and an SPDX
   SBOM, and attest released artifacts.
+- The production guest kernel is built reproducibly from checksum-pinned Linux
+  source. Its config verifier requires the virtio devices used by the VMM and
+  rejects unused legacy hardware entropy drivers.
 
 ## Required gates
 
