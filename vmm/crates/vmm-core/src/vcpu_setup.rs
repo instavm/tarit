@@ -881,12 +881,12 @@ pub struct VcpuFullState {
 
 /// Architectural MSRs required for the Linux configuration Tarit exposes.
 ///
-/// KVM paravirtual MSRs are selected separately from KVM_GET_MSR_INDEX_LIST.
-/// Keeping that selection dynamic is important: Linux can add state inside
-/// KVM's reserved custom range without changing Tarit (async-PF INT/ACK are a
-/// concrete example). The exact selected indices are serialized, so a
-/// destination can reject an incompatible snapshot before partially restoring
-/// a vCPU.
+/// Architectural MSRs come from this fixed baseline. KVM paravirtual MSRs are
+/// added from KVM_GET_MSR_INDEX_LIST when they fall in KVM's reserved custom
+/// range. Keeping that selection dynamic lets Linux add paravirtual state
+/// without requiring a Tarit change (async-PF INT/ACK are a concrete example).
+/// The exact selected indices are serialized, so a destination can reject an
+/// incompatible snapshot before partially restoring a vCPU.
 const SNAPSHOT_ARCH_MSRS: &[u32] = &[
     0x0000_0010, // IA32_TSC
     0x0000_0174, // IA32_SYSENTER_CS

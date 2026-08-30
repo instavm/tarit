@@ -90,7 +90,14 @@ echo "  $RA"
 assert_status snapshot "$RA"
 SNAP=$(echo "$RA" | python3 -c "import sys,json;print(json.loads(sys.stdin.read()).get('path',''))" 2>/dev/null)
 echo "  snap=$SNAP"
-test -n "$SNAP" && test -f "$SNAP"
+if [ -z "$SNAP" ]; then
+  echo "snapshot response did not include a path" >&2
+  exit 1
+fi
+if [ ! -f "$SNAP" ]; then
+  echo "snapshot file does not exist: $SNAP" >&2
+  exit 1
+fi
 # Snapshot paths returned by the VMM are process-owned scratch files. Preserve
 # a private test copy before stop, which correctly releases the scratch file.
 cp --reflink=auto --sparse=always "$SNAP" "$PERSISTED_SNAP"
