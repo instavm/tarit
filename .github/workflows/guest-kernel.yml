@@ -100,10 +100,10 @@ jobs:
         run: |
           set -euo pipefail
           bash vmm/guest/verify-kernel-config.sh dist/minimal-x86_64.config
-          cmp vmm/guest/configs/minimal-x86_64.config dist/minimal-x86_64.config
-          cd dist
-          actual="$(sha256sum "vmlinux-${{ steps.kernel.outputs.version }}-x86_64" | awk '{print $1}')"
+          actual="$(sha256sum "dist/vmlinux-${{ steps.kernel.outputs.version }}-x86_64" | awk '{print $1}')"
           printf 'kernel sha256: %s\n' "$actual"
+          diff -u vmm/guest/configs/minimal-x86_64.config dist/minimal-x86_64.config
+          cd dist
           test -n "${{ steps.kernel.outputs.artifact_sha256 }}"
           test "$actual" = "${{ steps.kernel.outputs.artifact_sha256 }}"
           sha256sum "vmlinux-${{ steps.kernel.outputs.version }}-x86_64" \
