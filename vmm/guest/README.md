@@ -12,8 +12,8 @@ workflow build, verify, and run `vmlinux`.
 ### Minimal cold-boot kernel
 
 `guest/configs/minimal-x86_64.config` is the Linux 6.12 LTS config for the cold
-create-to-exec path. It has virtio-mmio block, net, and vsock devices built in,
-with modules and unused device families disabled.
+create-to-exec path. It has virtio-mmio block, net, vsock, balloon, and entropy
+devices built in, with modules and unused device families disabled.
 
 The normal entry point downloads the release artifact and verifies its
 repository-pinned SHA-256. If the artifact is unavailable, it falls back to the

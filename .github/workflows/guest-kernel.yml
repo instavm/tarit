@@ -103,6 +103,7 @@ jobs:
           cmp vmm/guest/configs/minimal-x86_64.config dist/minimal-x86_64.config
           cd dist
           actual="$(sha256sum "vmlinux-${{ steps.kernel.outputs.version }}-x86_64" | awk '{print $1}')"
+          printf 'kernel sha256: %s\n' "$actual"
           test -n "${{ steps.kernel.outputs.artifact_sha256 }}"
           test "$actual" = "${{ steps.kernel.outputs.artifact_sha256 }}"
           sha256sum "vmlinux-${{ steps.kernel.outputs.version }}-x86_64" \

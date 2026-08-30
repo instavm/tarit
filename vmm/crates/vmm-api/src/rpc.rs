@@ -196,38 +196,55 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                     "live diff snapshots are not supported".into(),
                 ))
             } else if live {
-                controller
-                    .live_snapshot(vmm_core::LiveSnapshotConfig::default())
-                    .map(|result| {
-                        let termination = match result.termination {
-                            vmm_core::LiveSnapshotTermination::Converged => {
-                                tarit_proto::LiveSnapshotTermination::Converged
-                            }
-                            vmm_core::LiveSnapshotTermination::Diverging => {
-                                tarit_proto::LiveSnapshotTermination::Diverging
-                            }
-                            vmm_core::LiveSnapshotTermination::Timeout => {
-                                tarit_proto::LiveSnapshotTermination::Timeout
-                            }
-                            vmm_core::LiveSnapshotTermination::MaxRounds => {
-                                tarit_proto::LiveSnapshotTermination::MaxRounds
-                            }
-                        };
-                        let live_stats = tarit_proto::LiveSnapshotStats {
-                            rounds: result.rounds,
-                            pages_copied: result.pages_copied,
-                            final_dirty_pages: result.final_dirty_pages,
-                            elapsed_us: result.elapsed.as_micros().try_into().unwrap_or(u64::MAX),
-                            downtime_us: result.downtime.as_micros().try_into().unwrap_or(u64::MAX),
-                            termination,
-                        };
-                        (
-                            result.snapshot_path,
-                            result.overlay_path,
-                            result.integrity_path,
-                            Some(live_stats),
-                        )
-                    })
+                #[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+                {
+                    controller
+                        .live_snapshot(vmm_core::LiveSnapshotConfig::default())
+                        .map(|result| {
+                            let termination = match result.termination {
+                                vmm_core::LiveSnapshotTermination::Converged => {
+                                    tarit_proto::LiveSnapshotTermination::Converged
+                                }
+                                vmm_core::LiveSnapshotTermination::Diverging => {
+                                    tarit_proto::LiveSnapshotTermination::Diverging
+                                }
+                                vmm_core::LiveSnapshotTermination::Timeout => {
+                                    tarit_proto::LiveSnapshotTermination::Timeout
+                                }
+                                vmm_core::LiveSnapshotTermination::MaxRounds => {
+                                    tarit_proto::LiveSnapshotTermination::MaxRounds
+                                }
+                            };
+                            let live_stats = tarit_proto::LiveSnapshotStats {
+                                rounds: result.rounds,
+                                pages_copied: result.pages_copied,
+                                final_dirty_pages: result.final_dirty_pages,
+                                elapsed_us: result
+                                    .elapsed
+                                    .as_micros()
+                                    .try_into()
+                                    .unwrap_or(u64::MAX),
+                                downtime_us: result
+                                    .downtime
+                                    .as_micros()
+                                    .try_into()
+                                    .unwrap_or(u64::MAX),
+                                termination,
+                            };
+                            (
+                                result.snapshot_path,
+                                result.overlay_path,
+                                result.integrity_path,
+                                Some(live_stats),
+                            )
+                        })
+                }
+                #[cfg(not(all(feature = "boot", target_arch = "x86_64", target_os = "linux")))]
+                {
+                    Err(vmm_core::error::VmmError::Snapshot(
+                        "live snapshots require the Linux x86_64 boot feature".into(),
+                    ))
+                }
             } else {
                 controller
                     .snapshot(diff)
@@ -862,6 +879,19 @@ mod tests {
     fn dispatch_suspend_without_vm_returns_err() {
         let controller = VmmController::new();
         let resp = dispatch(ApiRequest::Suspend, &controller);
+        assert!(matches!(resp, ApiResponse::Err { .. }));
+    }
+
+    #[test]
+    fn dispatch_live_snapshot_without_vm_returns_err() {
+        let controller = VmmController::new();
+        let resp = dispatch(
+            ApiRequest::Snapshot {
+                diff: false,
+                live: true,
+            },
+            &controller,
+        );
         assert!(matches!(resp, ApiResponse::Err { .. }));
     }
 

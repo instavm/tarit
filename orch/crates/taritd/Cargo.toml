@@ -31,7 +31,7 @@ tarit-volume = { path = "../tarit-volume" }
 tarit-vmm-client = { path = "../tarit-vmm-client" }
 reqwest = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
 russh = { version = "0.61", default-features = false, features = ["aws-lc-rs", "flate2"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

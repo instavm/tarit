@@ -413,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn vcpu_profile_covers_kvm_and_lazy_balloon_syscalls() {
         let p = SeccompProfile::vcpu();
         for syscall in ["ioctl", "fcntl", "madvise", "mincore"] {

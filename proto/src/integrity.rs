@@ -137,7 +137,7 @@ impl IntegrityManifest {
                 .get(cursor..hashes_end)
                 .ok_or_else(|| IntegrityManifestError("truncated chunk hashes".into()))?;
             let mut chunk_hashes = Vec::with_capacity(expected_count);
-            for hash in encoded_hashes.chunks_exact(HASH_LEN) {
+            for hash in encoded_hashes.chunks(HASH_LEN) {
                 chunk_hashes.push(hash.try_into().expect("32-byte hash"));
             }
             artifacts.push(ArtifactIntegrity {

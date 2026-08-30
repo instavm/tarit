@@ -4,8 +4,9 @@ use rustls::{
     server::WebPkiClientVerifier,
     ClientConfig, RootCertStore, ServerConfig,
 };
+use rustls_pki_types::pem::PemObject;
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::BufReader, sync::Arc};
+use std::sync::Arc;
 
 use crate::config::PeerTlsConfig;
 
@@ -17,9 +18,10 @@ fn ensure_crypto_provider() {
 }
 
 fn certificate_chain(path: &std::path::Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).with_context(|| format!("open certificate {}", path.display()))?;
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(file))
-        .collect::<std::io::Result<Vec<_>>>()
+    let pem =
+        std::fs::read(path).with_context(|| format!("read certificate {}", path.display()))?;
+    let certificates = CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("parse certificate {}", path.display()))?;
     if certificates.is_empty() {
         bail!(
@@ -58,10 +60,10 @@ fn private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {
             );
         }
     }
-    let file = File::open(path).with_context(|| format!("open private key {}", path.display()))?;
-    rustls_pemfile::private_key(&mut BufReader::new(file))
-        .with_context(|| format!("parse private key {}", path.display()))?
-        .ok_or_else(|| anyhow::anyhow!("private key file {} contains no key", path.display()))
+    let pem =
+        std::fs::read(path).with_context(|| format!("read private key {}", path.display()))?;
+    PrivateKeyDer::from_pem_slice(&pem)
+        .with_context(|| format!("parse private key {}", path.display()))
 }
 
 fn trust_roots(path: &std::path::Path) -> Result<RootCertStore> {

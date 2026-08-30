@@ -2629,7 +2629,12 @@ pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-#[cfg(feature = "test-failpoints")]
+#[cfg(all(
+    feature = "test-failpoints",
+    target_arch = "x86_64",
+    target_os = "linux",
+    feature = "boot"
+))]
 fn inject_live_snapshot_controller_failure(phase: &str) -> Result<()> {
     if std::env::var_os("TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE").as_deref()
         == Some(std::ffi::OsStr::new(phase))
@@ -2641,7 +2646,12 @@ fn inject_live_snapshot_controller_failure(phase: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "test-failpoints"))]
+#[cfg(all(
+    not(feature = "test-failpoints"),
+    target_arch = "x86_64",
+    target_os = "linux",
+    feature = "boot"
+))]
 fn inject_live_snapshot_controller_failure(_phase: &str) -> Result<()> {
     Ok(())
 }
