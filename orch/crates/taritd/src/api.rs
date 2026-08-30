@@ -68,11 +68,11 @@ use tarit_store::{Store, VolumeTransition};
 use tarit_types::{
     AuditEvent, BranchRecord, CreateBranchRequest, CreateShareRequest, CreateVmRequest,
     CreateVolumeRequest, EgressPolicyRecord, EgressUpdateRequest, ErrorBody, ExecuteRequest,
-    ExecutionRecord, ExecutionStatus, ForkVmRequest, ForkVmResponse, OrchError, PublicVmRecord,
-    PublicVolumeRecord, PutEgressPolicyRequest, RestoreBranchRequest, ShareRecord,
-    ShareTokenResponse, ShareVisibility, SnapshotRequest, SnapshotResponse,
-    UpdateBranchHeadRequest, UpdateShareRequest, UsageEvent, UsageSummary, VmRecord, VmStatus,
-    VolumeCapabilities, VolumeRecord, VolumeStatus, VolumeStorageClass,
+    ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ForkVmRequest,
+    ForkVmResponse, OrchError, PublicVmRecord, PublicVolumeRecord, PutEgressPolicyRequest,
+    RestoreBranchRequest, ShareRecord, ShareTokenResponse, ShareVisibility, SnapshotRequest,
+    SnapshotResponse, UpdateBranchHeadRequest, UpdateShareRequest, UsageEvent, UsageSummary,
+    VmRecord, VmStatus, VolumeCapabilities, VolumeRecord, VolumeStatus, VolumeStorageClass,
 };
 use tarit_volume::{VolumeError, MIN_BLOCK_VOLUME_BYTES};
 use tower_http::trace::TraceLayer;
@@ -2072,9 +2072,9 @@ async fn reserve_vm_quota(
     identity: &ApiIdentity,
     id: Uuid,
 ) -> Result<bool, OrchError> {
-    let Some(max_vms) = identity.max_vms else {
-        return Ok(false);
-    };
+    // Reservations fence VM ids as well as quota. Keep that protection for
+    // unlimited tenants so concurrent create/fork requests cannot share an id.
+    let max_vms = identity.max_vms.unwrap_or(usize::MAX);
     let ttl_ms = state
         .config
         .admission_timeout_ms
@@ -2532,12 +2532,265 @@ async fn snapshot_vm(
     Ok(Json(out))
 }
 
+async fn get_fork_operation(
+    state: &AppState,
+    child_vm_id: Uuid,
+) -> Result<Option<ForkOperationRecord>, OrchError> {
+    if let Some(fleet) = &state.fleet {
+        return fleet
+            .get_fork_operation(child_vm_id)
+            .await
+            .map_err(|error| OrchError::Internal(format!("fork operation lookup: {error}")));
+    }
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .get_fork_operation(child_vm_id)
+        .map_err(store_err)
+}
+
+async fn get_vm_for_fork_replay(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> Result<VmRecord, OrchError> {
+    match cluster::resolve_owner(state, id).await? {
+        Owner::Local => {
+            let vm = ops::get_local(state, id)?;
+            ensure_vm_access(identity, &vm)?;
+            Ok(vm)
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.get_remote(&rpc, id, &identity))
+                .await
+                .map_err(|error| OrchError::Internal(format!("fork replay lookup join: {error}")))?
+        }
+    }
+}
+
+fn fork_child_incarnation_matches(
+    fleet_precision: bool,
+    expected: chrono::DateTime<Utc>,
+    actual: chrono::DateTime<Utc>,
+) -> bool {
+    if fleet_precision {
+        expected.timestamp_micros() == actual.timestamp_micros()
+    } else {
+        expected == actual
+    }
+}
+
+async fn commit_fork_operation(
+    state: &AppState,
+    operation: &ForkOperationRecord,
+    child_created_at: chrono::DateTime<Utc>,
+) -> Result<(), OrchError> {
+    if let Some(fleet) = &state.fleet {
+        return fleet
+            .commit_fork_operation(
+                operation.child_vm_id,
+                operation.source_vm_id,
+                &operation.owner_key,
+                child_created_at,
+                Utc::now(),
+            )
+            .await
+            .map_err(|error| OrchError::Internal(format!("commit fork operation: {error}")));
+    }
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .commit_fork_operation(
+            operation.child_vm_id,
+            operation.source_vm_id,
+            &operation.owner_key,
+            child_created_at,
+            Utc::now(),
+        )
+        .map_err(store_err)
+}
+
+async fn claim_fork_operation(
+    state: &AppState,
+    identity: &ApiIdentity,
+    operation: &ForkOperationRecord,
+) -> Result<(), OrchError> {
+    let ttl_ms = state
+        .config
+        .admission_timeout_ms
+        .saturating_add(5 * 60 * 1_000)
+        .min(i64::MAX as u64) as i64;
+    let expires_at = Utc::now() + chrono::Duration::milliseconds(ttl_ms);
+    let max_vms = identity.max_vms.unwrap_or(usize::MAX);
+    if let Some(fleet) = &state.fleet {
+        return match fleet
+            .claim_fork_operation(operation, max_vms, expires_at)
+            .await
+        {
+            Ok(tarit_fleet::ForkOperationClaimOutcome::New)
+            | Ok(tarit_fleet::ForkOperationClaimOutcome::Resumed) => Ok(()),
+            Ok(tarit_fleet::ForkOperationClaimOutcome::InProgress) => {
+                Err(OrchError::Conflict(format!(
+                    "fork child {} is already being prepared",
+                    operation.child_vm_id
+                )))
+            }
+            Ok(tarit_fleet::ForkOperationClaimOutcome::Committed) => {
+                Err(OrchError::Conflict(format!(
+                    "fork child {} was committed concurrently; retry",
+                    operation.child_vm_id
+                )))
+            }
+            Err(tarit_fleet::FleetError::QuotaExceeded { .. }) => {
+                Err(OrchError::Forbidden(format!(
+                    "tenant {} VM quota exceeded: max_vms {max_vms}",
+                    identity.tenant
+                )))
+            }
+            Err(tarit_fleet::FleetError::Conflict(message)) => Err(OrchError::Conflict(message)),
+            Err(error) => Err(OrchError::Internal(format!(
+                "claim fleet fork operation: {error}"
+            ))),
+        };
+    }
+    match state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .claim_fork_operation(operation, max_vms, expires_at)
+        .map_err(store_err)?
+    {
+        tarit_store::ForkOperationClaimOutcome::New
+        | tarit_store::ForkOperationClaimOutcome::Resumed => Ok(()),
+        tarit_store::ForkOperationClaimOutcome::InProgress => Err(OrchError::Conflict(format!(
+            "fork child {} is already being prepared",
+            operation.child_vm_id
+        ))),
+        tarit_store::ForkOperationClaimOutcome::Committed => Err(OrchError::Conflict(format!(
+            "fork child {} was committed concurrently; retry",
+            operation.child_vm_id
+        ))),
+        tarit_store::ForkOperationClaimOutcome::QuotaExceeded => {
+            Err(OrchError::Forbidden(format!(
+                "tenant {} VM quota exceeded: max_vms {max_vms}",
+                identity.tenant
+            )))
+        }
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+async fn fork_after_child_failpoint(child_vm_id: Uuid) {
+    let Ok(value) = std::env::var("TARIT_TEST_FORK_PAUSE_AFTER_CHILD_MS") else {
+        return;
+    };
+    let Ok(milliseconds) = value.parse::<u64>() else {
+        return;
+    };
+    if milliseconds == 0 {
+        return;
+    }
+    tracing::warn!(vm = %child_vm_id, milliseconds, "test fork paused after child persistence");
+    tokio::time::sleep(std::time::Duration::from_millis(milliseconds)).await;
+}
+
+#[cfg(not(feature = "test-failpoints"))]
+async fn fork_after_child_failpoint(_child_vm_id: Uuid) {}
+
 async fn fork_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(source_id): Path<Uuid>,
-    Json(mut body): Json<ForkVmRequest>,
+    Json(body): Json<ForkVmRequest>,
 ) -> Result<(StatusCode, Json<ForkVmResponse>), ApiError> {
+    let child_id = body.id.unwrap_or_else(Uuid::new_v4);
+    let existing_operation = if body.id.is_some() {
+        get_fork_operation(&state, child_id).await?
+    } else {
+        None
+    };
+    if let Some(operation) = &existing_operation {
+        if operation.owner_key != identity.tenant {
+            return Err(OrchError::NotFound("fork operation not found".into()).into());
+        }
+        if operation.source_vm_id != source_id {
+            return Err(OrchError::Conflict(format!(
+                "fork child {child_id} is bound to source {}",
+                operation.source_vm_id
+            ))
+            .into());
+        }
+        match get_vm_for_fork_replay(&state, &identity, child_id).await {
+            Ok(child) => {
+                if child.host_id != operation.target_host_id {
+                    return Err(OrchError::Conflict(format!(
+                        "fork child {child_id} is owned by unexpected host {}",
+                        child.host_id
+                    ))
+                    .into());
+                }
+                if let Some(expected_created_at) = operation.child_created_at {
+                    if !fork_child_incarnation_matches(
+                        state.fleet.is_some(),
+                        expected_created_at,
+                        child.created_at,
+                    ) {
+                        return Err(OrchError::Conflict(format!(
+                            "fork child {child_id} belongs to another VM incarnation"
+                        ))
+                        .into());
+                    }
+                } else {
+                    if child.status != VmStatus::Running {
+                        return Err(OrchError::Unavailable(format!(
+                            "interrupted fork child {child_id} is not safely runnable"
+                        ))
+                        .into());
+                    }
+                    // The process may have died after the fully repaired child
+                    // became durable but before it committed the operation.
+                    // The pre-created operation plus global VM-id reservation
+                    // proves this child belongs to this source-bound attempt.
+                    commit_fork_operation(&state, operation, child.created_at).await?;
+                }
+                if matches!(
+                    child.status,
+                    VmStatus::Creating | VmStatus::Stopped | VmStatus::Error
+                ) {
+                    return Err(OrchError::Unavailable(format!(
+                        "fork child {child_id} is not available"
+                    ))
+                    .into());
+                }
+                return Ok((
+                    StatusCode::OK,
+                    Json(ForkVmResponse {
+                        source_vm_id: source_id,
+                        vm: PublicVmRecord::from(child),
+                    }),
+                ));
+            }
+            Err(OrchError::NotFound(_)) if operation.status == ForkOperationStatus::Preparing => {}
+            Err(OrchError::NotFound(_)) => {
+                return Err(OrchError::Unavailable(format!(
+                    "committed fork child {child_id} is temporarily unavailable"
+                ))
+                .into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if operation.status == ForkOperationStatus::Committed {
+            return Err(OrchError::Unavailable(format!(
+                "committed fork child {child_id} is temporarily unavailable"
+            ))
+            .into());
+        }
+    }
+
     let owner = cluster::resolve_owner(&state, source_id).await?;
     let (source, remote_source) = match &owner {
         Owner::Local => {
@@ -2571,16 +2824,29 @@ async fn fork_vm(
         ))
         .into());
     }
-    let child_id = *body.id.get_or_insert_with(Uuid::new_v4);
-    match cluster::resolve_owner(&state, child_id).await {
-        Ok(_) => {
-            return Err(OrchError::Conflict(format!("vm {child_id} already exists")).into());
+    if let Some(operation) = &existing_operation {
+        if source.host_id != operation.source_host_id {
+            return Err(OrchError::Conflict(format!(
+                "fork child {child_id} was prepared from source host {}, but source {source_id} is now on {}",
+                operation.source_host_id, source.host_id
+            ))
+            .into());
         }
-        Err(OrchError::NotFound(_)) => {}
-        Err(error) => return Err(error.into()),
     }
-
-    let reserved = reserve_vm_quota(&state, &identity, child_id).await?;
+    let now = Utc::now();
+    let operation = existing_operation.unwrap_or(ForkOperationRecord {
+        child_vm_id: child_id,
+        source_vm_id: source_id,
+        owner_key: identity.tenant.clone(),
+        source_host_id: source.host_id.clone(),
+        target_host_id: state.config.host_id.clone(),
+        status: ForkOperationStatus::Preparing,
+        child_created_at: None,
+        created_at: now,
+        updated_at: now,
+    });
+    claim_fork_operation(&state, &identity, &operation).await?;
+    let reserved = true;
     let result = async {
         let (child, source_host) = if let Some(remote_source) = remote_source {
             // The target contains the source host's current boot session. Every
@@ -2640,6 +2906,8 @@ async fn fork_vm(
             .await?;
             (child, None)
         };
+        fork_after_child_failpoint(child_id).await;
+        commit_fork_operation(&state, &operation, child.created_at).await?;
         audit::record(
             &state,
             &identity,
@@ -4034,6 +4302,146 @@ mod tests {
             serde_json::json!({}),
         ));
         assert_eq!(paused_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn fleet_fork_incarnation_fence_uses_postgres_microsecond_precision() {
+        let persisted = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_000).unwrap();
+        let local_cache = chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        assert!(fork_child_incarnation_matches(true, persisted, local_cache));
+        assert!(!fork_child_incarnation_matches(
+            false,
+            persisted,
+            local_cache
+        ));
+    }
+
+    #[test]
+    fn interrupted_live_fork_recovers_and_replays_exact_child_without_source() {
+        let state = test_state();
+        let source_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let now = Utc::now();
+        let operation = ForkOperationRecord {
+            child_vm_id: child_id,
+            source_vm_id: source_id,
+            owner_key: "tenant-a".into(),
+            source_host_id: state.config.host_id.clone(),
+            target_host_id: state.config.host_id.clone(),
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let store = state.store.lock().unwrap();
+            assert_eq!(
+                store
+                    .claim_fork_operation(&operation, 2, now + chrono::Duration::minutes(1))
+                    .unwrap(),
+                tarit_store::ForkOperationClaimOutcome::New
+            );
+        }
+        insert_vm(&state, child_id, "tenant-a", VmStatus::Running);
+        let child_created_at = state
+            .vm_cache
+            .read()
+            .unwrap()
+            .get(&child_id)
+            .unwrap()
+            .created_at;
+        let state_check = state.clone();
+        let app = router(state);
+        let rt = test_runtime();
+        let replay = rt.block_on(request_json(
+            app.clone(),
+            "POST",
+            &format!("/v1/vms/{source_id}/fork"),
+            "tenant-a-key",
+            serde_json::json!({"id": child_id}),
+        ));
+        assert_eq!(replay.status(), StatusCode::OK);
+        let recovered = state_check
+            .store
+            .lock()
+            .unwrap()
+            .get_fork_operation(child_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ForkOperationStatus::Committed);
+        assert_eq!(recovered.child_created_at, Some(child_created_at));
+
+        let replay_again = rt.block_on(request_json(
+            app.clone(),
+            "POST",
+            &format!("/v1/vms/{source_id}/fork"),
+            "tenant-a-key",
+            serde_json::json!({"id": child_id}),
+        ));
+        assert_eq!(replay_again.status(), StatusCode::OK);
+
+        let wrong_source = rt.block_on(request_json(
+            app.clone(),
+            "POST",
+            &format!("/v1/vms/{}/fork", Uuid::new_v4()),
+            "tenant-a-key",
+            serde_json::json!({"id": child_id}),
+        ));
+        assert_eq!(wrong_source.status(), StatusCode::CONFLICT);
+
+        let foreign = rt.block_on(request_json(
+            app.clone(),
+            "POST",
+            &format!("/v1/vms/{source_id}/fork"),
+            "tenant-b-key",
+            serde_json::json!({"id": child_id}),
+        ));
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+        let failed_source = Uuid::new_v4();
+        let failed_child = Uuid::new_v4();
+        let failed_operation = ForkOperationRecord {
+            child_vm_id: failed_child,
+            source_vm_id: failed_source,
+            owner_key: "tenant-a".into(),
+            source_host_id: state_check.config.host_id.clone(),
+            target_host_id: state_check.config.host_id.clone(),
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state_check
+            .store
+            .lock()
+            .unwrap()
+            .claim_fork_operation(
+                &failed_operation,
+                3,
+                Utc::now() + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        insert_vm(&state_check, failed_child, "tenant-a", VmStatus::Error);
+        let failed_replay = rt.block_on(request_json(
+            app,
+            "POST",
+            &format!("/v1/vms/{failed_source}/fork"),
+            "tenant-a-key",
+            serde_json::json!({"id": failed_child}),
+        ));
+        assert_eq!(failed_replay.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state_check
+                .store
+                .lock()
+                .unwrap()
+                .get_fork_operation(failed_child)
+                .unwrap()
+                .unwrap()
+                .status,
+            ForkOperationStatus::Preparing,
+            "an errored child must not be committed by retry recovery"
+        );
     }
 
     #[test]

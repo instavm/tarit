@@ -7,9 +7,10 @@ use std::time::Duration;
 use tarit_types::{
     ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
     ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
-    ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, SshKeyRecord, UsageEvent,
-    UsageKind, VmRecord, VmRuntimeLayout, VmStartupPath, VmStatus, VmVolumeAttachmentRecord,
-    VolumeAttachmentMode, VolumeCapabilities, VolumeRecord, VolumeStatus, VolumeStorageClass,
+    ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ShareRecord,
+    ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, VmRecord, VmRuntimeLayout, VmStartupPath,
+    VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord,
+    VolumeStatus, VolumeStorageClass,
 };
 use uuid::Uuid;
 
@@ -118,6 +119,15 @@ pub enum VmQuotaReservationOutcome {
     IdConflict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkOperationClaimOutcome {
+    New,
+    Resumed,
+    InProgress,
+    Committed,
+    QuotaExceeded,
+}
+
 pub struct VolumeTransition<'a> {
     pub expected_status: VolumeStatus,
     pub expected_revision: u64,
@@ -178,6 +188,19 @@ impl Store {
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS vm_fork_operations (
+               child_vm_id TEXT PRIMARY KEY NOT NULL,
+               source_vm_id TEXT NOT NULL,
+               owner_key TEXT NOT NULL,
+               source_host_id TEXT NOT NULL,
+               target_host_id TEXT NOT NULL,
+               status TEXT NOT NULL CHECK (status IN ('preparing','committed')),
+               child_created_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS vm_fork_operations_source
+               ON vm_fork_operations(owner_key, source_vm_id);
              CREATE TABLE IF NOT EXISTS hosts (
                host_id TEXT PRIMARY KEY NOT NULL,
                boot_session_id TEXT,
@@ -1646,7 +1669,11 @@ impl Store {
             return Ok(VmQuotaReservationOutcome::IdConflict);
         }
         let already_exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM vms WHERE id = ?1)",
+            "SELECT EXISTS(
+               SELECT 1 FROM vms WHERE id = ?1
+               UNION ALL
+               SELECT 1 FROM vm_fork_operations WHERE child_vm_id = ?1
+             )",
             params![id.to_string()],
             |row| row.get(0),
         )?;
@@ -1676,6 +1703,184 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(VmQuotaReservationOutcome::Reserved)
+    }
+
+    /// Atomically bind a fork id to its tenant and source while reserving its
+    /// admission slot. A matching interrupted operation may reacquire an
+    /// expired/released reservation; no other create or fork may share it.
+    pub fn claim_fork_operation(
+        &self,
+        operation: &ForkOperationRecord,
+        max_vms: usize,
+        expires_at: DateTime<Utc>,
+    ) -> Result<ForkOperationClaimOutcome, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "DELETE FROM vm_quota_reservations WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        let existing = tx
+            .query_row(
+                "SELECT child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
+                        status, child_created_at, created_at, updated_at
+                 FROM vm_fork_operations WHERE child_vm_id = ?1",
+                params![operation.child_vm_id.to_string()],
+                row_to_fork_operation,
+            )
+            .optional()?;
+        let outcome = if let Some(existing) = existing {
+            if existing.source_vm_id != operation.source_vm_id
+                || existing.owner_key != operation.owner_key
+                || existing.source_host_id != operation.source_host_id
+                || existing.target_host_id != operation.target_host_id
+            {
+                return Err(StoreError::Conflict(format!(
+                    "fork child {} is already bound to another operation",
+                    operation.child_vm_id
+                )));
+            }
+            if existing.status == ForkOperationStatus::Committed {
+                tx.commit()?;
+                return Ok(ForkOperationClaimOutcome::Committed);
+            }
+            ForkOperationClaimOutcome::Resumed
+        } else {
+            let vm_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM vms WHERE id = ?1)",
+                params![operation.child_vm_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if vm_exists {
+                return Err(StoreError::Conflict(format!(
+                    "VM {} already exists",
+                    operation.child_vm_id
+                )));
+            }
+            tx.execute(
+                "INSERT INTO vm_fork_operations (
+                   child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
+                   status, child_created_at, created_at, updated_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8)",
+                params![
+                    operation.child_vm_id.to_string(),
+                    operation.source_vm_id.to_string(),
+                    operation.owner_key,
+                    operation.source_host_id,
+                    operation.target_host_id,
+                    ForkOperationStatus::Preparing.as_str(),
+                    operation.created_at.to_rfc3339(),
+                    operation.updated_at.to_rfc3339(),
+                ],
+            )?;
+            ForkOperationClaimOutcome::New
+        };
+
+        let reservation_owner = tx
+            .query_row(
+                "SELECT owner_key FROM vm_quota_reservations WHERE id = ?1",
+                params![operation.child_vm_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match reservation_owner {
+            Some(owner) if owner != operation.owner_key => {
+                return Err(StoreError::Conflict(format!(
+                    "VM {} reservation belongs to another tenant",
+                    operation.child_vm_id
+                )));
+            }
+            Some(_) => {
+                if outcome == ForkOperationClaimOutcome::Resumed {
+                    tx.commit()?;
+                    return Ok(ForkOperationClaimOutcome::InProgress);
+                }
+                tx.execute(
+                    "UPDATE vm_quota_reservations SET expires_at = ?2 WHERE id = ?1",
+                    params![operation.child_vm_id.to_string(), expires_at.to_rfc3339()],
+                )?;
+            }
+            None => {
+                let child_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM vms WHERE id = ?1)",
+                    params![operation.child_vm_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if !child_exists {
+                    let active: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM (
+                           SELECT id FROM vms
+                            WHERE owner_key = ?1 AND status IN ('creating','running','paused','suspended')
+                           UNION
+                           SELECT id FROM vm_quota_reservations
+                            WHERE owner_key = ?1 AND expires_at > ?2
+                         )",
+                        params![operation.owner_key, now],
+                        |row| row.get(0),
+                    )?;
+                    if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
+                        return Ok(ForkOperationClaimOutcome::QuotaExceeded);
+                    }
+                    tx.execute(
+                        "INSERT INTO vm_quota_reservations (id, owner_key, expires_at)
+                         VALUES (?1,?2,?3)",
+                        params![
+                            operation.child_vm_id.to_string(),
+                            operation.owner_key,
+                            expires_at.to_rfc3339()
+                        ],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn get_fork_operation(
+        &self,
+        child_vm_id: Uuid,
+    ) -> Result<Option<ForkOperationRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
+                        status, child_created_at, created_at, updated_at
+                 FROM vm_fork_operations WHERE child_vm_id = ?1",
+                params![child_vm_id.to_string()],
+                row_to_fork_operation,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn commit_fork_operation(
+        &self,
+        child_vm_id: Uuid,
+        source_vm_id: Uuid,
+        owner_key: &str,
+        child_created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE vm_fork_operations
+             SET status = 'committed', child_created_at = ?4, updated_at = ?5
+             WHERE child_vm_id = ?1 AND source_vm_id = ?2 AND owner_key = ?3
+               AND (status = 'preparing'
+                    OR (status = 'committed' AND child_created_at = ?4))",
+            params![
+                child_vm_id.to_string(),
+                source_vm_id.to_string(),
+                owner_key,
+                child_created_at.to_rfc3339(),
+                updated_at.to_rfc3339(),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Conflict(format!(
+                "fork child {child_vm_id} operation changed concurrently"
+            )));
+        }
+        Ok(())
     }
 
     pub fn release_vm_quota(&self, owner_key: &str, id: Uuid) -> Result<(), StoreError> {
@@ -2614,6 +2819,33 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
         runtime_layout,
         socket_path: row.get(16)?,
         pid: row.get(17)?,
+        created_at: parse_ts(&created_at)?,
+        updated_at: parse_ts(&updated_at)?,
+    })
+}
+
+fn row_to_fork_operation(row: &rusqlite::Row<'_>) -> Result<ForkOperationRecord, rusqlite::Error> {
+    let child_vm_id: String = row.get(0)?;
+    let source_vm_id: String = row.get(1)?;
+    let status: String = row.get(5)?;
+    let child_created_at: Option<String> = row.get(6)?;
+    let created_at: String = row.get(7)?;
+    let updated_at: String = row.get(8)?;
+    let status = ForkOperationStatus::parse(&status).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            format!("invalid fork operation status {status}").into(),
+        )
+    })?;
+    Ok(ForkOperationRecord {
+        child_vm_id: parse_uuid_col(&child_vm_id, 0)?,
+        source_vm_id: parse_uuid_col(&source_vm_id, 1)?,
+        owner_key: row.get(2)?,
+        source_host_id: row.get(3)?,
+        target_host_id: row.get(4)?,
+        status,
+        child_created_at: child_created_at.as_deref().map(parse_ts).transpose()?,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
     })
@@ -3672,6 +3904,93 @@ mod tests {
                 .reserve_vm_quota(owner, Uuid::new_v4(), 1, expiry)
                 .unwrap(),
             VmQuotaReservationOutcome::Reserved
+        );
+    }
+
+    #[test]
+    fn fork_operation_is_source_bound_recoverable_and_incarnation_fenced() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let operation = ForkOperationRecord {
+            child_vm_id: Uuid::new_v4(),
+            source_vm_id: Uuid::new_v4(),
+            owner_key: "tenant-a".into(),
+            source_host_id: "host-a".into(),
+            target_host_id: "host-b".into(),
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let expiry = now + chrono::Duration::minutes(1);
+
+        assert_eq!(
+            store.claim_fork_operation(&operation, 2, expiry).unwrap(),
+            ForkOperationClaimOutcome::New
+        );
+        assert_eq!(
+            store.claim_fork_operation(&operation, 2, expiry).unwrap(),
+            ForkOperationClaimOutcome::InProgress
+        );
+
+        let wrong_source = ForkOperationRecord {
+            source_vm_id: Uuid::new_v4(),
+            ..operation.clone()
+        };
+        assert!(matches!(
+            store.claim_fork_operation(&wrong_source, 2, expiry),
+            Err(StoreError::Conflict(_))
+        ));
+
+        store
+            .release_vm_quota(&operation.owner_key, operation.child_vm_id)
+            .unwrap();
+        assert_eq!(
+            store.claim_fork_operation(&operation, 2, expiry).unwrap(),
+            ForkOperationClaimOutcome::Resumed
+        );
+
+        let child_created_at = now + chrono::Duration::seconds(1);
+        store
+            .commit_fork_operation(
+                operation.child_vm_id,
+                operation.source_vm_id,
+                &operation.owner_key,
+                child_created_at,
+                Utc::now(),
+            )
+            .unwrap();
+        let committed = store
+            .get_fork_operation(operation.child_vm_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.status, ForkOperationStatus::Committed);
+        assert_eq!(committed.child_created_at, Some(child_created_at));
+        assert!(matches!(
+            store.commit_fork_operation(
+                operation.child_vm_id,
+                operation.source_vm_id,
+                &operation.owner_key,
+                Utc::now(),
+                Utc::now(),
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+
+        store
+            .release_vm_quota(&operation.owner_key, operation.child_vm_id)
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_vm_quota(
+                    &operation.owner_key,
+                    operation.child_vm_id,
+                    usize::MAX,
+                    expiry,
+                )
+                .unwrap(),
+            VmQuotaReservationOutcome::IdConflict,
+            "a committed fork id must never be recycled into another VM incarnation"
         );
     }
 

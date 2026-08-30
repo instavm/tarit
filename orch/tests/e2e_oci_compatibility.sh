@@ -295,7 +295,13 @@ print(row.get("stdout", "").strip())
 PY
 )
       FORK_START=$(now_ms)
-      api POST "$BASE_URL/v1/vms/$CURRENT_VM/fork" '{}' >"$DIR/fork-$name.json"
+      REQUESTED_CHILD_ID=$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)
+      api POST "$BASE_URL/v1/vms/$CURRENT_VM/fork" \
+        "{\"id\":\"$REQUESTED_CHILD_ID\"}" >"$DIR/fork-$name.json"
       FORK_END=$(now_ms)
       CURRENT_CHILD=$(python3 - "$DIR/fork-$name.json" <<'PY'
 import json,sys
@@ -303,6 +309,39 @@ row=json.load(open(sys.argv[1])); assert row.get("vm", {}).get("status") == "run
 print(row["vm"]["id"])
 PY
 )
+      [ "$CURRENT_CHILD" = "$REQUESTED_CHILD_ID" ] || {
+        echo "FAIL: fork ignored the caller's idempotency id" >&2
+        exit 1
+      }
+      RETRY_STATUS=$(curl -sS --max-time 30 -o "$DIR/fork-retry-$name.json" \
+        -w '%{http_code}' -X POST -H "X-API-Key: $KEY" \
+        -H 'Content-Type: application/json' \
+        -d "{\"id\":\"$REQUESTED_CHILD_ID\"}" \
+        "$BASE_URL/v1/vms/$CURRENT_VM/fork")
+      [ "$RETRY_STATUS" = 200 ] || {
+        echo "FAIL: idempotent fork retry returned HTTP $RETRY_STATUS" >&2
+        exit 1
+      }
+      python3 - "$DIR/fork-retry-$name.json" "$CURRENT_VM" "$CURRENT_CHILD" <<'PY'
+import json,sys
+row=json.load(open(sys.argv[1]))
+assert row.get("source_vm_id") == sys.argv[2], row
+assert row.get("vm", {}).get("id") == sys.argv[3], row
+PY
+      WRONG_SOURCE=$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)
+      WRONG_SOURCE_STATUS=$(curl -sS --max-time 30 -o "$DIR/fork-wrong-source-$name.json" \
+        -w '%{http_code}' -X POST -H "X-API-Key: $KEY" \
+        -H 'Content-Type: application/json' \
+        -d "{\"id\":\"$REQUESTED_CHILD_ID\"}" \
+        "$BASE_URL/v1/vms/$WRONG_SOURCE/fork")
+      [ "$WRONG_SOURCE_STATUS" = 409 ] || {
+        echo "FAIL: source-confused fork retry returned HTTP $WRONG_SOURCE_STATUS" >&2
+        exit 1
+      }
       wait_exec_success "$CURRENT_CHILD" \
         'grep -qx source-before-fork /root/tarit-oci-fork-state && test ! -e /run/tarit/cached-token && cmp -s /run/tarit/hook-observed /run/tarit/clone-id' \
         "$DIR/fork-ready-$name.json"

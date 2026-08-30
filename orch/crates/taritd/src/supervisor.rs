@@ -3260,10 +3260,52 @@ impl VmmSupervisor {
             data_volumes: Vec::new(),
         };
         if record.startup_path == Some(tarit_types::VmStartupPath::SnapshotRestore) {
-            self.runtime_layout_for_restore_config(record.id, &config)
+            let persisted_overlay = record
+                .runtime_layout
+                .as_ref()
+                .and_then(|layout| layout.overlay_path.as_deref())
+                .filter(|path| self.is_valid_restore_overlay_path(record.id, Path::new(path)));
+            match persisted_overlay {
+                Some(path) => {
+                    self.runtime_layout_with_overlay(record.id, &config, path.to_string())
+                }
+                None => self.runtime_layout_for_restore_config(record.id, &config),
+            }
         } else {
             self.runtime_layout_for_config(record.id, &config)
         }
+    }
+
+    fn is_valid_restore_overlay_path(&self, id: Uuid, path: &Path) -> bool {
+        if path == Path::new(&self.restore_overlay_path_for(id)) {
+            return true;
+        }
+        let (expected_parent, prefix) = match &self.jails {
+            Some(jails) => (
+                jails.root_for(id).join("assets"),
+                format!("restored-rootfs-{id}-"),
+            ),
+            None => (
+                self.config.socket_dir.join("overlays"),
+                format!("{id}-restore-"),
+            ),
+        };
+        if path.parent() != Some(expected_parent.as_path()) {
+            return false;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Some(token) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".cow"))
+        else {
+            return false;
+        };
+        token.len() == 16
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
     fn register_artifact_owner(&self, id: Uuid) -> Result<(), OrchError> {
@@ -10185,6 +10227,22 @@ mod tests {
         let next_id = Uuid::new_v4();
         let next_restored = supervisor.runtime_layout_for_restore_config(next_id, &cfg);
         assert_ne!(restored.overlay_path, next_restored.overlay_path);
+
+        let snapshot_overlay = supervisor
+            .restore_overlay_path_for_snapshot(id, Path::new("/private/snapshot-handle.ram"));
+        assert!(supervisor.is_valid_restore_overlay_path(id, Path::new(&snapshot_overlay)));
+        assert!(!supervisor.is_valid_restore_overlay_path(
+            id,
+            &root.join(format!(
+                "jails/tarit-{id}/assets/restored-rootfs-{id}-BAD.cow"
+            ))
+        ));
+        assert!(!supervisor.is_valid_restore_overlay_path(
+            id,
+            &root.join(format!(
+                "jails/tarit-{id}/elsewhere/restored-rootfs-{id}-0123456789abcdef.cow"
+            ))
+        ));
         std::fs::remove_dir_all(root).unwrap();
     }
 

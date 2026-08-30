@@ -463,6 +463,48 @@ pub struct ForkVmResponse {
     pub vm: PublicVmRecord,
 }
 
+/// Durable phase of a source-bound fork operation. `Preparing` is written
+/// before the child can be created, so a retry can distinguish interrupted
+/// work from an unrelated VM-id collision. `Committed` is fenced to the exact
+/// child incarnation by [`ForkOperationRecord::child_created_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkOperationStatus {
+    Preparing,
+    Committed,
+}
+
+impl ForkOperationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Committed => "committed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "preparing" => Some(Self::Preparing),
+            "committed" => Some(Self::Committed),
+            _ => None,
+        }
+    }
+}
+
+/// Idempotency and recovery record for one live-fork request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkOperationRecord {
+    pub child_vm_id: Uuid,
+    pub source_vm_id: Uuid,
+    pub owner_key: String,
+    pub source_host_id: String,
+    pub target_host_id: String,
+    pub status: ForkOperationStatus,
+    pub child_created_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Whether a shared VM port is public or requires a valid private-share token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -9,9 +9,10 @@ use tarit_store::{HostRecord, SnapshotRecord, VolumeTransition};
 use tarit_types::{
     ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
     ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
-    ExecutionRecord, ExecutionStatus, ShareRecord, ShareVisibility, UsageEvent, UsageSummary,
-    VmRecord, VmStartupPath, VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode,
-    VolumeCapabilities, VolumeRecord, VolumeStatus, VolumeStorageClass,
+    ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ShareRecord,
+    ShareVisibility, UsageEvent, UsageSummary, VmRecord, VmStartupPath, VmStatus,
+    VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord, VolumeStatus,
+    VolumeStorageClass,
 };
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
@@ -67,6 +68,14 @@ pub struct FleetExecutionRecord {
     pub owner_key: String,
     pub api_key_id: String,
     pub host_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkOperationClaimOutcome {
+    New,
+    Resumed,
+    InProgress,
+    Committed,
 }
 
 impl PostgresFleet {
@@ -2133,7 +2142,13 @@ impl PostgresFleet {
         )
         .await?;
         if tx
-            .query_opt("SELECT 1 FROM fleet_vms WHERE id = $1", &[&id])
+            .query_opt(
+                "SELECT 1 FROM fleet_vms WHERE id = $1
+                 UNION ALL
+                 SELECT 1 FROM fleet_vm_fork_operations WHERE child_vm_id = $1
+                 LIMIT 1",
+                &[&id],
+            )
             .await?
             .is_some()
         {
@@ -2185,6 +2200,228 @@ impl PostgresFleet {
         )
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically create or resume a source-bound fork operation and hold its
+    /// tenant admission slot. The child id cannot be claimed by an unrelated
+    /// create while the operation is preparing.
+    pub async fn claim_fork_operation(
+        &self,
+        operation: &ForkOperationRecord,
+        max_vms: usize,
+        expires_at: DateTime<Utc>,
+    ) -> Result<ForkOperationClaimOutcome, FleetError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&operation.owner_key],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM tenant_vm_reservations WHERE expires_at <= NOW()",
+            &[],
+        )
+        .await?;
+
+        let existing = tx
+            .query_opt(
+                "SELECT source_vm_id, owner_key, source_host_id, target_host_id, status,
+                        child_created_at, created_at, updated_at
+                 FROM fleet_vm_fork_operations WHERE child_vm_id = $1",
+                &[&operation.child_vm_id],
+            )
+            .await?;
+        let outcome = if let Some(row) = existing {
+            let source_vm_id: Uuid = row.get(0);
+            let owner_key: String = row.get(1);
+            let source_host_id: String = row.get(2);
+            let target_host_id: String = row.get(3);
+            let status: String = row.get(4);
+            if source_vm_id != operation.source_vm_id
+                || owner_key != operation.owner_key
+                || source_host_id != operation.source_host_id
+                || target_host_id != operation.target_host_id
+            {
+                return Err(FleetError::Conflict(format!(
+                    "fork child {} is already bound to another operation",
+                    operation.child_vm_id
+                )));
+            }
+            match ForkOperationStatus::parse(&status) {
+                Some(ForkOperationStatus::Committed) => {
+                    tx.commit().await?;
+                    return Ok(ForkOperationClaimOutcome::Committed);
+                }
+                Some(ForkOperationStatus::Preparing) => ForkOperationClaimOutcome::Resumed,
+                None => {
+                    return Err(FleetError::Conflict(format!(
+                        "fork child {} has invalid durable status {status}",
+                        operation.child_vm_id
+                    )));
+                }
+            }
+        } else {
+            if tx
+                .query_opt(
+                    "SELECT 1 FROM fleet_vms WHERE id = $1",
+                    &[&operation.child_vm_id],
+                )
+                .await?
+                .is_some()
+            {
+                return Err(FleetError::Conflict(format!(
+                    "VM {} already exists",
+                    operation.child_vm_id
+                )));
+            }
+            tx.execute(
+                "INSERT INTO fleet_vm_fork_operations (
+                   child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
+                   status, child_created_at, created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,'preparing',NULL,$6,$7)",
+                &[
+                    &operation.child_vm_id,
+                    &operation.source_vm_id,
+                    &operation.owner_key,
+                    &operation.source_host_id,
+                    &operation.target_host_id,
+                    &operation.created_at,
+                    &operation.updated_at,
+                ],
+            )
+            .await?;
+            ForkOperationClaimOutcome::New
+        };
+
+        if let Some(row) = tx
+            .query_opt(
+                "SELECT owner_key FROM tenant_vm_reservations WHERE id = $1",
+                &[&operation.child_vm_id],
+            )
+            .await?
+        {
+            let existing_owner: String = row.get(0);
+            if existing_owner != operation.owner_key {
+                return Err(FleetError::Conflict(format!(
+                    "VM {} reservation belongs to another tenant",
+                    operation.child_vm_id
+                )));
+            }
+            if outcome == ForkOperationClaimOutcome::Resumed {
+                tx.commit().await?;
+                return Ok(ForkOperationClaimOutcome::InProgress);
+            }
+            tx.execute(
+                "UPDATE tenant_vm_reservations SET expires_at = $2 WHERE id = $1",
+                &[&operation.child_vm_id, &expires_at],
+            )
+            .await?;
+        } else if tx
+            .query_opt(
+                "SELECT 1 FROM fleet_vms WHERE id = $1",
+                &[&operation.child_vm_id],
+            )
+            .await?
+            .is_none()
+        {
+            let active = tx
+                .query_one(
+                    "SELECT
+                       (SELECT COUNT(*) FROM fleet_vms
+                         WHERE owner_key = $1 AND status IN ('creating','running','paused','suspended'))
+                       +
+                       (SELECT COUNT(*) FROM tenant_vm_reservations
+                         WHERE owner_key = $1 AND expires_at > NOW())",
+                    &[&operation.owner_key],
+                )
+                .await?
+                .get::<_, i64>(0);
+            if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
+                return Err(FleetError::QuotaExceeded {
+                    owner_key: operation.owner_key.clone(),
+                    max_vms,
+                });
+            }
+            tx.execute(
+                "INSERT INTO tenant_vm_reservations (id, owner_key, expires_at)
+                 VALUES ($1,$2,$3)",
+                &[&operation.child_vm_id, &operation.owner_key, &expires_at],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    pub async fn get_fork_operation(
+        &self,
+        child_vm_id: Uuid,
+    ) -> Result<Option<ForkOperationRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT source_vm_id, owner_key, source_host_id, target_host_id, status,
+                        child_created_at, created_at, updated_at
+                 FROM fleet_vm_fork_operations WHERE child_vm_id = $1",
+                &[&child_vm_id],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let status: String = row.get(4);
+        let status = ForkOperationStatus::parse(&status).ok_or_else(|| {
+            FleetError::Conflict(format!(
+                "fork child {child_vm_id} has invalid durable status {status}"
+            ))
+        })?;
+        Ok(Some(ForkOperationRecord {
+            child_vm_id,
+            source_vm_id: row.get(0),
+            owner_key: row.get(1),
+            source_host_id: row.get(2),
+            target_host_id: row.get(3),
+            status,
+            child_created_at: row.get(5),
+            created_at: row.get(6),
+            updated_at: row.get(7),
+        }))
+    }
+
+    pub async fn commit_fork_operation(
+        &self,
+        child_vm_id: Uuid,
+        source_vm_id: Uuid,
+        owner_key: &str,
+        child_created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+    ) -> Result<(), FleetError> {
+        let child_created_at = normalize_timestamp_for_postgres(child_created_at);
+        let updated_at = normalize_timestamp_for_postgres(updated_at);
+        let client = self.pool.get().await?;
+        let changed = client
+            .execute(
+                "UPDATE fleet_vm_fork_operations
+                 SET status = 'committed', child_created_at = $4, updated_at = $5
+                 WHERE child_vm_id = $1 AND source_vm_id = $2 AND owner_key = $3
+                   AND (status = 'preparing'
+                        OR (status = 'committed' AND child_created_at = $4))",
+                &[
+                    &child_vm_id,
+                    &source_vm_id,
+                    &owner_key,
+                    &child_created_at,
+                    &updated_at,
+                ],
+            )
+            .await?;
+        if changed != 1 {
+            return Err(FleetError::Conflict(format!(
+                "fork child {child_vm_id} operation changed concurrently"
+            )));
+        }
         Ok(())
     }
 
@@ -2717,6 +2954,19 @@ CREATE TABLE IF NOT EXISTS fleet_vms (
   updated_at TIMESTAMPTZ NOT NULL,
   generation BIGINT NOT NULL DEFAULT 1 CHECK (generation > 0)
 );
+CREATE TABLE IF NOT EXISTS fleet_vm_fork_operations (
+  child_vm_id UUID PRIMARY KEY,
+  source_vm_id UUID NOT NULL,
+  owner_key TEXT NOT NULL,
+  source_host_id TEXT NOT NULL,
+  target_host_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('preparing','committed')),
+  child_created_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fleet_vm_fork_operations_source
+  ON fleet_vm_fork_operations(owner_key, source_vm_id);
 CREATE TABLE IF NOT EXISTS fleet_hibernations (
   vm_id UUID PRIMARY KEY REFERENCES fleet_vms(id) ON DELETE CASCADE,
   owner_key TEXT NOT NULL,
@@ -3522,6 +3772,7 @@ mod tests {
         assert!(FLEET_SCHEMA.contains("snapshot_id UUID PRIMARY KEY"));
         assert!(FLEET_SCHEMA.contains("generation BIGINT NOT NULL DEFAULT 1"));
         assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS tenant_vm_reservations"));
+        assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_vm_fork_operations"));
         assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_executions"));
         assert!(FLEET_SCHEMA.contains("fleet_executions_host_status"));
         assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_artifacts"));
@@ -3537,6 +3788,111 @@ mod tests {
         assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_volumes"));
         assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_vm_volume_attachments"));
         assert!(FLEET_SCHEMA.contains("fleet_volume_writer_lookup"));
+    }
+
+    #[tokio::test]
+    async fn fork_operation_is_source_bound_and_recoverable_in_postgres() -> Result<(), FleetError>
+    {
+        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+            eprintln!("skipping PostgreSQL fork operation test: TARIT_TEST_DATABASE_URL is absent");
+            return Ok(());
+        };
+        if database_url.is_empty() {
+            return Ok(());
+        }
+        let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let now = Utc::now();
+        let operation = ForkOperationRecord {
+            child_vm_id: Uuid::new_v4(),
+            source_vm_id: Uuid::new_v4(),
+            owner_key: format!("fork-owner-{}", Uuid::new_v4()),
+            source_host_id: "source-host".into(),
+            target_host_id: "target-host".into(),
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let expiry = now + chrono::Duration::minutes(1);
+        let result = async {
+            assert_eq!(
+                fleet.claim_fork_operation(&operation, 2, expiry).await?,
+                ForkOperationClaimOutcome::New
+            );
+            assert_eq!(
+                fleet.claim_fork_operation(&operation, 2, expiry).await?,
+                ForkOperationClaimOutcome::InProgress
+            );
+            let wrong_source = ForkOperationRecord {
+                source_vm_id: Uuid::new_v4(),
+                ..operation.clone()
+            };
+            assert!(matches!(
+                fleet.claim_fork_operation(&wrong_source, 2, expiry).await,
+                Err(FleetError::Conflict(_))
+            ));
+
+            fleet
+                .release_vm_quota(&operation.owner_key, operation.child_vm_id)
+                .await?;
+            assert_eq!(
+                fleet.claim_fork_operation(&operation, 2, expiry).await?,
+                ForkOperationClaimOutcome::Resumed
+            );
+            let child_created_at = Utc::now();
+            fleet
+                .commit_fork_operation(
+                    operation.child_vm_id,
+                    operation.source_vm_id,
+                    &operation.owner_key,
+                    child_created_at,
+                    Utc::now(),
+                )
+                .await?;
+            let committed = fleet
+                .get_fork_operation(operation.child_vm_id)
+                .await?
+                .ok_or_else(|| FleetError::Config("committed fork operation is missing".into()))?;
+            assert_eq!(committed.status, ForkOperationStatus::Committed);
+            assert_eq!(committed.source_vm_id, operation.source_vm_id);
+            assert_eq!(
+                committed.child_created_at,
+                Some(normalize_timestamp_for_postgres(child_created_at))
+            );
+
+            fleet
+                .release_vm_quota(&operation.owner_key, operation.child_vm_id)
+                .await?;
+            assert!(matches!(
+                fleet
+                    .reserve_vm_quota(
+                        &operation.owner_key,
+                        operation.child_vm_id,
+                        usize::MAX,
+                        expiry,
+                    )
+                    .await,
+                Err(FleetError::Conflict(_))
+            ));
+            Ok::<(), FleetError>(())
+        }
+        .await;
+
+        let client = fleet.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM tenant_vm_reservations WHERE id = $1",
+                &[&operation.child_vm_id],
+            )
+            .await?;
+        client
+            .execute(
+                "DELETE FROM fleet_vm_fork_operations WHERE child_vm_id = $1",
+                &[&operation.child_vm_id],
+            )
+            .await?;
+        result
     }
 
     #[tokio::test]

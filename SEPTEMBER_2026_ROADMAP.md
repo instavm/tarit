@@ -868,6 +868,32 @@ OCI input was Ubuntu.
   1,079 ms. Share ingress is not claimed for these two Alpine runs because an
   unrelated host process owns the shared nftables tables; its earlier dedicated
   gate remains separate.
+- Explicit live-fork ids are now durable operation identities rather than only
+  caller-selected VM ids. SQLite and PostgreSQL persist the tenant, source VM,
+  source host, target host, `preparing`/`committed` phase, and exact child
+  `created_at` fence. VM-id reservations now protect unlimited tenants as well
+  as quota-limited tenants. A committed retry returns HTTP 200 with the same
+  child; another source or tenant cannot claim it. A production-disabled
+  failpoint paused after the repaired child was durable and before operation
+  commit. The c8i gate killed taritd with `SIGKILL`, restarted it, deleted the
+  source, replayed the request, verified the child proof and incarnation fence,
+  and rejected source confusion on Ubuntu and Alpine with Linux 6.6.155 and
+  5.10.230. The first run found that restart reconciliation recomputed an
+  unsuffixed restore-overlay name and killed a valid child whose persisted name
+  contained the snapshot digest. Reconciliation now accepts only the exact
+  persisted overlay when it remains inside the VM's expected private directory
+  and has the strict digest-suffixed name. All four crash lanes then passed.
+  The exact production taritd SHA-256
+  `b327918b8f9dbf7f9787e418c34b0dbbe032509bfb0abb92b0074b9cae9e1fc7`
+  passed fresh Ubuntu 24.04 and Alpine 3.20 OCI ingestion, live fork, immediate
+  idempotent replay, wrong-source rejection, private disk isolation,
+  hibernate, and HTTP wake on both kernels. Fork-to-ready was 6,420/6,359 ms on
+  6.6 and 6,362/6,348 ms on 5.10; HTTP wake was 1,806/1,906 ms and
+  1,792/1,777 ms. The 399-test taritd suite, all workspace tests, and strict
+  all-target/all-feature Clippy pass. The same source-bound claim/resume/commit,
+  wrong-source rejection, and terminal id-reuse fence also passed against a
+  disposable real PostgreSQL database on c8i. Cross-node process-death phase
+  injection remains open.
 - A bounded mixed-OCI soak gate now runs isolated longer state-machine rounds
   across explicit kernel/rootfs cases, rotates deterministic seeds, retains the
   exact failing log, rejects leaked candidate VMM/taritd processes or lifecycle
