@@ -108,6 +108,10 @@ Only want the hypervisor? `sudo make install-vmm` installs just `vmm`.
 Drive the same socket to capture and move VM state. A full snapshot writes memory
 plus device state; `--diff` writes only dirty pages. Suspend releases resident
 guest RAM; resume brings it back. Restore boots a fresh VMM from a snapshot.
+Snapshots include the architectural and host-advertised KVM paravirtual MSR
+state used by the guest. Restore validates that state against the destination
+before changing a vCPU and rejects incompatible hosts without a partial
+restore.
 
 ```sh
 sudo vmm --socket /tmp/vm.sock snapshot              # full snapshot, prints the .snap path
