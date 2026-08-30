@@ -76,6 +76,8 @@ cp "${BASE_CONFIG}" "${BUILD}/.config"
   --disable VIRTIO_CONSOLE --enable VSOCKETS --enable VIRTIO_VSOCKETS \
   --disable VIRTIO_PMEM --enable VIRTIO_BALLOON --disable VIRTIO_MEM \
   --enable HW_RANDOM --enable HW_RANDOM_VIRTIO \
+  --disable HW_RANDOM_TIMERIOMEM --disable HW_RANDOM_INTEL --disable HW_RANDOM_AMD \
+  --disable HW_RANDOM_BA431 --disable HW_RANDOM_VIA --disable HW_RANDOM_XIPHERA \
   --enable SERIAL_8250 --enable SERIAL_8250_CONSOLE --enable SERIAL_8250_PNP \
   --set-val SERIAL_8250_NR_UARTS 1 --set-val SERIAL_8250_RUNTIME_UARTS 1 \
   --enable EXT4_FS --enable EXT4_USE_FOR_EXT2 --enable JBD2 --enable FS_MBCACHE \
