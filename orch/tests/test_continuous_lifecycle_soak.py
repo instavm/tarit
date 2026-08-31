@@ -237,6 +237,8 @@ class StatusPublicationTests(unittest.TestCase):
             ("--seeds", str(1 << 64)),
             ("--steps", "10001"),
             ("--interval-seconds", "60.1"),
+            ("--interval-seconds", "nan"),
+            ("--actions", "assert,,fork"),
         ]
         for arguments in invalid:
             with self.subTest(arguments=arguments), \

@@ -1105,7 +1105,10 @@ def parse_args() -> argparse.Namespace:
         "guest-work", "contended-exec", "snapshot",
     }
     if args.actions:
-        args.actions = [value.strip() for value in args.actions.split(",") if value.strip()]
+        action_values = args.actions.split(",")
+        if any(not value.strip() for value in action_values):
+            parser.error("actions must be a comma-separated list without empty entries")
+        args.actions = [value.strip() for value in action_values]
         invalid_actions = sorted(set(args.actions) - allowed_actions)
         if not args.actions or invalid_actions:
             parser.error(f"unknown loop actions: {','.join(invalid_actions)}")
@@ -1113,7 +1116,7 @@ def parse_args() -> argparse.Namespace:
         args.actions = []
     if args.steps < 1 or args.steps > 10000:
         parser.error("steps must be between one and 10000")
-    if args.interval_seconds < 0 or args.interval_seconds > 60:
+    if not 0 <= args.interval_seconds <= 60:
         parser.error("action interval must be between zero and 60 seconds")
     if args.duration_seconds is not None and args.duration_seconds < 60:
         parser.error("duration must be at least 60 seconds")
