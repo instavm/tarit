@@ -1226,7 +1226,13 @@ passing focused gate does not waive an item in the final column.
   incomplete BSP, AP, VM, block, net, vsock, or balloon state. A c8i gate
   corrupted the serialized state while retaining a valid outer checksum,
   required rejection before VM publication, and then restored the untouched
-  snapshot lazily. A paused two-vCPU restore gate found that applying MSRs
+  snapshot lazily. Block and network restoration now decode every device state
+  before applying any of them; a count mismatch or malformed entry is an error
+  rather than a warning followed by a fresh device. A focused Ubuntu OCI gate
+  replaced the captured root block state with malformed bytes, recomputed the
+  state CRC, required rejection with no published VM, and then restored and
+  executed in the untouched snapshot on Linux 6.6.155 and 5.10.230. A paused
+  two-vCPU restore gate found that applying MSRs
   before LAPIC state could leave the secondary CPU's TSC-deadline timer
   stalled; restoring LAPIC before MSRs fixed it. The live path now clears old
   captures, arms every vCPU before waiting, requires fresh state from every

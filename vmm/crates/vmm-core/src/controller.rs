@@ -5245,50 +5245,60 @@ fn capture_virtio_net_states(
 fn restore_virtio_blk_states(
     devs: &mut [Arc<vmm_devices::virtio::blk_transport::VirtioBlkMmio>],
     states: &[Vec<u8>],
-) {
-    if states.is_empty() {
-        return;
-    }
+) -> Result<()> {
     if states.len() != devs.len() {
-        log::warn!(
-            "restore: virtio-blk state count {} != device count {}; using fresh blk devices",
+        return Err(VmmError::Snapshot(format!(
+            "snapshot virtio-blk state count mismatch: expected {}, got {}",
+            devs.len(),
             states.len(),
-            devs.len()
-        );
-        return;
+        )));
     }
-    for (i, (dev, bytes)) in devs.iter_mut().zip(states.iter()).enumerate() {
-        match postcard::from_bytes::<vmm_devices::virtio::blk_transport::VirtioBlkMmioState>(bytes)
-        {
-            Ok(state) => vmm_devices::persist::Persist::restore(dev, state),
-            Err(e) => log::warn!("restore: virtio-blk state {i}: {e}; using fresh state"),
-        }
+    let decoded = states
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            postcard::from_bytes::<vmm_devices::virtio::blk_transport::VirtioBlkMmioState>(bytes)
+                .map_err(|error| {
+                    VmmError::Snapshot(format!(
+                        "snapshot virtio-blk state {index} is malformed: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (dev, state) in devs.iter_mut().zip(decoded) {
+        vmm_devices::persist::Persist::restore(dev, state);
     }
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn restore_virtio_net_states(
     devs: &mut [Arc<vmm_devices::virtio::net_transport::VirtioNetMmio>],
     states: &[Vec<u8>],
-) {
-    if states.is_empty() {
-        return;
-    }
+) -> Result<()> {
     if states.len() != devs.len() {
-        log::warn!(
-            "restore: virtio-net state count {} != device count {}; using fresh net devices",
+        return Err(VmmError::Snapshot(format!(
+            "snapshot virtio-net state count mismatch: expected {}, got {}",
+            devs.len(),
             states.len(),
-            devs.len()
-        );
-        return;
+        )));
     }
-    for (i, (dev, bytes)) in devs.iter_mut().zip(states.iter()).enumerate() {
-        match postcard::from_bytes::<vmm_devices::virtio::net_transport::VirtioNetMmioState>(bytes)
-        {
-            Ok(state) => vmm_devices::persist::Persist::restore(dev, state),
-            Err(e) => log::warn!("restore: virtio-net state {i}: {e}; using fresh state"),
-        }
+    let decoded = states
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            postcard::from_bytes::<vmm_devices::virtio::net_transport::VirtioNetMmioState>(bytes)
+                .map_err(|error| {
+                    VmmError::Snapshot(format!(
+                        "snapshot virtio-net state {index} is malformed: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (dev, state) in devs.iter_mut().zip(decoded) {
+        vmm_devices::persist::Persist::restore(dev, state);
     }
+    Ok(())
 }
 
 /// Reconstruct a *running* VM from restored guest memory + a captured vCPU
@@ -5335,9 +5345,9 @@ fn build_running_vm(
         vsock,
         balloon,
     } = build_devices(config, &mem)?;
-    restore_virtio_blk_states(&mut blks, restored.virtio_blk);
+    restore_virtio_blk_states(&mut blks, restored.virtio_blk)?;
     let mut net_devices: Vec<_> = nets.iter().map(|n| n.dev.clone()).collect();
-    restore_virtio_net_states(&mut net_devices, restored.virtio_net);
+    restore_virtio_net_states(&mut net_devices, restored.virtio_net)?;
     let mut balloon = balloon;
     if let (Some(wired), Some(state)) = (balloon.as_mut(), restored.balloon) {
         vmm_devices::persist::Persist::restore(&mut wired.device, state.clone());
@@ -6786,6 +6796,41 @@ mod tests {
         .expect("malformed BSP state must fail")
         .to_string();
         assert!(error.contains("snapshot BSP vCPU state is malformed"));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn malformed_virtio_state_is_rejected_instead_of_reset() {
+        use vmm_devices::virtio::blk_backend::BlkBackend;
+        use vmm_devices::virtio::blk_transport::VirtioBlkMmio;
+        use vmm_devices::virtio::net_transport::VirtioNetMmio;
+
+        let backing = tempfile::tempfile().expect("create block backing");
+        backing.set_len(4096).expect("size block backing");
+        let backend = BlkBackend::from_file(backing, false, "restore-state-test")
+            .expect("open block backend");
+        let mut block = vec![Arc::new(VirtioBlkMmio::new(5, backend))];
+        let block_error = restore_virtio_blk_states(&mut block, &[vec![0xff]])
+            .unwrap_err()
+            .to_string();
+        assert!(block_error.contains("virtio-blk state 0 is malformed"));
+        assert!(restore_virtio_blk_states(&mut block, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("count mismatch"));
+
+        let mut net = vec![Arc::new(VirtioNetMmio::new(
+            6,
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        ))];
+        let net_error = restore_virtio_net_states(&mut net, &[vec![0xff]])
+            .unwrap_err()
+            .to_string();
+        assert!(net_error.contains("virtio-net state 0 is malformed"));
+        assert!(restore_virtio_net_states(&mut net, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("count mismatch"));
     }
 
     // Incremental diff-chain round trip. Boot-gated because it uses the
