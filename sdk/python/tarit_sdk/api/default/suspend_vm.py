@@ -67,10 +67,12 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Suspend sandbox
+    """Suspend a VM in place
 
-     Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume
-    the VM before exec, snapshot, PTY, SSH, or pause operations.
+     Stops every vCPU, drains and parks block, network, and vsock workers at the same boundary, captures
+    the in-process suspend image, and drops resident guest memory while retaining the VMM, VM ownership,
+    quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause
+    operations.
 
     Args:
         id (UUID):
@@ -99,10 +101,12 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Suspend sandbox
+    """Suspend a VM in place
 
-     Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume
-    the VM before exec, snapshot, PTY, SSH, or pause operations.
+     Stops every vCPU, drains and parks block, network, and vsock workers at the same boundary, captures
+    the in-process suspend image, and drops resident guest memory while retaining the VMM, VM ownership,
+    quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause
+    operations.
 
     Args:
         id (UUID):
@@ -126,10 +130,12 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Suspend sandbox
+    """Suspend a VM in place
 
-     Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume
-    the VM before exec, snapshot, PTY, SSH, or pause operations.
+     Stops every vCPU, drains and parks block, network, and vsock workers at the same boundary, captures
+    the in-process suspend image, and drops resident guest memory while retaining the VMM, VM ownership,
+    quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause
+    operations.
 
     Args:
         id (UUID):
@@ -156,10 +162,12 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Suspend sandbox
+    """Suspend a VM in place
 
-     Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume
-    the VM before exec, snapshot, PTY, SSH, or pause operations.
+     Stops every vCPU, drains and parks block, network, and vsock workers at the same boundary, captures
+    the in-process suspend image, and drops resident guest memory while retaining the VMM, VM ownership,
+    quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause
+    operations.
 
     Args:
         id (UUID):

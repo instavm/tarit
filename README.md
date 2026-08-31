@@ -111,7 +111,9 @@ guest RAM; resume brings it back. Restore boots a fresh VMM from a snapshot.
 Snapshots include the architectural and host-advertised KVM paravirtual MSR
 state used by the guest. Restore validates that state against the destination
 before changing a vCPU and rejects incompatible hosts without a partial
-restore.
+restore. Suspend parks the block, network, and vsock workers after stopping the
+vCPUs; resume waits for those workers to leave the parked state before vCPUs
+run again.
 
 ```sh
 sudo vmm --socket /tmp/vm.sock snapshot              # full snapshot, prints the .snap path

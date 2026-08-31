@@ -85,12 +85,12 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     body: SnapshotVmBody,
 ) -> Response[Any | SnapshotVmResponse200]:
-    """Snapshot sandbox
+    """Snapshot a VM
 
      User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses
-    the bounded live pre-copy path; RAM, device state, and the private disk upper are captured at one
-    atomic final-stop boundary. The response is an opaque handle; paths and physical host identity
-    remain private.
+    the bounded live pre-copy path; a paused VM captures from its existing stop boundary. RAM, device
+    state, and the private disk upper are captured at one atomic boundary. The response is an opaque
+    handle; paths and physical host identity remain private.
 
     Args:
         id (UUID):
@@ -122,12 +122,12 @@ def sync(
     client: AuthenticatedClient | Client,
     body: SnapshotVmBody,
 ) -> Any | SnapshotVmResponse200 | None:
-    """Snapshot sandbox
+    """Snapshot a VM
 
      User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses
-    the bounded live pre-copy path; RAM, device state, and the private disk upper are captured at one
-    atomic final-stop boundary. The response is an opaque handle; paths and physical host identity
-    remain private.
+    the bounded live pre-copy path; a paused VM captures from its existing stop boundary. RAM, device
+    state, and the private disk upper are captured at one atomic boundary. The response is an opaque
+    handle; paths and physical host identity remain private.
 
     Args:
         id (UUID):
@@ -154,12 +154,12 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     body: SnapshotVmBody,
 ) -> Response[Any | SnapshotVmResponse200]:
-    """Snapshot sandbox
+    """Snapshot a VM
 
      User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses
-    the bounded live pre-copy path; RAM, device state, and the private disk upper are captured at one
-    atomic final-stop boundary. The response is an opaque handle; paths and physical host identity
-    remain private.
+    the bounded live pre-copy path; a paused VM captures from its existing stop boundary. RAM, device
+    state, and the private disk upper are captured at one atomic boundary. The response is an opaque
+    handle; paths and physical host identity remain private.
 
     Args:
         id (UUID):
@@ -189,12 +189,12 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     body: SnapshotVmBody,
 ) -> Any | SnapshotVmResponse200 | None:
-    """Snapshot sandbox
+    """Snapshot a VM
 
      User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses
-    the bounded live pre-copy path; RAM, device state, and the private disk upper are captured at one
-    atomic final-stop boundary. The response is an opaque handle; paths and physical host identity
-    remain private.
+    the bounded live pre-copy path; a paused VM captures from its existing stop boundary. RAM, device
+    state, and the private disk upper are captured at one atomic boundary. The response is an opaque
+    handle; paths and physical host identity remain private.
 
     Args:
         id (UUID):

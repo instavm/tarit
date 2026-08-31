@@ -1889,9 +1889,8 @@ fn is_network_pool_exhausted(message: &str) -> bool {
     message.contains("network address pool exhausted")
 }
 
-/// Restore a snapshot into a running VM. Routes to the node that holds the
-/// snapshot file (`host_id`, as returned by the snapshot call) so no cross-node
-/// file transfer is needed; `None`/self restores locally.
+/// Restore a snapshot from its opaque public handle. The control plane resolves
+/// the private host and artifact locator, then routes the restore to that host.
 async fn restore_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,

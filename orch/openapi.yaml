@@ -1135,7 +1135,7 @@ paths:
   /v1/vms/{id}/pause:
     post:
       operationId: pauseVm
-      summary: Pause sandbox
+      summary: Pause a VM
       description: User keys can pause only their tenant's VMs; admin keys can pause any VM.
       parameters:
         - name: id
@@ -1158,12 +1158,12 @@ paths:
         "404":
           description: VM not found
         "409":
-          description: VM is stopped
+          description: Invalid lifecycle transition
   /v1/vms/{id}/resume:
     post:
       operationId: resumeVm
-      summary: Resume sandbox
-      description: User keys can resume only their tenant's VMs; admin keys can resume any VM.
+      summary: Resume a VM
+      description: Resumes a paused or suspended VM after every device worker leaves its parked state and before vCPUs restart. A hibernated VM activates through the fenced single-flight placement, artifact-verification, network-repair, and readiness path. User keys can resume only their tenant's VMs; admin keys can resume any VM.
       parameters:
         - name: id
           in: path
@@ -1185,12 +1185,16 @@ paths:
         "404":
           description: VM not found
         "409":
-          description: VM is stopped
+          description: Invalid lifecycle transition
+        "429":
+          description: No placement capacity is available for hibernated activation
+        "503":
+          description: The owning host or activation prerequisites are unavailable
   /v1/vms/{id}/suspend:
     post:
       operationId: suspendVm
-      summary: Suspend sandbox
-      description: Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause operations.
+      summary: Suspend a VM in place
+      description: Stops every vCPU, drains and parks block, network, and vsock workers at the same boundary, captures the in-process suspend image, and drops resident guest memory while retaining the VMM, VM ownership, quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause operations.
       parameters:
         - name: id
           in: path
@@ -1212,11 +1216,11 @@ paths:
         "404":
           description: VM not found
         "409":
-          description: VM is not running
+          description: Invalid lifecycle transition
   /v1/vms/{id}/hibernate:
     post:
       operationId: hibernateVm
-      summary: Hibernate sandbox and release host capacity
+      summary: Hibernate a VM and release host capacity
       description: Atomically captures an authenticated live RAM/device/disk snapshot, stops the resident VMM, releases CPU, memory, cgroup, network, and scheduler capacity, and retains a tenant-owned logical VM record for secure resume.
       parameters:
         - name: id
@@ -1245,8 +1249,8 @@ paths:
   /v1/vms/{id}/snapshot:
     post:
       operationId: snapshotVm
-      summary: Snapshot sandbox
-      description: User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses the bounded live pre-copy path; RAM, device state, and the private disk upper are captured at one atomic final-stop boundary. The response is an opaque handle; paths and physical host identity remain private.
+      summary: Snapshot a VM
+      description: User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses the bounded live pre-copy path; a paused VM captures from its existing stop boundary. RAM, device state, and the private disk upper are captured at one atomic boundary. The response is an opaque handle; paths and physical host identity remain private.
       parameters:
         - name: id
           in: path
@@ -1286,7 +1290,7 @@ paths:
         "422":
           description: Incremental snapshots are disabled; retry with `diff=false`.
         "409":
-          description: VM is stopped
+          description: VM lifecycle state does not support snapshots
   /v1/vms/{id}/fork:
     post:
       operationId: forkVm
@@ -1327,7 +1331,7 @@ paths:
   /v1/restore:
     post:
       operationId: restoreVm
-      summary: Restore sandbox from a snapshot
+      summary: Restore a VM from a snapshot
       description: Restores a VM from an opaque snapshot handle. The control plane resolves its private host and storage locator; tenant VM quotas apply.
       requestBody:
         required: true
@@ -1348,14 +1352,18 @@ paths:
           description: Tenant VM quota reached
         "404":
           description: Snapshot handle or owning host not found
+        "409":
+          description: Requested VM id already exists
         "429":
-          description: Selected node is at capacity
+          description: Snapshot-owning node is at capacity
           headers:
             Retry-After:
               description: Seconds the client should wait before retrying
               schema:
                 type: integer
                 minimum: 1
+        "503":
+          description: Snapshot-owning node is unhealthy, stale, or unavailable
   /v1/execute:
     post:
       operationId: execute
