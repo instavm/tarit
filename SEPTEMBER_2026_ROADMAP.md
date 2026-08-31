@@ -1250,6 +1250,14 @@ passing focused gate does not waive an item in the final column.
   publishes a net TX descriptor without a notification and requires the pause
   drain to complete it; Ubuntu OCI guests on Linux 6.6.155 and 5.10.230 also
   passed ordinary and live snapshots while a vsock command remained in flight.
+  Restored vsock state clears every captured host stream before vCPU resume,
+  injects RST for the captured connection generation, and accepts payload only
+  after the guest issues a new connection request. A deterministic worst-order
+  gate proves that stale payload published before control-thread reset is
+  discarded and cannot reach the replacement listener. A real-KVM Ubuntu OCI
+  gate captured an active stream, required it in snapshot state, completed the
+  source command, restored through the nonce-bound clone-repair exchange, and
+  then delivered fresh payload on Linux 6.6.155 and 5.10.230.
 - UART snapshots now retain the pending interrupt cause, line/modem status, and
   receive FIFO in addition to guest-programmed registers. Restore reconstructs
   the complete device and reasserts pending transmit or receive interrupts

@@ -93,5 +93,15 @@ name = "device_state_rejection"
 path = "device_state_rejection.rs"
 required-features = ["kvm"]
 
+[[test]]
+name = "serial_snapshot_inflight"
+path = "serial_snapshot_inflight.rs"
+required-features = ["kvm"]
+
+[[test]]
+name = "vsock_restore_ordering"
+path = "vsock_restore_ordering.rs"
+required-features = ["kvm"]
+
 [lints]
 workspace = true
