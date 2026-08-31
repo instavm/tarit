@@ -40,7 +40,28 @@ class Soak:
         self.transient: set[str] = set()
         self.snapshots = 0
         self.operations = 0
+        self.action_latencies_ms: dict[str, list[float]] = {}
         self.started_at = time.monotonic()
+
+    @staticmethod
+    def percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = round((len(ordered) - 1) * percentile)
+        return ordered[index]
+
+    def action_summary(self) -> dict[str, dict[str, float | int]]:
+        return {
+            action: {
+                "count": len(values),
+                "p50_ms": round(self.percentile(values, 0.50), 3),
+                "p95_ms": round(self.percentile(values, 0.95), 3),
+                "p99_ms": round(self.percentile(values, 0.99), 3),
+                "max_ms": round(max(values), 3),
+            }
+            for action, values in sorted(self.action_latencies_ms.items())
+        }
 
     def write_status(self, kind: str, fields: dict[str, object]) -> None:
         if not self.args.status_file:
@@ -63,6 +84,7 @@ class Soak:
             "snapshots": self.snapshots,
             "anchors": len(self.anchors),
             "transient_vms": len(self.transient),
+            "actions": self.action_summary(),
             **fields,
         }
         descriptor, temporary = tempfile.mkstemp(
@@ -511,6 +533,37 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         self.assert_anchor(vm_id)
         self.event("guest_work_verified", vm_id=vm_id, proof=proof)
 
+    def concurrent_guest_work(self, _vm_id: str) -> None:
+        token = uuid.uuid4().hex
+
+        def work(vm_id: str) -> tuple[str, str]:
+            output = self.exec(
+                vm_id,
+                "set -eu; before=$(cat /tmp/soak-counter); "
+                f"printf '%s' {token} > /tmp/tarit-concurrent-work.next; "
+                "busybox dd if=/dev/urandom of=/tmp/tarit-concurrent-io.next "
+                "bs=4096 count=64 2>/dev/null; "
+                "test -s /tmp/tarit-concurrent-io.next; "
+                "mv /tmp/tarit-concurrent-work.next /tmp/tarit-concurrent-work; "
+                "mv /tmp/tarit-concurrent-io.next /tmp/tarit-concurrent-io; "
+                "sync; after=$(cat /tmp/soak-counter); "
+                "test \"$after\" -ge \"$before\"; "
+                "printf '%s %s\n' \"$(cat /tmp/tarit-concurrent-work)\" \"$after\"",
+            ).split()
+            assert len(output) == 2 and output[0] == token, (vm_id, output)
+            return vm_id, output[1]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.anchors)) as pool:
+            results = list(pool.map(work, sorted(self.anchors)))
+        assert len(results) == len(self.anchors), results
+        for vm_id in self.anchors:
+            self.assert_anchor(vm_id)
+        self.event(
+            "concurrent_guest_work_verified",
+            token=token,
+            counters={vm_id: counter for vm_id, counter in results},
+        )
+
     def assert_global_invariants(self) -> None:
         _, rows = self.request("GET", "/v1/vms")
         by_id = {row["id"]: row for row in rows}
@@ -574,6 +627,19 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         self.transient.clear()
         self.anchors.clear()
 
+    def run_action(self, action, vm_id: str) -> None:
+        self.assert_storage_headroom()
+        started = time.monotonic()
+        action(vm_id)
+        self.assert_global_invariants()
+        duration_ms = (time.monotonic() - started) * 1000
+        self.action_latencies_ms.setdefault(action.__name__, []).append(duration_ms)
+        self.event(
+            "operation_complete", action=action.__name__, vm_id=vm_id,
+            duration_ms=round(duration_ms, 3), operations=self.operations,
+            snapshots=self.snapshots,
+        )
+
     def run(self) -> None:
         self.assert_storage_headroom()
         for index in range(self.args.anchors):
@@ -585,29 +651,34 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         if self.args.sibling_fork_timer_seconds:
             self.sibling_fork_timers(next(iter(self.anchors)))
             self.assert_global_invariants()
+        anchor_ids = list(self.anchors)
+        required_actions = [
+            (self.fork_anchor, anchor_ids[0]),
+            (self.snapshot_restore, anchor_ids[1]),
+            (self.concurrent_guest_work, anchor_ids[2 % len(anchor_ids)]),
+        ]
+        for action, vm_id in required_actions:
+            self.run_action(action, vm_id)
         deadline = time.monotonic() + self.args.duration_seconds
         actions = [
             self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
-            self.snapshot_restore, self.hibernate_resume, self.pause_resume, self.balloon,
+            self.hibernate_resume, self.pause_resume, self.balloon,
+            self.concurrent_guest_work,
         ]
         while time.monotonic() < deadline:
-            self.assert_storage_headroom()
             vm_id = self.random.choice(list(self.anchors))
-            action = self.random.choice(actions)
-            started = time.monotonic()
-            action(vm_id)
-            self.assert_global_invariants()
-            self.event(
-                "operation_complete", action=action.__name__, vm_id=vm_id,
-                duration_ms=round((time.monotonic() - started) * 1000, 3),
-                operations=self.operations, snapshots=self.snapshots,
-            )
+            available_actions = list(actions)
+            if self.snapshots < self.args.max_snapshots:
+                available_actions.append(self.snapshot_restore)
+            action = self.random.choice(available_actions)
+            self.run_action(action, vm_id)
             time.sleep(self.args.interval_seconds)
         minimum_age = min(time.monotonic() - anchor.created_at for anchor in self.anchors.values())
         self.event(
             "soak_pass", seed=self.args.seed, operations=self.operations,
             snapshots=self.snapshots, anchors=len(self.anchors),
             minimum_anchor_age_s=round(minimum_age, 3),
+            actions=self.action_summary(),
         )
 
 

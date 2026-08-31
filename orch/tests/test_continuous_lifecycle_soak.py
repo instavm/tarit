@@ -67,6 +67,31 @@ class StatusPublicationTests(unittest.TestCase):
                 "failed",
             )
 
+    def test_action_summary_reports_counts_and_latency_percentiles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            soak.action_latencies_ms = {
+                "fork_anchor": [10.0, 20.0, 30.0, 40.0, 50.0],
+                "pause_resume": [4.0],
+            }
+
+            self.assertEqual(soak.action_summary(), {
+                "fork_anchor": {
+                    "count": 5,
+                    "p50_ms": 30.0,
+                    "p95_ms": 50.0,
+                    "p99_ms": 50.0,
+                    "max_ms": 50.0,
+                },
+                "pause_resume": {
+                    "count": 1,
+                    "p50_ms": 4.0,
+                    "p95_ms": 4.0,
+                    "p99_ms": 4.0,
+                    "max_ms": 4.0,
+                },
+            })
+
 
 if __name__ == "__main__":
     unittest.main()
