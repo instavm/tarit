@@ -31,7 +31,7 @@ use std::{
 use tarit_store::HostRecord;
 use tarit_types::{
     ArtifactReplicaStatus, ArtifactStatus, CreateVmRequest, EgressPolicyRecord,
-    EgressUpdateRequest, PutEgressPolicyRequest, SnapshotResponse, VmRecord,
+    EgressUpdateRequest, PeerSnapshotResponse, PutEgressPolicyRequest, VmRecord,
 };
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
@@ -1039,18 +1039,24 @@ async fn internal_snapshot(
     identity: Option<Extension<ApiIdentity>>,
     Path(id): Path<Uuid>,
     Json(body): Json<InternalSnapshotBody>,
-) -> Result<Json<SnapshotResponse>, ApiError> {
+) -> Result<Json<PeerSnapshotResponse>, ApiError> {
     enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
-    let path = if let Some(child_id) = body.fork_child_id {
+    let (path, live_snapshot) = if let Some(child_id) = body.fork_child_id {
         if body.diff {
             return Err(tarit_types::OrchError::Unprocessable(
                 "fork snapshots must be full snapshots".into(),
             )
             .into());
         }
-        ops::snapshot_local_for_fork(&state, id, child_id).await?
+        let snapshot = ops::snapshot_local_for_fork(&state, id, child_id).await?;
+        (
+            snapshot.path,
+            snapshot
+                .live_stats
+                .map(crate::api::public_fork_snapshot_metrics),
+        )
     } else {
-        ops::snapshot_local(&state, id, body.diff).await?
+        (ops::snapshot_local(&state, id, body.diff).await?, None)
     };
     let snapshot = state
         .store
@@ -1059,8 +1065,9 @@ async fn internal_snapshot(
         .get_snapshot(&path)
         .map_err(crate::api::store_err)?
         .ok_or_else(|| tarit_types::OrchError::Internal("snapshot publication missing".into()))?;
-    Ok(Json(SnapshotResponse {
+    Ok(Json(PeerSnapshotResponse {
         snapshot_id: snapshot.snapshot_id,
+        live_snapshot,
     }))
 }
 

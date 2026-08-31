@@ -19,6 +19,10 @@ from .error_body import ErrorBody
 from .execute_request import ExecuteRequest
 from .execution_record import ExecutionRecord
 from .execution_record_status import ExecutionRecordStatus
+from .fork_execution_path import ForkExecutionPath
+from .fork_metrics import ForkMetrics
+from .fork_snapshot_metrics import ForkSnapshotMetrics
+from .fork_snapshot_termination import ForkSnapshotTermination
 from .fork_vm_request import ForkVmRequest
 from .fork_vm_response import ForkVmResponse
 from .get_cluster_response_200 import GetClusterResponse200
@@ -75,6 +79,10 @@ __all__ = (
     "ExecuteRequest",
     "ExecutionRecord",
     "ExecutionRecordStatus",
+    "ForkExecutionPath",
+    "ForkMetrics",
+    "ForkSnapshotMetrics",
+    "ForkSnapshotTermination",
     "ForkVmRequest",
     "ForkVmResponse",
     "GetClusterResponse200",

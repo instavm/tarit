@@ -1840,6 +1840,7 @@ impl OwnedArtifact {
 pub(crate) struct SnapshotBundle {
     snapshot_path: String,
     overlay_path: Option<String>,
+    live_stats: Option<tarit_proto::LiveSnapshotStats>,
     artifacts: Vec<OwnedArtifact>,
     /// VMM-generated hashes for the exact live RAM artifact. This temporary
     /// sidecar is consumed when the durable manifest is created and never
@@ -1903,6 +1904,10 @@ impl SnapshotBundle {
 
     pub(crate) fn overlay_path(&self) -> Option<&str> {
         self.overlay_path.as_deref()
+    }
+
+    pub(crate) fn live_stats(&self) -> Option<&tarit_proto::LiveSnapshotStats> {
+        self.live_stats.as_ref()
     }
 
     /// Hash the exact open inodes owned by this bundle. Path replacement cannot
@@ -7248,6 +7253,7 @@ impl VmmSupervisor {
         let bundle = SnapshotBundle {
             snapshot_path: ram_destination.display().to_string(),
             overlay_path,
+            live_stats: None,
             artifacts: publications
                 .into_iter()
                 .map(|(artifact, _)| artifact)
@@ -7270,7 +7276,12 @@ impl VmmSupervisor {
     ) -> Result<SnapshotBundle, OrchError> {
         let _reservation = self.reserve_snapshot_space(id, memory_mib, expects_overlay)?;
         let client = self.lifecycle_client_for(id)?;
-        let (scratch_ram_vmm_path, scratch_overlay_vmm_path, scratch_integrity_vmm_path) = client
+        let (
+            scratch_ram_vmm_path,
+            scratch_overlay_vmm_path,
+            scratch_integrity_vmm_path,
+            live_stats,
+        ) = client
             .live_snapshot_unreleased()
             .map_err(|error| OrchError::Vmm(format!("atomic live snapshot: {error}")))?;
         if scratch_overlay_vmm_path.is_some() != expects_overlay {
@@ -7389,6 +7400,7 @@ impl VmmSupervisor {
         Ok(SnapshotBundle {
             snapshot_path: ram_destination.display().to_string(),
             overlay_path,
+            live_stats: Some(live_stats),
             artifacts: publications
                 .into_iter()
                 .map(|(artifact, _)| artifact)
@@ -12125,6 +12137,7 @@ mod tests {
         SnapshotBundle {
             snapshot_path: destination.display().to_string(),
             overlay_path: None,
+            live_stats: None,
             artifacts: publications
                 .into_iter()
                 .map(|(artifact, _)| artifact)

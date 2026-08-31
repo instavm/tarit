@@ -503,7 +503,17 @@ impl VmmClient {
 
     /// Take an atomic live snapshot while the VMM retains cleanup ownership of
     /// both RAM and the optional reflinked disk upper.
-    pub fn live_snapshot_unreleased(&self) -> Result<(String, Option<String>, String), VmmError> {
+    pub fn live_snapshot_unreleased(
+        &self,
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            String,
+            tarit_proto::LiveSnapshotStats,
+        ),
+        VmmError,
+    > {
         match self.request_ok(&ApiRequest::Snapshot {
             diff: false,
             live: true,
@@ -512,8 +522,8 @@ impl VmmClient {
                 path,
                 overlay_path,
                 integrity_path: Some(integrity_path),
-                live_stats: Some(_),
-            } => Ok((path, overlay_path, integrity_path)),
+                live_stats: Some(live_stats),
+            } => Ok((path, overlay_path, integrity_path, live_stats)),
             ApiResponse::Snapshot {
                 integrity_path: None,
                 ..

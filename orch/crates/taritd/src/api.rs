@@ -68,7 +68,8 @@ use tarit_store::{Store, VolumeTransition};
 use tarit_types::{
     AuditEvent, BranchRecord, CreateBranchRequest, CreateShareRequest, CreateVmRequest,
     CreateVolumeRequest, EgressPolicyRecord, EgressUpdateRequest, ErrorBody, ExecuteRequest,
-    ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ForkVmRequest,
+    ExecutionRecord, ExecutionStatus, ForkExecutionPath, ForkMetrics, ForkOperationRecord,
+    ForkOperationStatus, ForkSnapshotMetrics, ForkSnapshotTermination, ForkVmRequest,
     ForkVmResponse, OrchError, PublicVmRecord, PublicVolumeRecord, PutEgressPolicyRequest,
     RestoreBranchRequest, ShareRecord, ShareTokenResponse, ShareVisibility, SnapshotRequest,
     SnapshotResponse, UpdateBranchHeadRequest, UpdateShareRequest, UsageEvent, UsageSummary,
@@ -2712,12 +2713,36 @@ async fn fork_phase_failpoint(child_vm_id: Uuid, phase: &'static str) {
 #[cfg(not(feature = "test-failpoints"))]
 async fn fork_phase_failpoint(_child_vm_id: Uuid, _phase: &'static str) {}
 
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+pub(crate) fn public_fork_snapshot_metrics(
+    stats: tarit_proto::LiveSnapshotStats,
+) -> ForkSnapshotMetrics {
+    let termination = match stats.termination {
+        tarit_proto::LiveSnapshotTermination::Converged => ForkSnapshotTermination::Converged,
+        tarit_proto::LiveSnapshotTermination::Diverging => ForkSnapshotTermination::Diverging,
+        tarit_proto::LiveSnapshotTermination::Timeout => ForkSnapshotTermination::Timeout,
+        tarit_proto::LiveSnapshotTermination::MaxRounds => ForkSnapshotTermination::MaxRounds,
+    };
+    ForkSnapshotMetrics {
+        rounds: stats.rounds,
+        pages_copied: stats.pages_copied,
+        final_dirty_pages: stats.final_dirty_pages,
+        elapsed_us: stats.elapsed_us,
+        downtime_us: stats.downtime_us,
+        termination,
+    }
+}
+
 async fn fork_vm(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Path(source_id): Path<Uuid>,
     Json(body): Json<ForkVmRequest>,
 ) -> Result<(StatusCode, Json<ForkVmResponse>), ApiError> {
+    let fork_started = Instant::now();
     let child_id = body.id.unwrap_or_else(Uuid::new_v4);
     let existing_operation = if body.id.is_some() {
         get_fork_operation(&state, child_id).await?
@@ -2782,6 +2807,7 @@ async fn fork_vm(
                     Json(ForkVmResponse {
                         source_vm_id: source_id,
                         vm: PublicVmRecord::from(child),
+                        metrics: None,
                     }),
                 ));
             }
@@ -2844,6 +2870,7 @@ async fn fork_vm(
             .into());
         }
     }
+    let source_resolution_us = elapsed_micros(fork_started);
     let now = Utc::now();
     let mut operation = existing_operation.unwrap_or(ForkOperationRecord {
         child_vm_id: child_id,
@@ -2868,11 +2895,15 @@ async fn fork_vm(
         operation.target_boot_session_id = Some(state.config.host_session_id);
         operation.updated_at = now;
     }
+    let claim_started = Instant::now();
     claim_fork_operation(&state, &identity, &operation).await?;
+    let operation_claim_us = elapsed_micros(claim_started);
     fork_phase_failpoint(child_id, "after_claim").await;
     let reserved = true;
     let result = async {
-        let (child, source_host) = if let Some(remote_source) = remote_source {
+        let (child, source_host, execution_path, live_snapshot, snapshot_artifact_us, child_ready_us) =
+            if let Some(remote_source) = remote_source {
+            let snapshot_started = Instant::now();
             // The target contains the source host's current boot session. Every
             // request below is signed for that exact source/target session pair,
             // so an owner restart or stale fleet route fails closed.
@@ -2908,9 +2939,11 @@ async fn fork_vm(
             {
                 return Err(OrchError::Unavailable(
                     "cross-node fork snapshot has not satisfied the configured replication policy"
-                        .into(),
+                    .into(),
                 ));
             }
+            let snapshot_artifact_us = elapsed_micros(snapshot_started);
+            let child_started = Instant::now();
             let child = match ops::restore_local_from_surviving_artifact(
                 &state,
                 &snapshot_path,
@@ -2933,13 +2966,23 @@ async fn fork_vm(
                     return Err(error);
                 }
             };
-            (child, Some(remote_source.host_id))
+            (
+                child,
+                Some(remote_source.host_id),
+                ForkExecutionPath::CrossNode,
+                snapshot.live_snapshot,
+                snapshot_artifact_us,
+                elapsed_micros(child_started),
+            )
         } else {
-            let snapshot_path = ops::snapshot_local_for_fork(&state, source_id, child_id).await?;
+            let snapshot_started = Instant::now();
+            let snapshot = ops::snapshot_local_for_fork(&state, source_id, child_id).await?;
+            let snapshot_artifact_us = elapsed_micros(snapshot_started);
             fork_phase_failpoint(child_id, "after_snapshot").await;
+            let child_started = Instant::now();
             let child = match ops::restore_local(
                 &state,
-                &snapshot_path,
+                &snapshot.path,
                 Some(child_id),
                 Some(identity.tenant.clone()),
                 Some(identity.api_key_id.clone()),
@@ -2959,11 +3002,48 @@ async fn fork_vm(
                     return Err(error);
                 }
             };
-            (child, None)
+            (
+                child,
+                None,
+                ForkExecutionPath::Local,
+                snapshot.live_stats.map(public_fork_snapshot_metrics),
+                snapshot_artifact_us,
+                elapsed_micros(child_started),
+            )
         };
         fork_phase_failpoint(child_id, "after_child").await;
+        let commit_started = Instant::now();
         commit_fork_operation(&state, &operation, child.created_at).await?;
+        let operation_commit_us = elapsed_micros(commit_started);
         fork_phase_failpoint(child_id, "after_commit").await;
+        let metrics = ForkMetrics {
+            path: execution_path,
+            source_resolution_us,
+            operation_claim_us,
+            snapshot_artifact_us,
+            child_ready_us,
+            operation_commit_us,
+            total_us: elapsed_micros(fork_started),
+            live_snapshot,
+        };
+        tracing::info!(
+            source_vm = %source_id,
+            child_vm = %child_id,
+            path = ?metrics.path,
+            source_resolution_us = metrics.source_resolution_us,
+            operation_claim_us = metrics.operation_claim_us,
+            snapshot_artifact_us = metrics.snapshot_artifact_us,
+            child_ready_us = metrics.child_ready_us,
+            operation_commit_us = metrics.operation_commit_us,
+            total_us = metrics.total_us,
+            live_rounds = metrics.live_snapshot.as_ref().map(|value| value.rounds),
+            live_pages_copied = metrics.live_snapshot.as_ref().map(|value| value.pages_copied),
+            live_final_dirty_pages = metrics.live_snapshot.as_ref().map(|value| value.final_dirty_pages),
+            live_elapsed_us = metrics.live_snapshot.as_ref().map(|value| value.elapsed_us),
+            live_downtime_us = metrics.live_snapshot.as_ref().map(|value| value.downtime_us),
+            live_termination = ?metrics.live_snapshot.as_ref().map(|value| value.termination),
+            "fork phase measurements"
+        );
         audit::record(
             &state,
             &identity,
@@ -2983,6 +3063,7 @@ async fn fork_vm(
             Json(ForkVmResponse {
                 source_vm_id: source_id,
                 vm: PublicVmRecord::from(child),
+                metrics: Some(metrics),
             }),
         ))
     }

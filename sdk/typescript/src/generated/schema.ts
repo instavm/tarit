@@ -955,10 +955,54 @@ export interface components {
              */
             id?: string;
         };
+        /** @enum {string} */
+        ForkExecutionPath: "local" | "cross_node";
+        /** @enum {string} */
+        ForkSnapshotTermination: "converged" | "diverging" | "timeout" | "max_rounds";
+        ForkSnapshotMetrics: {
+            /** Format: uint32 */
+            rounds: number;
+            /** Format: uint64 */
+            pages_copied: number;
+            /** Format: uint64 */
+            final_dirty_pages: number;
+            /** Format: uint64 */
+            elapsed_us: number;
+            /**
+             * Format: uint64
+             * @description Complete final-stop guest blackout, including pause and resume handshakes.
+             */
+            downtime_us: number;
+            termination: components["schemas"]["ForkSnapshotTermination"];
+        };
+        ForkMetrics: {
+            path: components["schemas"]["ForkExecutionPath"];
+            /** Format: uint64 */
+            source_resolution_us: number;
+            /** Format: uint64 */
+            operation_claim_us: number;
+            /**
+             * Format: uint64
+             * @description Atomic snapshot plus durable local artifact publication, or peer replication and localization.
+             */
+            snapshot_artifact_us: number;
+            /**
+             * Format: uint64
+             * @description Restore through repaired guest readiness.
+             */
+            child_ready_us: number;
+            /** Format: uint64 */
+            operation_commit_us: number;
+            /** Format: uint64 */
+            total_us: number;
+            live_snapshot?: components["schemas"]["ForkSnapshotMetrics"];
+        };
         ForkVmResponse: {
             /** Format: uuid */
             source_vm_id: string;
             vm: components["schemas"]["VmRecord"];
+            /** @description Present when this request executed the fork. An idempotent replay returns the original child without fabricating new timings. */
+            metrics?: components["schemas"]["ForkMetrics"];
         };
         ExecuteRequest: {
             /** Format: uuid */

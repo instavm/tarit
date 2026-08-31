@@ -975,7 +975,7 @@ impl PeerClient {
         vm_id: Uuid,
         child_id: Uuid,
         identity: &ApiIdentity,
-    ) -> Result<tarit_types::SnapshotResponse, OrchError> {
+    ) -> Result<tarit_types::PeerSnapshotResponse, OrchError> {
         self.post_json(
             target,
             &format!("/internal/v1/vms/{vm_id}/snapshot"),

@@ -421,8 +421,30 @@ import json,sys
 row=json.load(sys.stdin)
 assert row["source_vm_id"] == sys.argv[1], row
 assert row["vm"]["status"] == "running" and row["vm"]["startup_path"] == "snapshot_restore", row
+status=int(sys.argv[2]); injected_death=sys.argv[3] == "1"
+if status == 200:
+    assert "metrics" not in row, row
+else:
+    metrics=row["metrics"]
+    assert metrics["path"] == "cross_node", metrics
+    phases=[metrics[name] for name in (
+        "source_resolution_us", "operation_claim_us", "snapshot_artifact_us",
+        "child_ready_us", "operation_commit_us",
+    )]
+    assert all(isinstance(value, int) and value > 0 for value in phases), metrics
+    assert metrics["total_us"] >= sum(phases), metrics
+    if not injected_death:
+        live=metrics["live_snapshot"]
+        assert live["rounds"] >= 2 and live["pages_copied"] > 0, live
+        assert 0 < live["downtime_us"] <= live["elapsed_us"], live
+        assert live["termination"] in {"converged", "diverging", "timeout", "max_rounds"}, live
+    print(
+        "cross_node_fork_metrics "
+        + " ".join(f"{name}={value}" for name, value in metrics.items() if name != "live_snapshot"),
+        file=sys.stderr,
+    )
 print(row["vm"]["id"])
-' "$SOURCE_VM")
+' "$SOURCE_VM" "$CROSS_NODE_FORK_STATUS" "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}")
 [ "$CROSS_NODE_FORK_VM" = "$REQUESTED_CROSS_NODE_FORK_VM" ]
 RETRY_CROSS_NODE_FORK_STATUS=$(curl -sS --max-time 30 \
   -o "$DIR/cross-node-fork-retry.json" -w '%{http_code}' \
@@ -435,6 +457,7 @@ import json,sys
 row=json.load(open(sys.argv[1]))
 assert row.get("source_vm_id") == sys.argv[2], row
 assert row.get("vm", {}).get("id") == sys.argv[3], row
+assert "metrics" not in row, row
 PY
 WRONG_CROSS_NODE_SOURCE=$(python3 -c 'import uuid; print(uuid.uuid4())')
 WRONG_CROSS_NODE_STATUS=$(curl -sS --max-time 30 \

@@ -272,11 +272,70 @@ components:
           description: Optional id for the isolated restored VM; generated when omitted.
     ForkVmRequest:
       type: object
+      additionalProperties: false
       properties:
         id:
           type: string
           format: uuid
           description: Optional child VM id; generated when omitted.
+    ForkExecutionPath:
+      type: string
+      enum: [local, cross_node]
+    ForkSnapshotTermination:
+      type: string
+      enum: [converged, diverging, timeout, max_rounds]
+    ForkSnapshotMetrics:
+      type: object
+      additionalProperties: false
+      required: [rounds, pages_copied, final_dirty_pages, elapsed_us, downtime_us, termination]
+      properties:
+        rounds:
+          type: integer
+          format: uint32
+        pages_copied:
+          type: integer
+          format: uint64
+        final_dirty_pages:
+          type: integer
+          format: uint64
+        elapsed_us:
+          type: integer
+          format: uint64
+        downtime_us:
+          type: integer
+          format: uint64
+          description: Complete final-stop guest blackout, including pause and resume handshakes.
+        termination:
+          $ref: "#/components/schemas/ForkSnapshotTermination"
+    ForkMetrics:
+      type: object
+      additionalProperties: false
+      required: [path, source_resolution_us, operation_claim_us, snapshot_artifact_us, child_ready_us, operation_commit_us, total_us]
+      properties:
+        path:
+          $ref: "#/components/schemas/ForkExecutionPath"
+        source_resolution_us:
+          type: integer
+          format: uint64
+        operation_claim_us:
+          type: integer
+          format: uint64
+        snapshot_artifact_us:
+          type: integer
+          format: uint64
+          description: Atomic snapshot plus durable local artifact publication, or peer replication and localization.
+        child_ready_us:
+          type: integer
+          format: uint64
+          description: Restore through repaired guest readiness.
+        operation_commit_us:
+          type: integer
+          format: uint64
+        total_us:
+          type: integer
+          format: uint64
+        live_snapshot:
+          $ref: "#/components/schemas/ForkSnapshotMetrics"
     ForkVmResponse:
       type: object
       required: [source_vm_id, vm]
@@ -286,6 +345,10 @@ components:
           format: uuid
         vm:
           $ref: "#/components/schemas/VmRecord"
+        metrics:
+          allOf:
+            - $ref: "#/components/schemas/ForkMetrics"
+          description: Present when this request executed the fork. An idempotent replay returns the original child without fabricating new timings.
     ExecuteRequest:
       type: object
       required: [vm_id, command]

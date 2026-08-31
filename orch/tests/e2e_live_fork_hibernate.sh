@@ -243,7 +243,56 @@ fi
 FORK_JSON=$(cat "$FORK_BODY")
 FORK_END=$(now_ms)
 CHILD_ID=$(printf '%s' "$FORK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["vm"]["id"])')
-printf '%s' "$FORK_JSON" | grep -q '"status":"running"'
+printf '%s' "$FORK_JSON" | python3 -c '
+import json,sys
+row=json.load(sys.stdin)
+metrics=row["metrics"]
+live=metrics["live_snapshot"]
+assert row["vm"]["status"] == "running", row
+assert metrics["path"] == "local", metrics
+phases=[metrics[name] for name in (
+    "source_resolution_us", "operation_claim_us", "snapshot_artifact_us",
+    "child_ready_us", "operation_commit_us",
+)]
+assert all(isinstance(value, int) and value > 0 for value in phases), metrics
+assert isinstance(metrics["total_us"], int) and metrics["total_us"] >= sum(phases), metrics
+assert live["rounds"] >= 2 and live["pages_copied"] > 0, live
+assert live["elapsed_us"] > 0 and live["downtime_us"] > 0, live
+assert live["downtime_us"] <= live["elapsed_us"], live
+assert live["termination"] in {"converged", "diverging", "timeout", "max_rounds"}, live
+serialized=json.dumps(row, separators=(",", ":"))
+for private in ("snapshot_path", "overlay_path", "host_id"):
+    assert private not in metrics and private not in live, serialized
+print(
+    "fork_metrics "
+    + " ".join(
+        f"{name}={value}"
+        for name, value in (
+            ("path", metrics["path"]),
+            ("source_resolution_us", metrics["source_resolution_us"]),
+            ("operation_claim_us", metrics["operation_claim_us"]),
+            ("snapshot_artifact_us", metrics["snapshot_artifact_us"]),
+            ("child_ready_us", metrics["child_ready_us"]),
+            ("operation_commit_us", metrics["operation_commit_us"]),
+            ("total_us", metrics["total_us"]),
+            ("rounds", live["rounds"]),
+            ("pages_copied", live["pages_copied"]),
+            ("final_dirty_pages", live["final_dirty_pages"]),
+            ("live_elapsed_us", live["elapsed_us"]),
+            ("downtime_us", live["downtime_us"]),
+            ("termination", live["termination"]),
+        )
+    )
+)
+'
+FORK_REPLAY=$(api -H 'Content-Type: application/json' \
+  -d "{\"id\":\"$CHILD_ID\"}" "$BASE_URL/v1/vms/$PARENT_ID/fork")
+printf '%s' "$FORK_REPLAY" | python3 -c '
+import json,sys
+row=json.load(sys.stdin); expected=sys.argv[1]
+assert row["vm"]["id"] == expected and row["vm"]["status"] == "running", row
+assert "metrics" not in row, row
+' "$CHILD_ID"
 expect_exec "$PARENT_ID" 'cat /root/tarit-fork-state /tmp/tarit-memory-state' 'parent-before-fork'
 expect_exec "$CHILD_ID" 'cat /root/tarit-fork-state /tmp/tarit-memory-state' 'memory-before-fork'
 expect_exec "$PARENT_ID" "sh -c 'echo parent-after > /root/tarit-fork-state'" ""
@@ -624,7 +673,10 @@ if [ "${TARIT_TEST_SHARE:-0}" = 1 ]; then
   fi
   grep -q '"pty_id"' "$DIR/mixed-pty.json"
   grep -q REPAIRED_SSH "$DIR/mixed-ssh.log"
-  ! grep -q UNREPAIRED_SSH "$DIR/mixed-ssh.log"
+  if grep -q UNREPAIRED_SSH "$DIR/mixed-ssh.log"; then
+    echo "FAIL: SSH ingress reached the guest before clone repair" >&2
+    exit 1
+  fi
   grep -qx REPAIRED_SHARE "$DIR/mixed-share.out"
   api "$BASE_URL/v1/vms/$RECOVERY_ID" | grep -q '"status":"running"'
   [ "$(vmm_pids_for_id "$RECOVERY_ID" | sed '/^$/d' | wc -l)" -eq 1 ]

@@ -452,15 +452,61 @@ pub struct RestoreBranchRequest {
 /// supplied for idempotent orchestration; host paths and placement are never
 /// caller-controlled.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForkVmRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkExecutionPath {
+    Local,
+    CrossNode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkSnapshotTermination {
+    Converged,
+    Diverging,
+    Timeout,
+    MaxRounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSnapshotMetrics {
+    pub rounds: u32,
+    pub pages_copied: u64,
+    pub final_dirty_pages: u64,
+    pub elapsed_us: u64,
+    pub downtime_us: u64,
+    pub termination: ForkSnapshotTermination,
+}
+
+/// Measurements for one newly executed fork. Idempotent replays return the
+/// original child without inventing a second set of timings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkMetrics {
+    pub path: ForkExecutionPath,
+    pub source_resolution_us: u64,
+    pub operation_claim_us: u64,
+    pub snapshot_artifact_us: u64,
+    pub child_ready_us: u64,
+    pub operation_commit_us: u64,
+    pub total_us: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_snapshot: Option<ForkSnapshotMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkVmResponse {
     pub source_vm_id: Uuid,
     pub vm: PublicVmRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<ForkMetrics>,
 }
 
 /// Durable phase of a source-bound fork operation. `Preparing` is written
@@ -1006,6 +1052,17 @@ pub struct SnapshotResponse {
     pub snapshot_id: Uuid,
 }
 
+/// Peer-only snapshot result. Public snapshot routes expose only the opaque
+/// snapshot id; cluster fork coordination also carries source-side live
+/// snapshot measurements without exposing a physical locator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerSnapshotResponse {
+    pub snapshot_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_snapshot: Option<ForkSnapshotMetrics>,
+}
+
 /// OpenSSH SHA256 fingerprint for an RFC4253 public-key blob.
 ///
 /// This returns the same string format as `ssh-keygen -lf` and
@@ -1332,6 +1389,40 @@ mod tests {
             "host_id": "attacker-selected"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn fork_metrics_are_structured_and_contain_no_host_locator() {
+        let metrics = ForkMetrics {
+            path: ForkExecutionPath::Local,
+            source_resolution_us: 10,
+            operation_claim_us: 20,
+            snapshot_artifact_us: 30,
+            child_ready_us: 40,
+            operation_commit_us: 50,
+            total_us: 150,
+            live_snapshot: Some(ForkSnapshotMetrics {
+                rounds: 3,
+                pages_copied: 4096,
+                final_dirty_pages: 4,
+                elapsed_us: 25,
+                downtime_us: 5,
+                termination: ForkSnapshotTermination::Converged,
+            }),
+        };
+        let value = serde_json::to_value(&metrics).unwrap();
+        assert_eq!(value["path"], "local");
+        assert_eq!(value["live_snapshot"]["termination"], "converged");
+        for private in ["host_id", "snapshot_path", "overlay_path"] {
+            assert!(
+                value.get(private).is_none(),
+                "fork metrics leaked {private}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<ForkMetrics>(value).unwrap(),
+            metrics
+        );
     }
 
     #[test]

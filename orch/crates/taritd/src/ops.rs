@@ -2088,7 +2088,9 @@ pub async fn hibernate_local(
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
-    let snapshot_path = snapshot_local_locked(state, id, false, Some(id), None).await?;
+    let snapshot_path = snapshot_local_locked(state, id, false, Some(id), None)
+        .await?
+        .path;
     let snapshot =
         verify_snapshot_access(state, &snapshot_path, current.owner_key.as_deref(), false)?;
     let owner_key = current.owner_key.as_ref().ok_or_else(|| {
@@ -2627,7 +2629,14 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     )?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
-    snapshot_local_locked(state, id, diff, None, None).await
+    Ok(snapshot_local_locked(state, id, diff, None, None)
+        .await?
+        .path)
+}
+
+pub(crate) struct ForkSnapshotOutcome {
+    pub(crate) path: String,
+    pub(crate) live_stats: Option<tarit_proto::LiveSnapshotStats>,
 }
 
 /// Create the private snapshot that backs one local live-fork attempt. Its
@@ -2637,7 +2646,7 @@ pub async fn snapshot_local_for_fork(
     state: &AppState,
     source_id: Uuid,
     child_id: Uuid,
-) -> Result<String, OrchError> {
+) -> Result<ForkSnapshotOutcome, OrchError> {
     if let Some(existing) = state
         .store
         .lock()
@@ -2650,7 +2659,10 @@ pub async fn snapshot_local_for_fork(
                 "fork artifact {child_id} is already bound to another operation"
             )));
         }
-        return Ok(existing.path);
+        return Ok(ForkSnapshotOutcome {
+            path: existing.path,
+            live_stats: None,
+        });
     }
     ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
     let gate = state.supervisor.operation_gate(source_id)?;
@@ -2679,7 +2691,7 @@ async fn snapshot_local_locked(
     diff: bool,
     ephemeral_owner_vm_id: Option<Uuid>,
     snapshot_id: Option<Uuid>,
-) -> Result<String, OrchError> {
+) -> Result<ForkSnapshotOutcome, OrchError> {
     let vm = ensure_vm_status(
         state,
         id,
@@ -2905,8 +2917,9 @@ async fn snapshot_local_locked(
         }
     }
     let path = record.path;
+    let live_stats = bundle.live_stats().cloned();
     bundle.persist();
-    Ok(path)
+    Ok(ForkSnapshotOutcome { path, live_stats })
 }
 
 /// R-006: confirm the caller may restore the snapshot at `snapshot_path`.
