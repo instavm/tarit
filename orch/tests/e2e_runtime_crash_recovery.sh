@@ -8,6 +8,7 @@ TARITD="${TARITD_BIN:-$ROOT/orch/target/release/taritd}"
 VMM="${TARIT_VMM_BIN:-$ROOT/vmm/target/release/vmm}"
 KERNEL="${TARIT_KERNEL:?set TARIT_KERNEL to a KVM guest kernel}"
 ROOTFS="${TARIT_ROOTFS:?set TARIT_ROOTFS to an agent-enabled OCI rootfs}"
+GUEST_AGENT="${TARIT_TEST_GUEST_AGENT_BIN:-}"
 EXPECTED_OS_ID="${TARIT_EXPECT_OS_ID:-ubuntu}"
 SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
 KEY="runtime-crash-recovery-e2e-key"
@@ -49,9 +50,13 @@ mkdir -m 700 "$DIR/sockets" "$DIR/runtime" "$DIR/images" "$DIR/jails"
 BASE_URL="http://127.0.0.1:$PORT"
 TARITD_PID=""
 TARITD_PGID=""
+ROOTFS_MOUNT=""
 
 cleanup() {
   local status=$?
+  if [ -n "$ROOTFS_MOUNT" ] && mountpoint -q "$ROOTFS_MOUNT"; then
+    umount "$ROOTFS_MOUNT" || true
+  fi
   if [ -n "$TARITD_PGID" ] && kill -0 -- "-$TARITD_PGID" 2>/dev/null; then
     kill -TERM -- "-$TARITD_PGID" 2>/dev/null || true
     for _ in $(seq 1 80); do
@@ -94,6 +99,23 @@ cmp -s -- "$ROOTFS" "$STAGED_ROOTFS" || {
   echo "FAIL: staged OCI rootfs differs from its source" >&2
   exit 1
 }
+if [ -n "$GUEST_AGENT" ]; then
+  for required in e2fsck install mount mountpoint umount; do
+    command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
+  done
+  test -x "$GUEST_AGENT" || {
+    echo "FAIL: guest agent is not executable: $GUEST_AGENT" >&2
+    exit 1
+  }
+  ROOTFS_MOUNT="$DIR/rootfs-mount"
+  mkdir -m 700 "$ROOTFS_MOUNT"
+  mount -o loop,rw "$STAGED_ROOTFS" "$ROOTFS_MOUNT"
+  install -D -m 0755 "$GUEST_AGENT" "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  sync -f "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  umount "$ROOTFS_MOUNT"
+  ROOTFS_MOUNT=""
+  e2fsck -pf "$STAGED_ROOTFS" >/dev/null
+fi
 chmod 0444 "$STAGED_ROOTFS"
 ROOTFS="$STAGED_ROOTFS"
 

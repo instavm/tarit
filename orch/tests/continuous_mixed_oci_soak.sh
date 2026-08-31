@@ -205,6 +205,7 @@ while :; do
       TARIT_VMM_BIN="$VMM" \
       TARIT_KERNEL="$kernel" \
       TARIT_ROOTFS="$rootfs" \
+      TARIT_TEST_GUEST_AGENT_BIN="$GUEST_AGENT" \
       TARIT_EXPECT_OS_ID="$expected_os" \
       TARIT_TEST_SOCKET_ROOT="$SOCKET_ROOT" \
       TARIT_E2E_KEEP_FAILED=0 \
