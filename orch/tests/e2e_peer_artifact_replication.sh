@@ -667,16 +667,44 @@ PY
     sleep 0.1
   done
   test "$ENOSPC_PAUSED" = 1
-  ENOSPC_AVAILABLE=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
   ENOSPC_TARGET_FREE=$((ENOSPC_LOCALIZATION_BYTES / 4))
   [ "$ENOSPC_TARGET_FREE" -ge 33554432 ] || ENOSPC_TARGET_FREE=33554432
   [ "$ENOSPC_TARGET_FREE" -lt "$ENOSPC_LOCALIZATION_BYTES" ]
-  ENOSPC_FILL_BYTES=$((ENOSPC_AVAILABLE - ENOSPC_TARGET_FREE))
-  [ "$ENOSPC_FILL_BYTES" -gt 0 ]
-  fallocate -l "$ENOSPC_FILL_BYTES" "$DIR/node-b/.near-enospc-filler"
-  sync -f "$DIR/node-b/.near-enospc-filler"
+  ENOSPC_FILLER="$DIR/node-b/.near-enospc-filler"
+  : >"$ENOSPC_FILLER"
+  ENOSPC_PRESSURE_CONVERGED=0
+  for ENOSPC_PRESSURE_ROUND in $(seq 1 16); do
+    ENOSPC_AVAILABLE=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
+    if [ "$ENOSPC_AVAILABLE" -lt "$ENOSPC_LOCALIZATION_BYTES" ]; then
+      ENOSPC_PRESSURE_CONVERGED=1
+      break
+    fi
+    ENOSPC_FILL_SIZE=$(stat -c %s "$ENOSPC_FILLER")
+    ENOSPC_FILL_DELTA=$((ENOSPC_AVAILABLE - ENOSPC_TARGET_FREE))
+    [ "$ENOSPC_FILL_DELTA" -gt 0 ] || break
+    ENOSPC_FILL_TARGET=$((ENOSPC_FILL_SIZE + ENOSPC_FILL_DELTA))
+    if ! fallocate -l "$ENOSPC_FILL_TARGET" "$ENOSPC_FILLER"; then
+      echo "near-ENOSPC pressure allocation stopped at round $ENOSPC_PRESSURE_ROUND" >&2
+    fi
+    if ! sync -f "$ENOSPC_FILLER"; then
+      echo "near-ENOSPC pressure sync reported exhausted storage at round $ENOSPC_PRESSURE_ROUND" >&2
+    fi
+    ENOSPC_AFTER=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
+    echo "near_enospc_pressure round=$ENOSPC_PRESSURE_ROUND before=$ENOSPC_AVAILABLE after=$ENOSPC_AFTER target=$ENOSPC_TARGET_FREE localization=$ENOSPC_LOCALIZATION_BYTES" >&2
+    if [ "$ENOSPC_AFTER" -ge "$ENOSPC_AVAILABLE" ]; then
+      echo "FAIL: near-ENOSPC pressure made no forward progress" >&2
+      exit 1
+    fi
+  done
   ENOSPC_REMAINING=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
-  [ "$ENOSPC_REMAINING" -lt "$ENOSPC_LOCALIZATION_BYTES" ]
+  if [ "$ENOSPC_REMAINING" -lt "$ENOSPC_LOCALIZATION_BYTES" ]; then
+    ENOSPC_PRESSURE_CONVERGED=1
+  fi
+  if [ "$ENOSPC_PRESSURE_CONVERGED" != 1 ]; then
+    echo "FAIL: near-ENOSPC pressure did not reach the localization threshold" >&2
+    echo "remaining_bytes=$ENOSPC_REMAINING localization_bytes=$ENOSPC_LOCALIZATION_BYTES" >&2
+    exit 1
+  fi
   wait "$PRESSURE_CURL_PID"
   PRESSURE_CURL_PID=""
   test "$(cat "$DIR/enospc-status")" = 503
@@ -697,7 +725,7 @@ PY
   PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
     "select count(*) from fleet_branches where branch_id='$BRANCH_ID'" | grep -qx 0
   wait_exec_ubuntu "http://127.0.0.1:$A_CONTROL" "$SOURCE_VM"
-  rm -f -- "$DIR/node-b/.near-enospc-filler"
+  rm -f -- "$ENOSPC_FILLER"
   sync -f "$DIR/node-b"
   ENOSPC_RECOVERED=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
   [ "$ENOSPC_RECOVERED" -gt "$ENOSPC_LOCALIZATION_BYTES" ]
@@ -943,4 +971,4 @@ for deleted in \
   [ -z "$deleted" ] || test ! -e "$deleted"
 done
 
-echo 'PASS: atomic live fork started its isolated child across nodes; boot metadata failed closed; Ubuntu OCI artifacts used peer mTLS; hibernate reached zero; stale owner was fenced; HTTP exec woke the same VM ID on B with durable egress and its shared-volume attachment; cross-node volume deletion removed the backing object; branch restored; node C repaired degradation; last-branch deletion preserved the live lazy restore and physical replica GC converged'
+echo "PASS source=${TARIT_SOURCE_REVISION:-unknown}: atomic live fork started its isolated child across nodes; boot metadata failed closed; Ubuntu OCI artifacts used peer mTLS; hibernate reached zero; stale owner was fenced; HTTP exec woke the same VM ID on B with durable egress and its shared-volume attachment; cross-node volume deletion removed the backing object; branch restored; node C repaired degradation; last-branch deletion preserved the live lazy restore and physical replica GC converged"
