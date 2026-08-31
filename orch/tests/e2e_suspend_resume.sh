@@ -13,6 +13,17 @@ KEY="suspend-e2e-key"
 PORT="${SUSPEND_E2E_PORT:-}"
 MIN_RSS_DROP_KIB="${SUSPEND_MIN_RSS_DROP_KIB:-32768}"
 MAX_RESUME_EXEC_MS="${SUSPEND_RESUME_EXEC_MAX_MS:-5000}"
+EXPECTED_KERNEL_PREFIX="${TARIT_EXPECT_KERNEL_RELEASE_PREFIX:-}"
+EXPECTED_OS_ID="${TARIT_EXPECT_OS_ID:-}"
+
+[[ "$EXPECTED_KERNEL_PREFIX" != *[[:space:]]* ]] || {
+  echo "FAIL: TARIT_EXPECT_KERNEL_RELEASE_PREFIX must not contain whitespace" >&2
+  exit 1
+}
+[[ "$EXPECTED_OS_ID" =~ ^[a-z0-9._-]*$ ]] || {
+  echo "FAIL: TARIT_EXPECT_OS_ID contains unsupported characters" >&2
+  exit 1
+}
 
 for required in curl python3 setsid ps awk; do
   command -v "$required" >/dev/null || {
@@ -164,6 +175,30 @@ VM_ID=$(printf '%s' "$VM_JSON" | json_field id)
 printf '%s' "$VM_JSON" | grep -q '"status":"running"'
 VMM_PID=$(vmm_pid_for_socket "$DIR/sockets/$VM_ID.sock")
 kill -0 "$VMM_PID"
+
+if [ -n "$EXPECTED_KERNEL_PREFIX" ]; then
+  KERNEL_IDENTITY=$(exec_json "$VM_ID" 'uname -r')
+  printf '%s' "$KERNEL_IDENTITY" | python3 -c '
+import json, sys
+expected = sys.argv[1]
+result = json.load(sys.stdin)
+assert result["exit_code"] == 0, result
+actual = result.get("stdout", "").strip()
+assert actual.startswith(expected), (expected, actual)
+' "$EXPECTED_KERNEL_PREFIX"
+fi
+if [ -n "$EXPECTED_OS_ID" ]; then
+  # shellcheck disable=SC2016 # $ID expands inside the guest shell.
+  OS_IDENTITY=$(exec_json "$VM_ID" '. /etc/os-release && printf "%s\n" "$ID"')
+  printf '%s' "$OS_IDENTITY" | python3 -c '
+import json, sys
+expected = sys.argv[1]
+result = json.load(sys.stdin)
+assert result["exit_code"] == 0, result
+actual = result.get("stdout", "").strip()
+assert actual == expected, (expected, actual)
+' "$EXPECTED_OS_ID"
+fi
 
 PREP=$(exec_json "$VM_ID" "mkdir -p /mnt/tarit-rss && mount -t tmpfs -o size=192m tmpfs /mnt/tarit-rss && dd if=/dev/zero of=/mnt/tarit-rss/fill bs=1M count=160 2>/dev/null && echo suspend-state-ok > /mnt/tarit-rss/state")
 printf '%s' "$PREP" | grep -q '"exit_code":0'
