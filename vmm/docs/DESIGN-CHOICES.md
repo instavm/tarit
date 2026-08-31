@@ -187,10 +187,10 @@ but they optimize for long-running VMs, not cold-boot latency.
 **Why full jailer:** The security model requires a host-owned security boundary.
 The jailer creates a chroot, drops all capabilities (PR_CAPBSET_DROP +
 capset + ambient clear), installs a seccomp BPF filter, and applies
-cgroup limits. This is the standard jailer isolation model for
-microVMs. The seccomp
-filter is per-thread (installed only on the vCPU thread, not the
-controller thread) so the controller can still call openat/snapshot.
+cgroup limits. Seccomp is installed independently on vCPU, block, network, and
+vsock threads with role-specific allowlists. The controller does not process
+guest queue data and retains only the host operations required for lifecycle
+and snapshot management.
 
 ## Boot Timeout / Watchdog
 

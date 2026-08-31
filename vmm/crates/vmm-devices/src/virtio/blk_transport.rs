@@ -1,5 +1,5 @@
 //! virtio-mmio transport for virtio-blk: real register decode + virtqueue
-//! processing + file I/O on QUEUE_NOTIFY.
+//! queue processing and a file-backed data plane.
 //!
 //! When the guest writes to QUEUE_NOTIFY, we walk the descriptor ring,
 //! extract the virtio_blk_req, call BlkBackend::service(), write the
@@ -160,6 +160,21 @@ pub struct VirtioBlkMmio {
 }
 
 impl VirtioBlkMmio {
+    /// Permanently fail the transport after its isolated queue worker exits
+    /// unexpectedly. Snapshot capture then fails closed instead of serializing
+    /// a VM whose storage queue can no longer make progress.
+    pub fn fail_worker(&self, context: &str) {
+        self.fail_device(context);
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub fn set_test_service_delay(&self, delay: std::time::Duration) -> MmioWriteResult {
+        let mut backend = self.try_lock_state(&self.backend, "backend")?;
+        let backend = backend.as_mut().ok_or(MmioError::Device)?;
+        backend.set_test_service_delay(delay);
+        Ok(())
+    }
+
     fn fail_device(&self, context: &str) {
         log::error!("virtio-blk: {context}");
         self.status.fetch_or(
@@ -482,8 +497,10 @@ impl VirtioBlkMmio {
         }
     }
 
-    /// Process the virtqueue when the guest kicks (writes to QUEUE_NOTIFY).
-    fn process_queue(&self, _queue_idx: u32) -> MmioWriteResult {
+    /// Process the virtqueue when the guest kicks. Production KVM guests route
+    /// QUEUE_NOTIFY to the block I/O worker; direct MMIO callers retain this
+    /// entry point as a portable fallback.
+    pub fn process_queue(&self, _queue_idx: u32) -> MmioWriteResult {
         self.ensure_operational()?;
         let mem = match self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() {
             Some(m) => m,

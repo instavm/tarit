@@ -564,8 +564,8 @@ crates/
   vmm-memory-backend/ Guest memory (mmap), dirty bitmap, KVM registration,
                       dirty-log ioctl, UFFD lazy restore
   vmm-loader/         Kernel load (bzImage/ELF), E820 map, zero page, cmdline
-  vmm-devices/        MMIO bus, virtio-mmio transport, virtio-blk (backend +
-                      transport + vqueue walker), virtio-net, virtio-rng, serial
+  vmm-devices/        MMIO bus, virtio-mmio transport, isolated virtio-blk
+                      queue workers, virtio-net, virtio-rng, serial
   vmm-snapshot/       CRC state file, diff snapshots, clone plans, live
                       snapshot convergence, snapshot format
   vmm-net/            TAP creation, nftables egress compiler, DNS-aware
@@ -584,7 +584,9 @@ guest/                Guest kernel configs, release tooling, and agent
 
 ## Security Model
 
-- **Seccomp confinement**: the jailer seccomp profile blocks process network syscalls (socket, connect, bind, sendto, recvfrom)
+- **Seccomp confinement**: each queue worker has a purpose-specific syscall
+  profile. Block workers can poll and use pre-opened storage descriptors but
+  cannot open paths, create sockets, use network syscalls, or issue ioctls.
 - **VM-to-VM isolation**: each VM gets its own netns, no bridge between VMs
 - **Host-enforced egress**: nftables default-deny + allowlist, guest cannot alter
 - **Jailer**: chroot + mount namespace + privilege drop + seccomp + cgroup v2 limits

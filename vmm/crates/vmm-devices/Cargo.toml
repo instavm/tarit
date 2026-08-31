@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+test-failpoints = []
+
 [dependencies]
 vmm-jailer = { path = "../vmm-jailer" }
 virtio-queue.workspace = true

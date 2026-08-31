@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum ThreadKind {
     Vcpu,
     Device,
+    Block,
     Vsock,
 }
 
@@ -50,21 +51,11 @@ impl SeccompProfile {
                 // residency before MADV_DONTNEED so it never waits on an
                 // unresolved UFFD fault.
                 "mincore".into(),
-                // virtio-blk MMIO exits are handled in the vCPU thread.
-                // The backend does pread64/pwrite64/lseek for file I/O.
-                "pread64".into(),
-                "pwrite64".into(),
-                "lseek".into(),
-                "fdatasync".into(),
                 // Rust's owned-fd drop path checks that the KVM vCPU fd is
                 // still valid with fcntl(F_GETFD) immediately before close.
                 // Permit only that read-only query; general fcntl operations
                 // (duplication, flag mutation, and locking) stay denied.
                 "fcntl".into(),
-                // CoW-overlay and plain-blk FLUSH call File::sync_all() = fsync
-                // for durability; without it the first FLUSH on a write-heavy
-                // guest rootfs kills the vCPU thread with SIGSYS (seccomp).
-                "fsync".into(),
                 // Rust runtime + glibc need these during normal operation and
                 // especially during a panic unwind: the stack-overflow guard
                 // (sigaltstack), TLS/guard pages (mprotect/mremap), signal setup
@@ -109,6 +100,48 @@ impl SeccompProfile {
                 "futex".into(),
                 "close".into(),
                 "dup".into(),
+                "mmap".into(),
+                "munmap".into(),
+                "mprotect".into(),
+                "mremap".into(),
+                "rt_sigreturn".into(),
+                "rt_sigaction".into(),
+                "rt_sigprocmask".into(),
+                "sigaltstack".into(),
+                "exit".into(),
+                "exit_group".into(),
+                "nanosleep".into(),
+                "clock_nanosleep".into(),
+                "sched_yield".into(),
+                "restart_syscall".into(),
+                "getrandom".into(),
+                "madvise".into(),
+                "brk".into(),
+                "gettid".into(),
+                "getpid".into(),
+                "clock_gettime".into(),
+            ],
+        }
+    }
+
+    /// Block queue worker. It can poll eventfds and perform positional I/O or
+    /// durable flushes on descriptors opened before confinement, but cannot
+    /// create sockets, open paths, issue ioctls, or use network syscalls.
+    pub fn block() -> Self {
+        Self {
+            kind: ThreadKind::Block,
+            allow: vec![
+                "poll".into(),
+                "ppoll".into(),
+                "read".into(),
+                "write".into(),
+                "pread64".into(),
+                "pwrite64".into(),
+                "lseek".into(),
+                "fdatasync".into(),
+                "fsync".into(),
+                "futex".into(),
+                "close".into(),
                 "mmap".into(),
                 "munmap".into(),
                 "mprotect".into(),
@@ -190,6 +223,7 @@ impl SeccompProfile {
             match self.kind {
                 ThreadKind::Vcpu => "vCPU",
                 ThreadKind::Device => "device",
+                ThreadKind::Block => "block",
                 ThreadKind::Vsock => "vsock",
             },
             self.allow.len()
@@ -344,6 +378,29 @@ mod tests {
     fn device_profile_has_device_kind() {
         let p = SeccompProfile::device();
         assert_eq!(p.kind, ThreadKind::Device);
+    }
+
+    #[test]
+    fn block_profile_has_no_path_network_or_ioctl_authority() {
+        let profile = SeccompProfile::block();
+        assert_eq!(profile.kind, ThreadKind::Block);
+        for denied in [
+            "open", "openat", "socket", "connect", "ioctl", "recvfrom", "sendto",
+        ] {
+            assert!(!profile.allow.contains(&denied.to_string()), "{denied}");
+        }
+        for required in [
+            "poll",
+            "read",
+            "write",
+            "pread64",
+            "pwrite64",
+            "lseek",
+            "fdatasync",
+            "fsync",
+        ] {
+            assert!(profile.allow.contains(&required.to_string()), "{required}");
+        }
     }
 
     #[test]

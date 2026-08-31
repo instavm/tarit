@@ -26,7 +26,7 @@ env_logger = "0.10"
 
 [features]
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vmm-core", "dep:vmm-snapshot", "dep:postcard", "dep:vmm-migration", "vmm-core/kvm", "vmm-core/boot"]
-test-failpoints = ["vmm-core/test-failpoints"]
+test-failpoints = ["vmm-core/test-failpoints", "vmm-devices/test-failpoints"]
 
 [[test]]
 name = "boot_smoke"
@@ -81,6 +81,11 @@ required-features = ["kvm"]
 name = "pv_msr_snapshot"
 path = "pv_msr_snapshot.rs"
 required-features = ["kvm"]
+
+[[test]]
+name = "blk_io_isolation"
+path = "blk_io_isolation.rs"
+required-features = ["kvm", "test-failpoints"]
 
 [lints]
 workspace = true

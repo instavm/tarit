@@ -1244,6 +1244,25 @@ passing focused gate does not waive an item in the final column.
   publishes a net TX descriptor without a notification and requires the pause
   drain to complete it; Ubuntu OCI guests on Linux 6.6.155 and 5.10.230 also
   passed ordinary and live snapshots while a vsock command remained in flight.
+- Virtio block queue notifications now land on a dedicated, event-driven worker
+  per volume instead of running host storage operations on a vCPU thread. Slow
+  reads, writes, or flushes therefore cannot occupy the guest execution path or
+  starve unrelated control/device work. Snapshot quiescence pauses vCPUs first,
+  drains each block queue even if its host event counter was already consumed,
+  and parks the workers before capturing RAM and device state. Worker setup is
+  admission-critical, and an unexpected worker exit permanently fails the
+  device so snapshots cannot serialize a storage-stalled VM. The worker seccomp
+  profile permits polling and I/O on pre-opened descriptors but denies path
+  opening, sockets, network operations, and ioctls; block-file syscalls were
+  removed from the vCPU profile. A deterministic c8i real-KVM gate injected
+  750 ms service latency into a writable `/dev/vdb`, required vCPU pause/resume
+  to complete within 250 ms, required snapshot capture to wait for the in-flight
+  write, and verified the exact persisted 1 KiB after shutdown. The same Ubuntu
+  OCI gate passed Linux 6.6.155 and 5.10.230: vCPU control completed in 183 and
+  649 microseconds while quiescent snapshot capture waited 7.30 and 4.94 seconds
+  for the finite delayed queues. With the current candidate guest agent baked
+  into the private OCI fixture, boot/snapshot/restore also passed on both
+  kernels.
 - The current c8i storage audit does not show the assumed 200 GiB device. It
   exposes one 50 GiB EBS NVMe disk with a 49 GiB root partition and no second
   NVMe block device; `/t` is a 12 GiB Btrfs loop image backed by

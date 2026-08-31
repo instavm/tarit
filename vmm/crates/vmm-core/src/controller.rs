@@ -31,6 +31,9 @@ pub struct RunningVm {
     /// and are paused/resumed/stopped together with the BSP.
     pub ap_threads: Vec<crate::vcpu_thread::VcpuThread>,
     pub loaded_entry: u64,
+    /// Per-volume queue workers. Declared before their device/eventfd owners so
+    /// they are stopped and joined before those resources are dropped.
+    pub blk_io_loops: Vec<vmm_devices::virtio::blk_io_loop::BlkIoLoop>,
     /// virtio-net host<->tap I/O loops. Each is dropped (which stops+joins the
     /// thread) before `keep_alive_fds`, whose EventFds the loops reference as
     /// their TX kick fd — so declaration order here is load-bearing.
@@ -372,6 +375,51 @@ impl Drop for LifecycleGuard<'_> {
 }
 
 impl VmmController {
+    /// Configure deterministic per-volume storage latency for Linux/KVM
+    /// integration tests. This API is absent from production builds.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        feature = "boot",
+        feature = "test-failpoints"
+    ))]
+    pub fn set_test_block_service_delay(
+        &self,
+        volume_index: usize,
+        delay: std::time::Duration,
+    ) -> Result<()> {
+        let slot = self.lock();
+        let running = slot
+            .as_ref()
+            .and_then(|vm| vm.running.as_ref())
+            .ok_or_else(|| VmmError::InvalidConfig("no running VM".into()))?;
+        let device = running.blk_devices.get(volume_index).ok_or_else(|| {
+            VmmError::InvalidConfig(format!("volume index {volume_index} is out of range"))
+        })?;
+        device
+            .set_test_service_delay(delay)
+            .map_err(|error| VmmError::Device(format!("set block service delay: {error}")))
+    }
+
+    /// Pause and immediately resume only the vCPUs. Used to prove that a slow
+    /// storage backend cannot occupy the KVM execution/control thread.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        feature = "boot",
+        feature = "test-failpoints"
+    ))]
+    pub fn test_vcpu_pause_round_trip(&self) -> Result<()> {
+        let slot = self.lock();
+        let vm = slot
+            .as_ref()
+            .ok_or_else(|| VmmError::InvalidConfig("no running VM".into()))?;
+        if pause_running_vcpus(vm)? {
+            resume_running_vcpus(vm)?;
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             vm: Arc::new(Mutex::new(None)),
@@ -748,6 +796,8 @@ impl VmmController {
             acpi_devices,
             blks,
             blk_irq_evts,
+            blk_io_evts,
+            blk_mmio_bases,
             nets,
             rng_irq,
             vsock,
@@ -792,12 +842,28 @@ impl VmmController {
         kvm_vm.register_irqfd(vmgenid.eventfd(), crate::vmgenid::VMGENID_GSI)?;
         let vmgenid_evt = vmgenid.into_eventfd();
 
-        // Register irqfds (no ioeventfds for block — QUEUE_NOTIFY traps to userspace).
+        // Route each block queue kick away from the vCPU and into its dedicated
+        // storage worker. Failure is fatal: silently falling back to blocking
+        // file I/O on the vCPU would violate control-plane latency isolation.
         for (i, evt) in irq_evts.iter().enumerate() {
             let irq = 5 + i as u32;
-            if let Err(e) = kvm_vm.register_irqfd(evt, irq) {
-                log::warn!("irqfd for volume {i} (gsi={irq}): {e}");
-            }
+            kvm_vm.register_irqfd(evt, irq)?;
+        }
+        let mut blk_io_loops = Vec::with_capacity(blks.len());
+        for (i, ((device, io_evt), mmio_base)) in
+            blks.iter().zip(blk_io_evts).zip(blk_mmio_bases).enumerate()
+        {
+            kvm_vm.register_ioeventfd_datamatch(mmio_base + 0x50, &io_evt, 0)?;
+            use std::os::fd::AsRawFd;
+            let io_loop = vmm_devices::virtio::blk_io_loop::spawn_blk_io_loop(
+                Arc::clone(device),
+                io_evt.as_raw_fd(),
+            )
+            .map_err(|error| {
+                VmmError::Device(format!("spawn block I/O worker for volume {i}: {error}"))
+            })?;
+            blk_io_loops.push(io_loop);
+            irq_evts.push(io_evt);
         }
         // Keep the VM Generation ID eventfd alive, but only after the block
         // loop above. It has its own fixed GSI and must never be enumerated as
@@ -826,10 +892,9 @@ impl VmmController {
         irq_evts.push(serial_evt);
 
         // virtio-net: register an irqfd + a TX-queue ioeventfd per device and
-        // spawn its host<->tap I/O loop. Unlike block (whose QUEUE_NOTIFY traps
-        // to userspace), net uses an ioeventfd so the guest's TX kick lands on
-        // the io thread instead of exiting the vCPU. NetIoLoop + Tap are kept
-        // alive in RunningVm and dropped (loop first) on stop.
+        // spawn its host<->tap I/O loop. The guest's TX kick lands on the I/O
+        // thread instead of exiting the vCPU. NetIoLoop + Tap are kept alive
+        // in RunningVm and dropped (loop first) on stop.
         let mut net_io_loops = Vec::new();
         let mut net_devices = Vec::new();
         let mut taps = Vec::new();
@@ -986,6 +1051,7 @@ impl VmmController {
                 vcpu_thread,
                 ap_threads,
                 loaded_entry: loaded.entry,
+                blk_io_loops,
                 net_io_loops,
                 blk_devices: blks,
                 net_devices,
@@ -1063,11 +1129,9 @@ impl VmmController {
         // with the memory image (a blob captured before the loop would carry
         // boot-time registers against post-boot memory).
         //
-        // `quiesce` parks the VMM threads that DMA into guest memory (net I/O
-        // loops, vsock pump) for the final stop, so no page can go stale
-        // between the residual copy and the device-state capture. Virtio-blk
-        // needs no entry here: its QUEUE_NOTIFY traps to a vCPU thread, so
-        // pausing every vCPU already quiesces it.
+        // `quiesce` parks every host device worker that can write guest memory
+        // (block, network, and vsock) for the final stop, so no page can go
+        // stale between the residual copy and device-state capture.
         let quiesce = |pause: bool| set_running_io_paused(&running, pause);
         let memory_stage_path = match unique_scratch_snapshot_path("vmm-live-memory") {
             Ok(path) => path,
@@ -2451,6 +2515,9 @@ fn stop_running_vm(vm: &mut VmInstance) {
             }
         }
         // Stop the net I/O threads before their EventFds/taps drop.
+        for io_loop in running.blk_io_loops.iter_mut() {
+            io_loop.stop();
+        }
         for l in running.net_io_loops.iter_mut() {
             l.stop();
         }
@@ -2495,6 +2562,9 @@ fn pause_running_vcpus(vm: &VmInstance) -> Result<bool> {
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn set_running_io_paused(running: &RunningVm, paused: bool) {
     if paused {
+        for io_loop in &running.blk_io_loops {
+            io_loop.pause();
+        }
         for io_loop in &running.net_io_loops {
             io_loop.pause();
         }
@@ -2502,6 +2572,9 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) {
             pump.pause();
         }
     } else {
+        for io_loop in &running.blk_io_loops {
+            io_loop.resume();
+        }
         for io_loop in &running.net_io_loops {
             io_loop.resume();
         }
@@ -5255,6 +5328,8 @@ fn build_running_vm(
         acpi_devices: _,
         mut blks,
         blk_irq_evts,
+        blk_io_evts,
+        blk_mmio_bases,
         nets,
         rng_irq,
         vsock,
@@ -5289,9 +5364,25 @@ fn build_running_vm(
 
     for (i, evt) in irq_evts.iter().enumerate() {
         let irq = 5 + i as u32;
-        if let Err(e) = kvm_vm.register_irqfd(evt, irq) {
-            log::warn!("irqfd for volume {i} (gsi={irq}): {e}");
-        }
+        kvm_vm.register_irqfd(evt, irq)?;
+    }
+    let mut blk_io_loops = Vec::with_capacity(blks.len());
+    for (i, ((device, io_evt), mmio_base)) in
+        blks.iter().zip(blk_io_evts).zip(blk_mmio_bases).enumerate()
+    {
+        kvm_vm.register_ioeventfd_datamatch(mmio_base + 0x50, &io_evt, 0)?;
+        use std::os::fd::AsRawFd;
+        let io_loop = vmm_devices::virtio::blk_io_loop::spawn_blk_io_loop(
+            Arc::clone(device),
+            io_evt.as_raw_fd(),
+        )
+        .map_err(|error| {
+            VmmError::Device(format!(
+                "spawn restored block I/O worker for volume {i}: {error}"
+            ))
+        })?;
+        blk_io_loops.push(io_loop);
+        irq_evts.push(io_evt);
     }
     // i8042 irqfd (gsi 1), matching create_live's full-boot path.
     let i8042_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
@@ -5487,6 +5578,7 @@ fn build_running_vm(
         vcpu_thread,
         ap_threads,
         loaded_entry: entry,
+        blk_io_loops,
         net_io_loops,
         blk_devices: blks,
         net_devices,
@@ -5519,6 +5611,8 @@ struct WiredDevices {
     acpi_devices: Vec<(u64, u64, u32, bool)>,
     blks: Vec<Arc<vmm_devices::virtio::blk_transport::VirtioBlkMmio>>,
     blk_irq_evts: Vec<vmm_sys_util::eventfd::EventFd>,
+    blk_io_evts: Vec<vmm_sys_util::eventfd::EventFd>,
+    blk_mmio_bases: Vec<u64>,
     nets: Vec<WiredNet>,
     /// virtio-rng completion irqfd (gsi, EventFd), registered by the caller.
     rng_irq: Option<(u32, vmm_sys_util::eventfd::EventFd)>,
@@ -5633,6 +5727,8 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     let mut acpi_devices: Vec<(u64, u64, u32, bool)> = Vec::new();
     let mut blks: Vec<Arc<VirtioBlkMmio>> = Vec::new();
     let mut blk_irq_evts: Vec<vmm_sys_util::eventfd::EventFd> = Vec::new();
+    let mut blk_io_evts: Vec<vmm_sys_util::eventfd::EventFd> = Vec::new();
+    let mut blk_mmio_bases = Vec::new();
     let mut nets: Vec<WiredNet> = Vec::new();
 
     for (i, vol) in config.volumes.iter().enumerate() {
@@ -5645,13 +5741,13 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         transport.set_guest_dirty_tracker(host_dirty.clone());
         let irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
             .map_err(|e| VmmError::Kvm(format!("EventFd: {e}")))?;
+        let io_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| VmmError::Kvm(format!("EventFd: {e}")))?;
         transport.set_irq_evt(
             irq_evt
                 .try_clone()
                 .map_err(|e| VmmError::Kvm(format!("EventFd clone: {e}")))?,
         );
-        // No ioeventfd for block — QUEUE_NOTIFY must trap to userspace so
-        // process_queue() runs synchronously.
         devices.push((
             MmioRange::new(mmio_base, 0x1000),
             Box::new(transport.clone()),
@@ -5659,6 +5755,8 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         acpi_devices.push((mmio_base, 0x1000, irq, true));
         blks.push(transport);
         blk_irq_evts.push(irq_evt);
+        blk_io_evts.push(io_evt);
+        blk_mmio_bases.push(mmio_base);
         log::info!("volume {i}: {} at mmio 0x{mmio_base:x} irq {irq}", vol.path);
     }
 
@@ -5702,10 +5800,8 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     }
 
     // virtio-rng at the slot after all block + net devices (entropy for
-    // restored/cloned guests to reseed their CRNG). Like block, its QUEUE_NOTIFY
-    // traps to userspace and is serviced synchronously on the MMIO bus, so it
-    // needs only a completion irqfd. Now safe to probe: the backend fills
-    // entropy via getrandom (openat was killing the vCPU under seccomp).
+    // restored/cloned guests to reseed their CRNG). It is bounded and serviced
+    // synchronously on the MMIO bus, so it needs only a completion irqfd.
     let rng_slot = config.volumes.len() + config.net.len();
     let rng_irq_num = 5 + rng_slot as u32;
     let rng_mmio = MMIO_START + (rng_slot as u64) * 0x1000;
@@ -5793,6 +5889,8 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         acpi_devices,
         blks,
         blk_irq_evts,
+        blk_io_evts,
+        blk_mmio_bases,
         nets,
         rng_irq: Some((rng_irq_num, rng_evt)),
         vsock: Some(WiredVsock {

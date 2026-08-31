@@ -9,7 +9,7 @@ authors.workspace = true
 default = []
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "vmm-memory-backend/kvm"]
 boot = ["kvm"]
-test-failpoints = ["vmm-memory-backend/test-failpoints"]
+test-failpoints = ["vmm-memory-backend/test-failpoints", "vmm-devices/test-failpoints"]
 # Test-only build boundary used to prove that a real VMM with a newer state
 # schema rejects snapshots before KVM reconstruction.
 test-incompatible-snapshot-abi = []

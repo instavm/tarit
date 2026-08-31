@@ -412,6 +412,29 @@ pub struct BlkBackend {
     storage: BackendStorage,
     pub read_only: bool,
     pub sectors: u64,
+    #[cfg(feature = "test-failpoints")]
+    service_delay: std::time::Duration,
+}
+
+#[cfg(feature = "test-failpoints")]
+static TEST_DELAYED_SERVICES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "test-failpoints")]
+struct DelayedServiceGuard;
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for DelayedServiceGuard {
+    fn drop(&mut self) {
+        TEST_DELAYED_SERVICES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Number of block service calls currently held in the test-only latency
+/// injection point.
+#[cfg(feature = "test-failpoints")]
+pub fn test_delayed_services() -> usize {
+    TEST_DELAYED_SERVICES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(unix)]
@@ -495,6 +518,8 @@ impl BlkBackend {
             storage: BackendStorage::Raw(file),
             read_only,
             sectors,
+            #[cfg(feature = "test-failpoints")]
+            service_delay: std::time::Duration::ZERO,
         })
     }
 
@@ -532,7 +557,14 @@ impl BlkBackend {
             storage: BackendStorage::Cow(cow),
             read_only: false,
             sectors,
+            #[cfg(feature = "test-failpoints")]
+            service_delay: std::time::Duration::ZERO,
         })
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub fn set_test_service_delay(&mut self, delay: std::time::Duration) {
+        self.service_delay = delay;
     }
 
     /// Service a single block request.
@@ -542,6 +574,16 @@ impl BlkBackend {
     ///
     /// Returns the status byte to write back to the guest's status descriptor.
     pub fn service(&mut self, header: &BlkReqHeader, data: &mut [u8]) -> u8 {
+        #[cfg(feature = "test-failpoints")]
+        let _delay_guard = if self.service_delay.is_zero() {
+            None
+        } else {
+            TEST_DELAYED_SERVICES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = DelayedServiceGuard;
+            std::thread::sleep(self.service_delay);
+            Some(guard)
+        };
+
         // Validate the request.
         let (op, offset, force_unit_access) = match self.validate_service_req(header, data.len()) {
             Ok(validated) => validated,

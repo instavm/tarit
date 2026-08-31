@@ -7,6 +7,7 @@
 pub mod balloon;
 pub mod blk;
 pub mod blk_backend;
+pub mod blk_io_loop;
 pub mod blk_transport;
 pub mod net;
 pub mod net_io_loop;
