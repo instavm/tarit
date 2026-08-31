@@ -107,7 +107,7 @@ impl Drop for VcpuPauseGuard<'_> {
 /// guest memory (net/vsock pumps). Disengaging, or dropping on an error path,
 /// releases them.
 struct IoQuiesceGuard<'a> {
-    quiesce: &'a dyn Fn(bool),
+    quiesce: &'a dyn Fn(bool) -> Result<()>,
     armed: bool,
 }
 
@@ -152,17 +152,17 @@ impl Drop for DirtyReplayGuard<'_> {
 }
 
 impl<'a> IoQuiesceGuard<'a> {
-    fn engage(quiesce: &'a dyn Fn(bool)) -> Self {
-        quiesce(true);
-        Self {
+    fn engage(quiesce: &'a dyn Fn(bool) -> Result<()>) -> Result<Self> {
+        quiesce(true)?;
+        Ok(Self {
             quiesce,
             armed: true,
-        }
+        })
     }
 
     fn disengage(mut self) {
         if self.armed {
-            (self.quiesce)(false);
+            let _ = (self.quiesce)(false);
             self.armed = false;
         }
     }
@@ -171,7 +171,7 @@ impl<'a> IoQuiesceGuard<'a> {
 impl Drop for IoQuiesceGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            (self.quiesce)(false);
+            let _ = (self.quiesce)(false);
         }
     }
 }
@@ -390,7 +390,7 @@ pub fn live_snapshot<F>(
     vcpu_threads: &[&VcpuThread],
     config: &LiveSnapshotConfig,
     memory_file: &File,
-    quiesce_io: &dyn Fn(bool),
+    quiesce_io: &dyn Fn(bool) -> Result<()>,
     capture_state: F,
 ) -> Result<LiveSnapshotOutput>
 where
@@ -606,7 +606,7 @@ where
     log::info!("live_snapshot: final stop — pausing all vCPUs, draining I/O");
     let final_stop_start = Instant::now();
     let final_pause_guard = VcpuPauseGuard::pause_all(vcpu_threads)?;
-    let io_guard = IoQuiesceGuard::engage(quiesce_io);
+    let io_guard = IoQuiesceGuard::engage(quiesce_io)?;
     inject_live_snapshot_failure("final_pause")?;
 
     let mut final_dirty = kvm_vm.read_dirty()?;
@@ -790,5 +790,35 @@ mod tests {
             decide(&params, 2, 100 << 20),
             RoundDecision::Continue { .. }
         ));
+    }
+
+    #[test]
+    fn io_quiesce_failure_is_propagated_without_arming_release() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let quiesce = |paused| {
+            calls.borrow_mut().push(paused);
+            Err(VmmError::Device("quiescence failed".into()))
+        };
+
+        let error = match IoQuiesceGuard::engage(&quiesce) {
+            Ok(_) => panic!("failed quiescence unexpectedly armed the guard"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("quiescence failed"));
+        assert_eq!(&*calls.borrow(), &[true]);
+    }
+
+    #[test]
+    fn io_quiesce_guard_releases_on_drop() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let quiesce = |paused| {
+            calls.borrow_mut().push(paused);
+            Ok(())
+        };
+
+        drop(IoQuiesceGuard::engage(&quiesce).expect("engage I/O quiescence"));
+
+        assert_eq!(&*calls.borrow(), &[true, false]);
     }
 }

@@ -17,6 +17,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 const POLL_TIMEOUT_MS: libc::c_int = 100;
 const PAUSE_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Handle for one volume's queue worker. Dropping it stops and joins the
 /// worker before the eventfds and backing storage are released.
@@ -41,20 +42,38 @@ impl BlkIoLoop {
 
     /// Drain all work published by stopped vCPUs, then park without touching
     /// guest memory or device state until resumed.
-    pub fn pause(&self) {
+    pub fn pause(&self) -> io::Result<()> {
         if self.thread_gone() {
             self.fail_if_unexpected_exit();
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "block I/O worker exited before quiescence",
+            ));
         }
         self.pause_req.store(true, Ordering::SeqCst);
-        let _ = self.wake_evt.write(1);
+        self.wake_evt.write(1)?;
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
         while !self.pause_ack.load(Ordering::SeqCst) {
             if self.thread_gone() {
                 self.fail_if_unexpected_exit();
-                return;
+                self.pause_req.store(false, Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "block I/O worker exited during quiescence",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                self.pause_req.store(false, Ordering::SeqCst);
+                self.device
+                    .fail_worker("block I/O worker quiescence timed out");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "block I/O worker quiescence timed out",
+                ));
             }
             std::thread::sleep(PAUSE_POLL);
         }
+        Ok(())
     }
 
     pub fn resume(&self) {
@@ -84,6 +103,14 @@ impl Drop for BlkIoLoop {
 /// Spawn a queue worker. `kick_fd` must be the non-blocking eventfd registered
 /// for queue 0 at this device's QUEUE_NOTIFY MMIO address.
 pub fn spawn_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Result<BlkIoLoop> {
+    // SAFETY: F_GETFD inspects the descriptor without retaining it. The
+    // controller owns the descriptor for the returned worker's lifetime.
+    if unsafe { libc::fcntl(kick_fd, libc::F_GETFD) } < 0 {
+        return Err(io::Error::new(
+            io::Error::last_os_error().kind(),
+            "block queue kick descriptor is invalid",
+        ));
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let pause_req = Arc::new(AtomicBool::new(false));
     let pause_ack = Arc::new(AtomicBool::new(false));
@@ -229,5 +256,23 @@ fn drain_eventfd(fd: RawFd, label: &str) {
         ) {
             log::warn!("block I/O worker: {label} read failed: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_rejects_an_invalid_queue_descriptor() {
+        let device = Arc::new(VirtioBlkMmio::new_stub(5, 2));
+        let error = match spawn_blk_io_loop(device, -1) {
+            Ok(mut worker) => {
+                worker.stop();
+                panic!("invalid queue descriptor unexpectedly started a block worker")
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("descriptor is invalid"));
     }
 }

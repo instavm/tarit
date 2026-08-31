@@ -595,7 +595,31 @@ impl VmmController {
             false
         };
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        let io_paused_here = paused_here && pause_running_io(vm);
+        // A Paused VM already has its I/O workers parked by pause(). Only a
+        // Running VM is quiesced here, and only that transition is undone
+        // below. This preserves Paused semantics across snapshot success and
+        // failure paths.
+        let io_paused_here = if state_before == VmState::Running {
+            match pause_running_io(vm) {
+                Ok(paused) => paused,
+                Err(error) => {
+                    let resume_error = if paused_here {
+                        resume_running_vcpus(vm).err()
+                    } else {
+                        None
+                    };
+                    remove_owned_scratch_file(&owned_snapshot);
+                    return Err(match resume_error {
+                        Some(resume) => VmmError::Snapshot(format!(
+                            "{error}; failed to resume vCPUs after I/O quiescence failure: {resume}"
+                        )),
+                        None => error,
+                    });
+                }
+            }
+        } else {
+            false
+        };
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let mut consumed_dirty = None;
@@ -907,22 +931,20 @@ impl VmmController {
                 irq,
                 mmio_base,
             } = net;
-            if let Err(e) = kvm_vm.register_irqfd(&irq_evt, irq) {
-                log::warn!("net irqfd (gsi={irq}): {e}");
-            }
-            if let Err(e) = kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt) {
-                log::warn!("net ioeventfd at 0x{:x}: {e}", mmio_base + 0x50);
-            }
+            kvm_vm.register_irqfd(&irq_evt, irq)?;
+            kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt)?;
             let tap_fd = tap.fd;
             let kick_fd = {
                 use std::os::fd::AsRawFd;
                 io_evt.as_raw_fd()
             };
-            match vmm_devices::virtio::net_io_loop::spawn_net_io_loop(dev.clone(), tap_fd, kick_fd)
-            {
-                Ok(l) => net_io_loops.push(l),
-                Err(e) => log::warn!("net io loop: {e}"),
-            }
+            let io_loop = vmm_devices::virtio::net_io_loop::spawn_net_io_loop(
+                dev.clone(),
+                tap_fd,
+                kick_fd,
+            )
+            .map_err(|error| VmmError::Device(format!("spawn network I/O worker: {error}")))?;
+            net_io_loops.push(io_loop);
             net_devices.push(dev);
             irq_evts.push(irq_evt);
             irq_evts.push(io_evt);
@@ -961,23 +983,19 @@ impl VmmController {
 
         // Wire the virtio-vsock exec channel: register its irqfd, bind the
         // control socket the guest agent dials into, and start the host→guest
-        // pump. Best-effort — on any failure exec transparently uses serial.
+        // pump. A configured vsock device is an admitted control channel, so
+        // worker or socket setup failure must fail creation rather than publish
+        // a VM whose PTY/SSH/exec behavior differs from its configuration.
         let (vsock_pump, vsock_exec, vsock_pty) = match vsock {
             Some(wv) => {
-                if let Err(e) = kvm_vm.register_irqfd(&wv.irq_evt, wv.irq) {
-                    log::warn!("vsock irqfd (gsi={}): {e}", wv.irq);
-                }
+                kvm_vm.register_irqfd(&wv.irq_evt, wv.irq)?;
                 irq_evts.push(wv.irq_evt);
                 // TX QUEUE_NOTIFY → ioeventfd, so the guest's kick runs the TX
                 // path (host socket connect/write) on the pump thread rather than
                 // the seccomped vCPU thread (which would SIGSYS on connect()).
                 // datamatch=1 = QUEUE_TX: only the TX kick routes here; RX/EVENT
                 // (values 0/2) still trap to the vCPU, where they do no host I/O.
-                if let Err(e) =
-                    kvm_vm.register_ioeventfd_datamatch(wv.mmio_base + 0x50, &wv.io_evt, 1)
-                {
-                    log::warn!("vsock ioeventfd at 0x{:x}: {e}", wv.mmio_base + 0x50);
-                }
+                kvm_vm.register_ioeventfd_datamatch(wv.mmio_base + 0x50, &wv.io_evt, 1)?;
                 use std::os::fd::AsRawFd;
                 let tx_kick_fd = wv.io_evt.as_raw_fd();
                 let device = wv.device;
@@ -985,24 +1003,30 @@ impl VmmController {
                     device.clone(),
                     tx_kick_fd,
                 )
-                .ok();
-                let pump_wake = pump.as_ref().and_then(|p| p.wake_evt().ok());
-                let pty_wake = pump.as_ref().and_then(|p| p.wake_evt().ok());
+                .map_err(|error| VmmError::Device(format!("spawn vsock worker: {error}")))?;
+                let pump_wake = Some(
+                    pump.wake_evt()
+                        .map_err(|error| VmmError::Device(format!("clone vsock wake: {error}")))?,
+                );
+                let pty_wake = Some(
+                    pump.wake_evt()
+                        .map_err(|error| VmmError::Device(format!("clone PTY wake: {error}")))?,
+                );
                 irq_evts.push(wv.io_evt);
-                let exec = match crate::vsock_exec::VsockExecChannel::bind_with_pump_wake(
-                    &wv.control_socket,
-                    pump_wake,
-                ) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        log::warn!("vsock exec bind {}: {e}", wv.control_socket.display());
-                        None
-                    }
-                };
-                let pty = pump
-                    .as_ref()
-                    .map(|_| crate::vsock_pty::VsockPtyChannel::new(device, pty_wake));
-                (pump, exec, pty)
+                let exec = Some(
+                    crate::vsock_exec::VsockExecChannel::bind_with_pump_wake(
+                        &wv.control_socket,
+                        pump_wake,
+                    )
+                    .map_err(|error| {
+                        VmmError::Device(format!(
+                            "bind vsock exec socket {}: {error}",
+                            wv.control_socket.display()
+                        ))
+                    })?,
+                );
+                let pty = Some(crate::vsock_pty::VsockPtyChannel::new(device, pty_wake));
+                (Some(pump), exec, pty)
             }
             None => (None, None, None),
         };
@@ -1751,6 +1775,15 @@ impl VmmController {
         // thousand). snapshot() drives the thread directly; the API must too.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         pause_running_vcpus(vm)?;
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        if let Err(error) = pause_running_io(vm) {
+            return match resume_running_vcpus(vm) {
+                Ok(()) => Err(error),
+                Err(resume) => Err(VmmError::Device(format!(
+                    "{error}; failed to resume vCPUs after I/O quiescence failure: {resume}"
+                ))),
+            };
+        }
         vm.state = VmState::Paused;
         log::info!("VM paused");
         Ok(())
@@ -1765,7 +1798,8 @@ impl VmmController {
         if vm.state == VmState::Running {
             return Ok(());
         }
-        if vm.state != VmState::Paused {
+        let state_before = vm.state;
+        if !matches!(state_before, VmState::Paused | VmState::Suspended) {
             return Err(VmmError::InvalidConfig(format!(
                 "cannot resume a VM in {:?} state",
                 vm.state
@@ -1773,6 +1807,8 @@ impl VmmController {
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         resume_running_vcpus(vm)?;
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        resume_running_io(vm);
         vm.state = VmState::Running;
         log::info!("VM resumed");
         Ok(())
@@ -2567,43 +2603,62 @@ fn pause_running_vcpus(vm: &VmInstance) -> Result<bool> {
 /// returns with `paused = true`, device state and RAM are stable as long as the
 /// vCPUs are also paused.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn set_running_io_paused(running: &RunningVm, paused: bool) {
+fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
     if paused {
         for io_loop in &running.blk_io_loops {
-            io_loop.pause();
+            if let Err(error) = io_loop.pause() {
+                resume_running_io_workers(running);
+                return Err(VmmError::Device(format!(
+                    "quiesce block I/O worker: {error}"
+                )));
+            }
         }
         for io_loop in &running.net_io_loops {
-            io_loop.pause();
+            if let Err(error) = io_loop.pause() {
+                resume_running_io_workers(running);
+                return Err(VmmError::Device(format!(
+                    "quiesce network I/O worker: {error}"
+                )));
+            }
         }
         if let Some(pump) = running.vsock_pump.as_ref() {
-            pump.pause();
+            if let Err(error) = pump.pause() {
+                resume_running_io_workers(running);
+                return Err(VmmError::Device(format!("quiesce vsock worker: {error}")));
+            }
         }
     } else {
-        for io_loop in &running.blk_io_loops {
-            io_loop.resume();
-        }
-        for io_loop in &running.net_io_loops {
-            io_loop.resume();
-        }
-        if let Some(pump) = running.vsock_pump.as_ref() {
-            pump.resume();
-        }
+        resume_running_io_workers(running);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn resume_running_io_workers(running: &RunningVm) {
+    for io_loop in &running.blk_io_loops {
+        io_loop.resume();
+    }
+    for io_loop in &running.net_io_loops {
+        io_loop.resume();
+    }
+    if let Some(pump) = running.vsock_pump.as_ref() {
+        pump.resume();
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn pause_running_io(vm: &VmInstance) -> bool {
+fn pause_running_io(vm: &VmInstance) -> Result<bool> {
     let Some(running) = vm.running.as_ref() else {
-        return false;
+        return Ok(false);
     };
-    set_running_io_paused(running, true);
-    true
+    set_running_io_paused(running, true)?;
+    Ok(true)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn resume_running_io(vm: &VmInstance) {
     if let Some(running) = vm.running.as_ref() {
-        set_running_io_paused(running, false);
+        let _ = set_running_io_paused(running, false);
     }
 }
 
@@ -2722,6 +2777,21 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
     } else {
         false
     };
+    // pause() already parked I/O for a Paused VM. Preserve that state if
+    // suspend fails; only a Running VM is newly quiesced here.
+    let io_paused_here = if state_before == VmState::Running {
+        match pause_running_io(vm) {
+            Ok(paused) => paused,
+            Err(error) => {
+                if paused_here {
+                    resume_running_vcpus(vm)?;
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        false
+    };
     vm.state = VmState::Paused;
     let result = (|| -> Result<()> {
         capture_live_state(vm)?;
@@ -2815,9 +2885,15 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
 
     if result.is_err() {
         vm.state = state_before;
-        if paused_here && state_before == VmState::Running {
-            resume_running_vcpus(vm)?;
+        let resume_result = if paused_here && state_before == VmState::Running {
+            resume_running_vcpus(vm)
+        } else {
+            Ok(())
+        };
+        if io_paused_here {
+            resume_running_io(vm);
         }
+        resume_result?;
     }
     result
 }
@@ -5461,21 +5537,18 @@ fn build_running_vm(
             irq,
             mmio_base,
         } = net;
-        if let Err(e) = kvm_vm.register_irqfd(&irq_evt, irq) {
-            log::warn!("net irqfd (gsi={irq}): {e}");
-        }
-        if let Err(e) = kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt) {
-            log::warn!("net ioeventfd at 0x{:x}: {e}", mmio_base + 0x50);
-        }
+        kvm_vm.register_irqfd(&irq_evt, irq)?;
+        kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt)?;
         let tap_fd = tap.fd;
         let kick_fd = {
             use std::os::fd::AsRawFd;
             io_evt.as_raw_fd()
         };
-        match vmm_devices::virtio::net_io_loop::spawn_net_io_loop(dev, tap_fd, kick_fd) {
-            Ok(l) => net_io_loops.push(l),
-            Err(e) => log::warn!("net io loop: {e}"),
-        }
+        let io_loop = vmm_devices::virtio::net_io_loop::spawn_net_io_loop(dev, tap_fd, kick_fd)
+            .map_err(|error| {
+                VmmError::Device(format!("spawn restored network I/O worker: {error}"))
+            })?;
+        net_io_loops.push(io_loop);
         irq_evts.push(irq_evt);
         irq_evts.push(io_evt);
         taps.push(tap);
@@ -5510,14 +5583,9 @@ fn build_running_vm(
     // VM re-establishes exec-over-vsock when the guest agent re-dials.
     let (vsock_pump, vsock_exec, vsock_pty, vsock_reset) = match vsock {
         Some(wv) => {
-            if let Err(e) = kvm_vm.register_irqfd(&wv.irq_evt, wv.irq) {
-                log::warn!("vsock irqfd (gsi={}): {e}", wv.irq);
-            }
+            kvm_vm.register_irqfd(&wv.irq_evt, wv.irq)?;
             irq_evts.push(wv.irq_evt);
-            if let Err(e) = kvm_vm.register_ioeventfd_datamatch(wv.mmio_base + 0x50, &wv.io_evt, 1)
-            {
-                log::warn!("vsock ioeventfd at 0x{:x}: {e}", wv.mmio_base + 0x50);
-            }
+            kvm_vm.register_ioeventfd_datamatch(wv.mmio_base + 0x50, &wv.io_evt, 1)?;
             use std::os::fd::AsRawFd;
             let tx_kick_fd = wv.io_evt.as_raw_fd();
             let device = wv.device;
@@ -5532,9 +5600,16 @@ fn build_running_vm(
             });
             let pump =
                 vmm_devices::virtio::vsock_io_loop::spawn_vsock_pump(device.clone(), tx_kick_fd)
-                    .ok();
-            let pump_wake = pump.as_ref().and_then(|p| p.wake_evt().ok());
-            let pty_wake = pump.as_ref().and_then(|p| p.wake_evt().ok());
+                    .map_err(|error| {
+                        VmmError::Device(format!("spawn restored vsock worker: {error}"))
+                    })?;
+            let pump_wake = Some(pump.wake_evt().map_err(|error| {
+                VmmError::Device(format!("clone restored vsock wake: {error}"))
+            })?);
+            let pty_wake =
+                Some(pump.wake_evt().map_err(|error| {
+                    VmmError::Device(format!("clone restored PTY wake: {error}"))
+                })?);
             irq_evts.push(wv.io_evt);
             let exec = Some(
                 crate::vsock_exec::VsockExecChannel::bind_with_pump_wake(
@@ -5548,10 +5623,8 @@ fn build_running_vm(
                     ))
                 })?,
             );
-            let pty = pump
-                .as_ref()
-                .map(|_| crate::vsock_pty::VsockPtyChannel::new(device, pty_wake));
-            (pump, exec, pty, reset)
+            let pty = Some(crate::vsock_pty::VsockPtyChannel::new(device, pty_wake));
+            (Some(pump), exec, pty, reset)
         }
         None => (None, None, None, None),
     };
@@ -6106,6 +6179,27 @@ mod tests {
         }
     }
 
+    fn controller_in_state(state: VmState) -> VmmController {
+        let controller = VmmController::new();
+        *controller.lock() = Some(VmInstance {
+            state,
+            generation: next_vm_generation(),
+            created_at: std::time::Instant::now(),
+            last_snapshot: None,
+            transient_files: VmTransientFiles::default(),
+            dirty_logging: false,
+            config: cfg(),
+            guest_mem: None,
+            state_blob: None,
+            mem_dump: Some(vec![0; 4096]),
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            lazy_restore: None,
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            running: None,
+        });
+        controller
+    }
+
     fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {
         NetConfig {
             tap: tap.into(),
@@ -6198,6 +6292,41 @@ mod tests {
     fn status_without_vm_errors() {
         let c = VmmController::new();
         assert!(c.status().is_err());
+    }
+
+    #[test]
+    fn suspended_vm_can_resume_and_reenter_pause_resume_cycle() {
+        let controller = controller_in_state(VmState::Suspended);
+
+        controller.resume().expect("resume suspended VM");
+        assert_eq!(
+            controller.status().expect("running status").state,
+            VmState::Running
+        );
+
+        controller.pause().expect("pause resumed VM");
+        assert_eq!(
+            controller.status().expect("paused status").state,
+            VmState::Paused
+        );
+
+        controller.resume().expect("resume paused VM");
+        assert_eq!(
+            controller.status().expect("resumed status").state,
+            VmState::Running
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_paused_controller_state() {
+        let controller = controller_in_state(VmState::Paused);
+
+        controller.snapshot(false).expect("snapshot paused VM");
+
+        assert_eq!(
+            controller.status().expect("paused status").state,
+            VmState::Paused
+        );
     }
 
     #[cfg(not(feature = "boot"))]

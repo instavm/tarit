@@ -23,6 +23,7 @@ const POLL_TIMEOUT_MS: libc::c_int = 250;
 
 /// How long the paused pump sleeps between checks of the pause flag.
 const PAUSE_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Handle for the vsock pump thread. Dropping it stops + joins the thread.
 pub struct VsockPump {
@@ -54,18 +55,34 @@ impl VsockPump {
     /// touching guest memory until [`Self::resume`]. Callers must pause every
     /// vCPU first so the guest cannot publish another descriptor after this
     /// drain.
-    pub fn pause(&self) {
+    pub fn pause(&self) -> io::Result<()> {
         if self.thread_gone() {
-            return;
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "vsock worker exited before quiescence",
+            ));
         }
         self.pause_req.store(true, Ordering::SeqCst);
-        let _ = self.wake_evt.write(1);
+        self.wake_evt.write(1)?;
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
         while !self.pause_ack.load(Ordering::SeqCst) {
             if self.thread_gone() {
-                return;
+                self.pause_req.store(false, Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "vsock worker exited during quiescence",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                self.pause_req.store(false, Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "vsock worker quiescence timed out",
+                ));
             }
             std::thread::sleep(PAUSE_POLL);
         }
+        Ok(())
     }
 
     /// Release a pause. Does not wait: the thread re-enters its poll loop on
@@ -74,7 +91,6 @@ impl VsockPump {
         self.pause_req.store(false, Ordering::SeqCst);
     }
 
-    /// A finished thread writes no guest memory, so it counts as paused.
     fn thread_gone(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
     }
@@ -90,6 +106,14 @@ impl Drop for VsockPump {
 /// QUEUE_NOTIFY register (datamatch=1), so guest kicks wake this thread instead
 /// of trapping into the vCPU thread.
 pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::Result<VsockPump> {
+    // SAFETY: F_GETFD inspects the descriptor without retaining it. The caller
+    // owns the descriptor for the lifetime of the returned worker.
+    if unsafe { libc::fcntl(tx_kick_fd, libc::F_GETFD) } < 0 {
+        return Err(io::Error::new(
+            io::Error::last_os_error().kind(),
+            "vsock queue kick descriptor is invalid",
+        ));
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let pause_req = Arc::new(AtomicBool::new(false));
     let pause_ack = Arc::new(AtomicBool::new(false));
@@ -99,6 +123,7 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
     let device_t = device.clone();
     let wake_evt = EventFd::new(libc::EFD_NONBLOCK)?;
     let wake_fd = wake_evt.as_raw_fd();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     let handle = std::thread::Builder::new()
         .name("virtio-vsock-pump".into())
@@ -110,8 +135,23 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
                 device_t,
                 tx_kick_fd,
                 wake_fd,
+                ready_tx,
             );
         })?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = handle.join();
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = handle.join();
+            return Err(io::Error::other(format!(
+                "vsock worker exited during startup: {error}"
+            )));
+        }
+    }
 
     Ok(VsockPump {
         stop,
@@ -130,9 +170,15 @@ fn run(
     device: Arc<VirtioVsockMmio>,
     tx_kick_fd: RawFd,
     wake_fd: RawFd,
+    ready_tx: std::sync::mpsc::SyncSender<io::Result<()>>,
 ) {
     if let Err(e) = vmm_jailer::seccomp::SeccompProfile::vsock().install() {
-        log::error!("vsock pump: seccomp install failed; refusing guest I/O: {e}");
+        let _ = ready_tx.send(Err(io::Error::other(format!(
+            "install vsock worker sandbox: {e}"
+        ))));
+        return;
+    }
+    if ready_tx.send(Ok(())).is_err() {
         return;
     }
 
@@ -232,5 +278,23 @@ fn drain_eventfd(fd: RawFd, label: &str) {
         ) {
             log::warn!("vsock pump: {label} read failed: {err}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_rejects_an_invalid_queue_descriptor() {
+        let device = Arc::new(VirtioVsockMmio::new(7, 3));
+        let error = match spawn_vsock_pump(device, -1) {
+            Ok(mut worker) => {
+                worker.stop();
+                panic!("invalid queue descriptor unexpectedly started a vsock worker")
+            }
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("descriptor is invalid"));
     }
 }
