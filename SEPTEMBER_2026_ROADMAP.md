@@ -1250,6 +1250,17 @@ passing focused gate does not waive an item in the final column.
   publishes a net TX descriptor without a notification and requires the pause
   drain to complete it; Ubuntu OCI guests on Linux 6.6.155 and 5.10.230 also
   passed ordinary and live snapshots while a vsock command remained in flight.
+- UART snapshots now retain the pending interrupt cause, line/modem status, and
+  receive FIFO in addition to guest-programmed registers. Restore reconstructs
+  the complete device and reasserts pending transmit or receive interrupts
+  before vCPUs resume. The added state is framed outside the historical
+  postcard field order; legacy version-1 snapshots continue through the
+  register-replay path, while current snapshots require the complete state and
+  bind the new device-model ABI. A real-KVM Ubuntu OCI gate on Linux 6.6.155
+  and 5.10.230 captured sustained serial output, verified no loss or
+  duplication in the resumed source, completed a separate serial command
+  across explicit pause/resume, restored the snapshot, and executed through
+  serial again.
 - Virtio block queue notifications now land on a dedicated, event-driven worker
   per volume instead of running host storage operations on a vCPU thread. Slow
   reads, writes, or flushes therefore cannot occupy the guest execution path or

@@ -924,6 +924,7 @@ dependencies = [
 name = "vmm-integration"
 version = "0.1.2"
 dependencies = [
+ "crc32fast",
  "env_logger 0.10.2",
  "kvm-bindings",
  "kvm-ioctls",

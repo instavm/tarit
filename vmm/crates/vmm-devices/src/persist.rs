@@ -40,6 +40,13 @@ pub trait Persist {
 
     /// Restore device state. Called on a freshly-constructed device.
     fn restore(&mut self, state: Self::State);
+
+    /// Restore device state while allowing implementations with fallible
+    /// reconstruction to reject malformed or unusable state.
+    fn try_restore(&mut self, state: Self::State) -> Result<(), PersistError> {
+        self.restore(state);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

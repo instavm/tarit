@@ -1517,6 +1517,7 @@ impl VmmController {
             decode_state_blob(&state_blob).ok_or_else(|| {
                 VmmError::Snapshot("snapshot state blob is malformed or unsupported".into())
             })?;
+        let has_compatibility_manifest = compatibility.is_some();
         validate_snapshot_compatibility(snapshot_version, compatibility.as_ref())?;
 
         let (kernel_path, cmdline, vcpus, volumes, net) = (
@@ -1539,6 +1540,11 @@ impl VmmController {
             decode_snapshot_component(saved.vcpu_full.as_deref(), "BSP vCPU")?;
         let vm_full: Option<crate::kvm::VmFullState> =
             decode_snapshot_component(saved.vm_full.as_deref(), "VM")?;
+        if has_compatibility_manifest && vcpu_full.is_some() && saved.serial_runtime.is_none() {
+            return Err(VmmError::Snapshot(
+                "live snapshot is missing complete UART runtime state".into(),
+            ));
+        }
         // AP vCPU states (SMP restore, phase B). Each entry is a postcard
         // VcpuFullState for AP id 1..N; empty for a uniprocessor snapshot.
         let ap_states: Vec<crate::vcpu_setup::VcpuFullState> = saved
@@ -1616,6 +1622,7 @@ impl VmmController {
                     aps: &ap_states,
                     vm: vm_full.as_ref(),
                     serial: &serial_state,
+                    serial_runtime: saved.serial_runtime.as_ref(),
                     virtio_blk: &virtio_blk,
                     virtio_net: &virtio_net,
                     vsock: vsock_state.as_ref(),
@@ -2669,6 +2676,7 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Vec<u
     let vm_state = postcard::to_allocvec(&vm_state)
         .map_err(|error| VmmError::Snapshot(format!("serialize in-kernel VM state: {error}")))?;
     let serial_state = vmm_devices::persist::Persist::save(&*running.vcpu_thread.serial);
+    let serial_runtime = running.vcpu_thread.serial.runtime_state();
     let virtio_blk = capture_virtio_blk_states(&running.blk_devices)?;
     let virtio_net = capture_virtio_net_states(&running.net_devices)?;
     let balloon = running
@@ -2694,6 +2702,7 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Vec<u
     b.vcpu_full_aps = ap_captured;
     b.vm_full = Some(vm_state);
     b.serial = serial_state;
+    b.serial_runtime = Some(serial_runtime);
     b.virtio_blk = virtio_blk;
     b.virtio_net = virtio_net;
     b.vsock = Some(vsock_state);
@@ -4929,6 +4938,10 @@ pub struct StateBlob {
     /// resurrected; restore injects RSTs so the guest agent re-dials.
     #[serde(default)]
     pub vsock: Option<vmm_devices::virtio::vsock::VirtioVsockMmioState>,
+    /// Encoded in a framed trailer so historical postcard field order remains
+    /// unchanged.
+    #[serde(skip)]
+    pub serial_runtime: Option<vmm_devices::serial::SerialRuntimeState>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5011,6 +5024,8 @@ const BALLOON_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTBLN01";
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const COMPATIBILITY_TRAILER_MAGIC: &[u8; 8] = b"TRTCMP01";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const SERIAL_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTSER01";
 #[cfg(all(
     target_arch = "x86_64",
     target_os = "linux",
@@ -5026,7 +5041,7 @@ const SNAPSHOT_STATE_ABI: u16 = 1;
 ))]
 const SNAPSHOT_STATE_ABI: u16 = 2;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-const DEVICE_MODEL_ABI: u16 = 1;
+const DEVICE_MODEL_ABI: u16 = 2;
 
 /// Compatibility boundary for state that is meaningful only to a matching
 /// VMM implementation. The outer file version protects framing; these fields
@@ -5141,7 +5156,7 @@ fn decode_state_blob(
     Option<vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
     Option<SnapshotCompatibility>,
 )> {
-    let (blob, mut trailing) = postcard::take_from_bytes::<StateBlob>(bytes).ok()?;
+    let (mut blob, mut trailing) = postcard::take_from_bytes::<StateBlob>(bytes).ok()?;
     // Full live snapshots may pad the state area with zeroes so the following
     // RAM extent is block-aligned and can be range-reflinked from the pre-copy
     // stage. Zero padding is semantically empty and covered by the state CRC.
@@ -5152,6 +5167,11 @@ fn decode_state_blob(
     if trailing.starts_with(BALLOON_STATE_TRAILER_MAGIC) {
         let (decoded, remaining) = decode_trailer(trailing, BALLOON_STATE_TRAILER_MAGIC)?;
         balloon = Some(decoded);
+        trailing = remaining;
+    }
+    if trailing.starts_with(SERIAL_STATE_TRAILER_MAGIC) {
+        let (decoded, remaining) = decode_trailer(trailing, SERIAL_STATE_TRAILER_MAGIC)?;
+        blob.serial_runtime = Some(decoded);
         trailing = remaining;
     }
     let mut compatibility = None;
@@ -5177,6 +5197,14 @@ fn encode_state_blob(
         let payload_len =
             u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
         bytes.extend_from_slice(BALLOON_STATE_TRAILER_MAGIC);
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+    if let Some(serial_runtime) = blob.serial_runtime.as_ref() {
+        let payload = postcard::to_allocvec(serial_runtime)?;
+        let payload_len =
+            u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
+        bytes.extend_from_slice(SERIAL_STATE_TRAILER_MAGIC);
         bytes.extend_from_slice(&payload_len.to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
@@ -5311,6 +5339,7 @@ struct RestoredRuntimeState<'a> {
     aps: &'a [crate::vcpu_setup::VcpuFullState],
     vm: Option<&'a crate::kvm::VmFullState>,
     serial: &'a vmm_devices::serial::SerialState,
+    serial_runtime: Option<&'a vmm_devices::serial::SerialRuntimeState>,
     virtio_blk: &'a [Vec<u8>],
     virtio_net: &'a [Vec<u8>],
     vsock: Option<&'a vmm_devices::virtio::vsock::VirtioVsockMmioState>,
@@ -5413,7 +5442,9 @@ fn build_running_vm(
     // Replay the guest's captured UART programming so the restored serial
     // re-arms its RX interrupt; without this, host→guest bytes (exec commands)
     // raise no IRQ and the guest agent never wakes — exec hangs post-restore.
-    vmm_devices::persist::Persist::restore(&mut serial_dev, restored.serial.clone());
+    serial_dev
+        .try_restore_snapshot(restored.serial.clone(), restored.serial_runtime)
+        .map_err(|error| VmmError::Snapshot(format!("restore UART state: {error}")))?;
     let serial = Arc::new(serial_dev);
     irq_evts.push(serial_evt);
 
@@ -6003,6 +6034,7 @@ fn serialize_state_blob(
         virtio_blk: Vec::new(),
         virtio_net: Vec::new(),
         vsock: None,
+        serial_runtime: None,
     };
 
     encode_state_blob(&blob, None).unwrap_or_default()
@@ -6692,7 +6724,7 @@ mod tests {
             vsock: None,
         })
         .unwrap();
-        let (decoded, balloon, compatibility) = decode_state_blob(&bytes).unwrap();
+        let (mut decoded, balloon, compatibility) = decode_state_blob(&bytes).unwrap();
         assert_eq!(decoded.kernel_path, "kernel");
         assert!(balloon.is_none());
         assert!(compatibility.is_none());
@@ -6705,11 +6737,19 @@ mod tests {
         assert!(padded_compatibility.is_none());
 
         let balloon_state = vmm_devices::virtio::balloon::VirtioBalloonMmioState::default();
+        let serial_runtime = vmm_devices::serial::SerialRuntimeState {
+            interrupt_identification: 4,
+            line_status: 0x61,
+            modem_status: 0xb0,
+            in_buffer: b"pending".to_vec(),
+        };
+        decoded.serial_runtime = Some(serial_runtime.clone());
         let mut encoded = encode_state_blob(&decoded, Some(&balloon_state)).unwrap();
         encoded.resize(4096, 0);
         let (decoded_with_trailer, decoded_balloon, decoded_compatibility) =
             decode_state_blob(&encoded).unwrap();
         assert_eq!(decoded_with_trailer.kernel_path, "kernel");
+        assert_eq!(decoded_with_trailer.serial_runtime, Some(serial_runtime));
         assert_eq!(decoded_balloon, Some(balloon_state));
         decoded_compatibility.unwrap().validate().unwrap();
     }
