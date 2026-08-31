@@ -15,6 +15,7 @@ find "$ROOT/sdk/python" -mindepth 1 -delete 2>/dev/null || true
 uvx --from "openapi-python-client==$PYTHON_CLIENT_VERSION" openapi-python-client generate \
   --path "$ROOT/orch/openapi.yaml" \
   --config "$ROOT/sdk/python-generator.yaml" \
+  --custom-template-path "$ROOT/sdk/python-templates" \
   --output-path "$ROOT/sdk/python" \
   --meta uv \
   --overwrite \

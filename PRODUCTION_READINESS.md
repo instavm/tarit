@@ -84,7 +84,10 @@ its scope.
   chain; direct VMM incremental snapshots remain available for local testing.
 - Python and TypeScript SDKs are generated from the checked-in OpenAPI contract.
   CI rejects generation drift, type-checks and packages both clients, and tests
-  typed tenant denials, bounded execution polling, and stable-ID fork retry.
+  typed tenant denials, bounded execution polling, stable-ID fork retry, and
+  bounded PTY/WebSocket sessions with server-lease cleanup. Public SDK E2E
+  tests pass against Ubuntu and Alpine OCI guests on Linux 6.6 and 5.10,
+  including hibernate followed by PTY-triggered wake.
 - Release workflows pin third-party actions, publish checksums and an SPDX
   SBOM, and attest released artifacts.
 - The production guest kernel is built reproducibly from checksum-pinned Linux
@@ -114,8 +117,8 @@ not executed on the persistent privileged runner.
 
 The earlier peer-mTLS/session-fencing, opaque authenticated artifact,
 cross-node replication, and immutable signed-image stop-ships now have focused
-implementation and c8i evidence recorded in the September roadmap. They remain
-regression gates, but the following unresolved items now block release:
+implementation and c8i qualification evidence. They remain regression gates,
+but the following unresolved items now block release:
 
 1. Complete the four-case continuous c8i rotation. The gate carries a long-lived
    process with cached PRNG state,

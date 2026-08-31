@@ -4,7 +4,8 @@ import asyncio
 import os
 from uuid import UUID
 
-from tarit_sdk.high_level import AsyncTaritClient, TaritApiError, TaritClient
+from tarit_sdk.api.default import hibernate_vm
+from tarit_sdk.high_level import AsyncTaritClient, PtyData, PtyExit, TaritApiError, TaritClient
 
 
 def required(name: str) -> str:
@@ -37,6 +38,24 @@ def main() -> None:
         child_execution = client.execute(child_id, "printf python-fork-ok", poll_interval=0.02)
         assert child_execution.status == "completed" and child_execution.stdout == "python-fork-ok", child_execution
 
+        hibernated = hibernate_vm.sync_detailed(vm_id, client=client.raw)
+        assert int(hibernated.status_code) == 200 and hibernated.parsed is not None, hibernated
+        assert hibernated.parsed.status == "hibernated", hibernated.parsed
+
+        output = bytearray()
+        with client.open_pty(vm_id, shell="/bin/sh", cols=80, rows=24, deadline_seconds=30) as pty:
+            pty.resize(cols=101, rows=31)
+            pty.write(b"stty size; printf python-pty-wake-ok; exit 0\n")
+            while True:
+                message = pty.read(timeout=30)
+                if isinstance(message, PtyData):
+                    output.extend(message.data)
+                    continue
+                assert isinstance(message, PtyExit) and message.exit_code == 0, message
+                break
+        normalized_output = bytes(output).replace(b"\r", b"")
+        assert b"31 101" in normalized_output and b"python-pty-wake-ok" in normalized_output, normalized_output
+
     asyncio.run(async_execution(base_url, tenant_key, vm_id))
 
     with TaritClient(base_url, foreign_key) as foreign:
@@ -47,7 +66,7 @@ def main() -> None:
         else:
             raise AssertionError("foreign tenant read another tenant's execution")
 
-    print(f"PYTHON_SDK_E2E_PASS source={vm_id} child={child_id}")
+    print(f"PYTHON_SDK_E2E_PASS source={vm_id} child={child_id} hibernate_pty_wake=pass")
 
 
 if __name__ == "__main__":
