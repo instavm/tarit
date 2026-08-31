@@ -16,6 +16,7 @@ MAX_RESUME_EXEC_MS="${SUSPEND_RESUME_EXEC_MAX_MS:-5000}"
 EXPECTED_KERNEL_PREFIX="${TARIT_EXPECT_KERNEL_RELEASE_PREFIX:-}"
 EXPECTED_OS_ID="${TARIT_EXPECT_OS_ID:-}"
 ENABLE_NET="${TARIT_TEST_ENABLE_NET:-0}"
+TRANSITION_CLIENT="${TARIT_TEST_TRANSITION_CLIENT:-api}"
 
 [[ "$EXPECTED_KERNEL_PREFIX" != *[[:space:]]* ]] || {
   echo "FAIL: TARIT_EXPECT_KERNEL_RELEASE_PREFIX must not contain whitespace" >&2
@@ -27,6 +28,10 @@ ENABLE_NET="${TARIT_TEST_ENABLE_NET:-0}"
 }
 [[ "$ENABLE_NET" = 0 || "$ENABLE_NET" = 1 ]] || {
   echo "FAIL: TARIT_TEST_ENABLE_NET must be 0 or 1" >&2
+  exit 1
+}
+[[ "$TRANSITION_CLIENT" = api || "$TRANSITION_CLIENT" = cli ]] || {
+  echo "FAIL: TARIT_TEST_TRANSITION_CLIENT must be api or cli" >&2
   exit 1
 }
 
@@ -96,6 +101,17 @@ trap 'exit 143' TERM
 
 api() {
   curl -fsS --max-time 30 -H "X-API-Key: $KEY" "$@"
+}
+
+vm_transition() {
+  local action=$1
+  if [ "$TRANSITION_CLIENT" = cli ]; then
+    TARIT_BASE_URL="$BASE_URL" TARIT_API_KEY="$KEY" \
+      "$TARITD" --json vm "$action" "$VM_ID"
+  else
+    api -H 'Content-Type: application/json' -d '{}' \
+      "$BASE_URL/v1/vms/$VM_ID/$action"
+  fi
 }
 
 json_field() {
@@ -276,7 +292,7 @@ printf '%s' "$PREP" | grep -q '"exit_code":0'
 RSS_BEFORE=$(rss_kib "$VMM_PID")
 
 echo "== suspend and verify resource contract =="
-SUSPENDED=$(api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/suspend")
+SUSPENDED=$(vm_transition suspend)
 printf '%s' "$SUSPENDED" | grep -q '"status":"suspended"'
 if [ "$ENABLE_NET" = 1 ]; then
   ip link show "$NET_TAP" >/dev/null
@@ -309,7 +325,7 @@ CREATE_CODE=$(curl -sS --max-time 10 -o "$DIR/suspended-create.json" -w '%{http_
 
 echo "== resume, first exec, and verify preserved state =="
 START_MS=$(monotonic_ms)
-RESUMED=$(api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/resume")
+RESUMED=$(vm_transition resume)
 printf '%s' "$RESUMED" | grep -q '"status":"running"'
 if [ "$ENABLE_NET" = 1 ]; then
   ip link show "$NET_TAP" >/dev/null
@@ -338,20 +354,20 @@ RESUME_EXEC_MS=$((END_MS - START_MS))
 
 echo "== repeated transitions are idempotent =="
 for _ in 1 2; do
-  api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/suspend" | grep -q '"status":"suspended"'
+  vm_transition suspend | grep -q '"status":"suspended"'
 done
 for _ in 1 2; do
-  api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/resume" | grep -q '"status":"running"'
+  vm_transition resume | grep -q '"status":"running"'
 done
 exec_json "$VM_ID" 'cat /mnt/tarit-rss/state' | grep -q 'suspend-state-ok'
 
 echo "== rapid suspend/resume transitions preserve worker handshakes =="
 for cycle in $(seq 1 20); do
-  api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/suspend" | grep -q '"status":"suspended"'
+  vm_transition suspend | grep -q '"status":"suspended"'
   if [ "$ENABLE_NET" = 1 ]; then
     ip link show "$NET_TAP" >/dev/null
   fi
-  api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/resume" | grep -q '"status":"running"'
+  vm_transition resume | grep -q '"status":"running"'
   exec_json "$VM_ID" "printf rapid-cycle-$cycle" | grep -q "rapid-cycle-$cycle"
 done
 exec_json "$VM_ID" 'cat /mnt/tarit-rss/state' | grep -q 'suspend-state-ok'
@@ -368,4 +384,4 @@ if [ "$ENABLE_NET" = 1 ]; then
     exit 1
   fi
 fi
-echo "RESULT: SUSPEND_PASS rss_before_kib=$RSS_BEFORE rss_after_kib=$RSS_AFTER rss_drop_kib=$RSS_DROP resume_first_exec_ms=$RESUME_EXEC_MS"
+echo "RESULT: SUSPEND_PASS transition_client=$TRANSITION_CLIENT rss_before_kib=$RSS_BEFORE rss_after_kib=$RSS_AFTER rss_drop_kib=$RSS_DROP resume_first_exec_ms=$RESUME_EXEC_MS"
