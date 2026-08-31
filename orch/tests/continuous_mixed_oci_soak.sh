@@ -10,6 +10,8 @@ SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-/t}"
 STATE_GATE="$ROOT/orch/tests/e2e_lifecycle_state_machine.sh"
 DRIVER="$ROOT/orch/tests/continuous_lifecycle_soak.py"
 CRASH_GATE="${TARIT_CONTINUOUS_CRASH_GATE:-$ROOT/orch/tests/e2e_runtime_crash_recovery.sh}"
+INGRESS_GATE="${TARIT_CONTINUOUS_INGRESS_GATE:-$ROOT/orch/tests/e2e_live_fork_hibernate.sh}"
+VOLUME_GATE="${TARIT_CONTINUOUS_VOLUME_GATE:-$ROOT/orch/tests/e2e_persistent_volume_hibernate.sh}"
 WORKLOAD_SOURCE="$ROOT/orch/tests/clone_repair_workload.c"
 GUEST_AGENT="${TARIT_TEST_GUEST_AGENT_BIN:-$ROOT/vmm/guest/agent/vmm-agent}"
 RUN_ROOT="${TARIT_CONTINUOUS_RUN_ROOT:-$SOCKET_ROOT/tarit-continuous-soak}"
@@ -18,6 +20,8 @@ EPOCH_SECONDS="${TARIT_CONTINUOUS_EPOCH_SECONDS:-1800}"
 MIN_FREE_BYTES="${TARIT_CONTINUOUS_MIN_FREE_BYTES:-3221225472}"
 MAX_SNAPSHOTS="${TARIT_CONTINUOUS_MAX_SNAPSHOTS:-2}"
 CHAOS_EVERY_EPOCHS="${TARIT_CONTINUOUS_CHAOS_EVERY_EPOCHS:-1}"
+INGRESS_EVERY_EPOCHS="${TARIT_CONTINUOUS_INGRESS_EVERY_EPOCHS:-1}"
+VOLUME_EVERY_EPOCHS="${TARIT_CONTINUOUS_VOLUME_EVERY_EPOCHS:-1}"
 MAX_EPOCHS="${TARIT_CONTINUOUS_MAX_EPOCHS:-0}"
 STATUS_FILE="${TARIT_CONTINUOUS_STATUS_FILE:-$RUN_ROOT/status.json}"
 CASES="${TARIT_CONTINUOUS_CASES:-}"
@@ -36,9 +40,19 @@ test -x "$GUEST_AGENT" || { echo "FAIL: guest agent not executable: $GUEST_AGENT
 [[ "$MIN_FREE_BYTES" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid free-space floor" >&2; exit 1; }
 [[ "$MAX_SNAPSHOTS" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: invalid snapshot limit" >&2; exit 1; }
 [[ "$CHAOS_EVERY_EPOCHS" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid chaos interval" >&2; exit 1; }
+[[ "$INGRESS_EVERY_EPOCHS" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid ingress interval" >&2; exit 1; }
+[[ "$VOLUME_EVERY_EPOCHS" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid volume interval" >&2; exit 1; }
 [[ "$MAX_EPOCHS" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid maximum epoch count" >&2; exit 1; }
-[ "$CHAOS_EVERY_EPOCHS" -eq 0 ] || test -x "$CRASH_GATE" || {
-  echo "FAIL: runtime crash gate not executable: $CRASH_GATE" >&2
+[ "$CHAOS_EVERY_EPOCHS" -eq 0 ] || test -r "$CRASH_GATE" || {
+  echo "FAIL: runtime crash gate not readable: $CRASH_GATE" >&2
+  exit 1
+}
+[ "$INGRESS_EVERY_EPOCHS" -eq 0 ] || test -r "$INGRESS_GATE" || {
+  echo "FAIL: ingress gate not readable: $INGRESS_GATE" >&2
+  exit 1
+}
+[ "$VOLUME_EVERY_EPOCHS" -eq 0 ] || test -r "$VOLUME_GATE" || {
+  echo "FAIL: volume gate not readable: $VOLUME_GATE" >&2
   exit 1
 }
 
@@ -115,6 +129,51 @@ trap 'terminate_epoch 130' INT
 trap 'terminate_epoch 0' TERM
 trap 'terminate_epoch 129' HUP
 
+run_auxiliary_gate() {
+  local kind=$1 gate=$2 marker=$3 name=$4 seed_value=$5 expected_os=$6
+  shift 6
+  local gate_timestamp gate_ref gate_log gate_status
+  gate_timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+  gate_ref="history/${gate_timestamp}-${name}-${kind}.log"
+  gate_log="$RUN_ROOT/$gate_ref"
+  write_supervisor_status qualification "${kind}_start" "$name" "$seed_value" "$gate_ref"
+  echo "CONTINUOUS_QUALIFICATION_START case=$name seed=$seed_value gate=$kind log=$gate_log"
+  set +e
+  setsid --wait flock -F -w 300 "$LOCK" env \
+    ROOT="$ROOT" \
+    TARITD_BIN="$TARITD" \
+    TARIT_VMM_BIN="$VMM" \
+    TARIT_KERNEL="$kernel" \
+    TARIT_ROOTFS="$rootfs" \
+    TARIT_TEST_CLONE_WORKLOAD_BIN="$WORKLOAD_BIN" \
+    TARIT_TEST_GUEST_AGENT_BIN="$GUEST_AGENT" \
+    TARIT_EXPECT_OS_ID="$expected_os" \
+    TARIT_TEST_SOCKET_ROOT="$SOCKET_ROOT" \
+    TARIT_E2E_KEEP_FAILED=0 \
+    "$@" \
+    bash "$gate" >"$gate_log" 2>&1 &
+  epoch_pid=$!
+  wait "$epoch_pid"
+  gate_status=$?
+  epoch_pid=""
+  set -e
+  if [ "$gate_status" -ne 0 ] || ! grep -Eq "$marker" "$gate_log"; then
+    printf '{"timestamp":"%s","case":"%s","seed":%s,"status":%s,"kind":"%s","log":"%s"}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$seed_value" "$gate_status" "$kind" "$gate_ref" \
+      >>"$RUN_ROOT/failures/index.jsonl"
+    write_supervisor_status failed "${kind}_failed" "$name" "$seed_value" "$gate_ref"
+    echo "CONTINUOUS_QUALIFICATION_FAILED case=$name seed=$seed_value gate=$kind log=$gate_log" >&2
+    tail -240 "$gate_log" >&2
+    [ "$gate_status" -ne 0 ] && return "$gate_status"
+    return 1
+  fi
+  printf '{"timestamp":"%s","case":"%s","seed":%s,"status":0,"kind":"%s","log":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$seed_value" "$kind" "$gate_ref" \
+    >>"$RUN_ROOT/qualification.jsonl"
+  write_supervisor_status running "${kind}_pass" "$name" "$seed_value" "$gate_ref"
+  echo "CONTINUOUS_QUALIFICATION_PASS case=$name seed=$seed_value gate=$kind log=$gate_log"
+}
+
 epoch=0
 write_supervisor_status starting supervisor_start
 while :; do
@@ -183,54 +242,34 @@ while :; do
   echo "CONTINUOUS_SOAK_EPOCH_PASS case=$name seed=$seed log=$log"
 
   completed_epochs=$((epoch + 1))
+  expected_os=${name%%[0-9]*}
+  case "$expected_os" in
+    ubuntu|alpine) ;;
+    *)
+      echo "FAIL: cannot derive expected OCI OS ID from case name: $name" >&2
+      exit 1
+      ;;
+  esac
   if [ "$CHAOS_EVERY_EPOCHS" -gt 0 ] && \
      [ $((completed_epochs % CHAOS_EVERY_EPOCHS)) -eq 0 ]; then
-    chaos_timestamp=$(date -u +%Y%m%dT%H%M%SZ)
-    chaos_ref="history/${chaos_timestamp}-${name}-runtime-crash.log"
-    chaos_log="$RUN_ROOT/$chaos_ref"
-    expected_os=${name%%[0-9]*}
-    case "$expected_os" in
-      ubuntu|alpine) ;;
-      *)
-        echo "FAIL: cannot derive expected OCI OS ID from case name: $name" >&2
-        exit 1
-        ;;
-    esac
-    write_supervisor_status chaos runtime_crash_start "$name" "$seed" "$chaos_ref"
-    echo "CONTINUOUS_CHAOS_START case=$name seed=$seed gate=runtime_crash log=$chaos_log"
-    set +e
-    setsid --wait flock -F -w 300 "$LOCK" env \
-      ROOT="$ROOT" \
-      TARITD_BIN="$TARITD" \
-      TARIT_VMM_BIN="$VMM" \
-      TARIT_KERNEL="$kernel" \
-      TARIT_ROOTFS="$rootfs" \
-      TARIT_TEST_GUEST_AGENT_BIN="$GUEST_AGENT" \
-      TARIT_EXPECT_OS_ID="$expected_os" \
-      TARIT_TEST_SOCKET_ROOT="$SOCKET_ROOT" \
-      TARIT_E2E_KEEP_FAILED=0 \
-      "$CRASH_GATE" >"$chaos_log" 2>&1 &
-    epoch_pid=$!
-    wait "$epoch_pid"
-    chaos_status=$?
-    epoch_pid=""
-    set -e
-    if [ "$chaos_status" -ne 0 ] || \
-       ! grep -q '^RUNTIME_CRASH_RECOVERY_PASS ' "$chaos_log"; then
-      printf '{"timestamp":"%s","case":"%s","seed":%s,"status":%s,"kind":"runtime_crash","log":"%s"}\n' \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$seed" "$chaos_status" "$chaos_ref" \
-        >>"$RUN_ROOT/failures/index.jsonl"
-      write_supervisor_status failed runtime_crash_failed "$name" "$seed" "$chaos_ref"
-      echo "CONTINUOUS_CHAOS_FAILED case=$name seed=$seed log=$chaos_log" >&2
-      tail -240 "$chaos_log" >&2
-      [ "$chaos_status" -ne 0 ] && exit "$chaos_status"
-      exit 1
+    run_auxiliary_gate runtime_crash "$CRASH_GATE" \
+      '^RUNTIME_CRASH_RECOVERY_PASS ' "$name" "$seed" "$expected_os"
+  fi
+  if [ "$INGRESS_EVERY_EPOCHS" -gt 0 ] && \
+     [ $((completed_epochs % INGRESS_EVERY_EPOCHS)) -eq 0 ]; then
+    run_auxiliary_gate ingress_wake "$INGRESS_GATE" \
+      '^PASS: live fork \+ hibernate \+ HTTP/PTy/SSH' "$name" "$seed" "$expected_os"
+  fi
+  if [ "$VOLUME_EVERY_EPOCHS" -gt 0 ] && \
+     [ $((completed_epochs % VOLUME_EVERY_EPOCHS)) -eq 0 ]; then
+    if [ $((completed_epochs % 2)) -eq 0 ]; then
+      volume_provider=nfs_v4_1_block
+    else
+      volume_provider=local_block
     fi
-    printf '{"timestamp":"%s","case":"%s","seed":%s,"status":0,"kind":"runtime_crash","log":"%s"}\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$seed" "$chaos_ref" \
-      >>"$RUN_ROOT/chaos.jsonl"
-    write_supervisor_status running runtime_crash_pass "$name" "$seed" "$chaos_ref"
-    echo "CONTINUOUS_CHAOS_PASS case=$name seed=$seed gate=runtime_crash log=$chaos_log"
+    run_auxiliary_gate "volume_${volume_provider}" "$VOLUME_GATE" \
+      '^VOLUME_E2E_PASS provider=' "$name" "$seed" "$expected_os" \
+      "TARIT_VOLUME_PROVIDER=$volume_provider"
   fi
 
   find "$RUN_ROOT/history" -type f \( -name '*.jsonl' -o -name '*.log' \) -mtime +14 -delete

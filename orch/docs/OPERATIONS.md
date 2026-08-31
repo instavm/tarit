@@ -384,6 +384,20 @@ failed epoch and restarts after 30 seconds so an isolated failure does not stop
 subsequent qualification. Repeated failures remain visible in
 `failures/index.jsonl`; they are not treated as passing epochs.
 
+After each configured number of epochs, the supervisor runs independent
+qualification gates against the same OCI and kernel case. The runtime-crash
+gate kills and re-adopts active VMMs. The ingress gate verifies live fork,
+true scale-to-zero, and single-flight wake through execute, PTY, SSH, and HTTP
+share traffic. The volume gate alternates local block and NFS 4.1-backed block
+storage, writes and flushes a filesystem in the guest, hibernates to zero VMM
+processes, wakes through HTTP, and verifies the durable attachment. Set
+`TARIT_CONTINUOUS_CHAOS_EVERY_EPOCHS`,
+`TARIT_CONTINUOUS_INGRESS_EVERY_EPOCHS`, or
+`TARIT_CONTINUOUS_VOLUME_EVERY_EPOCHS` to `0` to disable a gate or to a larger
+integer to reduce its frequency. Successful auxiliary runs are recorded in
+`qualification.jsonl`; their complete logs use the same 14-day bounded
+retention as epoch logs.
+
 Required environment entries are `TARIT_CONTINUOUS_CASES_FILE`,
 `TARITD_BIN`, `TARIT_VMM_BIN`, and `TARIT_TEST_GUEST_AGENT_BIN`. The case file
 and environment file belong under `/etc/tarit` with mode `0600`. The

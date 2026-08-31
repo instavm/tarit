@@ -10,6 +10,7 @@ ROOTFS="${TARIT_ROOTFS:?set TARIT_ROOTFS to an agent-enabled OCI rootfs}"
 EXPECTED_OS_ID="${TARIT_EXPECT_OS_ID:-ubuntu}"
 VOLUME_PROVIDER="${TARIT_VOLUME_PROVIDER:-local_block}"
 SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
+GUEST_AGENT_BIN="${TARIT_TEST_GUEST_AGENT_BIN:-}"
 KEY="persistent-volume-e2e-key"
 PORT="${PERSISTENT_VOLUME_E2E_PORT:-}"
 
@@ -47,6 +48,7 @@ DIR=$(mktemp -d "$SOCKET_ROOT/tarit-volume-hibernate.XXXXXX")
 chmod 700 "$DIR"
 mkdir -m 700 "$DIR/sockets" "$DIR/runtime" "$DIR/images" "$DIR/jails"
 BASE_URL="http://127.0.0.1:$PORT"
+ROOTFS_MOUNT=""
 NFS_UNIT=""
 NFS_WAS_ACTIVE=0
 NFS_EXPORTED=0
@@ -101,14 +103,34 @@ rm -f -- "$DIR/.reflink-source" "$DIR/.reflink-clone"
 STAGED_ROOTFS="$DIR/rootfs.ext4"
 cp --reflink=auto --sparse=always -- "$ROOTFS" "$STAGED_ROOTFS"
 cmp -s -- "$ROOTFS" "$STAGED_ROOTFS" || {
-  echo "FAIL: staged Ubuntu rootfs differs from the source" >&2
+  echo "FAIL: staged OCI rootfs differs from the source" >&2
   exit 1
 }
+if [ -n "$GUEST_AGENT_BIN" ]; then
+  for required in e2fsck install mount mountpoint umount; do
+    command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
+  done
+  test -x "$GUEST_AGENT_BIN" || {
+    echo "FAIL: guest agent not executable: $GUEST_AGENT_BIN" >&2
+    exit 1
+  }
+  ROOTFS_MOUNT="$DIR/rootfs-mount"
+  mkdir -m 700 "$ROOTFS_MOUNT"
+  mount -o loop,rw "$STAGED_ROOTFS" "$ROOTFS_MOUNT"
+  install -D -m 0755 "$GUEST_AGENT_BIN" "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  sync -f "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  umount "$ROOTFS_MOUNT"
+  ROOTFS_MOUNT=""
+  e2fsck -pf "$STAGED_ROOTFS" >/dev/null
+fi
 chmod 0444 "$STAGED_ROOTFS"
 ROOTFS="$STAGED_ROOTFS"
 
 cleanup() {
   local status=$?
+  if [ -n "$ROOTFS_MOUNT" ] && mountpoint -q "$ROOTFS_MOUNT"; then
+    umount "$ROOTFS_MOUNT" || status=1
+  fi
   if [ -n "${TARITD_PGID:-}" ] && kill -0 -- "-$TARITD_PGID" 2>/dev/null; then
     kill -TERM -- "-$TARITD_PGID" 2>/dev/null || true
     for _ in $(seq 1 50); do

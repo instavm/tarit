@@ -129,11 +129,15 @@ regression gates, but the following unresolved items now block release:
    repaired Ubuntu/Linux 6.6 lane subsequently passed 803 operations with
    18 live forks and bounded storage; Ubuntu/Linux 5.10 passed a separate
    348-operation lane. The installed service also schedules an isolated
-   taritd/VMM crash-recovery gate after each six-hour epoch and publishes a
-   root-only atomic status record. A bounded Ubuntu/Linux 6.6 supervisor
-   acceptance passed 300 API operations, then exact VMM re-adoption,
-   HTTP-triggered wake from zero VMMs, killed-VMM reconciliation, and capacity
-   reuse. The full Ubuntu/Alpine and Linux 6.6/5.10 service must
+   taritd/VMM crash-recovery, multi-ingress wake, and persistent-volume gates
+   after each configured number of six-hour epochs and publishes a root-only
+   atomic status record. A bounded Ubuntu/Linux 6.6 supervisor acceptance
+   passed 300 API operations, then exact VMM re-adoption, HTTP-triggered wake
+   from zero VMMs, killed-VMM reconciliation, and capacity reuse. A subsequent
+   two-case rehearsal passed Ubuntu/Linux 6.6 and Alpine/Linux 5.10 workload
+   epochs, runtime crash recovery, execute/PTY/SSH/share activation, and local-
+   plus NFS-backed volume hibernation. The full Ubuntu/Alpine and Linux
+   6.6/5.10 service must
    complete sustained rotation
    without this stall before ingress admission is considered qualified.
 2. Pass the remaining cancellation, dirty-rate non-convergence, corruption,

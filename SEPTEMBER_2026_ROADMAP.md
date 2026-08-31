@@ -1099,6 +1099,19 @@ passing focused gate does not waive an item in the final column.
   left no candidate VMM, lifecycle mount, or occupied runtime tree, returned the
   12 GiB CoW fixture to 11 GiB free, and the unlimited service restarted with
   zero systemd restarts.
+  The supervisor now also schedules the complete live-fork/hibernate ingress
+  gate and a persistent-volume gate after each configured number of epochs.
+  The ingress gate races execute, PTY, SSH, and HTTP share traffic through one
+  repair-gated activation. The volume gate alternates local and NFS 4.1-backed
+  block storage and verifies a guest-formatted, flushed filesystem after true
+  scale-to-zero. A two-case c8i rehearsal on the release VMM
+  (`54bc435394259773dfd55e13b2f24e3c5bd9d322b6bdf9933cfd29115cefb527`)
+  passed Ubuntu 24.04/Linux 6.6 and Alpine 3.20/Linux 5.10 workload epochs,
+  runtime process-death recovery, all four ingress paths, local-block resume,
+  and NFS-backed resume. The first volume attempt correctly failed clone-repair
+  admission because the OCI fixture carried an older agent; the volume gate
+  now injects the exact candidate agent into a private CoW image and the full
+  rehearsal passes.
   The service is enabled and running; completion of
   the full four-case rotation remains a release gate.
 - A bounded runtime-crash gate now covers fresh digest-pinned Ubuntu 24.04 and

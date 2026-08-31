@@ -16,8 +16,9 @@ versions may contain breaking changes.
   Their handwritten layers provide API-key setup, typed failures,
   deadline-bounded execution polling, and stable-child-id live-fork retries.
 - The continuous mixed-OCI supervisor now publishes an atomically replaced,
-  root-only status record and runs bounded orchestrator/VMM crash recovery
-  between long-lived lifecycle epochs.
+  root-only status record and runs bounded orchestrator/VMM crash recovery,
+  multi-ingress wake qualification, and persistent-volume hibernation between
+  long-lived lifecycle epochs.
 - Cross-node fork operations now persist the target daemon boot session and
   reuse an exact child-bound private artifact across interrupted retries.
 - Version-2 snapshot state now records the state ABI, device-model ABI,
@@ -40,6 +41,8 @@ versions may contain breaking changes.
   transitions and reports per-action p50, p95, p99, and maximum latency.
 - Runtime recovery qualification now stages the exact candidate guest agent in
   its private OCI-derived rootfs before testing hibernation and restore.
+- Persistent-volume hibernation qualification now stages the exact candidate
+  guest agent in its private OCI-derived rootfs before testing restore.
 - Balloon release qualification now injects the exact candidate guest agent
   into each OCI fixture and creates cgroup pressure without blocking control on
   a throttled VMM.
