@@ -75,6 +75,10 @@ its scope.
   have absolute deadlines, pathname vsock listeners are identity-owned and
   removed on teardown, and OCI extraction uses private workspaces and no-follow
   file access.
+- OCI conversion verifies manifest, config, and layer descriptor size and
+  SHA-256 before extraction, then enforces disk-size-derived limits for layers,
+  compressed and expanded bytes, entries, individual files, and paths. Limit
+  failures publish no rootfs and remove the private build workspace.
 - Orchestrated snapshots are full snapshots only. Incremental requests fail
   with `422` until every parent can be relocated into a durable manifest-backed
   chain; direct VMM incremental snapshots remain available for local testing.

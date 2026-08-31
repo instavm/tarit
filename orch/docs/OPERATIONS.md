@@ -76,7 +76,7 @@ Build immutable rootfs images from OCI refs on the host that has the VMM binary
 and OCI tooling:
 
 ```sh
-taritd image build --oci node:20-slim --name node20
+taritd image build --oci node:20-slim --name node20 --size 2048
 taritd image ls
 ```
 
@@ -104,6 +104,14 @@ warm-pool classes:
 taritd image gc --older-than-days 7 --dry-run
 taritd image gc --older-than-days 30 --pattern 'node:*'
 ```
+
+`--size` defaults to 1024 MiB and also bounds OCI preprocessing. Tarit verifies
+manifest, config, and layer descriptor size and SHA-256, then streams each
+supported layer before extraction. It rejects excessive layers, compressed or
+expanded bytes, entries, file size, or path length before running the unpacker.
+The command exits non-zero and removes its unpublished output and private
+workspace. The public VM-create API continues to accept only a successfully
+registered `image` name; no partial image becomes API-visible.
 
 ## Run a three-node cluster
 

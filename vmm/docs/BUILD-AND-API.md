@@ -292,9 +292,18 @@ the image's container entrypoint and init system are not started automatically.
 |---|---|---|
 | `<IMAGE_REF>` | (required) | OCI image reference |
 | `--output <PATH>` | (required) | Output disk image path |
-| `--size <MIB>` | 1024 | Disk image size in MiB |
+| `--size <MIB>` | 1024 | Disk image size in MiB and basis for OCI unpack limits |
 | `--auth <PATH>` | none | Auth file path for private registries |
 | `--agent <PATH>` | none | Compiled guest exec agent to inject |
+
+Before unpack, Tarit verifies every manifest, config, and layer descriptor
+against the referenced regular file and SHA-256 digest. It rejects manifests or
+configs over 8 MiB, more than 128 layers, compressed or expanded layer streams
+over twice the requested disk size, a single file larger than the requested
+disk, paths over 4096 bytes, or more than `max(16384, 256 * MIB)` layer entries.
+Rejection exits non-zero, publishes no output image, and removes the private
+build workspace. Increase `--size` only when the intended filesystem genuinely
+requires a larger image and corresponding unpack budget.
 
 ### Global Flags
 

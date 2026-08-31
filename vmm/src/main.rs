@@ -531,7 +531,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         output: String,
 
-        /// Disk image size in MiB.
+        /// Disk image size in MiB. This also determines OCI unpack limits.
         #[arg(long, default_value = "1024", value_name = "MIB")]
         size: u64,
 

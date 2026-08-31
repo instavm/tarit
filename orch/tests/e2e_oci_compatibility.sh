@@ -12,6 +12,7 @@ AGENT="${TARIT_VMM_AGENT:-$ROOT/vmm/guest/agent/vmm-agent}"
 SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
 KEY="oci-compatibility-e2e-key"
 PORT="${OCI_COMPATIBILITY_E2E_PORT:-}"
+IMAGE_SIZE_MIB="${OCI_COMPATIBILITY_IMAGE_SIZE_MIB:-1024}"
 
 for required in curl e2fsck python3 setsid skopeo sqlite3 umoci; do
   command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
@@ -154,6 +155,18 @@ wait_pid_gone() {
   done
   return 1
 }
+delete_vm() {
+  local vm_id=$1 label=$2
+  local body="$DIR/delete-$label.json"
+  local status
+  status=$(curl -sS --max-time 180 -o "$body" -w '%{http_code}' \
+    -X DELETE -H "X-API-Key: $KEY" "$BASE_URL/v1/vms/$vm_id")
+  [ "$status" = 204 ] || {
+    echo "FAIL: $label delete returned HTTP $status" >&2
+    cat "$body" >&2
+    exit 1
+  }
+}
 now_ms() { python3 -c 'import time; print(time.monotonic_ns() // 1000000)'; }
 
 TARIT_API_KEY="$KEY" \
@@ -217,7 +230,8 @@ while IFS='|' read -r name oci_ref expected_id expected_version expectation; do
   CASES=$((CASES + 1))
   echo "== OCI case $name ($oci_ref, $expectation) =="
   BUILD_START=$(now_ms)
-  image_cli image build --oci "$oci_ref" --name "$name" >"$DIR/build-$name.log" 2>&1
+  image_cli image build --oci "$oci_ref" --name "$name" \
+    --size "$IMAGE_SIZE_MIB" >"$DIR/build-$name.log" 2>&1
   BUILD_END=$(now_ms)
   image_cli image verify "$name" >"$DIR/verify-$name.log"
   image_cli --json image ls >"$DIR/images-$name.json"
@@ -242,8 +256,20 @@ PY
     'import json,sys; print(json.dumps({"image":sys.argv[1],"vcpus":1,"memory_mib":256}))' \
     "$name")
   BOOT_START=$(now_ms)
-  CURRENT_VM=$(api POST "$BASE_URL/v1/vms" "$CREATE_BODY" | \
-    python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["status"] == "running", row; print(row["id"])')
+  CREATE_STATUS=$(curl -sS --max-time 180 -o "$DIR/create-$name.json" \
+    -w '%{http_code}' -X POST -H "X-API-Key: $KEY" \
+    -H 'Content-Type: application/json' -d "$CREATE_BODY" "$BASE_URL/v1/vms")
+  [ "$CREATE_STATUS" = 201 ] || {
+    echo "FAIL: $name create returned HTTP $CREATE_STATUS" >&2
+    cat "$DIR/create-$name.json" >&2
+    exit 1
+  }
+  CURRENT_VM=$(python3 - "$DIR/create-$name.json" <<'PY'
+import json,sys
+row=json.load(open(sys.argv[1])); assert row["status"] == "running", row
+print(row["id"])
+PY
+)
 
   VM_PID=$(python3 - "$DIR/fleet.db" "$CURRENT_VM" <<'PY'
 import sqlite3,sys
@@ -309,7 +335,11 @@ PY
       FORK_REQUEST_PID=$!
 
       CREATING_OBSERVED=0
-      for _ in $(seq 1 300); do
+      # Snapshot creation precedes child registration and can exceed several
+      # seconds under disk or CPU contention. Follow the bounded fork request
+      # for its full lifetime; a 100 ms poll still samples the two-second
+      # userspace-repair barrier without hammering SQLite.
+      for _ in $(seq 1 1800); do
         CHILD_STATUS=$(python3 - "$DIR/fleet.db" "$REQUESTED_CHILD_ID" <<'PY'
 import sqlite3,sys
 with sqlite3.connect(sys.argv[1]) as db:
@@ -322,7 +352,7 @@ PY
           break
         fi
         kill -0 "$FORK_REQUEST_PID" 2>/dev/null || break
-        sleep 0.01
+        sleep 0.1
       done
       [ "$CREATING_OBSERVED" -eq 1 ] || {
         echo "FAIL: $name fork did not expose the creating-state repair window" >&2
@@ -447,7 +477,7 @@ assert row and row[0], row
 print(row[0])
 PY
 )
-      api DELETE "$BASE_URL/v1/vms/$CURRENT_CHILD" >/dev/null
+      delete_vm "$CURRENT_CHILD" "$name-child"
       CURRENT_CHILD=""
       wait_pid_gone "$CHILD_PID"
 
@@ -527,7 +557,7 @@ PY
   fi
 
   DELETED_PID=$VM_PID
-  api DELETE "$BASE_URL/v1/vms/$CURRENT_VM" >/dev/null
+  delete_vm "$CURRENT_VM" "$name-parent"
   CURRENT_VM=""
   wait_pid_gone "$DELETED_PID"
   image_cli image rm "$name" >"$DIR/remove-$name.log"

@@ -145,6 +145,7 @@ impl LocalImageConfig {
 
 pub struct BuildImageOptions {
     pub oci_ref: String,
+    pub size_mib: u64,
     pub image_ref: ImageRef,
     pub vmm_bin: PathBuf,
     pub vmm_agent: PathBuf,
@@ -223,6 +224,8 @@ fn build_image_inner(
         .arg(temp_path)
         .arg("--agent")
         .arg(&opts.vmm_agent)
+        .arg("--size")
+        .arg(opts.size_mib.to_string())
         .arg(&resolved.pinned_ref)
         .status()
         .with_context(|| format!("run {}", opts.vmm_bin.display()))?;

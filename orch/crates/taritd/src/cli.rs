@@ -113,6 +113,9 @@ pub struct ImageBuildArgs {
     oci: String,
     #[arg(long, value_name = "NAME[:TAG]")]
     name: String,
+    /// Output filesystem size in MiB. This also determines OCI unpack limits.
+    #[arg(long, default_value_t = 1024, value_name = "MIB")]
+    size: u64,
 }
 
 #[derive(Debug, Args)]
@@ -446,10 +449,14 @@ fn image_verify(args: ImageRemoveArgs, json_output: bool) -> Result<()> {
 }
 
 fn image_build(args: ImageBuildArgs, json_output: bool) -> Result<()> {
+    if args.size == 0 {
+        bail!("image size must be greater than zero");
+    }
     let config = crate::image::LocalImageConfig::from_env()?;
     let image_ref = crate::image::parse_image_ref(&args.name)?;
     let image = crate::image::build_image(crate::image::BuildImageOptions {
         oci_ref: args.oci,
+        size_mib: args.size,
         image_ref,
         vmm_bin: config.vmm_bin,
         vmm_agent: config.vmm_agent,
@@ -990,6 +997,45 @@ mod tests {
             Some(Command::Vm {
                 command: VmCommand::Create(args),
             }) => assert_eq!(args.vcpus, Some(2)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_build_size_defaults_and_parses() {
+        let defaults = Cli::try_parse_from([
+            "taritd",
+            "image",
+            "build",
+            "--oci",
+            "ubuntu:24.04",
+            "--name",
+            "ubuntu",
+        ])
+        .unwrap();
+        match defaults.command {
+            Some(Command::Image {
+                command: ImageCommand::Build(args),
+            }) => assert_eq!(args.size, 1024),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let explicit = Cli::try_parse_from([
+            "taritd",
+            "image",
+            "build",
+            "--oci",
+            "alpine:3.20",
+            "--name",
+            "alpine",
+            "--size",
+            "2048",
+        ])
+        .unwrap();
+        match explicit.command {
+            Some(Command::Image {
+                command: ImageCommand::Build(args),
+            }) => assert_eq!(args.size, 2048),
             other => panic!("unexpected command: {other:?}"),
         }
     }

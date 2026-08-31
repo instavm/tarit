@@ -54,6 +54,9 @@ crc32fast = "1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 tempfile = "3"
 sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zstd = "0.13"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

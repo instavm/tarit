@@ -57,6 +57,15 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- OCI image conversion now verifies manifest, config, and layer descriptors and
+  streams layers through disk-size-derived expansion, entry-count, file-size,
+  path-length, and layer-count limits before unpack. Rejected images publish no
+  rootfs and leave no private build workspace.
+- The OCI compatibility gate follows a fork request for its full bounded
+  lifetime, so a contended snapshot phase cannot make it miss the child repair
+  state; VM-create and VM-delete failures now retain the exact HTTP status and
+  response body.
+
 - Internal live-fork and hibernation snapshots now carry an explicit VM lease.
   Successful resume and terminal child deletion retire the exact RAM, integrity,
   and CoW files; user-created snapshots remain durable. Continuous lifecycle

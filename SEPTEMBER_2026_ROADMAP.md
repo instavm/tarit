@@ -374,7 +374,7 @@ OCI input was Ubuntu.
 | Clone identity | Linux 6.6 VMGenID notification and the mandatory userspace repair barrier pass; Linux 5.10 passes through the barrier-only compatibility path; mixed exec, PTY, SSH, and HTTP-share ingress waits for application PRNG, nonce, ticket, and session-cache repair | Completion of the sustained four-case Ubuntu/Alpine and Linux 6.6/5.10 rotation |
 | Security and isolation | Guest VMX/SVM and `/dev/kvm` are hidden while worker KVM remains enabled; jail, seccomp, cgroups, mTLS peer identity, opaque artifacts, signed-image admission, and tenant fences pass focused gates | Continued kernel/microcode qualification and the remaining adversarial release matrix |
 | Persistent volumes | Local and NFS-backed raw block volumes pass attach, fsync, hibernate, cross-node recovery, busy-detach, and deletion across Ubuntu/Alpine and Linux 6.6/5.10 | Managed EFS/Azure qualification, protected NFS transport, physical host loss, and backend-native snapshot/clone support |
-| OCI and kernels | Ubuntu 24.04 and Alpine 3.20 cover the lifecycle matrix on Linux 6.6 and 5.10; the broader seven-image compatibility gate passes on both kernels | Decompression/inode exhaustion and interrupted registry-transfer qualification |
+| OCI and kernels | Ubuntu 24.04 and Alpine 3.20 cover the lifecycle matrix on Linux 6.6 and 5.10; the broader seven-image compatibility gate passes on both kernels; digest-verified preflight rejects expansion and inode exhaustion before unpack | Interrupted registry-transfer qualification |
 | Release artifacts | The Linux 6.12 production guest kernel is checksum-pinned, config-verified, and reproducibly built with required virtio drivers | Protected-main KVM runner execution and retained release evidence |
 
 The rows above distinguish implemented behavior from release qualification. A
@@ -925,6 +925,25 @@ passing focused gate does not waive an item in the final column.
   Fedora Minimal 42, and non-root distroless Debian 12. All six shell images
   retained a visible block root device and passed exec/security checks;
   distroless passed agent readiness and the intentional no-shell result.
+- OCI conversion now performs digest-verified streaming admission before the
+  unpacker runs. Manifest and config JSON are capped at 8 MiB; the requested
+  disk size determines the compressed, expanded, entry-count, and single-file
+  budgets, alongside fixed layer-count and path-length limits. A c8i CLI gate
+  supplied valid OCI layouts containing a compressed expansion workload and a
+  16,385-entry inode workload. Both failed with the documented resource-limit
+  error, published no ext4, and left no build workspace. The isolated release
+  VMM SHA-256 was
+  `02b56b52ff150b3d64a20d925aca76e0f994a46d01e0a80aa677e887360a9b7b`
+  and the release orchestrator SHA-256 was
+  `ba6791ef2937d75603e18fbf765a6f0ccec49f53148dfea6e6f9911cc69b14f4`.
+  With the candidate agent SHA-256
+  `7fce0ed3818d18f127fc30c4ac86f2b28bf52711158d1fb8b09d867724f93041`,
+  fresh `taritd image build` and `image verify` calls followed by public VM API
+  create, exec, live fork, repair-gated ingress, private CoW writes, hibernate,
+  HTTP wake, and delete passed for Ubuntu 24.04 and Alpine 3.20 on Linux
+  6.6.155 and 5.10.230. The gate's child-state polling now follows the bounded
+  fork request rather than assuming snapshot creation finishes within three
+  seconds, and API create failures retain their exact status and response body.
 - The model-based lifecycle gate also passed against a freshly ingested Alpine
   3.20 OCI rootfs on Linux 6.6 and 5.10. Each run reconciled 689 API, database,
   process, jail, artifact, proof-file, and CoW invariants across the deterministic
