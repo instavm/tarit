@@ -263,6 +263,16 @@ cache_hash_after=$(json_field stdout <<<"$cache_json" | awk '{print $1}')
 echo "balloon-e2e: guest data survived inflate/deflate"
 
 if [[ "$CGROUP_ENFORCE" == 1 ]]; then
+  # Discard guest pages, return them to the guest, and arm a delayed writer
+  # before lowering memory.high. The writer creates a new charge after the
+  # boundary is armed, while the host observes and removes the throttle without
+  # waiting for a synchronous VMM control response from inside that throttle.
+  "$VMM_BIN" --socket "$SOCKET" balloon --target "$ACTIVE_TARGET_MIB" >/dev/null
+  wait_for_actual_at_least "$MIN_ACTUAL_MIB" >/dev/null
+  "$VMM_BIN" --socket "$SOCKET" balloon --target 0 >/dev/null
+  wait_for_actual_zero
+  pressure_writer='rm -f /tmp/cgroup-pressure /tmp/cgroup-pressure-done; nohup setsid sh -c '\''sleep 2; dd if=/dev/zero of=/tmp/cgroup-pressure bs=1M count=32 status=none; sync; printf done > /tmp/cgroup-pressure-done'\'' </dev/null >/tmp/cgroup-pressure.log 2>&1 &'
+  guest_exec "$pressure_writer" >/dev/null
   cgroup_current=$(<"$CGROUP_DIR/memory.current")
   pressure_high=$CGROUP_HIGH_BYTES
   if (( pressure_high >= cgroup_current )); then
@@ -274,11 +284,6 @@ if [[ "$CGROUP_ENFORCE" == 1 ]]; then
   fi
   printf '%s\n' "$pressure_high" >"$CGROUP_DIR/memory.high"
   CGROUP_HIGH_BEFORE=$(awk '$1 == "high" { print $2 }' "$CGROUP_DIR/memory.events")
-  guest_exec 'dd if=/dev/zero of=/tmp/cgroup-pressure bs=1M count=4 status=none; rm -f /tmp/cgroup-pressure' >/dev/null
-  "$VMM_BIN" --socket "$SOCKET" balloon --target "$ACTIVE_TARGET_MIB" >/dev/null
-  wait_for_actual_at_least "$MIN_ACTUAL_MIB" >/dev/null
-  "$VMM_BIN" --socket "$SOCKET" balloon --target 0 >/dev/null
-  wait_for_actual_zero
   for _ in $(seq 1 100); do
     cgroup_high_observed=$(awk '$1 == "high" { print $2 }' "$CGROUP_DIR/memory.events")
     (( cgroup_high_observed > CGROUP_HIGH_BEFORE )) && break
@@ -292,6 +297,14 @@ if [[ "$CGROUP_ENFORCE" == 1 ]]; then
   # Pressure has been proven. Keep the hard memory.max boundary in force but
   # stop throttling below the guest's irreducible working set before snapshot.
   printf '%s\n' "$CGROUP_MAX_BYTES" >"$CGROUP_DIR/memory.high"
+  # Expansion is intentionally performed by the guest shell.
+  # shellcheck disable=SC2016
+  pressure_done=$(guest_exec 'for i in $(seq 1 200); do test -f /tmp/cgroup-pressure-done && break; sleep .05; done; cat /tmp/cgroup-pressure-done; rm -f /tmp/cgroup-pressure /tmp/cgroup-pressure-done; sync')
+  grep -q 'done' <<<"$pressure_done"
+  "$VMM_BIN" --socket "$SOCKET" balloon --target "$ACTIVE_TARGET_MIB" >/dev/null
+  wait_for_actual_at_least "$MIN_ACTUAL_MIB" >/dev/null
+  "$VMM_BIN" --socket "$SOCKET" balloon --target 0 >/dev/null
+  wait_for_actual_zero
   pressure_hash=$(guest_exec 'sha256sum /tmp/balloon-cache')
   pressure_hash_value=$(json_field stdout <<<"$pressure_hash" | awk '{print $1}')
   [[ "$pressure_hash_value" == "$cache_hash_before" ]]

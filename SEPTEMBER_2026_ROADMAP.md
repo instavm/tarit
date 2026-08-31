@@ -721,8 +721,10 @@ passing focused gate does not waive an item in the final column.
   Each case completed 20 live-snapshot/lazy-restore/inflate/deflate cycles (80
   restores total), retained its guest workload digest, scanned guest output for
   stalls/panics/virtio failures, and ran inside a cgroup v2 memory boundary.
-  Measured VMM RSS reclaim was 16,028/15,152 KiB for Ubuntu/Alpine on 6.6 and
-  13,688/12,816 KiB on 5.10. Every guest had a working balloon driver but no `/dev/kvm`
+  The current-source rerun measured VMM RSS reclaim of 14,196/13,316 KiB for
+  Ubuntu/Alpine on 6.6 and 15,928/15,064 KiB on 5.10, recorded 18/18/36/53
+  `memory.high` events, and stayed below 765 MiB peak cgroup usage. Every guest
+  had a working balloon driver but no `/dev/kvm`
   or VMX/SVM, while worker KVM remained available. The soak found and fixed a
   lost interrupt window between the balloon configuration and first 256-page
   used-ring completion: balloon now uses an active-high level GSI with KVM EOI
@@ -734,6 +736,12 @@ passing focused gate does not waive an item in the final column.
   case) without an abnormal vCPU exit or a new host seccomp audit event. The
   exact boot-enabled VMM SHA-256 for the file-backed live-snapshot candidate is
   `275f24d02d2790092c371d503b260467ab0d93ed20c8b3dc257abefacab2b8e3`.
+  The rerun also caught a stale guest agent in the retained OCI fixtures after
+  clone-repair protocol v3 was introduced. The matrix now injects the exact
+  candidate agent into each private CoW image before boot. Its cgroup stimulus
+  now uses a delayed guest writer and restores `memory.high` from the host as
+  soon as pressure is recorded, avoiding a synchronous control request from a
+  throttled VMM.
 - Live snapshot no longer allocates a second guest-sized anonymous RAM buffer.
   Bounded pre-copy rounds write pages directly into a private sparse staging
   file; the final dirty pages and device state share one paused cut, and every

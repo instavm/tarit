@@ -19,6 +19,9 @@ versions may contain breaking changes.
   API, removing the `iproute2` dependency from minimal OCI guests.
 - Continuous lifecycle qualification now carries absolute and monotonic timers
   through two live sibling forks and verifies independent delivery and state.
+- Balloon release qualification now injects the exact candidate guest agent
+  into each OCI fixture and creates cgroup pressure without blocking control on
+  a throttled VMM.
 
 ### Fixed
 
