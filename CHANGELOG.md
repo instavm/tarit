@@ -71,6 +71,10 @@ versions may contain breaking changes.
   vCPU or device-worker transition cannot be rolled back and acknowledged,
   the VM is fenced paused and the orchestrator durably records that state
   before returning the failure.
+- Forced VMM teardown now has a bounded exit wait. If the process remains alive
+  after `SIGKILL`, taritd returns a retryable cleanup failure and retains the
+  control socket, writable overlay, jail, cgroup, and network allocation instead
+  of releasing resources that a host-I/O-blocked process may still own.
 - OCI image conversion now verifies manifest, config, and layer descriptors and
   streams layers through disk-size-derived expansion, entry-count, file-size,
   path-length, and layer-count limits before unpack. Rejected images publish no

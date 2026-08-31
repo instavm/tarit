@@ -253,6 +253,12 @@ Operational behavior:
   stop/delete/stop-all retries convergence before teardown. Terminal records
   retain fleet ownership and capacity until SQLite, fleet clear, cache commit,
   and reservation release each acknowledge.
+- Stop first gives the VMM a bounded graceful shutdown window, then sends
+  `SIGKILL` and waits at most five seconds for confirmed exit. A process blocked
+  in uninterruptible host I/O may outlive that signal. In that case teardown
+  fails closed and retains the socket, overlay, jail, cgroup, and network
+  allocation for reconciliation; operators must resolve the host I/O condition
+  before those resources can be reclaimed safely.
 - Warm handout is possible only when the create request exactly matches a warm class shape and boot config.
 - If the pool drains, creates cold boot instead of failing.
 - Replenishment limits concurrent warm spawns by `replenish_concurrency`; it
