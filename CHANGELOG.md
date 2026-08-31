@@ -67,9 +67,10 @@ versions may contain breaking changes.
   waits for every worker to leave its parked state before restarting vCPUs, so
   rapid resume/suspend cycles cannot reuse a stale acknowledgement. Worker
   startup, unexpected exit, and five-second quiescence failures are surfaced
-  instead of publishing a partially functional VM or snapshot. If worker
-  rollback cannot be confirmed, vCPUs remain paused and the orchestrator
-  durably fences the observed state before returning the failure.
+  instead of publishing a partially functional VM or snapshot. If a partial
+  vCPU or device-worker transition cannot be rolled back and acknowledged,
+  the VM is fenced paused and the orchestrator durably records that state
+  before returning the failure.
 - OCI image conversion now verifies manifest, config, and layer descriptors and
   streams layers through disk-size-derived expansion, entry-count, file-size,
   path-length, and layer-count limits before unpack. Rejected images publish no

@@ -2608,7 +2608,7 @@ fn stop_running_vm(vm: &mut VmInstance) {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn pause_running_vcpus(vm: &VmInstance) -> Result<bool> {
+fn pause_running_vcpus(vm: &mut VmInstance) -> Result<bool> {
     if let Some(r) = vm.running.as_ref() {
         let vcpu_threads = std::iter::once(&r.vcpu_thread)
             .chain(r.ap_threads.iter())
@@ -2618,16 +2618,18 @@ fn pause_running_vcpus(vm: &VmInstance) -> Result<bool> {
         }
         for vcpu_thread in &vcpu_threads {
             if let Err(error) = vcpu_thread.request_snapshot_pause() {
-                for armed in &vcpu_threads {
-                    armed.resume();
+                let (error, rollback_confirmed) = rollback_failed_vcpu_pause(vcpu_threads, error);
+                if !rollback_confirmed {
+                    vm.state = VmState::Paused;
                 }
                 return Err(error);
             }
         }
         for vcpu_thread in &vcpu_threads {
             if let Err(error) = vcpu_thread.wait_snapshot_paused() {
-                for armed in &vcpu_threads {
-                    armed.resume();
+                let (error, rollback_confirmed) = rollback_failed_vcpu_pause(vcpu_threads, error);
+                if !rollback_confirmed {
+                    vm.state = VmState::Paused;
                 }
                 return Err(error);
             }
@@ -2635,6 +2637,28 @@ fn pause_running_vcpus(vm: &VmInstance) -> Result<bool> {
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn rollback_failed_vcpu_pause(
+    vcpu_threads: Vec<&VcpuThread>,
+    primary: VmmError,
+) -> (VmmError, bool) {
+    for vcpu_thread in &vcpu_threads {
+        vcpu_thread.resume();
+    }
+    let rollback = vcpu_threads
+        .iter()
+        .try_for_each(|vcpu_thread| vcpu_thread.wait_snapshot_resumed());
+    match rollback {
+        Ok(()) => (primary, true),
+        Err(resume_error) => (
+            VmmError::Snapshot(format!(
+                "{primary}; failed to confirm vCPU rollback: {resume_error}"
+            )),
+            false,
+        ),
     }
 }
 

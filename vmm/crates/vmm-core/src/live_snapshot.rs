@@ -70,10 +70,14 @@ impl<'a> VcpuPauseGuard<'a> {
         // Arm every vCPU before waiting for any acknowledgement. The guard is
         // already active, so a partial request failure resumes every thread.
         for vcpu_thread in &guard.vcpu_threads {
-            vcpu_thread.request_snapshot_pause()?;
+            if let Err(error) = vcpu_thread.request_snapshot_pause() {
+                return Err(finish_failed_vcpu_pause(error, guard));
+            }
         }
         for vcpu_thread in &guard.vcpu_threads {
-            vcpu_thread.wait_snapshot_paused()?;
+            if let Err(error) = vcpu_thread.wait_snapshot_paused() {
+                return Err(finish_failed_vcpu_pause(error, guard));
+            }
         }
         Ok(guard)
     }
@@ -83,10 +87,13 @@ impl<'a> VcpuPauseGuard<'a> {
             for vcpu_thread in &self.vcpu_threads {
                 vcpu_thread.resume();
             }
+            // Every control flag is clear now. Disarm before waiting so a
+            // failed acknowledgement does not issue a second, unobserved
+            // resume request from Drop.
+            self.armed = false;
             for vcpu_thread in &self.vcpu_threads {
                 vcpu_thread.wait_snapshot_resumed()?;
             }
-            self.armed = false;
         }
         Ok(())
     }
@@ -206,6 +213,17 @@ impl FinalVcpuRelease for VcpuPauseGuard<'_> {
 
     fn keep_paused(self) {
         VcpuPauseGuard::keep_paused(self);
+    }
+}
+
+/// A failed all-vCPU pause must not report a recoverable source until every
+/// armed thread has acknowledged the compensating resume.
+fn finish_failed_vcpu_pause<V: FinalVcpuRelease>(primary: VmmError, vcpus: V) -> VmmError {
+    match vcpus.resume() {
+        Ok(()) => primary,
+        Err(resume_error) => VmmError::Snapshot(format!(
+            "{primary}; failed to confirm vCPU rollback: {resume_error}"
+        )),
     }
 }
 
@@ -662,9 +680,10 @@ where
     //   3. Inside the pause do only O(residual) work: read both dirty
     //      sources, copy the residual pages, capture state.
     //
-    // On any error below, the guards resume all vCPUs and I/O threads as they
-    // drop. Downtime is measured across the whole pause — including the
-    // pause/resume handshakes — because that is the blackout the guest sees.
+    // Capture errors restore I/O and then vCPUs. If either release cannot be
+    // confirmed, the controller fences the source paused for explicit
+    // recovery. Downtime covers the complete all-vCPU blackout, including the
+    // pause/resume handshakes.
     log::info!("live_snapshot: final stop — pausing all vCPUs, draining I/O");
     let final_stop_start = Instant::now();
     let final_pause_guard = VcpuPauseGuard::pause_all(vcpu_threads)?;
@@ -773,12 +792,17 @@ mod tests {
 
     struct FakeVcpuRelease {
         actions: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        fail_resume: bool,
     }
 
     impl FinalVcpuRelease for FakeVcpuRelease {
         fn resume(self) -> Result<()> {
             self.actions.borrow_mut().push("vcpu-resume");
-            Ok(())
+            if self.fail_resume {
+                Err(VmmError::Snapshot("vCPU did not resume".into()))
+            } else {
+                Ok(())
+            }
         }
 
         fn keep_paused(self) {
@@ -970,6 +994,7 @@ mod tests {
             },
             FakeVcpuRelease {
                 actions: std::rc::Rc::clone(&actions),
+                fail_resume: false,
             },
         )
         .expect_err("I/O release failure unexpectedly resumed the source");
@@ -989,11 +1014,30 @@ mod tests {
             },
             FakeVcpuRelease {
                 actions: std::rc::Rc::clone(&actions),
+                fail_resume: false,
             },
         )
         .expect_err("capture failure unexpectedly succeeded");
 
         assert!(error.to_string().contains("capture failed"));
         assert_eq!(&*actions.borrow(), &["io-release", "vcpu-resume"]);
+    }
+
+    #[test]
+    fn failed_vcpu_pause_requires_confirmed_rollback() {
+        let actions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let error = finish_failed_vcpu_pause(
+            VmmError::Snapshot("pause failed".into()),
+            FakeVcpuRelease {
+                actions: std::rc::Rc::clone(&actions),
+                fail_resume: true,
+            },
+        );
+
+        assert!(error.to_string().contains("pause failed"));
+        assert!(error
+            .to_string()
+            .contains("failed to confirm vCPU rollback"));
+        assert_eq!(&*actions.borrow(), &["vcpu-resume"]);
     }
 }

@@ -412,10 +412,10 @@ Resolve the owner, stop every vCPU, drain and park the block, network, and vsock
 workers, then publish the paused state. The public handler does not require a
 JSON body.
 
-If an I/O transition fails and the VMM cannot confirm a safe rollback, it keeps
-the vCPUs paused. The orchestrator observes and durably records that state
-before returning the operation failure, allowing a later explicit resume or
-delete instead of leaving the control plane marked running.
+If a vCPU or device-worker transition fails and the VMM cannot confirm a safe
+rollback, it fences the VM paused. The orchestrator observes and durably
+records that state before returning the operation failure, allowing a later
+explicit resume or delete instead of leaving the control plane marked running.
 
 Response `200`: updated `VmRecord` with `status: "paused"`.
 
