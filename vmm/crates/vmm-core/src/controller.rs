@@ -524,7 +524,17 @@ impl VmmController {
         // so a snapshot never stops a running VM. (An idle guest is already
         // quiescent; this makes an actively-running guest's snapshot consistent.)
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        let paused_here = pause_running_vcpus(vm);
+        let paused_here = if state_before == VmState::Running {
+            match pause_running_vcpus(vm) {
+                Ok(paused) => paused,
+                Err(error) => {
+                    remove_owned_scratch_file(&owned_snapshot);
+                    return Err(error);
+                }
+            }
+        } else {
+            false
+        };
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let mut consumed_dirty = None;
@@ -630,11 +640,18 @@ impl VmmController {
         })();
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        if paused_here && state_before == VmState::Running {
-            resume_running_vcpus(vm);
-        }
+        let resume_result = if paused_here && state_before == VmState::Running {
+            resume_running_vcpus(vm)
+        } else {
+            Ok(())
+        };
 
         vm.state = state_before;
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let snapshot_result = match resume_result {
+            Ok(()) => snapshot_result,
+            Err(error) => Err(error),
+        };
         let mem_len = match snapshot_result {
             Ok(mem_len) => mem_len,
             Err(error) => {
@@ -987,10 +1004,9 @@ impl VmmController {
             let vm = slot
                 .as_mut()
                 .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
-            // Phase A: live snapshot is uniprocessor-only (see snapshot()).
-            if vm.config.vcpus.count > 1 {
-                return Err(VmmError::Snapshot(
-                    "SMP live snapshot (vcpus.count > 1) not yet supported".into(),
+            if vm.state != VmState::Running {
+                return Err(VmmError::InvalidConfig(
+                    "live snapshot requires a running VM".into(),
                 ));
             }
             let mem = vm
@@ -1026,15 +1042,15 @@ impl VmmController {
 
         // The controller lock is released for the whole pre-copy loop so other
         // operations are not blocked for seconds. `capture_state` runs inside
-        // the final vCPU pause, which is what makes the state blob coherent
+        // the final all-vCPU pause, which makes the state blob coherent
         // with the memory image (a blob captured before the loop would carry
         // boot-time registers against post-boot memory).
         //
         // `quiesce` parks the VMM threads that DMA into guest memory (net I/O
         // loops, vsock pump) for the final stop, so no page can go stale
         // between the residual copy and the device-state capture. Virtio-blk
-        // needs no entry here: its QUEUE_NOTIFY traps to the vCPU thread, so
-        // pausing the vCPU already quiesces it.
+        // needs no entry here: its QUEUE_NOTIFY traps to a vCPU thread, so
+        // pausing every vCPU already quiesces it.
         let quiesce = |pause: bool| {
             if pause {
                 for io_loop in &running.net_io_loops {
@@ -1090,10 +1106,13 @@ impl VmmController {
             return Err(error);
         }
         let mut live_overlay = None;
+        let vcpu_threads = std::iter::once(&running.vcpu_thread)
+            .chain(running.ap_threads.iter())
+            .collect::<Vec<_>>();
         let snap_result = crate::live_snapshot::live_snapshot(
             &running.kvm_vm,
             &mem,
-            &running.vcpu_thread,
+            &vcpu_threads,
             &snapshot_config,
             memory_stage.file(),
             &quiesce,
@@ -1643,11 +1662,20 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        if vm.state == VmState::Paused {
+            return Ok(());
+        }
+        if vm.state != VmState::Running {
+            return Err(VmmError::InvalidConfig(format!(
+                "cannot pause a VM in {:?} state",
+                vm.state
+            )));
+        }
         // Actually stop the guest vCPU, not just flip the state enum — a paused
         // VM must stop consuming host CPU (a PaaS pauses idle VMs by the
         // thousand). snapshot() drives the thread directly; the API must too.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        pause_running_vcpus(vm);
+        pause_running_vcpus(vm)?;
         vm.state = VmState::Paused;
         log::info!("VM paused");
         Ok(())
@@ -1659,8 +1687,17 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        if vm.state == VmState::Running {
+            return Ok(());
+        }
+        if vm.state != VmState::Paused {
+            return Err(VmmError::InvalidConfig(format!(
+                "cannot resume a VM in {:?} state",
+                vm.state
+            )));
+        }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        resume_running_vcpus(vm);
+        resume_running_vcpus(vm)?;
         vm.state = VmState::Running;
         log::info!("VM resumed");
         Ok(())
@@ -2415,37 +2452,50 @@ fn stop_running_vm(vm: &mut VmInstance) {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn pause_running_vcpus(vm: &VmInstance) -> bool {
+fn pause_running_vcpus(vm: &VmInstance) -> Result<bool> {
     if let Some(r) = vm.running.as_ref() {
-        let mut any = false;
-        if !r.vcpu_thread.is_exited() {
-            r.vcpu_thread.pause();
-            any = true;
+        let vcpu_threads = std::iter::once(&r.vcpu_thread)
+            .chain(r.ap_threads.iter())
+            .collect::<Vec<_>>();
+        if vcpu_threads.is_empty() {
+            return Ok(false);
         }
-        for ap in &r.ap_threads {
-            if !ap.is_exited() {
-                ap.pause();
-                any = true;
+        for vcpu_thread in &vcpu_threads {
+            if let Err(error) = vcpu_thread.request_snapshot_pause() {
+                for armed in &vcpu_threads {
+                    armed.resume();
+                }
+                return Err(error);
             }
         }
-        any
+        for vcpu_thread in &vcpu_threads {
+            if let Err(error) = vcpu_thread.wait_snapshot_paused() {
+                for armed in &vcpu_threads {
+                    armed.resume();
+                }
+                return Err(error);
+            }
+        }
+        Ok(true)
     } else {
-        false
+        Ok(false)
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn resume_running_vcpus(vm: &VmInstance) {
+fn resume_running_vcpus(vm: &VmInstance) -> Result<()> {
     if let Some(r) = vm.running.as_ref() {
-        if !r.vcpu_thread.is_exited() {
-            r.vcpu_thread.resume();
+        let vcpu_threads = std::iter::once(&r.vcpu_thread)
+            .chain(r.ap_threads.iter())
+            .collect::<Vec<_>>();
+        for vcpu_thread in &vcpu_threads {
+            vcpu_thread.resume();
         }
-        for ap in &r.ap_threads {
-            if !ap.is_exited() {
-                ap.resume();
-            }
+        for vcpu_thread in &vcpu_threads {
+            vcpu_thread.wait_snapshot_resumed()?;
         }
     }
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -2536,7 +2586,11 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
     }
 
     let state_before = vm.state;
-    let paused_here = pause_running_vcpus(vm);
+    let paused_here = if state_before == VmState::Running {
+        pause_running_vcpus(vm)?
+    } else {
+        false
+    };
     vm.state = VmState::Paused;
     let result = (|| -> Result<()> {
         capture_live_state(vm)?;
@@ -2631,7 +2685,7 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
     if result.is_err() {
         vm.state = state_before;
         if paused_here && state_before == VmState::Running {
-            resume_running_vcpus(vm);
+            resume_running_vcpus(vm)?;
         }
     }
     result

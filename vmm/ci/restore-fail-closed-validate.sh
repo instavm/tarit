@@ -11,6 +11,7 @@ CONTROL_TIMEOUT_SECS=${CONTROL_TIMEOUT_SECS:-35}
 RESTORE_TIMEOUT_SECS=${RESTORE_TIMEOUT_SECS:-120}
 VCPUS=${VCPUS:-1}
 LIVE_SNAPSHOT=${LIVE_SNAPSHOT:-1}
+FAIL_PHASE=${FAIL_PHASE:-}
 
 WORK_DIR=$(mktemp -d "$SOCKET_ROOT/tarit-restore-fail-closed.XXXXXX")
 SOCKET="$WORK_DIR/vmm.sock"
@@ -19,6 +20,8 @@ CORRUPT="$WORK_DIR/corrupt.snap"
 TEST_ROOTFS="$WORK_DIR/rootfs.ext4"
 RESTORE_ERROR="$WORK_DIR/restore-error.log"
 STATUS_ERROR="$WORK_DIR/status-error.log"
+SNAPSHOT_FAILURE="$WORK_DIR/snapshot-failure.log"
+PAUSED_LIVE_ERROR="$WORK_DIR/paused-live-error.log"
 SERVE_PID=
 ROOTFS_MOUNT=
 SNAPSHOT=
@@ -84,6 +87,13 @@ done
   echo "LIVE_SNAPSHOT must be 0 or 1" >&2
   exit 1
 }
+case "$FAIL_PHASE" in
+  '' | dirty_logging | bulk | dirty_round | final_pause | state_capture) ;;
+  *)
+    echo "unsupported FAIL_PHASE: $FAIL_PHASE" >&2
+    exit 1
+    ;;
+esac
 
 json_field() {
   local field=$1
@@ -117,6 +127,25 @@ wait_for_exec() {
   return 1
 }
 
+verify_ap_progress() {
+  local label=$1 ap_jiffies ap_output ap_seen ap_cpu ap_before ap_after
+  ((VCPUS > 1)) || return 0
+  # More CPU-bound workers than vCPUs avoids depending on taskset, which is
+  # absent from minimal Alpine images. Every restored AP must receive work and
+  # advance its scheduler accounting.
+  # shellcheck disable=SC2016
+  ap_jiffies=$(guest_exec 'set -eu; before=/tmp/tarit-ap-before.$$; cp /proc/stat "$before"; worker=0; workers='"$((VCPUS * 2))"'; iterations='"$((4000 / (VCPUS * 2)))"'; while test "$worker" -lt "$workers"; do (i=0; while test "$i" -lt "$iterations"; do sha256sum /usr/sbin/vmm-agent >/dev/null; i=$((i + 1)); done) & worker=$((worker + 1)); done; wait; awk -v limit='"$VCPUS"' '\''FNR == NR { if ($1 ~ /^cpu[0-9]+$/) before[$1] = $2 + $4; next } $1 ~ /^cpu[0-9]+$/ { cpu = substr($1, 4) + 0; if (cpu > 0 && cpu < limit) printf "%d:%d:%d\n", cpu, before[$1], $2 + $4 }'\'' "$before" /proc/stat; rm -f "$before"' 30000)
+  ap_output=$(json_field stdout <<<"$ap_jiffies")
+  ap_seen=0
+  while IFS=: read -r ap_cpu ap_before ap_after; do
+    [[ "$ap_cpu" =~ ^[1-9][0-9]*$ && "$ap_before" =~ ^[0-9]+$ && "$ap_after" =~ ^[0-9]+$ ]]
+    echo "restore-e2e: $label AP cpu$ap_cpu jiffies $ap_before -> $ap_after"
+    ((ap_after > ap_before))
+    ((ap_seen += 1))
+  done <<<"$ap_output"
+  ((ap_seen == VCPUS - 1))
+}
+
 rm -f -- "$SOCKET" "$LOG"
 cp --reflink=auto --sparse=always -- "$ROOTFS" "$TEST_ROOTFS"
 chmod 0600 "$TEST_ROOTFS"
@@ -129,7 +158,8 @@ umount "$ROOTFS_MOUNT"
 ROOTFS_MOUNT=
 e2fsck -pf "$TEST_ROOTFS" >/dev/null
 echo "restore-e2e: candidate guest agent sha256=$(sha256sum "$GUEST_AGENT_BIN" | awk '{print $1}')"
-"$VMM_BIN" --socket "$SOCKET" serve >"$LOG" 2>&1 &
+TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE="$FAIL_PHASE" \
+  "$VMM_BIN" --socket "$SOCKET" serve >"$LOG" 2>&1 &
 SERVE_PID=$!
 for _ in $(seq 1 100); do
   [[ -S "$SOCKET" ]] && break
@@ -143,6 +173,44 @@ CMDLINE='console=tty0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on n
 wait_for_exec
 guest_exec "set -eu; test \"\$(nproc)\" -eq $VCPUS; printf strict-restore-proof >/root/strict-restore-proof; sync; test ! -e /dev/kvm; ! grep -Eq \"(^|[[:space:]])(vmx|svm)([[:space:]]|$)\" /proc/cpuinfo" >/dev/null
 
+if [[ "$LIVE_SNAPSHOT" == 1 ]]; then
+  "$VMM_BIN" --socket "$SOCKET" pause >/dev/null
+  if "$VMM_BIN" --socket "$SOCKET" snapshot --live >"$PAUSED_LIVE_ERROR" 2>&1; then
+    echo "live snapshot unexpectedly accepted an already-paused VM" >&2
+    exit 1
+  fi
+  grep -Fq 'live snapshot requires a running VM' "$PAUSED_LIVE_ERROR"
+  status_json=$("$VMM_BIN" --socket "$SOCKET" status)
+  status_state=$(json_field state <<<"$status_json")
+  [[ "${status_state,,}" == paused ]]
+  "$VMM_BIN" --socket "$SOCKET" resume >/dev/null
+  wait_for_exec
+  guest_exec 'grep -qx strict-restore-proof /root/strict-restore-proof' >/dev/null
+fi
+
+if [[ -n "$FAIL_PHASE" ]]; then
+  if timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" snapshot --live \
+    >"$SNAPSHOT_FAILURE" 2>&1; then
+    echo "injected live snapshot failure unexpectedly succeeded" >&2
+    exit 1
+  fi
+  grep -Fq "injected live snapshot failure at $FAIL_PHASE" "$SNAPSHOT_FAILURE"
+  guest_exec 'set -eu; grep -qx strict-restore-proof /root/strict-restore-proof; test ! -e /dev/kvm; ! grep -Eq "(^|[[:space:]])(vmx|svm)([[:space:]]|$)" /proc/cpuinfo' >/dev/null
+  verify_ap_progress source-after-failure
+  status_json=$("$VMM_BIN" --socket "$SOCKET" status)
+  status_state=$(json_field state <<<"$status_json")
+  [[ "${status_state,,}" == running ]]
+  runtime_dir="${SOCKET_ROOT%/}/.vmm-runtime/vmm-$SERVE_PID"
+  if [[ -d "$runtime_dir" ]] && \
+    find "$runtime_dir" -maxdepth 1 -type f -name '*live*' -print -quit | grep -q .; then
+    echo "failed live snapshot leaked a staged artifact" >&2
+    exit 1
+  fi
+  "$VMM_BIN" --socket "$SOCKET" stop >/dev/null
+  echo "LIVE_SMP_FAILPOINT_E2E_PASS phase=$FAIL_PHASE source_resumed=yes artifacts=clean nested_virtualization=hidden vcpus=$VCPUS"
+  exit 0
+fi
+
 snapshot_args=(snapshot)
 if [[ "$LIVE_SNAPSHOT" == 1 ]]; then
   snapshot_args+=(--live)
@@ -154,6 +222,8 @@ OVERLAY=$(json_field overlay_path <<<"$snapshot_json")
 [[ -s "$SNAPSHOT" ]]
 [[ -z "$INTEGRITY" || -s "$INTEGRITY" ]]
 [[ -z "$OVERLAY" || -s "$OVERLAY" ]]
+guest_exec 'set -eu; grep -qx strict-restore-proof /root/strict-restore-proof' >/dev/null
+verify_ap_progress source
 cp --reflink=auto --sparse=always -- "$SNAPSHOT" "$CORRUPT"
 
 # Preserve the VMSN envelope and memory image while replacing only the state
@@ -209,17 +279,7 @@ timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
 wait_for_exec
 proof=$(guest_exec 'set -eu; cat /root/strict-restore-proof; test ! -e /dev/kvm; ! grep -Eq "(^|[[:space:]])(vmx|svm)([[:space:]]|$)" /proc/cpuinfo')
 grep -q strict-restore-proof <<<"$proof"
-if (( VCPUS > 1 )); then
-  # Expansion is intentionally performed by the guest shell.
-  # shellcheck disable=SC2016
-  ap_jiffies=$(guest_exec 'set -eu; before=$(awk '\''/^cpu1 / { print $2 + $4 }'\'' /proc/stat); worker=0; while test "$worker" -lt 4; do (i=0; while test "$i" -lt 2000; do sha256sum /usr/sbin/vmm-agent >/dev/null; i=$((i + 1)); done) & worker=$((worker + 1)); done; wait; after=$(awk '\''/^cpu1 / { print $2 + $4 }'\'' /proc/stat); printf "%s:%s" "$before" "$after"' 30000)
-  ap_delta=$(json_field stdout <<<"$ap_jiffies")
-  ap_before=${ap_delta%%:*}
-  ap_after=${ap_delta##*:}
-  [[ "$ap_before" =~ ^[0-9]+$ && "$ap_after" =~ ^[0-9]+$ ]]
-  echo "restore-e2e: AP cpu1 jiffies $ap_before -> $ap_after"
-  (( ap_after > ap_before ))
-fi
+verify_ap_progress restored
 "$VMM_BIN" --socket "$SOCKET" stop >/dev/null
 
 if grep -Eiq 'panicked at|thread .* panicked|kernel panic|BUG: unable to handle' "$LOG"; then

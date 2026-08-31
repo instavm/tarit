@@ -12,6 +12,8 @@ versions may contain breaking changes.
 
 ### Changed
 
+- Live snapshots now pause, capture, and resume every configured vCPU through
+  one bounded barrier; live fork supports SMP guests instead of rejecting them.
 - Hibernated exec, PTY, SSH, and public-share requests now join the same
   registered activation instead of competing for or replacing its boot
   reservation.
@@ -25,6 +27,9 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Failed all-vCPU live snapshot transitions resume the source and discard
+  staging state; a live request against an already-paused VM fails without
+  changing its state.
 - Live snapshot capture and restore now reject malformed or incomplete runtime
   state instead of publishing a paused, partially restored VM.
 - Restored x86 vCPUs apply LAPIC state before MSRs so TSC-deadline timers resume

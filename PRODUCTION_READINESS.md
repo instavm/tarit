@@ -50,8 +50,10 @@ its scope.
   guest realtime from a host timestamp before admitting workload traffic.
 - Live fork takes one memory, device, and disk boundary, publishes authenticated
   artifacts, and restores each child with independent lazy RAM and a private
-  disk overlay. VMGenID notification on supported kernels is paired with a
-  mandatory userspace repair barrier; older kernels use the barrier-only path.
+  disk overlay. Every configured vCPU is armed before any pause acknowledgement
+  is awaited, and publication requires fresh state from each vCPU. VMGenID
+  notification on supported kernels is paired with a mandatory userspace repair
+  barrier; older kernels use the barrier-only path.
 - Provider-neutral local and NFS-backed raw block volumes are generation-fenced,
   tenant-scoped, and ordered with hibernate, resume, recovery, and deletion.
 - Snapshot files are opened without following symlinks and validated before
@@ -110,8 +112,6 @@ regression gates, but the following unresolved items now block release:
 2. Pass the remaining phase-by-phase kill, cancellation, dirty-rate
    non-convergence, corruption, and near-ENOSPC rollback tests without source
    pause leaks, duplicate writers, terminal-ID resurrection, or staged files.
-   Live snapshots with more than one vCPU are currently rejected; implement and
-   qualify an atomic all-vCPU live cut before advertising live SMP fork.
    Unexpected UFFD handler exit, descriptor loss, UNMAP, and REMAP now fail the
    VMM closed and preserve retryable hibernated state. The fixed vCPU MSR
    omission is repaired, but the dynamic KVM custom-MSR set still needs the

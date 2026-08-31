@@ -957,17 +957,23 @@ passing focused gate does not waive an item in the final column.
   space returned to 8,313,483,264 bytes after every round. This is bounded soak
   evidence, not yet the required long-duration or destructive chaos campaign.
 - A continuous c8i lifecycle service now keeps three OCI-derived guests active
-  for 30-minute epochs and rotates Ubuntu 24.04 and Alpine 3.20 across Linux
-  6.6.155 and 5.10.230. Each epoch performs guest writes, live forks,
+  for six-hour epochs and rotates Ubuntu 24.04 and Alpine 3.20 across Linux
+  6.6.155 and 5.10.230. The anchors use one, two, and four vCPUs so the same
+  workload continuously covers uniprocessor and SMP lifecycle paths. Each epoch
+  performs guest writes, live forks,
   snapshot/restore, hibernate with concurrent wake requests, pause/resume, and
   balloon changes while reconciling API, database, process, jail, clone-ID,
-  cached-session, and nested-virtualization invariants. It retains one snapshot,
+  cached-session, and nested-virtualization invariants. It retains up to six snapshots,
   enforces a 3 GiB free-space floor both before and during each epoch, records
   JSONL history for 14 days, and stops on the first failure so evidence is not
   overwritten. Failure handling archives the database and service log, removes
   the multi-gigabyte runtime tree, and trims the CoW filesystem. The supervisor
   owns each epoch's process group, forwards shutdown to that group, waits for
   cleanup, and gives the process tree 90 seconds before forced termination. Before
+  enabling the SMP profile, a 60-second Ubuntu/Linux 6.6 acceptance run completed
+  136 API operations against simultaneous one-, two-, and four-vCPU anchors. It
+  covered five live forks, two snapshot/restores, three hibernate/wake cycles,
+  pause/resume, ballooning, and guest mutation without an invariant failure. Before
   installation, Alpine/Linux 5.10 runs passed 225 and 278 API operations with
   three guests older than 120 seconds, and Ubuntu/Linux 6.6 runs passed 261 and
   217 operations with three guests older than 122 seconds. Earlier qualification
@@ -1068,12 +1074,18 @@ passing focused gate does not waive an item in the final column.
   incomplete BSP, AP, VM, block, net, vsock, or balloon state. A c8i gate
   corrupted the serialized state while retaining a valid outer checksum,
   required rejection before VM publication, and then restored the untouched
-  snapshot lazily. One-vCPU live snapshots passed on Ubuntu 24.04/Linux 6.6 and
-  Alpine 3.20/Linux 5.10. A separate paused two-vCPU restore gate found that
-  applying MSRs before LAPIC state could leave the secondary CPU's
-  TSC-deadline timer stalled; restoring LAPIC before MSRs fixed it, with CPU1
-  jiffies advancing from 6 to 676 on Ubuntu and from 6 to 1,539 on Alpine.
-  Live snapshots with more than one vCPU are still rejected and remain open.
+  snapshot lazily. A paused two-vCPU restore gate found that applying MSRs
+  before LAPIC state could leave the secondary CPU's TSC-deadline timer
+  stalled; restoring LAPIC before MSRs fixed it. The live path now clears old
+  captures, arms every vCPU before waiting, requires fresh state from every
+  thread, and bounds pause and resume. Two-vCPU live snapshots passed all four
+  Ubuntu/Alpine and Linux 6.6/5.10 combinations. Four-vCPU gates on Ubuntu/6.6
+  and Alpine/5.10 required every AP to make progress in both the resumed source
+  and lazy-restored child; Ubuntu/6.6 also passed with the configured maximum
+  of eight vCPUs. Five injected failure phases on Ubuntu/6.6, plus final-pause
+  and state-capture failures on Alpine/5.10, resumed every source vCPU and
+  removed all staged live-snapshot files. An already-paused VM rejects a live
+  request without changing its state.
 - The current c8i storage audit does not show the assumed 200 GiB device. It
   exposes one 50 GiB EBS NVMe disk with a 49 GiB root partition and no second
   NVMe block device; `/t` is a 12 GiB Btrfs loop image backed by

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 class Anchor:
     proof: str
     created_at: float
+    vcpus: int
     operations: int = 0
 
 
@@ -100,14 +101,17 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
 
     def create_anchor(self, index: int) -> str:
         proof = f"anchor-{self.args.seed}-{index}-{uuid.uuid4().hex[:12]}"
+        vcpus = self.args.anchor_vcpus[index % len(self.args.anchor_vcpus)]
         _, row = self.request(
-            "POST", "/v1/vms", {"vcpus": 1, "memory_mib": 256}, 201
+            "POST", "/v1/vms", {"vcpus": vcpus, "memory_mib": 256}, 201
         )
         vm_id = row["id"]
         assert row["status"] == "running", row
         self.install_workload(vm_id, proof)
-        self.anchors[vm_id] = Anchor(proof=proof, created_at=time.monotonic())
-        self.event("anchor_created", vm_id=vm_id, proof=proof)
+        self.anchors[vm_id] = Anchor(
+            proof=proof, created_at=time.monotonic(), vcpus=vcpus
+        )
+        self.event("anchor_created", vm_id=vm_id, proof=proof, vcpus=vcpus)
         return vm_id
 
     def assert_anchor(self, vm_id: str) -> None:
@@ -554,6 +558,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-seconds", type=int, default=1800)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--anchors", type=int, default=3)
+    parser.add_argument("--anchor-vcpus", default="1,2,4")
     parser.add_argument("--hibernate-hold-seconds", type=int, default=0)
     parser.add_argument("--guest-timer-seconds", type=int, default=5)
     parser.add_argument("--sibling-fork-timer-seconds", type=int, default=0)
@@ -561,6 +566,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-free-bytes", type=int, default=0)
     args = parser.parse_args()
     args.seed = int(args.seeds.split(",", 1)[0])
+    try:
+        args.anchor_vcpus = [int(value) for value in args.anchor_vcpus.split(",")]
+    except ValueError:
+        parser.error("anchor vCPU counts must be comma-separated integers")
+    if not args.anchor_vcpus or any(value < 1 or value > 8 for value in args.anchor_vcpus):
+        parser.error("anchor vCPU counts must be between one and eight")
     if args.duration_seconds < 60 or args.anchors < 2 or args.anchors > args.max_vms - 2:
         parser.error("duration must be at least 60 seconds and anchors must leave two transient slots")
     if args.min_free_bytes < 0 or (args.min_free_bytes and not args.storage_path):

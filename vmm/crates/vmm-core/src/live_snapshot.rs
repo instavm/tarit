@@ -1,11 +1,11 @@
 //! Live snapshot executor — wires the pre-copy convergence algorithm
-//! to real KVM dirty-log, running while the vCPU keeps executing.
+//! to real KVM dirty-log, running while the vCPUs keep executing.
 //!
 //! Design: while the guest runs, copy memory pages out to the snapshot
 //! buffer. Re-read the dirty set, copy only newly-dirtied pages; repeat.
 //! When the remaining dirty set is small enough that it can be copied
 //! within the target downtime, do a brief final stop that copies only the
-//! residual pages and captures vCPU + device state.
+//! residual pages and captures all-vCPU + device state.
 
 #![cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 
@@ -52,31 +52,52 @@ fn inject_live_snapshot_failure(_phase: &str) -> Result<()> {
 }
 
 struct VcpuPauseGuard<'a> {
-    vcpu_thread: &'a VcpuThread,
+    vcpu_threads: Vec<&'a VcpuThread>,
     armed: bool,
 }
 
 impl<'a> VcpuPauseGuard<'a> {
-    fn pause(vcpu_thread: &'a VcpuThread) -> Self {
-        vcpu_thread.pause();
-        Self {
-            vcpu_thread,
-            armed: true,
+    fn pause_all(vcpu_threads: &[&'a VcpuThread]) -> Result<Self> {
+        if vcpu_threads.is_empty() {
+            return Err(VmmError::Snapshot(
+                "live snapshot has no vCPU threads".into(),
+            ));
         }
+        let guard = Self {
+            vcpu_threads: vcpu_threads.to_vec(),
+            armed: true,
+        };
+        // Arm every vCPU before waiting for any acknowledgement. The guard is
+        // already active, so a partial request failure resumes every thread.
+        for vcpu_thread in &guard.vcpu_threads {
+            vcpu_thread.request_snapshot_pause()?;
+        }
+        for vcpu_thread in &guard.vcpu_threads {
+            vcpu_thread.wait_snapshot_paused()?;
+        }
+        Ok(guard)
     }
 
-    fn resume(mut self) {
+    fn resume(mut self) -> Result<()> {
         if self.armed {
-            self.vcpu_thread.resume();
+            for vcpu_thread in &self.vcpu_threads {
+                vcpu_thread.resume();
+            }
+            for vcpu_thread in &self.vcpu_threads {
+                vcpu_thread.wait_snapshot_resumed()?;
+            }
             self.armed = false;
         }
+        Ok(())
     }
 }
 
 impl Drop for VcpuPauseGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.vcpu_thread.resume();
+            for vcpu_thread in &self.vcpu_threads {
+                vcpu_thread.resume();
+            }
         }
     }
 }
@@ -344,11 +365,11 @@ fn dirty_rate_sample(bytes: u64, elapsed: Duration) -> u64 {
 /// Execute a live snapshot of a running VM.
 ///
 /// Flow:
-/// 1. Pause the vCPU, enable dirty logging, clear the baseline, resume.
-/// 2. Bulk round: copy all of guest RAM while the vCPU runs.
+/// 1. Pause every vCPU, enable dirty logging, clear the baseline, resume.
+/// 2. Bulk round: copy all of guest RAM while the vCPUs run.
 /// 3. Pre-copy rounds: read the dirty log, copy those pages, check convergence.
-/// 4. Final stop: quiesce device I/O threads, pause the vCPU, copy the residual
-///    dirty pages, capture vCPU + device state via `capture_state`, resume.
+/// 4. Final stop: quiesce device I/O threads, pause every vCPU, copy the
+///    residual dirty pages, capture all-vCPU + device state, resume.
 ///
 /// Dirty pages come from two sources, and both are consulted every round:
 /// KVM's dirty log (guest vCPU writes) and the software host-dirty tracker
@@ -357,15 +378,15 @@ fn dirty_rate_sample(bytes: u64, elapsed: Duration) -> u64 {
 ///
 /// `quiesce_io(true)` must park every non-vCPU thread that writes guest
 /// memory and only return once they have acknowledged; `quiesce_io(false)`
-/// releases them. It is engaged *before* the final vCPU pause — its
+/// releases them. It is engaged *before* the final all-vCPU pause — its
 /// handshake costs guest I/O stall, never guest downtime.
 ///
-/// `capture_state` runs while the vCPU is paused for the final stop, so the
+/// `capture_state` runs while every vCPU is paused for the final stop, so the
 /// state blob it returns is coherent with the memory image.
 pub fn live_snapshot<F>(
     kvm_vm: &KvmVm,
     mem: &GuestMemory,
-    vcpu_thread: &VcpuThread,
+    vcpu_threads: &[&VcpuThread],
     config: &LiveSnapshotConfig,
     memory_file: &File,
     quiesce_io: &dyn Fn(bool),
@@ -390,7 +411,7 @@ where
     let mut consumed_dirty = DirtyReplayGuard::new(mem);
     let baseline_pages;
     {
-        let pause_guard = VcpuPauseGuard::pause(vcpu_thread);
+        let pause_guard = VcpuPauseGuard::pause_all(vcpu_threads)?;
         // Draining the baseline is what makes the first real read meaningful.
         // These bits are still replayed to the host-dirty tracker: if dirty
         // logging was already on, they are pages the guest wrote since the
@@ -404,7 +425,7 @@ where
                 consumed_dirty.merge(&baseline);
             }
             Err(e) => {
-                pause_guard.resume();
+                pause_guard.resume()?;
                 return Err(e);
             }
         }
@@ -413,7 +434,7 @@ where
         // of the first round's residual. They still flow into `consumed_dirty`
         // so the controller replays them for later diff snapshots.
         consumed_dirty.merge(&mem.drain_host_dirty());
-        pause_guard.resume();
+        pause_guard.resume()?;
     }
     // The dirty set accumulates from here, so the first round's dirty rate must
     // be measured from here too — not from the end of the bulk copy, which would
@@ -421,7 +442,7 @@ where
     // overestimate the rate by an order of magnitude.
     let mut last_read = Instant::now();
     log::info!(
-        "live_snapshot: dirty logging active ({baseline_pages} baseline pages), vCPU resumed"
+        "live_snapshot: dirty logging active ({baseline_pages} baseline pages), all vCPUs resumed"
     );
     inject_live_snapshot_failure("dirty_logging")?;
 
@@ -572,19 +593,19 @@ where
     //   1. Quiesce the device I/O threads (net/vsock pumps) while the guest
     //      is still running — their ack handshake stalls guest I/O briefly
     //      but adds zero guest downtime.
-    //   2. Pause the vCPU. In-flight MMIO (including virtio-blk DMA, which
-    //      runs on the vCPU thread) completes before the pause is acked, so
+    //   2. Pause every vCPU. In-flight MMIO (including virtio-blk DMA, which
+    //      runs on a vCPU thread) completes before every pause is acked, so
     //      after this point nothing writes guest memory.
     //   3. Inside the pause do only O(residual) work: read both dirty
     //      sources, copy the residual pages, capture state.
     //
-    // On any error below, the guards resume the vCPU and I/O threads as they
+    // On any error below, the guards resume all vCPUs and I/O threads as they
     // drop. Downtime is measured across the whole pause — including the
     // pause/resume handshakes — because that is the blackout the guest sees.
-    log::info!("live_snapshot: final stop — quiescing I/O, pausing vCPU");
+    log::info!("live_snapshot: final stop — quiescing I/O, pausing all vCPUs");
     let io_guard = IoQuiesceGuard::engage(quiesce_io);
     let final_stop_start = Instant::now();
-    let final_pause_guard = VcpuPauseGuard::pause(vcpu_thread);
+    let final_pause_guard = VcpuPauseGuard::pause_all(vcpu_threads)?;
     inject_live_snapshot_failure("final_pause")?;
 
     let mut final_dirty = kvm_vm.read_dirty()?;
@@ -600,16 +621,15 @@ where
     });
     total_pages_copied += copy_dirty_pages(mem, memory_file, &final_dirty)?;
     drop(_final_read_guard);
-    // The vCPU is paused, so the registers and device state captured here are
+    // Every vCPU is paused, so the registers and device state captured here are
     // coherent with the memory image assembled above.
     let state_blob = capture_state()?;
     inject_live_snapshot_failure("state_capture")?;
 
-    final_pause_guard.resume();
-    // `resume()` only requests the resume; wait for the vCPU to actually
-    // leave its park before stopping the clock so the reported downtime is
-    // the blackout the guest really saw.
-    vcpu_thread.wait_resumed();
+    // Resume requests are issued to every vCPU before waiting for any one of
+    // them. The guard then observes every thread leave its park, so downtime
+    // covers the complete all-vCPU blackout.
+    final_pause_guard.resume()?;
     let downtime = final_stop_start.elapsed();
     io_guard.disengage();
     // Final residual pages entered the page cache during blackout, but durable

@@ -89,10 +89,12 @@ while :; do
     TARIT_TEST_CLONE_WORKLOAD_BIN="$WORKLOAD_BIN" \
     TARIT_TEST_GUEST_AGENT_BIN="$GUEST_AGENT" \
     TARIT_LIFECYCLE_DRIVER="$DRIVER" \
-    TARIT_LIFECYCLE_DRIVER_ARGS="--duration-seconds $EPOCH_SECONDS --interval-seconds 1 --anchors 3 --hibernate-hold-seconds 65 --guest-timer-seconds 5 --sibling-fork-timer-seconds 45 --storage-path $SOCKET_ROOT --min-free-bytes $MIN_FREE_BYTES" \
+    TARIT_LIFECYCLE_DRIVER_ARGS="--duration-seconds $EPOCH_SECONDS --interval-seconds 1 --anchors 3 --anchor-vcpus 1,2,4 --hibernate-hold-seconds 65 --guest-timer-seconds 5 --sibling-fork-timer-seconds 45 --storage-path $SOCKET_ROOT --min-free-bytes $MIN_FREE_BYTES" \
     TARIT_LIFECYCLE_SEEDS="$seed" \
     TARIT_LIFECYCLE_MAX_VMS=6 \
-    TARIT_LIFECYCLE_MAX_SNAPSHOTS=1 \
+    TARIT_LIFECYCLE_MAX_VCPUS=12 \
+    TARIT_LIFECYCLE_MAX_MEMORY_MIB=2048 \
+    TARIT_LIFECYCLE_MAX_SNAPSHOTS=6 \
     TARIT_E2E_KEEP_FAILED=0 \
     TARIT_E2E_FAILURE_ARCHIVE_ROOT="$RUN_ROOT/failures" \
     "$STATE_GATE" >"$log" 2>&1 &
