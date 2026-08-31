@@ -149,8 +149,13 @@ cleanup() {
       umount -l -- "$mounted_target" 2>/dev/null || status=1
   done < <(findmnt -rn -t nfs4 -o TARGET || true)
   if [ "$B_STORAGE_MOUNTED" -eq 1 ]; then
-    umount -- "$DIR/node-b" 2>/dev/null || status=1
-    B_STORAGE_MOUNTED=0
+    if timeout --signal=TERM --kill-after=2s 10s \
+      umount -- "$DIR/node-b" 2>/dev/null || \
+      umount -l -- "$DIR/node-b" 2>/dev/null; then
+      B_STORAGE_MOUNTED=0
+    else
+      status=1
+    fi
   fi
   if [ -n "$B_STORAGE_LOOP" ]; then
     detach_loop_device "$B_STORAGE_LOOP" || status=1
