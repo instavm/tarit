@@ -945,8 +945,19 @@ passing focused gate does not waive an item in the final column.
   `76fef90dd6037b4e7c05f14458e1e5520e5216fcf8d3e40a1b674a84fa158777`;
   the VMM SHA-256 was
   `a13f8d7e70112739a610432bb73ef3cd69eb2e5113ba6ec36b87b179bbd96528`.
-  Physical multi-host failure and additional transfer/publication phase
-  injection remain open.
+  Cross-node retry now reuses a private fork artifact whose durable ID is the
+  requested child ID. The target records the daemon boot session entitled to
+  prepare that child: a restarted target may reclaim its existing reservation,
+  a duplicate request in the same session remains fenced, and another host may
+  not take over the operation. Snapshot ownership binding is idempotent only
+  for the same child. The c8i gate killed node B after claim, source snapshot,
+  target localization, ownership bind, child publication, and operation commit.
+  All six boundaries passed the complete PostgreSQL, mTLS, Ubuntu 24.04 OCI,
+  artifact-integrity, scale-to-zero, stale-owner recovery, NFS-backed volume,
+  replica-repair, and physical-GC suite on Linux 6.6.155 and 5.10.230. The first
+  ownership-bind run exposed and fixed non-idempotent same-child rebinding; the
+  complete matrix was rerun after the fix. Physical multi-host failure remains
+  open.
 - A bounded mixed-OCI soak gate now runs isolated longer state-machine rounds
   across explicit kernel/rootfs cases, rotates deterministic seeds, retains the
   exact failing log, rejects leaked candidate VMM/taritd processes or lifecycle
@@ -1029,6 +1040,16 @@ passing focused gate does not waive an item in the final column.
   repeated fork/delete, snapshot/restore, hibernate/resume, pause/resume,
   ballooning, clone-identity repair, and timer compatibility, with the same
   row-to-file invariant enforced.
+  Each epoch now guarantees an initial live fork, snapshot/restore, and
+  concurrent work burst across all three anchors before entering randomized
+  transitions. Status and terminal records report per-action counts and p50,
+  p95, p99, and maximum latency; once the retained-snapshot cap is reached the
+  driver no longer mislabels health checks as snapshots. Focused c8i runs of
+  this measured workload passed 1,010 API operations, 20 live forks, and eight
+  snapshot/restores across Ubuntu 24.04 and Alpine 3.20 on both Linux 6.6.155
+  and 5.10.230. The first run found an unavailable optional BusyBox applet in
+  the minimal Ubuntu image; the workload now uses the common minimal-image
+  command set and the complete four-case matrix passes.
   The three-node PostgreSQL/mTLS gate also binds a localized cross-node fork
   artifact to its target child. Deleting that child converged the global
   artifact and fleet-snapshot rows, source and target metadata, and both

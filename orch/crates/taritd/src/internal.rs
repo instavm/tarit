@@ -116,6 +116,8 @@ pub struct InternalExecBody {
 pub struct InternalSnapshotBody {
     #[serde(default)]
     pub diff: bool,
+    #[serde(default)]
+    pub fork_child_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -1039,7 +1041,17 @@ async fn internal_snapshot(
     Json(body): Json<InternalSnapshotBody>,
 ) -> Result<Json<SnapshotResponse>, ApiError> {
     enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
-    let path = ops::snapshot_local(&state, id, body.diff).await?;
+    let path = if let Some(child_id) = body.fork_child_id {
+        if body.diff {
+            return Err(tarit_types::OrchError::Unprocessable(
+                "fork snapshots must be full snapshots".into(),
+            )
+            .into());
+        }
+        ops::snapshot_local_for_fork(&state, id, child_id).await?
+    } else {
+        ops::snapshot_local(&state, id, body.diff).await?
+    };
     let snapshot = state
         .store
         .lock()

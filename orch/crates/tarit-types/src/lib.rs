@@ -499,6 +499,10 @@ pub struct ForkOperationRecord {
     pub owner_key: String,
     pub source_host_id: String,
     pub target_host_id: String,
+    /// Boot session currently entitled to prepare this child. A later target
+    /// session may take over an interrupted operation; concurrent requests in
+    /// the same session remain fenced by the live reservation.
+    pub target_boot_session_id: Option<Uuid>,
     pub status: ForkOperationStatus,
     pub child_created_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,

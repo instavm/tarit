@@ -131,6 +131,7 @@ impl PostgresFleet {
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS startup_path TEXT;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS rootfs_read_only BOOLEAN NOT NULL DEFAULT FALSE;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
+             ALTER TABLE fleet_vm_fork_operations ADD COLUMN IF NOT EXISTS target_boot_session_id UUID;
              CREATE INDEX IF NOT EXISTS fleet_vms_owner_status ON fleet_vms (owner_key, status);
              CREATE TABLE IF NOT EXISTS fleet_schema_migrations (
                version BIGINT PRIMARY KEY,
@@ -2242,18 +2243,19 @@ impl PostgresFleet {
 
         let existing = tx
             .query_opt(
-                "SELECT source_vm_id, owner_key, source_host_id, target_host_id, status,
-                        child_created_at, created_at, updated_at
+                "SELECT source_vm_id, owner_key, source_host_id, target_host_id,
+                        target_boot_session_id, status, child_created_at, created_at, updated_at
                  FROM fleet_vm_fork_operations WHERE child_vm_id = $1",
                 &[&operation.child_vm_id],
             )
             .await?;
-        let outcome = if let Some(row) = existing {
+        let outcome = if let Some(row) = existing.as_ref() {
             let source_vm_id: Uuid = row.get(0);
             let owner_key: String = row.get(1);
             let source_host_id: String = row.get(2);
             let target_host_id: String = row.get(3);
-            let status: String = row.get(4);
+            let target_boot_session_id: Option<Uuid> = row.get(4);
+            let status: String = row.get(5);
             if source_vm_id != operation.source_vm_id
                 || owner_key != operation.owner_key
                 || source_host_id != operation.source_host_id
@@ -2269,7 +2271,22 @@ impl PostgresFleet {
                     tx.commit().await?;
                     return Ok(ForkOperationClaimOutcome::Committed);
                 }
-                Some(ForkOperationStatus::Preparing) => ForkOperationClaimOutcome::Resumed,
+                Some(ForkOperationStatus::Preparing) => {
+                    if target_boot_session_id != operation.target_boot_session_id {
+                        tx.execute(
+                            "UPDATE fleet_vm_fork_operations
+                             SET target_boot_session_id = $2, updated_at = $3
+                             WHERE child_vm_id = $1 AND status = 'preparing'",
+                            &[
+                                &operation.child_vm_id,
+                                &operation.target_boot_session_id,
+                                &operation.updated_at,
+                            ],
+                        )
+                        .await?;
+                    }
+                    ForkOperationClaimOutcome::Resumed
+                }
                 None => {
                     return Err(FleetError::Conflict(format!(
                         "fork child {} has invalid durable status {status}",
@@ -2294,14 +2311,15 @@ impl PostgresFleet {
             tx.execute(
                 "INSERT INTO fleet_vm_fork_operations (
                    child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
-                   status, child_created_at, created_at, updated_at
-                 ) VALUES ($1,$2,$3,$4,$5,'preparing',NULL,$6,$7)",
+                   target_boot_session_id, status, child_created_at, created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,'preparing',NULL,$7,$8)",
                 &[
                     &operation.child_vm_id,
                     &operation.source_vm_id,
                     &operation.owner_key,
                     &operation.source_host_id,
                     &operation.target_host_id,
+                    &operation.target_boot_session_id,
                     &operation.created_at,
                     &operation.updated_at,
                 ],
@@ -2310,6 +2328,10 @@ impl PostgresFleet {
             ForkOperationClaimOutcome::New
         };
 
+        let resumed_after_restart = existing
+            .as_ref()
+            .map(|row| row.get::<_, Option<Uuid>>(4) != operation.target_boot_session_id)
+            .unwrap_or(false);
         if let Some(row) = tx
             .query_opt(
                 "SELECT owner_key FROM tenant_vm_reservations WHERE id = $1",
@@ -2324,7 +2346,7 @@ impl PostgresFleet {
                     operation.child_vm_id
                 )));
             }
-            if outcome == ForkOperationClaimOutcome::Resumed {
+            if outcome == ForkOperationClaimOutcome::Resumed && !resumed_after_restart {
                 tx.commit().await?;
                 return Ok(ForkOperationClaimOutcome::InProgress);
             }
@@ -2377,8 +2399,8 @@ impl PostgresFleet {
         let client = self.pool.get().await?;
         let Some(row) = client
             .query_opt(
-                "SELECT source_vm_id, owner_key, source_host_id, target_host_id, status,
-                        child_created_at, created_at, updated_at
+                "SELECT source_vm_id, owner_key, source_host_id, target_host_id,
+                        target_boot_session_id, status, child_created_at, created_at, updated_at
                  FROM fleet_vm_fork_operations WHERE child_vm_id = $1",
                 &[&child_vm_id],
             )
@@ -2386,7 +2408,7 @@ impl PostgresFleet {
         else {
             return Ok(None);
         };
-        let status: String = row.get(4);
+        let status: String = row.get(5);
         let status = ForkOperationStatus::parse(&status).ok_or_else(|| {
             FleetError::Conflict(format!(
                 "fork child {child_vm_id} has invalid durable status {status}"
@@ -2398,10 +2420,11 @@ impl PostgresFleet {
             owner_key: row.get(1),
             source_host_id: row.get(2),
             target_host_id: row.get(3),
+            target_boot_session_id: row.get(4),
             status,
-            child_created_at: row.get(5),
-            created_at: row.get(6),
-            updated_at: row.get(7),
+            child_created_at: row.get(6),
+            created_at: row.get(7),
+            updated_at: row.get(8),
         }))
     }
 
@@ -2975,6 +2998,7 @@ CREATE TABLE IF NOT EXISTS fleet_vm_fork_operations (
   owner_key TEXT NOT NULL,
   source_host_id TEXT NOT NULL,
   target_host_id TEXT NOT NULL,
+  target_boot_session_id UUID,
   status TEXT NOT NULL CHECK (status IN ('preparing','committed')),
   child_created_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL,
@@ -3824,6 +3848,7 @@ mod tests {
             owner_key: format!("fork-owner-{}", Uuid::new_v4()),
             source_host_id: "source-host".into(),
             target_host_id: "target-host".into(),
+            target_boot_session_id: Some(Uuid::new_v4()),
             status: ForkOperationStatus::Preparing,
             child_created_at: None,
             created_at: now,
@@ -3838,6 +3863,31 @@ mod tests {
             assert_eq!(
                 fleet.claim_fork_operation(&operation, 2, expiry).await?,
                 ForkOperationClaimOutcome::InProgress
+            );
+            let restarted_operation = ForkOperationRecord {
+                target_boot_session_id: Some(Uuid::new_v4()),
+                updated_at: now + chrono::Duration::seconds(1),
+                ..operation.clone()
+            };
+            assert_eq!(
+                fleet
+                    .claim_fork_operation(&restarted_operation, 2, expiry)
+                    .await?,
+                ForkOperationClaimOutcome::Resumed
+            );
+            assert_eq!(
+                fleet
+                    .claim_fork_operation(&restarted_operation, 2, expiry)
+                    .await?,
+                ForkOperationClaimOutcome::InProgress
+            );
+            assert_eq!(
+                fleet
+                    .get_fork_operation(operation.child_vm_id)
+                    .await?
+                    .expect("fork operation")
+                    .target_boot_session_id,
+                restarted_operation.target_boot_session_id
             );
             let wrong_source = ForkOperationRecord {
                 source_vm_id: Uuid::new_v4(),

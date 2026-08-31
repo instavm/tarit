@@ -2088,7 +2088,7 @@ pub async fn hibernate_local(
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
-    let snapshot_path = snapshot_local_locked(state, id, false, Some(id)).await?;
+    let snapshot_path = snapshot_local_locked(state, id, false, Some(id), None).await?;
     let snapshot =
         verify_snapshot_access(state, &snapshot_path, current.owner_key.as_deref(), false)?;
     let owner_key = current.owner_key.as_ref().ok_or_else(|| {
@@ -2627,7 +2627,7 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     )?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
-    snapshot_local_locked(state, id, diff, None).await
+    snapshot_local_locked(state, id, diff, None, None).await
 }
 
 /// Create the private snapshot that backs one local live-fork attempt. Its
@@ -2638,10 +2638,24 @@ pub async fn snapshot_local_for_fork(
     source_id: Uuid,
     child_id: Uuid,
 ) -> Result<String, OrchError> {
+    if let Some(existing) = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .get_snapshot_by_id(child_id)
+        .map_err(crate::api::store_err)?
+    {
+        if existing.vm_id != source_id || existing.ephemeral_owner_vm_id != Some(child_id) {
+            return Err(OrchError::Conflict(format!(
+                "fork artifact {child_id} is already bound to another operation"
+            )));
+        }
+        return Ok(existing.path);
+    }
     ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
     let gate = state.supervisor.operation_gate(source_id)?;
     let _operation = gate.lock_owned().await;
-    snapshot_local_locked(state, source_id, false, Some(child_id)).await
+    snapshot_local_locked(state, source_id, false, Some(child_id), Some(child_id)).await
 }
 
 pub fn bind_localized_snapshot_to_fork(
@@ -2664,6 +2678,7 @@ async fn snapshot_local_locked(
     id: Uuid,
     diff: bool,
     ephemeral_owner_vm_id: Option<Uuid>,
+    snapshot_id: Option<Uuid>,
 ) -> Result<String, OrchError> {
     let vm = ensure_vm_status(
         state,
@@ -2758,7 +2773,7 @@ async fn snapshot_local_locked(
     // record cannot be written, so we never create a snapshot that only an
     // admin could restore.
     let record = tarit_store::SnapshotRecord {
-        snapshot_id: Uuid::new_v4(),
+        snapshot_id: snapshot_id.unwrap_or_else(Uuid::new_v4),
         path: bundle.snapshot_path().to_string(),
         overlay_path: bundle.overlay_path().map(str::to_string),
         host_id: state.config.host_id.clone(),

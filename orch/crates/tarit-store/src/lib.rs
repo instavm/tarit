@@ -197,6 +197,7 @@ impl Store {
                owner_key TEXT NOT NULL,
                source_host_id TEXT NOT NULL,
                target_host_id TEXT NOT NULL,
+               target_boot_session_id TEXT,
                status TEXT NOT NULL CHECK (status IN ('preparing','committed')),
                child_created_at TEXT,
                created_at TEXT NOT NULL,
@@ -460,6 +461,12 @@ impl Store {
         ensure_column(&conn, "hosts", "peer_certificate_sha256", "TEXT")?;
         ensure_column(&conn, "snapshots", "size_bytes", "INTEGER")?;
         ensure_column(&conn, "snapshots", "ephemeral_owner_vm_id", "TEXT")?;
+        ensure_column(
+            &conn,
+            "vm_fork_operations",
+            "target_boot_session_id",
+            "TEXT",
+        )?;
         ensure_column(&conn, "images", "source_digest", "TEXT")?;
         ensure_column(&conn, "images", "rootfs_digest", "TEXT")?;
         ensure_column(&conn, "images", "agent_digest", "TEXT")?;
@@ -697,7 +704,8 @@ impl Store {
     pub fn bind_snapshot_ephemeral_owner(&self, path: &str, vm_id: Uuid) -> Result<(), StoreError> {
         let changed = self.conn.execute(
             "UPDATE snapshots SET ephemeral_owner_vm_id = ?2
-             WHERE path = ?1 AND ephemeral_owner_vm_id IS NULL",
+             WHERE path = ?1
+               AND (ephemeral_owner_vm_id IS NULL OR ephemeral_owner_vm_id = ?2)",
             params![path, vm_id.to_string()],
         )?;
         if changed != 1 {
@@ -1760,12 +1768,13 @@ impl Store {
         let existing = tx
             .query_row(
                 "SELECT child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
-                        status, child_created_at, created_at, updated_at
+                        target_boot_session_id, status, child_created_at, created_at, updated_at
                  FROM vm_fork_operations WHERE child_vm_id = ?1",
                 params![operation.child_vm_id.to_string()],
                 row_to_fork_operation,
             )
             .optional()?;
+        let mut resumed_after_restart = false;
         let outcome = if let Some(existing) = existing {
             if existing.source_vm_id != operation.source_vm_id
                 || existing.owner_key != operation.owner_key
@@ -1780,6 +1789,20 @@ impl Store {
             if existing.status == ForkOperationStatus::Committed {
                 tx.commit()?;
                 return Ok(ForkOperationClaimOutcome::Committed);
+            }
+            resumed_after_restart =
+                existing.target_boot_session_id != operation.target_boot_session_id;
+            if resumed_after_restart {
+                tx.execute(
+                    "UPDATE vm_fork_operations
+                     SET target_boot_session_id = ?2, updated_at = ?3
+                     WHERE child_vm_id = ?1 AND status = 'preparing'",
+                    params![
+                        operation.child_vm_id.to_string(),
+                        operation.target_boot_session_id.map(|id| id.to_string()),
+                        operation.updated_at.to_rfc3339(),
+                    ],
+                )?;
             }
             ForkOperationClaimOutcome::Resumed
         } else {
@@ -1797,14 +1820,15 @@ impl Store {
             tx.execute(
                 "INSERT INTO vm_fork_operations (
                    child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
-                   status, child_created_at, created_at, updated_at
-                 ) VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8)",
+                   target_boot_session_id, status, child_created_at, created_at, updated_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL,?8,?9)",
                 params![
                     operation.child_vm_id.to_string(),
                     operation.source_vm_id.to_string(),
                     operation.owner_key,
                     operation.source_host_id,
                     operation.target_host_id,
+                    operation.target_boot_session_id.map(|id| id.to_string()),
                     ForkOperationStatus::Preparing.as_str(),
                     operation.created_at.to_rfc3339(),
                     operation.updated_at.to_rfc3339(),
@@ -1828,7 +1852,7 @@ impl Store {
                 )));
             }
             Some(_) => {
-                if outcome == ForkOperationClaimOutcome::Resumed {
+                if outcome == ForkOperationClaimOutcome::Resumed && !resumed_after_restart {
                     tx.commit()?;
                     return Ok(ForkOperationClaimOutcome::InProgress);
                 }
@@ -1881,7 +1905,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT child_vm_id, source_vm_id, owner_key, source_host_id, target_host_id,
-                        status, child_created_at, created_at, updated_at
+                        target_boot_session_id, status, child_created_at, created_at, updated_at
                  FROM vm_fork_operations WHERE child_vm_id = ?1",
                 params![child_vm_id.to_string()],
                 row_to_fork_operation,
@@ -2864,13 +2888,14 @@ fn row_to_vm(row: &rusqlite::Row<'_>) -> Result<VmRecord, rusqlite::Error> {
 fn row_to_fork_operation(row: &rusqlite::Row<'_>) -> Result<ForkOperationRecord, rusqlite::Error> {
     let child_vm_id: String = row.get(0)?;
     let source_vm_id: String = row.get(1)?;
-    let status: String = row.get(5)?;
-    let child_created_at: Option<String> = row.get(6)?;
-    let created_at: String = row.get(7)?;
-    let updated_at: String = row.get(8)?;
+    let target_boot_session_id: Option<String> = row.get(5)?;
+    let status: String = row.get(6)?;
+    let child_created_at: Option<String> = row.get(7)?;
+    let created_at: String = row.get(8)?;
+    let updated_at: String = row.get(9)?;
     let status = ForkOperationStatus::parse(&status).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            5,
+            6,
             rusqlite::types::Type::Text,
             format!("invalid fork operation status {status}").into(),
         )
@@ -2881,6 +2906,10 @@ fn row_to_fork_operation(row: &rusqlite::Row<'_>) -> Result<ForkOperationRecord,
         owner_key: row.get(2)?,
         source_host_id: row.get(3)?,
         target_host_id: row.get(4)?,
+        target_boot_session_id: target_boot_session_id
+            .as_deref()
+            .map(|value| parse_uuid_col(value, 5))
+            .transpose()?,
         status,
         child_created_at: child_created_at.as_deref().map(parse_ts).transpose()?,
         created_at: parse_ts(&created_at)?,
@@ -3924,6 +3953,9 @@ mod tests {
         store
             .bind_snapshot_ephemeral_owner(&replaced.path, child_id)
             .unwrap();
+        store
+            .bind_snapshot_ephemeral_owner(&replaced.path, child_id)
+            .expect("replaying the same lifecycle owner is idempotent");
         assert_eq!(
             store
                 .get_snapshot(&replaced.path)
@@ -3991,6 +4023,7 @@ mod tests {
             owner_key: "tenant-a".into(),
             source_host_id: "host-a".into(),
             target_host_id: "host-b".into(),
+            target_boot_session_id: Some(Uuid::new_v4()),
             status: ForkOperationStatus::Preparing,
             child_created_at: None,
             created_at: now,
@@ -4005,6 +4038,32 @@ mod tests {
         assert_eq!(
             store.claim_fork_operation(&operation, 2, expiry).unwrap(),
             ForkOperationClaimOutcome::InProgress
+        );
+
+        let restarted_operation = ForkOperationRecord {
+            target_boot_session_id: Some(Uuid::new_v4()),
+            updated_at: now + chrono::Duration::seconds(1),
+            ..operation.clone()
+        };
+        assert_eq!(
+            store
+                .claim_fork_operation(&restarted_operation, 2, expiry)
+                .unwrap(),
+            ForkOperationClaimOutcome::Resumed
+        );
+        assert_eq!(
+            store
+                .claim_fork_operation(&restarted_operation, 2, expiry)
+                .unwrap(),
+            ForkOperationClaimOutcome::InProgress
+        );
+        assert_eq!(
+            store
+                .get_fork_operation(operation.child_vm_id)
+                .unwrap()
+                .unwrap()
+                .target_boot_session_id,
+            restarted_operation.target_boot_session_id
         );
 
         let wrong_source = ForkOperationRecord {

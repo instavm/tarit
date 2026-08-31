@@ -98,6 +98,8 @@ struct RemoteExecResponse {
 #[derive(Serialize)]
 struct RemoteSnapshotRequest {
     diff: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fork_child_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -958,9 +960,31 @@ impl PeerClient {
         self.post_json(
             target,
             &format!("/internal/v1/vms/{vm_id}/snapshot"),
-            &RemoteSnapshotRequest { diff },
+            &RemoteSnapshotRequest {
+                diff,
+                fork_child_id: None,
+            },
             Some(identity),
             "snapshot",
+        )
+    }
+
+    pub fn snapshot_remote_for_fork(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        child_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<tarit_types::SnapshotResponse, OrchError> {
+        self.post_json(
+            target,
+            &format!("/internal/v1/vms/{vm_id}/snapshot"),
+            &RemoteSnapshotRequest {
+                diff: false,
+                fork_child_id: Some(child_id),
+            },
+            Some(identity),
+            "fork snapshot",
         )
     }
 

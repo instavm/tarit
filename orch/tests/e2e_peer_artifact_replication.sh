@@ -34,9 +34,19 @@ C_PID=""
 SOURCE_VM=""
 RESTORED_VM=""
 CROSS_NODE_FORK_VM=""
+REQUESTED_CROSS_NODE_FORK_VM=""
 B_FORK_PAUSE_MS=0
+B_FORK_PAUSE_PHASE=""
 if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
   B_FORK_PAUSE_MS=30000
+  B_FORK_PAUSE_PHASE="${TARIT_TEST_CROSS_NODE_FORK_DEATH_PHASE:-after_child}"
+  case "$B_FORK_PAUSE_PHASE" in
+    after_claim|after_snapshot|after_localize|after_bind|after_child|after_commit) ;;
+    *)
+      echo "FAIL: unsupported cross-node fork death phase: $B_FORK_PAUSE_PHASE" >&2
+      exit 1
+      ;;
+  esac
 fi
 VOLUME_VM=""
 VOLUME_ID=""
@@ -79,6 +89,7 @@ cleanup() {
   for endpoint_and_vm in \
     "http://127.0.0.1:$B_CONTROL $VOLUME_VM" \
     "http://127.0.0.1:$B_CONTROL $CROSS_NODE_FORK_VM" \
+    "http://127.0.0.1:$B_CONTROL $REQUESTED_CROSS_NODE_FORK_VM" \
     "http://127.0.0.1:$B_CONTROL $RESTORED_VM" \
     "http://127.0.0.1:$A_CONTROL $SOURCE_VM"; do
     read -r endpoint vm_id <<<"$endpoint_and_vm"
@@ -183,6 +194,7 @@ start_node() {
   local name=$1 zone=$2 control=$3 peer=$4 log=$5
   local node_kernel=$KERNEL
   local fork_pause_ms=0
+  local fork_pause_phase=""
   # Peers deliberately start with a different readable kernel. Artifact
   # localization must fetch the authenticated source kernel rather than rely
   # on a shared host path or manual pre-provisioning.
@@ -191,6 +203,7 @@ start_node() {
   fi
   if [ "$name" = node-b ]; then
     fork_pause_ms=$B_FORK_PAUSE_MS
+    fork_pause_phase=$B_FORK_PAUSE_PHASE
   fi
   install -d -m 0700 "$DIR/$name/sockets" "$DIR/$name/images"
   install -d -m 0700 "$DIR/$name/nfs-mounts"
@@ -233,6 +246,8 @@ start_node() {
     TARIT_ARTIFACT_GC_INTERVAL_SECS=1 \
     TARIT_ARTIFACT_GC_MIN_AGE_SECS=1 \
     TARIT_REAP_ON_SHUTDOWN=false \
+    TARIT_TEST_FORK_PAUSE_PHASE="$fork_pause_phase" \
+    TARIT_TEST_FORK_PAUSE_MS="$fork_pause_ms" \
     TARIT_TEST_FORK_PAUSE_AFTER_CHILD_MS="$fork_pause_ms" \
     RUST_LOG=info \
     "$TARITD" serve >"$log" 2>&1 &
@@ -351,27 +366,39 @@ if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
   FIRST_FORK_CURL_PID=$!
   FORK_PAUSED=0
   for _ in $(seq 1 1800); do
-    operation_state=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
-      "select status from fleet_vm_fork_operations where child_vm_id='$REQUESTED_CROSS_NODE_FORK_VM'" 2>/dev/null || true)
-    child_state=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
-      "select status from fleet_vms where id='$REQUESTED_CROSS_NODE_FORK_VM'" 2>/dev/null || true)
-    if [ "$operation_state:$child_state" = preparing:running ] && \
-       grep -q 'test fork paused after child persistence' "$DIR/node-b.log"; then
+    if grep -F 'test fork paused at phase' "$DIR/node-b.log" | \
+      grep -Fq "\"$B_FORK_PAUSE_PHASE\""; then
       FORK_PAUSED=1
       break
     fi
     sleep 0.1
   done
   [ "$FORK_PAUSED" = 1 ] || {
-    echo 'FAIL: cross-node fork did not reach the post-child failpoint' >&2
+    echo "FAIL: cross-node fork did not reach $B_FORK_PAUSE_PHASE" >&2
     exit 1
   }
+  operation_state=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+    "select status from fleet_vm_fork_operations where child_vm_id='$REQUESTED_CROSS_NODE_FORK_VM'")
+  child_state=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+    "select coalesce((select status from fleet_vms where id='$REQUESTED_CROSS_NODE_FORK_VM'), '')")
+  case "$B_FORK_PAUSE_PHASE" in
+    after_claim|after_snapshot|after_localize|after_bind)
+      [ "$operation_state:$child_state" = preparing: ]
+      ;;
+    after_child)
+      [ "$operation_state:$child_state" = preparing:running ]
+      ;;
+    after_commit)
+      [ "$operation_state:$child_state" = committed:running ]
+      ;;
+  esac
   kill -KILL "$B_PID"
   wait "$B_PID" 2>/dev/null || true
   wait "$FIRST_FORK_CURL_PID" 2>/dev/null || true
   FIRST_FORK_CURL_PID=""
   B_PID=""
   B_FORK_PAUSE_MS=0
+  B_FORK_PAUSE_PHASE=""
   start_node node-b zone-b "$B_CONTROL" "$B_PEER" "$DIR/node-b.log"
   B_PID=$LAST_PID
   wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
@@ -382,7 +409,8 @@ CROSS_NODE_FORK_STATUS=$(curl -sS --max-time 180 \
   -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
   -d "$FORK_REQUEST_BODY" \
   "http://127.0.0.1:$B_CONTROL/v1/vms/$SOURCE_VM/fork")
-if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
+if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ] && \
+   [[ "${TARIT_TEST_CROSS_NODE_FORK_DEATH_PHASE:-after_child}" =~ ^after_(child|commit)$ ]]; then
   [ "$CROSS_NODE_FORK_STATUS" = 200 ]
 else
   [ "$CROSS_NODE_FORK_STATUS" = 201 ]

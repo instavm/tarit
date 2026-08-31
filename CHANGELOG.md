@@ -18,6 +18,8 @@ versions may contain breaking changes.
 - The continuous mixed-OCI supervisor now publishes an atomically replaced,
   root-only status record and runs bounded orchestrator/VMM crash recovery
   between long-lived lifecycle epochs.
+- Cross-node fork operations now persist the target daemon boot session and
+  reuse an exact child-bound private artifact across interrupted retries.
 
 ### Changed
 
@@ -30,6 +32,9 @@ versions may contain breaking changes.
   API, removing the `iproute2` dependency from minimal OCI guests.
 - Continuous lifecycle qualification now carries absolute and monotonic timers
   through two live sibling forks and verifies independent delivery and state.
+- Continuous lifecycle qualification now guarantees live fork,
+  snapshot/restore, and concurrent guest-work coverage before randomized
+  transitions and reports per-action p50, p95, p99, and maximum latency.
 - Runtime recovery qualification now stages the exact candidate guest agent in
   its private OCI-derived rootfs before testing hibernation and restore.
 - Balloon release qualification now injects the exact candidate guest agent
@@ -60,6 +65,10 @@ versions may contain breaking changes.
   hibernation interval.
 - Continuous lifecycle shutdown now waits for the active epoch to remove its
   process tree, mounts, and runtime storage before the service exits.
+- A restarted cross-node fork target can reclaim its own durable quota
+  reservation immediately. Same-session duplicate requests, wrong-target
+  takeover, and rebinding a private snapshot to another child still fail
+  closed; replaying the same child ownership bind is idempotent.
 
 ## [0.1.2] - 2026-08-07
 

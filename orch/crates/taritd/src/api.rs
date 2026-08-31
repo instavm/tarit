@@ -2684,22 +2684,33 @@ async fn claim_fork_operation(
 }
 
 #[cfg(feature = "test-failpoints")]
-async fn fork_after_child_failpoint(child_vm_id: Uuid) {
-    let Ok(value) = std::env::var("TARIT_TEST_FORK_PAUSE_AFTER_CHILD_MS") else {
+async fn fork_phase_failpoint(child_vm_id: Uuid, phase: &'static str) {
+    let configured_phase = std::env::var("TARIT_TEST_FORK_PAUSE_PHASE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("TARIT_TEST_FORK_PAUSE_AFTER_CHILD_MS")
+                .ok()
+                .filter(|value| value.parse::<u64>().unwrap_or(0) > 0)
+                .map(|_| "after_child".to_string())
+        });
+    if configured_phase.as_deref() != Some(phase) {
         return;
-    };
-    let Ok(milliseconds) = value.parse::<u64>() else {
+    }
+    let value = std::env::var("TARIT_TEST_FORK_PAUSE_MS")
+        .or_else(|_| std::env::var("TARIT_TEST_FORK_PAUSE_AFTER_CHILD_MS"));
+    let Some(milliseconds) = value.ok().and_then(|value| value.parse::<u64>().ok()) else {
         return;
     };
     if milliseconds == 0 {
         return;
     }
-    tracing::warn!(vm = %child_vm_id, milliseconds, "test fork paused after child persistence");
+    tracing::warn!(vm = %child_vm_id, phase, milliseconds, "test fork paused at phase");
     tokio::time::sleep(std::time::Duration::from_millis(milliseconds)).await;
 }
 
 #[cfg(not(feature = "test-failpoints"))]
-async fn fork_after_child_failpoint(_child_vm_id: Uuid) {}
+async fn fork_phase_failpoint(_child_vm_id: Uuid, _phase: &'static str) {}
 
 async fn fork_vm(
     State(state): State<AppState>,
@@ -2834,18 +2845,31 @@ async fn fork_vm(
         }
     }
     let now = Utc::now();
-    let operation = existing_operation.unwrap_or(ForkOperationRecord {
+    let mut operation = existing_operation.unwrap_or(ForkOperationRecord {
         child_vm_id: child_id,
         source_vm_id: source_id,
         owner_key: identity.tenant.clone(),
         source_host_id: source.host_id.clone(),
         target_host_id: state.config.host_id.clone(),
+        target_boot_session_id: Some(state.config.host_session_id),
         status: ForkOperationStatus::Preparing,
         child_created_at: None,
         created_at: now,
         updated_at: now,
     });
+    if operation.target_host_id != state.config.host_id {
+        return Err(OrchError::Conflict(format!(
+            "interrupted fork child {child_id} must resume on target host {}",
+            operation.target_host_id
+        ))
+        .into());
+    }
+    if operation.status == ForkOperationStatus::Preparing {
+        operation.target_boot_session_id = Some(state.config.host_session_id);
+        operation.updated_at = now;
+    }
     claim_fork_operation(&state, &identity, &operation).await?;
+    fork_phase_failpoint(child_id, "after_claim").await;
     let reserved = true;
     let result = async {
         let (child, source_host) = if let Some(remote_source) = remote_source {
@@ -2856,12 +2880,13 @@ async fn fork_vm(
             let target = remote_source.clone();
             let request_identity = identity.clone();
             let snapshot = tokio::task::spawn_blocking(move || {
-                peer.snapshot_remote(&target, source_id, false, &request_identity)
+                peer.snapshot_remote_for_fork(&target, source_id, child_id, &request_identity)
             })
             .await
             .map_err(|error| {
                 OrchError::Internal(format!("cross-node fork snapshot join: {error}"))
             })??;
+            fork_phase_failpoint(child_id, "after_snapshot").await;
             let fleet = state.fleet.as_ref().ok_or_else(|| {
                 OrchError::Unavailable("cross-node fork requires durable fleet storage".into())
             })?;
@@ -2871,7 +2896,9 @@ async fn fork_vm(
                 .map_err(branch_fleet_err)?;
             let snapshot_path =
                 ops::localize_branch_artifact(&state, &artifact, &identity, false).await?;
+            fork_phase_failpoint(child_id, "after_localize").await;
             ops::bind_localized_snapshot_to_fork(&state, &snapshot_path, child_id)?;
+            fork_phase_failpoint(child_id, "after_bind").await;
             let replicated = fleet
                 .get_artifact(&identity.tenant, snapshot.snapshot_id)
                 .await
@@ -2909,6 +2936,7 @@ async fn fork_vm(
             (child, Some(remote_source.host_id))
         } else {
             let snapshot_path = ops::snapshot_local_for_fork(&state, source_id, child_id).await?;
+            fork_phase_failpoint(child_id, "after_snapshot").await;
             let child = match ops::restore_local(
                 &state,
                 &snapshot_path,
@@ -2933,8 +2961,9 @@ async fn fork_vm(
             };
             (child, None)
         };
-        fork_after_child_failpoint(child_id).await;
+        fork_phase_failpoint(child_id, "after_child").await;
         commit_fork_operation(&state, &operation, child.created_at).await?;
+        fork_phase_failpoint(child_id, "after_commit").await;
         audit::record(
             &state,
             &identity,
@@ -4355,6 +4384,7 @@ mod tests {
             owner_key: "tenant-a".into(),
             source_host_id: state.config.host_id.clone(),
             target_host_id: state.config.host_id.clone(),
+            target_boot_session_id: Some(state.config.host_session_id),
             status: ForkOperationStatus::Preparing,
             child_created_at: None,
             created_at: now,
@@ -4433,6 +4463,7 @@ mod tests {
             owner_key: "tenant-a".into(),
             source_host_id: state_check.config.host_id.clone(),
             target_host_id: state_check.config.host_id.clone(),
+            target_boot_session_id: Some(state_check.config.host_session_id),
             status: ForkOperationStatus::Preparing,
             child_created_at: None,
             created_at: Utc::now(),
@@ -4469,6 +4500,87 @@ mod tests {
             ForkOperationStatus::Preparing,
             "an errored child must not be committed by retry recovery"
         );
+    }
+
+    #[test]
+    fn interrupted_live_fork_is_reclaimed_only_by_a_new_session_on_its_target() {
+        let state = test_state();
+        let source_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let now = Utc::now();
+        insert_vm(&state, source_id, "tenant-a", VmStatus::Running);
+        let old_session = Uuid::new_v4();
+        assert_ne!(old_session, state.config.host_session_id);
+        let operation = ForkOperationRecord {
+            child_vm_id: child_id,
+            source_vm_id: source_id,
+            owner_key: "tenant-a".into(),
+            source_host_id: state.config.host_id.clone(),
+            target_host_id: state.config.host_id.clone(),
+            target_boot_session_id: Some(old_session),
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .claim_fork_operation(&operation, 2, now + chrono::Duration::minutes(1))
+                .unwrap(),
+            tarit_store::ForkOperationClaimOutcome::New
+        );
+
+        let state_check = state.clone();
+        let app = router(state);
+        let rt = test_runtime();
+        let response = rt.block_on(request_json(
+            app,
+            "POST",
+            &format!("/v1/vms/{source_id}/fork"),
+            "tenant-a-key",
+            serde_json::json!({"id": child_id}),
+        ));
+        assert_ne!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            state_check
+                .store
+                .lock()
+                .unwrap()
+                .get_fork_operation(child_id)
+                .unwrap()
+                .unwrap()
+                .target_boot_session_id,
+            Some(state_check.config.host_session_id)
+        );
+
+        let foreign_target_child = Uuid::new_v4();
+        let foreign_target = ForkOperationRecord {
+            child_vm_id: foreign_target_child,
+            target_host_id: "another-target".into(),
+            target_boot_session_id: Some(old_session),
+            ..operation
+        };
+        state_check
+            .store
+            .lock()
+            .unwrap()
+            .claim_fork_operation(
+                &foreign_target,
+                2,
+                Utc::now() + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        let response = rt.block_on(request_json(
+            router(state_check),
+            "POST",
+            &format!("/v1/vms/{source_id}/fork"),
+            "tenant-a-key",
+            serde_json::json!({"id": foreign_target_child}),
+        ));
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

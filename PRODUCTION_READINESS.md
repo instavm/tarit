@@ -127,9 +127,15 @@ regression gates, but the following unresolved items now block release:
    reuse. The full Ubuntu/Alpine and Linux 6.6/5.10 service must
    complete sustained rotation
    without this stall before ingress admission is considered qualified.
-2. Pass the remaining phase-by-phase kill, cancellation, dirty-rate
-   non-convergence, corruption, and near-ENOSPC rollback tests without source
-   pause leaks, duplicate writers, terminal-ID resurrection, or staged files.
+2. Pass the remaining cancellation, dirty-rate non-convergence, corruption,
+   and near-ENOSPC rollback tests without source pause leaks, duplicate writers,
+   terminal-ID resurrection, or staged files. Cross-node fork interruption now
+   passes after claim, source snapshot, target localization, ownership bind,
+   child publication, and operation commit on both Linux 6.6.155 and 5.10.230.
+   Retry reuses the exact child-bound artifact, target restart reclaims its
+   durable reservation, same-session duplicates and wrong-target takeovers stay
+   fenced, and child deletion converges both replicas and global metadata to
+   zero.
    Unexpected UFFD handler exit, descriptor loss, UNMAP, and REMAP now fail the
    VMM closed and preserve retryable hibernated state. The fixed vCPU MSR
    omission is repaired, but the dynamic KVM custom-MSR set still needs the
