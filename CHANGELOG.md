@@ -15,6 +15,9 @@ versions may contain breaking changes.
 - Generated Python and TypeScript clients now cover the public OpenAPI contract.
   Their handwritten layers provide API-key setup, typed failures,
   deadline-bounded execution polling, and stable-child-id live-fork retries.
+- The continuous mixed-OCI supervisor now publishes an atomically replaced,
+  root-only status record and runs bounded orchestrator/VMM crash recovery
+  between long-lived lifecycle epochs.
 
 ### Changed
 
@@ -27,6 +30,8 @@ versions may contain breaking changes.
   API, removing the `iproute2` dependency from minimal OCI guests.
 - Continuous lifecycle qualification now carries absolute and monotonic timers
   through two live sibling forks and verifies independent delivery and state.
+- Runtime recovery qualification now stages the exact candidate guest agent in
+  its private OCI-derived rootfs before testing hibernation and restore.
 - Balloon release qualification now injects the exact candidate guest agent
   into each OCI fixture and creates cgroup pressure without blocking control on
   a throttled VMM.

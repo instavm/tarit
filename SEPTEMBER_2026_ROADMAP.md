@@ -970,7 +970,12 @@ passing focused gate does not waive an item in the final column.
   overwritten. Failure handling archives the database and service log, removes
   the multi-gigabyte runtime tree, and trims the CoW filesystem. The supervisor
   owns each epoch's process group, forwards shutdown to that group, waits for
-  cleanup, and gives the process tree 90 seconds before forced termination. Before
+  cleanup, and gives the process tree 90 seconds before forced termination. It
+  atomically publishes a root-only status record after every completed state
+  transition. After each epoch it runs an isolated recovery campaign that kills
+  taritd without a drain, re-adopts the exact surviving VMM, hibernates to zero
+  VMMs, wakes over HTTP, kills the resumed VMM, reconciles terminal ownership,
+  and proves capacity reuse before the next OCI/kernel case starts. Before
   enabling the SMP profile, a 60-second Ubuntu/Linux 6.6 acceptance run completed
   136 API operations against simultaneous one-, two-, and four-vCPU anchors. It
   covered five live forks, two snapshot/restores, three hibernate/wake cycles,
@@ -1029,6 +1034,16 @@ passing focused gate does not waive an item in the final column.
   artifact and fleet-snapshot rows, source and target metadata, and both
   replicas' RAM, integrity, and CoW files to zero before the test continued
   through stale-owner wake, volume recovery, branch repair, and last-reader GC.
+  A bounded Ubuntu/Linux 6.6 supervisor acceptance passed 300 API operations
+  with three anchors aged at least 184.512 seconds, two durable snapshots, the
+  65-second scale-to-zero timer gate, and two live siblings before its scheduled
+  recovery campaign emitted `RUNTIME_CRASH_RECOVERY_PASS`. The first campaign
+  attempt detected that its OCI fixture contained an older guest agent and
+  failed closed at clone-repair admission; the recovery gate now injects the
+  exact candidate agent into its private reflinked rootfs. The corrected run
+  left no candidate VMM, lifecycle mount, or occupied runtime tree, returned the
+  12 GiB CoW fixture to 11 GiB free, and the unlimited service restarted with
+  zero systemd restarts.
   The service is enabled and running; completion of
   the full four-case rotation remains a release gate.
 - A bounded runtime-crash gate now covers fresh digest-pinned Ubuntu 24.04 and
