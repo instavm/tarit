@@ -884,7 +884,19 @@ passing focused gate does not waive an item in the final column.
   before VM publication on Ubuntu/Linux 6.6 and Alpine/Linux 5.10. The writer
   VMM subsequently lazily restored each untouched snapshot and both vCPUs
   advanced. The incompatible build and runtime artifacts were removed after
-  the gate. The 100-sample latency distributions remain open.
+  the gate. The continuous c8i workload then produced 226 valid local
+  live-fork samples from Ubuntu 24.04/Linux 6.6 guests: 74 at one vCPU, 81 at
+  two vCPUs, and 71 at four vCPUs. Every child identity was unique; every
+  phase sum, source identity, local-path classification, termination value,
+  and downtime bound was valid. End-to-end fork phase time was
+  7,004/8,649/10,861/11,358 ms at p50/p95/p99/max. Measured final-stop
+  downtime was 15.480/16.081/35.531/1,192.985 ms. The maximum occurred while
+  a separate real-KVM block-I/O gate was co-scheduled on the two-logical-CPU
+  host with seven anchor vCPUs, so it is retained as oversubscription evidence
+  rather than an isolated performance result. This closes the local
+  100-sample functional/contention distribution. A non-overcommitted
+  same-hardware performance distribution and a 100-sample cross-node
+  distribution remain open.
 - The persistent local-block gate now passes a four-way OCI/kernel matrix:
   Ubuntu and Alpine-derived workloads on Linux 6.6 and 5.10. Each case creates
   a 64 MiB raw volume through the public API, observes it as `/dev/vdb`, formats

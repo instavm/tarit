@@ -113,13 +113,13 @@ class StatusPublicationTests(unittest.TestCase):
                     "termination": "converged",
                 },
             }
-            soak.record_fork_metrics({"metrics": base})
+            soak.record_fork_metrics({"metrics": base}, 1)
             second = json.loads(json.dumps(base))
             second["path"] = "cross_node"
             second["total_us"] = 1200
             second["live_snapshot"]["termination"] = "max_rounds"
             second["live_snapshot"]["downtime_us"] = 50
-            soak.record_fork_metrics({"metrics": second})
+            soak.record_fork_metrics({"metrics": second}, 4)
 
             summary = soak.fork_summary()
             self.assertEqual(summary["count"], 2)
@@ -136,6 +136,11 @@ class StatusPublicationTests(unittest.TestCase):
             self.assertEqual(
                 summary["measurements"]["live_downtime_us"]["max"], 50
             )
+            self.assertEqual(
+                summary["by_source_vcpus"]["1"]["measurements"]["total_us"],
+                {"p50": 800, "p95": 800, "p99": 800, "max": 800},
+            )
+            self.assertEqual(summary["by_source_vcpus"]["4"]["count"], 1)
 
     def test_fork_metrics_reject_incoherent_downtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -157,7 +162,7 @@ class StatusPublicationTests(unittest.TestCase):
                         "downtime_us": 11,
                         "termination": "converged",
                     },
-                }})
+                }}, 2)
 
 
 if __name__ == "__main__":
