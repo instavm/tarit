@@ -845,9 +845,20 @@ passing focused gate does not waive an item in the final column.
   `a13f8d7e70112739a610432bb73ef3cd69eb2e5113ba6ec36b87b179bbd96528`
   and taritd
   `f1955ca1f2a07b576c47960d6e8d967984c35e726bf801cee31ffbb83203c746`.
-  Orchestrator/process-death and lost-acknowledgement failure injection,
-  source/output alias and swap negatives, cross-build/template compatibility,
-  and 100-sample latency distributions remain open.
+  A separate incremental-snapshot gate now requests a diff before any parent
+  exists and verifies that Tarit publishes a complete full `VMSN`, then dirties
+  a second RAM region and restores both regions through a real `VMSD` chain.
+  It also restores the full input through a hardlink alias, takes another full
+  snapshot, and verifies that the output has a different inode while the input
+  hash and inode remain unchanged. Ubuntu 24.04 and Alpine 3.20 passed this gate
+  on Linux 6.6.155 and 5.10.230 with the exact candidate agent. The matrix found
+  that pathname vsock listeners survived VMM exit; the channel now owns the
+  exact socket inode, refuses to replace a pre-existing path, and removes its
+  socket on drop. Caller-owned snapshot cleanup removes an empty per-process
+  directory. The repaired matrix held the runtime-directory count constant,
+  and 187 stale sockets in 107 audited socket-only or empty directories from
+  earlier runs were removed. Swap negatives, cross-build/template
+  compatibility, and 100-sample latency distributions remain open.
 - The persistent local-block gate now passes a four-way OCI/kernel matrix:
   Ubuntu and Alpine-derived workloads on Linux 6.6 and 5.10. Each case creates
   a 64 MiB raw volume through the public API, observes it as `/dev/vdb`, formats

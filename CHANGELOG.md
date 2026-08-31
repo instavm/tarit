@@ -72,6 +72,13 @@ versions may contain breaking changes.
   reservation immediately. Same-session duplicate requests, wrong-target
   takeover, and rebinding a private snapshot to another child still fail
   closed; replaying the same child ownership bind is idempotent.
+- Pathname vsock listeners now retain the exact socket identity, refuse to
+  replace a pre-existing filesystem entry, and unlink the owned socket during
+  VMM teardown. Empty private runtime directories are removed after VM-owned
+  artifacts are retired.
+- Incremental snapshot qualification now proves full-snapshot fallback for the
+  first diff request, restores a real parent/diff RAM chain, and verifies that
+  a hardlink-spelled input is neither mutated nor reused as snapshot output.
 
 ## [0.1.2] - 2026-08-07
 

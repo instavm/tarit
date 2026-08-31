@@ -12,8 +12,9 @@ use crate::gc::OwnedScratchFile;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -74,9 +75,97 @@ struct ExecConnection {
     stream: UnixStream,
 }
 
+/// The exact filesystem entry created by `UnixListener::bind`.
+///
+/// A pathname Unix socket survives after its listener closes. Track its inode
+/// so teardown removes only the socket this channel created and refuses a path
+/// that was replaced while the VM was running.
+struct OwnedControlSocket {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl OwnedControlSocket {
+    fn claim(path: &Path) -> std::io::Result<Self> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "bound control path is not a Unix socket: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    fn remove(&self) -> std::io::Result<bool> {
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_socket()
+            || metadata.dev() != self.device
+            || metadata.ino() != self.inode
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to unlink replaced control socket: {}",
+                    self.path.display()
+                ),
+            ));
+        }
+        std::fs::remove_file(&self.path)?;
+        Ok(true)
+    }
+
+    fn remove_empty_private_parent(&self) {
+        let expected = std::env::temp_dir()
+            .join(".vmm-runtime")
+            .join(format!("vmm-{}", std::process::id()));
+        if self.path.parent() != Some(expected.as_path()) {
+            return;
+        }
+        if let Err(error) = std::fs::remove_dir(&expected) {
+            if !matches!(
+                error.kind(),
+                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+            ) {
+                log::warn!(
+                    "remove empty vsock runtime dir {}: {error}",
+                    expected.display()
+                );
+            }
+        }
+    }
+}
+
+impl Drop for OwnedControlSocket {
+    fn drop(&mut self) {
+        match self.remove() {
+            Ok(_) => self.remove_empty_private_parent(),
+            Err(error) => {
+                log::warn!(
+                    "remove vsock control socket {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
 /// A live exec channel over vsock. Holds the accepted guest connection (if the
 /// agent has dialed) and re-accepts on reconnect.
 pub struct VsockExecChannel {
+    _control_socket: Option<OwnedControlSocket>,
     stream: Arc<Mutex<Option<ExecConnection>>>,
     connected: Arc<Condvar>,
     stop: Arc<AtomicBool>,
@@ -254,8 +343,8 @@ impl VsockExecChannel {
         control_socket: &Path,
         pump_wake: Option<EventFd>,
     ) -> std::io::Result<Arc<Self>> {
-        let _ = std::fs::remove_file(control_socket);
         let listener = UnixListener::bind(control_socket)?;
+        let control_socket = OwnedControlSocket::claim(control_socket)?;
         listener.set_nonblocking(true)?;
 
         let stream = Arc::new(Mutex::new(None));
@@ -308,6 +397,7 @@ impl VsockExecChannel {
             })?;
 
         Ok(Arc::new(Self {
+            _control_socket: Some(control_socket),
             stream,
             connected,
             stop,
@@ -963,10 +1053,25 @@ fn parse_error_frame(payload: &[u8]) -> Result<(u64, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
+
+    fn test_socket_path(label: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "tarit-vsock-exec-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("control.sock");
+        (directory, socket)
+    }
 
     fn disconnected_channel() -> Arc<VsockExecChannel> {
         Arc::new(VsockExecChannel {
+            _control_socket: None,
             stream: Arc::new(Mutex::new(None)),
             connected: Arc::new(Condvar::new()),
             stop: Arc::new(AtomicBool::new(false)),
@@ -976,6 +1081,51 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             initial_connect_waited: AtomicBool::new(false),
         })
+    }
+
+    #[test]
+    fn channel_drop_unlinks_the_bound_socket() {
+        let (directory, socket) = test_socket_path("cleanup");
+        let channel = VsockExecChannel::bind(&socket).unwrap();
+        assert!(std::fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket());
+
+        drop(channel);
+
+        assert!(!socket.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn bind_refuses_to_replace_an_existing_path() {
+        let (directory, socket) = test_socket_path("existing");
+        let mut file = std::fs::File::create(&socket).unwrap();
+        file.write_all(b"keep").unwrap();
+        drop(file);
+
+        assert!(VsockExecChannel::bind(&socket).is_err());
+        assert_eq!(std::fs::read(&socket).unwrap(), b"keep");
+
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn channel_drop_refuses_to_unlink_a_replaced_path() {
+        let (directory, socket) = test_socket_path("replaced");
+        let channel = VsockExecChannel::bind(&socket).unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        let mut replacement = std::fs::File::create(&socket).unwrap();
+        replacement.write_all(b"replacement").unwrap();
+        drop(replacement);
+
+        drop(channel);
+
+        assert_eq!(std::fs::read(&socket).unwrap(), b"replacement");
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     fn exec_request(stream: &mut UnixStream) -> (u64, String) {

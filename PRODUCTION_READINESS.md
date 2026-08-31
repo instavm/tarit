@@ -69,8 +69,12 @@ its scope.
   Production generic NFS requires Kerberos privacy (`krb5p`), and mount
   admission checks the kernel-reported security and transport parameters.
 - Snapshot files are opened without following symlinks and validated before
-  restore. VMM control frames have absolute deadlines, and OCI extraction uses
-  private workspaces and no-follow file access.
+  restore. A first incremental request without a parent is emitted as a complete
+  full snapshot, and subsequent diff-chain restore plus hardlink-spelled input
+  isolation pass across Ubuntu/Alpine and Linux 6.6/5.10. VMM control frames
+  have absolute deadlines, pathname vsock listeners are identity-owned and
+  removed on teardown, and OCI extraction uses private workspaces and no-follow
+  file access.
 - Orchestrated snapshots are full snapshots only. Incremental requests fail
   with `422` until every parent can be relocated into a durable manifest-backed
   chain; direct VMM incremental snapshots remain available for local testing.

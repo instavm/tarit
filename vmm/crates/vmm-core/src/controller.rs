@@ -93,6 +93,7 @@ impl Drop for VmInstance {
             self.lazy_restore = None;
         }
         self.transient_files.cleanup();
+        cleanup_private_runtime_dir();
     }
 }
 
@@ -2716,6 +2717,37 @@ pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
             .map_err(|e| VmmError::Snapshot(format!("chmod runtime dir {}: {e}", dir.display())))?;
     }
     Ok(dir)
+}
+
+fn cleanup_private_runtime_dir() {
+    use std::io::ErrorKind;
+
+    let dir = std::env::temp_dir()
+        .join(".vmm-runtime")
+        .join(format!("vmm-{}", std::process::id()));
+    let metadata = match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!("stat private runtime dir {}: {error}", dir.display());
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        log::warn!(
+            "refusing to remove replaced private runtime dir: {}",
+            dir.display()
+        );
+        return;
+    }
+    if let Err(error) = std::fs::remove_dir(&dir) {
+        if !matches!(
+            error.kind(),
+            ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+        ) {
+            log::warn!("remove private runtime dir {}: {error}", dir.display());
+        }
+    }
 }
 
 #[cfg(all(
