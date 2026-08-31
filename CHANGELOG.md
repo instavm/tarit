@@ -14,7 +14,12 @@ versions may contain breaking changes.
 
 - Generated Python and TypeScript clients now cover the public OpenAPI contract.
   Their handwritten layers provide API-key setup, typed failures,
-  deadline-bounded execution polling, and stable-child-id live-fork retries.
+  deadline-bounded execution polling, stable-child-id live-fork retries, and
+  bounded PTY/WebSocket sessions with terminal resize, typed protocol failures,
+  and server-side session cleanup.
+- SDK releases now share the server version, build and install both registry
+  artifacts before release, retain checksums and attestations, and publish
+  through registry-trusted short-lived identities after a protected tag.
 - The continuous mixed-OCI supervisor now publishes an atomically replaced,
   root-only status record and runs bounded orchestrator/VMM crash recovery,
   multi-ingress wake qualification, and persistent-volume hibernation between

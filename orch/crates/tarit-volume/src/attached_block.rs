@@ -322,7 +322,9 @@ fn device_numbers(metadata: &std::fs::Metadata) -> (u64, u64) {
 
 #[cfg(target_os = "linux")]
 fn block_device_size(file: &File) -> Result<u64, VolumeError> {
-    const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+    // libc's ioctl request type is c_ulong on glibc/uclibc and c_int on
+    // musl/Android. Using its target-specific alias keeps this call portable.
+    const BLKGETSIZE64: libc::Ioctl = 0x8008_1272_u32 as libc::Ioctl;
     let mut size = 0_u64;
     // SAFETY: BLKGETSIZE64 writes one u64 to the supplied valid pointer and
     // `file` is held open for the duration of the ioctl.

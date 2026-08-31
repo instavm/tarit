@@ -2916,7 +2916,7 @@ fn prepare_live_snapshot_stage(file: &std::fs::File) -> Result<()> {
     use std::os::fd::AsRawFd;
 
     const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683E_u32 as libc::c_long;
-    const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601;
+    const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601_u32 as libc::Ioctl;
     const FS_IOC_SETFLAGS: libc::Ioctl = 0x4008_6602;
     const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
 
@@ -2929,7 +2929,7 @@ fn prepare_live_snapshot_stage(file: &std::fs::File) -> Result<()> {
             std::io::Error::last_os_error()
         )));
     }
-    if fs.f_type != BTRFS_SUPER_MAGIC {
+    if fs.f_type as u64 != BTRFS_SUPER_MAGIC as u64 {
         return Ok(());
     }
 
