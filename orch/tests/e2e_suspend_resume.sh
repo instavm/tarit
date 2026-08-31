@@ -326,6 +326,18 @@ for _ in 1 2; do
 done
 exec_json "$VM_ID" 'cat /mnt/tarit-rss/state' | grep -q 'suspend-state-ok'
 
+echo "== rapid suspend/resume transitions preserve worker handshakes =="
+for cycle in $(seq 1 20); do
+  api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/suspend" | grep -q '"status":"suspended"'
+  if [ "$ENABLE_NET" = 1 ]; then
+    ip link show "$NET_TAP" >/dev/null
+  fi
+  api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/resume" | grep -q '"status":"running"'
+  exec_json "$VM_ID" "printf rapid-cycle-$cycle" | grep -q "rapid-cycle-$cycle"
+done
+exec_json "$VM_ID" 'cat /mnt/tarit-rss/state' | grep -q 'suspend-state-ok'
+assert_guest_security "$VM_ID"
+
 api -X DELETE "$BASE_URL/v1/vms/$VM_ID" >/dev/null
 if [ "$ENABLE_NET" = 1 ]; then
   for _ in $(seq 1 40); do
