@@ -164,6 +164,20 @@ class StatusPublicationTests(unittest.TestCase):
                     },
                 }}, 2)
 
+    def test_vm_fork_metrics_use_the_source_vcpu_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            soak.anchors["source"] = SimpleNamespace(vcpus=4)
+            recorded = []
+            soak.record_fork_metrics = lambda response, vcpus: recorded.append(
+                (response, vcpus)
+            )
+            response = {"metrics": {"path": "local"}}
+
+            soak.record_vm_fork_metrics("source", response)
+
+            self.assertEqual(recorded, [(response, 4)])
+
 
 if __name__ == "__main__":
     unittest.main()

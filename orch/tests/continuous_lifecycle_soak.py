@@ -164,6 +164,9 @@ class Soak:
         self.fork_paths[path] = self.fork_paths.get(path, 0) + 1
         self.fork_terminations[termination] = self.fork_terminations.get(termination, 0) + 1
 
+    def record_vm_fork_metrics(self, vm_id: str, response: dict[str, object]) -> None:
+        self.record_fork_metrics(response, self.anchors[vm_id].vcpus)
+
     def write_status(self, kind: str, fields: dict[str, object]) -> None:
         if not self.args.status_file:
             return
@@ -305,7 +308,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         before = self.workload_state(vm_id)
         ticket = self.exec(vm_id, "/usr/local/bin/tarit-clone-repair-workload ticket")
         _, response = self.request("POST", f"/v1/vms/{vm_id}/fork", {}, 201, 360)
-        self.record_fork_metrics(response, self.anchors[vm_id].vcpus)
+        self.record_vm_fork_metrics(vm_id, response)
         child = response["vm"]
         child_id = child["id"]
         self.transient.add(child_id)
@@ -606,7 +609,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         fork_ready: dict[str, float] = {}
         for _ in range(2):
             _, response = self.request("POST", f"/v1/vms/{vm_id}/fork", {}, 201, 360)
-            self.record_fork_metrics(response)
+            self.record_vm_fork_metrics(vm_id, response)
             child = response["vm"]
             child_id = child["id"]
             assert child["status"] == "running", child
