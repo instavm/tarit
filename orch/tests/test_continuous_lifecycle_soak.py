@@ -28,6 +28,8 @@ class StatusPublicationTests(unittest.TestCase):
             base_url="http://127.0.0.1:1",
             case_name="ubuntu66",
             epoch=7,
+            expected_kernel_prefix=None,
+            expected_os_id=None,
             seed=20260831,
             status_file=str(status_file),
         ))
@@ -177,6 +179,23 @@ class StatusPublicationTests(unittest.TestCase):
             soak.record_vm_fork_metrics("source", response)
 
             self.assertEqual(recorded, [(response, 4)])
+
+    def test_guest_identity_requires_exact_os_and_kernel_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            soak.args.expected_kernel_prefix = "6.6."
+            soak.args.expected_os_id = "ubuntu"
+            soak.exec = lambda vm_id, command: "6.6.155-tarit\nubuntu"
+            events = []
+            soak.event = lambda kind, **fields: events.append((kind, fields))
+
+            soak.assert_guest_identity("vm-1")
+
+            self.assertEqual(events[0][0], "guest_identity_verified")
+            self.assertEqual(events[0][1]["kernel_release"], "6.6.155-tarit")
+            soak.exec = lambda vm_id, command: "5.10.230-tarit\nubuntu"
+            with self.assertRaises(AssertionError):
+                soak.assert_guest_identity("vm-1")
 
 
 if __name__ == "__main__":

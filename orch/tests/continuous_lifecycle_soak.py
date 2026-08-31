@@ -277,6 +277,28 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         output = self.exec(vm_id, command)
         assert "clone=cold-boot" in output, output
 
+    def assert_guest_identity(self, vm_id: str) -> None:
+        if not self.args.expected_kernel_prefix and not self.args.expected_os_id:
+            return
+        output = self.exec(
+            vm_id,
+            "set -eu; uname -r; . /etc/os-release; printf '%s\\n' \"$ID\"",
+        ).splitlines()
+        assert len(output) == 2, output
+        kernel_release, os_id = output
+        if self.args.expected_kernel_prefix:
+            assert kernel_release.startswith(self.args.expected_kernel_prefix), (
+                self.args.expected_kernel_prefix, kernel_release,
+            )
+        if self.args.expected_os_id:
+            assert os_id == self.args.expected_os_id, (
+                self.args.expected_os_id, os_id,
+            )
+        self.event(
+            "guest_identity_verified", vm_id=vm_id,
+            kernel_release=kernel_release, os_id=os_id,
+        )
+
     def create_anchor(self, index: int) -> str:
         proof = f"anchor-{self.args.seed}-{index}-{uuid.uuid4().hex[:12]}"
         vcpus = self.args.anchor_vcpus[index % len(self.args.anchor_vcpus)]
@@ -285,6 +307,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         )
         vm_id = row["id"]
         assert row["status"] == "running", row
+        self.assert_guest_identity(vm_id)
         self.install_workload(vm_id, proof)
         self.anchors[vm_id] = Anchor(
             proof=proof, created_at=time.monotonic(), vcpus=vcpus
@@ -1028,6 +1051,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epoch-hibernate-min-seconds", type=int, default=0)
     parser.add_argument("--storage-path")
     parser.add_argument("--min-free-bytes", type=int, default=0)
+    parser.add_argument("--expected-kernel-prefix")
+    parser.add_argument("--expected-os-id")
     parser.add_argument(
         "--status-file", default=os.environ.get("TARIT_LIFECYCLE_STATUS_FILE"),
     )
