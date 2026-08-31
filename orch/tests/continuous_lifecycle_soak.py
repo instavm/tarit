@@ -257,6 +257,137 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             host_realtime_error_seconds=realtime_after - host_realtime,
         )
 
+    def sibling_fork_timers(self, vm_id: str) -> None:
+        timer_seconds = self.args.sibling_fork_timer_seconds
+        token = uuid.uuid4().hex
+        monotonic_marker = f"/tmp/tarit-sibling-monotonic-{token}"
+        realtime_marker = f"/tmp/tarit-sibling-realtime-{token}"
+        before_workload = self.workload_state(vm_id)
+        before = self.exec(
+            vm_id,
+            f"set -eu; rm -f {monotonic_marker} {realtime_marker}; "
+            "read uptime rest < /proc/uptime; "
+            f"busybox setsid sh -c 'sleep {timer_seconds}; printf fired > "
+            f"{monotonic_marker}' </dev/null >/tmp/tarit-sibling-monotonic.log 2>&1 & "
+            f"deadline=$(($(date +%s) + {timer_seconds})); "
+            "busybox setsid sh -c '/usr/local/bin/tarit-clone-repair-workload "
+            f"wait-realtime \"$1\" && printf fired > {realtime_marker}' "
+            "sh \"$deadline\" </dev/null >/tmp/tarit-sibling-realtime.log 2>&1 & "
+            "printf '%s %s %s\n' \"$uptime\" \"$(date +%s)\" \"$deadline\"",
+        ).split()
+        assert len(before) == 3, before
+        uptime_before, realtime_before, realtime_deadline = (
+            float(before[0]), int(before[1]), int(before[2])
+        )
+        started = time.monotonic()
+
+        children: list[str] = []
+        fork_ready: dict[str, float] = {}
+        for _ in range(2):
+            _, response = self.request("POST", f"/v1/vms/{vm_id}/fork", {}, 201, 360)
+            child = response["vm"]
+            child_id = child["id"]
+            assert child["status"] == "running", child
+            self.transient.add(child_id)
+            children.append(child_id)
+            fork_ready[child_id] = time.monotonic() - started
+
+        after_source = self.workload_state(vm_id)
+        for field in ("clone", "prng", "ticket", "prefix", "counter", "cache"):
+            assert after_source[field] == before_workload[field], (
+                field, before_workload, after_source,
+            )
+        child_states = [self.workload_state(child_id) for child_id in children]
+        for child_state in child_states:
+            for field in ("clone", "prng", "ticket", "prefix"):
+                assert child_state[field] != before_workload[field], (
+                    field, before_workload, child_state,
+                )
+            assert child_state["counter"] == "0" and child_state["cache"] == "-", child_state
+        for field in ("clone", "prng", "ticket", "prefix"):
+            assert child_states[0][field] != child_states[1][field], (
+                field, child_states,
+            )
+
+        vm_ids = [vm_id, *children]
+
+        def read_timer_state(timer_vm_id: str) -> dict[str, str]:
+            return self.parse_state(
+                self.exec(
+                    timer_vm_id,
+                    "set -eu; read uptime rest < /proc/uptime; "
+                    f"if test -e {monotonic_marker}; then mono=$(cat {monotonic_marker}); "
+                    "else mono=pending; fi; "
+                    f"if test -e {realtime_marker}; then real=$(cat {realtime_marker}); "
+                    "else real=pending; fi; "
+                    "printf 'mono=%s real=%s uptime=%s realtime=%s\\n' "
+                    "\"$mono\" \"$real\" \"$uptime\" \"$(date +%s)\"",
+                )
+            )
+
+        for timer_vm_id in vm_ids:
+            state = read_timer_state(timer_vm_id)
+            assert state["mono"] == "pending" and state["real"] == "pending", (
+                timer_vm_id, state, fork_ready,
+            )
+            assert abs(int(state["realtime"]) - int(time.time())) <= 3, state
+            assert float(state["uptime"]) >= uptime_before, state
+
+        sleep_until = started + timer_seconds - 2
+        if sleep_until > time.monotonic():
+            time.sleep(sleep_until - time.monotonic())
+        fired: dict[str, dict[str, float]] = {timer_vm_id: {} for timer_vm_id in vm_ids}
+        delivery_deadline = started + timer_seconds + max(fork_ready.values()) + 15
+        while time.monotonic() < delivery_deadline:
+            for timer_vm_id in vm_ids:
+                state = read_timer_state(timer_vm_id)
+                elapsed = time.monotonic() - started
+                if state["real"] == "fired" and "realtime" not in fired[timer_vm_id]:
+                    fired[timer_vm_id]["realtime"] = elapsed
+                if state["mono"] == "fired" and "monotonic" not in fired[timer_vm_id]:
+                    fired[timer_vm_id]["monotonic"] = elapsed
+            if all(len(value) == 2 for value in fired.values()):
+                break
+            time.sleep(0.1)
+        assert all(len(value) == 2 for value in fired.values()), fired
+
+        for timer_vm_id in vm_ids:
+            assert fired[timer_vm_id]["realtime"] >= timer_seconds - 2, fired
+            assert fired[timer_vm_id]["realtime"] <= max(
+                timer_seconds + 3, fork_ready.get(timer_vm_id, 0) + 3,
+            ), fired
+            assert fired[timer_vm_id]["monotonic"] >= timer_seconds - 1, fired
+            assert fired[timer_vm_id]["monotonic"] <= (
+                timer_seconds + fork_ready.get(timer_vm_id, 0) + 5
+            ), fired
+
+        self.exec(
+            children[0],
+            f"printf child-one > {monotonic_marker}; printf child-one > {realtime_marker}",
+        )
+        for timer_vm_id in (vm_id, children[1]):
+            assert self.exec(
+                timer_vm_id,
+                f"printf '%s %s\n' \"$(cat {monotonic_marker})\" "
+                f"\"$(cat {realtime_marker})\"",
+            ) == "fired fired"
+
+        for child_id in children:
+            self.delete_vm(child_id)
+        self.event(
+            "sibling_fork_timers_verified",
+            source=vm_id,
+            children=children,
+            timer_seconds=timer_seconds,
+            source_realtime_before=realtime_before,
+            realtime_deadline=realtime_deadline,
+            fork_ready_seconds={key: round(value, 3) for key, value in fork_ready.items()},
+            delivery_seconds={
+                key: {timer: round(value, 3) for timer, value in timers.items()}
+                for key, timers in fired.items()
+            },
+        )
+
     def pause_resume(self, vm_id: str) -> None:
         _, paused = self.request("POST", f"/v1/vms/{vm_id}/pause", {}, 200)
         assert paused["status"] == "paused", paused
@@ -332,6 +463,9 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         if self.args.hibernate_hold_seconds:
             self.long_hibernate_clock_timer(next(iter(self.anchors)))
             self.assert_global_invariants()
+        if self.args.sibling_fork_timer_seconds:
+            self.sibling_fork_timers(next(iter(self.anchors)))
+            self.assert_global_invariants()
         deadline = time.monotonic() + self.args.duration_seconds
         actions = [
             self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
@@ -375,6 +509,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anchors", type=int, default=3)
     parser.add_argument("--hibernate-hold-seconds", type=int, default=0)
     parser.add_argument("--guest-timer-seconds", type=int, default=5)
+    parser.add_argument("--sibling-fork-timer-seconds", type=int, default=0)
     parser.add_argument("--storage-path")
     parser.add_argument("--min-free-bytes", type=int, default=0)
     args = parser.parse_args()
@@ -387,6 +522,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("hibernate hold must exceed the guest timer by at least three seconds")
     if args.guest_timer_seconds < 2:
         parser.error("guest timer must be at least two seconds")
+    if args.sibling_fork_timer_seconds and args.sibling_fork_timer_seconds < 10:
+        parser.error("sibling fork timer must be at least ten seconds")
     return args
 
 

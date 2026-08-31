@@ -980,7 +980,14 @@ passing focused gate does not waive an item in the final column.
   delivered the expired absolute timer 1.038 and 0.997 seconds after resume,
   fired the inherited five-second timer after 4.573 and 4.775 seconds, and
   completed 130 and 153 operations without a watchdog, lockup, panic, kernel
-  BUG signature, or leak. Each continuous epoch
+  BUG signature, or leak. A two-sibling live-fork gate now arms absolute and
+  monotonic timers in the running source, forks it twice, and proves independent
+  clone identity, entropy, session repair, timer delivery, and post-fork disk
+  state. Ubuntu/Linux 6.6 delivered the common absolute deadline in all three
+  VMs at 44.43–44.54 seconds and their monotonic timers at 45.09–48.69 seconds;
+  Alpine/Linux 5.10 delivered them at 44.68–44.89 and 45.10–48.69 seconds. The
+  complete lanes passed 364 and 413 API operations with no leaked process,
+  mount, or runtime directory. Each continuous epoch
   now includes a 65-second hibernation hold; the first supervised lane matched
   host realtime exactly, advanced guest uptime by 2.15 seconds, and delivered
   the inherited timer 4.07 seconds after resume. A forced in-epoch capacity-floor

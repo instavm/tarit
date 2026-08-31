@@ -120,7 +120,7 @@ regression gates, but the following unresolved items now block release:
    rather than extrapolating from local-block tests.
 4. Extend the now-passing c8i stable-seed lifecycle matrix into a sustained
    balloon-after-restore kernel-liveness soak, complete the cross-build/
-   CPU-template rejection matrix, complete multi-hour, sibling-fork timer, and
+   CPU-template rejection matrix, complete multi-hour hibernation and
    ownership-lease qualification, and record 100-sample fork/snapshot/restore
    latency distributions on a larger reflink-capable fixture.
 5. Run the full protected release workflow from an immutable source revision

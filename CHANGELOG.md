@@ -17,6 +17,8 @@ versions may contain breaking changes.
   reservation.
 - Guest IPv4 restore repair is applied and verified through the Linux network
   API, removing the `iproute2` dependency from minimal OCI guests.
+- Continuous lifecycle qualification now carries absolute and monotonic timers
+  through two live sibling forks and verifies independent delivery and state.
 
 ### Fixed
 
