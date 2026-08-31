@@ -948,6 +948,25 @@ passing focused gate does not waive an item in the final column.
   and `7`. Every inner lifecycle gate emitted its exact pass sentinel, and free
   space returned to 8,313,483,264 bytes after every round. This is bounded soak
   evidence, not yet the required long-duration or destructive chaos campaign.
+- A continuous c8i lifecycle service now keeps three OCI-derived guests active
+  for 30-minute epochs and rotates Ubuntu 24.04 and Alpine 3.20 across Linux
+  6.6.155 and 5.10.230. Each epoch performs guest writes, live forks,
+  snapshot/restore, hibernate with concurrent wake requests, pause/resume, and
+  balloon changes while reconciling API, database, process, jail, clone-ID,
+  cached-session, and nested-virtualization invariants. It retains one snapshot,
+  refuses to start below 3 GiB free space, records JSONL history for 14 days,
+  and stops on the first failure so evidence is not overwritten. Before service
+  installation, Alpine/Linux 5.10 runs passed 225 and 278 API operations with
+  three guests older than 120 seconds, and Ubuntu/Linux 6.6 runs passed 261 and
+  217 operations with three guests older than 122 seconds. Earlier qualification
+  attempts exposed both a five-second restore-client timeout and an intermittent
+  post-restore clone-repair stall. Restore now uses the lifecycle deadline;
+  the host-monotonic admission deadline remains bounded, and repair failures
+  report their last completed stage. Retained state proved the application
+  marker had completed while the agent slept on restored guest time. Repair now
+  uses a signal plus generation-matched marker, and the agent does not sleep on
+  guest time before admission. The service is enabled and running; completion
+  of the full four-case rotation remains a release gate.
 - A bounded runtime-crash gate now covers fresh digest-pinned Ubuntu 24.04 and
   Alpine 3.20 OCI guests on Linux 6.6 and 5.10. It kills taritd without a drain,
   requires exact VMM PID and `/proc` start-time re-adoption with an unchanged

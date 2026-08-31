@@ -9,6 +9,8 @@ KERNEL="${TARIT_KERNEL:?set TARIT_KERNEL to a KVM guest kernel}"
 ROOTFS="${TARIT_ROOTFS:?set TARIT_ROOTFS to an agent-enabled rootfs}"
 EXPECTED_OS_ID="${TARIT_EXPECT_OS_ID:-ubuntu}"
 SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
+CLONE_WORKLOAD_BIN="${TARIT_TEST_CLONE_WORKLOAD_BIN:-}"
+GUEST_AGENT_BIN="${TARIT_TEST_GUEST_AGENT_BIN:-}"
 KEY="live-fork-hibernate-e2e-key"
 PORT="${FORK_HIBERNATE_E2E_PORT:-}"
 
@@ -51,9 +53,13 @@ DIR=$(mktemp -d "$SOCKET_ROOT/tarit-fork-hibernate.XXXXXX")
 chmod 700 "$DIR"
 mkdir -m 700 "$DIR/sockets"
 mkdir -m 700 "$DIR/runtime"
+ROOTFS_MOUNT=""
 BASE_URL="http://127.0.0.1:$PORT"
 
 cleanup() {
+  if [ -n "$ROOTFS_MOUNT" ] && mountpoint -q "$ROOTFS_MOUNT"; then
+    umount "$ROOTFS_MOUNT" || true
+  fi
   if [ -n "${TARITD_PGID:-}" ] && kill -0 -- "-$TARITD_PGID" 2>/dev/null; then
     kill -TERM -- "-$TARITD_PGID" 2>/dev/null || true
     for _ in $(seq 1 50); do
@@ -97,6 +103,34 @@ cmp -s -- "$ROOTFS" "$STAGED_ROOTFS" || {
   echo "FAIL: staged guest rootfs differs from the source" >&2
   exit 1
 }
+if [ -n "$CLONE_WORKLOAD_BIN" ] || [ -n "$GUEST_AGENT_BIN" ]; then
+  for required in e2fsck install mount mountpoint umount; do
+    command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
+  done
+  [ -z "$CLONE_WORKLOAD_BIN" ] || test -x "$CLONE_WORKLOAD_BIN" || {
+    echo "FAIL: clone-repair workload is not executable: $CLONE_WORKLOAD_BIN" >&2
+    exit 1
+  }
+  [ -z "$GUEST_AGENT_BIN" ] || test -x "$GUEST_AGENT_BIN" || {
+    echo "FAIL: guest agent is not executable: $GUEST_AGENT_BIN" >&2
+    exit 1
+  }
+  ROOTFS_MOUNT="$DIR/rootfs-mount"
+  mkdir -m 700 "$ROOTFS_MOUNT"
+  mount -o loop,rw "$STAGED_ROOTFS" "$ROOTFS_MOUNT"
+  if [ -n "$CLONE_WORKLOAD_BIN" ]; then
+    install -D -m 0755 "$CLONE_WORKLOAD_BIN" \
+      "$ROOTFS_MOUNT/usr/local/bin/tarit-clone-repair-workload"
+    sync -f "$ROOTFS_MOUNT/usr/local/bin/tarit-clone-repair-workload"
+  fi
+  if [ -n "$GUEST_AGENT_BIN" ]; then
+    install -D -m 0755 "$GUEST_AGENT_BIN" "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+    sync -f "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  fi
+  umount "$ROOTFS_MOUNT"
+  ROOTFS_MOUNT=""
+  e2fsck -pf "$STAGED_ROOTFS" >/dev/null
+fi
 chmod 0444 "$STAGED_ROOTFS"
 ROOTFS="$STAGED_ROOTFS"
 
@@ -218,6 +252,58 @@ expect_exec "$PARENT_ID" 'cat /root/tarit-fork-state' 'parent-after'
 expect_exec "$CHILD_ID" 'cat /root/tarit-fork-state' 'child-after'
 echo "live_fork_ready_ms=$((FORK_END-FORK_START))"
 
+if [ -n "$CLONE_WORKLOAD_BIN" ]; then
+  echo "== long-lived application state is repaired before clone admission =="
+  expect_exec "$PARENT_ID" \
+    "sh -c '/usr/local/bin/tarit-clone-repair-workload serve >/tmp/clone-workload.log 2>&1 & for i in \$(seq 1 100); do /usr/local/bin/tarit-clone-repair-workload state >/dev/null 2>&1 && break; sleep 0.05; done; /usr/local/bin/tarit-clone-repair-workload state'" \
+    'clone=cold-boot'
+  expect_exec "$PARENT_ID" \
+    "mkdir -p /usr/libexec/tarit; printf '%s\\n' '#!/bin/sh' 'set -eu' 'test \"\$TARIT_POST_FORK\" = 1' 'exec /usr/local/bin/tarit-clone-repair-workload repair-signal \"\$TARIT_CLONE_ID\"' > /usr/libexec/tarit/post-fork; chmod 0755 /usr/libexec/tarit/post-fork; /usr/local/bin/tarit-clone-repair-workload cache inherited-session" \
+    'stored'
+  SOURCE_WORKLOAD_STATE=$(exec_request "$PARENT_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload state' | json_field stdout)
+  SOURCE_TICKET=$(exec_request "$PARENT_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload ticket' | json_field stdout | tr -d '\r\n')
+  SOURCE_NONCE=$(exec_request "$PARENT_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload issue' | json_field stdout | tr -d '\r\n')
+  APP_FORK_JSON=$(api -H 'Content-Type: application/json' -d '{}' \
+    "$BASE_URL/v1/vms/$PARENT_ID/fork")
+  APP_CHILD_ID=$(printf '%s' "$APP_FORK_JSON" | python3 -c \
+    'import json,sys; row=json.load(sys.stdin); assert row["vm"]["status"] == "running", row; print(row["vm"]["id"])')
+  CHILD_WORKLOAD_STATE=$(exec_request "$APP_CHILD_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload state' | json_field stdout)
+  CHILD_NONCE=$(exec_request "$APP_CHILD_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload issue' | json_field stdout | tr -d '\r\n')
+  PARENT_WORKLOAD_STATE=$(exec_request "$PARENT_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload state' | json_field stdout)
+  python3 - "$SOURCE_WORKLOAD_STATE" "$PARENT_WORKLOAD_STATE" \
+    "$CHILD_WORKLOAD_STATE" "$SOURCE_NONCE" "$CHILD_NONCE" <<'PY'
+import sys
+
+def fields(value):
+    return dict(item.split("=", 1) for item in value.split())
+
+source, parent, child = map(fields, sys.argv[1:4])
+source_nonce, child_nonce = sys.argv[4:]
+assert source["clone"] == "cold-boot", source
+assert parent["clone"] == "cold-boot", parent
+assert child["clone"] not in {"cold-boot", source["clone"]}, child
+for key in ("prng", "ticket", "prefix"):
+    assert child[key] != source[key], (key, source, child)
+assert source["cache"] == parent["cache"] == "inherited-session", (source, parent)
+assert child["cache"] == "-", child
+assert child["counter"] == "0", child
+assert source_nonce.split("-", 1)[0] != child_nonce.split("-", 1)[0], (source_nonce, child_nonce)
+PY
+  expect_exec "$APP_CHILD_ID" \
+    "/usr/local/bin/tarit-clone-repair-workload accept-ticket '$SOURCE_TICKET' | grep -qx rejected; /usr/local/bin/tarit-clone-repair-workload check inherited-session | grep -qx absent" \
+    ''
+  expect_exec "$PARENT_ID" \
+    "/usr/local/bin/tarit-clone-repair-workload accept-ticket '$SOURCE_TICKET' | grep -qx accepted; /usr/local/bin/tarit-clone-repair-workload check inherited-session | grep -qx present" \
+    ''
+  api -X DELETE "$BASE_URL/v1/vms/$APP_CHILD_ID" >/dev/null
+fi
+
 echo "== public snapshot/restore uses an opaque handle, never a host path =="
 SNAPSHOT_JSON=$(api -H 'Content-Type: application/json' -d '{"diff":false}' \
   "$BASE_URL/v1/vms/$PARENT_ID/snapshot")
@@ -294,6 +380,12 @@ assert p["revision"] == 2 and p["allowlist"] == ["8.8.8.8:443/tcp"], p
     exit 1
   }
 fi
+if [ -n "$CLONE_WORKLOAD_BIN" ]; then
+  HIBERNATE_WORKLOAD_STATE=$(exec_request "$PARENT_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload state' | json_field stdout)
+  HIBERNATE_TICKET=$(exec_request "$PARENT_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload ticket' | json_field stdout | tr -d '\r\n')
+fi
 api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$PARENT_ID/hibernate" | grep -q '"status":"hibernated"'
 [ -z "$(vmm_pids_for_id "$PARENT_ID")" ] || { echo "FAIL: VMM survived hibernate"; exit 1; }
 if [ "${TARIT_TEST_ENABLE_NET:-0}" = 1 ]; then
@@ -327,6 +419,25 @@ PIDS=$(vmm_pids_for_id "$PARENT_ID")
   echo "FAIL: expected exactly one resumed VMM, got: $PIDS"; exit 1;
 }
 expect_exec "$PARENT_ID" 'cat /root/tarit-fork-state' 'parent-after'
+if [ -n "$CLONE_WORKLOAD_BIN" ]; then
+  RESUMED_WORKLOAD_STATE=$(exec_request "$PARENT_ID" \
+    '/usr/local/bin/tarit-clone-repair-workload state' | json_field stdout)
+  python3 - "$HIBERNATE_WORKLOAD_STATE" "$RESUMED_WORKLOAD_STATE" <<'PY'
+import sys
+
+def fields(value):
+    return dict(item.split("=", 1) for item in value.split())
+
+before, after = map(fields, sys.argv[1:])
+assert after["clone"] != before["clone"], (before, after)
+for key in ("prng", "ticket", "prefix"):
+    assert after[key] != before[key], (key, before, after)
+assert after["counter"] == "0" and after["cache"] == "-", after
+PY
+  expect_exec "$PARENT_ID" \
+    "/usr/local/bin/tarit-clone-repair-workload accept-ticket '$HIBERNATE_TICKET' | grep -qx rejected; /usr/local/bin/tarit-clone-repair-workload check inherited-session | grep -qx absent" \
+    ''
+fi
 if [ "${TARIT_TEST_ENABLE_NET:-0}" = 1 ]; then
   api "$BASE_URL/v1/vms/$PARENT_ID/egress-policy" | python3 -c '
 import json,sys

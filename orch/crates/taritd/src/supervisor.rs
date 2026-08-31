@@ -4198,10 +4198,14 @@ impl VmmSupervisor {
         })
     }
 
-    /// Wait for a boot already registered for this VM. The boot entry and its
-    /// completion signal share one control object, so callers cannot mistake a
-    /// replaced or stale scheduler reservation for the in-flight incarnation.
-    pub(crate) async fn wait_for_registered_boot(&self, id: Uuid) -> Result<bool, OrchError> {
+    /// Wait for a boot already registered for this VM, or recognize the narrow
+    /// handoff window after the runtime moved to `running`. The boot entry and
+    /// its completion signal share one control object, so callers cannot mistake
+    /// an unrelated leaked scheduler reservation for the active incarnation.
+    pub(crate) async fn wait_for_registered_boot_or_running(
+        &self,
+        id: Uuid,
+    ) -> Result<bool, OrchError> {
         let control = self
             .booting
             .lock()
@@ -4209,7 +4213,11 @@ impl VmmSupervisor {
             .get(&id)
             .map(|booting| Arc::clone(&booting.control));
         let Some(control) = control else {
-            return Ok(false);
+            return self
+                .running
+                .lock()
+                .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))
+                .map(|running| running.contains_key(&id));
         };
         tokio::task::spawn_blocking(move || control.wait_for_completion())
             .await
@@ -5456,7 +5464,11 @@ impl VmmSupervisor {
             .into_iter()
             .collect::<Vec<_>>();
 
-        let client = VmmClient::new(&vm.socket_path);
+        // A restore can legitimately spend longer than the control client's
+        // default five-second I/O timeout servicing lazy faults and waiting
+        // for the guest clone-repair barrier. Keep the request bounded by the
+        // lifecycle deadline used by the other snapshot operations.
+        let client = VmmClient::new(&vm.socket_path).with_request_timeout(LIFECYCLE_OP_TIMEOUT);
         let restore_path = runtime.guest_snapshot.as_deref().unwrap_or(snapshot_path);
         let volume_override = runtime_volume_configs(&runtime.data_volumes);
         if let Err(e) = client.restore_with_resource_overrides(
@@ -10755,7 +10767,7 @@ mod tests {
 
         let waiting_supervisor = Arc::clone(&supervisor);
         let waiter = thread::spawn(move || {
-            test_runtime().block_on(waiting_supervisor.wait_for_registered_boot(id))
+            test_runtime().block_on(waiting_supervisor.wait_for_registered_boot_or_running(id))
         });
         ticket.control.complete(Ok(()));
         assert!(waiter.join().unwrap().unwrap());
@@ -10763,6 +10775,28 @@ mod tests {
         supervisor.complete_booting(id, &ticket.control, Ok(()));
         supervisor.release_reservation_after_terminal(id).unwrap();
         assert!(!supervisor.has_retained_boot(id));
+    }
+
+    #[test]
+    fn late_boot_join_recognizes_runtime_handoff_without_accepting_a_bare_reservation() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        supervisor.reserve_existing_for_test(id);
+        assert!(!test_runtime()
+            .block_on(supervisor.wait_for_registered_boot_or_running(id))
+            .unwrap());
+
+        let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        supervisor.running.lock().unwrap().insert(
+            id,
+            RunningVm::new(process.pid, PathBuf::new(), process, None),
+        );
+        assert!(test_runtime()
+            .block_on(supervisor.wait_for_registered_boot_or_running(id))
+            .unwrap());
+
+        supervisor.stop_vm(id).unwrap();
+        supervisor.release_reservation_after_terminal(id).unwrap();
     }
 
     #[test]

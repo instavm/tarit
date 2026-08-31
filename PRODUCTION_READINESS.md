@@ -89,15 +89,21 @@ cross-node replication, and immutable signed-image stop-ships now have focused
 implementation and c8i evidence recorded in the September roadmap. They remain
 regression gates, but the following unresolved items now block release:
 
-1. Add application-specific repair workloads for long-lived PRNG state, TLS
-   session keys, nonce allocators, and framework session caches. The current
-   c8i gate holds a hibernated guest in its post-fork hook while exec, PTY, SSH,
-   and public-share requests race activation. All callers join one registered
-   restore and observe only repaired token and HTTP state. This passed twice on
-   Linux 6.6.155 and once on Linux 5.10.230. Linux 6.6 VMGenID notification and
-   the mandatory userspace repair barrier, plus the Linux 5.10 barrier-only
-   compatibility path, remain required regression gates before ingress is
-   admitted.
+1. Close the intermittent clone-repair stall found by the continuous c8i load
+   gate. The gate now carries a long-lived process with cached PRNG state,
+   session-ticket key material, nonce allocation state, and a framework-style
+   session cache; every successful fork and resume must rotate the first three,
+   clear the cache, reject the inherited ticket, and leave the source unchanged.
+   Alpine/Linux 5.10 runs passed 225 and 278 API operations, and Ubuntu/Linux
+   6.6 runs passed 261 and 217. Earlier sequences produced a repair command that
+   started and did not complete before the 30-second admission deadline.
+   Restore control requests now use the lifecycle timeout, the repair exchange
+   remains bounded by a host-monotonic deadline, and failures report the last
+   repair stage. Retained state proved the application marker was complete while
+   the agent slept on restored guest time; repair now uses a timer-independent
+   signal/marker handoff with no guest-clock sleep before admission. The four-case
+   Ubuntu/Alpine and Linux 6.6/5.10 service must complete sustained rotation
+   without this stall before ingress admission is considered qualified.
 2. Pass the remaining phase-by-phase kill, cancellation, dirty-rate
    non-convergence, corruption, and near-ENOSPC rollback tests without source
    pause leaks, duplicate writers, terminal-ID resurrection, or staged files.

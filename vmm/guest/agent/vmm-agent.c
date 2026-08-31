@@ -76,6 +76,7 @@
 #define CLONE_REPAIR_NONCE_BYTES (CLONE_REPAIR_SEED_BYTES + CLONE_REPAIR_ID_BYTES)
 #define CLONE_REPAIR_OK "TARIT_CLONE_REPAIR_V2_OK"
 #define POST_FORK_HOOK_PATH "/usr/libexec/tarit/post-fork"
+#define CLONE_REPAIR_STAGE_PATH "/run/tarit/clone-repair-stage"
 
 /* A sane default PATH so commands (node, python, ...) resolve when we run as
  * init on an OCI-derived rootfs where no login shell exported one. */
@@ -138,6 +139,15 @@ static int decode_clone_repair_nonce(const char *command,
     return 0;
 }
 
+static void set_clone_repair_stage(const char *stage) {
+    int fd = open(CLONE_REPAIR_STAGE_PATH,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    (void)write_all(fd, stage, strlen(stage));
+    (void)write_all(fd, "\n", 1);
+    (void)close(fd);
+}
+
 static int run_post_fork_hook(const char *clone_id) {
     struct stat st;
     int hook_fd = open(POST_FORK_HOOK_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -192,6 +202,9 @@ static int run_post_fork_hook(const char *clone_id) {
     }
     close(hook_fd);
 
+    /* Do not implement this wait with a guest-clock sleep. Repair runs before
+     * admission specifically while restored timer state is still untrusted.
+     * The VMM's host-monotonic admission deadline bounds the whole exchange. */
     int status;
     while (waitpid(child, &status, 0) < 0) {
         if (errno != EINTR) return -1;
@@ -215,6 +228,10 @@ static int repair_clone_entropy(const char *command, char clone_id[33]) {
     int boot_id_file = -1;
     int rc = -1;
 
+    if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) {
+        goto out;
+    }
+    set_clone_repair_stage("decode");
     if (decode_clone_repair_nonce(command, nonce) < 0) {
         goto out;
     }
@@ -222,6 +239,7 @@ static int repair_clone_entropy(const char *command, char clone_id[33]) {
     pool.entropy_count = (int)(CLONE_REPAIR_SEED_BYTES * 8U);
     pool.buf_size = (int)CLONE_REPAIR_SEED_BYTES;
     memcpy(pool.buf, nonce, CLONE_REPAIR_SEED_BYTES);
+    set_clone_repair_stage("entropy");
     random_fd = open("/dev/random", O_RDWR | O_CLOEXEC);
     if (random_fd < 0 || ioctl(random_fd, RNDADDENTROPY, &pool) < 0 ||
         ioctl(random_fd, RNDRESEEDCRNG, 0) < 0) {
@@ -229,6 +247,7 @@ static int repair_clone_entropy(const char *command, char clone_id[33]) {
     }
     close(random_fd);
     random_fd = -1;
+    set_clone_repair_stage("identity");
 
     /* The clone ID is a separate, non-secret part of the host nonce. Echoing
      * it proves that the exact repair request was consumed before admission. */
@@ -240,9 +259,6 @@ static int repair_clone_entropy(const char *command, char clone_id[33]) {
     }
     clone_id[32] = '\0';
 
-    if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) {
-        goto out;
-    }
     marker = open("/run/tarit/clone-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (marker < 0 || write_all(marker, clone_id, 32) < 0 || write_all(marker, "\n", 1) < 0) {
         goto out;
@@ -266,6 +282,7 @@ static int repair_clone_entropy(const char *command, char clone_id[33]) {
     }
     close(boot_id_file);
     boot_id_file = -1;
+    set_clone_repair_stage("boot-id");
 
     /* A kernel boot_id is immutable and remains captured in VM RAM. Overlay it
      * with this incarnation ID before admission. On descendants the existing
@@ -281,9 +298,11 @@ static int repair_clone_entropy(const char *command, char clone_id[33]) {
             goto out;
         }
     }
+    set_clone_repair_stage("userspace");
     if (run_post_fork_hook(clone_id) < 0) {
         goto out;
     }
+    set_clone_repair_stage("complete");
     rc = 0;
 
 out:

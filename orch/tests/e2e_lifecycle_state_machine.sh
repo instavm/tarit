@@ -10,6 +10,9 @@ VMM="${TARIT_VMM_BIN:-$ROOT/vmm/target/release/vmm}"
 KERNEL="${TARIT_KERNEL:?set TARIT_KERNEL to a KVM guest kernel}"
 ROOTFS="${TARIT_ROOTFS:?set TARIT_ROOTFS to an Ubuntu ext4 rootfs containing vmm-agent}"
 SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
+CLONE_WORKLOAD_BIN="${TARIT_TEST_CLONE_WORKLOAD_BIN:-}"
+GUEST_AGENT_BIN="${TARIT_TEST_GUEST_AGENT_BIN:-}"
+DRIVER="${TARIT_LIFECYCLE_DRIVER:-$ROOT/orch/tests/lifecycle_state_machine.py}"
 PORT="${TARIT_LIFECYCLE_STATE_PORT:-}"
 KEY="lifecycle-state-machine-e2e-key"
 JAIL_UID_BASE="${TARIT_LIFECYCLE_JAIL_UID_BASE:-300000}"
@@ -28,7 +31,8 @@ done
 test -x "$TARITD" || { echo "FAIL: taritd not executable: $TARITD" >&2; exit 1; }
 test -x "$VMM" || { echo "FAIL: vmm not executable: $VMM" >&2; exit 1; }
 test -r "$KERNEL" || { echo "FAIL: kernel not readable: $KERNEL" >&2; exit 1; }
-test -r "$ROOTFS" || { echo "FAIL: Ubuntu rootfs not readable: $ROOTFS" >&2; exit 1; }
+test -r "$ROOTFS" || { echo "FAIL: guest rootfs not readable: $ROOTFS" >&2; exit 1; }
+test -r "$DRIVER" || { echo "FAIL: lifecycle driver not readable: $DRIVER" >&2; exit 1; }
 [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] || {
   echo "FAIL: worker /dev/kvm is unavailable" >&2
   exit 1
@@ -51,6 +55,7 @@ fi
 DIR=$(mktemp -d "$SOCKET_ROOT/tarit-sm.XXXXXX")
 chmod 700 "$DIR"
 mkdir -m 700 "$DIR/sockets" "$DIR/runtime" "$DIR/jails"
+ROOTFS_MOUNT=""
 BASE_URL="http://127.0.0.1:$PORT"
 TARITD_PID=""
 TARITD_PGID=""
@@ -76,14 +81,45 @@ rm -f -- "$DIR/.reflink-source" "$DIR/.reflink-clone"
 STAGED_ROOTFS="$DIR/ubuntu.ext4"
 cp --reflink=auto --sparse=always -- "$ROOTFS" "$STAGED_ROOTFS"
 cmp -s -- "$ROOTFS" "$STAGED_ROOTFS" || {
-  echo "FAIL: staged Ubuntu rootfs differs from the source" >&2
+  echo "FAIL: staged guest rootfs differs from the source" >&2
   exit 1
 }
+if [ -n "$CLONE_WORKLOAD_BIN" ] || [ -n "$GUEST_AGENT_BIN" ]; then
+  for required in e2fsck install mount mountpoint umount; do
+    command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
+  done
+  [ -z "$CLONE_WORKLOAD_BIN" ] || test -x "$CLONE_WORKLOAD_BIN" || {
+    echo "FAIL: clone-repair workload is not executable: $CLONE_WORKLOAD_BIN" >&2
+    exit 1
+  }
+  [ -z "$GUEST_AGENT_BIN" ] || test -x "$GUEST_AGENT_BIN" || {
+    echo "FAIL: guest agent is not executable: $GUEST_AGENT_BIN" >&2
+    exit 1
+  }
+  ROOTFS_MOUNT="$DIR/rootfs-mount"
+  mkdir -m 700 "$ROOTFS_MOUNT"
+  mount -o loop,rw "$STAGED_ROOTFS" "$ROOTFS_MOUNT"
+  if [ -n "$CLONE_WORKLOAD_BIN" ]; then
+    install -D -m 0755 "$CLONE_WORKLOAD_BIN" \
+      "$ROOTFS_MOUNT/usr/local/bin/tarit-clone-repair-workload"
+    sync -f "$ROOTFS_MOUNT/usr/local/bin/tarit-clone-repair-workload"
+  fi
+  if [ -n "$GUEST_AGENT_BIN" ]; then
+    install -D -m 0755 "$GUEST_AGENT_BIN" "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+    sync -f "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  fi
+  umount "$ROOTFS_MOUNT"
+  ROOTFS_MOUNT=""
+  e2fsck -pf "$STAGED_ROOTFS" >/dev/null
+fi
 chmod 0444 "$STAGED_ROOTFS"
 ROOTFS="$STAGED_ROOTFS"
 
 cleanup() {
   local status=$?
+  if [ -n "$ROOTFS_MOUNT" ] && mountpoint -q "$ROOTFS_MOUNT"; then
+    umount "$ROOTFS_MOUNT" || true
+  fi
   if [ -n "$TARITD_PGID" ] && kill -0 -- "-$TARITD_PGID" 2>/dev/null; then
     kill -TERM -- "-$TARITD_PGID" 2>/dev/null || true
     for _ in $(seq 1 80); do
@@ -154,7 +190,8 @@ for _ in $(seq 1 100); do
 done
 curl -fsS "$BASE_URL/health" >/dev/null
 
-python3 "$ROOT/orch/tests/lifecycle_state_machine.py" \
+read -r -a DRIVER_ARGS <<<"${TARIT_LIFECYCLE_DRIVER_ARGS:-}"
+python3 "$DRIVER" \
   --base-url "$BASE_URL" \
   --api-key "$KEY" \
   --database "$DIR/fleet.db" \
@@ -164,7 +201,8 @@ python3 "$ROOT/orch/tests/lifecycle_state_machine.py" \
   --max-vms "$MAX_VMS" \
   --max-snapshots "${TARIT_LIFECYCLE_MAX_SNAPSHOTS:-8}" \
   --seeds "${TARIT_LIFECYCLE_SEEDS:-7,202609,424242}" \
-  --steps "${TARIT_LIFECYCLE_STEPS:-20}"
+  --steps "${TARIT_LIFECYCLE_STEPS:-20}" \
+  "${DRIVER_ARGS[@]}"
 
 if pgrep -f -- "${VMM} serve .*${DIR}" >/dev/null; then
   echo "FAIL: lifecycle state-machine left a VMM process" >&2

@@ -2286,8 +2286,37 @@ fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
                     ));
                 }
                 Some(Ok((exit_code, _, stderr, _))) => {
+                    let stage = if exit_code == -1 {
+                        let diagnostic = controller
+                            .exec(
+                                "pid=$(cat /run/tarit/clone-workload.pid 2>/dev/null || true); \
+                                 printf 'stage='; cat /run/tarit/clone-repair-stage 2>/dev/null || true; \
+                                 printf 'clone_id='; cat /run/tarit/clone-id 2>/dev/null || true; \
+                                 printf 'workload_repaired='; cat /run/tarit/clone-workload-repaired 2>/dev/null || true; \
+                                 printf 'pid=%s\\n' \"$pid\"; \
+                                 if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then \
+                                   printf 'wchan='; cat \"/proc/$pid/wchan\" 2>/dev/null || true; printf '\\n'; \
+                                   grep -E '^(State|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):' \"/proc/$pid/status\" 2>/dev/null || true; \
+                                 fi",
+                                5000,
+                            )
+                            .ok()
+                            .and_then(|(code, stdout, _, _)| (code == 0).then_some(stdout));
+                        if let Some(diagnostic) = diagnostic.as_deref() {
+                            log::warn!("clone repair timeout diagnostic: {}", diagnostic.trim());
+                        }
+                        diagnostic
+                            .as_deref()
+                            .and_then(|value| value.lines().next())
+                            .and_then(|line| line.strip_prefix("stage="))
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("unavailable")
+                            .to_owned()
+                    } else {
+                        "reported".into()
+                    };
                     return Err(VmmError::Device(format!(
-                        "guest clone repair failed with status {exit_code}: {stderr}"
+                        "guest clone repair failed with status {exit_code} at stage {stage}: {stderr}"
                     )));
                 }
                 Some(Err(error)) => {

@@ -2396,7 +2396,11 @@ async fn resume_hibernated_local(
     {
         Ok(ticket) => ticket,
         Err(error @ OrchError::Conflict(_)) => {
-            if !state.supervisor.wait_for_registered_boot(id).await? {
+            if !state
+                .supervisor
+                .wait_for_registered_boot_or_running(id)
+                .await?
+            {
                 return Err(error);
             }
             let joined = vm_get(state, id)?;

@@ -368,6 +368,29 @@ The c8i rootfs must contain `curl`; `make guest` includes it. The deploy script
 records the remote daemon PID in `~/.taritd/taritd.pid` and verifies the process
 identity before stopping a prior run.
 
+## Continuous lifecycle qualification
+
+`tests/continuous_mixed_oci_soak.sh` runs one bounded epoch at a time while
+keeping three guest workloads active. It rotates entries from a case file with
+the format `name|kernel|rootfs`, writes per-operation JSONL logs, keeps at most
+one snapshot per epoch, checks a configurable free-space floor, and stops on the
+first failure. `tests/tarit-continuous-soak.service` is the c8i systemd unit.
+
+Required environment entries are `TARIT_CONTINUOUS_CASES_FILE`,
+`TARITD_BIN`, `TARIT_VMM_BIN`, and `TARIT_TEST_GUEST_AGENT_BIN`. The case file
+and environment file belong under `/etc/tarit` with mode `0600`. The service is
+intentionally not configured to restart after failure; inspect the latest file
+under `/t/tarit-continuous-soak/history` before restarting it.
+
+```sh
+sudo systemctl status tarit-continuous-soak
+sudo journalctl -u tarit-continuous-soak -n 100 --no-pager
+sudo systemctl stop tarit-continuous-soak
+```
+
+Manual KVM gates use the same global lock. Stop the service before running a
+manual gate rather than bypassing the lock.
+
 ## Benchmarks
 
 `tarit-bench` exercises create, execute, poll, and delete flows and writes reports under `./bench-results` by default.
