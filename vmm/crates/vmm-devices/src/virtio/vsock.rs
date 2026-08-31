@@ -312,6 +312,13 @@ pub struct VirtioVsockMmio {
 }
 
 impl VirtioVsockMmio {
+    /// Permanently fail the transport after its isolated pump exits or cannot
+    /// acknowledge quiescence. Control-channel failure must be explicit and
+    /// must prevent a later snapshot from publishing incomplete device state.
+    pub fn fail_worker(&self, context: &str) {
+        self.fail_device(context);
+    }
+
     fn fail_device(&self, context: &str) {
         log::error!("virtio-vsock: {context}");
         self.status.fetch_or(
@@ -1435,6 +1442,16 @@ mod tests {
 
     fn new_mem() -> Arc<GuestMemoryMmap> {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap())
+    }
+
+    #[test]
+    fn worker_failure_marks_transport_failed_and_unsnapshotable() {
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+
+        dev.fail_worker("test worker exit");
+
+        assert_ne!(dev.current_status() & status_bits::FAILED, 0);
+        assert!(Persist::try_save(&dev).is_err());
     }
 
     #[test]

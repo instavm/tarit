@@ -162,6 +162,13 @@ pub struct VirtioNetMmio {
 }
 
 impl VirtioNetMmio {
+    /// Permanently fail the transport after its isolated queue worker exits or
+    /// cannot acknowledge quiescence. A later snapshot must not serialize a
+    /// VM whose network worker can still mutate memory or cannot make progress.
+    pub fn fail_worker(&self, context: &str) {
+        self.fail_device(context);
+    }
+
     fn fail_device(&self, context: &str) {
         log::error!("virtio-net: {context}");
         self.status.fetch_or(
@@ -821,6 +828,16 @@ mod tests {
 
     fn new_mem() -> Arc<GuestMemoryMmap> {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap())
+    }
+
+    #[test]
+    fn worker_failure_marks_transport_failed_and_unsnapshotable() {
+        let dev = VirtioNetMmio::new(6, [0x02, 0, 0, 0, 0, 1]);
+
+        dev.fail_worker("test worker exit");
+
+        assert_ne!(dev.current_status() & status_bits::FAILED, 0);
+        assert!(Persist::try_save(&dev).is_err());
     }
 
     #[test]

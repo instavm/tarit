@@ -60,6 +60,7 @@ impl NetIoLoop {
     /// after this drain.
     pub fn pause(&self) -> io::Result<()> {
         if self.thread_gone() {
+            self.fail_if_unexpected_exit();
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "network I/O worker exited before quiescence",
@@ -70,6 +71,7 @@ impl NetIoLoop {
         let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
         while !self.pause_ack.load(Ordering::SeqCst) {
             if self.thread_gone() {
+                self.fail_if_unexpected_exit();
                 self.pause_req.store(false, Ordering::SeqCst);
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -78,6 +80,8 @@ impl NetIoLoop {
             }
             if std::time::Instant::now() >= deadline {
                 self.pause_req.store(false, Ordering::SeqCst);
+                self.device
+                    .fail_worker("network I/O worker quiescence timed out");
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "network I/O worker quiescence timed out",
@@ -96,6 +100,13 @@ impl NetIoLoop {
 
     fn thread_gone(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+
+    fn fail_if_unexpected_exit(&self) {
+        if !self.stop.load(Ordering::SeqCst) {
+            self.device
+                .fail_worker("network I/O worker is not running during quiescence");
+        }
     }
 }
 
@@ -123,23 +134,35 @@ pub fn spawn_net_io_loop(
     let pause_ack_t = pause_ack.clone();
     let wake_fd = wake_evt.as_raw_fd();
     let device_t = device.clone();
+    let health_device = device.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     let handle = std::thread::Builder::new()
         .name("virtio-net-io".into())
         .spawn(move || {
-            run(
-                WorkerControl {
-                    stop: stop_t,
-                    pause_req: pause_req_t,
-                    pause_ack: pause_ack_t,
-                    ready_tx,
-                },
-                device_t,
-                tap_fd,
-                tx_kick_fd,
-                wake_fd,
-            );
+            let stop_health = Arc::clone(&stop_t);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    WorkerControl {
+                        stop: stop_t,
+                        pause_req: pause_req_t,
+                        pause_ack: pause_ack_t,
+                        ready_tx,
+                    },
+                    device_t,
+                    tap_fd,
+                    tx_kick_fd,
+                    wake_fd,
+                );
+            }));
+            if !stop_health.load(Ordering::SeqCst) {
+                let context = if outcome.is_err() {
+                    "network I/O worker panicked"
+                } else {
+                    "network I/O worker exited unexpectedly"
+                };
+                health_device.fail_worker(context);
+            }
         })?;
 
     match ready_rx.recv() {

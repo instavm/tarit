@@ -57,6 +57,7 @@ impl VsockPump {
     /// drain.
     pub fn pause(&self) -> io::Result<()> {
         if self.thread_gone() {
+            self.fail_if_unexpected_exit();
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "vsock worker exited before quiescence",
@@ -67,6 +68,7 @@ impl VsockPump {
         let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
         while !self.pause_ack.load(Ordering::SeqCst) {
             if self.thread_gone() {
+                self.fail_if_unexpected_exit();
                 self.pause_req.store(false, Ordering::SeqCst);
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -75,6 +77,7 @@ impl VsockPump {
             }
             if std::time::Instant::now() >= deadline {
                 self.pause_req.store(false, Ordering::SeqCst);
+                self.device.fail_worker("vsock worker quiescence timed out");
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "vsock worker quiescence timed out",
@@ -93,6 +96,13 @@ impl VsockPump {
 
     fn thread_gone(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+
+    fn fail_if_unexpected_exit(&self) {
+        if !self.stop.load(Ordering::SeqCst) {
+            self.device
+                .fail_worker("vsock worker is not running during quiescence");
+        }
     }
 }
 
@@ -121,6 +131,7 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
     let pause_req_t = pause_req.clone();
     let pause_ack_t = pause_ack.clone();
     let device_t = device.clone();
+    let health_device = device.clone();
     let wake_evt = EventFd::new(libc::EFD_NONBLOCK)?;
     let wake_fd = wake_evt.as_raw_fd();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -128,15 +139,26 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
     let handle = std::thread::Builder::new()
         .name("virtio-vsock-pump".into())
         .spawn(move || {
-            run(
-                stop_t,
-                pause_req_t,
-                pause_ack_t,
-                device_t,
-                tx_kick_fd,
-                wake_fd,
-                ready_tx,
-            );
+            let stop_health = Arc::clone(&stop_t);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    stop_t,
+                    pause_req_t,
+                    pause_ack_t,
+                    device_t,
+                    tx_kick_fd,
+                    wake_fd,
+                    ready_tx,
+                );
+            }));
+            if !stop_health.load(Ordering::SeqCst) {
+                let context = if outcome.is_err() {
+                    "vsock worker panicked"
+                } else {
+                    "vsock worker exited unexpectedly"
+                };
+                health_device.fail_worker(context);
+            }
         })?;
 
     match ready_rx.recv() {
