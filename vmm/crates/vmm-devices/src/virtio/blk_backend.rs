@@ -465,7 +465,7 @@ fn backing_size_bytes(file: &File) -> Result<u64, BlkBackendError> {
     }
     #[cfg(target_os = "linux")]
     if metadata.file_type().is_block_device() {
-        const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+        const BLKGETSIZE64: libc::Ioctl = 0x8008_1272_u32 as libc::Ioctl;
         let mut bytes = 0_u64;
         if unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut bytes) } < 0 {
             return Err(io::Error::last_os_error().into());

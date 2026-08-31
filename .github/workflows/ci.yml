@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   musl:
-    name: check attached volumes (musl)
+    name: build release targets (musl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -24,9 +24,25 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      - name: Install zig
+        uses: mlugg/setup-zig@53fc45b17fe98b52f92ee5ea08ff48a85a3e7eb7 # v1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-zigbuild
+
       - name: Check attached volume portability
         working-directory: orch
         run: cargo check --locked --target x86_64-unknown-linux-musl -p tarit-volume
+
+      - name: Build VMM release target
+        working-directory: vmm
+        run: >-
+          cargo zigbuild --locked --target x86_64-unknown-linux-musl
+          -p vmm --features boot
 
   sdk:
     name: generate / type-check / test (SDKs)
