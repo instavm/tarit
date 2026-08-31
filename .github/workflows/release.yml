@@ -1,11 +1,12 @@
 name: Release
 
-# Builds static (musl) x86_64 Linux binaries for the orchestrator (taritd) and
-# the microVM manager (vmm), then publishes them as a GitHub Release.
+# Builds static (musl) x86_64 Linux binaries plus Python and TypeScript SDK
+# packages. Tag runs publish the binaries as a GitHub Release, then publish the
+# coordinated SDK version through registry-trusted OIDC identities.
 #
 # Triggered by pushing a version tag (e.g. `v0.1.0`). A manual `workflow_dispatch`
-# run only builds and uploads the binaries as workflow artifacts; it never
-# creates a Release, so the build can be validated before cutting a real tag.
+# run only builds, verifies, attests, and uploads artifacts; it never publishes,
+# so the complete package path can be validated before cutting a real tag.
 
 on:
   push:
@@ -133,9 +134,106 @@ jobs:
           name: linux-x86_64-musl
           path: dist/
 
+  sdk:
+    name: Build and verify SDK packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+
+      - name: Install SDK toolchains
+        run: |
+          python -m pip install uv==0.9.30
+          npm install --global npm@11.5.1
+          npm ci --prefix sdk/typescript
+
+      - name: Verify coordinated release version
+        id: version
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            args+=(--tag "$GITHUB_REF_NAME")
+          fi
+          version=$(python sdk/verify_release.py "${args[@]}")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify generated clients and tests
+        run: |
+          set -euo pipefail
+          ./sdk/generate.sh
+          git diff --exit-code -- sdk/python sdk/typescript/src/generated sdk/typescript/LICENSE
+          uv run --project sdk/python --with mypy==2.3.1 mypy --strict \
+            sdk/python/tarit_sdk/high_level.py sdk/verify_release.py
+          uvx --from ruff==0.16.5 ruff check \
+            sdk/python-high-level sdk/python/tarit_sdk sdk/tests/python sdk/verify_release.py
+          uv run --project sdk/python python -m unittest discover -s sdk/tests/python -v
+          npm --prefix sdk/typescript run check
+          npm --prefix sdk/typescript test
+
+      - name: Build SDK packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist/sdk-packages/python dist/sdk-packages/typescript
+          uv build --project sdk/python --out-dir "$PWD/dist/sdk-packages/python"
+          npm --prefix sdk/typescript run build
+          npm pack ./sdk/typescript --pack-destination dist/sdk-packages/typescript
+
+      - name: Inspect and install SDK packages
+        env:
+          SDK_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          uvx --from twine==6.2.0 twine check dist/sdk-packages/python/*
+          npm publish --dry-run --access public \
+            "dist/sdk-packages/typescript/tarit-sdk-${SDK_VERSION}.tgz"
+          python -m venv "$RUNNER_TEMP/tarit-python-smoke"
+          "$RUNNER_TEMP/tarit-python-smoke/bin/pip" install dist/sdk-packages/python/*.whl
+          "$RUNNER_TEMP/tarit-python-smoke/bin/python" -c \
+            'from tarit_sdk.high_level import AsyncTaritClient, TaritClient; assert TaritClient and AsyncTaritClient'
+          mkdir -p "$RUNNER_TEMP/tarit-typescript-smoke"
+          npm install --ignore-scripts --prefix "$RUNNER_TEMP/tarit-typescript-smoke" \
+            "dist/sdk-packages/typescript/tarit-sdk-${SDK_VERSION}.tgz"
+          cd "$RUNNER_TEMP/tarit-typescript-smoke"
+          node --input-type=module -e \
+            'import("@tarit/sdk").then(({ TaritClient }) => { if (!TaritClient) process.exit(1); })'
+
+      - name: Generate SDK checksums
+        run: |
+          set -euo pipefail
+          cd dist/sdk-packages
+          sha256sum python/* typescript/* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest SDK packages
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: dist/sdk-packages/**
+
+      - name: Upload SDK packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-packages
+          path: dist/sdk-packages/
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, sdk]
     # Only real tag pushes publish a Release; manual dispatch (even against a
     # tag ref) stops after the build job above.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -168,3 +266,56 @@ jobs:
             - `tarit.spdx.json` — SPDX software bill of materials
 
             Verify with `sha256sum -c SHA256SUMS`. Booting microVMs requires Linux with `/dev/kvm`.
+
+  pypi:
+    name: Publish Python SDK
+    needs: [sdk, release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download SDK packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-packages
+          path: dist/sdk-packages
+
+      - name: Publish Python package
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/sdk-packages/python/
+
+  npm:
+    name: Publish TypeScript SDK
+    needs: [sdk, release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      - name: Install trusted-publishing npm client
+        run: npm install --global npm@11.5.1
+
+      - name: Download SDK packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sdk-packages
+          path: dist/sdk-packages
+
+      - name: Publish TypeScript package
+        env:
+          SDK_VERSION: ${{ needs.sdk.outputs.version }}
+        run: >-
+          npm publish
+          "dist/sdk-packages/typescript/tarit-sdk-${SDK_VERSION}.tgz"
+          --access public

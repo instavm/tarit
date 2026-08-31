@@ -22,6 +22,8 @@ uvx --from "openapi-python-client==$PYTHON_CLIENT_VERSION" openapi-python-client
   --fail-on-warning
 install -m 0644 "$ROOT/sdk/python-high-level/high_level.py" \
   "$ROOT/sdk/python/tarit_sdk/high_level.py"
+install -m 0644 "$ROOT/LICENSE" "$ROOT/sdk/python/LICENSE"
+install -m 0644 "$ROOT/LICENSE" "$ROOT/sdk/typescript/LICENSE"
 uvx --from "ruff==$RUFF_VERSION" ruff check --fix-only "$ROOT/sdk/python"
 uvx --from "ruff==$RUFF_VERSION" ruff format "$ROOT/sdk/python"
 

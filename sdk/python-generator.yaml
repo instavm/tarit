@@ -1,6 +1,6 @@
 project_name_override: tarit-sdk
 package_name_override: tarit_sdk
-package_version_override: 0.1.0
+package_version_override: 0.1.2
 literal_enums: true
 content_type_overrides:
   application/yaml: text/plain

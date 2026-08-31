@@ -1,10 +1,25 @@
 {
   "name": "@tarit/sdk",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Typed client for the Tarit Orchestrator API",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/instavm/tarit.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/instavm/tarit#readme",
+  "bugs": {
+    "url": "https://github.com/instavm/tarit/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "exports": {
     ".": {

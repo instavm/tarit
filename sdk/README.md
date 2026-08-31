@@ -10,6 +10,30 @@ polling, stable-child-id retry for live forks, and bounded PTY/WebSocket session
 Run `./sdk/generate.sh` from the repository root. Generator versions are pinned
 in that script. CI regenerates both clients and rejects any diff.
 
+## Versioning and publication
+
+The SDKs and server use one release version. `python sdk/verify_release.py`
+rejects disagreement between the protocol, VMM, orchestrator, Python generator,
+Python package, TypeScript package, and npm lock. A release tag must be exactly
+`vMAJOR.MINOR.PATCH` for that version.
+
+Manual runs of the Release workflow build, inspect, install, checksum, attest,
+and retain both SDK packages without publishing them. A matching protected tag
+publishes only after the binary and SDK build jobs succeed. Registry publication
+uses short-lived OIDC credentials; no PyPI or npm write token is stored in the
+repository.
+
+Before the first package release, configure these trusted publishers and protect
+both environments with required reviewers:
+
+- PyPI project `tarit-sdk`: repository `instavm/tarit`, workflow `release.yml`,
+  environment `pypi`.
+- npm package `@tarit/sdk`: repository `instavm/tarit`, workflow `release.yml`,
+  environment `npm`, allowed action `npm publish`.
+
+The npm organization must own the `@tarit` scope. Protect release tags so only
+the release owners can create them.
+
 ## Python
 
 The package in `sdk/python` supports Python 3.11 and later.
