@@ -401,6 +401,26 @@ impl VmmController {
             .map_err(|error| VmmError::Device(format!("set block service delay: {error}")))
     }
 
+    /// Return the number of requests currently held in one block device's
+    /// test-only latency injection point.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "linux",
+        feature = "boot",
+        feature = "test-failpoints"
+    ))]
+    pub fn test_block_delayed_services(&self, volume_index: usize) -> Result<usize> {
+        let slot = self.lock();
+        let running = slot
+            .as_ref()
+            .and_then(|vm| vm.running.as_ref())
+            .ok_or_else(|| VmmError::InvalidConfig("no running VM".into()))?;
+        let device = running.blk_devices.get(volume_index).ok_or_else(|| {
+            VmmError::InvalidConfig(format!("volume index {volume_index} is out of range"))
+        })?;
+        Ok(device.test_delayed_services())
+    }
+
     /// Pause and immediately resume only the vCPUs. Used to prove that a slow
     /// storage backend cannot occupy the KVM execution/control thread.
     #[cfg(all(

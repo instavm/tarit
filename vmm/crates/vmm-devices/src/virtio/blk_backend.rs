@@ -414,27 +414,18 @@ pub struct BlkBackend {
     pub sectors: u64,
     #[cfg(feature = "test-failpoints")]
     service_delay: std::time::Duration,
+    #[cfg(feature = "test-failpoints")]
+    delayed_services: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(feature = "test-failpoints")]
-static TEST_DELAYED_SERVICES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(feature = "test-failpoints")]
-struct DelayedServiceGuard;
+struct DelayedServiceGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
 #[cfg(feature = "test-failpoints")]
 impl Drop for DelayedServiceGuard {
     fn drop(&mut self) {
-        TEST_DELAYED_SERVICES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-/// Number of block service calls currently held in the test-only latency
-/// injection point.
-#[cfg(feature = "test-failpoints")]
-pub fn test_delayed_services() -> usize {
-    TEST_DELAYED_SERVICES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(unix)]
@@ -520,6 +511,8 @@ impl BlkBackend {
             sectors,
             #[cfg(feature = "test-failpoints")]
             service_delay: std::time::Duration::ZERO,
+            #[cfg(feature = "test-failpoints")]
+            delayed_services: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -559,12 +552,21 @@ impl BlkBackend {
             sectors,
             #[cfg(feature = "test-failpoints")]
             service_delay: std::time::Duration::ZERO,
+            #[cfg(feature = "test-failpoints")]
+            delayed_services: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
     #[cfg(feature = "test-failpoints")]
     pub fn set_test_service_delay(&mut self, delay: std::time::Duration) {
         self.service_delay = delay;
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) fn test_delayed_services_counter(
+        &self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.delayed_services)
     }
 
     /// Service a single block request.
@@ -578,8 +580,9 @@ impl BlkBackend {
         let _delay_guard = if self.service_delay.is_zero() {
             None
         } else {
-            TEST_DELAYED_SERVICES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let guard = DelayedServiceGuard;
+            self.delayed_services
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = DelayedServiceGuard(std::sync::Arc::clone(&self.delayed_services));
             std::thread::sleep(self.service_delay);
             Some(guard)
         };

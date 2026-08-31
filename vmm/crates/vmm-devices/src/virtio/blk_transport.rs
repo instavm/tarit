@@ -148,6 +148,8 @@ pub struct VirtioBlkMmio {
     /// Set by the VMM after registering the irqfd with KVM (Linux only).
     #[cfg(target_os = "linux")]
     irq_evt: Mutex<Option<vmm_sys_util::eventfd::EventFd>>,
+    #[cfg(feature = "test-failpoints")]
+    delayed_services: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Diagnostic counter: number of QUEUE_NOTIFY writes received from the
     /// guest. Used by the OCI-boot-to-login probe to distinguish "guest never
     /// kicked the queue" (driver didn't activate) from "queue kicked but
@@ -173,6 +175,11 @@ impl VirtioBlkMmio {
         let backend = backend.as_mut().ok_or(MmioError::Device)?;
         backend.set_test_service_delay(delay);
         Ok(())
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub fn test_delayed_services(&self) -> usize {
+        self.delayed_services.load(Ordering::SeqCst)
     }
 
     fn fail_device(&self, context: &str) {
@@ -281,6 +288,8 @@ impl VirtioBlkMmio {
 
     /// Create a new virtio-blk MMIO device with a file-backed backend.
     pub fn new(irq: u32, backend: BlkBackend) -> Self {
+        #[cfg(feature = "test-failpoints")]
+        let delayed_services = backend.test_delayed_services_counter();
         Self {
             irq,
             device_id: 2,
@@ -302,6 +311,8 @@ impl VirtioBlkMmio {
             interrupt_status: AtomicU32::new(0),
             #[cfg(target_os = "linux")]
             irq_evt: Mutex::new(None),
+            #[cfg(feature = "test-failpoints")]
+            delayed_services,
             notify_count: AtomicU64::new(0),
             status_writes: AtomicU64::new(0),
         }
@@ -330,6 +341,8 @@ impl VirtioBlkMmio {
             interrupt_status: AtomicU32::new(0),
             #[cfg(target_os = "linux")]
             irq_evt: Mutex::new(None),
+            #[cfg(feature = "test-failpoints")]
+            delayed_services: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             notify_count: AtomicU64::new(0),
             status_writes: AtomicU64::new(0),
         }
@@ -1253,6 +1266,44 @@ mod tests {
 
         assert_eq!(used_idx(&mem), 2);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn delayed_service_counters_are_isolated_per_device() {
+        let (backend_a, path_a) = new_test_backend("blk-delay-a");
+        let (backend_b, path_b) = new_test_backend("blk-delay-b");
+        let mem_a = new_test_mem();
+        let mem_b = new_test_mem();
+        let dev_a = Arc::new(VirtioBlkMmio::new(5, backend_a));
+        let dev_b = VirtioBlkMmio::new(6, backend_b);
+        configure_test_blk_queue(&dev_a, mem_a.clone());
+        configure_test_blk_queue(&dev_b, mem_b.clone());
+        setup_blk_out_requests(&mem_a, 1);
+        setup_blk_out_requests(&mem_b, 1);
+        dev_a
+            .set_test_service_delay(std::time::Duration::from_millis(100))
+            .unwrap();
+
+        let delayed = Arc::clone(&dev_a);
+        let worker = std::thread::spawn(move || delayed.process_queue(0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while dev_a.test_delayed_services() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "delayed request did not reach its device-local failpoint"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(dev_a.test_delayed_services(), 1);
+        assert_eq!(dev_b.test_delayed_services(), 0);
+
+        worker.join().unwrap().unwrap();
+        assert_eq!(dev_a.test_delayed_services(), 0);
+        assert_eq!(dev_b.test_delayed_services(), 0);
+        dev_b.process_queue(0).unwrap();
+        std::fs::remove_file(path_a).unwrap();
+        std::fs::remove_file(path_b).unwrap();
     }
 
     #[test]

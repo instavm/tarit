@@ -18,9 +18,13 @@ use vmm_core::controller::VmmController;
 mod test_support;
 use test_support::{agent_vm_config, guest_stdout};
 
-fn wait_for_delayed_service() {
+fn wait_for_delayed_service(controller: &VmmController, volume_index: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while vmm_devices::virtio::blk_backend::test_delayed_services() == 0 {
+    while controller
+        .test_block_delayed_services(volume_index)
+        .expect("read delayed block request count")
+        == 0
+    {
         assert!(
             Instant::now() < deadline,
             "delayed block request never started"
@@ -71,7 +75,7 @@ fn delayed_volume_io_isolated_from_vcpu_and_quiesced_for_snapshot() {
             15_000,
         )
     });
-    wait_for_delayed_service();
+    wait_for_delayed_service(&controller, 1);
 
     let pause_started = Instant::now();
     controller
@@ -95,7 +99,7 @@ fn delayed_volume_io_isolated_from_vcpu_and_quiesced_for_snapshot() {
             15_000,
         )
     });
-    wait_for_delayed_service();
+    wait_for_delayed_service(&controller, 1);
     let snapshot_started = Instant::now();
     let snapshot = controller
         .snapshot(false)
@@ -164,7 +168,7 @@ fn storage_quiescence_timeout_fails_snapshot_and_resumes_source() {
             20_000,
         )
     });
-    wait_for_delayed_service();
+    wait_for_delayed_service(&controller, 1);
 
     let snapshot_started = Instant::now();
     let error = controller
