@@ -1310,6 +1310,12 @@ paths:
             schema:
               $ref: "#/components/schemas/ForkVmRequest"
       responses:
+        "200":
+          description: Exact idempotent replay of an already ready child VM
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForkVmResponse"
         "201":
           description: Ready isolated child VM
           content:

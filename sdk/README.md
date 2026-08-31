@@ -57,6 +57,11 @@ with TaritClient("https://tarit.example", "tenant-api-key") as tarit:
 Generated models and operation modules remain available under `tarit_sdk.models`
 and `tarit_sdk.api`.
 
+The protected-main KVM workflow runs `sdk/tests/e2e_kvm.sh` against a disposable
+multi-tenant server. It verifies synchronous and asynchronous Python calls,
+TypeScript calls, stable-child fork replay, hibernate-to-PTY activation, and
+cross-tenant denial through the public API.
+
 ## TypeScript
 
 The package in `sdk/typescript` supports Node.js 20 and later and browser fetch

@@ -124,6 +124,15 @@ class SyncClientTests(unittest.TestCase):
         self.assertEqual(result.vm.id, CHILD_ID)
         self.assertEqual(bodies, [{"id": str(CHILD_ID)}, {"id": str(CHILD_ID)}])
 
+    def test_fork_accepts_an_idempotent_replay_response(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=fork_result())
+
+        with TaritClient("https://tarit.test", "tenant-key", transport=httpx.MockTransport(handler)) as client:
+            result = client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=1)
+        self.assertEqual(result.source_vm_id, VM_ID)
+        self.assertEqual(result.vm.id, CHILD_ID)
+
     def test_tenant_denial_is_typed(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(403, json={"error": "VM belongs to another tenant"})
@@ -226,6 +235,17 @@ class SyncClientTests(unittest.TestCase):
 
 
 class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fork_accepts_an_idempotent_replay_response(self) -> None:
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=fork_result())
+
+        async with AsyncTaritClient(
+            "https://tarit.test", "tenant-key", transport=httpx.MockTransport(handler)
+        ) as client:
+            result = await client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=1)
+        self.assertEqual(result.source_vm_id, VM_ID)
+        self.assertEqual(result.vm.id, CHILD_ID)
+
     async def test_execute_polls_to_terminal(self) -> None:
         polls = 0
 

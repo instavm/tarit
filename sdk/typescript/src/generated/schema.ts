@@ -2399,6 +2399,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Exact idempotent replay of an already ready child VM */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForkVmResponse"];
+                };
+            };
             /** @description Ready isolated child VM */
             201: {
                 headers: {

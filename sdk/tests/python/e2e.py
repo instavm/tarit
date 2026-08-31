@@ -12,6 +12,7 @@ from tarit_sdk.high_level import (
     TaritApiError,
     TaritClient,
 )
+from tarit_sdk.types import UNSET
 
 
 def required(name: str) -> str:
@@ -21,10 +22,30 @@ def required(name: str) -> str:
     return value
 
 
-async def async_execution(base_url: str, api_key: str, vm_id: UUID) -> None:
+async def async_execution(base_url: str, api_key: str, vm_id: UUID, child_id: UUID) -> None:
     async with AsyncTaritClient(base_url, api_key) as client:
         record = await client.execute(vm_id, "printf python-async-ok", poll_interval=0.02)
         assert record.status == "completed" and record.exit_code == 0 and record.stdout == "python-async-ok", record
+        replay = await client.fork(vm_id, child_id=child_id, deadline_seconds=30)
+        assert replay.vm.id == child_id and replay.vm.status == "running", replay
+        assert replay.metrics is UNSET, replay
+
+        output = bytearray()
+        pty = await client.open_pty(vm_id, shell="/bin/sh", cols=80, rows=24, deadline_seconds=30)
+        try:
+            await pty.resize(cols=103, rows=33)
+            await pty.write(b"stty size; printf python-async-pty-ok; exit 0\n")
+            while True:
+                message = await pty.read(timeout=30)
+                if isinstance(message, PtyData):
+                    output.extend(message.data)
+                    continue
+                assert isinstance(message, PtyExit) and message.exit_code == 0, message
+                break
+        finally:
+            await pty.close()
+        normalized_output = bytes(output).replace(b"\r", b"")
+        assert b"33 103" in normalized_output and b"python-async-pty-ok" in normalized_output, normalized_output
 
 
 def main() -> None:
@@ -41,6 +62,9 @@ def main() -> None:
         )
         fork = client.fork(vm_id, child_id=child_id, deadline_seconds=30)
         assert fork.source_vm_id == vm_id and fork.vm.id == child_id and fork.vm.status == "running", fork
+        replay = client.fork(vm_id, child_id=child_id, deadline_seconds=30)
+        assert replay.source_vm_id == vm_id and replay.vm.id == child_id and replay.vm.status == "running", replay
+        assert replay.metrics is UNSET, replay
         child_execution = client.execute(child_id, "printf python-fork-ok", poll_interval=0.02)
         assert child_execution.status == "completed" and child_execution.stdout == "python-fork-ok", child_execution
 
@@ -62,17 +86,27 @@ def main() -> None:
         normalized_output = bytes(output).replace(b"\r", b"")
         assert b"31 101" in normalized_output and b"python-pty-wake-ok" in normalized_output, normalized_output
 
-    asyncio.run(async_execution(base_url, tenant_key, vm_id))
+    asyncio.run(async_execution(base_url, tenant_key, vm_id, child_id))
 
     with TaritClient(base_url, foreign_key) as foreign:
-        try:
-            foreign.wait_execution(execution.id, poll_interval=0)
-        except TaritApiError as error:
-            assert error.status_code == 403, error
-        else:
-            raise AssertionError("foreign tenant read another tenant's execution")
+        denied = (
+            ("read execution", lambda: foreign.wait_execution(execution.id, poll_interval=0)),
+            ("execute", lambda: foreign.execute(vm_id, "true", poll_interval=0)),
+            ("fork", lambda: foreign.fork(vm_id, child_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))),
+            ("open PTY", lambda: foreign.open_pty(vm_id, deadline_seconds=5)),
+        )
+        for operation, call in denied:
+            try:
+                call()
+            except TaritApiError as error:
+                assert error.status_code == 403, (operation, error)
+            else:
+                raise AssertionError(f"foreign tenant could {operation}")
 
-    print(f"PYTHON_SDK_E2E_PASS source={vm_id} child={child_id} hibernate_pty_wake=pass")
+    print(
+        f"PYTHON_SDK_E2E_PASS source={vm_id} child={child_id} async=execute,fork,pty "
+        "fork_replay=pass tenant_denials=4 hibernate_pty_wake=pass"
+    )
 
 
 if __name__ == "__main__":

@@ -457,7 +457,9 @@ export class TaritClient {
           body: { id: childId },
           signal: controller.signal,
         });
-        if (result.response.status === 201 && result.data !== undefined) return result.data;
+        if ((result.response.status === 200 || result.response.status === 201) && result.data !== undefined) {
+          return result.data;
+        }
         if (!RETRYABLE_STATUS.has(result.response.status)) {
           throw new TaritApiError(
             "fork VM",

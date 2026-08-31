@@ -112,6 +112,28 @@ test("fork overload retry reuses one child id", async () => {
   assert.deepEqual(bodies, [{ id: childId }, { id: childId }]);
 });
 
+test("fork accepts an idempotent replay response", async () => {
+  const fetch: typeof globalThis.fetch = async () =>
+    json(200, {
+      source_vm_id: vmId,
+      vm: {
+        id: childId,
+        status: "running",
+        revision: 1,
+        memory_mib: 256,
+        vcpus: 1,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+
+  const result = await client.fork(vmId, { childId, deadlineMs: 1_000 });
+
+  assert.equal(result.source_vm_id, vmId);
+  assert.equal(result.vm.id, childId);
+});
+
 test("tenant denial raises a typed error", async () => {
   const fetch: typeof globalThis.fetch = async () => json(403, { error: "VM belongs to another tenant" });
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
