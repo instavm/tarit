@@ -206,7 +206,7 @@ class PtyConnection:
         close_error: Exception | None = None
         try:
             self._websocket.close()
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             close_error = error
         try:
             if delete_session:
@@ -265,7 +265,7 @@ class AsyncPtyConnection:
         close_error: Exception | None = None
         try:
             await self._websocket.close()
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001
             close_error = error
         try:
             if delete_session:
@@ -366,7 +366,7 @@ class TaritClient:
         except Exception as error:
             try:
                 self._delete_pty_session(vm_id, session.pty_id)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
             raise TaritPtyConnectionError("PTY WebSocket connection failed") from error
         return PtyConnection(self, vm_id, session.pty_id, websocket)
@@ -524,7 +524,7 @@ class AsyncTaritClient:
         except Exception as error:
             try:
                 await self._delete_pty_session(vm_id, session.pty_id)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
             raise TaritPtyConnectionError("PTY WebSocket connection failed") from error
         return AsyncPtyConnection(self, vm_id, session.pty_id, websocket)

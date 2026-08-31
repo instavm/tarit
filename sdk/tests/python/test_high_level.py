@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import httpx
-
 from tarit_sdk.high_level import (
     AsyncTaritClient,
     PtyData,
@@ -167,13 +166,13 @@ class SyncClientTests(unittest.TestCase):
         with (
             patch("tarit_sdk.high_level.sync_websocket_connect", return_value=websocket) as connect,
             TaritClient("https://tarit.test/base", "tenant-key", transport=httpx.MockTransport(handler)) as client,
+            client.open_pty(VM_ID, cols=100, rows=40, shell="/bin/sh") as pty,
         ):
-            with client.open_pty(VM_ID, cols=100, rows=40, shell="/bin/sh") as pty:
-                self.assertEqual(pty.pty_id, PTY_ID)
-                pty.write("echo sdk-pty\n")
-                pty.resize(120, 50)
-                self.assertEqual(pty.read(), PtyData(b"prompt"))
-                self.assertEqual(pty.read(), PtyExit(7))
+            self.assertEqual(pty.pty_id, PTY_ID)
+            pty.write("echo sdk-pty\n")
+            pty.resize(120, 50)
+            self.assertEqual(pty.read(), PtyData(b"prompt"))
+            self.assertEqual(pty.read(), PtyExit(7))
 
         url = connect.call_args.args[0]
         self.assertEqual(

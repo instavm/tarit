@@ -5,7 +5,13 @@ import os
 from uuid import UUID
 
 from tarit_sdk.api.default import hibernate_vm
-from tarit_sdk.high_level import AsyncTaritClient, PtyData, PtyExit, TaritApiError, TaritClient
+from tarit_sdk.high_level import (
+    AsyncTaritClient,
+    PtyData,
+    PtyExit,
+    TaritApiError,
+    TaritClient,
+)
 
 
 def required(name: str) -> str:
