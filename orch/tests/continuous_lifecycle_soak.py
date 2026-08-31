@@ -982,7 +982,6 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         ]
         for action, vm_id in required_actions:
             self.run_action(action, vm_id)
-        deadline = time.monotonic() + self.args.duration_seconds
         action_by_name = {
             "assert": self.assert_anchor,
             "mutate": self.mutate,
@@ -1002,13 +1001,22 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
                 self.hibernate_resume, self.pause_resume, self.balloon,
                 self.concurrent_guest_work, self.contended_guest_agent_exec,
             ]
-        while time.monotonic() < deadline:
+        deadline = (
+            time.monotonic() + self.args.duration_seconds
+            if self.args.duration_seconds is not None else None
+        )
+        completed_steps = 0
+        while (
+            time.monotonic() < deadline
+            if deadline is not None else completed_steps < self.args.steps
+        ):
             vm_id = self.random.choice(list(self.anchors))
             available_actions = list(actions)
             if not self.args.actions and self.snapshots < self.args.max_snapshots:
                 available_actions.append(self.snapshot_restore)
             action = self.random.choice(available_actions)
             self.run_action(action, vm_id)
+            completed_steps += 1
             time.sleep(self.args.interval_seconds)
         if self.sentinel:
             self.finish_epoch_hibernation()
@@ -1018,6 +1026,8 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             "soak_pass", seed=self.args.seed, operations=self.operations,
             snapshots=self.snapshots, anchors=len(self.anchors),
             minimum_anchor_age_s=round(minimum_age, 3),
+            mode="duration" if deadline is not None else "steps",
+            completed_steps=completed_steps,
             actions=self.action_summary(),
         )
 
@@ -1034,7 +1044,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-snapshots", type=int, default=8)
     parser.add_argument("--seeds", default="7")
     parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--duration-seconds", type=int, default=1800)
+    parser.add_argument("--duration-seconds", type=int)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--anchors", type=int, default=3)
     parser.add_argument("--anchor-vcpus", default="1,2,4")
@@ -1063,7 +1073,12 @@ def parse_args() -> argparse.Namespace:
         "--epoch", type=int, default=int(os.environ.get("TARIT_LIFECYCLE_EPOCH", "0")),
     )
     args = parser.parse_args()
-    args.seed = int(args.seeds.split(",", 1)[0])
+    try:
+        args.seeds = [int(value) for value in args.seeds.split(",") if value]
+    except ValueError:
+        parser.error("seeds must be comma-separated non-negative integers")
+    if not args.seeds or any(value < 0 for value in args.seeds):
+        parser.error("seeds must be comma-separated non-negative integers")
     try:
         args.anchor_vcpus = [int(value) for value in args.anchor_vcpus.split(",")]
     except ValueError:
@@ -1081,8 +1096,14 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"unknown loop actions: {','.join(invalid_actions)}")
     else:
         args.actions = []
-    if args.duration_seconds < 60 or args.anchors < 2 or args.anchors > args.max_vms - 2:
-        parser.error("duration must be at least 60 seconds and anchors must leave two transient slots")
+    if args.steps < 1:
+        parser.error("steps must be at least one")
+    if args.duration_seconds is not None and args.duration_seconds < 60:
+        parser.error("duration must be at least 60 seconds")
+    if args.duration_seconds is not None and len(args.seeds) != 1:
+        parser.error("duration mode requires exactly one seed")
+    if args.anchors < 2 or args.anchors > args.max_vms - 2:
+        parser.error("anchors must leave two transient slots")
     if args.min_free_bytes < 0 or (args.min_free_bytes and not args.storage_path):
         parser.error("a non-negative storage floor requires --storage-path")
     if args.hibernate_hold_seconds and args.hibernate_hold_seconds <= args.guest_timer_seconds + 2:
@@ -1098,15 +1119,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    soak = Soak(args)
-    try:
-        soak.run()
-        return 0
-    except Exception as error:
-        soak.event("soak_failure", error=repr(error), operations=soak.operations)
-        raise
-    finally:
-        soak.cleanup()
+    for seed in args.seeds:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.seed = seed
+        soak = Soak(run_args)
+        try:
+            soak.run()
+        except Exception as error:
+            soak.event("soak_failure", error=repr(error), operations=soak.operations)
+            raise
+        finally:
+            soak.cleanup()
+    return 0
 
 
 if __name__ == "__main__":

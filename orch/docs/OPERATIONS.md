@@ -402,6 +402,11 @@ concurrency checks still run before the selected loop. For example,
 `--actions hibernate` repeatedly exercises scale-to-zero and execute-triggered
 resume without removing the baseline lifecycle checks.
 
+Without `--duration-seconds`, the lifecycle driver runs exactly `--steps`
+randomized actions for every value in `--seeds`. Duration mode is intended for
+continuous qualification and requires one explicit seed so a failure remains
+reproducible.
+
 When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
 creates a fourth logical VM, arms monotonic and realtime timers, and hibernates
 it while the three resident anchors continue working. At epoch completion,

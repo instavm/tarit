@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -196,6 +198,61 @@ class StatusPublicationTests(unittest.TestCase):
             soak.exec = lambda vm_id, command: "5.10.230-tarit\nubuntu"
             with self.assertRaises(AssertionError):
                 soak.assert_guest_identity("vm-1")
+
+    def parse_args(self, *extra: str):
+        argv = [
+            "continuous_lifecycle_soak.py",
+            "--base-url", "http://127.0.0.1:1",
+            "--api-key", "key",
+            "--database", "/tmp/test.db",
+            "--vmm", "/tmp/vmm",
+            "--jail-uid-base", "300000",
+            "--jail-uid-count", "6",
+            "--max-vms", "6",
+            *extra,
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            return MODULE.parse_args()
+
+    def test_step_mode_keeps_every_requested_seed(self) -> None:
+        args = self.parse_args("--seeds", "7,202609,424242", "--steps", "12")
+
+        self.assertEqual(args.seeds, [7, 202609, 424242])
+        self.assertEqual(args.steps, 12)
+        self.assertIsNone(args.duration_seconds)
+
+    def test_duration_mode_requires_one_reproducible_seed(self) -> None:
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse_args("--seeds", "7,202609", "--duration-seconds", "900")
+
+        args = self.parse_args("--seeds", "202609", "--duration-seconds", "900")
+        self.assertEqual(args.seeds, [202609])
+        self.assertEqual(args.duration_seconds, 900)
+
+    def test_main_runs_and_cleans_each_step_mode_seed(self) -> None:
+        observed = []
+
+        class FakeSoak:
+            def __init__(self, args):
+                self.args = args
+                self.operations = 0
+
+            def run(self):
+                observed.append(("run", self.args.seed))
+
+            def cleanup(self):
+                observed.append(("cleanup", self.args.seed))
+
+        args = self.parse_args("--seeds", "7,202609", "--steps", "1")
+        with mock.patch.object(MODULE, "parse_args", return_value=args), \
+             mock.patch.object(MODULE, "Soak", FakeSoak):
+            self.assertEqual(MODULE.main(), 0)
+
+        self.assertEqual(observed, [
+            ("run", 7), ("cleanup", 7),
+            ("run", 202609), ("cleanup", 202609),
+        ])
 
 
 if __name__ == "__main__":
