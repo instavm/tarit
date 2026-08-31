@@ -2642,7 +2642,7 @@ fn pause_running_vcpus(vm: &mut VmInstance) -> Result<bool> {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn rollback_failed_vcpu_pause(
-    vcpu_threads: Vec<&VcpuThread>,
+    vcpu_threads: Vec<&crate::vcpu_thread::VcpuThread>,
     primary: VmmError,
 ) -> (VmmError, bool) {
     for vcpu_thread in &vcpu_threads {
