@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,6 +25,16 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StatusPublicationTests(unittest.TestCase):
+    def test_shell_write_command_preserves_one_exact_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "proof file"
+            value = "proof with spaces; $(exit 41)\nand newline"
+
+            command = MODULE.shell_write_command(str(output), value)
+            subprocess.run(["sh", "-c", command], check=True)
+
+            self.assertEqual(output.read_text(encoding="utf-8"), value + "\n")
+
     def make_soak(self, status_file: Path):
         return MODULE.Soak(SimpleNamespace(
             api_key="key",

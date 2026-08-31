@@ -1,17 +1,21 @@
 [Unit]
 Description=Tarit mixed-OCI lifecycle qualification soak
 After=local-fs.target
-ConditionPathIsDirectory=/home/ubuntu/tarit-c8i
+ConditionPathIsDirectory=/home/ubuntu/tarit-soak-current
 ConditionPathIsMountPoint=/t
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/tarit/continuous-soak.env
+Environment=ROOT=/home/ubuntu/tarit-soak-current
+Environment=TARITD_BIN=/home/ubuntu/tarit-soak-current/orch/target/release/taritd
+Environment=TARIT_VMM_BIN=/home/ubuntu/tarit-soak-current/vmm/target/release/vmm
+Environment=TARIT_TEST_GUEST_AGENT_BIN=/home/ubuntu/tarit-soak-current/vmm/guest/agent/vmm-agent
 Environment=TARIT_CONTINUOUS_STATUS_FILE=/run/tarit-continuous-soak/status.json
 Environment=TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS=3600
-WorkingDirectory=/home/ubuntu/tarit-c8i
-ExecStart=/home/ubuntu/tarit-c8i/orch/tests/continuous_mixed_oci_soak.sh
+WorkingDirectory=/home/ubuntu/tarit-soak-current
+ExecStart=/home/ubuntu/tarit-soak-current/orch/tests/continuous_mixed_oci_soak.sh
 RuntimeDirectory=tarit-continuous-soak
 RuntimeDirectoryMode=0700
 Restart=on-failure
