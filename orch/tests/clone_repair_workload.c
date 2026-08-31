@@ -28,6 +28,7 @@
 #define SECRET_BYTES 32U
 #define PREFIX_BYTES 16U
 #define MAX_REQUEST 256U
+#define REPAIR_WAIT_TIMEOUT_MS 30000
 #ifndef __linux__
 #define REPAIR_WAIT_ITERATIONS 1000000U
 #endif
@@ -296,6 +297,14 @@ static int repair_marker_matches(const char *expected_clone_id) {
     return length >= 32 && memcmp(repaired, expected_clone_id, 32) == 0;
 }
 
+#ifdef __linux__
+static int64_t monotonic_milliseconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+#endif
+
 static int signal_and_wait_for_repair(const char *expected_clone_id) {
     char value[32];
     char *end = NULL;
@@ -322,10 +331,41 @@ static int signal_and_wait_for_repair(const char *expected_clone_id) {
         return -1;
     }
 
+    int64_t started = monotonic_milliseconds();
+    if (started < 0) {
+        int error = errno;
+        close(notify_fd);
+        errno = error;
+        return -1;
+    }
+    int64_t deadline = started + REPAIR_WAIT_TIMEOUT_MS;
+
     for (;;) {
         if (repair_marker_matches(expected_clone_id)) {
             close(notify_fd);
             return 0;
+        }
+        int64_t now = monotonic_milliseconds();
+        if (now < 0) {
+            int error = errno;
+            close(notify_fd);
+            errno = error;
+            return -1;
+        }
+        int64_t remaining = deadline - now;
+        if (remaining <= 0) {
+            close(notify_fd);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        struct pollfd ready = {.fd = notify_fd, .events = POLLIN};
+        int poll_result = poll(&ready, 1, (int)remaining);
+        if (poll_result < 0 && errno == EINTR) continue;
+        if (poll_result <= 0 || (ready.revents & POLLIN) == 0) {
+            int error = poll_result == 0 ? ETIMEDOUT : (poll_result < 0 ? errno : EIO);
+            close(notify_fd);
+            errno = error;
+            return -1;
         }
         union {
             struct inotify_event alignment;
