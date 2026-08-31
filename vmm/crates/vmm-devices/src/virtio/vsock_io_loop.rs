@@ -88,10 +88,39 @@ impl VsockPump {
         Ok(())
     }
 
-    /// Release a pause. Does not wait: the thread re-enters its poll loop on
-    /// its own within [`PAUSE_POLL`].
-    pub fn resume(&self) {
+    /// Release a pause and wait until the worker has left its parked state.
+    /// This acknowledgement prevents a rapid resume/pause cycle from
+    /// mistaking the previous pause acknowledgement for the new request.
+    pub fn resume(&self) -> io::Result<()> {
+        if self.thread_gone() {
+            self.fail_if_unexpected_exit();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "vsock worker exited before resume",
+            ));
+        }
         self.pause_req.store(false, Ordering::SeqCst);
+        self.wake_evt.write(1)?;
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+        while self.pause_ack.load(Ordering::SeqCst) {
+            if self.thread_gone() {
+                self.fail_if_unexpected_exit();
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "vsock worker exited during resume",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                self.device
+                    .fail_worker("vsock worker resume acknowledgement timed out");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "vsock worker resume acknowledgement timed out",
+                ));
+            }
+            std::thread::sleep(PAUSE_POLL);
+        }
+        Ok(())
     }
 
     fn thread_gone(&self) -> bool {
@@ -318,5 +347,23 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("descriptor is invalid"));
+    }
+
+    #[test]
+    fn resume_waits_for_the_pause_acknowledgement_to_clear() {
+        let device = Arc::new(VirtioVsockMmio::new(7, 3));
+        let kick = EventFd::new(libc::EFD_NONBLOCK).expect("queue kick");
+        let mut worker = spawn_vsock_pump(device, kick.as_raw_fd()).expect("start vsock worker");
+
+        worker.pause().expect("pause vsock worker");
+        assert!(worker.pause_ack.load(Ordering::SeqCst));
+        worker.resume().expect("resume vsock worker");
+        assert!(!worker.pause_ack.load(Ordering::SeqCst));
+
+        worker.pause().expect("pause vsock worker again");
+        assert!(worker.pause_ack.load(Ordering::SeqCst));
+        worker.resume().expect("resume vsock worker again");
+        assert!(!worker.pause_ack.load(Ordering::SeqCst));
+        worker.stop();
     }
 }

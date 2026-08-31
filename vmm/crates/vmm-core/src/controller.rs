@@ -581,7 +581,8 @@ impl VmmController {
         // and RAM. Pause vCPUs first so the guest cannot enqueue new net/vsock work
         // after an I/O pump has acknowledged its pause. The pumps are then parked
         // before capture begins. Resume in the inverse order: vCPUs first, then the
-        // pumps, so a completion interrupt cannot be delivered to a paused LAPIC.
+        // pumps before vCPUs so a rapid subsequent pause cannot observe a stale
+        // worker acknowledgement from this snapshot.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let paused_here = if state_before == VmState::Running {
             match pause_running_vcpus(vm) {
@@ -725,17 +726,30 @@ impl VmmController {
         })();
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        let resume_result = if paused_here && state_before == VmState::Running {
-            resume_running_vcpus(vm)
+        let io_resume_result = if io_paused_here {
+            resume_running_io(vm)
         } else {
             Ok(())
         };
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        if io_paused_here {
-            resume_running_io(vm);
-        }
+        let resume_result = match io_resume_result {
+            Ok(()) if paused_here && state_before == VmState::Running => resume_running_vcpus(vm),
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        };
 
-        vm.state = state_before;
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        {
+            vm.state = if resume_result.is_ok() {
+                state_before
+            } else {
+                VmState::Paused
+            };
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        {
+            vm.state = state_before;
+        }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let snapshot_result = match resume_result {
             Ok(()) => snapshot_result,
@@ -1806,9 +1820,17 @@ impl VmmController {
             )));
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        resume_running_vcpus(vm)?;
+        resume_running_io(vm)?;
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        resume_running_io(vm);
+        if let Err(error) = resume_running_vcpus(vm) {
+            let rollback = pause_running_io(vm).err();
+            return Err(match rollback {
+                Some(rollback) => VmmError::Device(format!(
+                    "resume vCPUs: {error}; failed to re-quiesce I/O workers: {rollback}"
+                )),
+                None => error,
+            });
+        }
         vm.state = VmState::Running;
         log::info!("VM resumed");
         Ok(())
@@ -2607,42 +2629,68 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
     if paused {
         for io_loop in &running.blk_io_loops {
             if let Err(error) = io_loop.pause() {
-                resume_running_io_workers(running);
-                return Err(VmmError::Device(format!(
-                    "quiesce block I/O worker: {error}"
-                )));
+                let rollback = resume_running_io_workers(running).err();
+                return Err(VmmError::Device(match rollback {
+                    Some(rollback) => {
+                        format!("quiesce block I/O worker: {error}; rollback failed: {rollback}")
+                    }
+                    None => format!("quiesce block I/O worker: {error}"),
+                }));
             }
         }
         for io_loop in &running.net_io_loops {
             if let Err(error) = io_loop.pause() {
-                resume_running_io_workers(running);
-                return Err(VmmError::Device(format!(
-                    "quiesce network I/O worker: {error}"
-                )));
+                let rollback = resume_running_io_workers(running).err();
+                return Err(VmmError::Device(match rollback {
+                    Some(rollback) => {
+                        format!("quiesce network I/O worker: {error}; rollback failed: {rollback}")
+                    }
+                    None => format!("quiesce network I/O worker: {error}"),
+                }));
             }
         }
         if let Some(pump) = running.vsock_pump.as_ref() {
             if let Err(error) = pump.pause() {
-                resume_running_io_workers(running);
-                return Err(VmmError::Device(format!("quiesce vsock worker: {error}")));
+                let rollback = resume_running_io_workers(running).err();
+                return Err(VmmError::Device(match rollback {
+                    Some(rollback) => {
+                        format!("quiesce vsock worker: {error}; rollback failed: {rollback}")
+                    }
+                    None => format!("quiesce vsock worker: {error}"),
+                }));
             }
         }
     } else {
-        resume_running_io_workers(running);
+        resume_running_io_workers(running)?;
     }
     Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn resume_running_io_workers(running: &RunningVm) {
+fn resume_running_io_workers(running: &RunningVm) -> Result<()> {
+    let mut failures = Vec::new();
     for io_loop in &running.blk_io_loops {
-        io_loop.resume();
+        if let Err(error) = io_loop.resume() {
+            failures.push(format!("block I/O worker: {error}"));
+        }
     }
     for io_loop in &running.net_io_loops {
-        io_loop.resume();
+        if let Err(error) = io_loop.resume() {
+            failures.push(format!("network I/O worker: {error}"));
+        }
     }
     if let Some(pump) = running.vsock_pump.as_ref() {
-        pump.resume();
+        if let Err(error) = pump.resume() {
+            failures.push(format!("vsock worker: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(VmmError::Device(format!(
+            "resume I/O workers: {}",
+            failures.join("; ")
+        )))
     }
 }
 
@@ -2656,10 +2704,11 @@ fn pause_running_io(vm: &VmInstance) -> Result<bool> {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn resume_running_io(vm: &VmInstance) {
+fn resume_running_io(vm: &VmInstance) -> Result<()> {
     if let Some(running) = vm.running.as_ref() {
-        let _ = set_running_io_paused(running, false);
+        set_running_io_paused(running, false)?;
     }
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -2883,19 +2932,31 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         Ok(())
     })();
 
-    if result.is_err() {
-        vm.state = state_before;
-        let resume_result = if paused_here && state_before == VmState::Running {
-            resume_running_vcpus(vm)
+    if let Err(error) = result {
+        let io_resume_result = if io_paused_here {
+            resume_running_io(vm)
         } else {
             Ok(())
         };
-        if io_paused_here {
-            resume_running_io(vm);
-        }
-        resume_result?;
+        let resume_result = match io_resume_result {
+            Ok(()) if paused_here && state_before == VmState::Running => resume_running_vcpus(vm),
+            Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        };
+        return match resume_result {
+            Ok(()) => {
+                vm.state = state_before;
+                Err(error)
+            }
+            Err(resume) => {
+                vm.state = VmState::Paused;
+                Err(VmmError::Snapshot(format!(
+                    "{error}; failed to restore running state after suspend failure: {resume}"
+                )))
+            }
+        };
     }
-    result
+    Ok(())
 }
 
 pub(crate) fn private_runtime_dir() -> Result<PathBuf> {

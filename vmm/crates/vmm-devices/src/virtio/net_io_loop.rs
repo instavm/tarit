@@ -92,10 +92,39 @@ impl NetIoLoop {
         Ok(())
     }
 
-    /// Release a pause. Does not wait: the thread re-enters its poll loop on
-    /// its own within [`PAUSE_POLL`].
-    pub fn resume(&self) {
+    /// Release a pause and wait until the worker has left its parked state.
+    /// This acknowledgement prevents a rapid resume/pause cycle from
+    /// mistaking the previous pause acknowledgement for the new request.
+    pub fn resume(&self) -> io::Result<()> {
+        if self.thread_gone() {
+            self.fail_if_unexpected_exit();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network I/O worker exited before resume",
+            ));
+        }
         self.pause_req.store(false, Ordering::SeqCst);
+        self.wake_evt.write(1)?;
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+        while self.pause_ack.load(Ordering::SeqCst) {
+            if self.thread_gone() {
+                self.fail_if_unexpected_exit();
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network I/O worker exited during resume",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                self.device
+                    .fail_worker("network I/O worker resume acknowledgement timed out");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "network I/O worker resume acknowledgement timed out",
+                ));
+            }
+            std::thread::sleep(PAUSE_POLL);
+        }
+        Ok(())
     }
 
     fn thread_gone(&self) -> bool {
@@ -633,7 +662,12 @@ mod tests {
         };
         assert_eq!(&recv[..n], pause_payload);
         assert_eq!(device.tx_packets.load(Ordering::Relaxed), 2);
-        io_loop.resume();
+        io_loop.resume().expect("resume network worker");
+        assert!(!io_loop.pause_ack.load(Ordering::SeqCst));
+        io_loop.pause().expect("pause network worker again");
+        assert!(io_loop.pause_ack.load(Ordering::SeqCst));
+        io_loop.resume().expect("resume network worker again");
+        assert!(!io_loop.pause_ack.load(Ordering::SeqCst));
 
         // --- RX: write a frame on the host side; the loop should inject. ---
         let inbound = b"INBOUND-FRAME";

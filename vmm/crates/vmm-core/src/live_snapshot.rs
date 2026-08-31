@@ -160,11 +160,12 @@ impl<'a> IoQuiesceGuard<'a> {
         })
     }
 
-    fn disengage(mut self) {
+    fn disengage(mut self) -> Result<()> {
         if self.armed {
-            let _ = (self.quiesce)(false);
             self.armed = false;
+            (self.quiesce)(false)?;
         }
+        Ok(())
     }
 }
 
@@ -627,12 +628,13 @@ where
     let state_blob = capture_state()?;
     inject_live_snapshot_failure("state_capture")?;
 
-    // Resume requests are issued to every vCPU before waiting for any one of
-    // them. The guard then observes every thread leave its park, so downtime
-    // covers the complete all-vCPU blackout.
+    // Release I/O workers first and wait for their pause acknowledgements to
+    // clear. This closes the rapid resume/pause race before any vCPU can
+    // publish new descriptors. Then observe every vCPU leave its park, so
+    // downtime covers the complete all-vCPU blackout.
+    io_guard.disengage()?;
     final_pause_guard.resume()?;
     let downtime = final_stop_start.elapsed();
-    io_guard.disengage();
     // Final residual pages entered the page cache during blackout, but durable
     // writeback is not part of guest downtime.
     memory_file
@@ -819,6 +821,27 @@ mod tests {
 
         drop(IoQuiesceGuard::engage(&quiesce).expect("engage I/O quiescence"));
 
+        assert_eq!(&*calls.borrow(), &[true, false]);
+    }
+
+    #[test]
+    fn io_quiesce_release_failure_is_reported_once() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let quiesce = |paused| {
+            calls.borrow_mut().push(paused);
+            if paused {
+                Ok(())
+            } else {
+                Err(VmmError::Device("resume failed".into()))
+            }
+        };
+
+        let error = IoQuiesceGuard::engage(&quiesce)
+            .expect("engage I/O quiescence")
+            .disengage()
+            .expect_err("release failure was ignored");
+
+        assert!(error.to_string().contains("resume failed"));
         assert_eq!(&*calls.borrow(), &[true, false]);
     }
 }
