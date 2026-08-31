@@ -1042,9 +1042,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jail-uid-count", type=int, required=True)
     parser.add_argument("--max-vms", type=int, required=True)
     parser.add_argument("--max-snapshots", type=int, default=8)
-    parser.add_argument("--seeds", default="7")
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--duration-seconds", type=int)
+    parser.add_argument(
+        "--seeds", default="7",
+        help="comma-separated reproducible seeds; duration mode accepts one",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=20,
+        help="randomized actions per seed when duration mode is not selected",
+    )
+    parser.add_argument(
+        "--duration-seconds", type=int,
+        help="run continuously for this duration instead of using --steps",
+    )
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--anchors", type=int, default=3)
     parser.add_argument("--anchor-vcpus", default="1,2,4")
@@ -1073,12 +1082,18 @@ def parse_args() -> argparse.Namespace:
         "--epoch", type=int, default=int(os.environ.get("TARIT_LIFECYCLE_EPOCH", "0")),
     )
     args = parser.parse_args()
-    try:
-        args.seeds = [int(value) for value in args.seeds.split(",") if value]
-    except ValueError:
-        parser.error("seeds must be comma-separated non-negative integers")
-    if not args.seeds or any(value < 0 for value in args.seeds):
-        parser.error("seeds must be comma-separated non-negative integers")
+    seed_values = args.seeds.split(",")
+    if any(
+        not value or not value.isascii() or not value.isdecimal()
+        for value in seed_values
+    ):
+        parser.error("seeds must contain 1 to 64 comma-separated unsigned 64-bit integers")
+    args.seeds = [int(value) for value in seed_values]
+    if (
+        not args.seeds or len(args.seeds) > 64
+        or any(value < 0 or value > (1 << 64) - 1 for value in args.seeds)
+    ):
+        parser.error("seeds must contain 1 to 64 comma-separated unsigned 64-bit integers")
     try:
         args.anchor_vcpus = [int(value) for value in args.anchor_vcpus.split(",")]
     except ValueError:
@@ -1096,8 +1111,10 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"unknown loop actions: {','.join(invalid_actions)}")
     else:
         args.actions = []
-    if args.steps < 1:
-        parser.error("steps must be at least one")
+    if args.steps < 1 or args.steps > 10000:
+        parser.error("steps must be between one and 10000")
+    if args.interval_seconds < 0 or args.interval_seconds > 60:
+        parser.error("action interval must be between zero and 60 seconds")
     if args.duration_seconds is not None and args.duration_seconds < 60:
         parser.error("duration must be at least 60 seconds")
     if args.duration_seconds is not None and len(args.seeds) != 1:

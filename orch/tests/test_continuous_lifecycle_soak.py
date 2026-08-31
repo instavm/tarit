@@ -230,6 +230,20 @@ class StatusPublicationTests(unittest.TestCase):
         self.assertEqual(args.seeds, [202609])
         self.assertEqual(args.duration_seconds, 900)
 
+    def test_driver_bounds_seed_step_and_interval_inputs(self) -> None:
+        invalid = [
+            ("--seeds", "-1"),
+            ("--seeds", "7,,202609"),
+            ("--seeds", str(1 << 64)),
+            ("--steps", "10001"),
+            ("--interval-seconds", "60.1"),
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), \
+                 mock.patch("sys.stderr", new=io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.parse_args(*arguments)
+
     def test_main_runs_and_cleans_each_step_mode_seed(self) -> None:
         observed = []
 
