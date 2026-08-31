@@ -39,8 +39,9 @@ its scope.
   and PTY idle time are bounded. Invalid credentials pass through the outer
   admission limit.
 - Suspend is distinct from pause: it retains ownership and scheduler quota,
-  releases resident guest memory, and requires successful rehydration before
-  resume returns.
+  parks vCPUs plus block, network, and vsock workers at one boundary, releases
+  resident guest memory, and requires every worker to leave its parked state
+  before vCPUs restart and resume returns.
 - Hibernation releases the VMM and scheduler allocation. HTTP, PTY, SSH, and
   share ingress activate a hibernated VM through a single-flight restore gate;
   failed activation leaves a retryable hibernated record instead of a second

@@ -18,9 +18,13 @@ use vmm_core::controller::VmmController;
 mod test_support;
 use test_support::{agent_vm_config, guest_stdout};
 
-fn wait_for_delayed_service() {
+fn wait_for_delayed_service(controller: &VmmController, volume_index: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while vmm_devices::virtio::blk_backend::test_delayed_services() == 0 {
+    while controller
+        .test_block_delayed_services(volume_index)
+        .expect("read delayed block request count")
+        == 0
+    {
         assert!(
             Instant::now() < deadline,
             "delayed block request never started"
@@ -71,7 +75,7 @@ fn delayed_volume_io_isolated_from_vcpu_and_quiesced_for_snapshot() {
             15_000,
         )
     });
-    wait_for_delayed_service();
+    wait_for_delayed_service(&controller, 1);
 
     let pause_started = Instant::now();
     controller
@@ -95,7 +99,7 @@ fn delayed_volume_io_isolated_from_vcpu_and_quiesced_for_snapshot() {
             15_000,
         )
     });
-    wait_for_delayed_service();
+    wait_for_delayed_service(&controller, 1);
     let snapshot_started = Instant::now();
     let snapshot = controller
         .snapshot(false)
@@ -130,4 +134,68 @@ fn delayed_volume_io_isolated_from_vcpu_and_quiesced_for_snapshot() {
         !std::path::Path::new(&snapshot).exists(),
         "owned snapshot was not cleaned up on stop"
     );
+}
+
+#[test]
+fn storage_quiescence_timeout_fails_snapshot_and_resumes_source() {
+    let mut data = tempfile::NamedTempFile::new().expect("create data volume");
+    data.as_file_mut()
+        .set_len(4 * 1024 * 1024)
+        .expect("size data volume");
+
+    let mut config = agent_vm_config(512);
+    config.volumes.push(VolumeConfig {
+        path: data.path().to_string_lossy().into_owned(),
+        read_only: false,
+        overlay: None,
+        inherited_fd: None,
+    });
+
+    let controller = Arc::new(VmmController::new());
+    controller.create_live(config).expect("boot VM");
+    assert_eq!(
+        guest_stdout(&controller, "printf source-ready"),
+        "source-ready"
+    );
+
+    controller
+        .set_test_block_service_delay(1, Duration::from_millis(6_500))
+        .expect("enable blocking volume delay");
+    let writer_controller = Arc::clone(&controller);
+    let writer = std::thread::spawn(move || {
+        writer_controller.exec(
+            "dd if=/dev/zero of=/dev/vdb bs=512 count=1 conv=fsync 2>/dev/null; printf delayed-write",
+            20_000,
+        )
+    });
+    wait_for_delayed_service(&controller, 1);
+
+    let snapshot_started = Instant::now();
+    let error = controller
+        .snapshot(false)
+        .expect_err("snapshot unexpectedly ignored block-worker timeout");
+    let snapshot_elapsed = snapshot_started.elapsed();
+    assert!(
+        error
+            .to_string()
+            .contains("block I/O worker quiescence timed out"),
+        "unexpected snapshot failure: {error}"
+    );
+    assert!(
+        (Duration::from_millis(4_800)..Duration::from_secs(6)).contains(&snapshot_elapsed),
+        "block-worker timeout was not bounded at five seconds: {snapshot_elapsed:?}"
+    );
+
+    assert_eq!(
+        guest_stdout(&controller, "echo source-resumed"),
+        "source-resumed\n",
+        "snapshot failure left the source vCPU paused"
+    );
+    let (code, stdout, stderr, _) = writer
+        .join()
+        .expect("join delayed writer")
+        .expect("delayed writer exec");
+    assert_eq!(code, 0, "delayed writer failed: {stderr}");
+    assert_eq!(stdout, "delayed-write");
+    controller.stop().expect("stop VM after quiescence timeout");
 }

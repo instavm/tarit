@@ -47,6 +47,14 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         response_409 = cast(Any, None)
         return response_409
 
+    if response.status_code == 429:
+        response_429 = cast(Any, None)
+        return response_429
+
+    if response.status_code == 503:
+        response_503 = cast(Any, None)
+        return response_503
+
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -67,9 +75,12 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Resume sandbox
+    """Resume a VM
 
-     User keys can resume only their tenant's VMs; admin keys can resume any VM.
+     Resumes a paused or suspended VM after every device worker leaves its parked state and before vCPUs
+    restart. A hibernated VM activates through the fenced single-flight placement, artifact-
+    verification, network-repair, and readiness path. User keys can resume only their tenant's VMs;
+    admin keys can resume any VM.
 
     Args:
         id (UUID):
@@ -98,9 +109,12 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Resume sandbox
+    """Resume a VM
 
-     User keys can resume only their tenant's VMs; admin keys can resume any VM.
+     Resumes a paused or suspended VM after every device worker leaves its parked state and before vCPUs
+    restart. A hibernated VM activates through the fenced single-flight placement, artifact-
+    verification, network-repair, and readiness path. User keys can resume only their tenant's VMs;
+    admin keys can resume any VM.
 
     Args:
         id (UUID):
@@ -124,9 +138,12 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Resume sandbox
+    """Resume a VM
 
-     User keys can resume only their tenant's VMs; admin keys can resume any VM.
+     Resumes a paused or suspended VM after every device worker leaves its parked state and before vCPUs
+    restart. A hibernated VM activates through the fenced single-flight placement, artifact-
+    verification, network-repair, and readiness path. User keys can resume only their tenant's VMs;
+    admin keys can resume any VM.
 
     Args:
         id (UUID):
@@ -153,9 +170,12 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Resume sandbox
+    """Resume a VM
 
-     User keys can resume only their tenant's VMs; admin keys can resume any VM.
+     Resumes a paused or suspended VM after every device worker leaves its parked state and before vCPUs
+    restart. A hibernated VM activates through the fenced single-flight placement, artifact-
+    verification, network-repair, and readiness path. User keys can resume only their tenant's VMs;
+    admin keys can resume any VM.
 
     Args:
         id (UUID):

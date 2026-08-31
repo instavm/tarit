@@ -22,6 +22,7 @@ const MAX_FRAME: usize = 1600;
 
 /// How long the paused loop sleeps between checks of the pause flag.
 const PAUSE_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Handle returned by [`spawn_net_io_loop`]. Dropping it stops the thread.
 pub struct NetIoLoop {
@@ -32,6 +33,13 @@ pub struct NetIoLoop {
     handle: Option<JoinHandle<()>>,
     /// Caller may inspect packet counts via the device after stop.
     pub device: Arc<VirtioNetMmio>,
+}
+
+struct WorkerControl {
+    stop: Arc<AtomicBool>,
+    pause_req: Arc<AtomicBool>,
+    pause_ack: Arc<AtomicBool>,
+    ready_tx: std::sync::mpsc::SyncSender<io::Result<()>>,
 }
 
 impl NetIoLoop {
@@ -50,29 +58,84 @@ impl NetIoLoop {
     /// without touching guest memory until [`Self::resume`]. Callers must
     /// pause every vCPU first so the guest cannot publish another descriptor
     /// after this drain.
-    pub fn pause(&self) {
+    pub fn pause(&self) -> io::Result<()> {
         if self.thread_gone() {
-            return;
+            self.fail_if_unexpected_exit();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network I/O worker exited before quiescence",
+            ));
         }
         self.pause_req.store(true, Ordering::SeqCst);
-        let _ = self.wake_evt.write(1);
+        self.wake_evt.write(1)?;
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
         while !self.pause_ack.load(Ordering::SeqCst) {
             if self.thread_gone() {
-                return;
+                self.fail_if_unexpected_exit();
+                self.pause_req.store(false, Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network I/O worker exited during quiescence",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                self.pause_req.store(false, Ordering::SeqCst);
+                self.device
+                    .fail_worker("network I/O worker quiescence timed out");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "network I/O worker quiescence timed out",
+                ));
             }
             std::thread::sleep(PAUSE_POLL);
         }
+        Ok(())
     }
 
-    /// Release a pause. Does not wait: the thread re-enters its poll loop on
-    /// its own within [`PAUSE_POLL`].
-    pub fn resume(&self) {
+    /// Release a pause and wait until the worker has left its parked state.
+    /// This acknowledgement prevents a rapid resume/pause cycle from
+    /// mistaking the previous pause acknowledgement for the new request.
+    pub fn resume(&self) -> io::Result<()> {
+        if self.thread_gone() {
+            self.fail_if_unexpected_exit();
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "network I/O worker exited before resume",
+            ));
+        }
         self.pause_req.store(false, Ordering::SeqCst);
+        self.wake_evt.write(1)?;
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+        while self.pause_ack.load(Ordering::SeqCst) {
+            if self.thread_gone() {
+                self.fail_if_unexpected_exit();
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "network I/O worker exited during resume",
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                self.device
+                    .fail_worker("network I/O worker resume acknowledgement timed out");
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "network I/O worker resume acknowledgement timed out",
+                ));
+            }
+            std::thread::sleep(PAUSE_POLL);
+        }
+        Ok(())
     }
 
-    /// A finished thread writes no guest memory, so it counts as paused.
     fn thread_gone(&self) -> bool {
         self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+
+    fn fail_if_unexpected_exit(&self) {
+        if !self.stop.load(Ordering::SeqCst) {
+            self.device
+                .fail_worker("network I/O worker is not running during quiescence");
+        }
     }
 }
 
@@ -100,20 +163,50 @@ pub fn spawn_net_io_loop(
     let pause_ack_t = pause_ack.clone();
     let wake_fd = wake_evt.as_raw_fd();
     let device_t = device.clone();
+    let health_device = device.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     let handle = std::thread::Builder::new()
         .name("virtio-net-io".into())
         .spawn(move || {
-            run(
-                stop_t,
-                pause_req_t,
-                pause_ack_t,
-                device_t,
-                tap_fd,
-                tx_kick_fd,
-                wake_fd,
-            );
+            let stop_health = Arc::clone(&stop_t);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(
+                    WorkerControl {
+                        stop: stop_t,
+                        pause_req: pause_req_t,
+                        pause_ack: pause_ack_t,
+                        ready_tx,
+                    },
+                    device_t,
+                    tap_fd,
+                    tx_kick_fd,
+                    wake_fd,
+                );
+            }));
+            if !stop_health.load(Ordering::SeqCst) {
+                let context = if outcome.is_err() {
+                    "network I/O worker panicked"
+                } else {
+                    "network I/O worker exited unexpectedly"
+                };
+                health_device.fail_worker(context);
+            }
         })?;
+
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = handle.join();
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = handle.join();
+            return Err(io::Error::other(format!(
+                "network I/O worker exited during startup: {error}"
+            )));
+        }
+    }
 
     Ok(NetIoLoop {
         stop,
@@ -126,23 +219,28 @@ pub fn spawn_net_io_loop(
 }
 
 fn run(
-    stop: Arc<AtomicBool>,
-    pause_req: Arc<AtomicBool>,
-    pause_ack: Arc<AtomicBool>,
+    control: WorkerControl,
     device: Arc<VirtioNetMmio>,
     tap_fd: RawFd,
     tx_kick_fd: RawFd,
     wake_fd: RawFd,
 ) {
+    let WorkerControl {
+        stop,
+        pause_req,
+        pause_ack,
+        ready_tx,
+    } = control;
     // SAFETY: epoll_create1 has no pointer arguments; flags are a valid libc
     // constant, and errors are handled from the returned fd.
     let ep = match unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) } {
         fd if fd >= 0 => fd,
         _ => {
-            log::error!(
-                "net_io_loop: epoll_create1 failed: {}",
-                io::Error::last_os_error()
-            );
+            let error = io::Error::last_os_error();
+            let _ = ready_tx.send(Err(io::Error::new(
+                error.kind(),
+                format!("create network worker epoll: {error}"),
+            )));
             return;
         }
     };
@@ -162,21 +260,30 @@ fn run(
         }
     };
     if let Err(e) = add(tap_fd, 1) {
-        log::error!("net_io_loop: epoll add tap: {e}");
+        let _ = ready_tx.send(Err(io::Error::new(
+            e.kind(),
+            format!("register network tap with epoll: {e}"),
+        )));
         // SAFETY: `ep` is the fd returned by epoll_create1 above and is owned
         // by this function on this error path.
         unsafe { libc::close(ep) };
         return;
     }
     if let Err(e) = add(tx_kick_fd, 2) {
-        log::error!("net_io_loop: epoll add tx_kick: {e}");
+        let _ = ready_tx.send(Err(io::Error::new(
+            e.kind(),
+            format!("register network queue kick with epoll: {e}"),
+        )));
         // SAFETY: `ep` is the fd returned by epoll_create1 above and is owned
         // by this function on this error path.
         unsafe { libc::close(ep) };
         return;
     }
     if let Err(e) = add(wake_fd, 3) {
-        log::error!("net_io_loop: epoll add wake: {e}");
+        let _ = ready_tx.send(Err(io::Error::new(
+            e.kind(),
+            format!("register network worker wake with epoll: {e}"),
+        )));
         // SAFETY: `ep` is the fd returned by epoll_create1 above and is owned
         // by this function on this error path.
         unsafe { libc::close(ep) };
@@ -184,9 +291,17 @@ fn run(
     }
 
     if let Err(e) = vmm_jailer::seccomp::SeccompProfile::device().install() {
-        log::error!("net_io_loop: seccomp install failed; refusing guest I/O: {e}");
+        let _ = ready_tx.send(Err(io::Error::other(format!(
+            "install network worker sandbox: {e}"
+        ))));
         // SAFETY: `ep` is the fd returned by epoll_create1 above and is owned
         // by this function on this error path.
+        unsafe { libc::close(ep) };
+        return;
+    }
+    if ready_tx.send(Ok(())).is_err() {
+        // SAFETY: `ep` is owned by this worker and no longer needed when its
+        // creator disappeared before accepting startup readiness.
         unsafe { libc::close(ep) };
         return;
     }
@@ -341,6 +456,23 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    #[test]
+    fn startup_rejects_an_invalid_tap_before_returning_success() {
+        let device = Arc::new(VirtioNetMmio::new(7, [0x02, 0, 0, 0, 0, 1]));
+        let tx_kick = EventFd::new(libc::EFD_NONBLOCK).expect("tx kick");
+        let error = match spawn_net_io_loop(device, -1, tx_kick.as_raw_fd()) {
+            Ok(mut worker) => {
+                worker.stop();
+                panic!("invalid tap unexpectedly started a network worker")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("network tap"),
+            "unexpected startup error: {error}"
+        );
+    }
 
     /// Stand up an io_loop with a Unix socketpair impersonating a tap, an
     /// EventFd for TX kicks, and a real virtio-net transport. Verify:
@@ -513,7 +645,7 @@ mod tests {
         .unwrap();
         mem.write_obj(1u16, GuestAddress(TX_AVAIL + 6)).unwrap();
         mem.write_obj(2u16, GuestAddress(TX_AVAIL + 2)).unwrap();
-        io_loop.pause();
+        io_loop.pause().expect("pause network worker");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let n = loop {
             // SAFETY: `recv` remains a valid writable buffer and `host_fd` is
@@ -530,7 +662,12 @@ mod tests {
         };
         assert_eq!(&recv[..n], pause_payload);
         assert_eq!(device.tx_packets.load(Ordering::Relaxed), 2);
-        io_loop.resume();
+        io_loop.resume().expect("resume network worker");
+        assert!(!io_loop.pause_ack.load(Ordering::SeqCst));
+        io_loop.pause().expect("pause network worker again");
+        assert!(io_loop.pause_ack.load(Ordering::SeqCst));
+        io_loop.resume().expect("resume network worker again");
+        assert!(!io_loop.pause_ack.load(Ordering::SeqCst));
 
         // --- RX: write a frame on the host side; the loop should inject. ---
         let inbound = b"INBOUND-FRAME";

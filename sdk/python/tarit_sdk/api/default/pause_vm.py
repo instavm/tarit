@@ -67,7 +67,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Pause sandbox
+    """Pause a VM
 
      User keys can pause only their tenant's VMs; admin keys can pause any VM.
 
@@ -98,7 +98,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Pause sandbox
+    """Pause a VM
 
      User keys can pause only their tenant's VMs; admin keys can pause any VM.
 
@@ -124,7 +124,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Pause sandbox
+    """Pause a VM
 
      User keys can pause only their tenant's VMs; admin keys can pause any VM.
 
@@ -153,7 +153,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Pause sandbox
+    """Pause a VM
 
      User keys can pause only their tenant's VMs; admin keys can pause any VM.
 

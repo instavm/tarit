@@ -40,7 +40,7 @@ admin keys can call admin-only routes such as `/v1/cluster`.
 ```json
 {
   "id": "uuid",
-  "status": "creating|running|paused|suspended|error",
+  "status": "creating|running|paused|suspended|hibernated|stopped|error",
   "revision": 3,
   "startup_path": "cold|warm|snapshot_restore",
   "memory_mib": 256,
@@ -408,26 +408,65 @@ Note: the local SQLite VM row is not deleted. On the owner, a later local `GET` 
 
 ### `POST /v1/vms/{id}/pause`
 
-Resolve owner and pause the VM. The public handler does not require a JSON body.
+Resolve the owner, stop every vCPU, drain and park the block, network, and vsock
+workers, then publish the paused state. The public handler does not require a
+JSON body.
+
+If a vCPU or device-worker transition fails and the VMM cannot confirm a safe
+rollback, it fences the VM paused. The orchestrator observes and durably
+records that state before returning the operation failure, allowing a later
+explicit resume or delete instead of leaving the control plane marked running.
 
 Response `200`: updated `VmRecord` with `status: "paused"`.
 
-Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`.
+Status codes: `200`, `401`, `403`, `404`, `409` (invalid lifecycle
+transition), `500`.
+
+### `POST /v1/vms/{id}/suspend`
+
+Resolve the owner and capture a coherent in-process suspend image after every
+vCPU and guest-memory-writing device worker acknowledges quiescence. Resident
+guest RAM is released, but VM ownership, the VMM process, scheduler capacity,
+and tenant quota remain reserved.
+
+Response `200`: updated `VmRecord` with `status: "suspended"`.
+
+Status codes: `200`, `401`, `403`, `404`, `409` (invalid lifecycle
+transition), `500`.
+
+### `POST /v1/vms/{id}/hibernate`
+
+Capture and authenticate a live RAM, device, and private-disk artifact, satisfy
+the configured replication policy, stop the resident VMM, and release CPU,
+memory, cgroup, network, and scheduler capacity. The logical VM and its tenant
+ownership remain durable for later activation.
+
+Response `200`: updated `VmRecord` with `status: "hibernated"`.
+
+Status codes: `200`, `401`, `403`, `404`, `409` (VM is not running), `500`,
+`503` (durable artifact or peer lifecycle requirements are unavailable).
 
 ### `POST /v1/vms/{id}/resume`
 
-Resolve owner and resume a paused VM. The public handler does not require a JSON body.
+Resolve the owner and resume a paused or suspended VM. A hibernated VM is
+activated through the fenced single-flight restore path, including normal
+placement, artifact verification, network repair, and policy restoration.
+Device workers must leave their parked state before vCPUs restart, and the
+operation returns only after guest readiness succeeds. The public handler does
+not require a JSON body.
 
 Response `200`: updated `VmRecord` with `status: "running"`.
 
-Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`.
+Status codes: `200`, `401`, `403`, `404`, `409` (invalid lifecycle state),
+`429` (no placement capacity), `500`, `503` (owner or restore prerequisites are
+unavailable).
 
 ### `POST /v1/vms/{id}/snapshot`
 
-Resolve owner and ask the VMM to write a snapshot. Snapshot files are node-local.
-Only full snapshots are accepted. `diff: true` returns `422` before contacting
-the VMM because incremental snapshot headers contain parent paths; durable
-parent-chain relocation is not implemented yet.
+Resolve the owner and publish an authenticated snapshot behind an opaque UUID.
+Host paths, physical host identity, and artifact locators remain private. Only
+full snapshots are accepted. `diff: true` returns `422` before contacting the
+VMM because durable parent-chain relocation is not implemented yet.
 
 Request:
 
@@ -441,25 +480,25 @@ Response `200`:
 
 ```json
 {
-  "path": "/path/on/owner/snapshot",
-  "host_id": "node-a"
+  "snapshot_id": "uuid"
 }
 ```
 
-Always preserve `host_id`; pass it to `POST /v1/restore` so the restore routes to the node that has the file.
-
-Status codes: `200`, `401`, `403`, `404`, `409` (VM is stopped), `500`.
+Status codes: `200`, `401`, `403`, `404`, `409` (the lifecycle state does not
+support snapshots), `422` (`diff` is true), `500`.
 
 ### `POST /v1/restore`
 
-Restore a VM from a snapshot file. If `host_id` is present and is not the receiving node, the request is routed to that host. No snapshot bytes are copied between nodes.
+Restore a VM from an opaque tenant-owned snapshot handle. The control plane
+resolves its private locator, verifies the authenticated artifact, and routes
+the restore to the node that holds it. Clients cannot provide a host, path, or
+storage locator.
 
 Request:
 
 ```json
 {
-  "snapshot_path": "/path/on/snapshot-owner/snapshot",
-  "host_id": "node-a",
+  "snapshot_id": "uuid",
   "id": "optional new vm uuid"
 }
 ```
@@ -470,12 +509,14 @@ Status codes:
 
 | Status | Meaning |
 | --- | --- |
-| `201` | VM restored on the selected node. |
+| `201` | VM restored and ready. |
 | `401` | Missing or wrong `X-API-Key`. |
-| `403` | Tenant VM quota reached. |
-| `404` | `host_id` not found in the fleet. |
-| `429` | Selected node is at local capacity; includes `Retry-After` in seconds. Restore does not exhaustively try other nodes because the snapshot file is node-local. |
-| `500` | VMM restore, peer, or fleet failure. |
+| `403` | Tenant VM quota is reached. |
+| `404` | Snapshot handle not found or belongs to another tenant. |
+| `409` | Requested VM id already exists. |
+| `429` | The snapshot-owning node has no capacity; includes `Retry-After` in seconds. |
+| `500` | Internal restore failure. |
+| `503` | The snapshot-owning node is unhealthy, stale, or unavailable. |
 
 ### `POST /v1/execute`
 

@@ -71,7 +71,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Hibernate sandbox and release host capacity
+    """Hibernate a VM and release host capacity
 
      Atomically captures an authenticated live RAM/device/disk snapshot, stops the resident VMM, releases
     CPU, memory, cgroup, network, and scheduler capacity, and retains a tenant-owned logical VM record
@@ -104,7 +104,7 @@ def sync(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Hibernate sandbox and release host capacity
+    """Hibernate a VM and release host capacity
 
      Atomically captures an authenticated live RAM/device/disk snapshot, stops the resident VMM, releases
     CPU, memory, cgroup, network, and scheduler capacity, and retains a tenant-owned logical VM record
@@ -132,7 +132,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient | Client,
 ) -> Response[Any | VmRecord]:
-    """Hibernate sandbox and release host capacity
+    """Hibernate a VM and release host capacity
 
      Atomically captures an authenticated live RAM/device/disk snapshot, stops the resident VMM, releases
     CPU, memory, cgroup, network, and scheduler capacity, and retains a tenant-owned logical VM record
@@ -163,7 +163,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient | Client,
 ) -> Any | VmRecord | None:
-    """Hibernate sandbox and release host capacity
+    """Hibernate a VM and release host capacity
 
      Atomically captures an authenticated live RAM/device/disk snapshot, stops the resident VMM, releases
     CPU, memory, cgroup, network, and scheduler capacity, and retains a tenant-owned logical VM record

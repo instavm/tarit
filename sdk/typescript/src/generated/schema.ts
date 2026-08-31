@@ -297,7 +297,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Pause sandbox
+         * Pause a VM
          * @description User keys can pause only their tenant's VMs; admin keys can pause any VM.
          */
         post: operations["pauseVm"];
@@ -317,8 +317,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Resume sandbox
-         * @description User keys can resume only their tenant's VMs; admin keys can resume any VM.
+         * Resume a VM
+         * @description Resumes a paused or suspended VM after every device worker leaves its parked state and before vCPUs restart. A hibernated VM activates through the fenced single-flight placement, artifact-verification, network-repair, and readiness path. User keys can resume only their tenant's VMs; admin keys can resume any VM.
          */
         post: operations["resumeVm"];
         delete?: never;
@@ -337,8 +337,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Suspend sandbox
-         * @description Drops resident guest memory while retaining VM ownership, quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause operations.
+         * Suspend a VM in place
+         * @description Stops every vCPU, drains and parks block, network, and vsock workers at the same boundary, captures the in-process suspend image, and drops resident guest memory while retaining the VMM, VM ownership, quota, and scheduler reservations. Resume the VM before exec, snapshot, PTY, SSH, or pause operations.
          */
         post: operations["suspendVm"];
         delete?: never;
@@ -357,7 +357,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Hibernate sandbox and release host capacity
+         * Hibernate a VM and release host capacity
          * @description Atomically captures an authenticated live RAM/device/disk snapshot, stops the resident VMM, releases CPU, memory, cgroup, network, and scheduler capacity, and retains a tenant-owned logical VM record for secure resume.
          */
         post: operations["hibernateVm"];
@@ -377,8 +377,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Snapshot sandbox
-         * @description User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses the bounded live pre-copy path; RAM, device state, and the private disk upper are captured at one atomic final-stop boundary. The response is an opaque handle; paths and physical host identity remain private.
+         * Snapshot a VM
+         * @description User keys can snapshot only their tenant's VMs; admin keys can snapshot any VM. A running VM uses the bounded live pre-copy path; a paused VM captures from its existing stop boundary. RAM, device state, and the private disk upper are captured at one atomic boundary. The response is an opaque handle; paths and physical host identity remain private.
          */
         post: operations["snapshotVm"];
         delete?: never;
@@ -417,7 +417,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Restore sandbox from a snapshot
+         * Restore a VM from a snapshot
          * @description Restores a VM from an opaque snapshot handle. The control plane resolves its private host and storage locator; tenant VM quotas apply.
          */
         post: operations["restoreVm"];
@@ -2134,7 +2134,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description VM is stopped */
+            /** @description Invalid lifecycle transition */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -2184,8 +2184,22 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description VM is stopped */
+            /** @description Invalid lifecycle transition */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No placement capacity is available for hibernated activation */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The owning host or activation prerequisites are unavailable */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2234,7 +2248,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description VM is not running */
+            /** @description Invalid lifecycle transition */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -2354,7 +2368,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description VM is stopped */
+            /** @description VM lifecycle state does not support snapshots */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -2481,11 +2495,25 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Selected node is at capacity */
+            /** @description Requested VM id already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Snapshot-owning node is at capacity */
             429: {
                 headers: {
                     /** @description Seconds the client should wait before retrying */
                     "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Snapshot-owning node is unhealthy, stale, or unavailable */
+            503: {
+                headers: {
                     [name: string]: unknown;
                 };
                 content?: never;
