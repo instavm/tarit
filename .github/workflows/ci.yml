@@ -27,7 +27,7 @@ jobs:
       - name: Reject product-specific and out-of-tree dependencies
         run: |
           python3 scripts/check_oss_boundary.py
-          python3 -m unittest test/test_oss_boundary.py -v
+          python3 -m unittest discover -s test -p 'test_oss_boundary.py' -v
 
   musl:
     name: build release targets (musl)
