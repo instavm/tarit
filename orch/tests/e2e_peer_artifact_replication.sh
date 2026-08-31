@@ -186,7 +186,7 @@ test "$(stat -f -c %T "$DIR")" = btrfs || {
 
 if [ "${TARIT_TEST_NEAR_ENOSPC:-0}" = 1 ]; then
   echo '== create isolated node-B filesystem for near-ENOSPC fault injection =='
-  ENOSPC_FS_BYTES="${TARIT_TEST_ENOSPC_FS_BYTES:-3221225472}"
+  ENOSPC_FS_BYTES="${TARIT_TEST_ENOSPC_FS_BYTES:-5368709120}"
   case "$ENOSPC_FS_BYTES" in
     ''|*[!0-9]*)
       echo "FAIL: near-ENOSPC filesystem size must be an integer" >&2
@@ -642,6 +642,16 @@ print(sum(os.stat(path).st_size for path in paths))
 PY
   )
   test "$ENOSPC_LOCALIZATION_BYTES" -gt 134217728
+  ENOSPC_AVAILABLE_BEFORE_RESERVE=$(df -B1 --output=avail "$DIR/node-b" | \
+    tail -1 | tr -d '[:space:]')
+  ENOSPC_RESERVATION_HEADROOM=67108864
+  if [ "$ENOSPC_AVAILABLE_BEFORE_RESERVE" -le "$((ENOSPC_LOCALIZATION_BYTES + ENOSPC_RESERVATION_HEADROOM))" ]; then
+    echo "FAIL: near-ENOSPC fixture cannot admit localization before fault injection" >&2
+    echo "available_bytes=$ENOSPC_AVAILABLE_BEFORE_RESERVE" \
+      "localization_bytes=$ENOSPC_LOCALIZATION_BYTES" \
+      "required_headroom=$ENOSPC_RESERVATION_HEADROOM" >&2
+    exit 1
+  fi
   curl -sS --max-time 180 -o "$DIR/enospc-response.json" -w '%{http_code}' \
     -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' -d "$BRANCH_BODY" \
     "http://127.0.0.1:$A_CONTROL/v1/branches" \
