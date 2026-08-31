@@ -22,6 +22,9 @@ versions may contain breaking changes.
 
 - Duplicate activation can no longer replace an in-flight boot registration;
   waiters observe the result of the exact registered incarnation.
+- Snapshot restore now repairs guest realtime inside the mandatory
+  pre-admission barrier while leaving monotonic timers independent of the host
+  hibernation interval.
 
 ## [0.1.2] - 2026-08-07
 

@@ -45,6 +45,9 @@ its scope.
   share ingress activate a hibernated VM through a single-flight restore gate;
   failed activation leaves a retryable hibernated record instead of a second
   VMM or leaked capacity.
+- Restore keeps KVM realtime advancement disabled so guest monotonic timers do
+  not jump by the host hibernation interval. The mandatory repair barrier sets
+  guest realtime from a host timestamp before admitting workload traffic.
 - Live fork takes one memory, device, and disk boundary, publishes authenticated
   artifacts, and restores each child with independent lazy RAM and a private
   disk overlay. VMGenID notification on supported kernels is paired with a
@@ -117,7 +120,8 @@ regression gates, but the following unresolved items now block release:
    rather than extrapolating from local-block tests.
 4. Extend the now-passing c8i stable-seed lifecycle matrix into a sustained
    balloon-after-restore kernel-liveness soak, complete the cross-build/
-   CPU-template rejection matrix, and record 100-sample fork/snapshot/restore
+   CPU-template rejection matrix, complete multi-hour and absolute-realtime
+   timer/lease qualification, and record 100-sample fork/snapshot/restore
    latency distributions on a larger reflink-capable fixture.
 5. Run the full protected release workflow from an immutable source revision
    and retain its binaries, hashes, configuration, logs, and cleanup audit.

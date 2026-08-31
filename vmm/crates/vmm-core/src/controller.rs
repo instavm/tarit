@@ -2225,12 +2225,32 @@ impl VmmController {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn build_clone_repair_v3_command(
+    encoded_nonce: &str,
+    host_realtime: std::time::Duration,
+) -> String {
+    use std::fmt::Write as _;
+
+    const COMMAND_PREFIX: &str = "__TARIT_CLONE_REPAIR_V3__";
+    let mut command = String::with_capacity(COMMAND_PREFIX.len() + encoded_nonce.len() + 24);
+    command.push_str(COMMAND_PREFIX);
+    command.push_str(encoded_nonce);
+    write!(
+        command,
+        "{:016x}{:08x}",
+        host_realtime.as_secs(),
+        host_realtime.subsec_nanos()
+    )
+    .expect("writing timestamp hex to a String cannot fail");
+    command
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
     use std::fmt::Write as _;
     use std::time::{Duration, Instant};
 
-    const COMMAND_PREFIX: &str = "__TARIT_CLONE_REPAIR_V2__";
-    const RESPONSE: &str = "TARIT_CLONE_REPAIR_V2_OK";
+    const RESPONSE: &str = "TARIT_CLONE_REPAIR_V3_OK";
     const TIMEOUT: Duration = Duration::from_secs(30);
 
     // Generate this after restore on the host. Guest hwrng buffers and the
@@ -2242,12 +2262,11 @@ fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
     // Set RFC 4122 version/variant bits while retaining 122 random bits.
     nonce[32 + 6] = (nonce[32 + 6] & 0x0f) | 0x40;
     nonce[32 + 8] = (nonce[32 + 8] & 0x3f) | 0x80;
-    let mut command = String::with_capacity(COMMAND_PREFIX.len() + nonce.len() * 2);
-    command.push_str(COMMAND_PREFIX);
+    let mut encoded_nonce = String::with_capacity(nonce.len() * 2);
     for byte in &nonce {
-        write!(command, "{byte:02x}").expect("writing hex to a String cannot fail");
+        write!(encoded_nonce, "{byte:02x}").expect("writing hex to a String cannot fail");
     }
-    let expected_clone_id = command[command.len() - 32..].to_owned();
+    let expected_clone_id = encoded_nonce[encoded_nonce.len() - 32..].to_owned();
     nonce.fill(0);
 
     let deadline = Instant::now() + TIMEOUT;
@@ -2265,6 +2284,10 @@ fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
             if remaining.is_zero() {
                 break;
             }
+            let host_realtime = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| VmmError::Device("host realtime is before the Unix epoch".into()))?;
+            let command = build_clone_repair_v3_command(&encoded_nonce, host_realtime);
             match channel.exec(&command, remaining) {
                 Some(Ok((0, stdout, _, _))) => {
                     let mut fields = stdout.split_whitespace();
@@ -5541,6 +5564,20 @@ fn serialize_state_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn clone_repair_v3_command_has_fixed_width_realtime_suffix() {
+        let nonce = "ab".repeat(48);
+        let command = build_clone_repair_v3_command(
+            &nonce,
+            std::time::Duration::new(0x0102_0304_0506_0708, 0x0102_0304),
+        );
+        assert_eq!(
+            command,
+            format!("__TARIT_CLONE_REPAIR_V3__{nonce}010203040506070801020304")
+        );
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     #[test]

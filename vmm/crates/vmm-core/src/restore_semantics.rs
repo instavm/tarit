@@ -6,9 +6,10 @@
 //! **Clocks (kvmclock):**
 //! - The guest uses kvmclock (KVM's paravirtualized clock) for time.
 //! - On restore, the guest's clock reads the old TSC value → time jump.
-//! - Tarit restores the saved KVM clock with `KVM_CLOCK_REALTIME` cleared and
-//!   notifies restored vCPUs with `KVM_KVMCLOCK_CTRL`. Guest wall-clock repair
-//!   is still a guest policy concern.
+//! - Tarit restores the saved KVM clock with `KVM_CLOCK_REALTIME` cleared,
+//!   notifies restored vCPUs with `KVM_KVMCLOCK_CTRL`, and repairs realtime in
+//!   the guest during the mandatory pre-admission clone-repair exchange. This
+//!   advances wall time without incorrectly advancing monotonic timers.
 //! - For clones: each clone gets its own kvmclock offset (KVM creates a
 //!   fresh VM, so the clock starts from the host's current time).
 //!

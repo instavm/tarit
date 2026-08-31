@@ -370,7 +370,7 @@ OCI input was Ubuntu.
 | --- | --- | --- |
 | Live fork and lazy CoW | Atomic live snapshot, authenticated lazy RAM, private disk overlays, sibling isolation, high-dirty workloads, rollback failpoints, and fail-closed UFFD handler exit, descriptor loss, UNMAP, and REMAP handling pass on c8i | Cancellation across every distributed phase and 100-sample latency distributions |
 | Scale-to-zero and activation | Hibernation releases the VMM and scheduler capacity; HTTP, PTY, SSH, and share activation single-flight through the same restore gate | Long-hibernation timer/watchdog/lease qualification and sustained contention testing |
-| Clone identity | Linux 6.6 VMGenID notification and the mandatory userspace repair barrier pass; Linux 5.10 passes through the barrier-only compatibility path; a delayed application-token repair hook rejects or repairs eight concurrent exec requests without exposing inherited state | Concurrent PTY, SSH, HTTP-share, and mixed-ingress repair races for application-owned PRNG, nonce, token, and session caches |
+| Clone identity | Linux 6.6 VMGenID notification and the mandatory userspace repair barrier pass; Linux 5.10 passes through the barrier-only compatibility path; mixed exec, PTY, SSH, and HTTP-share ingress waits for application PRNG, nonce, ticket, and session-cache repair | Completion of the sustained four-case Ubuntu/Alpine and Linux 6.6/5.10 rotation |
 | Security and isolation | Guest VMX/SVM and `/dev/kvm` are hidden while worker KVM remains enabled; jail, seccomp, cgroups, mTLS peer identity, opaque artifacts, signed-image admission, and tenant fences pass focused gates | Continued kernel/microcode qualification and the remaining adversarial release matrix |
 | Persistent volumes | Local and NFS-backed raw block volumes pass attach, fsync, hibernate, cross-node recovery, busy-detach, and deletion across Ubuntu/Alpine and Linux 6.6/5.10 | Managed EFS/Azure qualification, protected NFS transport, physical host loss, and backend-native snapshot/clone support |
 | OCI and kernels | Ubuntu 24.04 and Alpine 3.20 cover the lifecycle matrix on Linux 6.6 and 5.10; the broader seven-image compatibility gate passes on both kernels | Decompression/inode exhaustion and interrupted registry-transfer qualification |
@@ -968,8 +968,20 @@ passing focused gate does not waive an item in the final column.
   report their last completed stage. Retained state proved the application
   marker had completed while the agent slept on restored guest time. Repair now
   uses a signal plus generation-matched marker, and the agent does not sleep on
-  guest time before admission. A forced in-epoch capacity-floor test stopped
-  after 54 operations, archived a 335 KiB database and 82 KiB service log, and
+  guest time before admission. A separate deterministic timer gate reproduced
+  guest realtime remaining 16 seconds behind the host after a 12-second
+  hibernation while an inherited monotonic timer correctly remained pending.
+  Clone-repair protocol v3 now repairs realtime inside the guest before
+  admission without enabling KVM realtime advancement. Ubuntu/Linux 6.6 and
+  Alpine/Linux 5.10 matched host realtime exactly, advanced guest uptime by
+  only 1.48 and 1.37 seconds, fired the inherited five-second timer 4.64 and
+  4.83 seconds after resume, and completed 164 and 154 operations without a
+  watchdog, lockup, panic, kernel BUG signature, or leak. Each continuous epoch
+  now includes a 65-second hibernation hold; the first supervised lane matched
+  host realtime exactly, advanced guest uptime by 2.15 seconds, and delivered
+  the inherited timer 4.07 seconds after resume. A forced in-epoch capacity-floor
+  test stopped after 54 operations, archived a 335 KiB database and 82 KiB
+  service log, and
   left no candidate process, mount, or runtime directory. A separate supervised
   stop after 90 operations produced the same clean result and restored 11 GiB
   free on the 12 GiB fixture. The service is enabled and running; completion of

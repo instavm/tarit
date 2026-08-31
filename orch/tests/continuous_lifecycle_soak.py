@@ -185,6 +185,61 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         ) == "rejected"
         self.event("hibernate_resume_verified", vm_id=vm_id)
 
+    def long_hibernate_clock_timer(self, vm_id: str) -> None:
+        timer_seconds = self.args.guest_timer_seconds
+        before = self.exec(
+            vm_id,
+            "set -eu; rm -f /tmp/tarit-timer-fired; "
+            "read uptime rest < /proc/uptime; "
+            f"busybox setsid sh -c 'sleep {timer_seconds}; printf fired > "
+            "/tmp/tarit-timer-fired' </dev/null >/tmp/tarit-timer.log 2>&1 & "
+            "printf '%s %s\\n' \"$uptime\" \"$(date +%s)\"",
+        ).split()
+        assert len(before) == 2, before
+        uptime_before, realtime_before = float(before[0]), int(before[1])
+        _, hibernated = self.request("POST", f"/v1/vms/{vm_id}/hibernate", {}, 200, 360)
+        assert hibernated["status"] == "hibernated", hibernated
+        hold_started = time.monotonic()
+        time.sleep(self.args.hibernate_hold_seconds)
+        resume_started = time.monotonic()
+        immediate = self.exec(
+            vm_id,
+            "set -eu; read uptime rest < /proc/uptime; "
+            "test ! -e /tmp/tarit-timer-fired; "
+            "! dmesg | tail -n 300 | grep -Eiq "
+            "'watchdog: BUG|soft lockup|hard LOCKUP|Kernel panic|BUG:'; "
+            "printf '%s %s\\n' \"$uptime\" \"$(date +%s)\"",
+        ).split()
+        assert len(immediate) == 2, immediate
+        uptime_after, realtime_after = float(immediate[0]), int(immediate[1])
+        host_realtime = int(time.time())
+        assert uptime_after >= uptime_before, (uptime_before, uptime_after)
+        assert uptime_after - uptime_before < timer_seconds, (uptime_before, uptime_after)
+        assert abs(realtime_after - host_realtime) <= 3, (realtime_after, host_realtime)
+        assert realtime_after - realtime_before >= self.args.hibernate_hold_seconds - 3, (
+            realtime_before, realtime_after,
+        )
+
+        timer_deadline = time.monotonic() + timer_seconds + 15
+        while time.monotonic() < timer_deadline:
+            if self.exec(vm_id, "if test -e /tmp/tarit-timer-fired; then echo fired; else echo pending; fi") == "fired":
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError("guest monotonic timer did not fire after resume")
+        timer_elapsed = time.monotonic() - resume_started
+        assert timer_elapsed >= timer_seconds - 1, timer_elapsed
+        self.event(
+            "long_hibernate_clock_timer_verified",
+            vm_id=vm_id,
+            hold_seconds=round(resume_started - hold_started, 3),
+            guest_timer_seconds=timer_seconds,
+            timer_after_resume_seconds=round(timer_elapsed, 3),
+            guest_uptime_delta_seconds=round(uptime_after - uptime_before, 3),
+            guest_realtime_delta_seconds=realtime_after - realtime_before,
+            host_realtime_error_seconds=realtime_after - host_realtime,
+        )
+
     def pause_resume(self, vm_id: str) -> None:
         _, paused = self.request("POST", f"/v1/vms/{vm_id}/pause", {}, 200)
         assert paused["status"] == "paused", paused
@@ -257,6 +312,9 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         for index in range(self.args.anchors):
             self.create_anchor(index)
             self.assert_storage_headroom()
+        if self.args.hibernate_hold_seconds:
+            self.long_hibernate_clock_timer(next(iter(self.anchors)))
+            self.assert_global_invariants()
         deadline = time.monotonic() + self.args.duration_seconds
         actions = [
             self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
@@ -298,6 +356,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-seconds", type=int, default=1800)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--anchors", type=int, default=3)
+    parser.add_argument("--hibernate-hold-seconds", type=int, default=0)
+    parser.add_argument("--guest-timer-seconds", type=int, default=5)
     parser.add_argument("--storage-path")
     parser.add_argument("--min-free-bytes", type=int, default=0)
     args = parser.parse_args()
@@ -306,6 +366,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("duration must be at least 60 seconds and anchors must leave two transient slots")
     if args.min_free_bytes < 0 or (args.min_free_bytes and not args.storage_path):
         parser.error("a non-negative storage floor requires --storage-path")
+    if args.hibernate_hold_seconds and args.hibernate_hold_seconds <= args.guest_timer_seconds + 2:
+        parser.error("hibernate hold must exceed the guest timer by at least three seconds")
+    if args.guest_timer_seconds < 2:
+        parser.error("guest timer must be at least two seconds")
     return args
 
 

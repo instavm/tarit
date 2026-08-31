@@ -69,12 +69,15 @@
 #define EXEC_FRAME_MAX_PAYLOAD (1024U * 1024U)
 #define EXEC_STREAM_CHUNK_BYTES (16U * 1024U)
 #define EXEC_PROTOCOL_LINE "VMM_VSOCK_EXEC_PROTO=2\n"
-#define CLONE_REPAIR_PREFIX "__TARIT_CLONE_REPAIR_V2__"
-#define CLONE_REPAIR_PREFIX_LEN (sizeof(CLONE_REPAIR_PREFIX) - 1U)
+#define CLONE_REPAIR_PREFIX_V2 "__TARIT_CLONE_REPAIR_V2__"
+#define CLONE_REPAIR_PREFIX_V2_LEN (sizeof(CLONE_REPAIR_PREFIX_V2) - 1U)
+#define CLONE_REPAIR_PREFIX_V3 "__TARIT_CLONE_REPAIR_V3__"
+#define CLONE_REPAIR_PREFIX_V3_LEN (sizeof(CLONE_REPAIR_PREFIX_V3) - 1U)
 #define CLONE_REPAIR_SEED_BYTES 32U
 #define CLONE_REPAIR_ID_BYTES 16U
 #define CLONE_REPAIR_NONCE_BYTES (CLONE_REPAIR_SEED_BYTES + CLONE_REPAIR_ID_BYTES)
-#define CLONE_REPAIR_OK "TARIT_CLONE_REPAIR_V2_OK"
+#define CLONE_REPAIR_OK_V2 "TARIT_CLONE_REPAIR_V2_OK"
+#define CLONE_REPAIR_OK_V3 "TARIT_CLONE_REPAIR_V3_OK"
 #define POST_FORK_HOOK_PATH "/usr/libexec/tarit/post-fork"
 #define CLONE_REPAIR_STAGE_PATH "/run/tarit/clone-repair-stage"
 
@@ -118,23 +121,60 @@ static int hex_nibble(unsigned char value) {
     return -1;
 }
 
-static int decode_clone_repair_nonce(const char *command,
-                                     unsigned char nonce[CLONE_REPAIR_NONCE_BYTES]) {
-    size_t prefix_len = strlen(CLONE_REPAIR_PREFIX);
-    size_t expected_len = prefix_len + CLONE_REPAIR_NONCE_BYTES * 2U;
-    if (prefix_len != CLONE_REPAIR_PREFIX_LEN || strlen(command) != expected_len ||
-        memcmp(command, CLONE_REPAIR_PREFIX, prefix_len) != 0) {
-        errno = EINVAL;
-        return -1;
-    }
-    for (size_t i = 0; i < CLONE_REPAIR_NONCE_BYTES; i++) {
-        int high = hex_nibble((unsigned char)command[prefix_len + i * 2U]);
-        int low = hex_nibble((unsigned char)command[prefix_len + i * 2U + 1U]);
+static int decode_hex_bytes(const char *encoded, unsigned char *output, size_t output_len) {
+    for (size_t i = 0; i < output_len; i++) {
+        int high = hex_nibble((unsigned char)encoded[i * 2U]);
+        int low = hex_nibble((unsigned char)encoded[i * 2U + 1U]);
         if (high < 0 || low < 0) {
             errno = EINVAL;
             return -1;
         }
-        nonce[i] = (unsigned char)((high << 4) | low);
+        output[i] = (unsigned char)((high << 4) | low);
+    }
+    return 0;
+}
+
+static int decode_clone_repair_request(const char *command,
+                                       unsigned char nonce[CLONE_REPAIR_NONCE_BYTES],
+                                       struct timespec *host_realtime, int *protocol_version) {
+    size_t prefix_len;
+    size_t timestamp_bytes;
+    if (strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
+        prefix_len = CLONE_REPAIR_PREFIX_V3_LEN;
+        timestamp_bytes = 12U;
+        *protocol_version = 3;
+    } else if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0) {
+        prefix_len = CLONE_REPAIR_PREFIX_V2_LEN;
+        timestamp_bytes = 0U;
+        *protocol_version = 2;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t expected_len = prefix_len + (CLONE_REPAIR_NONCE_BYTES + timestamp_bytes) * 2U;
+    if (strlen(command) != expected_len ||
+        decode_hex_bytes(command + prefix_len, nonce, CLONE_REPAIR_NONCE_BYTES) < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (*protocol_version == 3) {
+        unsigned char encoded_time[12];
+        if (decode_hex_bytes(command + prefix_len + CLONE_REPAIR_NONCE_BYTES * 2U,
+                             encoded_time, sizeof(encoded_time)) < 0) {
+            return -1;
+        }
+        uint64_t seconds = 0;
+        uint32_t nanoseconds = 0;
+        for (size_t i = 0; i < 8U; i++) seconds = (seconds << 8U) | encoded_time[i];
+        for (size_t i = 8U; i < 12U; i++) nanoseconds = (nanoseconds << 8U) | encoded_time[i];
+        time_t converted_seconds = (time_t)seconds;
+        if (nanoseconds >= 1000000000U || converted_seconds < 0 ||
+            (uint64_t)converted_seconds != seconds) {
+            errno = ERANGE;
+            return -1;
+        }
+        host_realtime->tv_sec = converted_seconds;
+        host_realtime->tv_nsec = (long)nanoseconds;
     }
     return 0;
 }
@@ -216,7 +256,7 @@ static int run_post_fork_hook(const char *clone_id) {
     return 0;
 }
 
-static int repair_clone_entropy(const char *command, char clone_id[33]) {
+static int repair_clone_entropy(const char *command, char clone_id[33], int *protocol_version) {
     unsigned char nonce[CLONE_REPAIR_NONCE_BYTES];
     struct {
         int entropy_count;
@@ -227,13 +267,18 @@ static int repair_clone_entropy(const char *command, char clone_id[33]) {
     int marker = -1;
     int boot_id_file = -1;
     int rc = -1;
+    struct timespec host_realtime = {0};
 
     if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) {
         goto out;
     }
     set_clone_repair_stage("decode");
-    if (decode_clone_repair_nonce(command, nonce) < 0) {
+    if (decode_clone_repair_request(command, nonce, &host_realtime, protocol_version) < 0) {
         goto out;
+    }
+    if (*protocol_version == 3) {
+        set_clone_repair_stage("clock");
+        if (clock_settime(CLOCK_REALTIME, &host_realtime) < 0) goto out;
     }
 
     pool.entropy_count = (int)(CLONE_REPAIR_SEED_BYTES * 8U);
@@ -621,10 +666,13 @@ static void run_command(int serial_fd, const char *command) {
         return;
     }
 #ifdef __linux__
-    if (strncmp(command, CLONE_REPAIR_PREFIX, CLONE_REPAIR_PREFIX_LEN) == 0) {
+    if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0 ||
+        strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
         char clone_id[33];
-        if (repair_clone_entropy(command, clone_id) == 0) {
-            serial_printf(serial_fd, "%s %s\n", CLONE_REPAIR_OK, clone_id);
+        int protocol_version = 0;
+        if (repair_clone_entropy(command, clone_id, &protocol_version) == 0) {
+            const char *response = protocol_version == 3 ? CLONE_REPAIR_OK_V3 : CLONE_REPAIR_OK_V2;
+            serial_printf(serial_fd, "%s %s\n", response, clone_id);
             serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 0);
         } else {
             serial_printf(serial_fd, "vmm-agent: clone repair failed: %s\n", strerror(errno));
@@ -823,11 +871,14 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
         (void)send_exec_exit(fd, request_id, 0);
         return;
     }
-    if (strncmp(command, CLONE_REPAIR_PREFIX, CLONE_REPAIR_PREFIX_LEN) == 0) {
+    if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0 ||
+        strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
         char clone_id[33];
-        if (repair_clone_entropy(command, clone_id) == 0) {
+        int protocol_version = 0;
+        if (repair_clone_entropy(command, clone_id, &protocol_version) == 0) {
             char response[96];
-            int len = snprintf(response, sizeof(response), "%s %s\n", CLONE_REPAIR_OK, clone_id);
+            const char *marker = protocol_version == 3 ? CLONE_REPAIR_OK_V3 : CLONE_REPAIR_OK_V2;
+            int len = snprintf(response, sizeof(response), "%s %s\n", marker, clone_id);
             if (len > 0 && (size_t)len < sizeof(response)) {
                 (void)send_exec_chunk(fd, EXEC_FRAME_STDOUT, request_id, response, (uint32_t)len);
                 (void)send_exec_exit(fd, request_id, 0);
