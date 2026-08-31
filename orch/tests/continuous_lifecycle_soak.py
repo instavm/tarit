@@ -164,6 +164,9 @@ class Soak:
         self.fork_paths[path] = self.fork_paths.get(path, 0) + 1
         self.fork_terminations[termination] = self.fork_terminations.get(termination, 0) + 1
 
+    def record_vm_fork_metrics(self, vm_id: str, response: dict[str, object]) -> None:
+        self.record_fork_metrics(response, self.anchors[vm_id].vcpus)
+
     def write_status(self, kind: str, fields: dict[str, object]) -> None:
         if not self.args.status_file:
             return
@@ -274,6 +277,28 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         output = self.exec(vm_id, command)
         assert "clone=cold-boot" in output, output
 
+    def assert_guest_identity(self, vm_id: str) -> None:
+        if not self.args.expected_kernel_prefix and not self.args.expected_os_id:
+            return
+        output = self.exec(
+            vm_id,
+            "set -eu; uname -r; . /etc/os-release; printf '%s\\n' \"$ID\"",
+        ).splitlines()
+        assert len(output) == 2, output
+        kernel_release, os_id = output
+        if self.args.expected_kernel_prefix:
+            assert kernel_release.startswith(self.args.expected_kernel_prefix), (
+                self.args.expected_kernel_prefix, kernel_release,
+            )
+        if self.args.expected_os_id:
+            assert os_id == self.args.expected_os_id, (
+                self.args.expected_os_id, os_id,
+            )
+        self.event(
+            "guest_identity_verified", vm_id=vm_id,
+            kernel_release=kernel_release, os_id=os_id,
+        )
+
     def create_anchor(self, index: int) -> str:
         proof = f"anchor-{self.args.seed}-{index}-{uuid.uuid4().hex[:12]}"
         vcpus = self.args.anchor_vcpus[index % len(self.args.anchor_vcpus)]
@@ -282,6 +307,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         )
         vm_id = row["id"]
         assert row["status"] == "running", row
+        self.assert_guest_identity(vm_id)
         self.install_workload(vm_id, proof)
         self.anchors[vm_id] = Anchor(
             proof=proof, created_at=time.monotonic(), vcpus=vcpus
@@ -305,7 +331,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         before = self.workload_state(vm_id)
         ticket = self.exec(vm_id, "/usr/local/bin/tarit-clone-repair-workload ticket")
         _, response = self.request("POST", f"/v1/vms/{vm_id}/fork", {}, 201, 360)
-        self.record_fork_metrics(response, self.anchors[vm_id].vcpus)
+        self.record_vm_fork_metrics(vm_id, response)
         child = response["vm"]
         child_id = child["id"]
         self.transient.add(child_id)
@@ -606,7 +632,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         fork_ready: dict[str, float] = {}
         for _ in range(2):
             _, response = self.request("POST", f"/v1/vms/{vm_id}/fork", {}, 201, 360)
-            self.record_fork_metrics(response)
+            self.record_vm_fork_metrics(vm_id, response)
             child = response["vm"]
             child_id = child["id"]
             assert child["status"] == "running", child
@@ -956,19 +982,41 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         ]
         for action, vm_id in required_actions:
             self.run_action(action, vm_id)
-        deadline = time.monotonic() + self.args.duration_seconds
-        actions = [
-            self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
-            self.hibernate_resume, self.pause_resume, self.balloon,
-            self.concurrent_guest_work, self.contended_guest_agent_exec,
-        ]
-        while time.monotonic() < deadline:
+        action_by_name = {
+            "assert": self.assert_anchor,
+            "mutate": self.mutate,
+            "fork": self.fork_anchor,
+            "hibernate": self.hibernate_resume,
+            "pause": self.pause_resume,
+            "balloon": self.balloon,
+            "guest-work": self.concurrent_guest_work,
+            "contended-exec": self.contended_guest_agent_exec,
+            "snapshot": self.snapshot_restore,
+        }
+        if self.args.actions:
+            actions = [action_by_name[name] for name in self.args.actions]
+        else:
+            actions = [
+                self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
+                self.hibernate_resume, self.pause_resume, self.balloon,
+                self.concurrent_guest_work, self.contended_guest_agent_exec,
+            ]
+        deadline = (
+            time.monotonic() + self.args.duration_seconds
+            if self.args.duration_seconds is not None else None
+        )
+        completed_steps = 0
+        while (
+            time.monotonic() < deadline
+            if deadline is not None else completed_steps < self.args.steps
+        ):
             vm_id = self.random.choice(list(self.anchors))
             available_actions = list(actions)
-            if self.snapshots < self.args.max_snapshots:
+            if not self.args.actions and self.snapshots < self.args.max_snapshots:
                 available_actions.append(self.snapshot_restore)
             action = self.random.choice(available_actions)
             self.run_action(action, vm_id)
+            completed_steps += 1
             time.sleep(self.args.interval_seconds)
         if self.sentinel:
             self.finish_epoch_hibernation()
@@ -978,6 +1026,8 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             "soak_pass", seed=self.args.seed, operations=self.operations,
             snapshots=self.snapshots, anchors=len(self.anchors),
             minimum_anchor_age_s=round(minimum_age, 3),
+            mode="duration" if deadline is not None else "steps",
+            completed_steps=completed_steps,
             actions=self.action_summary(),
         )
 
@@ -992,18 +1042,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jail-uid-count", type=int, required=True)
     parser.add_argument("--max-vms", type=int, required=True)
     parser.add_argument("--max-snapshots", type=int, default=8)
-    parser.add_argument("--seeds", default="7")
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--duration-seconds", type=int, default=1800)
+    parser.add_argument(
+        "--seeds", default="7",
+        help="comma-separated reproducible seeds; duration mode accepts one",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=20,
+        help="randomized actions per seed when duration mode is not selected",
+    )
+    parser.add_argument(
+        "--duration-seconds", type=int,
+        help="run continuously for this duration instead of using --steps",
+    )
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--anchors", type=int, default=3)
     parser.add_argument("--anchor-vcpus", default="1,2,4")
+    parser.add_argument(
+        "--actions",
+        help=(
+            "comma-separated loop actions: assert,mutate,fork,hibernate,pause,"
+            "balloon,guest-work,contended-exec,snapshot"
+        ),
+    )
     parser.add_argument("--hibernate-hold-seconds", type=int, default=0)
     parser.add_argument("--guest-timer-seconds", type=int, default=5)
     parser.add_argument("--sibling-fork-timer-seconds", type=int, default=0)
     parser.add_argument("--epoch-hibernate-min-seconds", type=int, default=0)
     parser.add_argument("--storage-path")
     parser.add_argument("--min-free-bytes", type=int, default=0)
+    parser.add_argument("--expected-kernel-prefix")
+    parser.add_argument("--expected-os-id")
     parser.add_argument(
         "--status-file", default=os.environ.get("TARIT_LIFECYCLE_STATUS_FILE"),
     )
@@ -1014,15 +1082,48 @@ def parse_args() -> argparse.Namespace:
         "--epoch", type=int, default=int(os.environ.get("TARIT_LIFECYCLE_EPOCH", "0")),
     )
     args = parser.parse_args()
-    args.seed = int(args.seeds.split(",", 1)[0])
+    seed_values = args.seeds.split(",")
+    if any(
+        not value or not value.isascii() or not value.isdecimal()
+        for value in seed_values
+    ):
+        parser.error("seeds must contain 1 to 64 comma-separated unsigned 64-bit integers")
+    args.seeds = [int(value) for value in seed_values]
+    if (
+        not args.seeds or len(args.seeds) > 64
+        or any(value < 0 or value > (1 << 64) - 1 for value in args.seeds)
+    ):
+        parser.error("seeds must contain 1 to 64 comma-separated unsigned 64-bit integers")
     try:
         args.anchor_vcpus = [int(value) for value in args.anchor_vcpus.split(",")]
     except ValueError:
         parser.error("anchor vCPU counts must be comma-separated integers")
     if not args.anchor_vcpus or any(value < 1 or value > 8 for value in args.anchor_vcpus):
         parser.error("anchor vCPU counts must be between one and eight")
-    if args.duration_seconds < 60 or args.anchors < 2 or args.anchors > args.max_vms - 2:
-        parser.error("duration must be at least 60 seconds and anchors must leave two transient slots")
+    allowed_actions = {
+        "assert", "mutate", "fork", "hibernate", "pause", "balloon",
+        "guest-work", "contended-exec", "snapshot",
+    }
+    if args.actions:
+        action_values = args.actions.split(",")
+        if any(not value.strip() for value in action_values):
+            parser.error("actions must be a comma-separated list without empty entries")
+        args.actions = [value.strip() for value in action_values]
+        invalid_actions = sorted(set(args.actions) - allowed_actions)
+        if not args.actions or invalid_actions:
+            parser.error(f"unknown loop actions: {','.join(invalid_actions)}")
+    else:
+        args.actions = []
+    if args.steps < 1 or args.steps > 10000:
+        parser.error("steps must be between one and 10000")
+    if not 0 <= args.interval_seconds <= 60:
+        parser.error("action interval must be between zero and 60 seconds")
+    if args.duration_seconds is not None and args.duration_seconds < 60:
+        parser.error("duration must be at least 60 seconds")
+    if args.duration_seconds is not None and len(args.seeds) != 1:
+        parser.error("duration mode requires exactly one seed")
+    if args.anchors < 2 or args.anchors > args.max_vms - 2:
+        parser.error("anchors must leave two transient slots")
     if args.min_free_bytes < 0 or (args.min_free_bytes and not args.storage_path):
         parser.error("a non-negative storage floor requires --storage-path")
     if args.hibernate_hold_seconds and args.hibernate_hold_seconds <= args.guest_timer_seconds + 2:
@@ -1038,15 +1139,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    soak = Soak(args)
-    try:
-        soak.run()
-        return 0
-    except Exception as error:
-        soak.event("soak_failure", error=repr(error), operations=soak.operations)
-        raise
-    finally:
-        soak.cleanup()
+    for seed in args.seeds:
+        run_args = argparse.Namespace(**vars(args))
+        run_args.seed = seed
+        soak = Soak(run_args)
+        try:
+            soak.run()
+        except Exception as error:
+            soak.event("soak_failure", error=repr(error), operations=soak.operations)
+            raise
+        finally:
+            soak.cleanup()
+    return 0
 
 
 if __name__ == "__main__":

@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import stat
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +30,8 @@ class StatusPublicationTests(unittest.TestCase):
             base_url="http://127.0.0.1:1",
             case_name="ubuntu66",
             epoch=7,
+            expected_kernel_prefix=None,
+            expected_os_id=None,
             seed=20260831,
             status_file=str(status_file),
         ))
@@ -163,6 +167,145 @@ class StatusPublicationTests(unittest.TestCase):
                         "termination": "converged",
                     },
                 }}, 2)
+
+    def test_vm_fork_metrics_use_the_source_vcpu_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            soak.anchors["source"] = SimpleNamespace(vcpus=4)
+            recorded = []
+            soak.record_fork_metrics = lambda response, vcpus: recorded.append(
+                (response, vcpus)
+            )
+            response = {"metrics": {"path": "local"}}
+
+            soak.record_vm_fork_metrics("source", response)
+
+            self.assertEqual(recorded, [(response, 4)])
+
+    def test_guest_identity_requires_exact_os_and_kernel_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            soak.args.expected_kernel_prefix = "6.6."
+            soak.args.expected_os_id = "ubuntu"
+            soak.exec = lambda vm_id, command: "6.6.155-tarit\nubuntu"
+            events = []
+            soak.event = lambda kind, **fields: events.append((kind, fields))
+
+            soak.assert_guest_identity("vm-1")
+
+            self.assertEqual(events[0][0], "guest_identity_verified")
+            self.assertEqual(events[0][1]["kernel_release"], "6.6.155-tarit")
+            soak.exec = lambda vm_id, command: "5.10.230-tarit\nubuntu"
+            with self.assertRaises(AssertionError):
+                soak.assert_guest_identity("vm-1")
+
+    def parse_args(self, *extra: str):
+        argv = [
+            "continuous_lifecycle_soak.py",
+            "--base-url", "http://127.0.0.1:1",
+            "--api-key", "key",
+            "--database", "/tmp/test.db",
+            "--vmm", "/tmp/vmm",
+            "--jail-uid-base", "300000",
+            "--jail-uid-count", "6",
+            "--max-vms", "6",
+            *extra,
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            return MODULE.parse_args()
+
+    def test_step_mode_keeps_every_requested_seed(self) -> None:
+        args = self.parse_args("--seeds", "7,202609,424242", "--steps", "12")
+
+        self.assertEqual(args.seeds, [7, 202609, 424242])
+        self.assertEqual(args.steps, 12)
+        self.assertIsNone(args.duration_seconds)
+
+    def test_duration_mode_requires_one_reproducible_seed(self) -> None:
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse_args("--seeds", "7,202609", "--duration-seconds", "900")
+
+        args = self.parse_args("--seeds", "202609", "--duration-seconds", "900")
+        self.assertEqual(args.seeds, [202609])
+        self.assertEqual(args.duration_seconds, 900)
+
+    def test_driver_bounds_seed_step_and_interval_inputs(self) -> None:
+        invalid = [
+            ("--seeds", "-1"),
+            ("--seeds", "7,,202609"),
+            ("--seeds", str(1 << 64)),
+            ("--steps", "10001"),
+            ("--interval-seconds", "60.1"),
+            ("--interval-seconds", "nan"),
+            ("--actions", "assert,,fork"),
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), \
+                 mock.patch("sys.stderr", new=io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.parse_args(*arguments)
+
+    def test_main_runs_and_cleans_each_step_mode_seed(self) -> None:
+        observed = []
+
+        class FakeSoak:
+            def __init__(self, args):
+                self.args = args
+                self.operations = 0
+
+            def run(self):
+                observed.append(("run", self.args.seed))
+
+            def cleanup(self):
+                observed.append(("cleanup", self.args.seed))
+
+        args = self.parse_args("--seeds", "7,202609", "--steps", "1")
+        with mock.patch.object(MODULE, "parse_args", return_value=args), \
+             mock.patch.object(MODULE, "Soak", FakeSoak):
+            self.assertEqual(MODULE.main(), 0)
+
+        self.assertEqual(observed, [
+            ("run", 7), ("cleanup", 7),
+            ("run", 202609), ("cleanup", 202609),
+        ])
+
+    def test_step_mode_executes_exact_requested_action_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            soak.args.anchors = 2
+            soak.args.actions = ["assert"]
+            soak.args.duration_seconds = None
+            soak.args.steps = 3
+            soak.args.interval_seconds = 0
+            soak.args.max_snapshots = 2
+            soak.args.hibernate_hold_seconds = 0
+            soak.args.sibling_fork_timer_seconds = 0
+            soak.args.epoch_hibernate_min_seconds = 0
+            soak.args.anchor_vcpus = [1, 2]
+            soak.args.storage_path = None
+            observed = []
+            events = []
+
+            def create_anchor(index):
+                vm_id = f"vm-{index}"
+                soak.anchors[vm_id] = SimpleNamespace(
+                    created_at=MODULE.time.monotonic(), vcpus=index + 1,
+                )
+                return vm_id
+
+            soak.create_anchor = create_anchor
+            soak.assert_global_invariants = lambda: None
+            soak.run_action = lambda action, vm_id: observed.append(action.__name__)
+            soak.event = lambda kind, **fields: events.append((kind, fields))
+
+            soak.run()
+
+            self.assertEqual(len(observed), 7)
+            self.assertEqual(observed[-3:], ["assert_anchor"] * 3)
+            self.assertEqual(events[-1][0], "soak_pass")
+            self.assertEqual(events[-1][1]["mode"], "steps")
+            self.assertEqual(events[-1][1]["completed_steps"], 3)
 
 
 if __name__ == "__main__":

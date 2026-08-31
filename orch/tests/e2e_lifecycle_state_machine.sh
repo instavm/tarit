@@ -221,7 +221,16 @@ for _ in $(seq 1 100); do
 done
 curl -fsS "$BASE_URL/health" >/dev/null
 
-read -r -a DRIVER_ARGS <<<"${TARIT_LIFECYCLE_DRIVER_ARGS:-}"
+DRIVER_ARGS_RAW=${TARIT_LIFECYCLE_DRIVER_ARGS:-}
+read -r -a DRIVER_ARGS <<<"$DRIVER_ARGS_RAW"
+LIFECYCLE_SEEDS=${TARIT_LIFECYCLE_SEEDS:-7,202609,424242}
+LIFECYCLE_STEPS=${TARIT_LIFECYCLE_STEPS:-20}
+DURATION_MODE=0
+for driver_arg in "${DRIVER_ARGS[@]}"; do
+  case "$driver_arg" in
+    --duration-seconds|--duration-seconds=*) DURATION_MODE=1 ;;
+  esac
+done
 python3 "$DRIVER" \
   --base-url "$BASE_URL" \
   --api-key "$KEY" \
@@ -231,8 +240,8 @@ python3 "$DRIVER" \
   --jail-uid-count "$JAIL_ID_COUNT" \
   --max-vms "$MAX_VMS" \
   --max-snapshots "${TARIT_LIFECYCLE_MAX_SNAPSHOTS:-8}" \
-  --seeds "${TARIT_LIFECYCLE_SEEDS:-7,202609,424242}" \
-  --steps "${TARIT_LIFECYCLE_STEPS:-20}" \
+  --seeds "$LIFECYCLE_SEEDS" \
+  --steps "$LIFECYCLE_STEPS" \
   "${DRIVER_ARGS[@]}"
 
 if pgrep -f -- "${VMM} serve .*${DIR}" >/dev/null; then
@@ -241,3 +250,8 @@ if pgrep -f -- "${VMM} serve .*${DIR}" >/dev/null; then
 fi
 [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]
 grep -Eq '\b(vmx|svm)\b' /proc/cpuinfo
+if [ "$DURATION_MODE" -eq 1 ]; then
+  echo "LIFECYCLE_DURATION_PASS seeds=$LIFECYCLE_SEEDS"
+else
+  echo "LIFECYCLE_STATE_MACHINE_PASS seeds=$LIFECYCLE_SEEDS steps_per_seed=$LIFECYCLE_STEPS"
+fi

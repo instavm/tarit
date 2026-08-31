@@ -394,6 +394,19 @@ pre-copy rounds, copied and residual dirty pages, downtime, convergence reason,
 and local versus cross-node path counts. Retained snapshots are bounded per
 epoch; live fork artifacts are deleted with their transient children.
 
+For focused reproduction, pass `--actions` through
+`TARIT_LIFECYCLE_DRIVER_ARGS`. Supported comma-separated actions are `assert`,
+`mutate`, `fork`, `hibernate`, `pause`, `balloon`, `guest-work`,
+`contended-exec`, and `snapshot`. The required baseline fork, snapshot, and
+concurrency checks still run before the selected loop. For example,
+`--actions hibernate` repeatedly exercises scale-to-zero and execute-triggered
+resume without removing the baseline lifecycle checks.
+
+Without `--duration-seconds`, the lifecycle driver runs exactly `--steps`
+randomized actions for every value in `--seeds`. Duration mode is intended for
+continuous qualification and requires one explicit seed so a failure remains
+reproducible.
+
 When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
 creates a fourth logical VM, arms monotonic and realtime timers, and hibernates
 it while the three resident anchors continue working. At epoch completion,
