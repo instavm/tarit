@@ -182,7 +182,7 @@ fn storage_quiescence_timeout_fails_snapshot_and_resumes_source() {
         "unexpected snapshot failure: {error}"
     );
     assert!(
-        (Duration::from_secs(4)..Duration::from_secs(6)).contains(&snapshot_elapsed),
+        (Duration::from_millis(4_800)..Duration::from_secs(6)).contains(&snapshot_elapsed),
         "block-worker timeout was not bounded at five seconds: {snapshot_elapsed:?}"
     );
 

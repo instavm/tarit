@@ -148,9 +148,10 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
     // SAFETY: F_GETFD inspects the descriptor without retaining it. The caller
     // owns the descriptor for the lifetime of the returned worker.
     if unsafe { libc::fcntl(tx_kick_fd, libc::F_GETFD) } < 0 {
+        let source = io::Error::last_os_error();
         return Err(io::Error::new(
-            io::Error::last_os_error().kind(),
-            "vsock queue kick descriptor is invalid",
+            source.kind(),
+            format!("vsock queue kick descriptor is invalid: {source}"),
         ));
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -346,7 +347,9 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert!(error.to_string().contains("descriptor is invalid"));
+        let message = error.to_string();
+        assert!(message.contains("descriptor is invalid"));
+        assert!(message.contains(&io::Error::from_raw_os_error(libc::EBADF).to_string()));
     }
 
     #[test]
