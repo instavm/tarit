@@ -89,6 +89,12 @@ jobs:
         working-directory: ${{ matrix.workspace }}
         run: cargo test --workspace
 
+      - name: Test lifecycle soak supervisor
+        if: matrix.workspace == 'orch'
+        run: |
+          python3 -m unittest orch/tests/test_continuous_lifecycle_soak.py
+          bash -n orch/tests/continuous_mixed_oci_soak.sh
+
       - name: Type-check KVM/Linux code paths
         if: matrix.workspace == 'vmm'
         working-directory: ${{ matrix.workspace }}

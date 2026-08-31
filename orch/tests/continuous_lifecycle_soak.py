@@ -11,6 +11,7 @@ import random
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -41,7 +42,53 @@ class Soak:
         self.operations = 0
         self.started_at = time.monotonic()
 
+    def write_status(self, kind: str, fields: dict[str, object]) -> None:
+        if not self.args.status_file:
+            return
+        status_path = os.path.abspath(self.args.status_file)
+        status_dir = os.path.dirname(status_path)
+        os.makedirs(status_dir, mode=0o700, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "state": "failed" if kind == "soak_failure" else (
+                "passed" if kind == "soak_pass" else "running"
+            ),
+            "latest_event": kind,
+            "updated_at_unix": int(time.time()),
+            "elapsed_s": round(time.monotonic() - self.started_at, 3),
+            "seed": self.args.seed,
+            "case": self.args.case_name,
+            "epoch": self.args.epoch,
+            "operations": self.operations,
+            "snapshots": self.snapshots,
+            "anchors": len(self.anchors),
+            "transient_vms": len(self.transient),
+            **fields,
+        }
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".status.", suffix=".tmp", dir=status_dir,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(payload, output, sort_keys=True)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, status_path)
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
     def event(self, kind: str, **fields: object) -> None:
+        self.write_status(kind, fields)
         print(json.dumps({"event": kind, "elapsed_s": round(time.monotonic() - self.started_at, 3), **fields}, sort_keys=True), flush=True)
 
     def request(self, method: str, path: str, body: object | None = None,
@@ -585,6 +632,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sibling-fork-timer-seconds", type=int, default=0)
     parser.add_argument("--storage-path")
     parser.add_argument("--min-free-bytes", type=int, default=0)
+    parser.add_argument(
+        "--status-file", default=os.environ.get("TARIT_LIFECYCLE_STATUS_FILE"),
+    )
+    parser.add_argument(
+        "--case-name", default=os.environ.get("TARIT_LIFECYCLE_CASE_NAME"),
+    )
+    parser.add_argument(
+        "--epoch", type=int, default=int(os.environ.get("TARIT_LIFECYCLE_EPOCH", "0")),
+    )
     args = parser.parse_args()
     args.seed = int(args.seeds.split(",", 1)[0])
     try:

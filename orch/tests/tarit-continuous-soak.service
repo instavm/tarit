@@ -8,8 +8,11 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 EnvironmentFile=/etc/tarit/continuous-soak.env
+Environment=TARIT_CONTINUOUS_STATUS_FILE=/run/tarit-continuous-soak/status.json
 WorkingDirectory=/home/ubuntu/tarit-c8i
 ExecStart=/home/ubuntu/tarit-c8i/orch/tests/continuous_mixed_oci_soak.sh
+RuntimeDirectory=tarit-continuous-soak
+RuntimeDirectoryMode=0700
 Restart=on-failure
 RestartSec=30
 KillMode=mixed
