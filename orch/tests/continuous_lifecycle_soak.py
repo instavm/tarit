@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -54,6 +55,7 @@ class Soak:
         self.sentinel: HibernationSentinel | None = None
         self.snapshots = 0
         self.operations = 0
+        self.operations_lock = threading.Lock()
         self.action_latencies_ms: dict[str, list[float]] = {}
         self.started_at = time.monotonic()
 
@@ -145,7 +147,8 @@ class Soak:
                 f"{method} {path}: expected {sorted(allowed)}, got {status}: "
                 f"{payload.decode(errors='replace')}"
             )
-        self.operations += 1
+        with self.operations_lock:
+            self.operations += 1
         return status, json.loads(payload) if payload else None
 
     def exec(self, vm_id: str, command: str, timeout_ms: int = 60_000) -> str:
@@ -715,6 +718,39 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             counters={vm_id: counter for vm_id, counter in results},
         )
 
+    def contended_guest_agent_exec(self, vm_id: str) -> None:
+        # Exercise the same VM through simultaneous API calls immediately after
+        # a lifecycle transition. This is the reconnect window where vsock and
+        # UART fallback previously admitted overlapping requests and corrupted
+        # the guest shell stream.
+        _, paused = self.request("POST", f"/v1/vms/{vm_id}/pause", {}, 200)
+        assert paused["status"] == "paused", paused
+        _, running = self.request("POST", f"/v1/vms/{vm_id}/resume", {}, 200)
+        assert running["status"] == "running", running
+        tokens = [uuid.uuid4().hex for _ in range(4)]
+
+        def work(index_and_token: tuple[int, str]) -> str:
+            index, token = index_and_token
+            path = f"/tmp/tarit-contended-exec-{index}"
+            return self.exec(
+                vm_id,
+                "set -eu; "
+                f"printf '%s\\n' {token} > {path}; "
+                "sleep 1; "
+                f"test \"$(cat {path})\" = {token}; "
+                f"printf '%s\\n' {token}",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(tokens)) as pool:
+            outputs = list(pool.map(work, enumerate(tokens)))
+        assert outputs == tokens, (tokens, outputs)
+        self.assert_anchor(vm_id)
+        self.event(
+            "contended_guest_agent_exec_verified",
+            vm_id=vm_id,
+            requests=len(tokens),
+        )
+
     def assert_global_invariants(self) -> None:
         _, rows = self.request("GET", "/v1/vms")
         by_id = {row["id"]: row for row in rows}
@@ -826,6 +862,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             (self.fork_anchor, anchor_ids[0]),
             (self.snapshot_restore, anchor_ids[1]),
             (self.concurrent_guest_work, anchor_ids[2 % len(anchor_ids)]),
+            (self.contended_guest_agent_exec, anchor_ids[0]),
         ]
         for action, vm_id in required_actions:
             self.run_action(action, vm_id)
@@ -833,7 +870,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         actions = [
             self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
             self.hibernate_resume, self.pause_resume, self.balloon,
-            self.concurrent_guest_work,
+            self.concurrent_guest_work, self.contended_guest_agent_exec,
         ]
         while time.monotonic() < deadline:
             vm_id = self.random.choice(list(self.anchors))

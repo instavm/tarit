@@ -376,9 +376,13 @@ the format `name|kernel|rootfs`, writes per-operation JSONL logs, and checks a
 configurable free-space floor. Each guest keeps a background writer active
 while the driver performs live forks, snapshot/restore, hibernate and ingress
 wake, pause/resume, balloon changes, mutations, and concurrent work across all
-anchors. The status and terminal records include per-action counts and p50,
-p95, p99, and maximum latency. Retained snapshots are bounded per epoch; live
-fork artifacts are deleted with their transient children.
+anchors. It also issues four concurrent execute requests to one VM immediately
+after pause/resume. Each request verifies a distinct guest-side token before the
+driver rechecks the long-lived workload, detecting cross-transport command
+interleaving, duplicate execution, stale completion, and response loss. The
+status and terminal records include per-action counts and p50, p95, p99, and
+maximum latency. Retained snapshots are bounded per epoch; live fork artifacts
+are deleted with their transient children.
 
 When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
 creates a fourth logical VM, arms monotonic and realtime timers, and hibernates

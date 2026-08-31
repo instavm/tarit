@@ -1083,14 +1083,25 @@ passing focused gate does not waive an item in the final column.
   row-to-file invariant enforced.
   Each epoch now guarantees an initial live fork, snapshot/restore, and
   concurrent work burst across all three anchors before entering randomized
-  transitions. Status and terminal records report per-action counts and p50,
-  p95, p99, and maximum latency; once the retained-snapshot cap is reached the
-  driver no longer mislabels health checks as snapshots. Focused c8i runs of
+  transitions. It also runs four simultaneous execute requests against one VM
+  immediately after pause/resume and verifies distinct guest-side tokens plus
+  the resident workload state. Status and terminal records report per-action
+  counts and p50, p95, p99, and maximum latency; once the retained-snapshot cap
+  is reached the driver no longer mislabels health checks as snapshots. Focused c8i runs of
   this measured workload passed 1,010 API operations, 20 live forks, and eight
   snapshot/restores across Ubuntu 24.04 and Alpine 3.20 on both Linux 6.6.155
   and 5.10.230. The first run found an unavailable optional BusyBox applet in
   the minimal Ubuntu image; the workload now uses the common minimal-image
   command set and the complete four-case matrix passes.
+  A later supervised run exposed a reconnect-window race between framed vsock
+  execution and UART fallback, plus a concurrent snapshot-retirement unlink.
+  Guest-agent requests now serialize across both transports and owned artifact
+  unlink treats an already-absent file as successful retirement. Focused
+  Ubuntu/Linux 6.6 and Alpine/Linux 5.10 reruns passed 261 and 279 API
+  operations respectively, including ten four-way same-VM contention bursts,
+  eight live forks, five snapshot/restores, and six hibernate/resume cycles,
+  without a stale completion, command-stream parse error, agent timeout, or
+  artifact cleanup error.
   The three-node PostgreSQL/mTLS gate also binds a localized cross-node fork
   artifact to its target child. Deleting that child converged the global
   artifact and fleet-snapshot rows, source and target metadata, and both

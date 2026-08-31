@@ -316,6 +316,13 @@ impl Drop for OwnedOverlayGuard {
 pub struct VmmController {
     vm: Arc<Mutex<Option<VmInstance>>>,
     lifecycle: Mutex<Option<LifecycleOp>>,
+    /// Serialize every guest-agent request across both the framed vsock path
+    /// and UART fallback.  The vsock channel has its own gate, but that alone
+    /// does not prevent two callers from racing into UART while vsock is
+    /// disconnected or reconnecting and splicing shell input in its 64-byte
+    /// FIFO.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    guest_agent: Mutex<()>,
 }
 
 #[cfg_attr(
@@ -369,6 +376,8 @@ impl VmmController {
         Self {
             vm: Arc::new(Mutex::new(None)),
             lifecycle: Mutex::new(None),
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            guest_agent: Mutex::new(()),
         }
     }
 
@@ -1842,6 +1851,7 @@ impl VmmController {
                 VmmError::InvalidConfig(format!("invalid guest DNS server: {error}"))
             })?;
         }
+        let _guest_agent_guard = self.guest_agent.lock().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
         let timeout = Duration::from_secs(5);
         let serial = {
@@ -1929,6 +1939,7 @@ impl VmmController {
     pub fn exec(&self, command: &str, timeout_ms: u64) -> Result<(i32, String, String, u64)> {
         use std::time::{Duration, Instant};
 
+        let _guest_agent_guard = self.guest_agent.lock().unwrap_or_else(|e| e.into_inner());
         let start = Instant::now();
         let timeout = Duration::from_millis(if timeout_ms > 0 { timeout_ms } else { 30000 });
 

@@ -653,6 +653,19 @@ fn safe_owned_file(path: &Path) -> Result<bool, OrchError> {
         && metadata.mode() & 0o077 == 0)
 }
 
+fn unlink_owned_file(path: &Path) -> Result<bool, OrchError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        // Another valid retirement path may win after safe_owned_file() has
+        // inspected the inode. Absence is the requested final state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(OrchError::Internal(format!(
+            "remove unreferenced replica {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 fn old_enough(path: &Path, min_age: Duration) -> Result<bool, OrchError> {
     let modified = std::fs::symlink_metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -727,13 +740,7 @@ pub(crate) fn delete_owned_snapshot_components(
                 path.display()
             )));
         }
-        if safe_owned_file(&path)? {
-            std::fs::remove_file(&path).map_err(|error| {
-                OrchError::Internal(format!(
-                    "remove unreferenced replica {}: {error}",
-                    path.display()
-                ))
-            })?;
+        if safe_owned_file(&path)? && unlink_owned_file(&path)? {
             removed = removed.saturating_add(1);
         }
     }
@@ -764,6 +771,19 @@ mod tests {
             "replica-{artifact}-{token}.ext4"
         )));
         assert!(!is_owned_snapshot_name("replica-customer-data.ram"));
+    }
+
+    #[test]
+    fn owned_file_unlink_is_idempotent() {
+        let root = test_root("idempotent-unlink");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("owned.ram");
+        std::fs::write(&path, b"snapshot").unwrap();
+
+        assert!(unlink_owned_file(&path).unwrap());
+        assert!(!unlink_owned_file(&path).unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
