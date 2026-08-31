@@ -89,7 +89,7 @@ detach_loop_device() {
   local loop_device=$1
   local _
   for _ in $(seq 1 20); do
-    if losetup -d -- "$loop_device" 2>/dev/null; then
+    if losetup --detach "$loop_device" 2>/dev/null; then
       return 0
     fi
     sleep 0.25
