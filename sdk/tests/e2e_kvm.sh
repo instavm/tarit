@@ -30,7 +30,9 @@ if [[ "$PYTHON_BIN" == */* ]]; then
 else
   command -v "$PYTHON_BIN" >/dev/null || { echo "missing $PYTHON_BIN" >&2; exit 1; }
 fi
-for required in TARITD_BIN VMM_BIN KERNEL ROOTFS_SOURCE AGENT; do
+for required in \
+  TARITD_BIN VMM_BIN KERNEL ROOTFS_SOURCE AGENT \
+  TARIT_SDK_EXPECTED_KERNEL_PREFIX TARIT_SDK_EXPECTED_OS_ID; do
   [ -n "${!required:-}" ] || { echo "set $required" >&2; exit 1; }
 done
 for required in "$FIXTURE" "$TSX"; do

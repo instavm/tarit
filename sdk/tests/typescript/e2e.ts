@@ -12,8 +12,29 @@ async function main(): Promise<void> {
   const foreignKey = required("TARIT_SDK_FOREIGN_KEY");
   const vmId = required("TARIT_SDK_VM_ID");
   const childId = required("TARIT_SDK_TYPESCRIPT_CHILD_ID");
+  const expectedKernelPrefix = required("TARIT_SDK_EXPECTED_KERNEL_PREFIX");
+  const expectedOsId = required("TARIT_SDK_EXPECTED_OS_ID");
 
   const client = new TaritClient({ baseUrl, apiKey: tenantKey });
+  const identity = await client.execute(vmId, 'uname -r; . /etc/os-release; printf \'%s\\n\' "$ID"', {
+    pollIntervalMs: 20,
+  });
+  const identityOutput = identity.stdout;
+  const identityLines = typeof identityOutput === "string" ? identityOutput.split(/\r?\n/).filter(Boolean) : [];
+  const [kernelRelease, osId, ...extraIdentityLines] = identityLines;
+  if (
+    identity.status !== "completed" ||
+    identity.exit_code !== 0 ||
+    typeof identityOutput !== "string" ||
+    !kernelRelease?.startsWith(expectedKernelPrefix) ||
+    osId !== expectedOsId ||
+    extraIdentityLines.length !== 0
+  ) {
+    throw new Error(
+      `unexpected guest identity: expected kernel=${expectedKernelPrefix}* os=${expectedOsId}, ` +
+        `got ${JSON.stringify(identity)}`,
+    );
+  }
   const execution = await client.execute(vmId, "printf typescript-sync-ok", { pollIntervalMs: 20 });
   if (execution.status !== "completed" || execution.exit_code !== 0 || execution.stdout !== "typescript-sync-ok") {
     throw new Error(`unexpected execution result: ${JSON.stringify(execution)}`);
@@ -30,6 +51,14 @@ async function main(): Promise<void> {
   const childExecution = await client.execute(childId, "printf typescript-fork-ok", { pollIntervalMs: 20 });
   if (childExecution.status !== "completed" || childExecution.stdout !== "typescript-fork-ok") {
     throw new Error(`unexpected child execution result: ${JSON.stringify(childExecution)}`);
+  }
+  const childIdentity = await client.execute(
+    childId,
+    'uname -r; . /etc/os-release; printf \'%s\\n\' "$ID"',
+    { pollIntervalMs: 20 },
+  );
+  if (childIdentity.status !== "completed" || childIdentity.exit_code !== 0 || childIdentity.stdout !== identityOutput) {
+    throw new Error(`fork changed guest identity: source=${JSON.stringify(identity)} child=${JSON.stringify(childIdentity)}`);
   }
 
   const hibernated = await client.raw.POST("/v1/vms/{id}/hibernate", { params: { path: { id: vmId } } });
@@ -77,7 +106,7 @@ async function main(): Promise<void> {
 
   console.log(
     `TYPESCRIPT_SDK_E2E_PASS source=${vmId} child=${childId} ` +
-      "fork_replay=pass tenant_denials=4 hibernate_pty_wake=pass",
+      `fork_replay=pass tenant_denials=4 hibernate_pty_wake=pass kernel=${kernelRelease} os=${osId}`,
   );
 }
 

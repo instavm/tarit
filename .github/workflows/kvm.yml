@@ -82,7 +82,13 @@ jobs:
           AGENT: ${{ github.workspace }}/vmm/guest/agent/vmm-agent
           SOCKET_ROOT: /tmp
           TARIT_SDK_PYTHON_BIN: ${{ github.workspace }}/sdk/python/.venv/bin/python
-        run: sudo -E env "PATH=$PATH" bash sdk/tests/e2e_kvm.sh
+          TARIT_SDK_EXPECTED_OS_ID: ubuntu
+        run: |
+          set -a
+          source vmm/guest/kernel-version.env
+          set +a
+          export TARIT_SDK_EXPECTED_KERNEL_PREFIX="$KERNEL_VERSION"
+          sudo -E env "PATH=$PATH" bash sdk/tests/e2e_kvm.sh
 
       - name: Enforce orchestrated suspend contract
         env:
