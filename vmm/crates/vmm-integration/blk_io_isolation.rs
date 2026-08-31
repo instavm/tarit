@@ -187,8 +187,8 @@ fn storage_quiescence_timeout_fails_snapshot_and_resumes_source() {
     );
 
     assert_eq!(
-        guest_stdout(&controller, "printf source-resumed"),
-        "source-resumed",
+        guest_stdout(&controller, "echo source-resumed"),
+        "source-resumed\n",
         "snapshot failure left the source vCPU paused"
     );
     let writer_result = writer.join().expect("join delayed writer");
