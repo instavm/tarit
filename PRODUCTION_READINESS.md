@@ -44,7 +44,8 @@ its scope.
 - Hibernation releases the VMM and scheduler allocation. HTTP, PTY, SSH, and
   share ingress activate a hibernated VM through a single-flight restore gate;
   failed activation leaves a retryable hibernated record instead of a second
-  VMM or leaked capacity.
+  VMM or leaked capacity. Private wake snapshots are VM-leased and are removed
+  after successful activation or terminal deletion.
 - Restore keeps KVM realtime advancement disabled so guest monotonic timers do
   not jump by the host hibernation interval. The mandatory repair barrier sets
   guest realtime from a host timestamp before admitting workload traffic.
@@ -53,7 +54,11 @@ its scope.
   disk overlay. Every configured vCPU is armed before any pause acknowledgement
   is awaited, and publication requires fresh state from each vCPU. VMGenID
   notification on supported kernels is paired with a mandatory userspace repair
-  barrier; older kernels use the barrier-only path.
+  barrier; older kernels use the barrier-only path. Private fork snapshots are
+  child-leased and are removed with the child rather than accumulating as
+  user-visible durable snapshots. Cross-node localization preserves the lease;
+  child deletion withdraws global metadata before source and target replicas
+  converge through zero-reference GC.
 - Provider-neutral local and NFS-backed raw block volumes are generation-fenced,
   tenant-scoped, and ordered with hibernate, resume, recovery, and deletion.
   Production generic NFS requires Kerberos privacy (`krb5p`), and mount
@@ -64,6 +69,9 @@ its scope.
 - Orchestrated snapshots are full snapshots only. Incremental requests fail
   with `422` until every parent can be relocated into a durable manifest-backed
   chain; direct VMM incremental snapshots remain available for local testing.
+- Python and TypeScript SDKs are generated from the checked-in OpenAPI contract.
+  CI rejects generation drift, type-checks and packages both clients, and tests
+  typed tenant denials, bounded execution polling, and stable-ID fork retry.
 - Release workflows pin third-party actions, publish checksums and an SPDX
   SBOM, and attest released artifacts.
 - The production guest kernel is built reproducibly from checksum-pinned Linux
@@ -96,8 +104,8 @@ cross-node replication, and immutable signed-image stop-ships now have focused
 implementation and c8i evidence recorded in the September roadmap. They remain
 regression gates, but the following unresolved items now block release:
 
-1. Close the intermittent clone-repair stall found by the continuous c8i load
-   gate. The gate now carries a long-lived process with cached PRNG state,
+1. Complete the four-case continuous c8i rotation. The gate carries a long-lived
+   process with cached PRNG state,
    session-ticket key material, nonce allocation state, and a framework-style
    session cache; every successful fork and resume must rotate the first three,
    clear the cache, reject the inherited ticket, and leave the source unchanged.
@@ -108,8 +116,11 @@ regression gates, but the following unresolved items now block release:
    remains bounded by a host-monotonic deadline, and failures report the last
    repair stage. Retained state proved the application marker was complete while
    the agent slept on restored guest time; repair now uses a timer-independent
-   signal/marker handoff with no guest-clock sleep before admission. The four-case
-   Ubuntu/Alpine and Linux 6.6/5.10 service must complete sustained rotation
+   signal/marker handoff with no guest-clock sleep before admission. The
+   repaired Ubuntu/Linux 6.6 lane subsequently passed 803 operations with
+   18 live forks and bounded storage; Ubuntu/Linux 5.10 passed a separate
+   348-operation lane. The full Ubuntu/Alpine and Linux 6.6/5.10 service must
+   complete sustained rotation
    without this stall before ingress admission is considered qualified.
 2. Pass the remaining phase-by-phase kill, cancellation, dirty-rate
    non-convergence, corruption, and near-ENOSPC rollback tests without source

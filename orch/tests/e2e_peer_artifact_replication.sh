@@ -434,8 +434,41 @@ PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
   "select host_id from fleet_vms where id='$CROSS_NODE_FORK_VM'" | grep -qx node-b
 PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
   "select host_id from fleet_vms where id='$SOURCE_VM'" | grep -qx node-a
+FORK_ARTIFACT_ID=$(sqlite3 "$DIR/node-b/store.db" \
+  "select snapshot_id from snapshots where ephemeral_owner_vm_id='$CROSS_NODE_FORK_VM'")
+test -n "$FORK_ARTIFACT_ID"
+FORK_SOURCE_RAM=$(sqlite3 "$DIR/node-a/store.db" \
+  "select path from snapshots where snapshot_id='$FORK_ARTIFACT_ID'")
+FORK_SOURCE_OVERLAY=$(sqlite3 "$DIR/node-a/store.db" \
+  "select coalesce(overlay_path,'') from snapshots where snapshot_id='$FORK_ARTIFACT_ID'")
+FORK_TARGET_RAM=$(sqlite3 "$DIR/node-b/store.db" \
+  "select path from snapshots where snapshot_id='$FORK_ARTIFACT_ID'")
+FORK_TARGET_OVERLAY=$(sqlite3 "$DIR/node-b/store.db" \
+  "select coalesce(overlay_path,'') from snapshots where snapshot_id='$FORK_ARTIFACT_ID'")
 api_json DELETE "http://127.0.0.1:$B_CONTROL/v1/vms/$CROSS_NODE_FORK_VM" >/dev/null
 CROSS_NODE_FORK_VM=""
+FORK_GC_CONVERGED=0
+for _ in $(seq 1 60); do
+  FORK_GLOBAL=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+    "select (select count(*) from fleet_artifacts where artifact_id='$FORK_ARTIFACT_ID') +
+            (select count(*) from fleet_snapshots where snapshot_id='$FORK_ARTIFACT_ID')")
+  FORK_SOURCE_LOCAL=$(sqlite3 "$DIR/node-a/store.db" \
+    "select (select count(*) from artifacts where artifact_id='$FORK_ARTIFACT_ID') +
+            (select count(*) from snapshots where snapshot_id='$FORK_ARTIFACT_ID')")
+  FORK_TARGET_LOCAL=$(sqlite3 "$DIR/node-b/store.db" \
+    "select (select count(*) from artifacts where artifact_id='$FORK_ARTIFACT_ID') +
+            (select count(*) from snapshots where snapshot_id='$FORK_ARTIFACT_ID')")
+  if [ "$FORK_GLOBAL:$FORK_SOURCE_LOCAL:$FORK_TARGET_LOCAL" = '0:0:0' ]; then
+    FORK_GC_CONVERGED=1
+    break
+  fi
+  sleep 1
+done
+test "$FORK_GC_CONVERGED" = 1
+for deleted in "$FORK_SOURCE_RAM" "$FORK_SOURCE_RAM.integrity" "$FORK_SOURCE_OVERLAY" \
+  "$FORK_TARGET_RAM" "$FORK_TARGET_RAM.integrity" "$FORK_TARGET_OVERLAY"; do
+  [ -z "$deleted" ] || test ! -e "$deleted"
+done
 
 echo '== snapshot on A; replication policy must initially be degraded =='
 ARTIFACT_ID=$(api_json POST "http://127.0.0.1:$A_CONTROL/v1/vms/$SOURCE_VM/snapshot" \

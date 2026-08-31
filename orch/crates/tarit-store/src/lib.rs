@@ -71,6 +71,9 @@ pub struct SnapshotRecord {
     pub owner_key: Option<String>,
     pub api_key_id: Option<String>,
     pub vm_id: Uuid,
+    /// VM whose private live-fork or hibernation transition retains this
+    /// snapshot. Ordinary user-created snapshots leave this unset.
+    pub ephemeral_owner_vm_id: Option<Uuid>,
     /// Resource shape and boot inputs captured with the snapshot ownership row.
     /// These are optional only for rows created before the metadata migration;
     /// production restore must fail closed when they are absent.
@@ -315,6 +318,7 @@ impl Store {
                owner_key TEXT,
                api_key_id TEXT,
                vm_id TEXT NOT NULL,
+               ephemeral_owner_vm_id TEXT,
                memory_mib INTEGER,
                vcpus INTEGER,
                kernel_path TEXT,
@@ -455,6 +459,7 @@ impl Store {
         ensure_column(&conn, "hosts", "boot_session_id", "TEXT")?;
         ensure_column(&conn, "hosts", "peer_certificate_sha256", "TEXT")?;
         ensure_column(&conn, "snapshots", "size_bytes", "INTEGER")?;
+        ensure_column(&conn, "snapshots", "ephemeral_owner_vm_id", "TEXT")?;
         ensure_column(&conn, "images", "source_digest", "TEXT")?;
         ensure_column(&conn, "images", "rootfs_digest", "TEXT")?;
         ensure_column(&conn, "images", "agent_digest", "TEXT")?;
@@ -599,10 +604,10 @@ impl Store {
     pub fn insert_snapshot(&self, snap: &SnapshotRecord) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO snapshots (
-               path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+               path, overlay_path, host_id, owner_key, api_key_id, vm_id, ephemeral_owner_vm_id, memory_mib, vcpus,
                kernel_path, rootfs_path, rootfs_read_only, cmdline, content_digest, size_bytes,
                created_at, snapshot_id
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
             params![
                 snap.path,
                 snap.overlay_path,
@@ -610,6 +615,7 @@ impl Store {
                 snap.owner_key,
                 snap.api_key_id,
                 snap.vm_id.to_string(),
+                snap.ephemeral_owner_vm_id.map(|id| id.to_string()),
                 snap.memory_mib,
                 snap.vcpus,
                 snap.kernel_path,
@@ -629,7 +635,7 @@ impl Store {
     pub fn get_snapshot(&self, path: &str) -> Result<Option<SnapshotRecord>, StoreError> {
         self.conn
             .query_row(
-                "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+                "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, ephemeral_owner_vm_id, memory_mib, vcpus,
                         kernel_path, rootfs_path, rootfs_read_only, cmdline, content_digest,
                         size_bytes, created_at, snapshot_id
                  FROM snapshots WHERE path = ?1",
@@ -646,7 +652,7 @@ impl Store {
     ) -> Result<Option<SnapshotRecord>, StoreError> {
         self.conn
             .query_row(
-                "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+                "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, ephemeral_owner_vm_id, memory_mib, vcpus,
                         kernel_path, rootfs_path, rootfs_read_only, cmdline, content_digest,
                         size_bytes, created_at, snapshot_id
                  FROM snapshots WHERE snapshot_id = ?1",
@@ -659,7 +665,7 @@ impl Store {
 
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, memory_mib, vcpus,
+            "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, ephemeral_owner_vm_id, memory_mib, vcpus,
                     kernel_path, rootfs_path, rootfs_read_only, cmdline, content_digest,
                     size_bytes, created_at, snapshot_id
              FROM snapshots",
@@ -669,6 +675,37 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)?;
         Ok(snapshots)
+    }
+
+    pub fn list_ephemeral_snapshots_for_vm(
+        &self,
+        vm_id: Uuid,
+    ) -> Result<Vec<SnapshotRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, ephemeral_owner_vm_id, memory_mib, vcpus,
+                    kernel_path, rootfs_path, rootfs_read_only, cmdline, content_digest,
+                    size_bytes, created_at, snapshot_id
+             FROM snapshots WHERE ephemeral_owner_vm_id = ?1",
+        )?;
+        let snapshots = statement
+            .query_map(params![vm_id.to_string()], row_to_snapshot)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(snapshots)
+    }
+
+    pub fn bind_snapshot_ephemeral_owner(&self, path: &str, vm_id: Uuid) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE snapshots SET ephemeral_owner_vm_id = ?2
+             WHERE path = ?1 AND ephemeral_owner_vm_id IS NULL",
+            params![path, vm_id.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "snapshot is missing or already has a lifecycle owner".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn delete_snapshot(&self, path: &str) -> Result<(), StoreError> {
@@ -3167,26 +3204,28 @@ fn row_to_branch(row: &rusqlite::Row<'_>) -> Result<BranchRecord, rusqlite::Erro
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> Result<SnapshotRecord, rusqlite::Error> {
     let vm_id: String = row.get(5)?;
-    let size_bytes: Option<i64> = row.get(13)?;
-    let created_at: String = row.get(14)?;
-    let snapshot_id: String = row.get(15)?;
+    let ephemeral_owner_vm_id: Option<String> = row.get(6)?;
+    let size_bytes: Option<i64> = row.get(14)?;
+    let created_at: String = row.get(15)?;
+    let snapshot_id: String = row.get(16)?;
     Ok(SnapshotRecord {
-        snapshot_id: parse_uuid_col(&snapshot_id, 15)?,
+        snapshot_id: parse_uuid_col(&snapshot_id, 16)?,
         path: row.get(0)?,
         overlay_path: row.get(1)?,
         host_id: row.get(2)?,
         owner_key: row.get(3)?,
         api_key_id: row.get(4)?,
         vm_id: parse_uuid_col(&vm_id, 5)?,
-        memory_mib: row.get(6)?,
-        vcpus: row.get(7)?,
-        kernel_path: row.get(8)?,
-        rootfs_path: row.get(9)?,
-        rootfs_read_only: row.get(10)?,
-        cmdline: row.get(11)?,
-        content_digest: row.get(12)?,
+        ephemeral_owner_vm_id: parse_optional_uuid_col(ephemeral_owner_vm_id, 6)?,
+        memory_mib: row.get(7)?,
+        vcpus: row.get(8)?,
+        kernel_path: row.get(9)?,
+        rootfs_path: row.get(10)?,
+        rootfs_read_only: row.get(11)?,
+        cmdline: row.get(12)?,
+        content_digest: row.get(13)?,
         size_bytes: size_bytes
-            .map(|value| sql_i64_to_u64(value, 13, "invalid snapshot size"))
+            .map(|value| sql_i64_to_u64(value, 14, "invalid snapshot size"))
             .transpose()?,
         created_at: parse_ts(&created_at)?,
     })
@@ -3669,6 +3708,7 @@ mod tests {
             owner_key: Some("tenant-a".into()),
             api_key_id: Some("key-a".into()),
             vm_id,
+            ephemeral_owner_vm_id: None,
             memory_mib: Some(256),
             vcpus: Some(1),
             kernel_path: Some("kernel".into()),
@@ -3831,6 +3871,7 @@ mod tests {
             owner_key: Some("tenant-a".into()),
             api_key_id: Some("key-1".into()),
             vm_id,
+            ephemeral_owner_vm_id: None,
             memory_mib: Some(512),
             vcpus: Some(2),
             kernel_path: Some("/opt/tarit/vmlinux".into()),
@@ -3862,6 +3903,39 @@ mod tests {
             store.get_snapshot(&snap.path).unwrap().unwrap().owner_key,
             Some("tenant-b".into())
         );
+
+        let child_id = Uuid::new_v4();
+        let ephemeral = SnapshotRecord {
+            snapshot_id: Uuid::new_v4(),
+            path: "/run/tarit/fork-private.snap".into(),
+            ephemeral_owner_vm_id: Some(child_id),
+            ..snap
+        };
+        store.insert_snapshot(&ephemeral).unwrap();
+        assert_eq!(
+            store.list_ephemeral_snapshots_for_vm(child_id).unwrap(),
+            vec![ephemeral]
+        );
+        assert!(store
+            .list_ephemeral_snapshots_for_vm(Uuid::new_v4())
+            .unwrap()
+            .is_empty());
+
+        store
+            .bind_snapshot_ephemeral_owner(&replaced.path, child_id)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_snapshot(&replaced.path)
+                .unwrap()
+                .unwrap()
+                .ephemeral_owner_vm_id,
+            Some(child_id)
+        );
+        assert!(matches!(
+            store.bind_snapshot_ephemeral_owner(&replaced.path, Uuid::new_v4()),
+            Err(StoreError::Conflict(_))
+        ));
     }
 
     #[test]

@@ -2871,6 +2871,7 @@ async fn fork_vm(
                 .map_err(branch_fleet_err)?;
             let snapshot_path =
                 ops::localize_branch_artifact(&state, &artifact, &identity, false).await?;
+            ops::bind_localized_snapshot_to_fork(&state, &snapshot_path, child_id)?;
             let replicated = fleet
                 .get_artifact(&identity.tenant, snapshot.snapshot_id)
                 .await
@@ -2883,7 +2884,7 @@ async fn fork_vm(
                         .into(),
                 ));
             }
-            let child = ops::restore_local_from_surviving_artifact(
+            let child = match ops::restore_local_from_surviving_artifact(
                 &state,
                 &snapshot_path,
                 Some(child_id),
@@ -2891,11 +2892,24 @@ async fn fork_vm(
                 Some(identity.api_key_id.clone()),
                 identity.is_admin(),
             )
-            .await?;
+            .await
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Err(cleanup) =
+                        ops::cleanup_ephemeral_snapshots_for_vm(&state, child_id).await
+                    {
+                        return Err(OrchError::Internal(format!(
+                            "{error}; failed cross-node fork snapshot cleanup: {cleanup}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
             (child, Some(remote_source.host_id))
         } else {
-            let snapshot_path = ops::snapshot_local(&state, source_id, false).await?;
-            let child = ops::restore_local(
+            let snapshot_path = ops::snapshot_local_for_fork(&state, source_id, child_id).await?;
+            let child = match ops::restore_local(
                 &state,
                 &snapshot_path,
                 Some(child_id),
@@ -2903,7 +2917,20 @@ async fn fork_vm(
                 Some(identity.api_key_id.clone()),
                 identity.is_admin(),
             )
-            .await?;
+            .await
+            {
+                Ok(child) => child,
+                Err(error) => {
+                    if let Err(cleanup) =
+                        ops::cleanup_ephemeral_snapshots_for_vm(&state, child_id).await
+                    {
+                        return Err(OrchError::Internal(format!(
+                            "{error}; failed fork snapshot cleanup: {cleanup}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
             (child, None)
         };
         fork_after_child_failpoint(child_id).await;

@@ -777,6 +777,7 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
                         .unbind_vm_volumes(owner_key, id)
                         .map_err(crate::api::store_err)?;
                 }
+                cleanup_ephemeral_snapshots_for_vm(state, id).await?;
                 state
                     .lifecycle
                     .lock()
@@ -786,6 +787,111 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
             }
         }
     }
+}
+
+/// Retire only private lifecycle snapshots explicitly leased to this VM. Fleet metadata
+/// is withdrawn before local bytes, while local metadata remains until all
+/// exact private files are gone so an interrupted deletion is safely retryable.
+pub async fn cleanup_ephemeral_snapshots_for_vm(
+    state: &AppState,
+    vm_id: Uuid,
+) -> Result<u64, OrchError> {
+    let snapshots = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .list_ephemeral_snapshots_for_vm(vm_id)
+        .map_err(crate::api::store_err)?;
+    cleanup_ephemeral_snapshots(state, snapshots).await
+}
+
+/// Retry cleanup left after a successful hibernation activation. A
+/// hibernation lease names the same VM as both snapshot source and owner;
+/// live-fork leases name distinct source and child VMs and are retained until
+/// child deletion.
+async fn cleanup_hibernation_snapshots_for_vm(
+    state: &AppState,
+    vm_id: Uuid,
+) -> Result<u64, OrchError> {
+    let snapshots = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .list_ephemeral_snapshots_for_vm(vm_id)
+        .map_err(crate::api::store_err)?
+        .into_iter()
+        .filter(|snapshot| snapshot.vm_id == vm_id)
+        .collect();
+    cleanup_ephemeral_snapshots(state, snapshots).await
+}
+
+async fn cleanup_ephemeral_snapshots(
+    state: &AppState,
+    snapshots: Vec<tarit_store::SnapshotRecord>,
+) -> Result<u64, OrchError> {
+    let mut removed_files = 0u64;
+    for snapshot in snapshots {
+        let artifact = if let Some(owner_key) = snapshot.owner_key.as_deref() {
+            let store = state
+                .store
+                .lock()
+                .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+            match store.get_artifact(owner_key, snapshot.snapshot_id) {
+                Ok(artifact) => Some(artifact),
+                Err(tarit_store::StoreError::NotFound) => None,
+                Err(error) => return Err(crate::api::store_err(error)),
+            }
+        } else {
+            None
+        };
+        if let (Some(fleet), Some(owner_key)) =
+            (state.fleet.as_ref(), snapshot.owner_key.as_deref())
+        {
+            if artifact.is_some() {
+                match fleet
+                    .delete_artifact_if_unreferenced(owner_key, snapshot.snapshot_id)
+                    .await
+                {
+                    Ok(_) | Err(tarit_fleet::FleetError::NotFound) => {}
+                    Err(error) => {
+                        return Err(OrchError::Internal(format!(
+                            "retire fork artifact from fleet: {error}"
+                        )))
+                    }
+                }
+            }
+            fleet
+                .delete_snapshot_by_id(owner_key, snapshot.snapshot_id)
+                .await
+                .map_err(|error| {
+                    OrchError::Internal(format!("retire fork snapshot from fleet: {error}"))
+                })?;
+        }
+        removed_files = removed_files.saturating_add(
+            crate::disk::delete_owned_snapshot_components(&state.config.socket_dir, &snapshot)?,
+        );
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+        if let (Some(artifact), Some(owner_key)) =
+            (artifact.as_ref(), snapshot.owner_key.as_deref())
+        {
+            store
+                .delete_local_replica_metadata_if_unreferenced(
+                    owner_key,
+                    artifact.artifact_id,
+                    &snapshot.path,
+                )
+                .map_err(crate::api::store_err)?;
+        } else {
+            match store.delete_snapshot(&snapshot.path) {
+                Ok(()) | Err(tarit_store::StoreError::NotFound) => {}
+                Err(error) => return Err(crate::api::store_err(error)),
+            }
+        }
+    }
+    Ok(removed_files)
 }
 
 async fn finish_failed_boot(state: &AppState, id: Uuid) -> Result<(), OrchError> {
@@ -1982,7 +2088,7 @@ pub async fn hibernate_local(
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
-    let snapshot_path = snapshot_local_locked(state, id, false).await?;
+    let snapshot_path = snapshot_local_locked(state, id, false, Some(id)).await?;
     let snapshot =
         verify_snapshot_access(state, &snapshot_path, current.owner_key.as_deref(), false)?;
     let owner_key = current.owner_key.as_ref().ok_or_else(|| {
@@ -2284,6 +2390,9 @@ pub(crate) async fn ensure_active_local(state: &AppState, id: Uuid) -> Result<Vm
     if current.status == VmStatus::Hibernated {
         resume_hibernated_local(state, id, false).await
     } else {
+        if current.status == VmStatus::Running {
+            cleanup_hibernation_snapshots_for_vm(state, id).await?;
+        }
         Ok(current)
     }
 }
@@ -2496,6 +2605,7 @@ async fn resume_hibernated_local(
         .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
         .delete_hibernation(&owner_key, id)
         .map_err(crate::api::store_err)?;
+    cleanup_hibernation_snapshots_for_vm(state, id).await?;
     Ok(record)
 }
 
@@ -2517,7 +2627,34 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     )?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
-    snapshot_local_locked(state, id, diff).await
+    snapshot_local_locked(state, id, diff, None).await
+}
+
+/// Create the private snapshot that backs one local live-fork attempt. Its
+/// child binding is committed with the snapshot row, so terminal cleanup never
+/// has to infer ownership from filenames or timing.
+pub async fn snapshot_local_for_fork(
+    state: &AppState,
+    source_id: Uuid,
+    child_id: Uuid,
+) -> Result<String, OrchError> {
+    ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
+    let gate = state.supervisor.operation_gate(source_id)?;
+    let _operation = gate.lock_owned().await;
+    snapshot_local_locked(state, source_id, false, Some(child_id)).await
+}
+
+pub fn bind_localized_snapshot_to_fork(
+    state: &AppState,
+    snapshot_path: &str,
+    child_id: Uuid,
+) -> Result<(), OrchError> {
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .bind_snapshot_ephemeral_owner(snapshot_path, child_id)
+        .map_err(crate::api::store_err)
 }
 
 /// Snapshot implementation for callers that already hold the exact runtime's
@@ -2526,6 +2663,7 @@ async fn snapshot_local_locked(
     state: &AppState,
     id: Uuid,
     diff: bool,
+    ephemeral_owner_vm_id: Option<Uuid>,
 ) -> Result<String, OrchError> {
     let vm = ensure_vm_status(
         state,
@@ -2627,6 +2765,7 @@ async fn snapshot_local_locked(
         owner_key: vm.owner_key.clone(),
         api_key_id: vm.api_key_id.clone(),
         vm_id: id,
+        ephemeral_owner_vm_id,
         memory_mib: Some(vm.memory_mib),
         vcpus: Some(vm.vcpus),
         kernel_path: Some(vm.kernel_path.clone()),
@@ -3355,6 +3494,7 @@ pub async fn localize_branch_artifact(
         owner_key: Some(identity.tenant.clone()),
         api_key_id: Some(identity.api_key_id.clone()),
         vm_id: descriptor.source_vm_id,
+        ephemeral_owner_vm_id: None,
         memory_mib: Some(descriptor.memory_mib),
         vcpus: Some(descriptor.vcpus),
         kernel_path: Some(kernel_path.display().to_string()),
@@ -4062,6 +4202,7 @@ mod tests {
             owner_key: Some("tenant-a".into()),
             api_key_id: Some("key-a".into()),
             vm_id: Uuid::new_v4(),
+            ephemeral_owner_vm_id: None,
             memory_mib: Some(256),
             vcpus: Some(1),
             kernel_path: Some(kernel_path.display().to_string()),

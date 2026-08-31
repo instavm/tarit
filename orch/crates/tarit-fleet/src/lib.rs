@@ -582,6 +582,21 @@ impl PostgresFleet {
         Ok(())
     }
 
+    pub async fn delete_snapshot_by_id(
+        &self,
+        owner_key: &str,
+        snapshot_id: Uuid,
+    ) -> Result<(), FleetError> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM fleet_snapshots WHERE snapshot_id = $1 AND owner_key = $2",
+                &[&snapshot_id, &owner_key],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Bind a hibernated logical VM to the immutable artifact that can recover
     /// it. The artifact reference and binding move in one transaction so GC
     /// can never remove the only recovery image between those writes.
@@ -4565,6 +4580,7 @@ mod tests {
             owner_key: Some("tenant-a".into()),
             api_key_id: Some("key-a".into()),
             vm_id: Uuid::new_v4(),
+            ephemeral_owner_vm_id: None,
             memory_mib: Some(256),
             vcpus: Some(1),
             kernel_path: Some("/private/vmlinux".into()),

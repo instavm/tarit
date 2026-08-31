@@ -963,7 +963,7 @@ passing focused gate does not waive an item in the final column.
   performs guest writes, live forks,
   snapshot/restore, hibernate with concurrent wake requests, pause/resume, and
   balloon changes while reconciling API, database, process, jail, clone-ID,
-  cached-session, and nested-virtualization invariants. It retains up to three
+  cached-session, and nested-virtualization invariants. It retains up to two
   snapshots by default (configurable for larger test volumes),
   enforces a 3 GiB free-space floor both before and during each epoch, records
   JSONL history for 14 days, and stops on the first failure so evidence is not
@@ -1011,6 +1011,24 @@ passing focused gate does not waive an item in the final column.
   left no candidate process, mount, or runtime directory. A separate supervised
   stop during a 65-second hibernation produced the same clean result, returned
   a successful service status, and restored 11 GiB free on the 12 GiB fixture.
+  Sustained load then exposed that private fork and wake snapshots were retained
+  after child deletion and successful resume. Snapshot rows now carry the exact
+  VM lease, and terminal deletion or completed activation retires only the
+  corresponding RAM, integrity, and CoW files. The state-machine invariant gate
+  compares durable snapshot rows with the exact files after every operation.
+  On the corrected Ubuntu 24.04/Linux 6.6 lane, 803 operations, 18 committed
+  forks, and repeated hibernate/resume cycles left exactly two requested
+  snapshots, six files, no ephemeral snapshot row, no hibernation row, and
+  9,867,669,504 free bytes. The service restart count did not advance. A separate
+  Ubuntu 24.04/Linux 5.10 lane passed 348 operations, including sibling forks,
+  repeated fork/delete, snapshot/restore, hibernate/resume, pause/resume,
+  ballooning, clone-identity repair, and timer compatibility, with the same
+  row-to-file invariant enforced.
+  The three-node PostgreSQL/mTLS gate also binds a localized cross-node fork
+  artifact to its target child. Deleting that child converged the global
+  artifact and fleet-snapshot rows, source and target metadata, and both
+  replicas' RAM, integrity, and CoW files to zero before the test continued
+  through stale-owner wake, volume recovery, branch repair, and last-reader GC.
   The service is enabled and running; completion of
   the full four-case rotation remains a release gate.
 - A bounded runtime-crash gate now covers fresh digest-pinned Ubuntu 24.04 and
@@ -1028,6 +1046,16 @@ passing focused gate does not waive an item in the final column.
   is targeted transition-boundary crash evidence, not the remaining
   long-duration peer/transfer/GC, database, network, corruption, or
   resource-exhaustion chaos campaign.
+- The public OpenAPI contract now generates checked-in Python and TypeScript
+  clients with pinned generators and a CI drift check. Both packages type-check,
+  test, build, and include their generated contract types. Their handwritten
+  layers add API-key configuration, typed errors, deadline-bounded asynchronous
+  execution polling, and stable-child-id retry for a lost fork acknowledgement.
+  Real c8i integration passed against OCI-derived Ubuntu on Linux 6.6.155 and
+  5.10.230: each SDK executed in the source, live-forked a caller-fenced child,
+  executed in the child, and rejected a foreign tenant's execution lookup.
+  PTY/WebSocket convenience helpers and release-publication automation remain
+  before the SDK row is complete.
 - Generic NFSv4.1-backed raw block volumes are now wired through the public
   volume API, provider-neutral placement, VM attachment, hibernation, resume,
   and deletion paths. Tarit mounts the export only long enough to open and
@@ -1110,9 +1138,9 @@ but disk-upper integrity work, replication, and high-dirty-rate behavior can
 still scale with touched content, so the full fork path has not yet proven the
 roadmap's size-independent performance requirement. These results close
 reference-counted logical and physical replica deletion, direct cross-node fork,
-and the provider-neutral local/NFS-backed block volume foundation. They do not
-close SDK generation/integration, managed EFS/Azure volume qualification,
-Sandbox decoupling, OCI
+the provider-neutral local/NFS-backed block volume foundation, and generated SDK
+contract/core lifecycle integration. They do not close SDK PTY helpers or release
+publication, managed EFS/Azure volume qualification, Sandbox decoupling, OCI
 container-config semantics beyond the declared PID-1-agent contract, soak/chaos,
 performance distributions, or any other remaining release row.
 

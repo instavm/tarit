@@ -10,6 +10,12 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- Generated Python and TypeScript clients now cover the public OpenAPI contract.
+  Their handwritten layers provide API-key setup, typed failures,
+  deadline-bounded execution polling, and stable-child-id live-fork retries.
+
 ### Changed
 
 - Live snapshots now pause, capture, and resume every configured vCPU through
@@ -26,6 +32,11 @@ versions may contain breaking changes.
   a throttled VMM.
 
 ### Fixed
+
+- Internal live-fork and hibernation snapshots now carry an explicit VM lease.
+  Successful resume and terminal child deletion retire the exact RAM, integrity,
+  and CoW files; user-created snapshots remain durable. Continuous lifecycle
+  qualification also rejects stale ephemeral rows and untracked snapshot files.
 
 - Production generic-NFS volume configuration now requires `krb5p`; mount
   admission verifies the live NFS version, TCP transport, hard-mount policy,

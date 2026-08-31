@@ -473,10 +473,31 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             resident = database.execute(
                 "select id,pid from vms where status in ('running','paused','suspended')"
             ).fetchall()
+            snapshots = database.execute(
+                "select path,overlay_path,ephemeral_owner_vm_id from snapshots"
+            ).fetchall()
         expected = set(self.anchors) | self.transient
         assert {vm_id for vm_id, _ in resident} == expected, (resident, expected)
         for vm_id, pid in resident:
             assert pid and os.path.exists(f"/proc/{pid}"), (vm_id, pid)
+        assert all(owner is None for _, _, owner in snapshots), snapshots
+        assert len(snapshots) == self.snapshots, (snapshots, self.snapshots)
+        expected_snapshot_files = {
+            path
+            for snapshot_path, overlay_path, _ in snapshots
+            for path in (snapshot_path, overlay_path, f"{snapshot_path}.integrity")
+            if path
+        }
+        snapshot_dir = os.path.join(os.path.dirname(self.args.database), "sockets", "snapshots")
+        actual_snapshot_files = {
+            entry.path
+            for entry in os.scandir(snapshot_dir)
+            if entry.is_file(follow_symlinks=False)
+        }
+        assert actual_snapshot_files == expected_snapshot_files, (
+            actual_snapshot_files - expected_snapshot_files,
+            expected_snapshot_files - actual_snapshot_files,
+        )
 
     def delete_vm(self, vm_id: str) -> None:
         self.request("DELETE", f"/v1/vms/{vm_id}", expected=204, timeout=360)
