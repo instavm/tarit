@@ -3863,15 +3863,8 @@ const FULL_SNAPSHOT_REST_HEADER_LEN: usize = 28;
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
 const FULL_SNAPSHOT_DIFF_FLAG: u16 = 1;
-#[cfg(any(
-    test,
-    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
-))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const LEGACY_SNAPSHOT_VERSION: u16 = 1;
-#[cfg(any(
-    test,
-    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
-))]
 const SNAPSHOT_VERSION: u16 = 2;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const MAX_SNAPSHOT_STATE_BYTES: u64 = 64 * 1024 * 1024;
