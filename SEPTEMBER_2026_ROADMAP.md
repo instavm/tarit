@@ -876,7 +876,7 @@ passing focused gate does not waive an item in the final column.
   state-ABI-2 VMM
   (`fc00fcf5dd1d637b542c6144c2fc4edb26d008718a35975841e5f6fa6f312c64`)
   then rejected live snapshots from the state-ABI-1 candidate
-  (`54bc435394259773dfd55e13b2f24e3c5bd9d322b6bdf9933cfd29115cefb527`)
+  (`43851e67d2a99d41b0a0126a49bc1b62a6139a465f76962489d309f459badf2a`)
   before VM publication on Ubuntu/Linux 6.6 and Alpine/Linux 5.10. The writer
   VMM subsequently lazily restored each untouched snapshot and both vCPUs
   advanced. The incompatible build and runtime artifacts were removed after
