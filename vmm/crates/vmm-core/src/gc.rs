@@ -192,10 +192,11 @@ impl OwnedScratchFile {
             let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "target path contains NUL")
             })?;
-            // SAFETY: both paths are valid NUL-terminated strings and renameat2 does
-            // not retain their pointers after the syscall returns.
+            // SAFETY: both paths are valid NUL-terminated strings and the kernel
+            // does not retain their pointers after renameat2 returns.
             let result = unsafe {
-                libc::renameat2(
+                libc::syscall(
+                    libc::SYS_renameat2,
                     libc::AT_FDCWD,
                     source.as_ptr(),
                     libc::AT_FDCWD,
