@@ -254,6 +254,43 @@ class StatusPublicationTests(unittest.TestCase):
             ("run", 202609), ("cleanup", 202609),
         ])
 
+    def test_step_mode_executes_exact_requested_action_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            soak.args.anchors = 2
+            soak.args.actions = ["assert"]
+            soak.args.duration_seconds = None
+            soak.args.steps = 3
+            soak.args.interval_seconds = 0
+            soak.args.max_snapshots = 2
+            soak.args.hibernate_hold_seconds = 0
+            soak.args.sibling_fork_timer_seconds = 0
+            soak.args.epoch_hibernate_min_seconds = 0
+            soak.args.anchor_vcpus = [1, 2]
+            soak.args.storage_path = None
+            observed = []
+            events = []
+
+            def create_anchor(index):
+                vm_id = f"vm-{index}"
+                soak.anchors[vm_id] = SimpleNamespace(
+                    created_at=MODULE.time.monotonic(), vcpus=index + 1,
+                )
+                return vm_id
+
+            soak.create_anchor = create_anchor
+            soak.assert_global_invariants = lambda: None
+            soak.run_action = lambda action, vm_id: observed.append(action.__name__)
+            soak.event = lambda kind, **fields: events.append((kind, fields))
+
+            soak.run()
+
+            self.assertEqual(len(observed), 7)
+            self.assertEqual(observed[-3:], ["assert_anchor"] * 3)
+            self.assertEqual(events[-1][0], "soak_pass")
+            self.assertEqual(events[-1][1]["mode"], "steps")
+            self.assertEqual(events[-1][1]["completed_steps"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()
