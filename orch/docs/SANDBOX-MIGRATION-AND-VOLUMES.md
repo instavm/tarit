@@ -101,8 +101,14 @@ foundations:
   generic NFS, AWS EFS, or Azure Files. It forces hard mounts plus explicit
   timeout/retransmission and `nosuid,nodev,noexec` policy, rejects endpoint,
   export, and option injection, and declares shared-writer/cross-node lifecycle
-  capabilities. It is not yet connected to the private mount-namespace and
-  jailed-filesystem transport, so this is not an NFS qualification claim.
+  capabilities. Generic NFS-backed raw block volumes are connected to the
+  public volume lifecycle. Tarit mounts them only long enough to open the exact
+  backing object, removes the host mount path, and passes the verified descriptor
+  to the VMM. `TARIT_SHARED_BLOCK_SECURITY` selects the NFS security flavor;
+  production requires `krb5p`. Admission verifies the kernel-reported NFS
+  version, TCP and hard-mount policy, and security flavor. AWS EFS and Azure
+  Files remain library profiles until their TLS mount helpers and real-service
+  cleanup gates are integrated.
 - `ImmutableObjectProvider` has only content-addressed put-if-absent,
   verified-get, and exact-delete operations. The local implementation uses
   private immutable files and rehashes content on every read. There is no mount,
@@ -149,8 +155,10 @@ attachment and replaces the VMM's inherited descriptor on same-host resume.
   tenant denial, unprivileged FD-only attachment, guest virtualization masking,
   and exact physical cleanup. A host-crash durability gate with explicit
   provider flush evidence remains required before claiming fsync durability.
-- NFS E2E proves reconnect, server interruption, busy detach, and that no cloud
-  or metadata-store credential reaches the guest.
+- NFS E2E proves reconnect, server interruption, busy detach, durable block
+  reopen, strict live-mount option verification, and that no cloud or
+  metadata-store credential reaches the guest. Production parsing rejects
+  generic `AUTH_SYS` and accepts only Kerberos privacy.
 - AWS and Azure gates use real disposable volumes, exercise attach timeout/node
   loss/stale generation cleanup, and leave no billable resource behind.
 - Object-provider tests cover immutable blob/checkpoint behavior and reject

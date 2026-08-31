@@ -56,6 +56,8 @@ its scope.
   barrier; older kernels use the barrier-only path.
 - Provider-neutral local and NFS-backed raw block volumes are generation-fenced,
   tenant-scoped, and ordered with hibernate, resume, recovery, and deletion.
+  Production generic NFS requires Kerberos privacy (`krb5p`), and mount
+  admission checks the kernel-reported security and transport parameters.
 - Snapshot files are opened without following symlinks and validated before
   restore. VMM control frames have absolute deadlines, and OCI extraction uses
   private workspaces and no-follow file access.

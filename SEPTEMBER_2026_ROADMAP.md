@@ -963,7 +963,8 @@ passing focused gate does not waive an item in the final column.
   performs guest writes, live forks,
   snapshot/restore, hibernate with concurrent wake requests, pause/resume, and
   balloon changes while reconciling API, database, process, jail, clone-ID,
-  cached-session, and nested-virtualization invariants. It retains up to six snapshots,
+  cached-session, and nested-virtualization invariants. It retains up to three
+  snapshots by default (configurable for larger test volumes),
   enforces a 3 GiB free-space floor both before and during each epoch, records
   JSONL history for 14 days, and stops on the first failure so evidence is not
   overwritten. Failure handling archives the database and service log, removes
@@ -1036,6 +1037,11 @@ passing focused gate does not waive an item in the final column.
   host-private. A disposable c8i provider gate passed exact mount validation,
   fsync durability across a deliberate NFS-server interruption and reconnect,
   busy-detach handling, durable block reopen, and cleanup with no live NFS mount.
+  Production configuration now requires `TARIT_SHARED_BLOCK_SECURITY=krb5p`.
+  Mount admission checks the live kernel mount for NFSv4.1, TCP, hard semantics,
+  and the requested security flavor, so an `AUTH_SYS` downgrade fails closed.
+  The disposable c8i interruption gate passes with strict mount verification;
+  a real Kerberos deployment remains required to qualify the protected path.
 - The public lifecycle gate passed eight fresh OCI/kernel/provider cases on the
   c8i: local block and NFS-backed block, each with digest-pinned Ubuntu 24.04 and
   Alpine 3.20 on Linux 6.6 and 5.10. Ubuntu formatted ext4, wrote and synced a

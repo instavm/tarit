@@ -27,6 +27,9 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Production generic-NFS volume configuration now requires `krb5p`; mount
+  admission verifies the live NFS version, TCP transport, hard-mount policy,
+  and security flavor instead of accepting an `AUTH_SYS` downgrade.
 - Failed all-vCPU live snapshot transitions resume the source and discard
   staging state; a live request against an already-paused VM fails without
   changing its state.

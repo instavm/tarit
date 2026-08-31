@@ -121,6 +121,7 @@ pub(crate) fn open(
         Some(config.region.clone()),
         None,
     )
+    .and_then(|provider| provider.with_security(shared.security))
     .map_err(|error| {
         tracing::error!(%error, provider = provider_name, "initialize shared NFS profile");
         OrchError::Internal("initialize shared volume provider".into())

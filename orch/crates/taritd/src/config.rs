@@ -579,6 +579,7 @@ impl SharedBlockProviderKind {
 #[derive(Clone)]
 pub struct SharedBlockConfig {
     pub kind: SharedBlockProviderKind,
+    pub security: tarit_volume::NfsSecurityFlavor,
     pub endpoint: String,
     pub export: String,
     pub mount_root: PathBuf,
@@ -591,6 +592,7 @@ impl fmt::Debug for SharedBlockConfig {
         formatter
             .debug_struct("SharedBlockConfig")
             .field("kind", &self.kind)
+            .field("security", &self.security)
             .field("endpoint", &"[REDACTED]")
             .field("export", &"[REDACTED]")
             .field("mount_root", &self.mount_root)
@@ -950,6 +952,7 @@ impl Config {
                 &vm_io_quota,
                 &vm_net_quota,
                 &disk_pressure,
+                shared_block.as_ref(),
                 allow_insecure_peer_http,
             )?;
         }
@@ -1302,6 +1305,7 @@ fn validate_production_requirements(
     vm_io_quota: &VmIoQuotaConfig,
     vm_net_quota: &VmNetQuotaConfig,
     disk_pressure: &DiskPressureConfig,
+    shared_block: Option<&SharedBlockConfig>,
     allow_insecure_peer_http: bool,
 ) -> Result<()> {
     if !cfg!(target_os = "linux") {
@@ -1354,6 +1358,9 @@ fn validate_production_requirements(
     if !disk_pressure.is_configured() {
         bail!("TARIT_PRODUCTION requires byte or inode disk-pressure high/low watermarks");
     }
+    if let Some(shared_block) = shared_block {
+        validate_production_shared_block(shared_block)?;
+    }
     for (name, path) in [
         ("TARIT_VMM_BIN", vmm_bin),
         ("TARIT_KERNEL", kernel),
@@ -1365,6 +1372,15 @@ fn validate_production_requirements(
     }
     if allow_insecure_peer_http {
         bail!("TARIT_PRODUCTION forbids TARIT_ALLOW_INSECURE_PEER_HTTP");
+    }
+    Ok(())
+}
+
+fn validate_production_shared_block(shared_block: &SharedBlockConfig) -> Result<()> {
+    if shared_block.kind == SharedBlockProviderKind::NfsV4_1
+        && shared_block.security != tarit_volume::NfsSecurityFlavor::Krb5Privacy
+    {
+        bail!("TARIT_PRODUCTION generic NFS volumes require TARIT_SHARED_BLOCK_SECURITY=krb5p");
     }
     Ok(())
 }
@@ -1798,6 +1814,7 @@ fn parse_shared_block_config() -> Result<Option<SharedBlockConfig>> {
         "TARIT_SHARED_BLOCK_MOUNT_ROOT",
         "TARIT_SHARED_BLOCK_MAX_BYTES",
         "TARIT_SHARED_BLOCK_TIMEOUT_MS",
+        "TARIT_SHARED_BLOCK_SECURITY",
     ];
     let provider = env::var("TARIT_SHARED_BLOCK_PROVIDER")
         .ok()
@@ -1815,6 +1832,18 @@ fn parse_shared_block_config() -> Result<Option<SharedBlockConfig>> {
             "unsupported TARIT_SHARED_BLOCK_PROVIDER={provider:?}; supported provider is nfs_v4_1_block"
         ),
     };
+    let security = match env::var("TARIT_SHARED_BLOCK_SECURITY")
+        .unwrap_or_else(|_| "sys".into())
+        .as_str()
+    {
+        "sys" => tarit_volume::NfsSecurityFlavor::Sys,
+        "krb5" => tarit_volume::NfsSecurityFlavor::Krb5,
+        "krb5i" => tarit_volume::NfsSecurityFlavor::Krb5Integrity,
+        "krb5p" => tarit_volume::NfsSecurityFlavor::Krb5Privacy,
+        value => bail!(
+            "unsupported TARIT_SHARED_BLOCK_SECURITY={value:?}; supported values are sys, krb5, krb5i, and krb5p"
+        ),
+    };
     let endpoint = env::var("TARIT_SHARED_BLOCK_ENDPOINT")
         .context("TARIT_SHARED_BLOCK_ENDPOINT must be set")?;
     let export =
@@ -1826,6 +1855,7 @@ fn parse_shared_block_config() -> Result<Option<SharedBlockConfig>> {
         None,
         None,
     )
+    .and_then(|provider| provider.with_security(security))
     .map_err(|error| anyhow::anyhow!("invalid shared-block NFS configuration: {error}"))?;
     let mount_root = expand_path(
         &env::var("TARIT_SHARED_BLOCK_MOUNT_ROOT")
@@ -1844,6 +1874,7 @@ fn parse_shared_block_config() -> Result<Option<SharedBlockConfig>> {
     }
     Ok(Some(SharedBlockConfig {
         kind,
+        security,
         endpoint,
         export,
         mount_root,
@@ -2014,6 +2045,7 @@ mod tests {
         "TARIT_SHARED_BLOCK_MOUNT_ROOT",
         "TARIT_SHARED_BLOCK_MAX_BYTES",
         "TARIT_SHARED_BLOCK_TIMEOUT_MS",
+        "TARIT_SHARED_BLOCK_SECURITY",
     ];
 
     fn clear_shared_block_env() {
@@ -2047,6 +2079,7 @@ mod tests {
 
         let config = parse_shared_block_config().unwrap().unwrap();
         assert_eq!(config.kind, SharedBlockProviderKind::NfsV4_1);
+        assert_eq!(config.security, tarit_volume::NfsSecurityFlavor::Sys);
         assert_eq!(config.endpoint, "127.0.0.1");
         assert_eq!(config.export, "/srv/tarit");
         assert_eq!(config.mount_root, PathBuf::from("/run/tarit/shared-block"));
@@ -2055,6 +2088,48 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("127.0.0.1"));
         assert!(!debug.contains("/srv/tarit"));
+        clear_shared_block_env();
+    }
+
+    #[test]
+    fn production_shared_nfs_requires_privacy_protection() {
+        let base = SharedBlockConfig {
+            kind: SharedBlockProviderKind::NfsV4_1,
+            security: tarit_volume::NfsSecurityFlavor::Sys,
+            endpoint: "server.internal".into(),
+            export: "/srv/tarit".into(),
+            mount_root: PathBuf::from("/run/tarit/shared-block"),
+            max_size_bytes: 8 * 1024 * 1024,
+            operation_timeout_ms: 30_000,
+        };
+        let error = validate_production_shared_block(&base)
+            .expect_err("AUTH_SYS must not be admitted in production");
+        assert!(error.to_string().contains("krb5p"));
+        let protected = SharedBlockConfig {
+            security: tarit_volume::NfsSecurityFlavor::Krb5Privacy,
+            ..base
+        };
+        validate_production_shared_block(&protected).unwrap();
+    }
+
+    #[test]
+    fn shared_block_security_flavor_is_validated() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        std::env::set_var("TARIT_SHARED_BLOCK_PROVIDER", "nfs_v4_1_block");
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "server.internal");
+        std::env::set_var("TARIT_SHARED_BLOCK_EXPORT", "/srv/tarit");
+        std::env::set_var("TARIT_SHARED_BLOCK_MOUNT_ROOT", "/run/tarit/shared-block");
+        std::env::set_var("TARIT_SHARED_BLOCK_SECURITY", "krb5p");
+        let config = parse_shared_block_config().unwrap().unwrap();
+        assert_eq!(
+            config.security,
+            tarit_volume::NfsSecurityFlavor::Krb5Privacy
+        );
+
+        std::env::set_var("TARIT_SHARED_BLOCK_SECURITY", "soft");
+        let error = parse_shared_block_config().expect_err("unknown flavor must fail closed");
+        assert!(error.to_string().contains("supported values"));
         clear_shared_block_env();
     }
 

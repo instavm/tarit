@@ -19,6 +19,25 @@ pub enum NfsDialect {
     AzureFiles,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NfsSecurityFlavor {
+    Sys,
+    Krb5,
+    Krb5Integrity,
+    Krb5Privacy,
+}
+
+impl NfsSecurityFlavor {
+    pub fn mount_option(self) -> &'static str {
+        match self {
+            Self::Sys => "sec=sys",
+            Self::Krb5 => "sec=krb5",
+            Self::Krb5Integrity => "sec=krb5i",
+            Self::Krb5Privacy => "sec=krb5p",
+        }
+    }
+}
+
 /// Credential-free mount intent. The orchestrator executes this in its private
 /// mount namespace and passes only a pre-mounted jailed path onward. It never
 /// serializes provider credentials into a VM record or guest command line.
@@ -49,6 +68,7 @@ impl fmt::Debug for NfsMountSpec {
 #[derive(Debug, Clone)]
 pub struct NfsProvider {
     dialect: NfsDialect,
+    security: NfsSecurityFlavor,
     endpoint: String,
     export: String,
     region: Option<String>,
@@ -265,6 +285,7 @@ struct MountEntry {
     fs_type: String,
     source: String,
     mount_options: Vec<String>,
+    super_options: Vec<String>,
 }
 
 fn run_bounded(command: &mut Command, timeout: Duration) -> Result<ExitStatus, VolumeError> {
@@ -334,11 +355,13 @@ fn parse_mountinfo(contents: &str) -> Vec<MountEntry> {
             let mut after = after.split_whitespace();
             let fs_type = after.next()?;
             let source = after.next()?;
+            let super_options = after.next()?;
             Some(MountEntry {
                 mount_point: PathBuf::from(decode_mount_field(mount_point)),
                 fs_type: fs_type.to_string(),
                 source: decode_mount_field(source),
                 mount_options: mount_options.split(',').map(str::to_string).collect(),
+                super_options: super_options.split(',').map(str::to_string).collect(),
             })
         })
         .collect()
@@ -354,15 +377,29 @@ fn decode_mount_field(value: &str) -> String {
 
 fn verify_mount(spec: &NfsMountSpec, entry: &MountEntry) -> Result<(), VolumeError> {
     let expected_access = if spec.read_only { "ro" } else { "rw" };
-    if entry.fs_type != "nfs4"
-        || entry.source != spec.source
-        || !entry
+    let has_option = |expected: &str| {
+        entry
             .mount_options
             .iter()
-            .any(|option| option == expected_access)
+            .chain(entry.super_options.iter())
+            .any(|option| option == expected)
+    };
+    let required_protocol_options = spec.options.iter().filter(|option| {
+        option.as_str() == "hard"
+            || option.as_str() == "proto=tcp"
+            || option.starts_with("vers=")
+            || option.starts_with("minorversion=")
+            || option.starts_with("sec=")
+    });
+    if entry.fs_type != "nfs4"
+        || entry.source != spec.source
+        || !has_option(expected_access)
         || ["nosuid", "nodev", "noexec"]
             .iter()
-            .any(|required| !entry.mount_options.iter().any(|option| option == required))
+            .any(|required| !has_option(required))
+        || required_protocol_options
+            .into_iter()
+            .any(|required| !has_option(required))
     {
         return Err(VolumeError::IdentityMismatch);
     }
@@ -398,11 +435,22 @@ impl NfsProvider {
         }
         Ok(Self {
             dialect,
+            security: NfsSecurityFlavor::Sys,
             endpoint,
             export,
             region,
             zone,
         })
+    }
+
+    pub fn with_security(mut self, security: NfsSecurityFlavor) -> Result<Self, VolumeError> {
+        if self.dialect != NfsDialect::GenericV4_1 && security != NfsSecurityFlavor::Sys {
+            return Err(VolumeError::Unsupported(
+                "managed NFS transport security requires its provider mount helper".into(),
+            ));
+        }
+        self.security = security;
+        Ok(self)
     }
 
     pub fn provider_name(&self) -> &'static str {
@@ -463,6 +511,7 @@ impl NfsProvider {
                 options.push("vers=4.1".into());
                 options.push("rsize=1048576".into());
                 options.push("wsize=1048576".into());
+                options.push(self.security.mount_option().into());
             }
             NfsDialect::AzureFiles => {
                 // Azure documents split major/minor options for distributions
@@ -685,6 +734,7 @@ mod tests {
             "nodev",
             "noexec",
             "rw",
+            "sec=sys",
         ] {
             assert!(spec.options.iter().any(|option| option == required));
         }
@@ -757,7 +807,7 @@ mod tests {
     #[test]
     fn mountinfo_identity_is_exact_and_escaped_paths_decode() {
         let entries = parse_mountinfo(
-            "41 32 0:51 / /run/tarit\\040mount rw,nosuid,nodev,noexec - nfs4 server.internal:/exports/work rw\n",
+            "41 32 0:51 / /run/tarit\\040mount rw,nosuid,nodev,noexec - nfs4 server.internal:/exports/work rw,vers=4.1,hard,proto=tcp,sec=sys\n",
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].mount_point, Path::new("/run/tarit mount"));
@@ -777,6 +827,27 @@ mod tests {
             verify_mount(&spec, &wrong),
             Err(VolumeError::IdentityMismatch)
         ));
+
+        let privacy = NfsProvider::new(
+            NfsDialect::GenericV4_1,
+            "server.internal",
+            "/exports/work",
+            None,
+            None,
+        )
+        .unwrap()
+        .with_security(NfsSecurityFlavor::Krb5Privacy)
+        .unwrap()
+        .prepare(Uuid::new_v4(), 1, false)
+        .unwrap();
+        assert!(matches!(
+            verify_mount(&privacy, &entries[0]),
+            Err(VolumeError::IdentityMismatch)
+        ));
+        let mut protected = entries[0].clone();
+        protected.super_options.retain(|option| option != "sec=sys");
+        protected.super_options.push("sec=krb5p".into());
+        assert!(verify_mount(&privacy, &protected).is_ok());
     }
 
     #[cfg(target_os = "linux")]

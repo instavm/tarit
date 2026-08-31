@@ -20,8 +20,8 @@ pub use attached_block::{
     AttachedBlockKind, AttachedBlockProvider, BlockDeviceIdentity, BlockDeviceRegistration,
 };
 pub use nfs::{
-    NfsBackedBlockProvider, NfsDialect, NfsMountSpec, NfsProvider, PreparedFilesystemAttachment,
-    SystemNfsMounter,
+    NfsBackedBlockProvider, NfsDialect, NfsMountSpec, NfsProvider, NfsSecurityFlavor,
+    PreparedFilesystemAttachment, SystemNfsMounter,
 };
 pub use object::{
     ImmutableObject, ImmutableObjectProvider, LocalImmutableObjectProvider, ObjectDigest,

@@ -15,6 +15,7 @@ RUN_ROOT="${TARIT_CONTINUOUS_RUN_ROOT:-$SOCKET_ROOT/tarit-continuous-soak}"
 LOCK="${TARIT_CONTINUOUS_LOCK:-/run/lock/tarit-september-global.lock}"
 EPOCH_SECONDS="${TARIT_CONTINUOUS_EPOCH_SECONDS:-1800}"
 MIN_FREE_BYTES="${TARIT_CONTINUOUS_MIN_FREE_BYTES:-3221225472}"
+MAX_SNAPSHOTS="${TARIT_CONTINUOUS_MAX_SNAPSHOTS:-3}"
 CASES="${TARIT_CONTINUOUS_CASES:-}"
 CASES_FILE="${TARIT_CONTINUOUS_CASES_FILE:-}"
 
@@ -29,6 +30,7 @@ test -x "$GUEST_AGENT" || { echo "FAIL: guest agent not executable: $GUEST_AGENT
   exit 1
 }
 [[ "$MIN_FREE_BYTES" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid free-space floor" >&2; exit 1; }
+[[ "$MAX_SNAPSHOTS" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: invalid snapshot limit" >&2; exit 1; }
 
 install -d -m 0700 "$RUN_ROOT/history" "$RUN_ROOT/build" "$RUN_ROOT/failures"
 WORKLOAD_BIN="$RUN_ROOT/build/clone-repair-workload"
@@ -94,7 +96,7 @@ while :; do
     TARIT_LIFECYCLE_MAX_VMS=6 \
     TARIT_LIFECYCLE_MAX_VCPUS=12 \
     TARIT_LIFECYCLE_MAX_MEMORY_MIB=2048 \
-    TARIT_LIFECYCLE_MAX_SNAPSHOTS=6 \
+    TARIT_LIFECYCLE_MAX_SNAPSHOTS="$MAX_SNAPSHOTS" \
     TARIT_E2E_KEEP_FAILED=0 \
     TARIT_E2E_FAILURE_ARCHIVE_ROOT="$RUN_ROOT/failures" \
     "$STATE_GATE" >"$log" 2>&1 &
