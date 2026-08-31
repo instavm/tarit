@@ -18,6 +18,7 @@ default = []
 # host — see crates/vmm-integration/boot_smoke.rs).
 boot = ["vmm-core/kvm", "vmm-api/boot"]
 test-failpoints = ["vmm-core/test-failpoints", "vmm-memory-backend/test-failpoints"]
+test-incompatible-snapshot-abi = ["vmm-core/test-incompatible-snapshot-abi"]
 [dependencies]
 vmm-core = { path = "../crates/vmm-core" }
 vmm-loader = { path = "../crates/vmm-loader" }

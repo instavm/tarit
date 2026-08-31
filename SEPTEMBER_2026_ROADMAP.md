@@ -872,8 +872,15 @@ passing focused gate does not waive an item in the final column.
   gate. A VMM built from `37f8bbb` then created version-1 full and incremental
   chains that the version-2 candidate restored on Ubuntu/Linux 6.6 and
   Alpine/Linux 5.10, including both RAM proofs and source/output isolation.
-  The old test worktree was removed after the gate. Actual incompatible-binary
-  qualification and 100-sample latency distributions remain open.
+  The old test worktree was removed after the gate. A separately compiled
+  state-ABI-2 VMM
+  (`fc00fcf5dd1d637b542c6144c2fc4edb26d008718a35975841e5f6fa6f312c64`)
+  then rejected live snapshots from the state-ABI-1 candidate
+  (`54bc435394259773dfd55e13b2f24e3c5bd9d322b6bdf9933cfd29115cefb527`)
+  before VM publication on Ubuntu/Linux 6.6 and Alpine/Linux 5.10. The writer
+  VMM subsequently lazily restored each untouched snapshot and both vCPUs
+  advanced. The incompatible build and runtime artifacts were removed after
+  the gate. The 100-sample latency distributions remain open.
 - The persistent local-block gate now passes a four-way OCI/kernel matrix:
   Ubuntu and Alpine-derived workloads on Linux 6.6 and 5.10. Each case creates
   a 64 MiB raw volume through the public API, observes it as `/dev/vdb`, formats

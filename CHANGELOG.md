@@ -88,9 +88,11 @@ versions may contain breaking changes.
   first diff request, restores a real parent/diff RAM chain, and verifies that
   a hardlink-spelled input is neither mutated nor reused as snapshot output.
 - Snapshot restore rejects a checksum-valid incompatible CPU template or
-  removed-manifest downgrade before publishing a VM. Differential restore
-  qualification can also force guest-sized VMM mappings into host swap and
-  verify pre-parent and post-parent RAM contents.
+  removed-manifest downgrade before publishing a VM. The compatibility gate
+  can build a deliberately newer state ABI and prove the same fail-closed
+  behavior across actual VMM binaries. Differential restore qualification can
+  also force guest-sized VMM mappings into host swap and verify pre-parent and
+  post-parent RAM contents.
 
 ## [0.1.2] - 2026-08-07
 

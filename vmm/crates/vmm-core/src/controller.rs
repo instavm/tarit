@@ -4897,8 +4897,20 @@ const BALLOON_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTBLN01";
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const COMPATIBILITY_TRAILER_MAGIC: &[u8; 8] = b"TRTCMP01";
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    feature = "boot",
+    not(feature = "test-incompatible-snapshot-abi")
+))]
 const SNAPSHOT_STATE_ABI: u16 = 1;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    feature = "boot",
+    feature = "test-incompatible-snapshot-abi"
+))]
+const SNAPSHOT_STATE_ABI: u16 = 2;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const DEVICE_MODEL_ABI: u16 = 1;
 

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Reject a CRC-valid snapshot with malformed runtime state before VM publication.
+# Reject malformed or incompatible runtime state before VM publication. Set
+# INCOMPATIBLE_VMM_BIN to a VMM built with
+# `--features boot,test-incompatible-snapshot-abi` to exercise a real binary
+# state-schema boundary in addition to checksum-valid artifact mutations.
 set -Eeuo pipefail
 
 VMM_BIN=${VMM_BIN:?set VMM_BIN}
 KERNEL=${KERNEL:?set KERNEL}
 ROOTFS=${ROOTFS:?set ROOTFS to an OCI-derived ext4 image with the Tarit agent}
 GUEST_AGENT_BIN=${GUEST_AGENT_BIN:?set GUEST_AGENT_BIN to the candidate vmm-agent}
+INCOMPATIBLE_VMM_BIN=${INCOMPATIBLE_VMM_BIN:-}
 SOCKET_ROOT=${SOCKET_ROOT:-/tmp}
 CONTROL_TIMEOUT_SECS=${CONTROL_TIMEOUT_SECS:-35}
 RESTORE_TIMEOUT_SECS=${RESTORE_TIMEOUT_SECS:-120}
@@ -15,7 +19,9 @@ FAIL_PHASE=${FAIL_PHASE:-}
 
 WORK_DIR=$(mktemp -d "$SOCKET_ROOT/tarit-restore-fail-closed.XXXXXX")
 SOCKET="$WORK_DIR/vmm.sock"
+INCOMPATIBLE_SOCKET="$WORK_DIR/incompatible-vmm.sock"
 LOG="$WORK_DIR/vmm.log"
+INCOMPATIBLE_LOG="$WORK_DIR/incompatible-vmm.log"
 CORRUPT="$WORK_DIR/corrupt.snap"
 INCOMPATIBLE="$WORK_DIR/incompatible.snap"
 DOWNGRADED="$WORK_DIR/downgraded.snap"
@@ -25,6 +31,7 @@ STATUS_ERROR="$WORK_DIR/status-error.log"
 SNAPSHOT_FAILURE="$WORK_DIR/snapshot-failure.log"
 PAUSED_LIVE_ERROR="$WORK_DIR/paused-live-error.log"
 SERVE_PID=
+INCOMPATIBLE_SERVE_PID=
 ROOTFS_MOUNT=
 SNAPSHOT=
 INTEGRITY=
@@ -48,6 +55,17 @@ cleanup() {
       kill -KILL "$SERVE_PID" 2>/dev/null || true
     fi
     wait "$SERVE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$INCOMPATIBLE_SERVE_PID" ]]; then
+    kill "$INCOMPATIBLE_SERVE_PID" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      kill -0 "$INCOMPATIBLE_SERVE_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$INCOMPATIBLE_SERVE_PID" 2>/dev/null; then
+      kill -KILL "$INCOMPATIBLE_SERVE_PID" 2>/dev/null || true
+    fi
+    wait "$INCOMPATIBLE_SERVE_PID" 2>/dev/null || true
   fi
   for artifact in "$SNAPSHOT" "$INTEGRITY" "$OVERLAY"; do
     if [[ -n "$artifact" ]]; then
@@ -84,6 +102,7 @@ done
   exit 1
 }
 [[ -x "$GUEST_AGENT_BIN" ]]
+[[ -z "$INCOMPATIBLE_VMM_BIN" || -x "$INCOMPATIBLE_VMM_BIN" ]]
 [[ "$VCPUS" =~ ^[1-8]$ ]] || {
   echo "VCPUS must be between 1 and 8" >&2
   exit 1
@@ -267,6 +286,40 @@ PY
 
 "$VMM_BIN" --socket "$SOCKET" stop >/dev/null
 
+if [[ -n "$INCOMPATIBLE_VMM_BIN" ]]; then
+  rm -f -- "$INCOMPATIBLE_SOCKET" "$INCOMPATIBLE_LOG"
+  "$INCOMPATIBLE_VMM_BIN" --socket "$INCOMPATIBLE_SOCKET" serve \
+    >"$INCOMPATIBLE_LOG" 2>&1 &
+  INCOMPATIBLE_SERVE_PID=$!
+  for _ in $(seq 1 100); do
+    [[ -S "$INCOMPATIBLE_SOCKET" ]] && break
+    kill -0 "$INCOMPATIBLE_SERVE_PID" 2>/dev/null || {
+      tail -120 "$INCOMPATIBLE_LOG" >&2
+      exit 1
+    }
+    sleep 0.05
+  done
+  [[ -S "$INCOMPATIBLE_SOCKET" ]]
+  if timeout "$RESTORE_TIMEOUT_SECS" "$INCOMPATIBLE_VMM_BIN" \
+    --socket "$INCOMPATIBLE_SOCKET" restore --snapshot "$SNAPSHOT" \
+    --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
+    echo "incompatible VMM binary unexpectedly restored the snapshot" >&2
+    exit 1
+  fi
+  grep -q 'incompatible snapshot state ABI' "$RESTORE_ERROR"
+  if "$INCOMPATIBLE_VMM_BIN" --socket "$INCOMPATIBLE_SOCKET" status \
+    >"$STATUS_ERROR" 2>&1; then
+    echo "incompatible VMM binary published a VM slot" >&2
+    exit 1
+  fi
+  grep -q 'no VM' "$STATUS_ERROR"
+  kill "$INCOMPATIBLE_SERVE_PID"
+  wait "$INCOMPATIBLE_SERVE_PID" 2>/dev/null || true
+  INCOMPATIBLE_SERVE_PID=
+  rm -f -- "$INCOMPATIBLE_SOCKET"
+  echo "restore-e2e: incompatible VMM binary rejected the state ABI before publication"
+fi
+
 # Change only the named CPU template inside the compatibility trailer and
 # recompute the state CRC. The state remains syntactically valid, so restore
 # must reject it as incompatible rather than as generic corruption.
@@ -384,4 +437,6 @@ if grep -Eiq 'panicked at|thread .* panicked|kernel panic|BUG: unable to handle'
   exit 1
 fi
 
-echo "RESTORE_FAIL_CLOSED_E2E_PASS malformed_state=rejected incompatible_template=rejected manifest_downgrade=rejected vm_published=no valid_lazy_restore=passed nested_virtualization=hidden vcpus=$VCPUS live_snapshot=$LIVE_SNAPSHOT"
+binary_boundary=not_requested
+[[ -z "$INCOMPATIBLE_VMM_BIN" ]] || binary_boundary=rejected
+echo "RESTORE_FAIL_CLOSED_E2E_PASS malformed_state=rejected incompatible_template=rejected incompatible_binary=$binary_boundary manifest_downgrade=rejected vm_published=no valid_lazy_restore=passed nested_virtualization=hidden vcpus=$VCPUS live_snapshot=$LIVE_SNAPSHOT"
