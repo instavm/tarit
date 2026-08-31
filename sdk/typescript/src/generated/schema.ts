@@ -2375,7 +2375,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Incremental snapshots are disabled; retry with `diff=false`. */
+            /** @description Incremental snapshots are disabled, or the VM has attached persistent data volumes that require an explicit provider clone policy. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -2431,6 +2431,13 @@ export interface operations {
             };
             /** @description Source is not running or the requested child id already exists */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The source has attached persistent data volumes that require an explicit provider clone policy. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

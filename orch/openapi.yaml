@@ -1288,7 +1288,7 @@ paths:
         "404":
           description: VM not found
         "422":
-          description: Incremental snapshots are disabled; retry with `diff=false`.
+          description: Incremental snapshots are disabled, or the VM has attached persistent data volumes that require an explicit provider clone policy.
         "409":
           description: VM lifecycle state does not support snapshots
   /v1/vms/{id}/fork:
@@ -1324,6 +1324,8 @@ paths:
           description: Source VM not found
         "409":
           description: Source is not running or the requested child id already exists
+        "422":
+          description: The source has attached persistent data volumes that require an explicit provider clone policy.
         "429":
           description: Host capacity is unavailable
         "503":

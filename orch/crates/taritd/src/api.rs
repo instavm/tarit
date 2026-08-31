@@ -2860,6 +2860,13 @@ async fn fork_vm(
         ))
         .into());
     }
+    ops::ensure_no_persistent_volume_attachments(
+        &state,
+        source.owner_key.as_deref(),
+        source_id,
+        "live fork",
+    )
+    .await?;
     if let Some(operation) = &existing_operation {
         if source.host_id != operation.source_host_id {
             return Err(OrchError::Conflict(format!(
@@ -4438,6 +4445,104 @@ mod tests {
             serde_json::json!({}),
         ));
         assert_eq!(paused_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn snapshot_and_live_fork_reject_persistent_volumes_before_artifact_work() {
+        let state = test_state();
+        let source_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let volume_id = Uuid::new_v4();
+        insert_vm(&state, source_id, "tenant-a", VmStatus::Running);
+        let app = router(state.clone());
+        let runtime = test_runtime();
+
+        let volume = runtime.block_on(request_json(
+            app.clone(),
+            "POST",
+            "/v1/volumes",
+            "tenant-a-key",
+            serde_json::json!({
+                "id": volume_id,
+                "name": format!("fork-source-{}", volume_id.simple()),
+                "size_bytes": 4 * 1024 * 1024,
+                "provider": "local_block",
+            }),
+        ));
+        assert_eq!(volume.status(), StatusCode::CREATED);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .bind_vm_volumes(&[tarit_types::VmVolumeAttachmentRecord {
+                vm_id: source_id,
+                volume_id,
+                device_index: 0,
+                owner_key: "tenant-a".into(),
+                mode: tarit_types::VolumeAttachmentMode::ReadWrite,
+                volume_generation: 1,
+                created_at: Utc::now(),
+            }])
+            .unwrap();
+
+        let snapshot = runtime.block_on(request_json(
+            app.clone(),
+            "POST",
+            &format!("/v1/vms/{source_id}/snapshot"),
+            "tenant-a-key",
+            serde_json::json!({"diff": false}),
+        ));
+        assert_eq!(snapshot.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let snapshot_body = runtime.block_on(response_json(snapshot));
+        assert!(snapshot_body["error"]
+            .as_str()
+            .unwrap()
+            .contains("explicit provider clone policy"));
+        assert!(!snapshot_body.to_string().contains(&volume_id.to_string()));
+
+        let fork = runtime.block_on(request_json(
+            app.clone(),
+            "POST",
+            &format!("/v1/vms/{source_id}/fork"),
+            "tenant-a-key",
+            serde_json::json!({"id": child_id}),
+        ));
+        assert_eq!(fork.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let fork_body = runtime.block_on(response_json(fork));
+        assert!(fork_body["error"]
+            .as_str()
+            .unwrap()
+            .contains("explicit provider clone policy"));
+        assert!(!fork_body.to_string().contains(&volume_id.to_string()));
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .get_fork_operation(child_id)
+            .unwrap()
+            .is_none());
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .list_snapshots()
+            .unwrap()
+            .is_empty());
+
+        state
+            .store
+            .lock()
+            .unwrap()
+            .unbind_vm_volumes("tenant-a", source_id)
+            .unwrap();
+        let deleted = runtime.block_on(request_json(
+            app,
+            "DELETE",
+            &format!("/v1/volumes/{volume_id}"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
     }
 
     #[test]

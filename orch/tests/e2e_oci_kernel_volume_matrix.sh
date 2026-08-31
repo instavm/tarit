@@ -26,6 +26,7 @@ for provider in local_block nfs_v4_1_block; do
       TARIT_KERNEL="$kernel_path" \
         TARIT_ROOTFS="$rootfs_path" \
         TARIT_EXPECT_OS_ID="$os_id" \
+        TARIT_EXPECT_KERNEL_PREFIX="$kernel_name." \
         TARIT_VOLUME_PROVIDER="$provider" \
         "$CASE_RUNNER"
       passed=$((passed + 1))

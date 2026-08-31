@@ -8,6 +8,7 @@ VMM="${TARIT_VMM_BIN:-$ROOT/vmm/target/release/vmm}"
 KERNEL="${TARIT_KERNEL:?set TARIT_KERNEL to a KVM guest kernel}"
 ROOTFS="${TARIT_ROOTFS:?set TARIT_ROOTFS to an agent-enabled OCI rootfs}"
 EXPECTED_OS_ID="${TARIT_EXPECT_OS_ID:-ubuntu}"
+EXPECTED_KERNEL_PREFIX="${TARIT_EXPECT_KERNEL_PREFIX:-}"
 VOLUME_PROVIDER="${TARIT_VOLUME_PROVIDER:-local_block}"
 SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
 GUEST_AGENT_BIN="${TARIT_TEST_GUEST_AGENT_BIN:-}"
@@ -32,6 +33,10 @@ grep -Eq '\b(vmx|svm)\b' /proc/cpuinfo || {
 }
 [[ "$EXPECTED_OS_ID" =~ ^[a-z0-9._-]+$ ]] || {
   echo "FAIL: TARIT_EXPECT_OS_ID contains unsupported characters" >&2
+  exit 1
+}
+[[ "$EXPECTED_KERNEL_PREFIX" =~ ^[0-9A-Za-z._+-]*$ ]] || {
+  echo "FAIL: TARIT_EXPECT_KERNEL_PREFIX contains unsupported characters" >&2
   exit 1
 }
 if [ -z "$PORT" ]; then
@@ -306,7 +311,20 @@ VM_JSON=$(api -H 'Content-Type: application/json' \
   -d "{\"vcpus\":1,\"memory_mib\":256,\"volumes\":[{\"volume_id\":\"$VOLUME_ID\",\"mode\":\"read_write\"}]}" \
   "$BASE_URL/v1/vms")
 VM_ID=$(printf '%s' "$VM_JSON" | json_field id)
-expect_exec "$VM_ID" "grep '^ID=$EXPECTED_OS_ID$' /etc/os-release" "ID=$EXPECTED_OS_ID"
+# shellcheck disable=SC2016 # $ID expands inside the guest.
+IDENTITY_JSON=$(exec_request "$VM_ID" 'uname -r; . /etc/os-release; printf "%s\n" "$ID"')
+GUEST_KERNEL_RELEASE=$(printf '%s' "$IDENTITY_JSON" | python3 -c '
+import json,sys
+r=json.load(sys.stdin); expected_os=sys.argv[1]; expected_kernel=sys.argv[2]
+assert r["exit_code"] == 0, r
+lines=r.get("stdout", "").splitlines()
+assert len(lines) == 2, r
+kernel_release, os_id = lines
+assert os_id == expected_os, (expected_os, os_id)
+if expected_kernel:
+    assert kernel_release.startswith(expected_kernel), (expected_kernel, kernel_release)
+print(kernel_release)
+' "$EXPECTED_OS_ID" "$EXPECTED_KERNEL_PREFIX")
 expect_exec "$VM_ID" "test ! -e /dev/kvm && ! grep -Eq '\\b(vmx|svm)\\b' /proc/cpuinfo && echo GUEST_VIRT_HIDDEN" GUEST_VIRT_HIDDEN
 expect_exec "$VM_ID" "test ! -e '$NFS_EXPORT_CONFIG' && ! grep -q nfs /proc/mounts && echo SHARED_STORAGE_HIDDEN" SHARED_STORAGE_HIDDEN
 expect_exec "$VM_ID" "test -b /dev/vdb || { ls -l /dev /dev/vd* 2>&1; exit 1; }; echo BLOCK_DEVICE_READY" BLOCK_DEVICE_READY
@@ -320,6 +338,46 @@ else
   expect_exec "$VM_ID" "export PATH=/usr/sbin:/usr/bin:/sbin:/bin; mkdir -p /mnt/persist && mount /dev/vdb /mnt/persist && printf 'tarit-volume-proof' > /mnt/persist/proof && sync && cat /mnt/persist/proof" tarit-volume-proof
 fi
 assert_no_provider_mounts
+
+echo "== reject non-cloning snapshot and fork before artifact work =="
+SNAPSHOT_REJECT_BODY="$DIR/snapshot-volume-reject.json"
+SNAPSHOT_REJECT_STATUS=$(curl -sS --max-time 20 -o "$SNAPSHOT_REJECT_BODY" -w '%{http_code}' \
+  -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"diff":false}' \
+  "$BASE_URL/v1/vms/$VM_ID/snapshot")
+[ "$SNAPSHOT_REJECT_STATUS" = 422 ] || {
+  echo "FAIL: attached-volume snapshot returned HTTP $SNAPSHOT_REJECT_STATUS: $(cat "$SNAPSHOT_REJECT_BODY")" >&2
+  exit 1
+}
+python3 - "$SNAPSHOT_REJECT_BODY" "$VOLUME_ID" <<'PY'
+import json,sys
+with open(sys.argv[1], encoding="utf-8") as response:
+    body=json.load(response)
+assert "explicit provider clone policy" in body.get("error", ""), body
+assert sys.argv[2] not in json.dumps(body), body
+PY
+
+FORK_CHILD_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+FORK_REJECT_BODY="$DIR/fork-volume-reject.json"
+FORK_REJECT_STATUS=$(curl -sS --max-time 20 -o "$FORK_REJECT_BODY" -w '%{http_code}' \
+  -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d "{\"id\":\"$FORK_CHILD_ID\"}" "$BASE_URL/v1/vms/$VM_ID/fork")
+[ "$FORK_REJECT_STATUS" = 422 ] || {
+  echo "FAIL: attached-volume fork returned HTTP $FORK_REJECT_STATUS: $(cat "$FORK_REJECT_BODY")" >&2
+  exit 1
+}
+python3 - "$FORK_REJECT_BODY" "$VOLUME_ID" "$DIR/fleet.db" "$VM_ID" "$FORK_CHILD_ID" <<'PY'
+import json,sqlite3,sys
+with open(sys.argv[1], encoding="utf-8") as response:
+    body=json.load(response)
+assert "explicit provider clone policy" in body.get("error", ""), body
+assert sys.argv[2] not in json.dumps(body), body
+with sqlite3.connect(sys.argv[3]) as db:
+    snapshots=db.execute("select count(*) from snapshots where vm_id=?", (sys.argv[4],)).fetchone()[0]
+    artifacts=db.execute("select count(*) from artifacts where source_vm_id=?", (sys.argv[4],)).fetchone()[0]
+    operations=db.execute("select count(*) from fork_operations where child_vm_id=?", (sys.argv[5],)).fetchone()[0]
+assert (snapshots, artifacts, operations) == (0, 0, 0), (snapshots, artifacts, operations)
+PY
+expect_exec "$VM_ID" "test -b /dev/vdb && echo SOURCE_STILL_RUNNING" SOURCE_STILL_RUNNING
 
 VMM_PIDS=$(vmm_pids_for_id "$VM_ID")
 [ "$(printf '%s\n' "$VMM_PIDS" | sed '/^$/d' | wc -l)" -eq 1 ] || {
@@ -381,4 +439,4 @@ if command -v systemctl >/dev/null && systemctl list-unit-files postgresql.servi
   systemctl is-active --quiet postgresql || { echo "FAIL: PostgreSQL is unhealthy" >&2; exit 1; }
 fi
 
-echo "VOLUME_E2E_PASS provider=$VOLUME_PROVIDER guest_mode=$GUEST_VOLUME_MODE vm_id=$VM_ID volume_id=$VOLUME_ID http_resume_ms=$((RESUME_END-RESUME_START)) credentials_in_guest=0"
+echo "VOLUME_E2E_PASS provider=$VOLUME_PROVIDER guest_mode=$GUEST_VOLUME_MODE kernel=$GUEST_KERNEL_RELEASE os=$EXPECTED_OS_ID vm_id=$VM_ID volume_id=$VOLUME_ID http_resume_ms=$((RESUME_END-RESUME_START)) credentials_in_guest=0 snapshot_fork_preflight=pass"

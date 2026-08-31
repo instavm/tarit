@@ -2621,12 +2621,13 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     // Scale-to-zero removes the supervisor gate, but not the VM. Check the
     // durable status before looking up a live-runtime gate so callers receive
     // a lifecycle conflict for hibernated VMs rather than a false 404.
-    ensure_vm_status(
+    let vm = ensure_vm_status(
         state,
         id,
         "snapshot",
         &[VmStatus::Running, VmStatus::Paused],
     )?;
+    ensure_no_persistent_volume_attachments(state, vm.owner_key.as_deref(), id, "snapshot").await?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     Ok(snapshot_local_locked(state, id, diff, None, None)
@@ -2664,10 +2665,47 @@ pub async fn snapshot_local_for_fork(
             live_stats: None,
         });
     }
-    ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
+    let source = ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
+    ensure_no_persistent_volume_attachments(
+        state,
+        source.owner_key.as_deref(),
+        source_id,
+        "live fork",
+    )
+    .await?;
     let gate = state.supervisor.operation_gate(source_id)?;
     let _operation = gate.lock_owned().await;
     snapshot_local_locked(state, source_id, false, Some(child_id), Some(child_id)).await
+}
+
+pub(crate) async fn ensure_no_persistent_volume_attachments(
+    state: &AppState,
+    owner_key: Option<&str>,
+    vm_id: Uuid,
+    operation: &str,
+) -> Result<(), OrchError> {
+    let Some(owner_key) = owner_key else {
+        return Ok(());
+    };
+    let attachments = if let Some(fleet) = &state.fleet {
+        fleet
+            .list_vm_volume_attachments(owner_key, vm_id)
+            .await
+            .map_err(crate::api::volume_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .list_vm_volume_attachments(owner_key, vm_id)
+            .map_err(crate::api::store_err)?
+    };
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    Err(OrchError::Unprocessable(format!(
+        "cannot {operation} a VM with attached persistent data volumes; an explicit provider clone policy is required"
+    )))
 }
 
 pub fn bind_localized_snapshot_to_fork(
