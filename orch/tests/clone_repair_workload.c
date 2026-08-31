@@ -3,12 +3,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#ifndef __linux__
 #include <sched.h>
+#endif
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <sys/inotify.h>
+#endif
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -23,7 +28,9 @@
 #define SECRET_BYTES 32U
 #define PREFIX_BYTES 16U
 #define MAX_REQUEST 256U
+#ifndef __linux__
 #define REPAIR_WAIT_ITERATIONS 1000000U
+#endif
 
 struct workload_state {
     unsigned char prng_state[SECRET_BYTES];
@@ -278,6 +285,17 @@ static int write_pid(void) {
     return result;
 }
 
+static int repair_marker_matches(const char *expected_clone_id) {
+    char repaired[33];
+    int fd = open(REPAIRED_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return 0;
+    ssize_t length = read(fd, repaired, sizeof(repaired));
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return length >= 32 && memcmp(repaired, expected_clone_id, 32) == 0;
+}
+
 static int signal_and_wait_for_repair(const char *expected_clone_id) {
     char value[32];
     char *end = NULL;
@@ -292,22 +310,45 @@ static int signal_and_wait_for_repair(const char *expected_clone_id) {
     errno = 0;
     long parsed = strtol(value, &end, 10);
     if (errno != 0 || end == value || parsed <= 1 || parsed > INT32_MAX) return -1;
-    if (kill((pid_t)parsed, SIGHUP) < 0) return -1;
 
-    for (unsigned int attempt = 0; attempt < REPAIR_WAIT_ITERATIONS; attempt++) {
-        char repaired[33];
-        fd = open(REPAIRED_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (fd >= 0) {
-            length = read(fd, repaired, sizeof(repaired));
-            close(fd);
-            if (length >= 32 && memcmp(repaired, expected_clone_id, 32) == 0) {
-                return 0;
-            }
+#ifdef __linux__
+    int notify_fd = inotify_init1(IN_CLOEXEC);
+    if (notify_fd < 0) return -1;
+    int watch = inotify_add_watch(notify_fd, "/run/tarit", IN_CLOSE_WRITE | IN_MOVED_TO);
+    if (watch < 0 || kill((pid_t)parsed, SIGHUP) < 0) {
+        int error = errno;
+        close(notify_fd);
+        errno = error;
+        return -1;
+    }
+
+    for (;;) {
+        if (repair_marker_matches(expected_clone_id)) {
+            close(notify_fd);
+            return 0;
         }
+        union {
+            struct inotify_event alignment;
+            unsigned char bytes[4096];
+        } events;
+        ssize_t received = read(notify_fd, events.bytes, sizeof(events.bytes));
+        if (received < 0 && errno == EINTR) continue;
+        if (received <= 0) {
+            int error = received == 0 ? EIO : errno;
+            close(notify_fd);
+            errno = error;
+            return -1;
+        }
+    }
+#else
+    if (kill((pid_t)parsed, SIGHUP) < 0) return -1;
+    for (unsigned int attempt = 0; attempt < REPAIR_WAIT_ITERATIONS; attempt++) {
+        if (repair_marker_matches(expected_clone_id)) return 0;
         (void)sched_yield();
     }
     errno = ETIMEDOUT;
     return -1;
+#endif
 }
 
 static int serve(void) {
