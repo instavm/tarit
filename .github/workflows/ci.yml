@@ -13,6 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  musl:
+    name: check attached volumes (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Check attached volume portability
+        working-directory: orch
+        run: cargo check --locked --target x86_64-unknown-linux-musl -p tarit-volume
+
   sdk:
     name: generate / type-check / test (SDKs)
     runs-on: ubuntu-latest
