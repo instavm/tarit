@@ -262,17 +262,22 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         token = uuid.uuid4().hex
         monotonic_marker = f"/tmp/tarit-sibling-monotonic-{token}"
         realtime_marker = f"/tmp/tarit-sibling-realtime-{token}"
+        monotonic_pidfile = f"{monotonic_marker}.pid"
+        realtime_pidfile = f"{realtime_marker}.pid"
         before_workload = self.workload_state(vm_id)
         before = self.exec(
             vm_id,
-            f"set -eu; rm -f {monotonic_marker} {realtime_marker}; "
+            f"set -eu; rm -f {monotonic_marker} {realtime_marker} "
+            f"{monotonic_pidfile} {realtime_pidfile}; "
             "read uptime rest < /proc/uptime; "
             f"busybox setsid sh -c 'sleep {timer_seconds}; printf fired > "
             f"{monotonic_marker}' </dev/null >/tmp/tarit-sibling-monotonic.log 2>&1 & "
+            f"printf '%s\n' \"$!\" > {monotonic_pidfile}; "
             f"deadline=$(($(date +%s) + {timer_seconds})); "
             "busybox setsid sh -c '/usr/local/bin/tarit-clone-repair-workload "
             f"wait-realtime \"$1\" && printf fired > {realtime_marker}' "
             "sh \"$deadline\" </dev/null >/tmp/tarit-sibling-realtime.log 2>&1 & "
+            f"printf '%s\n' \"$!\" > {realtime_pidfile}; "
             "printf '%s %s %s\n' \"$uptime\" \"$(date +%s)\" \"$deadline\"",
         ).split()
         assert len(before) == 3, before
@@ -325,6 +330,28 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
                 )
             )
 
+        def timer_process_state(timer_vm_id: str) -> str:
+            return self.exec(
+                timer_vm_id,
+                "set -u; "
+                f"for spec in monotonic:{monotonic_pidfile} "
+                f"realtime:{realtime_pidfile}; do "
+                "name=${spec%%:*}; pidfile=${spec#*:}; "
+                "if test ! -s \"$pidfile\"; then "
+                "printf '%s pidfile=missing\\n' \"$name\"; continue; fi; "
+                "pid=$(cat \"$pidfile\"); "
+                "if test -r \"/proc/$pid/stat\"; then "
+                "state=$(awk '{print $3}' \"/proc/$pid/stat\"); "
+                "wchan=$(cat \"/proc/$pid/wchan\" 2>/dev/null || printf unknown); "
+                "printf '%s pid=%s alive=yes state=%s wchan=%s\\n' "
+                "\"$name\" \"$pid\" \"$state\" \"$wchan\"; "
+                "else printf '%s pid=%s alive=no\\n' \"$name\" \"$pid\"; fi; done; "
+                "printf '%s\\n' monotonic-log-begin; "
+                "tail -n 20 /tmp/tarit-sibling-monotonic.log 2>/dev/null || true; "
+                "printf '%s\\n' realtime-log-begin; "
+                "tail -n 20 /tmp/tarit-sibling-realtime.log 2>/dev/null || true",
+            )
+
         for timer_vm_id in vm_ids:
             state = read_timer_state(timer_vm_id)
             assert state["mono"] == "pending" and state["real"] == "pending", (
@@ -332,6 +359,8 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             )
             assert abs(int(state["realtime"]) - int(time.time())) <= 3, state
             assert float(state["uptime"]) >= uptime_before, state
+            processes = timer_process_state(timer_vm_id)
+            assert processes.count("alive=yes") == 2, (timer_vm_id, processes)
 
         sleep_until = started + timer_seconds - 2
         if sleep_until > time.monotonic():
@@ -349,7 +378,25 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             if all(len(value) == 2 for value in fired.values()):
                 break
             time.sleep(0.1)
-        assert all(len(value) == 2 for value in fired.values()), fired
+        if not all(len(value) == 2 for value in fired.values()):
+            diagnostics = {
+                timer_vm_id: {
+                    "timers": fired[timer_vm_id],
+                    "state": read_timer_state(timer_vm_id),
+                    "processes": timer_process_state(timer_vm_id),
+                }
+                for timer_vm_id in vm_ids
+            }
+            self.event(
+                "sibling_fork_timer_failure",
+                source=vm_id,
+                children=children,
+                fork_ready_seconds={
+                    key: round(value, 3) for key, value in fork_ready.items()
+                },
+                diagnostics=diagnostics,
+            )
+            raise AssertionError(diagnostics)
 
         for timer_vm_id in vm_ids:
             assert fired[timer_vm_id]["realtime"] >= timer_seconds - 2, fired

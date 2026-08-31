@@ -3,13 +3,15 @@ Description=Tarit mixed-OCI lifecycle qualification soak
 After=local-fs.target
 ConditionPathIsDirectory=/home/ubuntu/tarit-c8i
 ConditionPathIsMountPoint=/t
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 EnvironmentFile=/etc/tarit/continuous-soak.env
 WorkingDirectory=/home/ubuntu/tarit-c8i
 ExecStart=/home/ubuntu/tarit-c8i/orch/tests/continuous_mixed_oci_soak.sh
-Restart=no
+Restart=on-failure
+RestartSec=30
 KillMode=mixed
 TimeoutStopSec=90
 UMask=0077

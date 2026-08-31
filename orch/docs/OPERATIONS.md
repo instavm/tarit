@@ -373,14 +373,18 @@ identity before stopping a prior run.
 `tests/continuous_mixed_oci_soak.sh` runs one bounded epoch at a time while
 keeping three guest workloads active. It rotates entries from a case file with
 the format `name|kernel|rootfs`, writes per-operation JSONL logs, keeps at most
-one snapshot per epoch, checks a configurable free-space floor, and stops on the
-first failure. `tests/tarit-continuous-soak.service` is the c8i systemd unit.
+one snapshot per epoch, and checks a configurable free-space floor.
+`tests/tarit-continuous-soak.service` is the c8i systemd unit. It archives a
+failed epoch and restarts after 30 seconds so an isolated failure does not stop
+subsequent qualification. Repeated failures remain visible in
+`failures/index.jsonl`; they are not treated as passing epochs.
 
 Required environment entries are `TARIT_CONTINUOUS_CASES_FILE`,
 `TARITD_BIN`, `TARIT_VMM_BIN`, and `TARIT_TEST_GUEST_AGENT_BIN`. The case file
-and environment file belong under `/etc/tarit` with mode `0600`. The service is
-intentionally not configured to restart after failure; inspect the latest file
-under `/t/tarit-continuous-soak/history` before restarting it.
+and environment file belong under `/etc/tarit` with mode `0600`. The
+`current.jsonl` symlink follows the active or most recently failed epoch;
+`epochs.jsonl` records completed epochs. Failure bundles and their index are
+stored under `/t/tarit-continuous-soak/failures`.
 
 ```sh
 sudo systemctl status tarit-continuous-soak

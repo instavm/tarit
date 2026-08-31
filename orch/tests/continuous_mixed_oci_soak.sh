@@ -74,7 +74,9 @@ while :; do
 
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   seed=$((10#$(date -u +%Y%m%d) + epoch))
-  log="$RUN_ROOT/history/${timestamp}-${name}-seed-${seed}.jsonl"
+  log_ref="history/${timestamp}-${name}-seed-${seed}.jsonl"
+  log="$RUN_ROOT/$log_ref"
+  ln -sfn -- "$log_ref" "$RUN_ROOT/current.jsonl"
   echo "CONTINUOUS_SOAK_EPOCH_START case=$name seed=$seed duration_s=$EPOCH_SECONDS log=$log"
   set +e
   setsid --wait flock -F -w 300 "$LOCK" env \
@@ -100,6 +102,9 @@ while :; do
   epoch_pid=""
   set -e
   if [ "$status" -ne 0 ]; then
+    printf '{"timestamp":"%s","case":"%s","seed":%s,"status":%s,"log":"%s"}\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$seed" "$status" "$log_ref" \
+      >>"$RUN_ROOT/failures/index.jsonl"
     echo "CONTINUOUS_SOAK_FAILED case=$name seed=$seed log=$log" >&2
     tail -240 "$log" >&2
     exit "$status"
@@ -108,6 +113,9 @@ while :; do
     echo "FAIL: soak epoch did not emit its pass record: $log" >&2
     exit 1
   }
+  printf '{"timestamp":"%s","case":"%s","seed":%s,"status":0,"log":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$seed" "$log_ref" \
+    >>"$RUN_ROOT/epochs.jsonl"
   echo "CONTINUOUS_SOAK_EPOCH_PASS case=$name seed=$seed log=$log"
 
   find "$RUN_ROOT/history" -type f -name '*.jsonl' -mtime +14 -delete
