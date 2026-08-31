@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SOCKET_PATH "/run/tarit/clone-workload.sock"
@@ -64,6 +65,27 @@ static int random_bytes(void *buffer, size_t length) {
         }
         cursor += (size_t)received;
         length -= (size_t)received;
+    }
+    return 0;
+}
+
+static int wait_realtime_deadline(const char *encoded_seconds) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long seconds = strtoull(encoded_seconds, &end, 10);
+    time_t converted = (time_t)seconds;
+    if (errno != 0 || end == encoded_seconds || *end != '\0' || converted < 0 ||
+        (unsigned long long)converted != seconds) {
+        errno = ERANGE;
+        return -1;
+    }
+    struct timespec deadline = {.tv_sec = converted, .tv_nsec = 0};
+    int result;
+    while ((result = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &deadline, NULL)) == EINTR) {
+    }
+    if (result != 0) {
+        errno = result;
+        return -1;
     }
     return 0;
 }
@@ -393,6 +415,9 @@ static int client(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "serve") == 0) return serve();
+    if (argc == 3 && strcmp(argv[1], "wait-realtime") == 0) {
+        return wait_realtime_deadline(argv[2]) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && strcmp(argv[1], "repair-signal") == 0) {
         return strlen(argv[2]) == 32 && signal_and_wait_for_repair(argv[2]) == 0
                    ? EXIT_SUCCESS

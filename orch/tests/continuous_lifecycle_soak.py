@@ -189,10 +189,14 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         timer_seconds = self.args.guest_timer_seconds
         before = self.exec(
             vm_id,
-            "set -eu; rm -f /tmp/tarit-timer-fired; "
+            "set -eu; rm -f /tmp/tarit-timer-fired /tmp/tarit-realtime-fired; "
             "read uptime rest < /proc/uptime; "
             f"busybox setsid sh -c 'sleep {timer_seconds}; printf fired > "
             "/tmp/tarit-timer-fired' </dev/null >/tmp/tarit-timer.log 2>&1 & "
+            f"deadline=$(($(date +%s) + {timer_seconds})); "
+            "busybox setsid sh -c '/usr/local/bin/tarit-clone-repair-workload "
+            "wait-realtime \"$1\" && printf fired > /tmp/tarit-realtime-fired' "
+            "sh \"$deadline\" </dev/null >/tmp/tarit-realtime-timer.log 2>&1 & "
             "printf '%s %s\\n' \"$uptime\" \"$(date +%s)\"",
         ).split()
         assert len(before) == 2, before
@@ -220,6 +224,18 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             realtime_before, realtime_after,
         )
 
+        realtime_timer_deadline = time.monotonic() + 2
+        while time.monotonic() < realtime_timer_deadline:
+            if self.exec(
+                vm_id,
+                "if test -e /tmp/tarit-realtime-fired; then echo fired; else echo pending; fi",
+            ) == "fired":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("expired absolute-realtime timer did not fire after repair")
+        realtime_timer_elapsed = time.monotonic() - resume_started
+
         timer_deadline = time.monotonic() + timer_seconds + 15
         while time.monotonic() < timer_deadline:
             if self.exec(vm_id, "if test -e /tmp/tarit-timer-fired; then echo fired; else echo pending; fi") == "fired":
@@ -235,6 +251,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             hold_seconds=round(resume_started - hold_started, 3),
             guest_timer_seconds=timer_seconds,
             timer_after_resume_seconds=round(timer_elapsed, 3),
+            realtime_timer_after_resume_seconds=round(realtime_timer_elapsed, 3),
             guest_uptime_delta_seconds=round(uptime_after - uptime_before, 3),
             guest_realtime_delta_seconds=realtime_after - realtime_before,
             host_realtime_error_seconds=realtime_after - host_realtime,

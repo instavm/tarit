@@ -21,6 +21,7 @@ CASES_FILE="${TARIT_CONTINUOUS_CASES_FILE:-}"
 for required in df flock gcc python3; do
   command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
 done
+command -v setsid >/dev/null || { echo "FAIL: missing setsid" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "FAIL: continuous soak must run as root" >&2; exit 1; }
 test -x "$GUEST_AGENT" || { echo "FAIL: guest agent not executable: $GUEST_AGENT" >&2; exit 1; }
 [[ "$EPOCH_SECONDS" =~ ^[1-9][0-9]*$ ]] && [ "$EPOCH_SECONDS" -ge 60 ] || {
@@ -29,7 +30,7 @@ test -x "$GUEST_AGENT" || { echo "FAIL: guest agent not executable: $GUEST_AGENT
 }
 [[ "$MIN_FREE_BYTES" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid free-space floor" >&2; exit 1; }
 
-mkdir -p -m 0700 "$RUN_ROOT/history" "$RUN_ROOT/build" "$RUN_ROOT/failures"
+install -d -m 0700 "$RUN_ROOT/history" "$RUN_ROOT/build" "$RUN_ROOT/failures"
 WORKLOAD_BIN="$RUN_ROOT/build/clone-repair-workload"
 gcc -std=c11 -O2 -Wall -Wextra -Werror -pedantic -static \
   "$WORKLOAD_SOURCE" -o "$WORKLOAD_BIN.next"
@@ -43,6 +44,20 @@ else
   mapfile -t case_rows < <(printf '%s\n' "$CASES" | sed '/^[[:space:]]*$/d')
 fi
 [ "${#case_rows[@]}" -gt 0 ] || { echo "FAIL: no continuous soak cases" >&2; exit 1; }
+
+epoch_pid=""
+terminate_epoch() {
+  local exit_status=$1
+  trap - INT TERM HUP
+  if [ -n "$epoch_pid" ] && kill -0 "$epoch_pid" 2>/dev/null; then
+    kill -TERM -- "-$epoch_pid" 2>/dev/null || true
+    wait "$epoch_pid" 2>/dev/null || true
+  fi
+  exit "$exit_status"
+}
+trap 'terminate_epoch 130' INT
+trap 'terminate_epoch 0' TERM
+trap 'terminate_epoch 129' HUP
 
 epoch=0
 while :; do
@@ -61,7 +76,8 @@ while :; do
   seed=$((10#$(date -u +%Y%m%d) + epoch))
   log="$RUN_ROOT/history/${timestamp}-${name}-seed-${seed}.jsonl"
   echo "CONTINUOUS_SOAK_EPOCH_START case=$name seed=$seed duration_s=$EPOCH_SECONDS log=$log"
-  if ! flock -w 300 "$LOCK" env \
+  set +e
+  setsid --wait flock -F -w 300 "$LOCK" env \
     ROOT="$ROOT" \
     TARITD_BIN="$TARITD" \
     TARIT_VMM_BIN="$VMM" \
@@ -77,10 +93,16 @@ while :; do
     TARIT_LIFECYCLE_MAX_SNAPSHOTS=1 \
     TARIT_E2E_KEEP_FAILED=0 \
     TARIT_E2E_FAILURE_ARCHIVE_ROOT="$RUN_ROOT/failures" \
-    "$STATE_GATE" >"$log" 2>&1; then
+    "$STATE_GATE" >"$log" 2>&1 &
+  epoch_pid=$!
+  wait "$epoch_pid"
+  status=$?
+  epoch_pid=""
+  set -e
+  if [ "$status" -ne 0 ]; then
     echo "CONTINUOUS_SOAK_FAILED case=$name seed=$seed log=$log" >&2
     tail -240 "$log" >&2
-    exit 1
+    exit "$status"
   fi
   grep -q '"event": "soak_pass"' "$log" || {
     echo "FAIL: soak epoch did not emit its pass record: $log" >&2

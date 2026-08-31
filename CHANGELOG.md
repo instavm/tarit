@@ -25,6 +25,8 @@ versions may contain breaking changes.
 - Snapshot restore now repairs guest realtime inside the mandatory
   pre-admission barrier while leaving monotonic timers independent of the host
   hibernation interval.
+- Continuous lifecycle shutdown now waits for the active epoch to remove its
+  process tree, mounts, and runtime storage before the service exits.
 
 ## [0.1.2] - 2026-08-07
 

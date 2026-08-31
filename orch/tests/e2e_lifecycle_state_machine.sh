@@ -117,6 +117,10 @@ ROOTFS="$STAGED_ROOTFS"
 
 cleanup() {
   local status=$?
+  local diagnostic_failure=1
+  case "$status" in
+    129|130|143) diagnostic_failure=0 ;;
+  esac
   if [ -n "$ROOTFS_MOUNT" ] && mountpoint -q "$ROOTFS_MOUNT"; then
     umount "$ROOTFS_MOUNT" || true
   fi
@@ -129,13 +133,14 @@ cleanup() {
     kill -KILL -- "-$TARITD_PGID" 2>/dev/null || true
   fi
   [ -z "$TARITD_PID" ] || wait "$TARITD_PID" 2>/dev/null || true
-  if [ "$status" -ne 0 ]; then
+  if [ "$status" -ne 0 ] && [ "$diagnostic_failure" -eq 1 ]; then
     echo "FAIL: lifecycle state-machine gate exited $status" >&2
     tail -240 "$DIR/taritd.log" 2>/dev/null || true
   fi
-  if [ "$status" -ne 0 ] && [ -n "${TARIT_E2E_FAILURE_ARCHIVE_ROOT:-}" ]; then
+  if [ "$status" -ne 0 ] && [ "$diagnostic_failure" -eq 1 ] && \
+     [ -n "${TARIT_E2E_FAILURE_ARCHIVE_ROOT:-}" ]; then
     archive="$TARIT_E2E_FAILURE_ARCHIVE_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$DIR")"
-    if mkdir -p -m 0700 "$archive"; then
+    if install -d -m 0700 "$archive"; then
       for artifact in taritd.log fleet.db fleet.db-wal fleet.db-shm; do
         [ ! -f "$DIR/$artifact" ] || cp --preserve=timestamps -- \
           "$DIR/$artifact" "$archive/$artifact" || true
@@ -145,10 +150,14 @@ cleanup() {
       echo "FAIL: unable to create compact diagnostic archive: $archive" >&2
     fi
   fi
-  if [ "$status" -ne 0 ] && [ "${TARIT_E2E_KEEP_FAILED:-0}" = 1 ]; then
+  if [ "$status" -ne 0 ] && [ "$diagnostic_failure" -eq 1 ] && \
+     [ "${TARIT_E2E_KEEP_FAILED:-0}" = 1 ]; then
     echo "FAIL: retained diagnostic directory: $DIR" >&2
   else
-    find "$DIR" -depth -delete 2>/dev/null || true
+    if ! find "$DIR" -depth -delete || [ -e "$DIR" ]; then
+      echo "FAIL: lifecycle cleanup could not remove runtime directory: $DIR" >&2
+      [ "$status" -ne 0 ] || status=1
+    fi
   fi
   mount_target=$(findmnt -n -o TARGET -T "$SOCKET_ROOT" 2>/dev/null || true)
   if [ -n "$mount_target" ] && command -v fstrim >/dev/null 2>&1; then

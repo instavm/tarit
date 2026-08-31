@@ -957,8 +957,9 @@ passing focused gate does not waive an item in the final column.
   enforces a 3 GiB free-space floor both before and during each epoch, records
   JSONL history for 14 days, and stops on the first failure so evidence is not
   overwritten. Failure handling archives the database and service log, removes
-  the multi-gigabyte runtime tree, and trims the CoW filesystem. Service stops
-  signal the complete process group and allow 90 seconds for cleanup. Before
+  the multi-gigabyte runtime tree, and trims the CoW filesystem. The supervisor
+  owns each epoch's process group, forwards shutdown to that group, waits for
+  cleanup, and gives the process tree 90 seconds before forced termination. Before
   installation, Alpine/Linux 5.10 runs passed 225 and 278 API operations with
   three guests older than 120 seconds, and Ubuntu/Linux 6.6 runs passed 261 and
   217 operations with three guests older than 122 seconds. Earlier qualification
@@ -972,19 +973,23 @@ passing focused gate does not waive an item in the final column.
   guest realtime remaining 16 seconds behind the host after a 12-second
   hibernation while an inherited monotonic timer correctly remained pending.
   Clone-repair protocol v3 now repairs realtime inside the guest before
-  admission without enabling KVM realtime advancement. Ubuntu/Linux 6.6 and
-  Alpine/Linux 5.10 matched host realtime exactly, advanced guest uptime by
-  only 1.48 and 1.37 seconds, fired the inherited five-second timer 4.64 and
-  4.83 seconds after resume, and completed 164 and 154 operations without a
-  watchdog, lockup, panic, kernel BUG signature, or leak. Each continuous epoch
+  admission without enabling KVM realtime advancement. The gate exercises both
+  an inherited monotonic timer and an absolute-realtime deadline that expires
+  while the VM is hibernated. Ubuntu/Linux 6.6 and Alpine/Linux 5.10 matched host
+  realtime exactly, advanced guest uptime by only 1.54 and 1.38 seconds,
+  delivered the expired absolute timer 1.038 and 0.997 seconds after resume,
+  fired the inherited five-second timer after 4.573 and 4.775 seconds, and
+  completed 130 and 153 operations without a watchdog, lockup, panic, kernel
+  BUG signature, or leak. Each continuous epoch
   now includes a 65-second hibernation hold; the first supervised lane matched
   host realtime exactly, advanced guest uptime by 2.15 seconds, and delivered
   the inherited timer 4.07 seconds after resume. A forced in-epoch capacity-floor
   test stopped after 54 operations, archived a 335 KiB database and 82 KiB
   service log, and
   left no candidate process, mount, or runtime directory. A separate supervised
-  stop after 90 operations produced the same clean result and restored 11 GiB
-  free on the 12 GiB fixture. The service is enabled and running; completion of
+  stop during a 65-second hibernation produced the same clean result, returned
+  a successful service status, and restored 11 GiB free on the 12 GiB fixture.
+  The service is enabled and running; completion of
   the full four-case rotation remains a release gate.
 - A bounded runtime-crash gate now covers fresh digest-pinned Ubuntu 24.04 and
   Alpine 3.20 OCI guests on Linux 6.6 and 5.10. It kills taritd without a drain,
