@@ -13,6 +13,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  oss-boundary:
+    name: standalone dependency boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Reject product-specific and out-of-tree dependencies
+        run: |
+          python3 scripts/check_oss_boundary.py
+          python3 -m unittest test/test_oss_boundary.py -v
+
   musl:
     name: build release targets (musl)
     runs-on: ubuntu-latest
