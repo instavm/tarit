@@ -191,10 +191,11 @@ fn storage_quiescence_timeout_fails_snapshot_and_resumes_source() {
         "source-resumed\n",
         "snapshot failure left the source vCPU paused"
     );
-    let writer_result = writer.join().expect("join delayed writer");
-    if let Ok((code, stdout, stderr, _)) = writer_result {
-        assert_eq!(code, 0, "delayed writer failed: {stderr}");
-        assert_eq!(stdout, "delayed-write");
-    }
+    let (code, stdout, stderr, _) = writer
+        .join()
+        .expect("join delayed writer")
+        .expect("delayed writer exec");
+    assert_eq!(code, 0, "delayed writer failed: {stderr}");
+    assert_eq!(stdout, "delayed-write");
     controller.stop().expect("stop VM after quiescence timeout");
 }

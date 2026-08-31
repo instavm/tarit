@@ -63,9 +63,11 @@ impl BlkIoLoop {
                 ));
             }
             if std::time::Instant::now() >= deadline {
+                // A slow backing operation can legitimately outlive the
+                // snapshot quiescence budget. Abort this capture boundary,
+                // but leave the healthy worker and its in-flight descriptor
+                // intact so the running source can finish the request.
                 self.pause_req.store(false, Ordering::SeqCst);
-                self.device
-                    .fail_worker("block I/O worker quiescence timed out");
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "block I/O worker quiescence timed out",
