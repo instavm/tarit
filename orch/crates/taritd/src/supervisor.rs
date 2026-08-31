@@ -3603,7 +3603,7 @@ impl VmmSupervisor {
     ) {
         enum Location {
             Running(RunningVm),
-            Warm(RunningVm),
+            Warm(WarmVm),
         }
 
         // A completed live operation persists its state before releasing this
@@ -3628,7 +3628,7 @@ impl VmmSupervisor {
                     warm.iter()
                         .position(|vm| vm.id == id && vm.vm.pid == pid)
                         .and_then(|index| warm.remove(index))
-                        .map(|vm| Location::Warm(vm.vm))
+                        .map(Location::Warm)
                 })
             });
         drop(gate);
@@ -3637,14 +3637,53 @@ impl VmmSupervisor {
             // Expected teardown removed ownership before signalling the child.
             return;
         };
-        let (vm, user_vm) = match location {
-            Location::Running(vm) => (vm, true),
-            Location::Warm(vm) => (vm, false),
+        let cleanup = match &location {
+            Location::Running(vm) => self.teardown_vm(id, vm),
+            Location::Warm(warm) => self.teardown_vm(id, &warm.vm),
         };
-        let cleanup_error = self.teardown_vm(id, &vm).err().map(|error| {
-            tracing::error!(vm = %id, pid, %error, "unexpected VMM exit cleanup incomplete");
-            error.to_string()
-        });
+        if let Err(error) = cleanup {
+            // Teardown deliberately leaves every runtime object owned until
+            // process exit is confirmed. Restore the same process handle to
+            // the scanner so reconciliation retries instead of releasing its
+            // reservation or allowing the VM id/resources to be reused.
+            let _gate = self.boot_gate.blocking_lock();
+            match location {
+                Location::Running(vm) => {
+                    let mut running = match self.running.lock() {
+                        Ok(running) => running,
+                        Err(_) => {
+                            tracing::error!(vm = %id, pid, %error,
+                                "unexpected VMM exit cleanup failed and running ownership could not be restored");
+                            return;
+                        }
+                    };
+                    if running.insert(id, vm).is_some() {
+                        tracing::error!(vm = %id, pid,
+                            "unexpected VMM exit cleanup retry collided with a running VM identity");
+                    }
+                }
+                Location::Warm(warm_vm) => {
+                    let mut warm = match self.warm.lock() {
+                        Ok(warm) => warm,
+                        Err(_) => {
+                            tracing::error!(vm = %id, pid, %error,
+                                "warm VMM exit cleanup failed and ownership could not be restored");
+                            return;
+                        }
+                    };
+                    if warm.iter().any(|candidate| candidate.id == id) {
+                        tracing::error!(vm = %id, pid,
+                            "warm VMM exit cleanup retry collided with an existing VM identity");
+                    } else {
+                        warm.push_back(warm_vm);
+                    }
+                }
+            }
+            tracing::error!(vm = %id, pid, %error,
+                "unexpected VMM exit cleanup retained resources for retry");
+            return;
+        }
+        let user_vm = matches!(location, Location::Running(_));
         self.release_reservation_after_cleanup(id);
         if user_vm {
             tracing::error!(vm = %id, pid, %status, "VMM exited unexpectedly");
@@ -3653,7 +3692,7 @@ impl VmmSupervisor {
                     id,
                     pid,
                     status: status.to_string(),
-                    cleanup_error,
+                    cleanup_error: None,
                 });
             }
         } else {
@@ -10217,6 +10256,68 @@ mod tests {
             .expect("lock retained warm pool for cleanup")
             .pop_front()
             .expect("remove retained warm VM");
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+        }
+        drop(retained);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unexpected_exit_retains_running_vm_until_cleanup_is_confirmed() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "tarit-exit-retain-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let id = Uuid::new_v4();
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn running test VMM process");
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(child));
+        let poisoned_child = Arc::clone(&child);
+        let poison = std::thread::spawn(move || {
+            let _guard = poisoned_child.lock().expect("lock child before poisoning");
+            panic!("poison child lock to simulate unconfirmed exit cleanup");
+        });
+        assert!(poison.join().is_err());
+
+        let process = ManagedProcess {
+            pid,
+            handle: ProcessHandle::Owned(child),
+        };
+        let vm = RunningVm::new(pid, root.join("vmm.sock"), process, None);
+        let operation_gate = Arc::clone(&vm.operation_gate);
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+        supervisor
+            .running
+            .lock()
+            .expect("lock running VMs")
+            .insert(id, vm);
+
+        supervisor.reconcile_process_exit(id, pid, "injected exit", operation_gate);
+
+        let retained = supervisor.running.lock().expect("lock retained running VM");
+        assert_eq!(retained.get(&id).map(|vm| vm.pid), Some(pid));
+        drop(retained);
+        assert!(
+            supervisor
+                .unexpected_exits
+                .lock()
+                .expect("lock unexpected exits")
+                .is_empty(),
+            "terminal exit must not publish before runtime cleanup succeeds"
+        );
+
+        let retained = supervisor
+            .running
+            .lock()
+            .expect("lock retained running VM for cleanup")
+            .remove(&id)
+            .expect("remove retained running VM");
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
             libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
