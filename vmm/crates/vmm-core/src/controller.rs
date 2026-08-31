@@ -410,9 +410,9 @@ impl VmmController {
         feature = "test-failpoints"
     ))]
     pub fn test_vcpu_pause_round_trip(&self) -> Result<()> {
-        let slot = self.lock();
+        let mut slot = self.lock();
         let vm = slot
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no running VM".into()))?;
         if pause_running_vcpus(vm)? {
             resume_running_vcpus(vm)?;
