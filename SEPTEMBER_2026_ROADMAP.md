@@ -1064,6 +1064,16 @@ passing focused gate does not waive an item in the final column.
   provider case cannot satisfy it.
   Real AWS EFS and Azure Files qualification, physical multi-host outage tests,
   and backend-native volume snapshot/clone support remain open.
+- Live snapshot state capture and restore now fail closed on malformed or
+  incomplete BSP, AP, VM, block, net, vsock, or balloon state. A c8i gate
+  corrupted the serialized state while retaining a valid outer checksum,
+  required rejection before VM publication, and then restored the untouched
+  snapshot lazily. One-vCPU live snapshots passed on Ubuntu 24.04/Linux 6.6 and
+  Alpine 3.20/Linux 5.10. A separate paused two-vCPU restore gate found that
+  applying MSRs before LAPIC state could leave the secondary CPU's
+  TSC-deadline timer stalled; restoring LAPIC before MSRs fixed it, with CPU1
+  jiffies advancing from 6 to 676 on Ubuntu and from 6 to 1,539 on Alpine.
+  Live snapshots with more than one vCPU are still rejected and remain open.
 - The current c8i storage audit does not show the assumed 200 GiB device. It
   exposes one 50 GiB EBS NVMe disk with a 49 GiB root partition and no second
   NVMe block device; `/t` is a 12 GiB Btrfs loop image backed by

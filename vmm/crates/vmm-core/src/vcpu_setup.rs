@@ -1202,21 +1202,27 @@ pub fn capture_vcpu_full_state(vcpu: &VcpuFd) -> Result<VcpuFullState> {
 
 /// Re-apply a captured vCPU state. Call after KVM_SET_CPUID2 on a fresh vCPU.
 pub fn restore_vcpu_full_state(vcpu: &VcpuFd, s: &VcpuFullState) -> Result<()> {
-    vcpu.set_sregs(&s.sregs)
-        .map_err(|e| VmmError::Kvm(format!("KVM_SET_SREGS: {e}")))?;
+    // KVM restore order is significant:
+    // - MP state depends on which vCPU KVM recognizes as the BSP.
+    // - SET_SREGS restores APIC_BASE, so it must precede SET_LAPIC.
+    // - SET_LAPIC must precede the TSC-deadline MSR or restored local timers
+    //   can remain disarmed even though the vCPU continues executing.
+    // - SET_REGS clears pending exceptions, so vCPU events are restored last.
+    vcpu.set_mp_state(s.mp_state)
+        .map_err(|e| VmmError::Kvm(format!("KVM_SET_MP_STATE: {e}")))?;
     vcpu.set_regs(&s.regs)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_REGS: {e}")))?;
+    vcpu.set_sregs(&s.sregs)
+        .map_err(|e| VmmError::Kvm(format!("KVM_SET_SREGS: {e}")))?;
     vcpu.set_xsave(&s.xsave)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_XSAVE: {e}")))?;
     vcpu.set_xcrs(&s.xcrs)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_XCRS: {e}")))?;
-    restore_msrs(vcpu, &s.msrs)?;
     vcpu.set_lapic(&s.lapic)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_LAPIC: {e}")))?;
+    restore_msrs(vcpu, &s.msrs)?;
     vcpu.set_vcpu_events(&s.vcpu_events)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_VCPU_EVENTS: {e}")))?;
-    vcpu.set_mp_state(s.mp_state)
-        .map_err(|e| VmmError::Kvm(format!("KVM_SET_MP_STATE: {e}")))?;
     Ok(())
 }
 

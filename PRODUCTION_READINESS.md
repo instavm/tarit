@@ -110,6 +110,8 @@ regression gates, but the following unresolved items now block release:
 2. Pass the remaining phase-by-phase kill, cancellation, dirty-rate
    non-convergence, corruption, and near-ENOSPC rollback tests without source
    pause leaks, duplicate writers, terminal-ID resurrection, or staged files.
+   Live snapshots with more than one vCPU are currently rejected; implement and
+   qualify an atomic all-vCPU live cut before advertising live SMP fork.
    Unexpected UFFD handler exit, descriptor loss, UNMAP, and REMAP now fail the
    VMM closed and preserve retryable hibernated state. The fixed vCPU MSR
    omission is repaired, but the dynamic KVM custom-MSR set still needs the

@@ -1102,7 +1102,6 @@ impl VmmController {
                     live_overlay = Some(capture_live_overlay(Path::new(source))?);
                 }
                 capture_live_state_blob(&running, &base_blob)
-                    .map(|captured| captured.unwrap_or_else(|| base_blob.clone()))
             },
         );
 
@@ -1429,22 +1428,17 @@ impl VmmController {
         // Deserialize the state blob (shared owned `StateBlob`) to recover the
         // kernel path/cmdline/vcpus, the attached volumes/net, and any captured
         // vCPU state for a faithful resume.
-        let (mut saved, balloon_state) = decode_state_blob(&state_blob)
-            .map(|(saved, balloon)| (Some(saved), balloon))
-            .unwrap_or((None, None));
+        let (mut saved, balloon_state) = decode_state_blob(&state_blob).ok_or_else(|| {
+            VmmError::Snapshot("snapshot state blob is malformed or unsupported".into())
+        })?;
 
-        let (kernel_path, cmdline, vcpus, volumes, net) = saved
-            .as_ref()
-            .map(|s| {
-                (
-                    s.kernel_path.clone(),
-                    s.cmdline.clone(),
-                    s.vcpus,
-                    s.volumes.clone(),
-                    s.net.clone(),
-                )
-            })
-            .unwrap_or_else(|| (String::new(), String::new(), 1, vec![], vec![]));
+        let (kernel_path, cmdline, vcpus, volumes, net) = (
+            saved.kernel_path.clone(),
+            saved.cmdline.clone(),
+            saved.vcpus,
+            saved.volumes.clone(),
+            saved.net.clone(),
+        );
         let vcpus = u8::try_from(vcpus).map_err(|_| {
             VmmError::InvalidConfig(format!("snapshot vcpu count too large: {vcpus}"))
         })?;
@@ -1453,38 +1447,40 @@ impl VmmController {
         // snapshot). With the full state we can reconstruct a *running* VM that
         // resumes exactly where it paused; without it we restore a paused,
         // memory-only image (the fast-boot / exec-via-fresh-boot fallback).
-        let entry = saved.as_ref().map(|s| s.entry).unwrap_or(0);
-        let vcpu_full: Option<crate::vcpu_setup::VcpuFullState> = saved
-            .as_ref()
-            .and_then(|s| s.vcpu_full.as_ref())
-            .and_then(|bytes| postcard::from_bytes(bytes).ok());
-        let vm_full: Option<crate::kvm::VmFullState> = saved
-            .as_ref()
-            .and_then(|s| s.vm_full.as_ref())
-            .and_then(|bytes| postcard::from_bytes(bytes).ok());
+        let entry = saved.entry;
+        let vcpu_full: Option<crate::vcpu_setup::VcpuFullState> =
+            decode_snapshot_component(saved.vcpu_full.as_deref(), "BSP vCPU")?;
+        let vm_full: Option<crate::kvm::VmFullState> =
+            decode_snapshot_component(saved.vm_full.as_deref(), "VM")?;
         // AP vCPU states (SMP restore, phase B). Each entry is a postcard
         // VcpuFullState for AP id 1..N; empty for a uniprocessor snapshot.
         let ap_states: Vec<crate::vcpu_setup::VcpuFullState> = saved
-            .as_ref()
-            .map(|s| {
-                s.vcpu_full_aps
-                    .iter()
-                    .filter_map(|bytes| postcard::from_bytes(bytes).ok())
-                    .collect()
+            .vcpu_full_aps
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                postcard::from_bytes(bytes).map_err(|error| {
+                    VmmError::Snapshot(format!(
+                        "snapshot AP vCPU {} state is malformed: {error}",
+                        index + 1
+                    ))
+                })
             })
-            .unwrap_or_default();
+            .collect::<Result<_>>()?;
+        validate_restored_runtime_shape(
+            &saved,
+            balloon_state.is_some(),
+            vcpu_full.is_some(),
+            vm_full.is_some(),
+            ap_states.len(),
+            vcpus,
+        )?;
         // UART register programming, so the restored serial re-arms the guest's
         // RX interrupt (post-restore exec fix). Default for pre-serial blobs.
-        let serial_state = saved.as_ref().map(|s| s.serial.clone()).unwrap_or_default();
-        let virtio_blk = saved
-            .as_ref()
-            .map(|s| s.virtio_blk.clone())
-            .unwrap_or_default();
-        let virtio_net = saved
-            .as_ref()
-            .map(|s| s.virtio_net.clone())
-            .unwrap_or_default();
-        let vsock_state = saved.as_ref().and_then(|s| s.vsock.clone());
+        let serial_state = saved.serial.clone();
+        let virtio_blk = saved.virtio_blk.clone();
+        let virtio_net = saved.virtio_net.clone();
+        let vsock_state = saved.vsock.clone();
 
         let mib = usize::try_from(crate::config::MIB).expect("MiB fits in usize");
         let mut config = VmConfig {
@@ -1515,18 +1511,17 @@ impl VmmController {
         // snapshots start from this blob and only patch in live device/vCPU
         // state, so leaving the golden overlay here would make clone snapshots
         // point back at the shared golden upper layer.
-        let state_blob = if let Some(saved) = saved.as_mut() {
-            saved.volumes = config.volumes.clone();
-            saved.net = config.net.clone();
-            encode_state_blob(saved, balloon_state.as_ref()).unwrap_or_else(|_| state_blob.clone())
-        } else {
-            state_blob
-        };
+        saved.volumes = config.volumes.clone();
+        saved.net = config.net.clone();
+        let state_blob = encode_state_blob(&saved, balloon_state.as_ref()).map_err(|error| {
+            VmmError::Snapshot(format!("re-encode restored snapshot state: {error}"))
+        })?;
 
         // With captured vCPU state, rebuild a *running* VM (fresh KVM VM over the
         // restored memory + devices, the vCPU state re-applied, and the vCPU
-        // thread resumed). Fall back to a paused image on any error so restore
-        // never hard-fails.
+        // thread resumed). A live snapshot must fail closed if reconstruction
+        // fails; publishing a paused memory-only VM would hide incompatibility
+        // and expose partially restored state.
         let (running, state) = match vcpu_full.as_ref() {
             Some(fs) => {
                 let restored = RestoredRuntimeState {
@@ -1539,15 +1534,8 @@ impl VmmController {
                     vsock: vsock_state.as_ref(),
                     balloon: balloon_state.as_ref(),
                 };
-                match build_running_vm(mem.clone(), &config, restored, entry) {
-                    Ok(r) => (Some(r), VmState::Running),
-                    Err(e) => {
-                        log::warn!(
-                            "restore: could not reconstruct running VM ({e}); restoring paused"
-                        );
-                        (None, VmState::Paused)
-                    }
-                }
+                let running = build_running_vm(mem.clone(), &config, restored, entry)?;
+                (Some(running), VmState::Running)
             }
             None => (None, VmState::Paused),
         };
@@ -2465,12 +2453,11 @@ fn capture_live_state(vm: &mut VmInstance) -> Result<()> {
     let Some(running) = vm.running.as_ref() else {
         return Ok(());
     };
-    let Some(existing) = vm.state_blob.as_deref() else {
-        return Ok(());
-    };
-    if let Some(blob) = capture_live_state_blob(running, existing)? {
-        vm.state_blob = Some(blob);
-    }
+    let existing = vm
+        .state_blob
+        .as_deref()
+        .ok_or_else(|| VmmError::Snapshot("running VM is missing its base state blob".into()))?;
+    vm.state_blob = Some(capture_live_state_blob(running, existing)?);
     Ok(())
 }
 
@@ -2478,71 +2465,67 @@ fn capture_live_state(vm: &mut VmInstance) -> Result<()> {
 /// into `existing`, returning the updated state blob.
 ///
 /// Call this with every vCPU paused: the returned blob is only coherent with a
-/// memory image taken during the same pause. Returns `None` when the vCPU has
-/// not published any captured state (e.g. a VM that never ran) or when
-/// `existing` is not a parseable state blob, in which case the caller should
-/// keep using `existing` unchanged.
+/// memory image taken during the same pause. Every runtime component is
+/// required: publishing an incomplete live snapshot only defers the failure to
+/// restore time and risks treating partial runtime state as a memory-only VM.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Option<Vec<u8>>> {
-    let Some(captured) = running
+fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Vec<u8>> {
+    let captured = running
         .vcpu_thread
         .captured_state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
-    else {
-        return Ok(None);
-    };
-    let ap_captured: Option<Vec<Vec<u8>>> = {
-        let mut v = Vec::with_capacity(running.ap_threads.len());
-        let mut all = true;
-        for ap in &running.ap_threads {
-            match ap
-                .captured_state
+        .ok_or_else(|| VmmError::Snapshot("live snapshot is missing BSP vCPU state".into()))?;
+    let ap_captured: Vec<Vec<u8>> = running
+        .ap_threads
+        .iter()
+        .enumerate()
+        .map(|(index, ap)| {
+            ap.captured_state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
-            {
-                Some(s) => v.push(s),
-                None => {
-                    all = false;
-                    break;
-                }
-            }
-        }
-        all.then_some(v)
-    };
+                .ok_or_else(|| {
+                    VmmError::Snapshot(format!(
+                        "live snapshot is missing AP vCPU {} state",
+                        index + 1
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
     let vm_state = running
         .kvm_vm
         .capture_vm_state()
-        .ok()
-        .and_then(|s| postcard::to_allocvec(&s).ok());
+        .map_err(|error| VmmError::Snapshot(format!("capture in-kernel VM state: {error}")))?;
+    let vm_state = postcard::to_allocvec(&vm_state)
+        .map_err(|error| VmmError::Snapshot(format!("serialize in-kernel VM state: {error}")))?;
     let serial_state = vmm_devices::persist::Persist::save(&*running.vcpu_thread.serial);
     let virtio_blk = capture_virtio_blk_states(&running.blk_devices)?;
     let virtio_net = capture_virtio_net_states(&running.net_devices)?;
     let balloon = running
         .balloon_device
         .as_ref()
-        .map(|device| vmm_devices::persist::Persist::save(&**device));
-    let vsock_state = running
+        .map(|device| vmm_devices::persist::Persist::save(&**device))
+        .ok_or_else(|| VmmError::Snapshot("live snapshot is missing virtio-balloon".into()))?;
+    let vsock_pump = running
         .vsock_pump
         .as_ref()
-        .map(|p| vmm_devices::persist::Persist::try_save(&*p.device))
-        .transpose()
+        .ok_or_else(|| VmmError::Snapshot("live snapshot is missing virtio-vsock".into()))?;
+    let vsock_state = vmm_devices::persist::Persist::try_save(&*vsock_pump.device)
         .map_err(|error| VmmError::Snapshot(format!("capture virtio-vsock state: {error}")))?;
 
-    let Some((mut b, _previous_balloon)) = decode_state_blob(existing) else {
-        return Ok(None);
-    };
+    let (mut b, _previous_balloon) = decode_state_blob(existing).ok_or_else(|| {
+        VmmError::Snapshot("running VM base state blob is malformed or unsupported".into())
+    })?;
     b.vcpu_full = Some(captured);
-    b.vcpu_full_aps = ap_captured.unwrap_or_default();
-    b.vm_full = vm_state;
+    b.vcpu_full_aps = ap_captured;
+    b.vm_full = Some(vm_state);
     b.serial = serial_state;
     b.virtio_blk = virtio_blk;
     b.virtio_net = virtio_net;
-    b.vsock = vsock_state;
-    encode_state_blob(&b, balloon.as_ref())
-        .map(Some)
+    b.vsock = Some(vsock_state);
+    encode_state_blob(&b, Some(&balloon))
         .map_err(|error| VmmError::Snapshot(format!("serialize live device state: {error}")))
 }
 
@@ -4724,6 +4707,81 @@ pub struct StateBlob {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn decode_snapshot_component<T>(encoded: Option<&[u8]>, name: &str) -> Result<Option<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    encoded
+        .map(|bytes| {
+            postcard::from_bytes(bytes).map(Some).map_err(|error| {
+                VmmError::Snapshot(format!("snapshot {name} state is malformed: {error}"))
+            })
+        })
+        .unwrap_or(Ok(None))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn validate_restored_runtime_shape(
+    saved: &StateBlob,
+    has_balloon: bool,
+    has_vcpu: bool,
+    has_vm: bool,
+    ap_states: usize,
+    vcpus: u8,
+) -> Result<()> {
+    if !has_vcpu {
+        if has_vm
+            || ap_states != 0
+            || !saved.virtio_blk.is_empty()
+            || !saved.virtio_net.is_empty()
+            || saved.vsock.is_some()
+            || has_balloon
+        {
+            return Err(VmmError::Snapshot(
+                "memory-only snapshot contains partial live runtime state".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if !has_vm {
+        return Err(VmmError::Snapshot(
+            "live snapshot is missing in-kernel VM state".into(),
+        ));
+    }
+    let expected_aps = usize::from(vcpus.saturating_sub(1));
+    if ap_states != expected_aps {
+        return Err(VmmError::Snapshot(format!(
+            "live snapshot AP state count mismatch: expected {expected_aps}, got {ap_states}"
+        )));
+    }
+    if saved.virtio_blk.len() != saved.volumes.len() {
+        return Err(VmmError::Snapshot(format!(
+            "live snapshot block state count mismatch: expected {}, got {}",
+            saved.volumes.len(),
+            saved.virtio_blk.len()
+        )));
+    }
+    if saved.virtio_net.len() != saved.net.len() {
+        return Err(VmmError::Snapshot(format!(
+            "live snapshot network state count mismatch: expected {}, got {}",
+            saved.net.len(),
+            saved.virtio_net.len()
+        )));
+    }
+    if saved.vsock.is_none() {
+        return Err(VmmError::Snapshot(
+            "live snapshot is missing virtio-vsock state".into(),
+        ));
+    }
+    if !has_balloon {
+        return Err(VmmError::Snapshot(
+            "live snapshot is missing virtio-balloon state".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const BALLOON_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTBLN01";
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -6260,6 +6318,53 @@ mod tests {
         let (decoded_with_trailer, decoded_balloon) = decode_state_blob(&encoded).unwrap();
         assert_eq!(decoded_with_trailer.kernel_path, "kernel");
         assert_eq!(decoded_balloon, Some(balloon_state));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn live_restore_shape_rejects_partial_runtime_state() {
+        let mut saved = StateBlob::default();
+
+        let partial_memory_only = validate_restored_runtime_shape(&saved, false, false, true, 0, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(partial_memory_only.contains("partial live runtime state"));
+
+        let partial_balloon = validate_restored_runtime_shape(&saved, true, false, false, 0, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(partial_balloon.contains("partial live runtime state"));
+
+        let missing_vm = validate_restored_runtime_shape(&saved, true, true, false, 0, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_vm.contains("missing in-kernel VM state"));
+
+        let missing_ap = validate_restored_runtime_shape(&saved, true, true, true, 0, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_ap.contains("AP state count mismatch"));
+
+        let missing_vsock = validate_restored_runtime_shape(&saved, true, true, true, 0, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(missing_vsock.contains("missing virtio-vsock state"));
+
+        saved.vsock = Some(Default::default());
+        validate_restored_runtime_shape(&saved, true, true, true, 0, 1).unwrap();
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn malformed_runtime_components_are_rejected() {
+        let error = decode_snapshot_component::<crate::vcpu_setup::VcpuFullState>(
+            Some(&[0xff]),
+            "BSP vCPU",
+        )
+        .err()
+        .expect("malformed BSP state must fail")
+        .to_string();
+        assert!(error.contains("snapshot BSP vCPU state is malformed"));
     }
 
     // Incremental diff-chain round trip. Boot-gated because it uses the

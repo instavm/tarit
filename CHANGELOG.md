@@ -25,6 +25,10 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Live snapshot capture and restore now reject malformed or incomplete runtime
+  state instead of publishing a paused, partially restored VM.
+- Restored x86 vCPUs apply LAPIC state before MSRs so TSC-deadline timers resume
+  correctly on secondary CPUs.
 - Duplicate activation can no longer replace an in-flight boot registration;
   waiters observe the result of the exact registered incarnation.
 - Snapshot restore now repairs guest realtime inside the mandatory
