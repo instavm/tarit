@@ -20,9 +20,10 @@
 //! - Virtio-rng can feed fresh host entropy, but its presence and a clock jump
 //!   do not prove that the cloned kernel CRNG has consumed it before returning
 //!   bytes. Userspace PRNGs and cached tokens are outside the kernel CRNG.
-//! - Secure multi-resume therefore still requires a VM generation device and
-//!   a pre-admission userspace post-fork repair hook. Until those exist, the
-//!   flag below describes required work, not a completed action.
+//! - Secure multi-resume therefore requires a VM generation device and the
+//!   mandatory pre-admission userspace repair exchange. The exchange supplies
+//!   fresh host entropy, forces a kernel reseed, rotates clone identity, and
+//!   completes the optional post-fork hook before restore is acknowledged.
 //!
 //! **What we need to do on restore:**
 //! 1. Create a fresh KvmVm (new VM = new kvmclock base)

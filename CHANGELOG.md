@@ -40,6 +40,9 @@ versions may contain breaking changes.
 - Balloon release qualification now injects the exact candidate guest agent
   into each OCI fixture and creates cgroup pressure without blocking control on
   a throttled VMM.
+- Clone-generation qualification now injects the exact candidate guest agent
+  into a private OCI rootfs copy, supports minimal images without Python, and
+  places large scratch artifacts on a configurable test volume.
 
 ### Fixed
 

@@ -58,7 +58,12 @@ its scope.
   child-leased and are removed with the child rather than accumulating as
   user-visible durable snapshots. Cross-node localization preserves the lease;
   child deletion withdraws global metadata before source and target replicas
-  converge through zero-reference GC.
+  converge through zero-reference GC. A direct c8i gate stages the exact
+  candidate agent in a private Ubuntu OCI rootfs copy: Linux 6.6.155 observes
+  VMGenID delivery and one kernel fork reseed per sibling, while Linux 5.10.230
+  intentionally has no VMGenID driver and relies on the mandatory userspace
+  barrier. Both paths produce distinct generation, boot, clone, and kernel RNG
+  state without modifying the base image.
 - Provider-neutral local and NFS-backed raw block volumes are generation-fenced,
   tenant-scoped, and ordered with hibernate, resume, recovery, and deletion.
   Production generic NFS requires Kerberos privacy (`krb5p`), and mount

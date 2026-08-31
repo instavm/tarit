@@ -5,10 +5,15 @@ set -euo pipefail
 VMM="${VMM:?set VMM to the vmm binary}"
 KERNEL="${KERNEL:?set KERNEL to a VMGenID-capable kernel}"
 ROOTFS="${ROOTFS:?set ROOTFS to an Ubuntu guest rootfs}"
+AGENT="${AGENT:?set AGENT to the candidate vmm-agent binary}"
+BAKE_AGENT="${BAKE_AGENT:-$(cd "$(dirname "$0")/../guest/agent" && pwd)/bake-agent.sh}"
 EXPECT_VMGENID_DRIVER="${EXPECT_VMGENID_DRIVER:?set EXPECT_VMGENID_DRIVER to 0 or 1}"
 case "$EXPECT_VMGENID_DRIVER" in 0|1) ;; *) echo "EXPECT_VMGENID_DRIVER must be 0 or 1" >&2; exit 2 ;; esac
 
-TEST_DIR=$(mktemp -d /tmp/tarit-vmgenid.XXXXXX)
+TEST_ROOT="${TARIT_TEST_ROOT:-${TMPDIR:-/tmp}}"
+mkdir -p -- "$TEST_ROOT"
+TEST_ROOT=$(cd "$TEST_ROOT" && pwd -P)
+TEST_DIR=$(mktemp -d "$TEST_ROOT/tarit-vmgenid.XXXXXX")
 SOURCE_SOCK="$TEST_DIR/source.sock"
 CLONE_A_SOCK="$TEST_DIR/clone-a.sock"
 CLONE_B_SOCK="$TEST_DIR/clone-b.sock"
@@ -62,7 +67,7 @@ cleanup() {
   stop_server "$CLONE_A_SOCK" "$CLONE_A_PID"
   stop_server "$CLONE_B_SOCK" "$CLONE_B_PID"
   case "$TEST_DIR" in
-    /tmp/tarit-vmgenid.*) rm -r -- "$TEST_DIR" ;;
+    "$TEST_ROOT"/tarit-vmgenid.*) rm -r -- "$TEST_DIR" ;;
   esac
 }
 trap cleanup EXIT INT TERM
@@ -104,11 +109,11 @@ wait_ready() {
 }
 
 generation_id() {
-  guest_stdout "$1" "python3 -c 'import os; f=os.open(\"/dev/mem\", os.O_RDONLY); print(os.pread(f,16,0xe6000).hex())'"
+  guest_stdout "$1" "dd if=/dev/mem bs=1 skip=942080 count=16 2>/dev/null | od -An -tx1 | tr -d ' \\n'"
 }
 
 random_sample() {
-  guest_stdout "$1" "python3 -c 'import os; print(os.getrandom(64).hex())'"
+  guest_stdout "$1" "dd if=/dev/urandom bs=64 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'"
 }
 
 ged_count() {
@@ -132,6 +137,14 @@ sample_digest() {
 }
 
 cp --reflink=auto -- "$ROOTFS" "$BASE"
+chmod u+w "$BASE"
+FSCK_STATUS=0
+e2fsck -fy "$BASE" >/dev/null || FSCK_STATUS=$?
+if (( FSCK_STATUS > 1 )); then
+  echo "failed to prepare the private rootfs copy: e2fsck status $FSCK_STATUS" >&2
+  exit "$FSCK_STATUS"
+fi
+"$BAKE_AGENT" "$BASE" "$AGENT" >/dev/null
 BASE_SHA_BEFORE=$(sha256sum "$BASE" | awk '{print $1}')
 CMDLINE='console=ttyS0 reboot=k panic=-1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw'
 

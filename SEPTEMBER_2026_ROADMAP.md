@@ -341,8 +341,9 @@ The upstream failure mapping and the evidence required to close each row are
 maintained in [`docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md`](docs/LIVE_FORK_KNOWN_FAILURE_AUDIT.md).
 In particular, fresh virtio-rng bytes do not by themselves prove that an
 already-cloned kernel or userspace PRNG has reseeded. Clone uniqueness remains
-a stop-ship item until a real generation notification and pre-admission
-userspace repair barrier pass on c8i.
+a stop-ship item until the sustained rotation completes; focused c8i gates now
+pass both the Linux 6.6 generation-notification path and the Linux 5.10
+userspace-barrier compatibility path.
 
 The release gate retains the documented 100 cold and warm create-to-exec samples,
 100 percent success requirement, p99 <= 5,000 ms cold and <= 1,000 ms warm, plus
@@ -405,7 +406,14 @@ passing focused gate does not waive an item in the final column.
   distinct generation IDs, boot IDs, clone IDs, and first random samples through
   the compatibility barrier. Ubuntu 24.04 and Alpine 3.20 OCI guests passed cold
   boot, live fork, private disk CoW, fail-closed hook admission, hibernate, and
-  HTTP resume under the production jail and seccomp policy on both kernels.
+  HTTP resume under the production jail and seccomp policy on both kernels. The
+  direct generation gate injects the exact candidate agent into a private copy
+  of the read-only OCI rootfs and keeps all scratch files on the dedicated test
+  volume. On Linux 6.6.155, two sibling restores each advanced the generation
+  interrupt and recorded one kernel fork reseed. On Linux 5.10.230, the same
+  siblings recorded no kernel reseed, as expected, while the mandatory barrier
+  still produced distinct generation IDs, boot IDs, clone IDs, and first CSPRNG
+  samples. Both runs left the source OCI artifact unchanged.
 - The model-based real-KVM lifecycle gate passed 693 API operations on each of
   Linux 5.10 and 6.6. It covered the deterministic transition table, concurrent
   live-fork fan-out, duplicate create, snapshot/delete and terminal-delete races,
