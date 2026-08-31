@@ -55,7 +55,7 @@ use crate::{
     config::{ApiIdentity, ApiRole},
     metrics::{ActiveShareHttp, Metrics, ShareMetricVisibility},
     net::NetAlloc,
-    shares,
+    ops, shares,
     supervisor::NetworkLease,
 };
 
@@ -684,7 +684,13 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             scheme: trusted_forwarded_scheme(request.headers()),
         };
         let (mut parts, body) = request.into_parts();
-        let owner = resolve_share_owner(&state, share.vm_id)
+        let activation_identity = ApiIdentity {
+            tenant: share.owner_key.clone(),
+            role: ApiRole::User,
+            max_vms: None,
+            api_key_id: format!("share:{}", share.id),
+        };
+        let owner = ops::resolve_owner_for_activation(&state, share.vm_id, &activation_identity)
             .await
             .map_err(|error| {
                 tracing::warn!(share_id = %share.id, %error, "share owner resolution failed");
@@ -1086,6 +1092,9 @@ async fn proxy_local_http(
     share: &ShareRecord,
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
+    crate::ops::ensure_active_local(state, share.vm_id)
+        .await
+        .map_err(|_| GatewayError::Unavailable)?;
     let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
     })?;
@@ -1368,6 +1377,9 @@ async fn proxy_local_websocket(
     if state.share_runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
+    crate::ops::ensure_active_local(state, share.vm_id)
+        .await
+        .map_err(|_| GatewayError::Unavailable)?;
     let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
     })?;
@@ -1850,7 +1862,7 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
-    use tarit_types::{ShareRecord, ShareVisibility};
+    use tarit_types::{ShareRecord, ShareVisibility, VmRecord, VmStatus};
     use tokio::{
         net::TcpListener,
         sync::{mpsc, oneshot, watch},
@@ -3052,6 +3064,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_share_request_rejects_a_valid_mac_for_a_stale_target_session() {
+        let cluster = TestShareCluster::start().await;
+        let headers =
+            signed_share_identity_headers_for_sessions(&cluster.share, Uuid::nil(), Uuid::new_v4());
+        let response = reqwest::Client::new()
+            .get(cluster.owner_share_url("/stream"))
+            .headers(headers)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn peer_share_request_rejects_spliced_identity_envelope() {
         let upstream = start_axum(
             Router::new().route("/stream", get(|| async { Response::new(Body::from("ok")) })),
@@ -3503,6 +3529,14 @@ mod tests {
     }
 
     fn signed_share_identity_headers(share: &ShareRecord) -> HeaderMap {
+        signed_share_identity_headers_for_sessions(share, Uuid::nil(), Uuid::nil())
+    }
+
+    fn signed_share_identity_headers_for_sessions(
+        share: &ShareRecord,
+        source_session: Uuid,
+        target_session: Uuid,
+    ) -> HeaderMap {
         let issued_at = Utc::now().timestamp();
         let identity_nonce = Uuid::new_v4().to_string();
         let request_nonce = Uuid::new_v4().to_string();
@@ -3518,6 +3552,8 @@ mod tests {
         identity_mac.update(b"\nuser\n");
         identity_mac.update(identity_id.as_bytes());
         let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
+        let source_session = source_session.to_string();
+        let target_session = target_session.to_string();
         let mut request_mac = Hmac::<Sha256>::new_from_slice(b"peer-secret").unwrap();
         for component in [
             "tarit-peer-request-v2",
@@ -3528,6 +3564,8 @@ mod tests {
             request_nonce.as_str(),
             "non-owner",
             "owner",
+            source_session.as_str(),
+            target_session.as_str(),
             identity_signature.as_str(),
         ] {
             request_mac.update(component.as_bytes());
@@ -3540,6 +3578,14 @@ mod tests {
         );
         headers.insert("x-tarit-peer-source", HeaderValue::from_static("non-owner"));
         headers.insert("x-tarit-peer-target", HeaderValue::from_static("owner"));
+        headers.insert(
+            "x-tarit-peer-source-session",
+            HeaderValue::from_str(&source_session).unwrap(),
+        );
+        headers.insert(
+            "x-tarit-peer-target-session",
+            HeaderValue::from_str(&target_session).unwrap(),
+        );
         headers.insert(
             "x-tarit-peer-timestamp",
             HeaderValue::from_str(&issued_at.to_string()).unwrap(),
@@ -3592,6 +3638,7 @@ mod tests {
             )])
             .unwrap(),
             host_id: host_id.into(),
+            host_session_id: Uuid::nil(),
             vmm_bin: PathBuf::from("target/taritd-gateway-test/vmm"),
             kernel: PathBuf::from("target/taritd-gateway-test/kernel"),
             rootfs: PathBuf::from("target/taritd-gateway-test/rootfs"),
@@ -3599,10 +3646,14 @@ mod tests {
             db_path: PathBuf::from("target/taritd-gateway-test/fleet.db"),
             net_state_path: PathBuf::from("target/taritd-gateway-test/net-state.json"),
             images_dir: PathBuf::from("target/taritd-gateway-test/images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
@@ -3650,6 +3701,7 @@ mod tests {
             vm_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             store_tx,
             lifecycle: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            activation_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             lifecycle_faults: Arc::new(std::sync::Mutex::new(Vec::new())),
             lifecycle_pauses: Arc::new(std::sync::Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -3696,6 +3748,30 @@ mod tests {
                 host_ip: "127.0.0.1".into(),
                 guest_ip: upstream.ip().to_string(),
                 prefix: 30,
+            },
+        );
+        let now = Utc::now();
+        state.vm_cache.write().unwrap().insert(
+            vm_id,
+            VmRecord {
+                id: vm_id,
+                host_id: state.config.host_id.clone(),
+                owner_key: Some(share.owner_key.clone()),
+                api_key_id: None,
+                status: VmStatus::Running,
+                revision: 1,
+                startup_path: None,
+                memory_mib: 128,
+                vcpus: 1,
+                kernel_path: state.config.kernel.display().to_string(),
+                rootfs_path: Some(state.config.rootfs.display().to_string()),
+                rootfs_read_only: state.config.rootfs_read_only,
+                cmdline: String::new(),
+                runtime_layout: None,
+                socket_path: None,
+                pid: None,
+                created_at: now,
+                updated_at: now,
             },
         );
         state.shares.insert(&share).await.unwrap();

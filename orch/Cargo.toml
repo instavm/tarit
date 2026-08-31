@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tarit-types", "crates/tarit-vmm-client", "crates/tarit-store", "crates/tarit-fleet", "crates/taritd", "crates/tarit-bench"]
+members = ["crates/tarit-types", "crates/tarit-vmm-client", "crates/tarit-store", "crates/tarit-fleet", "crates/tarit-volume", "crates/taritd", "crates/tarit-bench"]
 
 [workspace.package]
 version = "0.1.2"
@@ -14,6 +14,8 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hmac = "0.12"
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 # MIT OR Apache-2.0 licensed — validated IP network parser
 ipnet = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -31,6 +33,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 tokio-postgres-rustls = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
 webpki-roots = "0.26"
 deadpool-postgres = "0.14"

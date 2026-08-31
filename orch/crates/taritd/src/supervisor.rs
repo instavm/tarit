@@ -5,6 +5,7 @@ use crate::disk::{
 use crate::net::{NetAlloc, NetProvisioner};
 use crate::scheduler::{ReservationError, ResourceShape, Scheduler};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::net::Ipv4Addr;
@@ -26,6 +27,7 @@ use tarit_vmm_client::{
     KernelConfig, MemoryConfig, NetConfig, ScratchIdentity, VcpuConfig, VmConfig, VmmClient,
     VolumeConfig,
 };
+use tarit_volume::{AccessMode, PreparedBlockAttachment};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -77,6 +79,8 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
         )));
     }
     let path = std::ffi::CString::new("/dev/net/tun").expect("static TUN path");
+    // SAFETY: `path` is a valid NUL-terminated string and `open` does not
+    // retain the pointer after returning.
     let raw_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if raw_fd < 0 {
         return Err(OrchError::Internal(format!(
@@ -93,6 +97,8 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
         _pad: [0; 22],
     };
     ifreq.name[..tap_name.len()].copy_from_slice(tap_name.as_bytes());
+    // SAFETY: `fd` is an open TUN descriptor and `ifreq` is a valid writable
+    // TUNSETIFF request that remains alive for the duration of the ioctl.
     if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF as _, &mut ifreq) } < 0 {
         return Err(OrchError::Internal(format!(
             "attach inherited TAP queue for {tap_name}: {}",
@@ -100,6 +106,27 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
         )));
     }
     Ok(fd)
+}
+
+#[cfg(target_os = "linux")]
+fn open_inherited_kvm() -> Result<File, OrchError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/dev/kvm")
+        .map_err(|error| OrchError::Internal(format!("open inherited KVM device: {error}")))?;
+    if !file
+        .metadata()
+        .map_err(|error| OrchError::Internal(format!("inspect inherited KVM device: {error}")))?
+        .file_type()
+        .is_char_device()
+    {
+        return Err(OrchError::Internal(
+            "inherited KVM path is not a character device".into(),
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(target_os = "linux")]
@@ -784,6 +811,15 @@ enum ReadinessCheck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VmDataVolumeConfig {
+    pub id: Uuid,
+    pub provider: String,
+    pub size_bytes: u64,
+    pub read_only: bool,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VmSpawnConfig {
     pub memory_mib: u64,
     pub vcpus: u8,
@@ -793,6 +829,10 @@ pub struct VmSpawnConfig {
     /// Mount the rootfs read-only (shared immutable base). Set from
     /// `Config::rootfs_read_only` so warm VMs and requests agree.
     pub read_only: bool,
+    /// Desired host-enforced egress policy, installed before guest startup.
+    pub egress_allowlist: Vec<String>,
+    pub egress_allow_existing: bool,
+    pub data_volumes: Vec<VmDataVolumeConfig>,
 }
 
 impl VmSpawnConfig {
@@ -824,6 +864,9 @@ impl VmSpawnConfig {
             rootfs_path,
             cmdline,
             read_only: config.rootfs_read_only,
+            egress_allowlist: Vec::new(),
+            egress_allow_existing: false,
+            data_volumes: Vec::new(),
         }
     }
 
@@ -844,6 +887,9 @@ impl VmSpawnConfig {
             rootfs_path,
             cmdline: DEFAULT_CMDLINE.to_string(),
             read_only: config.rootfs_read_only,
+            egress_allowlist: Vec::new(),
+            egress_allow_existing: false,
+            data_volumes: Vec::new(),
         }
     }
 }
@@ -982,6 +1028,7 @@ const JAIL_KERNEL_PATH: &str = "/assets/kernel";
 const JAIL_ROOTFS_PATH: &str = "/assets/rootfs";
 const JAIL_OVERLAY_PATH: &str = "/assets/rootfs.cow";
 const JAIL_RESTORE_PATH: &str = "/assets/restore.ram";
+const JAIL_RESTORE_INTEGRITY_PATH: &str = "/assets/restore.integrity";
 
 fn jail_restore_overlay_path(id: Uuid) -> String {
     format!("/assets/restored-rootfs-{id}.cow")
@@ -1644,7 +1691,7 @@ fn read_jail_marker(root: &Path) -> Result<JailMarker, OrchError> {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PreparedRuntime {
     host_socket: PathBuf,
     socket_argument: PathBuf,
@@ -1654,6 +1701,7 @@ struct PreparedRuntime {
     host_overlay: Option<PathBuf>,
     guest_overlay: Option<String>,
     guest_snapshot: Option<String>,
+    data_volumes: Vec<PreparedBlockAttachment>,
     jail: Option<JailLease>,
 }
 
@@ -1792,9 +1840,30 @@ impl OwnedArtifact {
 pub(crate) struct SnapshotBundle {
     snapshot_path: String,
     overlay_path: Option<String>,
+    live_stats: Option<tarit_proto::LiveSnapshotStats>,
     artifacts: Vec<OwnedArtifact>,
+    /// VMM-generated hashes for the exact live RAM artifact. This temporary
+    /// sidecar is consumed when the durable manifest is created and never
+    /// becomes a public artifact itself.
+    precomputed_integrity: Option<OwnedArtifact>,
     in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
     registered_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotIntegrity {
+    pub(crate) content_digest: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) chunk_size_bytes: u64,
+    pub(crate) chunk_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifiedSnapshotIntegrity {
+    pub(crate) manifest_path: String,
+    pub(crate) manifest_sha256: String,
+    overlay: Option<tarit_proto::ArtifactIntegrity>,
+    chunk_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1837,6 +1906,92 @@ impl SnapshotBundle {
         self.overlay_path.as_deref()
     }
 
+    pub(crate) fn live_stats(&self) -> Option<&tarit_proto::LiveSnapshotStats> {
+        self.live_stats.as_ref()
+    }
+
+    /// Hash the exact open inodes owned by this bundle. Path replacement cannot
+    /// substitute bytes between capture and manifest creation.
+    pub(crate) fn integrity(&mut self) -> Result<SnapshotIntegrity, OrchError> {
+        let manifest =
+            snapshot_integrity_manifest(&self.artifacts, self.precomputed_integrity.as_ref())?;
+        let chunk_count = manifest
+            .artifacts
+            .iter()
+            .try_fold(0u64, |total, artifact| {
+                total
+                    .checked_add(artifact.chunk_hashes.len() as u64)
+                    .ok_or_else(|| OrchError::Internal("snapshot chunk count overflow".into()))
+            })?;
+        let chunk_size_bytes = u64::from(manifest.chunk_size);
+        let encoded = manifest.encode().map_err(|error| {
+            OrchError::Internal(format!("encode snapshot integrity manifest: {error}"))
+        })?;
+        let manifest_path = snapshot_manifest_path(&self.snapshot_path);
+        {
+            let mut registered = self
+                .in_progress_artifacts
+                .lock()
+                .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?;
+            if !registered.insert(manifest_path.clone()) {
+                return Err(OrchError::Internal(format!(
+                    "snapshot manifest path is already registered: {}",
+                    manifest_path.display()
+                )));
+            }
+        }
+        self.registered_paths.push(manifest_path.clone());
+        let artifact = OwnedArtifact::create_private(&manifest_path).map_err(|error| {
+            OrchError::Internal(format!("create snapshot integrity manifest: {error}"))
+        })?;
+        self.artifacts.push(artifact);
+        use std::io::Write as _;
+        let manifest_artifact = self
+            .artifacts
+            .last_mut()
+            .expect("manifest artifact was just appended");
+        manifest_artifact
+            ._file
+            .write_all(&encoded)
+            .and_then(|_| manifest_artifact._file.sync_all())
+            .map_err(|error| {
+                OrchError::Internal(format!("persist snapshot integrity manifest: {error}"))
+            })?;
+        let size_bytes = self.artifacts[..self.artifacts.len() - 1].iter().try_fold(
+            0u64,
+            |total, artifact| {
+                artifact
+                    ._file
+                    .metadata()
+                    .map_err(|error| {
+                        OrchError::Internal(format!("stat snapshot artifact: {error}"))
+                    })?
+                    .len()
+                    .checked_add(total)
+                    .ok_or_else(|| OrchError::Internal("snapshot bundle size overflow".into()))
+            },
+        )?;
+        if let Some(precomputed) = self.precomputed_integrity.take() {
+            let removed = precomputed.remove().map_err(|error| {
+                OrchError::Internal(format!(
+                    "remove consumed live integrity sidecar {}: {error}",
+                    precomputed.path().display()
+                ))
+            })?;
+            if !removed {
+                return Err(OrchError::BadRequest(
+                    "live integrity sidecar path changed before cleanup".into(),
+                ));
+            }
+        }
+        Ok(SnapshotIntegrity {
+            content_digest: format!("sha256:{:x}", Sha256::digest(&encoded)),
+            size_bytes,
+            chunk_size_bytes,
+            chunk_count,
+        })
+    }
+
     pub(crate) fn persist(mut self) {
         // Keep successfully published paths in the process registry. A GC pass
         // may have loaded durable snapshot rows just before this transaction
@@ -1845,9 +2000,25 @@ impl SnapshotBundle {
         // rebuilds the fence from the snapshot table.
         self.registered_paths.clear();
         self.artifacts.clear();
+        if let Some(precomputed) = self.precomputed_integrity.take() {
+            if let Err(error) = precomputed.remove() {
+                tracing::warn!(
+                    path = %precomputed.path().display(),
+                    "remove unused live integrity sidecar failed: {error}"
+                );
+            }
+        }
     }
 
     fn cleanup(&mut self) {
+        if let Some(precomputed) = self.precomputed_integrity.take() {
+            if let Err(error) = precomputed.remove() {
+                tracing::warn!(
+                    path = %precomputed.path().display(),
+                    "remove uncommitted live integrity sidecar failed: {error}"
+                );
+            }
+        }
         for artifact in self.artifacts.drain(..) {
             if let Err(error) = artifact.remove() {
                 tracing::warn!(
@@ -1866,6 +2037,370 @@ impl SnapshotBundle {
             }
         }
     }
+}
+
+fn snapshot_manifest_path(snapshot_path: &str) -> PathBuf {
+    PathBuf::from(format!("{snapshot_path}.integrity"))
+}
+
+fn snapshot_integrity_manifest(
+    artifacts: &[OwnedArtifact],
+    precomputed: Option<&OwnedArtifact>,
+) -> Result<tarit_proto::IntegrityManifest, OrchError> {
+    if artifacts.is_empty() || artifacts.len() > 2 {
+        return Err(OrchError::Internal(
+            "invalid snapshot artifact bundle".into(),
+        ));
+    }
+    let ram_len = artifacts[0]
+        ._file
+        .metadata()
+        .map_err(|error| OrchError::Internal(format!("stat RAM snapshot: {error}")))?
+        .len();
+    let mut header = [0u8; 32];
+    read_exact_at(&artifacts[0]._file, &mut header, 0, "snapshot header")?;
+    if &header[..4] != b"VMSN" {
+        return Err(OrchError::BadRequest(
+            "authenticated lazy restore requires a full VMSN snapshot".into(),
+        ));
+    }
+    let flags = u16::from_le_bytes(header[6..8].try_into().expect("VMSN flags"));
+    if flags != 0 {
+        return Err(OrchError::BadRequest(
+            "authenticated lazy restore does not support diff snapshots".into(),
+        ));
+    }
+    let state_len = u64::from_le_bytes(header[8..16].try_into().expect("VMSN state length"));
+    let memory_len = u64::from_le_bytes(header[20..28].try_into().expect("VMSN memory length"));
+    let memory_offset = 32u64
+        .checked_add(state_len)
+        .ok_or_else(|| OrchError::Internal("snapshot memory offset overflow".into()))?;
+    if memory_offset.checked_add(memory_len) != Some(ram_len) {
+        return Err(OrchError::BadRequest(
+            "snapshot layout does not match its file length".into(),
+        ));
+    }
+    let chunk_size = u64::from(tarit_proto::INTEGRITY_CHUNK_SIZE);
+    let mut manifest_artifacts = if let Some(precomputed) = precomputed {
+        let metadata_chunks = memory_offset.div_ceil(chunk_size);
+        let memory_chunks = memory_len.div_ceil(chunk_size);
+        let expected_len = 12u64
+            .checked_add(2 * 24)
+            .and_then(|base| {
+                metadata_chunks
+                    .checked_add(memory_chunks)
+                    .and_then(|chunks| chunks.checked_mul(32))
+                    .and_then(|hashes| base.checked_add(hashes))
+            })
+            .ok_or_else(|| OrchError::Internal("live integrity size overflow".into()))?;
+        let actual_len = precomputed
+            ._file
+            .metadata()
+            .map_err(|error| OrchError::Internal(format!("stat live integrity sidecar: {error}")))?
+            .len();
+        if actual_len != expected_len {
+            return Err(OrchError::BadRequest(format!(
+                "live integrity sidecar length mismatch: got {actual_len}, expected {expected_len}"
+            )));
+        }
+        let mut encoded = vec![
+            0u8;
+            usize::try_from(actual_len).map_err(|_| {
+                OrchError::Internal("live integrity sidecar is too large".into())
+            })?
+        ];
+        read_exact_at(
+            &precomputed._file,
+            &mut encoded,
+            0,
+            "live integrity sidecar",
+        )?;
+        let manifest = tarit_proto::IntegrityManifest::decode(&encoded).map_err(|error| {
+            OrchError::BadRequest(format!("invalid live integrity sidecar: {error}"))
+        })?;
+        if manifest.chunk_size != tarit_proto::INTEGRITY_CHUNK_SIZE
+            || manifest.artifacts.len() != 2
+            || manifest
+                .artifact(tarit_proto::ArtifactKind::Overlay)
+                .is_some()
+        {
+            return Err(OrchError::BadRequest(
+                "live integrity sidecar has an invalid artifact set".into(),
+            ));
+        }
+        let metadata = manifest
+            .artifact(tarit_proto::ArtifactKind::SnapshotMetadata)
+            .ok_or_else(|| OrchError::BadRequest("live integrity metadata is missing".into()))?;
+        let memory = manifest
+            .artifact(tarit_proto::ArtifactKind::Ram)
+            .ok_or_else(|| OrchError::BadRequest("live integrity RAM is missing".into()))?;
+        if metadata.len != memory_offset || memory.len != memory_len {
+            return Err(OrchError::BadRequest(
+                "live integrity sidecar does not match the snapshot layout".into(),
+            ));
+        }
+        let actual_metadata = hash_artifact_range(
+            &artifacts[0]._file,
+            tarit_proto::ArtifactKind::SnapshotMetadata,
+            0,
+            memory_offset,
+            chunk_size,
+        )?;
+        if actual_metadata.chunk_hashes != metadata.chunk_hashes {
+            return Err(OrchError::BadRequest(
+                "live integrity sidecar does not match snapshot metadata".into(),
+            ));
+        }
+        tracing::info!(
+            ram_bytes = memory_len,
+            ram_chunks = memory.chunk_hashes.len(),
+            "adopted VMM live integrity sidecar without rereading RAM"
+        );
+        manifest.artifacts
+    } else {
+        vec![
+            hash_artifact_range(
+                &artifacts[0]._file,
+                tarit_proto::ArtifactKind::SnapshotMetadata,
+                0,
+                memory_offset,
+                chunk_size,
+            )?,
+            hash_artifact_range(
+                &artifacts[0]._file,
+                tarit_proto::ArtifactKind::Ram,
+                memory_offset,
+                memory_len,
+                chunk_size,
+            )?,
+        ]
+    };
+    if let Some(overlay) = artifacts.get(1) {
+        let len = overlay
+            ._file
+            .metadata()
+            .map_err(|error| OrchError::Internal(format!("stat snapshot overlay: {error}")))?
+            .len();
+        manifest_artifacts.push(hash_artifact_range(
+            &overlay._file,
+            tarit_proto::ArtifactKind::Overlay,
+            0,
+            len,
+            chunk_size,
+        )?);
+    }
+    Ok(tarit_proto::IntegrityManifest {
+        chunk_size: tarit_proto::INTEGRITY_CHUNK_SIZE,
+        artifacts: manifest_artifacts,
+    })
+}
+
+fn read_exact_at(
+    file: &File,
+    mut output: &mut [u8],
+    mut offset: u64,
+    what: &str,
+) -> Result<(), OrchError> {
+    while !output.is_empty() {
+        let read = file
+            .read_at(output, offset)
+            .map_err(|error| OrchError::Internal(format!("read {what} for integrity: {error}")))?;
+        if read == 0 {
+            return Err(OrchError::BadRequest(format!("truncated {what}")));
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or_else(|| OrchError::Internal("integrity read offset overflow".into()))?;
+        output = &mut output[read..];
+    }
+    Ok(())
+}
+
+fn hash_artifact_range(
+    file: &File,
+    kind: tarit_proto::ArtifactKind,
+    start: u64,
+    len: u64,
+    chunk_size: u64,
+) -> Result<tarit_proto::ArtifactIntegrity, OrchError> {
+    #[cfg(test)]
+    if kind == tarit_proto::ArtifactKind::Ram {
+        TEST_RAM_INTEGRITY_HASH_PASSES.with(|passes| passes.set(passes.get() + 1));
+    }
+    let mut chunk_hashes = Vec::new();
+    let mut offset = 0u64;
+    // Read in large sequential windows while retaining small verification
+    // chunks. This keeps snapshot publication throughput close to the old
+    // whole-file hash (one pread per MiB, not one syscall per 64 KiB chunk).
+    let read_window = chunk_size.max(1024 * 1024);
+    let mut buffer = vec![0u8; read_window as usize];
+    while offset < len {
+        let wanted = usize::try_from((len - offset).min(read_window))
+            .map_err(|_| OrchError::Internal("integrity read length overflow".into()))?;
+        read_exact_at(
+            file,
+            &mut buffer[..wanted],
+            start
+                .checked_add(offset)
+                .ok_or_else(|| OrchError::Internal("integrity range overflow".into()))?,
+            "snapshot artifact",
+        )?;
+        chunk_hashes.extend(
+            buffer[..wanted]
+                .chunks(chunk_size as usize)
+                .map(|chunk| -> [u8; 32] { Sha256::digest(chunk).into() }),
+        );
+        offset = offset
+            .checked_add(wanted as u64)
+            .ok_or_else(|| OrchError::Internal("integrity offset overflow".into()))?;
+    }
+    Ok(tarit_proto::ArtifactIntegrity {
+        kind,
+        len,
+        chunk_hashes,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RAM_INTEGRITY_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Authenticate the durable chunk manifest, validate artifact shapes, and
+/// eagerly verify only the disk upper. RAM remains lazy: the VMM verifies each
+/// authenticated chunk from a stable private buffer before UFFDIO_COPY.
+pub(crate) fn verify_snapshot_integrity(
+    record: &tarit_store::SnapshotRecord,
+) -> Result<VerifiedSnapshotIntegrity, OrchError> {
+    let expected_digest = record.content_digest.as_deref().ok_or_else(|| {
+        OrchError::BadRequest(
+            "snapshot predates authenticated artifact metadata; create a new snapshot".into(),
+        )
+    })?;
+    let expected_size = record.size_bytes.ok_or_else(|| {
+        OrchError::BadRequest(
+            "snapshot predates authenticated artifact sizing; create a new snapshot".into(),
+        )
+    })?;
+    let artifacts = [
+        OwnedArtifact::capture(Path::new(&record.path)).map_err(|error| {
+            OrchError::BadRequest(format!(
+                "snapshot RAM artifact is unsafe or unavailable: {error}"
+            ))
+        })?,
+    ];
+    let ram_size = artifacts[0]
+        ._file
+        .metadata()
+        .map_err(|error| OrchError::BadRequest(format!("stat snapshot RAM: {error}")))?
+        .len();
+    let overlay = record
+        .overlay_path
+        .as_deref()
+        .map(|path| {
+            OwnedArtifact::capture(Path::new(path)).map_err(|error| {
+                OrchError::BadRequest(format!(
+                    "snapshot disk artifact is unsafe or unavailable: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+    let overlay_size = overlay
+        .as_ref()
+        .map(|artifact| artifact._file.metadata().map(|metadata| metadata.len()))
+        .transpose()
+        .map_err(|error| OrchError::BadRequest(format!("stat snapshot disk: {error}")))?
+        .unwrap_or(0);
+    if ram_size.checked_add(overlay_size) != Some(expected_size) {
+        return Err(OrchError::BadRequest(
+            "snapshot artifact integrity verification failed".into(),
+        ));
+    }
+    let manifest_path = snapshot_manifest_path(&record.path);
+    let manifest_artifact = OwnedArtifact::capture(&manifest_path).map_err(|error| {
+        OrchError::BadRequest(format!(
+            "snapshot integrity manifest is unsafe or unavailable: {error}"
+        ))
+    })?;
+    let manifest_len = manifest_artifact
+        ._file
+        .metadata()
+        .map_err(|error| OrchError::BadRequest(format!("stat snapshot manifest: {error}")))?
+        .len();
+    if manifest_len > 128 * 1024 * 1024 {
+        return Err(OrchError::BadRequest(
+            "snapshot integrity manifest is oversized".into(),
+        ));
+    }
+    let mut encoded = vec![0u8; manifest_len as usize];
+    read_exact_at(
+        &manifest_artifact._file,
+        &mut encoded,
+        0,
+        "integrity manifest",
+    )?;
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(&encoded));
+    if actual_digest != expected_digest {
+        return Err(OrchError::BadRequest(
+            "snapshot integrity manifest authentication failed".into(),
+        ));
+    }
+    let manifest = tarit_proto::IntegrityManifest::decode(&encoded).map_err(|error| {
+        OrchError::BadRequest(format!("invalid snapshot integrity manifest: {error}"))
+    })?;
+    let memory = manifest
+        .artifact(tarit_proto::ArtifactKind::Ram)
+        .ok_or_else(|| OrchError::BadRequest("snapshot manifest has no RAM entry".into()))?;
+    let metadata = manifest
+        .artifact(tarit_proto::ArtifactKind::SnapshotMetadata)
+        .ok_or_else(|| OrchError::BadRequest("snapshot manifest has no metadata entry".into()))?;
+    if metadata.len.checked_add(memory.len) != Some(ram_size) {
+        return Err(OrchError::BadRequest(
+            "snapshot manifest RAM size mismatch".into(),
+        ));
+    }
+    match (
+        overlay.as_ref(),
+        manifest.artifact(tarit_proto::ArtifactKind::Overlay),
+    ) {
+        (None, None) => {}
+        (Some(overlay), Some(integrity)) if integrity.len == overlay_size => {
+            verify_file_artifact_integrity(
+                &overlay._file,
+                integrity,
+                manifest.chunk_size as u64,
+                "snapshot disk",
+            )?;
+        }
+        _ => {
+            return Err(OrchError::BadRequest(
+                "snapshot manifest disk shape mismatch".into(),
+            ))
+        }
+    }
+    Ok(VerifiedSnapshotIntegrity {
+        manifest_path: manifest_path.display().to_string(),
+        manifest_sha256: actual_digest,
+        overlay: manifest
+            .artifact(tarit_proto::ArtifactKind::Overlay)
+            .cloned(),
+        chunk_size: manifest.chunk_size as u64,
+    })
+}
+
+fn verify_file_artifact_integrity(
+    file: &File,
+    integrity: &tarit_proto::ArtifactIntegrity,
+    chunk_size: u64,
+    what: &str,
+) -> Result<(), OrchError> {
+    let actual = hash_artifact_range(file, integrity.kind, 0, integrity.len, chunk_size)?;
+    if actual.chunk_hashes != integrity.chunk_hashes {
+        return Err(OrchError::BadRequest(format!(
+            "{what} integrity verification failed"
+        )));
+    }
+    Ok(())
 }
 
 impl Drop for SnapshotBundle {
@@ -2643,6 +3178,26 @@ impl VmmSupervisor {
         .to_string()
     }
 
+    fn restore_overlay_path_for_snapshot(&self, id: Uuid, snapshot_path: &Path) -> String {
+        let digest = Sha256::digest(snapshot_path.as_os_str().as_bytes());
+        let token = digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        match &self.jails {
+            Some(jails) => jails
+                .root_for(id)
+                .join(format!("assets/restored-rootfs-{id}-{token}.cow")),
+            None => self
+                .config
+                .socket_dir
+                .join("overlays")
+                .join(format!("{id}-restore-{token}.cow")),
+        }
+        .display()
+        .to_string()
+    }
+
     fn overlay_path_for_config(&self, id: Uuid, cfg: &VmSpawnConfig) -> Option<String> {
         cfg.rootfs_path.is_some().then(|| self.overlay_path_for(id))
     }
@@ -2661,6 +3216,19 @@ impl VmmSupervisor {
         cfg: &VmSpawnConfig,
     ) -> VmRuntimeLayout {
         self.runtime_layout_with_overlay(id, cfg, self.restore_overlay_path_for(id))
+    }
+
+    pub(crate) fn runtime_layout_for_snapshot_restore(
+        &self,
+        id: Uuid,
+        cfg: &VmSpawnConfig,
+        snapshot_path: &Path,
+    ) -> VmRuntimeLayout {
+        self.runtime_layout_with_overlay(
+            id,
+            cfg,
+            self.restore_overlay_path_for_snapshot(id, snapshot_path),
+        )
     }
 
     fn runtime_layout_with_overlay(
@@ -2696,12 +3264,57 @@ impl VmmSupervisor {
             rootfs_path: record.rootfs_path.as_ref().map(PathBuf::from),
             cmdline: record.cmdline.clone(),
             read_only: record.rootfs_read_only,
+            egress_allowlist: Vec::new(),
+            egress_allow_existing: false,
+            data_volumes: Vec::new(),
         };
         if record.startup_path == Some(tarit_types::VmStartupPath::SnapshotRestore) {
-            self.runtime_layout_for_restore_config(record.id, &config)
+            let persisted_overlay = record
+                .runtime_layout
+                .as_ref()
+                .and_then(|layout| layout.overlay_path.as_deref())
+                .filter(|path| self.is_valid_restore_overlay_path(record.id, Path::new(path)));
+            match persisted_overlay {
+                Some(path) => {
+                    self.runtime_layout_with_overlay(record.id, &config, path.to_string())
+                }
+                None => self.runtime_layout_for_restore_config(record.id, &config),
+            }
         } else {
             self.runtime_layout_for_config(record.id, &config)
         }
+    }
+
+    fn is_valid_restore_overlay_path(&self, id: Uuid, path: &Path) -> bool {
+        if path == Path::new(&self.restore_overlay_path_for(id)) {
+            return true;
+        }
+        let (expected_parent, prefix) = match &self.jails {
+            Some(jails) => (
+                jails.root_for(id).join("assets"),
+                format!("restored-rootfs-{id}-"),
+            ),
+            None => (
+                self.config.socket_dir.join("overlays"),
+                format!("{id}-restore-"),
+            ),
+        };
+        if path.parent() != Some(expected_parent.as_path()) {
+            return false;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Some(token) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".cow"))
+        else {
+            return false;
+        };
+        token.len() == 16
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 
     fn register_artifact_owner(&self, id: Uuid) -> Result<(), OrchError> {
@@ -2767,10 +3380,14 @@ impl VmmSupervisor {
         vm_config: &VmSpawnConfig,
         snapshot_path: Option<&Path>,
     ) -> Result<PreparedRuntime, OrchError> {
+        let data_volumes = self.prepare_data_volumes(vm_config)?;
         let Some(jails) = &self.jails else {
-            let host_overlay = self
-                .overlay_path_for_config(id, vm_config)
-                .map(PathBuf::from);
+            let host_overlay = vm_config.rootfs_path.as_ref().map(|_| {
+                snapshot_path.map_or_else(
+                    || PathBuf::from(self.overlay_path_for(id)),
+                    |snapshot| PathBuf::from(self.restore_overlay_path_for_snapshot(id, snapshot)),
+                )
+            });
             return Ok(PreparedRuntime {
                 host_socket: self.socket_path_for(id),
                 socket_argument: self.socket_path_for(id),
@@ -2779,6 +3396,7 @@ impl VmmSupervisor {
                 guest_overlay: host_overlay.as_ref().map(|path| path.display().to_string()),
                 host_overlay,
                 guest_snapshot: snapshot_path.map(|path| path.display().to_string()),
+                data_volumes,
                 jail: None,
             });
         };
@@ -2801,8 +3419,16 @@ impl VmmSupervisor {
                     let _ = jails.release(id);
                     return Err(error);
                 }
-                let overlay_path = if snapshot_path.is_some() {
-                    jail_restore_overlay_path(id)
+                let overlay_path = if let Some(snapshot_path) = snapshot_path {
+                    // VMM-created scratch paths are returned to taritd for an
+                    // inode-identity ownership handoff. Keep every jailed VMM
+                    // path absolute so host_path_for_vmm maps it back beneath
+                    // this VM's jail root; a relative `assets/...` path would
+                    // incorrectly resolve against taritd's working directory.
+                    jail_guest_path(
+                        &lease.root,
+                        Path::new(&self.restore_overlay_path_for_snapshot(id, snapshot_path)),
+                    )?
                 } else {
                     JAIL_OVERLAY_PATH.to_string()
                 };
@@ -2839,8 +3465,41 @@ impl VmmSupervisor {
             host_overlay,
             guest_overlay,
             guest_snapshot,
+            data_volumes,
             jail: Some(lease),
         })
+    }
+
+    fn prepare_data_volumes(
+        &self,
+        vm_config: &VmSpawnConfig,
+    ) -> Result<Vec<PreparedBlockAttachment>, OrchError> {
+        if vm_config.data_volumes.is_empty() {
+            return Ok(Vec::new());
+        }
+        vm_config
+            .data_volumes
+            .iter()
+            .map(|volume| {
+                let provider = crate::volume_provider::open(&self.config, &volume.provider)?;
+                provider
+                    .prepare(
+                        volume.id,
+                        volume.size_bytes,
+                        if volume.read_only {
+                            AccessMode::ReadOnlyMany
+                        } else {
+                            AccessMode::ReadWriteOnce
+                        },
+                        volume.generation,
+                    )
+                    .map_err(|error| {
+                        tracing::error!(volume_id = %volume.id, %error,
+                            "prepare runtime volume failed closed");
+                        OrchError::Internal(format!("prepare runtime volume {} failed", volume.id))
+                    })
+            })
+            .collect()
     }
 
     fn release_jail(&self, id: Uuid) -> Result<(), OrchError> {
@@ -3024,9 +3683,14 @@ impl VmmSupervisor {
 
     #[cfg(target_os = "linux")]
     fn cgroup_io_max_arg(&self, runtime: &PreparedRuntime) -> Result<Option<String>, OrchError> {
-        self.cgroup_io_max_for_paths(
+        self.cgroup_io_max_for_paths_and_files(
             runtime.host_rootfs.as_deref(),
             runtime.host_overlay.as_deref(),
+            &runtime
+                .data_volumes
+                .iter()
+                .map(|volume| &volume.file)
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -3035,6 +3699,16 @@ impl VmmSupervisor {
         &self,
         rootfs: Option<&Path>,
         overlay: Option<&Path>,
+    ) -> Result<Option<String>, OrchError> {
+        self.cgroup_io_max_for_paths_and_files(rootfs, overlay, &[])
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn cgroup_io_max_for_paths_and_files(
+        &self,
+        rootfs: Option<&Path>,
+        overlay: Option<&Path>,
+        data_volumes: &[&File],
     ) -> Result<Option<String>, OrchError> {
         use std::collections::BTreeSet;
 
@@ -3072,6 +3746,15 @@ impl VmmSupervisor {
                 ))
             })?;
             devices.insert(cgroup_device_number(&metadata)?);
+        }
+        for volume in data_volumes {
+            devices.insert(cgroup_device_number(&volume.metadata().map_err(
+                |error| {
+                    OrchError::Internal(format!(
+                        "inspect persistent volume for cgroup io.max: {error}"
+                    ))
+                },
+            )?)?);
         }
         if devices.is_empty() {
             return Ok(None);
@@ -3248,6 +3931,19 @@ impl VmmSupervisor {
                 bytes: ram_bytes,
                 inodes: 1,
             },
+            PathGrowth {
+                path: self
+                    .config
+                    .socket_dir
+                    .join("snapshots")
+                    .join(".integrity-reservation"),
+                bytes: ram_bytes
+                    .saturating_add(overlay_bytes)
+                    .div_ceil(u64::from(tarit_proto::INTEGRITY_CHUNK_SIZE))
+                    .saturating_mul(32)
+                    .saturating_add(4096),
+                inodes: 1,
+            },
         ];
         if has_overlay {
             growth.push(PathGrowth {
@@ -3257,6 +3953,22 @@ impl VmmSupervisor {
             });
         }
         self.disk_pressure.reserve_growth("VM snapshot", growth)
+    }
+
+    pub(crate) fn reserve_artifact_localization(
+        &self,
+        directory: PathBuf,
+        bytes: u64,
+        inodes: u64,
+    ) -> Result<DiskReservation, OrchError> {
+        self.disk_pressure.reserve_growth(
+            "artifact localization",
+            [PathGrowth {
+                path: directory,
+                bytes,
+                inodes,
+            }],
+        )
     }
 
     pub(crate) fn sweep_owned_artifacts(
@@ -3422,6 +4134,17 @@ impl VmmSupervisor {
             return Err(self.shutdown_error());
         }
 
+        if self
+            .booting
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?
+            .contains_key(&id)
+        {
+            return Err(OrchError::Conflict(format!(
+                "VM {id} already has a registered boot"
+            )));
+        }
+
         let control = Arc::new(BootControl::new(purpose));
         let socket_path = self.socket_path_for(id);
         self.register_artifact_owner(id)?;
@@ -3478,6 +4201,33 @@ impl VmmSupervisor {
             purpose,
             shape,
         })
+    }
+
+    /// Wait for a boot already registered for this VM, or recognize the narrow
+    /// handoff window after the runtime moved to `running`. The boot entry and
+    /// its completion signal share one control object, so callers cannot mistake
+    /// an unrelated leaked scheduler reservation for the active incarnation.
+    pub(crate) async fn wait_for_registered_boot_or_running(
+        &self,
+        id: Uuid,
+    ) -> Result<bool, OrchError> {
+        let control = self
+            .booting
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor booting lock poisoned".into()))?
+            .get(&id)
+            .map(|booting| Arc::clone(&booting.control));
+        let Some(control) = control else {
+            return self
+                .running
+                .lock()
+                .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))
+                .map(|running| running.contains_key(&id));
+        };
+        tokio::task::spawn_blocking(move || control.wait_for_completion())
+            .await
+            .map_err(|error| OrchError::Internal(format!("wait for registered boot: {error}")))??;
+        Ok(true)
     }
 
     /// Register an operation before spawning its async worker. The API/refill
@@ -4250,6 +5000,11 @@ impl VmmSupervisor {
                 .arg("--gid")
                 .arg(jail.gid.to_string())
                 .arg("--seccomp");
+            // `std::env::temp_dir()` caches the inherited TMPDIR. Once the VMM
+            // has chrooted, a host-absolute value is both unreachable and an
+            // information leak. prepare_jail_layout owns `/tmp` to the exact
+            // jail identity, so force every VMM scratch path into that tree.
+            command.env("TMPDIR", "/tmp").env_remove("XDG_RUNTIME_DIR");
             if let Some(jail_config) = &self.config.vm_jail {
                 if jail_config.pid_namespace {
                     command.arg("--pid-namespace");
@@ -4272,6 +5027,32 @@ impl VmmSupervisor {
             }
         };
         #[cfg(target_os = "linux")]
+        let inherited_kvm = if runtime.jail.is_some() {
+            match open_inherited_kvm() {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    drop(boot_gate);
+                    return Err(self.cleanup_boot_failure_without_process(
+                        id,
+                        &ticket.control,
+                        error,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(file) = &inherited_kvm {
+            let raw_fd = file.as_raw_fd();
+            command.env("VMM_KVM_FD", raw_fd.to_string());
+            // SAFETY: this runs only in the VMM child and clears CLOEXEC on the
+            // exact `/dev/kvm` descriptor opened and verified above.
+            unsafe {
+                command.pre_exec(move || clear_cloexec_for_child(raw_fd));
+            }
+        }
+        #[cfg(target_os = "linux")]
         if let (Some(allocation), Some(fd)) = (&net_alloc, &inherited_tap) {
             let raw_fd = fd.as_raw_fd();
             command.env("VMM_TAP_FDS", format!("{}={raw_fd}", allocation.tap));
@@ -4279,6 +5060,25 @@ impl VmmSupervisor {
             // the explicitly inherited TAP descriptor before exec.
             unsafe {
                 command.pre_exec(move || clear_cloexec_for_child(raw_fd));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if !runtime.data_volumes.is_empty() {
+            let raw_fds = runtime
+                .data_volumes
+                .iter()
+                .map(|volume| volume.file.as_raw_fd())
+                .collect::<Vec<_>>();
+            // SAFETY: this executes in the VMM child after fork. It changes
+            // only the verified volume descriptors retained by PreparedRuntime
+            // so they survive exec without exposing provider paths to the jail.
+            unsafe {
+                command.pre_exec(move || {
+                    for raw_fd in &raw_fds {
+                        clear_cloexec_for_child(*raw_fd)?;
+                    }
+                    Ok(())
+                });
             }
         }
         let child = match command
@@ -4357,7 +5157,12 @@ impl VmmSupervisor {
         };
         let net_alloc = match &self.net {
             Some(provisioner) => {
-                match provisioner.provision_with_owner(id, self.jail_identity(id)?) {
+                match provisioner.provision_with_owner_and_policy(
+                    id,
+                    self.jail_identity(id)?,
+                    &vm_config.egress_allowlist,
+                    vm_config.egress_allow_existing,
+                ) {
                     Ok(allocation) => Some(allocation),
                     Err(error) => {
                         let cause = match error {
@@ -4406,6 +5211,7 @@ impl VmmSupervisor {
             &runtime.vm_config,
             vm.net.as_ref(),
             runtime.guest_overlay.clone(),
+            &runtime.data_volumes,
         );
         let client = VmmClient::new(&vm.socket_path);
         if let Err(e) = client.create(vmm_config) {
@@ -4501,6 +5307,7 @@ impl VmmSupervisor {
         overlay: RestoreOverlay,
         vm_config: &VmSpawnConfig,
         shape: ResourceShape,
+        integrity: Option<VerifiedSnapshotIntegrity>,
     ) -> Result<BootedVm, OrchError> {
         let id = ticket.id;
         debug_assert_eq!(ticket.shape, shape);
@@ -4516,9 +5323,47 @@ impl VmmSupervisor {
                 return Err(error);
             }
         };
+        let (memory_integrity, overlay_integrity, integrity_chunk_size) = match integrity {
+            Some(integrity) => {
+                let manifest_path = if let Some(jail) = &runtime.jail {
+                    let destination = jail
+                        .root
+                        .join(JAIL_RESTORE_INTEGRITY_PATH.trim_start_matches('/'));
+                    if let Err(error) = copy_jail_asset(
+                        Path::new(&integrity.manifest_path),
+                        &destination,
+                        jail.uid,
+                        jail.gid,
+                    ) {
+                        return Err(self.cleanup_boot_failure_without_process(
+                            id,
+                            &ticket.control,
+                            error,
+                        ));
+                    }
+                    JAIL_RESTORE_INTEGRITY_PATH.to_string()
+                } else {
+                    integrity.manifest_path
+                };
+                (
+                    Some(tarit_vmm_client::MemoryIntegrity {
+                        manifest_path,
+                        manifest_sha256: integrity.manifest_sha256,
+                    }),
+                    integrity.overlay,
+                    integrity.chunk_size,
+                )
+            }
+            None => (None, None, 0),
+        };
         let net_alloc = match &self.net {
             Some(provisioner) => {
-                match provisioner.provision_with_owner(id, self.jail_identity(id)?) {
+                match provisioner.provision_with_owner_and_policy(
+                    id,
+                    self.jail_identity(id)?,
+                    &vm_config.egress_allowlist,
+                    vm_config.egress_allow_existing,
+                ) {
                     Ok(allocation) => Some(allocation),
                     Err(error) => {
                         return Err(self.cleanup_boot_failure_without_process(
@@ -4583,6 +5428,32 @@ impl VmmSupervisor {
                         ));
                     }
                 }
+                if let Some(integrity) = overlay_integrity.as_ref() {
+                    let destination_artifact =
+                        OwnedArtifact::capture(&destination).map_err(|error| {
+                            self.cleanup_boot_failure(
+                                id,
+                                &ticket.control,
+                                &base_vm,
+                                OrchError::Internal(format!(
+                                    "capture seeded restore disk upper: {error}"
+                                )),
+                            )
+                        })?;
+                    if let Err(error) = verify_file_artifact_integrity(
+                        &destination_artifact._file,
+                        integrity,
+                        integrity_chunk_size,
+                        "seeded restore disk",
+                    ) {
+                        return Err(self.cleanup_boot_failure(
+                            id,
+                            &ticket.control,
+                            &base_vm,
+                            error,
+                        ));
+                    }
+                }
                 runtime
                     .guest_overlay
                     .clone()
@@ -4598,11 +5469,21 @@ impl VmmSupervisor {
             .into_iter()
             .collect::<Vec<_>>();
 
-        let client = VmmClient::new(&vm.socket_path);
+        // A restore can legitimately spend longer than the control client's
+        // default five-second I/O timeout servicing lazy faults and waiting
+        // for the guest clone-repair barrier. Keep the request bounded by the
+        // lifecycle deadline used by the other snapshot operations.
+        let client = VmmClient::new(&vm.socket_path).with_request_timeout(LIFECYCLE_OP_TIMEOUT);
         let restore_path = runtime.guest_snapshot.as_deref().unwrap_or(snapshot_path);
-        if let Err(e) =
-            client.restore_with_network_override(restore_path, overlay.clone(), Some(net_override))
-        {
+        let volume_override = runtime_volume_configs(&runtime.data_volumes);
+        if let Err(e) = client.restore_with_resource_overrides(
+            restore_path,
+            overlay.clone(),
+            Some(net_override),
+            Some(volume_override),
+            tarit_vmm_client::RestoreMemoryPolicy::Auto,
+            memory_integrity,
+        ) {
             return Err(self.cleanup_boot_failure(
                 id,
                 &ticket.control,
@@ -4627,21 +5508,28 @@ impl VmmSupervisor {
         snapshot_overlay_path: Option<String>,
         vm_config: VmSpawnConfig,
         shape: ResourceShape,
+        integrity: VerifiedSnapshotIntegrity,
     ) -> Result<BootedVm, OrchError> {
         let overlay = snapshot_overlay_path
             .map(PathBuf::from)
             .map(RestoreOverlay::Seeded)
             .unwrap_or(RestoreOverlay::None);
-        self.spawn_and_restore(ticket, &snapshot_path, overlay, &vm_config, shape)
+        self.spawn_and_restore(
+            ticket,
+            &snapshot_path,
+            overlay,
+            &vm_config,
+            shape,
+            Some(integrity),
+        )
     }
 
     /// Boot one warm-pool VM of `class` and park it in the warm queue. The boot
     /// happens without the warm lock held; only the final enqueue takes it.
-    /// Block until the guest agent can actually run a command, so we never park a
-    /// still-booting VM. A freshly-parked, not-yet-ready VM handed out during a
-    /// burst blocks the caller for seconds on its first agent dial (the burst
-    /// p95 tail). Bounded; parks anyway on timeout so a wedged guest can't stall
-    /// replenishment forever.
+    /// Block until the guest agent answers its transport-level no-op, so we
+    /// never park a still-booting VM. The empty command is handled directly by
+    /// the agent and deliberately does not require `/bin/sh`; distroless OCI
+    /// guests are valid even though ordinary shell execution returns 127.
     fn await_ready(&self, socket: &Path, control: &BootControl) -> Result<(), OrchError> {
         wait_for_guest_ready(
             readiness_timeout(ReadinessCheck::Boot),
@@ -4658,10 +5546,10 @@ impl VmmSupervisor {
                 let client = VmmClient::new(socket)
                     .with_connect_timeout(request_timeout)
                     .with_request_timeout(request_timeout);
-                match client.exec("true", exec_timeout_ms) {
+                match client.exec("", exec_timeout_ms) {
                     Ok((0, _, _, _)) => Ok(true),
                     Ok((code, _, _, _)) => {
-                        Err(format!("readiness command exited with status {code}"))
+                        Err(format!("agent readiness probe exited with status {code}"))
                     }
                     Err(error) => Err(error.to_string()),
                 }
@@ -5022,7 +5910,7 @@ impl VmmSupervisor {
         let restore_spec = spec.clone();
         let booted = tokio::task::spawn_blocking(move || {
             let (snapshot_path, overlay) = bundle.into_restore_parts();
-            worker.spawn_and_restore(ticket, &snapshot_path, overlay, &restore_spec, shape)
+            worker.spawn_and_restore(ticket, &snapshot_path, overlay, &restore_spec, shape, None)
         })
         .await;
         let booted = match booted {
@@ -6107,10 +6995,10 @@ impl VmmSupervisor {
                 let client = VmmClient::new(socket)
                     .with_connect_timeout(request_timeout)
                     .with_request_timeout(request_timeout);
-                match client.exec("true", exec_timeout_ms) {
+                match client.exec("", exec_timeout_ms) {
                     Ok((0, _, _, _)) => Ok(true),
                     Ok((code, _, _, _)) => {
-                        Err(format!("resume readiness exited with status {code}"))
+                        Err(format!("resume agent probe exited with status {code}"))
                     }
                     Err(error) => Err(error.to_string()),
                 }
@@ -6184,6 +7072,22 @@ impl VmmSupervisor {
     pub fn status_vm(&self, id: Uuid) -> Result<tarit_vmm_client::VmStatus, OrchError> {
         let client = self.client_for(id)?.with_request_timeout(STATUS_OP_TIMEOUT);
         client.status().map_err(|e| OrchError::Vmm(e.to_string()))
+    }
+
+    pub fn set_balloon_vm(
+        &self,
+        id: Uuid,
+        target_mib: u64,
+    ) -> Result<(u64, u64, u32, u32), OrchError> {
+        self.client_for(id)?
+            .set_balloon(target_mib)
+            .map_err(|error| OrchError::Vmm(format!("set balloon: {error}")))
+    }
+
+    pub fn balloon_vm(&self, id: Uuid) -> Result<(u64, u64, u32, u32), OrchError> {
+        self.client_for(id)?
+            .balloon()
+            .map_err(|error| OrchError::Vmm(format!("get balloon: {error}")))
     }
 
     pub fn exec_vm(
@@ -6349,14 +7253,162 @@ impl VmmSupervisor {
         let bundle = SnapshotBundle {
             snapshot_path: ram_destination.display().to_string(),
             overlay_path,
+            live_stats: None,
             artifacts: publications
                 .into_iter()
                 .map(|(artifact, _)| artifact)
                 .collect(),
+            precomputed_integrity: None,
             in_progress_artifacts: Arc::clone(&self.in_progress_artifacts),
             registered_paths,
         };
         Ok(bundle)
+    }
+
+    /// Capture RAM, device state, and the optional writable disk upper from one
+    /// atomic live-snapshot boundary, then move the immutable pair into the
+    /// orchestrator's durable namespace after the source VM has resumed.
+    pub(crate) fn live_snapshot_bundle_vm(
+        &self,
+        id: Uuid,
+        memory_mib: u64,
+        expects_overlay: bool,
+    ) -> Result<SnapshotBundle, OrchError> {
+        let _reservation = self.reserve_snapshot_space(id, memory_mib, expects_overlay)?;
+        let client = self.lifecycle_client_for(id)?;
+        let (
+            scratch_ram_vmm_path,
+            scratch_overlay_vmm_path,
+            scratch_integrity_vmm_path,
+            live_stats,
+        ) = client
+            .live_snapshot_unreleased()
+            .map_err(|error| OrchError::Vmm(format!("atomic live snapshot: {error}")))?;
+        if scratch_overlay_vmm_path.is_some() != expects_overlay {
+            return Err(OrchError::Vmm(format!(
+                "atomic live snapshot disk mismatch: expected overlay={expects_overlay}, VMM returned overlay={}",
+                scratch_overlay_vmm_path.is_some()
+            )));
+        }
+
+        let scratch_ram_host_path = self.host_path_for_vmm(id, &scratch_ram_vmm_path);
+        let scratch_ram = OwnedArtifact::capture(&scratch_ram_host_path).map_err(|error| {
+            OrchError::Internal(format!("capture live RAM scratch ownership: {error}"))
+        })?;
+        let scratch_overlay = match scratch_overlay_vmm_path.as_deref() {
+            Some(path) => {
+                let host_path = self.host_path_for_vmm(id, path);
+                Some((
+                    path.to_string(),
+                    host_path.clone(),
+                    OwnedArtifact::capture(&host_path).map_err(|error| {
+                        OrchError::Internal(format!("capture live disk scratch ownership: {error}"))
+                    })?,
+                ))
+            }
+            None => None,
+        };
+        let expected_uid = self
+            .jail_identity(id)?
+            .map(|(uid, _)| uid)
+            .unwrap_or_else(|| unsafe { libc::geteuid() });
+        let scratch_integrity_host_path = self.host_path_for_vmm(id, &scratch_integrity_vmm_path);
+        let scratch_integrity = capture_private_artifact_owned(
+            &scratch_integrity_host_path,
+            expected_uid,
+        )
+        .map_err(|error| {
+            OrchError::Internal(format!("capture live integrity scratch ownership: {error}"))
+        })?;
+
+        let ram_staging = self.snapshot_ram_staging_path();
+        let ram_destination = self.snapshot_ram_path();
+        let ram_artifact =
+            copy_private_artifact_owned(&scratch_ram_host_path, &ram_staging, expected_uid)
+                .map_err(|error| {
+                    OrchError::Internal(format!("claim durable live RAM snapshot: {error}"))
+                })?;
+        let overlay_artifact = match scratch_overlay.as_ref() {
+            Some((_, host_path, _)) => {
+                let staging = self.snapshot_overlay_staging_path();
+                let destination = self.snapshot_overlay_path();
+                match copy_private_artifact_owned(host_path, &staging, expected_uid) {
+                    Ok(artifact) => Some((artifact, destination)),
+                    Err(error) => {
+                        let _ = ram_artifact.remove();
+                        return Err(OrchError::Internal(format!(
+                            "claim durable live disk snapshot: {error}"
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let cleanup_durable = |ram: OwnedArtifact, overlay: Option<(OwnedArtifact, PathBuf)>| {
+            let _ = ram.remove();
+            if let Some((overlay, _)) = overlay {
+                let _ = overlay.remove();
+            }
+        };
+        if let Err(error) = client.release_scratch(&scratch_ram_vmm_path, scratch_ram.identity()) {
+            cleanup_durable(ram_artifact, overlay_artifact);
+            return Err(OrchError::Vmm(format!("claim live RAM scratch: {error}")));
+        }
+        if let Err(error) = scratch_ram.remove() {
+            tracing::warn!(
+                path = %scratch_ram_host_path.display(),
+                "released live RAM scratch cleanup deferred to VMM GC: {error}"
+            );
+        }
+        if let Some((vmm_path, host_path, scratch)) = scratch_overlay {
+            if let Err(error) = client.release_scratch(&vmm_path, scratch.identity()) {
+                cleanup_durable(ram_artifact, overlay_artifact);
+                return Err(OrchError::Vmm(format!("claim live disk scratch: {error}")));
+            }
+            if let Err(error) = scratch.remove() {
+                tracing::warn!(
+                    path = %host_path.display(),
+                    "released live disk scratch cleanup deferred to VMM GC: {error}"
+                );
+            }
+        }
+        if let Err(error) =
+            client.release_scratch(&scratch_integrity_vmm_path, scratch_integrity.identity())
+        {
+            cleanup_durable(ram_artifact, overlay_artifact);
+            return Err(OrchError::Vmm(format!(
+                "claim live integrity scratch: {error}"
+            )));
+        }
+
+        let overlay_path = overlay_artifact
+            .as_ref()
+            .map(|(_, destination)| destination.display().to_string());
+        let mut publications = vec![(ram_artifact, ram_destination.clone())];
+        publications.extend(overlay_artifact);
+        let registered_paths = match self.publish_artifacts(&mut publications) {
+            Ok(paths) => paths,
+            Err(error) => {
+                for (artifact, _) in publications {
+                    let _ = artifact.remove();
+                }
+                let _ = scratch_integrity.remove();
+                return Err(error);
+            }
+        };
+        Ok(SnapshotBundle {
+            snapshot_path: ram_destination.display().to_string(),
+            overlay_path,
+            live_stats: Some(live_stats),
+            artifacts: publications
+                .into_iter()
+                .map(|(artifact, _)| artifact)
+                .collect(),
+            precomputed_integrity: Some(scratch_integrity),
+            in_progress_artifacts: Arc::clone(&self.in_progress_artifacts),
+            registered_paths,
+        })
     }
 
     pub fn update_egress(
@@ -6684,6 +7736,17 @@ fn remove_file_if_present(path: &Path) -> Result<(), std::io::Error> {
     }
 }
 
+fn jail_guest_path(jail_root: &Path, host_path: &Path) -> Result<String, OrchError> {
+    let relative = host_path.strip_prefix(jail_root).map_err(|_| {
+        OrchError::Internal(format!(
+            "jail asset {} escaped VM jail root {}",
+            host_path.display(),
+            jail_root.display()
+        ))
+    })?;
+    Ok(Path::new("/").join(relative).to_string_lossy().into_owned())
+}
+
 fn prepare_jail_layout(lease: &JailLease) -> Result<(), OrchError> {
     for (relative, mode) in [
         ("run", 0o700),
@@ -6701,7 +7764,8 @@ fn prepare_jail_layout(lease: &JailLease) -> Result<(), OrchError> {
         })?;
         set_jail_owner_mode(&path, lease.uid, lease.gid, mode)?;
     }
-    stage_jail_device(Path::new("/dev/kvm"), &lease.root.join("dev/kvm"), lease)?;
+    // KVM is deliberately not present in the jail. The privileged launcher
+    // passes a verified, already-open descriptor to the confined VMM instead.
     stage_jail_device(
         Path::new("/dev/net/tun"),
         &lease.root.join("dev/net/tun"),
@@ -6845,6 +7909,24 @@ fn copy_private_artifact(
     destination_path: &Path,
 ) -> std::io::Result<OwnedArtifact> {
     copy_private_artifact_owned(source_path, destination_path, unsafe { libc::geteuid() })
+}
+
+fn capture_private_artifact_owned(
+    source_path: &Path,
+    expected_uid: u32,
+) -> std::io::Result<OwnedArtifact> {
+    let artifact = OwnedArtifact::capture(source_path)?;
+    let metadata = artifact._file.metadata()?;
+    if metadata.uid() != expected_uid || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} must be owned by uid {expected_uid}, mode 0600, with one link",
+                source_path.display()
+            ),
+        ));
+    }
+    Ok(artifact)
 }
 
 fn copy_private_artifact_owned(
@@ -7159,7 +8241,7 @@ where
         match probe(remaining) {
             Ok(true) => return Ok(()),
             Ok(false) => {
-                last = "guest agent readiness command did not succeed".to_string();
+                last = "guest agent readiness probe did not succeed".to_string();
             }
             Err(error) => last = error,
         }
@@ -7177,7 +8259,12 @@ where
 
 #[cfg(any(target_os = "linux", test))]
 fn cgroup_device_number(metadata: &std::fs::Metadata) -> Result<String, OrchError> {
-    let device = libc::dev_t::try_from(metadata.dev())
+    let raw_device = if metadata.file_type().is_block_device() {
+        metadata.rdev()
+    } else {
+        metadata.dev()
+    };
+    let device = libc::dev_t::try_from(raw_device)
         .map_err(|_| OrchError::Internal("filesystem device number does not fit dev_t".into()))?;
     let device = format!("{}:{}", libc::major(device), libc::minor(device));
     #[cfg(target_os = "linux")]
@@ -7654,54 +8741,6 @@ impl TryFrom<&NetAlloc> for RestoredGuestNetwork {
     }
 }
 
-fn restored_guest_exec(
-    client: &VmmClient,
-    command: &str,
-    operation: &str,
-) -> Result<String, OrchError> {
-    let timeout_ms = u64::try_from(RESTORE_NETWORK_EXEC_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
-    match client.exec(command, timeout_ms) {
-        Ok((0, stdout, _, _)) => Ok(stdout),
-        Ok((exit_code, _, stderr, _)) => Err(OrchError::Vmm(format!(
-            "restore guest network {operation} exited with status {exit_code}: {}",
-            stderr.trim()
-        ))),
-        Err(error) => Err(OrchError::Vmm(format!(
-            "restore guest network {operation}: {error}"
-        ))),
-    }
-}
-
-fn restored_guest_has_address(output: &str, network: RestoredGuestNetwork) -> bool {
-    let expected = format!("{}/{}", network.guest_ip, network.prefix);
-    let addresses = output
-        .lines()
-        .flat_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            fields
-                .windows(2)
-                .filter_map(|fields| (fields[0] == "inet").then_some(fields[1]))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    addresses == [expected.as_str()]
-}
-
-fn restored_guest_has_default_route(output: &str, network: RestoredGuestNetwork) -> bool {
-    let routes = output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if routes.len() != 1 {
-        return false;
-    }
-    let gateway = network.gateway.to_string();
-    let fields = routes[0].split_whitespace().collect::<Vec<_>>();
-    fields == ["default", "via", gateway.as_str()]
-        || fields == ["default", "via", gateway.as_str(), "dev", "eth0"]
-}
-
 fn rebind_restored_guest_network(
     socket_path: &Path,
     allocation: &NetAlloc,
@@ -7718,30 +8757,6 @@ fn rebind_restored_guest_network(
             dns_servers: Vec::new(),
         })
         .map_err(|error| OrchError::Vmm(format!("restore guest network rebind: {error}")))?;
-
-    let addresses =
-        restored_guest_exec(&client, "ip -4 -o address show dev eth0", "verify address")?;
-    if !restored_guest_has_address(&addresses, network) {
-        return Err(OrchError::Vmm(format!(
-            "restore guest network address verification failed: expected {}/{} on eth0, got {:?}",
-            network.guest_ip,
-            network.prefix,
-            addresses.trim()
-        )));
-    }
-
-    let routes = restored_guest_exec(
-        &client,
-        "ip -4 route show default dev eth0",
-        "verify default route",
-    )?;
-    if !restored_guest_has_default_route(&routes, network) {
-        return Err(OrchError::Vmm(format!(
-            "restore guest network route verification failed: expected default via {} dev eth0, got {:?}",
-            network.gateway,
-            routes.trim()
-        )));
-    }
 
     Ok(())
 }
@@ -7791,6 +8806,7 @@ fn build_vmm_config(
     cfg: &VmSpawnConfig,
     net: Option<&NetAlloc>,
     overlay: Option<String>,
+    data_volumes: &[PreparedBlockAttachment],
 ) -> VmConfig {
     let mut volumes = Vec::new();
     // Every rootfs is an immutable base with a per-VM sparse CoW overlay. Never
@@ -7801,8 +8817,10 @@ fn build_vmm_config(
             path: rootfs.display().to_string(),
             read_only: false,
             overlay: overlay.clone(),
+            inherited_fd: None,
         });
     }
+    volumes.extend(runtime_volume_configs(data_volumes));
 
     // Host isolation always uses a CoW overlay. This independent flag controls
     // whether the guest itself mounts the root filesystem read-only.
@@ -7835,6 +8853,18 @@ fn build_vmm_config(
         volumes,
         net: nets,
     }
+}
+
+fn runtime_volume_configs(volumes: &[PreparedBlockAttachment]) -> Vec<VolumeConfig> {
+    volumes
+        .iter()
+        .map(|volume| VolumeConfig {
+            path: format!("volume:{}", volume.volume_id),
+            read_only: volume.read_only,
+            overlay: None,
+            inherited_fd: Some(volume.file.as_raw_fd()),
+        })
+        .collect()
 }
 
 fn net_config_for_allocation(allocation: &NetAlloc) -> NetConfig {
@@ -7871,6 +8901,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::mpsc;
     use std::thread;
+    use tarit_volume::BlockVolumeProvider;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -8108,6 +9139,7 @@ mod tests {
             )])
             .unwrap(),
             host_id: "test-host".into(),
+            host_session_id: Uuid::nil(),
             vmm_bin: root.join("vmm-must-not-run"),
             kernel: root.join("kernel"),
             rootfs: root.join("rootfs"),
@@ -8115,10 +9147,14 @@ mod tests {
             db_path: root.join("fleet.db"),
             net_state_path: root.join("net-state.json"),
             images_dir: root.join("images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
@@ -8162,6 +9198,9 @@ mod tests {
             rootfs_path,
             cmdline: DEFAULT_CMDLINE.to_string(),
             read_only,
+            egress_allowlist: Vec::new(),
+            egress_allow_existing: false,
+            data_volumes: Vec::new(),
         }
     }
 
@@ -8539,6 +9578,7 @@ mod tests {
             )])
             .unwrap(),
             host_id: "test-host".into(),
+            host_session_id: Uuid::nil(),
             vmm_bin: PathBuf::from("true"),
             kernel: PathBuf::from("kernel"),
             rootfs: PathBuf::from("rootfs"),
@@ -8546,10 +9586,14 @@ mod tests {
             db_path: PathBuf::from("target/taritd-supervisor-test/fleet.db"),
             net_state_path: PathBuf::from("target/taritd-supervisor-test/net-state.json"),
             images_dir: PathBuf::from("target/taritd-supervisor-test/images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
@@ -9071,7 +10115,7 @@ mod tests {
             Some(expected.clone())
         );
 
-        let vmm_config = build_vmm_config(&cfg, None, Some(expected.clone()));
+        let vmm_config = build_vmm_config(&cfg, None, Some(expected.clone()), &[]);
         assert_eq!(vmm_config.volumes.len(), 1);
         assert_eq!(vmm_config.volumes[0].overlay, Some(expected));
         assert!(!vmm_config.volumes[0].read_only);
@@ -9086,8 +10130,54 @@ mod tests {
             &configured_rw,
             None,
             supervisor.overlay_path_for_config(id, &configured_rw),
+            &[],
         );
         assert!(rw_config.kernel.cmdline.contains("root=/dev/vda rw"));
+    }
+
+    #[test]
+    fn persistent_volume_is_opened_once_and_rendered_as_an_inherited_descriptor() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/runtime-volume-{}", Uuid::new_v4()));
+        let config = supervisor_config(&root);
+        let provider = tarit_volume::LocalBlockProvider::open(
+            config.images_dir.join("volumes"),
+            config.host_id.clone(),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        let volume_id = Uuid::new_v4();
+        provider.create(volume_id, 4 * 1024 * 1024).unwrap();
+        let supervisor = VmmSupervisor::new(config);
+        let mut cfg = spawn_config(false, None);
+        cfg.data_volumes.push(VmDataVolumeConfig {
+            id: volume_id,
+            provider: "local_block".into(),
+            size_bytes: 4 * 1024 * 1024,
+            read_only: false,
+            generation: 1,
+        });
+
+        let runtime = supervisor
+            .prepare_runtime(Uuid::new_v4(), &cfg, None)
+            .unwrap();
+        assert_eq!(runtime.data_volumes.len(), 1);
+        let raw_fd = runtime.data_volumes[0].file.as_raw_fd();
+        assert_ne!(
+            unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let vmm = build_vmm_config(&runtime.vm_config, None, None, &runtime.data_volumes);
+        assert_eq!(vmm.volumes.len(), 1);
+        assert_eq!(vmm.volumes[0].path, format!("volume:{volume_id}"));
+        assert_eq!(vmm.volumes[0].inherited_fd, Some(raw_fd));
+        assert!(!vmm.volumes[0]
+            .path
+            .contains(root.to_string_lossy().as_ref()));
+
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -9120,7 +10210,34 @@ mod tests {
         let next_id = Uuid::new_v4();
         let next_restored = supervisor.runtime_layout_for_restore_config(next_id, &cfg);
         assert_ne!(restored.overlay_path, next_restored.overlay_path);
+
+        let snapshot_overlay = supervisor
+            .restore_overlay_path_for_snapshot(id, Path::new("/private/snapshot-handle.ram"));
+        assert!(supervisor.is_valid_restore_overlay_path(id, Path::new(&snapshot_overlay)));
+        assert!(!supervisor.is_valid_restore_overlay_path(
+            id,
+            &root.join(format!(
+                "jails/tarit-{id}/assets/restored-rootfs-{id}-BAD.cow"
+            ))
+        ));
+        assert!(!supervisor.is_valid_restore_overlay_path(
+            id,
+            &root.join(format!(
+                "jails/tarit-{id}/elsewhere/restored-rootfs-{id}-0123456789abcdef.cow"
+            ))
+        ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn jailed_snapshot_restore_passes_an_absolute_overlay_to_vmm() {
+        let jail_root = Path::new("/worker/jails/123/root");
+        let host_overlay = jail_root.join("assets/restored-rootfs-123.cow");
+        assert_eq!(
+            jail_guest_path(jail_root, &host_overlay).unwrap(),
+            "/assets/restored-rootfs-123.cow"
+        );
+        assert!(jail_guest_path(jail_root, Path::new("/worker/other.cow")).is_err());
     }
 
     #[test]
@@ -9631,6 +10748,67 @@ mod tests {
 
         assert!(!supervisor.scheduler.is_reserved(id));
         assert!(!supervisor.has_retained_boot(id));
+    }
+
+    #[test]
+    fn duplicate_boot_registration_joins_without_replacing_the_owner() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let ticket = test_runtime()
+            .block_on(supervisor.begin_boot_with_registration(
+                id,
+                SpawnPurpose::Live,
+                ResourceShape::new(1, 1),
+                || async { Ok(()) },
+            ))
+            .unwrap();
+
+        let duplicate = test_runtime().block_on(supervisor.begin_boot_with_registration(
+            id,
+            SpawnPurpose::Live,
+            ResourceShape::new(1, 1),
+            || async { Ok(()) },
+        ));
+        assert!(matches!(duplicate, Err(OrchError::Conflict(_))));
+        assert!(supervisor
+            .booting
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|booting| Arc::ptr_eq(&booting.control, &ticket.control)));
+
+        let waiting_supervisor = Arc::clone(&supervisor);
+        let waiter = thread::spawn(move || {
+            test_runtime().block_on(waiting_supervisor.wait_for_registered_boot_or_running(id))
+        });
+        ticket.control.complete(Ok(()));
+        assert!(waiter.join().unwrap().unwrap());
+
+        supervisor.complete_booting(id, &ticket.control, Ok(()));
+        supervisor.release_reservation_after_terminal(id).unwrap();
+        assert!(!supervisor.has_retained_boot(id));
+    }
+
+    #[test]
+    fn late_boot_join_recognizes_runtime_handoff_without_accepting_a_bare_reservation() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        supervisor.reserve_existing_for_test(id);
+        assert!(!test_runtime()
+            .block_on(supervisor.wait_for_registered_boot_or_running(id))
+            .unwrap());
+
+        let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        supervisor.running.lock().unwrap().insert(
+            id,
+            RunningVm::new(process.pid, PathBuf::new(), process, None),
+        );
+        assert!(test_runtime()
+            .block_on(supervisor.wait_for_registered_boot_or_running(id))
+            .unwrap());
+
+        supervisor.stop_vm(id).unwrap();
+        supervisor.release_reservation_after_terminal(id).unwrap();
     }
 
     #[test]
@@ -10318,7 +11496,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_network_rebind_uses_typed_repair_and_fixed_verification() {
+    fn restored_network_rebind_uses_typed_agent_repair() {
         let socket_path = PathBuf::from(format!(
             "target/taritd-restore-network-{}-{}.sock",
             std::process::id(),
@@ -10326,16 +11504,6 @@ mod tests {
         ));
         std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let expected = [
-            (
-                "ip -4 -o address show dev eth0",
-                "2: eth0 inet 172.16.0.30/30 scope global eth0\n",
-            ),
-            (
-                "ip -4 route show default dev eth0",
-                "default via 172.16.0.29 dev eth0\n",
-            ),
-        ];
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut length = [0_u8; 4];
@@ -10363,37 +11531,6 @@ mod tests {
                 .unwrap();
             stream.write_all(&encoded).unwrap();
             stream.flush().unwrap();
-
-            for (expected_command, stdout) in expected {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut length = [0_u8; 4];
-                stream.read_exact(&mut length).unwrap();
-                let mut body = vec![0; u32::from_be_bytes(length) as usize];
-                stream.read_exact(&mut body).unwrap();
-                let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
-                match request {
-                    tarit_vmm_client::ApiRequest::Exec {
-                        command,
-                        timeout_ms,
-                    } => {
-                        assert_eq!(command, expected_command);
-                        assert_eq!(timeout_ms, RESTORE_NETWORK_EXEC_TIMEOUT.as_millis() as u64);
-                    }
-                    request => panic!("unexpected restore network request: {request:?}"),
-                }
-                let response = tarit_vmm_client::ApiResponse::Exec {
-                    exit_code: 0,
-                    stdout: stdout.into(),
-                    stderr: String::new(),
-                    duration_ms: 1,
-                };
-                let encoded = serde_json::to_vec(&response).unwrap();
-                stream
-                    .write_all(&(encoded.len() as u32).to_be_bytes())
-                    .unwrap();
-                stream.write_all(&encoded).unwrap();
-                stream.flush().unwrap();
-            }
         });
         let allocation = NetAlloc {
             idx: 7,
@@ -10444,28 +11581,6 @@ mod tests {
             rebind_restored_guest_network(Path::new("missing.sock"), &allocation).unwrap_err();
 
         assert!(error.to_string().contains("parse restored guest IPv4"));
-    }
-
-    #[test]
-    fn restored_network_verification_rejects_stale_guest_state() {
-        let network = RestoredGuestNetwork {
-            guest_ip: "172.16.0.30".parse().unwrap(),
-            gateway: "172.16.0.29".parse().unwrap(),
-            prefix: 30,
-        };
-
-        assert!(!restored_guest_has_address(
-            "2: eth0 inet 172.16.0.2/30 scope global eth0\n",
-            network
-        ));
-        assert!(!restored_guest_has_default_route(
-            "default via 172.16.0.1 dev eth0\n",
-            network
-        ));
-        assert!(restored_guest_has_default_route(
-            "default via 172.16.0.29\n",
-            network
-        ));
     }
 
     #[test]
@@ -10741,6 +11856,146 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn integrity_manifest_authenticates_snapshot_metadata_ram_and_disk_chunks() {
+        let dir = PathBuf::from(format!("target/snapshot-integrity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ram_path = dir.join("snapshot.ram");
+        let overlay_path = dir.join("snapshot.cow");
+        let state = b"serialized-device-and-vcpu-state";
+        let memory = vec![0x5a; tarit_proto::INTEGRITY_CHUNK_SIZE as usize * 2];
+        let mut header = Vec::new();
+        header.extend_from_slice(b"VMSN");
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&(state.len() as u64).to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&(memory.len() as u64).to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(header.len(), 32);
+        let mut ram = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&ram_path)
+            .unwrap();
+        ram.write_all(&header).unwrap();
+        ram.write_all(state).unwrap();
+        ram.write_all(&memory).unwrap();
+        ram.sync_all().unwrap();
+        std::fs::write(&overlay_path, b"private disk upper").unwrap();
+        std::fs::set_permissions(&overlay_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let artifacts = vec![
+            OwnedArtifact::capture(&ram_path).unwrap(),
+            OwnedArtifact::capture(&overlay_path).unwrap(),
+        ];
+        let manifest = snapshot_integrity_manifest(&artifacts, None).unwrap();
+        assert_eq!(
+            manifest
+                .artifact(tarit_proto::ArtifactKind::SnapshotMetadata)
+                .unwrap()
+                .len,
+            (header.len() + state.len()) as u64
+        );
+        let memory_integrity = manifest.artifact(tarit_proto::ArtifactKind::Ram).unwrap();
+        assert_eq!(memory_integrity.chunk_hashes.len(), 2);
+        assert!(manifest
+            .artifact(tarit_proto::ArtifactKind::Overlay)
+            .is_some());
+        let encoded = manifest.encode().unwrap();
+        assert_eq!(
+            tarit_proto::IntegrityManifest::decode(&encoded).unwrap(),
+            manifest
+        );
+
+        ram.write_all_at(b"tampered", (header.len() + state.len()) as u64)
+            .unwrap();
+        let tampered = hash_artifact_range(
+            &ram,
+            tarit_proto::ArtifactKind::Ram,
+            (header.len() + state.len()) as u64,
+            memory.len() as u64,
+            u64::from(tarit_proto::INTEGRITY_CHUNK_SIZE),
+        )
+        .unwrap();
+        assert_ne!(tampered.chunk_hashes, memory_integrity.chunk_hashes);
+
+        drop(artifacts);
+        drop(ram);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn precomputed_live_integrity_is_layout_bound_and_preserves_disk_verification() {
+        let dir = PathBuf::from(format!(
+            "target/precomputed-live-integrity-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ram_path = dir.join("snapshot.ram");
+        let overlay_path = dir.join("snapshot.cow");
+        let sidecar_path = dir.join("snapshot.precomputed");
+        let state = b"live-state";
+        let memory = vec![0xa5; tarit_proto::INTEGRITY_CHUNK_SIZE as usize + 17];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"VMSN");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(state.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(memory.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(state);
+        bytes.extend_from_slice(&memory);
+        std::fs::write(&ram_path, &bytes).unwrap();
+        std::fs::set_permissions(&ram_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&overlay_path, b"disk-upper").unwrap();
+        std::fs::set_permissions(&overlay_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let ram_artifact = OwnedArtifact::capture(&ram_path).unwrap();
+        let generated =
+            snapshot_integrity_manifest(std::slice::from_ref(&ram_artifact), None).unwrap();
+        TEST_RAM_INTEGRITY_HASH_PASSES.with(|passes| passes.set(0));
+        std::fs::write(&sidecar_path, generated.encode().unwrap()).unwrap();
+        std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let sidecar = OwnedArtifact::capture(&sidecar_path).unwrap();
+        let artifacts = vec![ram_artifact, OwnedArtifact::capture(&overlay_path).unwrap()];
+        let adopted = snapshot_integrity_manifest(&artifacts, Some(&sidecar)).unwrap();
+        TEST_RAM_INTEGRITY_HASH_PASSES.with(|passes| {
+            assert_eq!(
+                passes.get(),
+                0,
+                "precomputed live integrity must avoid a second RAM hash pass"
+            );
+        });
+        assert_eq!(
+            adopted.artifact(tarit_proto::ArtifactKind::Ram).unwrap(),
+            generated.artifact(tarit_proto::ArtifactKind::Ram).unwrap()
+        );
+        assert!(adopted
+            .artifact(tarit_proto::ArtifactKind::Overlay)
+            .is_some());
+
+        OpenOptions::new()
+            .write(true)
+            .open(&ram_path)
+            .unwrap()
+            .write_all_at(b"X", 4)
+            .unwrap();
+        let error = snapshot_integrity_manifest(&artifacts, Some(&sidecar)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match snapshot metadata"));
+
+        drop(artifacts);
+        drop(sidecar);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn snapshot_disk_capture_preserves_sparse_virtual_regions() {
@@ -10882,10 +12137,12 @@ mod tests {
         SnapshotBundle {
             snapshot_path: destination.display().to_string(),
             overlay_path: None,
+            live_stats: None,
             artifacts: publications
                 .into_iter()
                 .map(|(artifact, _)| artifact)
                 .collect(),
+            precomputed_integrity: None,
             in_progress_artifacts: Arc::clone(&supervisor.in_progress_artifacts),
             registered_paths: registered.clone(),
         }

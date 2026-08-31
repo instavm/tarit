@@ -7,14 +7,18 @@ use std::collections::HashSet;
 pub const MIB: u64 = 1024 * 1024;
 /// Minimum guest RAM accepted by config validation.
 pub const MIN_MEMORY_MIB: u64 = 1;
-/// Maximum guest RAM accepted by config validation (1 TiB).
-pub const MAX_MEMORY_MIB: u64 = 1024 * 1024;
+/// Maximum guest RAM accepted by config validation. The memory backend packs
+/// this RAM contiguously for snapshots and maps bytes beyond 3.25 GiB into a
+/// second KVM slot above the x86 MMIO aperture.
+pub const MAX_MEMORY_MIB: u64 = 65_536;
 /// Maximum guest RAM accepted by config validation, in bytes.
 pub const MAX_MEMORY_BYTES: u64 = MAX_MEMORY_MIB * MIB;
 /// Maximum number of vCPUs accepted by config validation.
 pub const MAX_VCPU_COUNT: u16 = 256;
 /// Maximum number of network devices supported by the deterministic MMIO map.
 pub const MAX_NET_DEVICES: usize = 8;
+/// Maximum number of virtio block devices supported by the deterministic MMIO map.
+pub const MAX_BLOCK_DEVICES: usize = 16;
 
 /// Error returned when a VM config fails resource-sizing validation.
 #[derive(Debug)]
@@ -79,6 +83,11 @@ pub struct VolumeConfig {
     /// Private sparse CoW overlay path. When set, `path` is the read-only base.
     #[serde(default)]
     pub overlay: Option<String>,
+    /// Private descriptor inherited from the orchestrator. When present the VMM
+    /// duplicates this already-open object instead of resolving `path`; `path`
+    /// is then only a non-sensitive diagnostic label.
+    #[serde(default)]
+    pub inherited_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,9 +125,45 @@ impl VmConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.memory.validate()?;
         self.vcpus.validate()?;
+        validate_volumes(&self.volumes)?;
         validate_networks(&self.net)?;
         Ok(())
     }
+}
+
+fn validate_volumes(volumes: &[VolumeConfig]) -> Result<(), ConfigError> {
+    if volumes.len() > MAX_BLOCK_DEVICES {
+        return Err(ConfigError::Invalid(format!(
+            "volumes supports at most {MAX_BLOCK_DEVICES} devices, got {}",
+            volumes.len()
+        )));
+    }
+    let mut inherited = HashSet::new();
+    for (index, volume) in volumes.iter().enumerate() {
+        if volume.path.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "volumes[{index}].path label must not be empty"
+            )));
+        }
+        if let Some(fd) = volume.inherited_fd {
+            if fd < 3 {
+                return Err(ConfigError::Invalid(format!(
+                    "volumes[{index}].inherited_fd must be at least 3"
+                )));
+            }
+            if volume.overlay.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "volumes[{index}] cannot combine inherited_fd with overlay"
+                )));
+            }
+            if !inherited.insert(fd) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate inherited volume descriptor {fd}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_networks(networks: &[NetConfig]) -> Result<(), ConfigError> {
@@ -283,6 +328,20 @@ mod tests {
         assert!(serde_json::from_str::<VmConfig>(nested).is_err());
     }
 
+    #[test]
+    fn memory_validation_accepts_the_split_memory_ceiling() {
+        assert!(MemoryConfig {
+            size_mib: MAX_MEMORY_MIB
+        }
+        .validate()
+        .is_ok());
+        assert!(MemoryConfig {
+            size_mib: MAX_MEMORY_MIB + 1
+        }
+        .validate()
+        .is_err());
+    }
+
     fn config_with_net(net: Vec<NetConfig>) -> VmConfig {
         VmConfig {
             kernel: KernelConfig {
@@ -295,6 +354,38 @@ mod tests {
             volumes: Vec::new(),
             net,
         }
+    }
+
+    fn volume(label: &str, inherited_fd: Option<i32>) -> VolumeConfig {
+        VolumeConfig {
+            path: label.into(),
+            read_only: false,
+            overlay: None,
+            inherited_fd,
+        }
+    }
+
+    #[test]
+    fn config_validates_inherited_volume_descriptors() {
+        let mut config = config_with_net(Vec::new());
+        config.volumes = vec![volume("data", Some(3)), volume("cache", Some(4))];
+        config.validate().unwrap();
+
+        config.volumes = vec![volume("data", Some(2))];
+        assert!(config.validate().is_err());
+        config.volumes = vec![volume("data", Some(3)), volume("cache", Some(3))];
+        assert!(config.validate().is_err());
+        config.volumes = vec![VolumeConfig {
+            overlay: Some("/tmp/unsafe.cow".into()),
+            ..volume("data", Some(3))
+        }];
+        assert!(config.validate().is_err());
+        config.volumes = vec![volume("", Some(3))];
+        assert!(config.validate().is_err());
+        config.volumes = (0..=MAX_BLOCK_DEVICES)
+            .map(|index| volume(&format!("disk-{index}"), None))
+            .collect();
+        assert!(config.validate().is_err());
     }
 
     fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {

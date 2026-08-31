@@ -228,19 +228,37 @@ impl NetProvisioner {
         self.provision_with_owner(vm_id, None)
     }
 
+    #[cfg(test)]
     pub fn provision_with_owner(
         &self,
         vm_id: Uuid,
         owner: Option<(u32, u32)>,
     ) -> Result<NetAlloc, OrchError> {
+        self.provision_with_owner_and_policy(vm_id, owner, &[], false)
+    }
+
+    /// Provision networking with the durable desired egress policy already
+    /// installed. The allocator state is persisted with that policy before any
+    /// host interface is created, so boot/resume cannot briefly run default-open
+    /// or lose policy intent across a hibernation allocation cycle.
+    pub fn provision_with_owner_and_policy(
+        &self,
+        vm_id: Uuid,
+        owner: Option<(u32, u32)>,
+        allowlist: &[String],
+        allow_existing: bool,
+    ) -> Result<NetAlloc, OrchError> {
+        let allowlist = normalize_egress_allowlist(allowlist)?;
         self.network_transactions
-            .run(|| self.provision_locked(vm_id, owner))?
+            .run(|| self.provision_locked(vm_id, owner, allowlist, allow_existing))?
     }
 
     fn provision_locked(
         &self,
         vm_id: Uuid,
         owner: Option<(u32, u32)>,
+        allowlist: Vec<String>,
+        allow_existing: bool,
     ) -> Result<NetAlloc, OrchError> {
         self.ensure_provisioning_available()?;
         let alloc = {
@@ -249,6 +267,13 @@ impl NetProvisioner {
                 .lock()
                 .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
             let alloc = inner.allocate(vm_id)?;
+            inner.replace_egress_policy(
+                &alloc,
+                EgressPolicy {
+                    allowlist,
+                    allow_existing,
+                },
+            )?;
             if let Err(error) = persist_allocator(&self.state_path, &inner) {
                 return Err(self.persistence_failure("persist newly allocated network slot", error));
             }
@@ -2803,6 +2828,34 @@ fn parse_egress_entry(entry: &str) -> Result<(String, u16, Option<&'static str>)
     Ok((cidr, port, Some(proto)))
 }
 
+/// Validate and canonicalize a durable policy before it is persisted. Keeping
+/// one representation makes CAS results stable and prevents duplicate rules
+/// from consuming unbounded nftables state.
+pub(crate) fn normalize_egress_allowlist(entries: &[String]) -> Result<Vec<String>, OrchError> {
+    const MAX_EGRESS_RULES: usize = 256;
+    if entries.len() > MAX_EGRESS_RULES {
+        return Err(OrchError::BadRequest(format!(
+            "egress allowlist exceeds {MAX_EGRESS_RULES} rules"
+        )));
+    }
+    let mut normalized = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.len() > 128 {
+            return Err(OrchError::BadRequest(
+                "egress rule exceeds 128 bytes".into(),
+            ));
+        }
+        let (cidr, port, proto) = parse_egress_entry(entry)?;
+        normalized.push(match proto {
+            Some(proto) => format!("{cidr}:{port}/{proto}"),
+            None => cidr,
+        });
+    }
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 fn parse_ipv4_egress_cidr(cidr: &str, entry: &str) -> Result<Ipv4Net, OrchError> {
     match cidr.parse::<IpAddr>() {
         Ok(IpAddr::V4(addr)) => Ok(Ipv4Net::from(addr)),
@@ -4885,6 +4938,23 @@ esac
         assert!(parse_egress_entry(":443").is_err());
         assert!(parse_egress_entry("1.2.3.4:443/sctp").is_err());
         assert!(parse_egress_entry("1.2.3.4:notaport").is_err());
+    }
+
+    #[test]
+    fn durable_egress_policy_is_canonical_bounded_and_deduplicated() {
+        let normalized = normalize_egress_allowlist(&[
+            "10.1.2.3/8".into(),
+            "1.2.3.4:443".into(),
+            "1.2.3.4:443/tcp".into(),
+            "8.8.8.8:53/udp".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            normalized,
+            vec!["1.2.3.4:443/tcp", "10.0.0.0/8", "8.8.8.8:53/udp"]
+        );
+        assert!(normalize_egress_allowlist(&vec!["1.1.1.1".into(); 257]).is_err());
+        assert!(normalize_egress_allowlist(&["x".repeat(129)]).is_err());
     }
 
     #[test]

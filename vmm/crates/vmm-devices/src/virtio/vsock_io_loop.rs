@@ -50,9 +50,10 @@ impl VsockPump {
     }
 
     /// Pause the pump and wait until it acknowledges: after this returns, the
-    /// thread is parked and will not touch guest memory until
-    /// [`Self::resume`]. Callers pause this thread *before* pausing the vCPU,
-    /// so the handshake latency here never contributes to guest downtime.
+    /// thread has drained guest TX and host RX once, then parked without
+    /// touching guest memory until [`Self::resume`]. Callers must pause every
+    /// vCPU first so the guest cannot publish another descriptor after this
+    /// drain.
     pub fn pause(&self) {
         if self.thread_gone() {
             return;
@@ -140,6 +141,19 @@ fn run(
         // performs no guest-memory writes — the live snapshot's final stop
         // relies on that to keep the memory image and device state coherent.
         if pause_req.load(Ordering::SeqCst) {
+            // Eventfd counters are host state and are not serialized. Drain the
+            // TX queue even when the counter is empty so a descriptor whose
+            // kick raced with the pause cannot become permanently stranded in
+            // a restored VM. vCPUs are already paused by the caller.
+            drain_eventfd(tx_kick_fd, "tx_kick");
+            if let Err(error) = device.process_tx_queue() {
+                log::error!("vsock pump: TX drain before pause failed: {error}");
+                break;
+            }
+            if let Err(error) = device.pump_host_streams() {
+                log::error!("vsock pump: RX drain before pause failed: {error}");
+                break;
+            }
             pause_ack.store(true, Ordering::SeqCst);
             while pause_req.load(Ordering::SeqCst) && !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(PAUSE_POLL);

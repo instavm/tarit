@@ -4,7 +4,7 @@ use crate::persist::Persist;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use vm_superio::serial::{NoEvents, Serial as VmSerial};
+use vm_superio::serial::{NoEvents, Serial as VmSerial, SerialState as VmSerialState};
 #[cfg(target_os = "linux")]
 use vmm_sys_util::eventfd::EventFd;
 
@@ -24,10 +24,14 @@ impl EventFd {
     }
 }
 
-pub struct EventFdTrigger(EventFd);
+pub struct EventFdTrigger(Arc<EventFd>);
 
 impl EventFdTrigger {
     pub fn new(evt: EventFd) -> Self {
+        Self(Arc::new(evt))
+    }
+
+    fn from_shared(evt: Arc<EventFd>) -> Self {
         Self(evt)
     }
 }
@@ -48,11 +52,16 @@ impl Write for SerialOut {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         {
             let mut buf = self.buf.lock().unwrap();
-            buf.extend_from_slice(bytes);
-            let len = buf.len();
-            if len > MAX_OUTPUT {
-                buf.drain(0..len - MAX_OUTPUT);
+            let retained = if bytes.len() > MAX_OUTPUT {
+                &bytes[bytes.len() - MAX_OUTPUT..]
+            } else {
+                bytes
+            };
+            let required = buf.len().saturating_add(retained.len());
+            if required > MAX_OUTPUT {
+                buf.drain(0..required - MAX_OUTPUT);
             }
+            buf.extend_from_slice(retained);
         }
         io::stdout().write_all(bytes)?;
         io::stdout().flush()?;
@@ -66,13 +75,10 @@ impl Write for SerialOut {
 
 /// Serial (16550 UART) register state that survives snapshot/restore.
 ///
-/// `vm-superio` 0.8 exposes no register getters and recreates a fresh UART with
-/// all registers zeroed, so a restored device would have interrupts *disabled*
-/// even though the running guest had enabled them. Host→guest bytes (e.g. an
-/// `exec` command) would then raise no RX interrupt and the guest agent, blocked
-/// in `read(/dev/ttyS0)`, would never wake — exec hangs until timeout even
-/// though the guest itself is live (TX/console still works). We therefore shadow
-/// every guest write to a writable register and replay it on restore.
+/// The legacy writable-register shadow remains for snapshots created before
+/// complete UART state was recorded. New snapshots also retain pending
+/// interrupts, status registers, and the receive FIFO so capture cannot lose a
+/// byte or strand a guest waiting for a transmit/receive interrupt.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SerialState {
     /// Interrupt Enable Register (offset 1, DLAB=0). Bit 0 (RX-data-available)
@@ -93,25 +99,43 @@ pub struct SerialState {
     pub dlm: u8,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SerialRuntimeState {
+    pub interrupt_identification: u8,
+    pub line_status: u8,
+    pub modem_status: u8,
+    #[serde(default)]
+    pub in_buffer: Vec<u8>,
+}
+
 /// A 16550 UART backed by an EventFd IRQ trigger and a captured stdout sink.
 pub struct Serial {
     inner: Mutex<VmSerial<EventFdTrigger, NoEvents, SerialOut>>,
     out_buf: Arc<Mutex<Vec<u8>>>,
+    irq_evt: Arc<EventFd>,
     /// Shadow of the guest-programmed writable registers, updated on every
     /// `write`, so the UART configuration can be snapshotted and replayed
-    /// (`vm-superio` exposes no register getters).
+    /// for compatibility with snapshots created before full runtime capture.
     shadow: Mutex<SerialState>,
 }
 
 impl Serial {
     pub fn new(irq_evt: EventFd) -> Self {
-        let out_buf = Arc::new(Mutex::new(Vec::new()));
+        // Guest console writes run on the seccomp-confined vCPU thread. Keep a
+        // fixed-capacity capture buffer so normal boot output never asks the
+        // allocator to open glibc tuning files after the filter is installed.
+        let out_buf = Arc::new(Mutex::new(Vec::with_capacity(MAX_OUTPUT)));
         let out = SerialOut {
             buf: out_buf.clone(),
         };
+        let irq_evt = Arc::new(irq_evt);
         Self {
-            inner: Mutex::new(VmSerial::new(EventFdTrigger::new(irq_evt), out)),
+            inner: Mutex::new(VmSerial::new(
+                EventFdTrigger::from_shared(Arc::clone(&irq_evt)),
+                out,
+            )),
             out_buf,
+            irq_evt,
             shadow: Mutex::new(SerialState::default()),
         }
     }
@@ -177,8 +201,91 @@ impl Serial {
     }
 
     pub fn drain_output(&self) -> Vec<u8> {
+        // Allocate the replacement on the unrestricted control thread before
+        // taking the old buffer. `mem::take` would leave capacity zero and the
+        // next guest byte could trigger a forbidden allocator-side openat in
+        // the vCPU thread.
+        let replacement = Vec::with_capacity(MAX_OUTPUT);
         let mut buf = self.out_buf.lock().unwrap();
-        std::mem::take(&mut *buf)
+        std::mem::replace(&mut *buf, replacement)
+    }
+
+    pub fn runtime_state(&self) -> SerialRuntimeState {
+        let runtime = self.inner.lock().unwrap().state();
+        SerialRuntimeState {
+            interrupt_identification: runtime.interrupt_identification,
+            line_status: runtime.line_status,
+            modem_status: runtime.modem_status,
+            in_buffer: runtime.in_buffer,
+        }
+    }
+
+    pub fn try_restore_snapshot(
+        &mut self,
+        state: SerialState,
+        runtime: Option<&SerialRuntimeState>,
+    ) -> Result<(), crate::persist::PersistError> {
+        if let Some(runtime) = runtime {
+            let restored = VmSerialState {
+                baud_divisor_low: state.dll,
+                baud_divisor_high: state.dlm,
+                interrupt_enable: state.ier,
+                interrupt_identification: runtime.interrupt_identification,
+                line_control: state.lcr,
+                line_status: runtime.line_status,
+                modem_control: state.mcr,
+                modem_status: runtime.modem_status,
+                scratch: state.scr,
+                in_buffer: runtime.in_buffer.clone(),
+            };
+            let out = SerialOut {
+                buf: Arc::clone(&self.out_buf),
+            };
+            *self.inner.get_mut().map_err(|_| {
+                crate::persist::PersistError::Unavailable("UART lock is poisoned".into())
+            })? = VmSerial::from_state(
+                &restored,
+                EventFdTrigger::from_shared(Arc::clone(&self.irq_evt)),
+                NoEvents,
+                out,
+            )
+            .map_err(|error| {
+                crate::persist::PersistError::Unavailable(format!(
+                    "reconstruct UART runtime state: {error}"
+                ))
+            })?;
+            *self.shadow.get_mut().map_err(|_| {
+                crate::persist::PersistError::Unavailable("UART shadow lock is poisoned".into())
+            })? = state;
+            return Ok(());
+        }
+
+        self.restore_legacy(state)
+    }
+
+    fn restore_legacy(&mut self, state: SerialState) -> Result<(), crate::persist::PersistError> {
+        // Replay the guest-programmed registers onto the fresh UART, in the
+        // order the guest would: program the baud divisor under DLAB=1, then
+        // restore the real LCR (which sets the final DLAB), then IER/FCR/MCR/SCR.
+        {
+            let inner = self.inner.get_mut().map_err(|_| {
+                crate::persist::PersistError::Unavailable("UART lock is poisoned".into())
+            })?;
+            let _ = inner.write(3, state.lcr | 0x80);
+            let _ = inner.write(0, state.dll);
+            let _ = inner.write(1, state.dlm);
+            let _ = inner.write(3, state.lcr);
+            let _ = inner.write(2, state.fcr);
+            let _ = inner.write(4, state.mcr);
+            let _ = inner.write(7, state.scr);
+            if state.lcr & 0x80 == 0 {
+                let _ = inner.write(1, state.ier);
+            }
+        }
+        *self.shadow.get_mut().map_err(|_| {
+            crate::persist::PersistError::Unavailable("UART shadow lock is poisoned".into())
+        })? = state;
+        Ok(())
     }
 }
 
@@ -190,27 +297,12 @@ impl Persist for Serial {
     }
 
     fn restore(&mut self, state: Self::State) {
-        // Replay the guest-programmed registers onto the fresh UART, in the
-        // order the guest would: program the baud divisor under DLAB=1, then
-        // restore the real LCR (which sets the final DLAB), then IER/FCR/MCR/SCR.
-        // Re-applying IER is what re-arms the RX interrupt so post-restore
-        // host→guest bytes reach the guest agent.
-        {
-            let inner = self.inner.get_mut().unwrap();
-            let _ = inner.write(3, state.lcr | 0x80); // DLAB=1 to reach the latch
-            let _ = inner.write(0, state.dll);
-            let _ = inner.write(1, state.dlm);
-            let _ = inner.write(3, state.lcr); // final LCR (guest's DLAB)
-            let _ = inner.write(2, state.fcr);
-            let _ = inner.write(4, state.mcr);
-            let _ = inner.write(7, state.scr);
-            // IER last, and only meaningful with DLAB=0; if the guest left DLAB
-            // set (unusual), offset 1 is the divisor high byte we already wrote.
-            if state.lcr & 0x80 == 0 {
-                let _ = inner.write(1, state.ier);
-            }
-        }
-        *self.shadow.get_mut().unwrap() = state;
+        self.try_restore(state)
+            .expect("restore captured UART state on a fresh device");
+    }
+
+    fn try_restore(&mut self, state: Self::State) -> Result<(), crate::persist::PersistError> {
+        self.restore_legacy(state)
     }
 }
 
@@ -239,6 +331,14 @@ mod tests {
     }
 
     #[test]
+    fn draining_preserves_preallocated_vcpu_output_capacity() {
+        let serial = Serial::new(test_eventfd());
+        serial.write(0, b'x');
+        assert_eq!(serial.drain_output(), b"x");
+        assert!(serial.out_buf.lock().unwrap().capacity() >= MAX_OUTPUT);
+    }
+
+    #[test]
     fn enqueued_input_is_read_from_data_register() {
         let serial = Serial::new(test_eventfd());
 
@@ -253,6 +353,73 @@ mod tests {
         let state = serial.save();
 
         serial.restore(state);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn restore_preserves_receive_fifo_and_reasserts_pending_irq() {
+        let source_irq = test_eventfd();
+        let serial = Serial::new(source_irq.try_clone().unwrap());
+        serial.write(1, 0x01); // RX-data-available interrupt.
+        serial.send(b"pending");
+        assert!(source_irq.read().is_ok(), "source RX interrupt missing");
+
+        let state = serial.save();
+        let runtime = serial.runtime_state();
+        assert_eq!(
+            runtime.in_buffer, b"pending\n",
+            "snapshot omitted pending UART input"
+        );
+
+        let restored_irq = test_eventfd();
+        let mut restored = Serial::new(restored_irq.try_clone().unwrap());
+        restored
+            .try_restore_snapshot(state, Some(&runtime))
+            .expect("restore complete UART state");
+        assert!(
+            restored_irq.read().is_ok(),
+            "restore did not reassert the pending RX interrupt"
+        );
+        let mut input = Vec::new();
+        while restored.read(5) & 1 != 0 {
+            input.push(restored.read(0));
+        }
+        assert_eq!(input, b"pending\n");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn restore_reasserts_pending_transmitter_interrupt() {
+        let source_irq = test_eventfd();
+        let serial = Serial::new(source_irq.try_clone().unwrap());
+        serial.write(1, 0x02); // Transmitter-holding-register-empty interrupt.
+        serial.write(0, b'x');
+        assert!(source_irq.read().is_ok(), "source TX interrupt missing");
+
+        let restored_irq = test_eventfd();
+        let mut restored = Serial::new(restored_irq.try_clone().unwrap());
+        restored
+            .try_restore_snapshot(serial.save(), Some(&serial.runtime_state()))
+            .expect("restore complete UART state");
+        assert!(
+            restored_irq.read().is_ok(),
+            "restore did not reassert the pending TX interrupt"
+        );
+        assert_ne!(restored.read(2) & 0x02, 0, "restored TX cause missing");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn restore_rejects_an_oversized_receive_fifo() {
+        let mut serial = Serial::new(test_eventfd());
+        let runtime = SerialRuntimeState {
+            in_buffer: vec![0; 65],
+            ..Default::default()
+        };
+        let error = serial
+            .try_restore_snapshot(SerialState::default(), Some(&runtime))
+            .expect_err("oversized UART FIFO must fail closed");
+        assert!(error.to_string().contains("FIFO"));
     }
 
     #[test]

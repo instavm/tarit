@@ -817,9 +817,13 @@ impl VirtioVsockMmio {
         for packet in packets {
             self.enqueue_rx(packet)?;
         }
-        if queued > 0 {
-            self.process_rx_queue()?;
-        }
+        // Retry the RX queue even when no established host stream produced
+        // bytes in this iteration. A host-initiated connection starts as an
+        // unestablished REQUEST; after restore the guest may publish its next
+        // RX descriptor just after connect_guest_stream's immediate attempt.
+        // Without this retry the REQUEST remains pending forever because an
+        // unestablished connection contributes no stream bytes to `packets`.
+        self.process_rx_queue()?;
         if self.is_failed() {
             Err(MmioError::Device)
         } else {
@@ -1847,6 +1851,82 @@ mod tests {
         assert_eq!(rx_used_idx, 2);
     }
 
+    #[test]
+    fn restored_stream_rejects_stale_payload_until_guest_redials() {
+        let mem = new_mem();
+        let source = VirtioVsockMmio::new(7, GUEST_CID);
+        let rx_bufs = setup_queues(&source, &mem, 5);
+        let source_stream = Arc::new(Mutex::new(FakeStreamState::default()));
+        source.set_host_listener(Arc::new(FakeListener {
+            state: Arc::clone(&source_stream),
+            connects: AtomicUsize::new(0),
+        }));
+        submit_tx(
+            &source,
+            &mem,
+            0,
+            0,
+            &guest_packet(GUEST_PORT, op::REQUEST, &[]),
+        );
+        assert_eq!(read_rx_packet(&mem, rx_bufs[0]).header.op, op::RESPONSE);
+        let state = source.save();
+        assert_eq!(state.connections.len(), 1);
+
+        let restored_stream = Arc::new(Mutex::new(FakeStreamState::default()));
+        let restored_listener = Arc::new(FakeListener {
+            state: Arc::clone(&restored_stream),
+            connects: AtomicUsize::new(0),
+        });
+        let restored = VirtioVsockMmio::new(7, GUEST_CID);
+        restored.set_guest_memory(Arc::clone(&mem));
+        restored.set_host_listener(restored_listener.clone());
+        restored.restore_transport_state(&state);
+
+        // Exercise the worst ordering: the restored vCPU publishes stale data
+        // before the control thread injects its captured-connection resets.
+        // The restored device has no live host stream, so the payload must be
+        // rejected with RST and must never reach the newly bound listener.
+        submit_tx(
+            &restored,
+            &mem,
+            1,
+            1,
+            &guest_packet(GUEST_PORT, op::RW, b"stale"),
+        );
+        assert_eq!(read_rx_packet(&mem, rx_bufs[1]).header.op, op::RST);
+        assert!(restored_stream.lock().unwrap().outbound.is_empty());
+        assert_eq!(restored_listener.connects.load(AtomicOrdering::Relaxed), 0);
+
+        assert_eq!(
+            restored
+                .reset_restored_connections(&state.connections)
+                .unwrap(),
+            1
+        );
+        assert_eq!(read_rx_packet(&mem, rx_bufs[2]).header.op, op::RST);
+        assert!(restored_stream.lock().unwrap().outbound.is_empty());
+
+        // A new REQUEST is the transport-generation acknowledgement. Only
+        // after that redial may payload enter the replacement host stream.
+        submit_tx(
+            &restored,
+            &mem,
+            2,
+            2,
+            &guest_packet(GUEST_PORT, op::REQUEST, &[]),
+        );
+        assert_eq!(read_rx_packet(&mem, rx_bufs[3]).header.op, op::RESPONSE);
+        assert_eq!(restored_listener.connects.load(AtomicOrdering::Relaxed), 1);
+        submit_tx(
+            &restored,
+            &mem,
+            3,
+            3,
+            &guest_packet(GUEST_PORT, op::RW, b"fresh"),
+        );
+        assert_eq!(restored_stream.lock().unwrap().outbound, b"fresh");
+    }
+
     #[cfg(unix)]
     #[test]
     fn host_initiated_stream_queues_request_and_waits_for_response() {
@@ -1907,6 +1987,36 @@ mod tests {
         let mut got = [0u8; 2];
         host.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_initiated_request_is_retried_when_rx_buffer_appears_late() {
+        let mem = new_mem();
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        setup_queues(&dev, &mem, 0);
+
+        let _host = dev.connect_guest_stream(1025).unwrap();
+        assert_eq!(dev.pending_rx.lock().unwrap().len(), 1);
+
+        mem.write_obj(
+            Descriptor {
+                addr: RX_BUF,
+                len: 0x1000,
+                flags: desc_flags::WRITE,
+                next: 0,
+            },
+            GuestAddress(RX_DESC),
+        )
+        .unwrap();
+        mem.write_obj(0u16, GuestAddress(RX_AVAIL + 4)).unwrap();
+        mem.write_obj(1u16, GuestAddress(RX_AVAIL + 2)).unwrap();
+
+        assert_eq!(dev.pump_host_streams().unwrap(), 0);
+        let request = read_rx_packet(&mem, RX_BUF);
+        assert_eq!(request.header.op, op::REQUEST);
+        assert_eq!(request.header.dst_port, 1025);
+        assert!(dev.pending_rx.lock().unwrap().is_empty());
     }
 
     #[test]

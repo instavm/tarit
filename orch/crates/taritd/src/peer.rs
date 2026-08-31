@@ -14,28 +14,44 @@ use axum::{
     },
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, io, str::FromStr, time::Duration};
-use tarit_types::{CreateVmRequest, EgressUpdateRequest, OrchError, VmRecord};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{self, Read, Write},
+    str::FromStr,
+    time::Duration,
+};
+use tarit_types::{
+    CreateVmRequest, EgressPolicyRecord, EgressUpdateRequest, OrchError, PutEgressPolicyRequest,
+    VmRecord,
+};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async, tungstenite::client::IntoClientRequest, MaybeTlsStream, WebSocketStream,
+    connect_async_tls_with_config, tungstenite::client::IntoClientRequest, Connector,
+    MaybeTlsStream, WebSocketStream,
 };
 use uuid::Uuid;
 
-use crate::{cluster::PeerTarget, config::ApiIdentity};
+use crate::{
+    cluster::PeerTarget,
+    config::{ApiIdentity, PeerTlsConfig},
+    peer_tls,
+};
 
 pub struct PeerClient {
     secret: String,
     source_host_id: String,
+    source_session_id: Uuid,
     allow_insecure_http: bool,
     http: Client,
     stream_http: reqwest::Client,
+    websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
 }
 
 pub type PeerWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -82,38 +98,113 @@ struct RemoteExecResponse {
 #[derive(Serialize)]
 struct RemoteSnapshotRequest {
     diff: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fork_child_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct RemoteRestoreRequest<'a> {
+    snapshot_path: &'a str,
+    id: Uuid,
+    owner_key: &'a str,
+    api_key_id: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ArtifactTransferDescriptor {
+    pub artifact_id: Uuid,
+    pub content_digest: String,
+    pub size_bytes: u64,
+    pub immutable_image_digest: String,
+    pub agent_digest: String,
+    pub boot_manifest_digest: String,
+    pub kernel_digest: String,
+    pub kernel_bytes: u64,
+    pub rootfs_digest: String,
+    pub rootfs_bytes: u64,
+    pub image_source_ref: String,
+    pub provenance_key_digest: Option<String>,
+    pub provenance_verified_at: Option<DateTime<Utc>>,
+    pub creation_revision: u64,
+    pub integrity_manifest_digest: String,
+    pub chunk_size_bytes: u64,
+    pub chunk_count: u64,
+    pub source_vm_id: Uuid,
+    pub memory_mib: u64,
+    pub vcpus: u8,
+    pub cmdline: String,
+    pub rootfs_read_only: bool,
+    pub has_overlay: bool,
+    pub ram_bytes: u64,
+    pub overlay_bytes: u64,
+    pub integrity_bytes: u64,
 }
 
 impl PeerClient {
     #[cfg(test)]
     pub fn new(secret: String) -> Self {
-        Self::new_for_host(secret, true, "test-source".into())
+        Self::new_for_host(secret, true, "test-source".into(), Uuid::nil(), None)
+            .expect("build test peer client")
     }
 
-    pub fn new_for_host(secret: String, allow_insecure_http: bool, source_host_id: String) -> Self {
-        let http = Client::builder()
+    pub fn new_for_host(
+        secret: String,
+        allow_insecure_http: bool,
+        source_host_id: String,
+        source_session_id: Uuid,
+        tls: Option<&PeerTlsConfig>,
+    ) -> Result<Self, OrchError> {
+        let mut http_builder = Client::builder()
             .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(5))
             // SSRF hardening: never follow redirects to an attacker-chosen host.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("reqwest client");
-        let stream_http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none());
+        let mut stream_builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             // The owner-side proxy enforces per-direction idle timeouts.
             // Deliberately keep reqwest's default of no total deadline so
             // healthy long-lived streams (SSE/downloads) are not truncated.
+            ;
+        let websocket_tls = match tls {
+            Some(tls) => {
+                let identity = peer_tls::reqwest_identity(tls).map_err(|error| {
+                    OrchError::Internal(format!("peer TLS identity: {error:#}"))
+                })?;
+                http_builder = http_builder
+                    .tls_built_in_root_certs(false)
+                    .identity(identity.clone());
+                stream_builder = stream_builder
+                    .tls_built_in_root_certs(false)
+                    .identity(identity);
+                for root in peer_tls::reqwest_roots(tls)
+                    .map_err(|error| OrchError::Internal(format!("peer TLS roots: {error:#}")))?
+                {
+                    http_builder = http_builder.add_root_certificate(root.clone());
+                    stream_builder = stream_builder.add_root_certificate(root);
+                }
+                Some(peer_tls::client_config(tls).map_err(|error| {
+                    OrchError::Internal(format!("peer WebSocket TLS: {error:#}"))
+                })?)
+            }
+            None => None,
+        };
+        let http = http_builder
             .build()
-            .expect("streaming reqwest client");
-        Self {
+            .map_err(|error| OrchError::Internal(format!("build peer HTTP client: {error}")))?;
+        let stream_http = stream_builder
+            .build()
+            .map_err(|error| OrchError::Internal(format!("build peer stream client: {error}")))?;
+        Ok(Self {
             secret,
             source_host_id,
+            source_session_id,
             allow_insecure_http,
             http,
             stream_http,
-        }
+            websocket_tls,
+        })
     }
 
     fn validate_rpc_addr(&self, rpc_addr: &str) -> Result<(), OrchError> {
@@ -165,10 +256,14 @@ impl PeerClient {
         issued_at: i64,
         nonce: &str,
         target_host_id: &str,
+        source_session_id: Uuid,
+        target_session_id: Uuid,
         identity_signature: &str,
     ) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes())
             .expect("HMAC accepts arbitrary key lengths");
+        let source_session_id = source_session_id.to_string();
+        let target_session_id = target_session_id.to_string();
         for component in [
             REQUEST_SIGNATURE_VERSION,
             method,
@@ -178,6 +273,8 @@ impl PeerClient {
             nonce,
             &self.source_host_id,
             target_host_id,
+            &source_session_id,
+            &target_session_id,
             // Binding the forwarded identity envelope (empty when absent)
             // prevents splicing a signed request together with an identity
             // captured from a different request by the same source host.
@@ -220,6 +317,14 @@ impl PeerClient {
             .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
             .header("X-Tarit-Peer-Source", &self.source_host_id)
             .header("X-Tarit-Peer-Target", &target.host_id)
+            .header(
+                "X-Tarit-Peer-Source-Session",
+                self.source_session_id.to_string(),
+            )
+            .header(
+                "X-Tarit-Peer-Target-Session",
+                target.boot_session_id.to_string(),
+            )
             .header("X-Tarit-Peer-Timestamp", issued_at)
             .header("X-Tarit-Peer-Nonce", &nonce)
             .header("X-Tarit-Peer-Body-SHA256", payload_hash)
@@ -232,6 +337,8 @@ impl PeerClient {
                     issued_at,
                     &nonce,
                     &target.host_id,
+                    self.source_session_id,
+                    target.boot_session_id,
                     identity_signature,
                 ),
             );
@@ -265,12 +372,18 @@ impl PeerClient {
             issued_at,
             &nonce,
             &target.host_id,
+            self.source_session_id,
+            target.boot_session_id,
             identity_signature,
         );
+        let source_session_id = self.source_session_id.to_string();
+        let target_session_id = target.boot_session_id.to_string();
         for (name, value) in [
             ("x-tarit-peer-version", REQUEST_SIGNATURE_VERSION),
             ("x-tarit-peer-source", self.source_host_id.as_str()),
             ("x-tarit-peer-target", target.host_id.as_str()),
+            ("x-tarit-peer-source-session", source_session_id.as_str()),
+            ("x-tarit-peer-target-session", target_session_id.as_str()),
             ("x-tarit-peer-nonce", nonce.as_str()),
             ("x-tarit-peer-body-sha256", payload_hash),
             ("x-tarit-peer-signature", signature.as_str()),
@@ -468,7 +581,11 @@ impl PeerClient {
                     .map_err(|_| OrchError::BadRequest("invalid WebSocket protocols".into()))?,
             );
         }
-        let (socket, response) = connect_async(request)
+        let connector = self
+            .websocket_tls
+            .as_ref()
+            .map(|config| Connector::Rustls(std::sync::Arc::clone(config)));
+        let (socket, response) = connect_async_tls_with_config(request, None, false, connector)
             .await
             .map_err(|error| OrchError::Internal(format!("peer WebSocket connect: {error}")))?;
         let protocol = response
@@ -553,6 +670,128 @@ impl PeerClient {
         ))
     }
 
+    pub fn download_artifact_component(
+        &self,
+        target: &PeerTarget,
+        artifact_id: Uuid,
+        component: &str,
+        identity: &ApiIdentity,
+        destination: &mut File,
+        max_bytes: u64,
+    ) -> Result<(u64, String), OrchError> {
+        if !matches!(
+            component,
+            "ram" | "overlay" | "integrity" | "kernel" | "rootfs"
+        ) {
+            return Err(OrchError::BadRequest(
+                "invalid artifact transfer component".into(),
+            ));
+        }
+        let path = format!("/internal/v1/artifacts/{artifact_id}/{component}");
+        let request = self.empty_request(target, reqwest::Method::GET, &path, Some(identity))?;
+        let mut response = request
+            .send()
+            .map_err(|error| OrchError::Internal(format!("peer artifact request: {error}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(match status.as_u16() {
+                401 => OrchError::Unauthorized,
+                403 => OrchError::Forbidden("peer artifact denied".into()),
+                404 => OrchError::NotFound("peer artifact not found".into()),
+                409 => OrchError::Conflict("peer artifact conflict".into()),
+                _ => OrchError::Internal(format!(
+                    "peer artifact HTTP {status}: {}",
+                    body.chars().take(256).collect::<String>()
+                )),
+            });
+        }
+        let declared_length = response.content_length();
+        if declared_length.is_some_and(|length| length > max_bytes) {
+            return Err(OrchError::Unprocessable(
+                "peer artifact component exceeds its authenticated size bound".into(),
+            ));
+        }
+        let mut total = 0u64;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = response
+                .read(&mut buffer)
+                .map_err(|error| OrchError::Internal(format!("read peer artifact: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read as u64)
+                .ok_or_else(|| OrchError::Unprocessable("peer artifact size overflow".into()))?;
+            if total > max_bytes {
+                return Err(OrchError::Unprocessable(
+                    "peer artifact component exceeds its authenticated size bound".into(),
+                ));
+            }
+            digest.update(&buffer[..read]);
+            destination
+                .write_all(&buffer[..read])
+                .map_err(|error| OrchError::Internal(format!("write peer artifact: {error}")))?;
+        }
+        if let Some(expected) = declared_length {
+            if total != expected {
+                return Err(OrchError::Unprocessable(
+                    "peer artifact component was truncated".into(),
+                ));
+            }
+        }
+        destination
+            .sync_all()
+            .map_err(|error| OrchError::Internal(format!("sync peer artifact: {error}")))?;
+        Ok((total, format!("sha256:{:x}", digest.finalize())))
+    }
+
+    pub fn artifact_descriptor(
+        &self,
+        target: &PeerTarget,
+        artifact_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<ArtifactTransferDescriptor, OrchError> {
+        let path = format!("/internal/v1/artifacts/{artifact_id}");
+        let response = self
+            .empty_request(target, reqwest::Method::GET, &path, Some(identity))?
+            .send()
+            .map_err(|error| OrchError::Internal(format!("peer artifact request: {error}")))?;
+        Self::decode(response, "artifact descriptor")
+    }
+
+    pub fn localize_artifact_remote(
+        &self,
+        target: &PeerTarget,
+        artifact_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<(), OrchError> {
+        let path = format!("/internal/v1/artifacts/{artifact_id}");
+        let response = self
+            .empty_request(target, reqwest::Method::POST, &path, Some(identity))?
+            .send()
+            .map_err(|error| OrchError::Internal(format!("peer artifact localization: {error}")))?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        Err(match status.as_u16() {
+            401 => OrchError::Unauthorized,
+            403 => OrchError::Forbidden("peer artifact localization denied".into()),
+            404 => OrchError::NotFound("peer artifact localization source not found".into()),
+            409 => OrchError::Conflict("peer artifact localization conflict".into()),
+            422 => OrchError::Unprocessable("peer artifact localization rejected".into()),
+            503 => OrchError::Unavailable("peer artifact localization unavailable".into()),
+            _ => OrchError::Internal(format!(
+                "peer artifact localization HTTP {status}: {}",
+                body.chars().take(256).collect::<String>()
+            )),
+        })
+    }
+
     fn decode<R: for<'de> Deserialize<'de>>(
         resp: reqwest::blocking::Response,
         what: &str,
@@ -612,13 +851,19 @@ impl PeerClient {
     pub fn restore_remote(
         &self,
         target: &PeerTarget,
-        req: &tarit_types::RestoreRequest,
+        snapshot_path: &str,
+        id: Uuid,
         identity: &ApiIdentity,
     ) -> Result<VmRecord, OrchError> {
         self.post_json(
             target,
             "/internal/v1/restore",
-            req,
+            &RemoteRestoreRequest {
+                snapshot_path,
+                id,
+                owner_key: &identity.tenant,
+                api_key_id: &identity.api_key_id,
+            },
             Some(identity),
             "restore",
         )
@@ -675,6 +920,21 @@ impl PeerClient {
         )
     }
 
+    pub fn hibernate_remote(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<VmRecord, OrchError> {
+        self.post_json(
+            target,
+            &format!("/internal/v1/vms/{vm_id}/hibernate"),
+            &serde_json::json!({}),
+            Some(identity),
+            "hibernate",
+        )
+    }
+
     pub fn resume_remote(
         &self,
         target: &PeerTarget,
@@ -696,13 +956,35 @@ impl PeerClient {
         vm_id: Uuid,
         diff: bool,
         identity: &ApiIdentity,
-    ) -> Result<serde_json::Value, OrchError> {
+    ) -> Result<tarit_types::SnapshotResponse, OrchError> {
         self.post_json(
             target,
             &format!("/internal/v1/vms/{vm_id}/snapshot"),
-            &RemoteSnapshotRequest { diff },
+            &RemoteSnapshotRequest {
+                diff,
+                fork_child_id: None,
+            },
             Some(identity),
             "snapshot",
+        )
+    }
+
+    pub fn snapshot_remote_for_fork(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        child_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<tarit_types::PeerSnapshotResponse, OrchError> {
+        self.post_json(
+            target,
+            &format!("/internal/v1/vms/{vm_id}/snapshot"),
+            &RemoteSnapshotRequest {
+                diff: false,
+                fork_child_id: Some(child_id),
+            },
+            Some(identity),
+            "fork snapshot",
         )
     }
 
@@ -729,6 +1011,45 @@ impl PeerClient {
             .send()
             .map_err(|e| OrchError::Internal(format!("peer egress request: {e}")))?;
         Self::decode(resp, "egress")
+    }
+
+    pub fn get_egress_policy_remote(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<EgressPolicyRecord, OrchError> {
+        let path = format!("/internal/v1/vms/{vm_id}/egress-policy");
+        let req = self.empty_request(target, reqwest::Method::GET, &path, Some(identity))?;
+        let resp = req
+            .send()
+            .map_err(|e| OrchError::Internal(format!("peer egress policy get: {e}")))?;
+        Self::decode(resp, "egress policy get")
+    }
+
+    pub fn put_egress_policy_remote(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        body: &PutEgressPolicyRequest,
+        identity: &ApiIdentity,
+    ) -> Result<EgressPolicyRecord, OrchError> {
+        self.validate_rpc_addr(&target.rpc_addr)?;
+        let path = format!("/internal/v1/vms/{vm_id}/egress-policy");
+        let encoded = serde_json::to_vec(body)
+            .map_err(|e| OrchError::Internal(format!("peer egress policy encode: {e}")))?;
+        let payload_hash = Self::payload_hash(&encoded);
+        let req = self
+            .http
+            .put(Self::peer_url(&target.rpc_addr, &path))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(encoded);
+        let req =
+            self.with_request_signature(req, target, "PUT", &path, &payload_hash, Some(identity));
+        let resp = req
+            .send()
+            .map_err(|e| OrchError::Internal(format!("peer egress policy put: {e}")))?;
+        Self::decode(resp, "egress policy put")
     }
 
     pub fn get_remote(
@@ -759,6 +1080,36 @@ impl PeerClient {
         Self::decode(resp, "status")
     }
 
+    pub fn balloon_remote(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<crate::api::PublicBalloonState, OrchError> {
+        let path = format!("/internal/v1/vms/{vm_id}/balloon");
+        let request = self.empty_request(target, reqwest::Method::GET, &path, Some(identity))?;
+        let response = request
+            .send()
+            .map_err(|error| OrchError::Internal(format!("peer balloon request: {error}")))?;
+        Self::decode(response, "balloon")
+    }
+
+    pub fn set_balloon_remote(
+        &self,
+        target: &PeerTarget,
+        vm_id: Uuid,
+        target_mib: u64,
+        identity: &ApiIdentity,
+    ) -> Result<crate::api::PublicBalloonState, OrchError> {
+        self.post_json(
+            target,
+            &format!("/internal/v1/vms/{vm_id}/balloon"),
+            &crate::api::BalloonTargetRequest { target_mib },
+            Some(identity),
+            "set balloon",
+        )
+    }
+
     pub fn stop_remote(
         &self,
         target: &PeerTarget,
@@ -781,6 +1132,33 @@ impl PeerClient {
             return Err(OrchError::Internal(format!("peer stop HTTP {status}")));
         }
         Ok(())
+    }
+
+    pub fn delete_volume_remote(
+        &self,
+        target: &PeerTarget,
+        volume_id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<(), OrchError> {
+        let path = format!("/internal/v1/volumes/{volume_id}");
+        let req = self.empty_request(target, reqwest::Method::DELETE, &path, Some(identity))?;
+        let resp = req
+            .send()
+            .map_err(|error| OrchError::Internal(format!("peer volume delete request: {error}")))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        match status.as_u16() {
+            404 => Err(OrchError::NotFound("peer volume delete: not found".into())),
+            409 => Err(OrchError::Conflict(
+                "peer volume delete: volume is attached or lifecycle changed".into(),
+            )),
+            403 => Err(OrchError::Forbidden("peer volume delete: forbidden".into())),
+            _ => Err(OrchError::Internal(format!(
+                "peer volume delete HTTP {status}"
+            ))),
+        }
     }
 
     fn insert_signed_identity_headers(
@@ -941,6 +1319,60 @@ mod tests {
     use crate::config::ApiRole;
 
     #[test]
+    fn artifact_download_is_bounded_streamed_and_hashed() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = b"verified artifact bytes".to_vec();
+        let expected = body.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 8192];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read])
+                .starts_with("GET /internal/v1/artifacts/"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let client = PeerClient::new("peer-secret".into());
+        let target = PeerTarget {
+            host_id: "node-b".into(),
+            boot_session_id: Uuid::new_v4(),
+            rpc_addr: format!("http://{address}"),
+        };
+        let identity = ApiIdentity {
+            api_key_id: "key-a".into(),
+            tenant: "tenant-a".into(),
+            role: ApiRole::User,
+            max_vms: None,
+        };
+        let path = std::env::temp_dir().join(format!("tarit-peer-download-{}", Uuid::new_v4()));
+        let mut destination = File::create(&path).unwrap();
+        let (size, digest) = client
+            .download_artifact_component(
+                &target,
+                Uuid::new_v4(),
+                "ram",
+                &identity,
+                &mut destination,
+                expected.len() as u64,
+            )
+            .unwrap();
+        drop(destination);
+        server.join().unwrap();
+        assert_eq!(size, expected.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(&expected)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn share_url_rejects_backslash_traversal() {
         let uri = r"/\..\..\vms".parse::<Uri>().unwrap();
 
@@ -991,6 +1423,7 @@ mod tests {
 
         let target = PeerTarget {
             host_id: "owner".into(),
+            boot_session_id: Uuid::nil(),
             rpc_addr: "https://owner.example".into(),
         };
         let sanitized = client
@@ -1024,11 +1457,55 @@ mod tests {
             max_vms: None,
             api_key_id: "key-id".into(),
         };
-        let a = PeerClient::new_for_host("peer-secret".into(), true, "node-a".into());
-        let b = PeerClient::new_for_host("peer-secret".into(), true, "node-b".into());
+        let a = PeerClient::new_for_host(
+            "peer-secret".into(),
+            true,
+            "node-a".into(),
+            Uuid::nil(),
+            None,
+        )
+        .unwrap();
+        let b = PeerClient::new_for_host(
+            "peer-secret".into(),
+            true,
+            "node-b".into(),
+            Uuid::nil(),
+            None,
+        )
+        .unwrap();
         assert_ne!(
             a.identity_signature(&identity, 123, "nonce"),
             b.identity_signature(&identity, 123, "nonce")
         );
+    }
+
+    #[test]
+    fn request_signature_is_bound_to_both_boot_sessions() {
+        let source_session = Uuid::new_v4();
+        let target_session = Uuid::new_v4();
+        let client = PeerClient::new_for_host(
+            "peer-secret".into(),
+            true,
+            "node-a".into(),
+            source_session,
+            None,
+        )
+        .unwrap();
+        let sign = |source_session, target_session| {
+            client.request_signature(
+                "GET",
+                "/internal/v1/vms/test",
+                "body",
+                123,
+                "nonce",
+                "node-b",
+                source_session,
+                target_session,
+                "identity",
+            )
+        };
+        let current = sign(source_session, target_session);
+        assert_ne!(current, sign(Uuid::new_v4(), target_session));
+        assert_ne!(current, sign(source_session, Uuid::new_v4()));
     }
 }

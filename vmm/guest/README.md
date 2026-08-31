@@ -5,15 +5,15 @@ The VMM does direct kernel boot (no firmware/BIOS). We need:
 ## Kernel
 
 Tarit's shipped kernel is an **uncompressed `vmlinux` ELF** built with a
-minimal config: virtio-mmio block, net, vsock, and 16550 serial. The loader
-also accepts user-supplied `bzImage` kernels, but `make guest` and the release
-workflow build, verify, and run `vmlinux`.
+minimal config: virtio-mmio block, network, vsock, balloon, entropy, and 16550
+serial. The loader also accepts user-supplied `bzImage` kernels, but `make
+guest` and the release workflow build, verify, and run `vmlinux`.
 
 ### Minimal cold-boot kernel
 
 `guest/configs/minimal-x86_64.config` is the Linux 6.12 LTS config for the cold
-create-to-exec path. It has virtio-mmio block, net, and vsock devices built in,
-with modules and unused device families disabled.
+create-to-exec path. It has virtio-mmio block, net, vsock, balloon, and entropy
+devices built in, with modules and unused device families disabled.
 
 The normal entry point downloads the release artifact and verifies its
 repository-pinned SHA-256. If the artifact is unavailable, it falls back to the

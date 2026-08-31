@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Drive `ssh` through a real PTY to test the taritd SSH gateway interactively.
+"""Drive `ssh` through a real PTY to test the taritd SSH gateway.
 
-Emulates an actual terminal (real winsize, interactive session) instead of a
-piped/batch stdin, which is the real use case for `ssh vm_id@gateway`.
+Emulates an actual terminal and sends an SSH exec request. Command mode avoids
+depending on a particular guest shell prompt while still exercising Tarit's
+authenticated SSH-to-guest-PTY bridge.
 
-Usage: ssh_pty_test.py KEYFILE PORT VM_ID HOST
+Usage: ssh_pty_test.py KEYFILE PORT VM_ID HOST [COMMAND [EXPECTED_MARKER]]
 """
 import fcntl
 import os
@@ -18,14 +19,17 @@ import time
 
 def main() -> int:
     keyfile, port, user, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+    command = sys.argv[5] if len(sys.argv) > 5 else "echo SSH_GW_OK_MARK; id -u"
+    expected_marker = sys.argv[6] if len(sys.argv) > 6 else "SSH_GW_OK_MARK"
     argv = [
         "ssh", "-tt", "-p", port, "-i", keyfile,
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "PreferredAuthentications=publickey",
         "-o", "IdentitiesOnly=yes",
-        "-o", "LogLevel=ERROR",
+        "-o", "LogLevel=VERBOSE",
         f"{user}@{host}",
+        command,
     ]
 
     pid, fd = pty.fork()
@@ -39,7 +43,7 @@ def main() -> int:
         os._exit(127)
 
     out = b""
-    sent = False
+    sent = True
     deadline = time.time() + 30
     while time.time() < deadline:
         r, _, _ = select.select([fd], [], [], 0.5)
@@ -58,14 +62,28 @@ def main() -> int:
             os.write(fd, b"echo SSH_GW_OK_MARK; id -u; exit\n")
             sent = True
 
+    # Never let a broken gateway/client handshake turn this bounded acceptance
+    # probe into an unbounded CI hang. Reap a completed child, otherwise
+    # terminate it and escalate after a short grace period.
     try:
-        os.waitpid(pid, 0)
-    except OSError:
+        waited, _ = os.waitpid(pid, os.WNOHANG)
+        if waited == 0:
+            os.kill(pid, 15)
+            grace = time.time() + 2
+            while time.time() < grace:
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+                if waited == pid:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+    except (ChildProcessError, ProcessLookupError, OSError):
         pass
 
     text = out.decode(errors="replace")
     sys.stdout.write(text)
-    ok = "SSH_GW_OK_MARK" in text
+    ok = expected_marker in text
     sys.stdout.write("\n---\nSSH_GW_PASS\n" if ok else "\n---\nSSH_GW_FAIL\n")
     return 0 if ok else 1
 

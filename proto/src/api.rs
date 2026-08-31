@@ -1,6 +1,6 @@
 //! Request / response types for the control plane (1:1 model — no VM ids).
 
-use crate::config::{NetConfig, VmConfig};
+use crate::config::{NetConfig, VmConfig, VolumeConfig};
 use crate::state::VmStatus;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,16 @@ pub struct GuestNetworkRepair {
     pub dns_servers: Vec<String>,
 }
 
+/// Trusted control-plane anchor for the private chunk manifest copied into the
+/// VMM namespace. The manifest is small and verified eagerly; RAM bytes are
+/// verified chunk-by-chunk as UFFD faults them in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryIntegrity {
+    pub manifest_path: String,
+    pub manifest_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ApiRequest {
@@ -74,6 +84,8 @@ pub enum ApiRequest {
     Restore {
         snapshot_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_integrity: Option<MemoryIntegrity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         overlay: Option<String>,
         /// Explicit replacement for snapshot-saved host network bindings.
         /// `Some([])` is valid only for a networkless snapshot. NIC addition or
@@ -82,6 +94,11 @@ pub enum ApiRequest {
         /// preventing stale tap/IP reuse.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         net: Option<Vec<NetConfig>>,
+        /// Replacement descriptors for every snapshot-saved inherited block
+        /// device, in saved-device order. The VMM never reuses serialized raw
+        /// descriptor numbers across processes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        volumes: Option<Vec<VolumeConfig>>,
         /// Restore memory backend policy. `auto` prefers UFFD-lazy restore for
         /// full snapshots and falls back to eager replay when needed; `eager`
         /// and `lazy` require that exact behavior.
@@ -111,6 +128,13 @@ pub enum ApiRequest {
         #[serde(default)]
         allow_existing: bool,
     },
+    /// Set the traditional virtio-balloon target. This is best-effort reclaim,
+    /// not a hard host memory limit.
+    SetBalloon {
+        target_mib: u64,
+    },
+    /// Read target/actual balloon state reported through virtio config space.
+    Balloon,
     /// Return a cheap health/info snapshot of the VM (state, uptime, config).
     Status,
 }
@@ -119,12 +143,42 @@ fn is_default_restore_memory_policy(policy: &RestoreMemoryPolicy) -> bool {
     *policy == RestoreMemoryPolicy::Auto
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSnapshotTermination {
+    Converged,
+    Diverging,
+    Timeout,
+    MaxRounds,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveSnapshotStats {
+    pub rounds: u32,
+    pub pages_copied: u64,
+    pub final_dirty_pages: u64,
+    pub elapsed_us: u64,
+    pub downtime_us: u64,
+    pub termination: LiveSnapshotTermination,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ApiResponse {
     Ok,
     Snapshot {
         path: String,
+        /// Disk upper captured at the same atomic boundary as a live memory
+        /// snapshot. Absent for memory-only and legacy snapshots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        overlay_path: Option<String>,
+        /// VMM-generated chunk hashes for the exact live RAM snapshot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        integrity_path: Option<String>,
+        /// Structured pre-copy outcome. Present only for live snapshots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_stats: Option<LiveSnapshotStats>,
     },
     Restored,
     GuestNetworkRepaired,
@@ -136,6 +190,12 @@ pub enum ApiResponse {
     },
     EgressUpdated {
         rules_applied: usize,
+    },
+    Balloon {
+        target_mib: u64,
+        actual_mib: u64,
+        target_pages: u32,
+        actual_pages: u32,
     },
     /// Health/info snapshot (response to `Status`).
     #[serde(rename = "vm_status")]
@@ -189,6 +249,7 @@ mod tests {
             path: "/base.img".into(),
             read_only: true,
             overlay: Some("/overlay.cow".into()),
+            inherited_fd: None,
         });
         let r = ApiRequest::Create(VmSpec { config });
         let s = serde_json::to_string(&r).unwrap();
@@ -334,13 +395,17 @@ mod tests {
         match back {
             ApiRequest::Restore {
                 snapshot_path,
+                memory_integrity,
                 overlay,
                 net,
+                volumes,
                 memory_policy,
             } => {
                 assert_eq!(snapshot_path, "/golden.snap");
+                assert!(memory_integrity.is_none());
                 assert_eq!(overlay, None);
                 assert!(net.is_none());
+                assert!(volumes.is_none());
                 assert_eq!(memory_policy, RestoreMemoryPolicy::Auto);
             }
             _ => panic!("expected restore"),
@@ -351,8 +416,10 @@ mod tests {
     fn request_restore_round_trips_with_overlay() {
         let r = ApiRequest::Restore {
             snapshot_path: "/golden.snap".into(),
+            memory_integrity: None,
             overlay: Some("/clones/a.cow".into()),
             net: None,
+            volumes: None,
             memory_policy: RestoreMemoryPolicy::Auto,
         };
         let s = serde_json::to_string(&r).unwrap();
@@ -365,8 +432,10 @@ mod tests {
             back,
             ApiRequest::Restore {
                 snapshot_path,
+                memory_integrity: None,
                 overlay: Some(overlay),
                 net: None,
+                volumes: None,
                 memory_policy: RestoreMemoryPolicy::Auto,
             } if snapshot_path == "/golden.snap" && overlay == "/clones/a.cow"
         ));
@@ -376,6 +445,7 @@ mod tests {
     fn request_restore_round_trips_with_explicit_network_rebind() {
         let r = ApiRequest::Restore {
             snapshot_path: "/golden.snap".into(),
+            memory_integrity: None,
             overlay: None,
             net: Some(vec![NetConfig {
                 tap: "tap-new".into(),
@@ -383,6 +453,7 @@ mod tests {
                 guest_ip: Some("10.0.0.3".into()),
                 port_forwards: Vec::new(),
             }]),
+            volumes: None,
             memory_policy: RestoreMemoryPolicy::Auto,
         };
         let json = serde_json::to_string(&r).unwrap();
@@ -402,8 +473,10 @@ mod tests {
     fn request_restore_round_trips_non_default_memory_policy() {
         let r = ApiRequest::Restore {
             snapshot_path: "/golden.snap".into(),
+            memory_integrity: None,
             overlay: None,
             net: None,
+            volumes: None,
             memory_policy: RestoreMemoryPolicy::Lazy,
         };
         let json = serde_json::to_string(&r).unwrap();
@@ -444,7 +517,12 @@ mod tests {
     fn response_variants_round_trip() {
         for r in [
             ApiResponse::Ok,
-            ApiResponse::Snapshot { path: "/p".into() },
+            ApiResponse::Snapshot {
+                path: "/p".into(),
+                overlay_path: None,
+                integrity_path: None,
+                live_stats: None,
+            },
             ApiResponse::Restored,
             ApiResponse::GuestNetworkRepaired,
             ApiResponse::Err { msg: "bad".into() },
@@ -453,6 +531,34 @@ mod tests {
             let back: ApiResponse = serde_json::from_str(&s).unwrap();
             let _ = back;
         }
+    }
+
+    #[test]
+    fn live_snapshot_response_round_trips_structured_stats() {
+        let stats = LiveSnapshotStats {
+            rounds: 7,
+            pages_copied: 123_456,
+            final_dirty_pages: 32_768,
+            elapsed_us: 30_125_000,
+            downtime_us: 357_000,
+            termination: LiveSnapshotTermination::Timeout,
+        };
+        let response = ApiResponse::Snapshot {
+            path: "/snapshots/live.snap".into(),
+            overlay_path: Some("/snapshots/live.overlay".into()),
+            integrity_path: Some("/snapshots/live.integrity".into()),
+            live_stats: Some(stats.clone()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let back: ApiResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            ApiResponse::Snapshot {
+                live_stats: Some(actual),
+                ..
+            } if actual == stats
+        ));
     }
 
     #[test]

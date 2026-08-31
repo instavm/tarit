@@ -256,9 +256,16 @@ target/release/vmm pull docker://ghcr.io/owner/image:tag \
 |---|---:|---|
 | `<IMAGE_REF>` | required | OCI reference, for example `docker://ubuntu:22.04`. |
 | `--output <PATH>` | required | Output ext4 disk image path. |
-| `--size <MIB>` | `1024` | Disk image size in MiB. |
+| `--size <MIB>` | `1024` | Disk image size in MiB and basis for OCI unpack limits. |
 | `--auth <PATH>` | none | Auth file for private registries. |
 | `--agent <PATH>` | none | Compiled guest exec agent to inject into the image. |
+
+OCI descriptor size and SHA-256 are verified before extraction. The pull fails
+without publishing an output if the image exceeds 128 layers, an 8 MiB
+manifest/config limit, twice the requested disk size in compressed or expanded
+layer data, the requested disk size for one file, 4096 bytes for one path, or
+`max(16384, 256 * MIB)` layer entries. Private build workspaces are removed on
+failure.
 
 ## Jailer and cgroup confinement
 

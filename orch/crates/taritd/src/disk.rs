@@ -276,7 +276,12 @@ impl DiskPressure {
                 .saturating_add(requested.inodes);
             let exceeds_reservable_space = root.reserved_bytes.saturating_add(requested.bytes)
                 > space.available_bytes
-                || root.reserved_inodes.saturating_add(requested.inodes) > space.available_inodes;
+                // Btrfs reports f_files=f_favail=0 because it allocates
+                // inodes dynamically. Zero therefore means "not reported",
+                // not "no inode can be created".
+                || !space.can_reserve_inodes(
+                    root.reserved_inodes.saturating_add(requested.inodes),
+                );
             if exceeds_reservable_space
                 || self
                     .config
@@ -426,6 +431,13 @@ struct FilesystemSpace {
     used_inodes: u64,
     available_bytes: u64,
     available_inodes: u64,
+    inode_capacity_known: bool,
+}
+
+impl FilesystemSpace {
+    fn can_reserve_inodes(&self, requested: u64) -> bool {
+        !self.inode_capacity_known || requested <= self.available_inodes
+    }
 }
 
 fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
@@ -455,6 +467,7 @@ fn filesystem_space(path: &Path) -> std::io::Result<FilesystemSpace> {
         used_inodes,
         available_bytes: block_size.saturating_mul(available_blocks),
         available_inodes: stat_u64(stats.f_favail),
+        inode_capacity_known: stats.f_files != 0,
     })
 }
 
@@ -640,6 +653,19 @@ fn safe_owned_file(path: &Path) -> Result<bool, OrchError> {
         && metadata.mode() & 0o077 == 0)
 }
 
+fn unlink_owned_file(path: &Path) -> Result<bool, OrchError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        // Another valid retirement path may win after safe_owned_file() has
+        // inspected the inode. Absence is the requested final state.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(OrchError::Internal(format!(
+            "remove unreferenced replica {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
 fn old_enough(path: &Path, min_age: Duration) -> Result<bool, OrchError> {
     let modified = std::fs::symlink_metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -660,10 +686,65 @@ fn is_owned_overlay_name(name: &str) -> bool {
 
 fn is_owned_snapshot_name(name: &str) -> bool {
     name.strip_prefix("bundle-")
-        .and_then(|name| name.strip_suffix(".ram"))
+        .and_then(|name| {
+            name.strip_suffix(".ram")
+                .or_else(|| name.strip_suffix(".ram.integrity"))
+        })
         .or_else(|| name.strip_suffix(".cow"))
         .and_then(|id| Uuid::parse_str(id).ok())
         .is_some()
+        || is_owned_replica_name(name)
+}
+
+fn is_owned_replica_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_suffix(".ram.integrity")
+        .or_else(|| name.strip_suffix(".ram"))
+        .or_else(|| name.strip_suffix(".cow"))
+        .and_then(|name| name.strip_prefix("replica-"))
+    else {
+        return false;
+    };
+    // UUIDs contain hyphens, so split at the fixed 36-byte UUID boundary.
+    if stem.len() != 73 || stem.as_bytes().get(36) != Some(&b'-') {
+        return false;
+    }
+    let (artifact, token) = (&stem[..36], &stem[37..]);
+    Uuid::parse_str(artifact).is_ok() && Uuid::parse_str(token).is_ok()
+}
+
+/// Remove only the exact private files named by a local replica record. The
+/// caller keeps metadata until this succeeds so partial I/O failure is
+/// retryable and never broadens deletion outside Tarit's snapshot directory.
+pub(crate) fn delete_owned_snapshot_components(
+    socket_dir: &Path,
+    snapshot: &tarit_store::SnapshotRecord,
+) -> Result<u64, OrchError> {
+    let root = socket_dir.join("snapshots");
+    validate_owned_root(&root)?;
+    let paths = [
+        Some(PathBuf::from(&snapshot.path)),
+        snapshot.overlay_path.as_deref().map(PathBuf::from),
+        Some(PathBuf::from(format!("{}.integrity", snapshot.path))),
+    ];
+    let mut removed = 0u64;
+    for path in paths.into_iter().flatten() {
+        if path.parent() != Some(root.as_path())
+            || !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_owned_snapshot_name)
+        {
+            return Err(OrchError::Internal(format!(
+                "refuse replica deletion outside owned snapshot namespace: {}",
+                path.display()
+            )));
+        }
+        if safe_owned_file(&path)? && unlink_owned_file(&path)? {
+            removed = removed.saturating_add(1);
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -675,6 +756,46 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../target")
             .join(format!("disk-{label}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn replica_snapshot_names_are_owned_but_malformed_near_matches_are_not() {
+        let artifact = Uuid::new_v4();
+        let token = Uuid::new_v4();
+        for suffix in ["ram", "ram.integrity", "cow"] {
+            assert!(is_owned_snapshot_name(&format!(
+                "replica-{artifact}-{token}.{suffix}"
+            )));
+        }
+        assert!(!is_owned_snapshot_name(&format!(
+            "replica-{artifact}-{token}.ext4"
+        )));
+        assert!(!is_owned_snapshot_name("replica-customer-data.ram"));
+    }
+
+    #[test]
+    fn owned_file_unlink_is_idempotent() {
+        let root = test_root("idempotent-unlink");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("owned.ram");
+        std::fs::write(&path, b"snapshot").unwrap();
+
+        assert!(unlink_owned_file(&path).unwrap());
+        assert!(!unlink_owned_file(&path).unwrap());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dynamic_inode_filesystems_do_not_report_zero_capacity() {
+        let space = FilesystemSpace {
+            used_bytes: 0,
+            used_inodes: 0,
+            available_bytes: 1024,
+            available_inodes: 0,
+            inode_capacity_known: false,
+        };
+        assert!(space.can_reserve_inodes(2));
     }
 
     #[test]
@@ -723,12 +844,21 @@ mod tests {
         let root = test_root("reservation");
         let same_device = root.join("jails");
         std::fs::create_dir_all(&same_device).unwrap();
-        let (used_bytes, _) = filesystem_usage(&root).unwrap();
+        let available_bytes = filesystem_space(&root).unwrap().available_bytes;
+        // Reservations are accounting-only, so use a fraction of the measured
+        // free space: one must fit while two cannot. This stays deterministic
+        // regardless of the test host's absolute capacity or concurrent build
+        // output growth.
+        let reservation_bytes = available_bytes.saturating_mul(3) / 4;
+        assert!(
+            reservation_bytes >= 4096,
+            "test filesystem must have at least 16 KiB available"
+        );
         let pressure = Arc::new(
             DiskPressure::new(
                 DiskPressureConfig {
-                    bytes_high: Some(used_bytes.saturating_add(1024 * 1024 * 1024)),
-                    bytes_low: Some(used_bytes),
+                    bytes_high: None,
+                    bytes_low: None,
                     inodes_high: None,
                     inodes_low: None,
                     sweep_interval_secs: 1,
@@ -738,15 +868,15 @@ mod tests {
             )
             .unwrap(),
         );
-        let reservation = pressure.reserve("snapshot", 400 * 1024 * 1024, 2).unwrap();
+        let reservation = pressure.reserve("snapshot", reservation_bytes, 2).unwrap();
         let snapshot = pressure.snapshot();
         assert_eq!(
             snapshot.roots.len(),
             1,
             "same-device roots are deduplicated"
         );
-        assert_eq!(snapshot.reserved_bytes, 400 * 1024 * 1024);
-        assert!(pressure.reserve("snapshot", 700 * 1024 * 1024, 2).is_err());
+        assert_eq!(snapshot.reserved_bytes, reservation_bytes);
+        assert!(pressure.reserve("snapshot", reservation_bytes, 2).is_err());
         drop(reservation);
         assert_eq!(pressure.snapshot().reserved_bytes, 0);
         std::fs::remove_dir_all(root).unwrap();

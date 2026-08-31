@@ -34,8 +34,12 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_PEER_SECRET` | string | random local-only value | Key for short-lived, source/target-bound peer request HMACs. It is never sent on the wire. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
 | `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. |
 | `TARIT_PRODUCTION` | bool | `false` | Enforce the strict production configuration gates, including per-VM PID and network namespaces. This does not by itself satisfy every release gate in `PRODUCTION_READINESS.md`. |
+| `TARIT_IMAGE_REQUIRE_SIGNATURE` | bool | `false` | Require registered OCI images to have been verified with the currently configured cosign public key. `TARIT_PRODUCTION=1` requires this setting. Non-admin production creates must name a registered image and cannot fall back to the raw node default rootfs. |
+| `TARIT_IMAGE_COSIGN_KEY` | path | unset | Trusted cosign public key used at image admission. The key is hashed into the immutable image record; rotating the configured key fences images admitted by the old policy until they are explicitly readmitted or the old key is restored. |
 | `TARIT_REAP_ON_SHUTDOWN` | bool | `true` | On SIGTERM or SIGINT, stop local `vmm serve` children after HTTP drain. |
 | `TARIT_RDS_CA_FILE` | path | unset | Extra CA bundle for PostgreSQL TLS. This is read by the fleet connector, not by `Config::from_env()`. Empty string is ignored. |
+| `TARIT_ARTIFACT_MIN_REPLICAS` | positive u64 | `1` development, `2` production | Minimum verified available physical copies before a fleet artifact is `ready`. PostgreSQL recomputes existing rows at startup; callers cannot self-declare readiness. |
+| `TARIT_ARTIFACT_MIN_FAILURE_DOMAINS` | positive u64 | `1` development, `2` production | Minimum distinct replica failure-domain labels required for readiness. Must not exceed `TARIT_ARTIFACT_MIN_REPLICAS`. |
 
 `TARIT_RPC_ADDR` is listed in Core / identity because it is always present. In cluster mode it should be a stable private URL reachable by every peer.
 

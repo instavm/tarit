@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum ThreadKind {
     Vcpu,
     Device,
+    Block,
     Vsock,
 }
 
@@ -45,16 +46,16 @@ impl SeccompProfile {
                 // glibc lazy-loads thread-local storage and may madvise
                 // the stack on the first `thread::sleep` call.
                 "madvise".into(),
-                // virtio-blk MMIO exits are handled in the vCPU thread.
-                // The backend does pread64/pwrite64/lseek for file I/O.
-                "pread64".into(),
-                "pwrite64".into(),
-                "lseek".into(),
-                "fdatasync".into(),
-                // CoW-overlay and plain-blk FLUSH call File::sync_all() = fsync
-                // for durability; without it the first FLUSH on a write-heavy
-                // guest rootfs kills the vCPU thread with SIGSYS (seccomp).
-                "fsync".into(),
+                // A restored guest's virtio-balloon MMIO notification is
+                // processed on this thread. Lazy-page discard checks
+                // residency before MADV_DONTNEED so it never waits on an
+                // unresolved UFFD fault.
+                "mincore".into(),
+                // Rust's owned-fd drop path checks that the KVM vCPU fd is
+                // still valid with fcntl(F_GETFD) immediately before close.
+                // Permit only that read-only query; general fcntl operations
+                // (duplication, flag mutation, and locking) stay denied.
+                "fcntl".into(),
                 // Rust runtime + glibc need these during normal operation and
                 // especially during a panic unwind: the stack-overflow guard
                 // (sigaltstack), TLS/guard pages (mprotect/mremap), signal setup
@@ -99,6 +100,48 @@ impl SeccompProfile {
                 "futex".into(),
                 "close".into(),
                 "dup".into(),
+                "mmap".into(),
+                "munmap".into(),
+                "mprotect".into(),
+                "mremap".into(),
+                "rt_sigreturn".into(),
+                "rt_sigaction".into(),
+                "rt_sigprocmask".into(),
+                "sigaltstack".into(),
+                "exit".into(),
+                "exit_group".into(),
+                "nanosleep".into(),
+                "clock_nanosleep".into(),
+                "sched_yield".into(),
+                "restart_syscall".into(),
+                "getrandom".into(),
+                "madvise".into(),
+                "brk".into(),
+                "gettid".into(),
+                "getpid".into(),
+                "clock_gettime".into(),
+            ],
+        }
+    }
+
+    /// Block queue worker. It can poll eventfds and perform positional I/O or
+    /// durable flushes on descriptors opened before confinement, but cannot
+    /// create sockets, open paths, issue ioctls, or use network syscalls.
+    pub fn block() -> Self {
+        Self {
+            kind: ThreadKind::Block,
+            allow: vec![
+                "poll".into(),
+                "ppoll".into(),
+                "read".into(),
+                "write".into(),
+                "pread64".into(),
+                "pwrite64".into(),
+                "lseek".into(),
+                "fdatasync".into(),
+                "fsync".into(),
+                "futex".into(),
+                "close".into(),
                 "mmap".into(),
                 "munmap".into(),
                 "mprotect".into(),
@@ -180,6 +223,7 @@ impl SeccompProfile {
             match self.kind {
                 ThreadKind::Vcpu => "vCPU",
                 ThreadKind::Device => "device",
+                ThreadKind::Block => "block",
                 ThreadKind::Vsock => "vsock",
             },
             self.allow.len()
@@ -202,6 +246,13 @@ impl SeccompProfile {
                 0xae00,
             )
             .map_err(|e| format!("ioctl condition: {e}"))?],
+            (ThreadKind::Vcpu, "fcntl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::F_GETFD as u64,
+            )
+            .map_err(|e| format!("fcntl condition: {e}"))?],
             // Rust may OR CLOEXEC/NONBLOCK into the socket type, so mask only
             // the low socket-type nibble and separately require AF_UNIX and
             // protocol 0. This prevents the guest-facing pump from creating
@@ -278,6 +329,7 @@ impl SeccompProfile {
             "nanosleep" => Ok(libc::SYS_nanosleep),
             "clock_nanosleep" => Ok(libc::SYS_clock_nanosleep),
             "madvise" => Ok(libc::SYS_madvise),
+            "mincore" => Ok(libc::SYS_mincore),
             "lseek" => Ok(libc::SYS_lseek),
             "fdatasync" => Ok(libc::SYS_fdatasync),
             "fsync" => Ok(libc::SYS_fsync),
@@ -329,6 +381,29 @@ mod tests {
     }
 
     #[test]
+    fn block_profile_has_no_path_network_or_ioctl_authority() {
+        let profile = SeccompProfile::block();
+        assert_eq!(profile.kind, ThreadKind::Block);
+        for denied in [
+            "open", "openat", "socket", "connect", "ioctl", "recvfrom", "sendto",
+        ] {
+            assert!(!profile.allow.contains(&denied.to_string()), "{denied}");
+        }
+        for required in [
+            "poll",
+            "read",
+            "write",
+            "pread64",
+            "pwrite64",
+            "lseek",
+            "fdatasync",
+            "fsync",
+        ] {
+            assert!(profile.allow.contains(&required.to_string()), "{required}");
+        }
+    }
+
+    #[test]
     fn vsock_profile_is_the_only_device_profile_with_socket_creation() {
         let device = SeccompProfile::device();
         let vsock = SeccompProfile::vsock();
@@ -348,6 +423,13 @@ mod tests {
         assert_eq!(
             SeccompProfile::vcpu()
                 .rules_for_syscall("ioctl")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SeccompProfile::vcpu()
+                .rules_for_syscall("fcntl")
                 .unwrap()
                 .len(),
             1
@@ -388,9 +470,13 @@ mod tests {
     }
 
     #[test]
-    fn vcpu_profile_allows_ioctl() {
+    #[cfg(target_os = "linux")]
+    fn vcpu_profile_covers_kvm_and_lazy_balloon_syscalls() {
         let p = SeccompProfile::vcpu();
-        assert!(p.allow.contains(&"ioctl".to_string()));
+        for syscall in ["ioctl", "fcntl", "madvise", "mincore"] {
+            assert!(p.allow.contains(&syscall.to_string()), "{syscall}");
+            assert!(p.syscall_nr(syscall).is_ok(), "{syscall}");
+        }
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub mod live_snapshot;
 pub mod vcpu_setup;
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub mod vcpu_thread;
+#[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+pub mod vmgenid;
 
 #[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
 pub mod vsock_exec;
@@ -40,6 +42,7 @@ pub use kvm::KvmVm;
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub use live_snapshot::{
     live_snapshot, LiveSnapshotConfig, LiveSnapshotOutput, LiveSnapshotResult,
+    LiveSnapshotTermination,
 };
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub use vcpu_setup::{

@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <arpa/inet.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -19,15 +20,22 @@
 #include <termios.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <net/if.h>
+#include <net/route.h>
+#include <linux/random.h>
 #include <linux/vm_sockets.h>
 #include <poll.h>
 #include <pty.h>
 #include <sys/mount.h>
+#include <sys/random.h>
 #include <sys/sysmacros.h>
+#include <sys/vfs.h>
 #endif
 
 #define EXEC_PREFIX "VMM_EXEC:"
 #define EXEC_PREFIX_LEN 9
+#define PROBE_PREFIX "VMM_PROBE:"
+#define PROBE_PREFIX_LEN 10
 #define REPAIR_NET_PREFIX "VMM_REPAIR_NET:"
 #define REPAIR_NET_PREFIX_LEN 15
 
@@ -61,6 +69,17 @@
 #define EXEC_FRAME_MAX_PAYLOAD (1024U * 1024U)
 #define EXEC_STREAM_CHUNK_BYTES (16U * 1024U)
 #define EXEC_PROTOCOL_LINE "VMM_VSOCK_EXEC_PROTO=2\n"
+#define CLONE_REPAIR_PREFIX_V2 "__TARIT_CLONE_REPAIR_V2__"
+#define CLONE_REPAIR_PREFIX_V2_LEN (sizeof(CLONE_REPAIR_PREFIX_V2) - 1U)
+#define CLONE_REPAIR_PREFIX_V3 "__TARIT_CLONE_REPAIR_V3__"
+#define CLONE_REPAIR_PREFIX_V3_LEN (sizeof(CLONE_REPAIR_PREFIX_V3) - 1U)
+#define CLONE_REPAIR_SEED_BYTES 32U
+#define CLONE_REPAIR_ID_BYTES 16U
+#define CLONE_REPAIR_NONCE_BYTES (CLONE_REPAIR_SEED_BYTES + CLONE_REPAIR_ID_BYTES)
+#define CLONE_REPAIR_OK_V2 "TARIT_CLONE_REPAIR_V2_OK"
+#define CLONE_REPAIR_OK_V3 "TARIT_CLONE_REPAIR_V3_OK"
+#define POST_FORK_HOOK_PATH "/usr/libexec/tarit/post-fork"
+#define CLONE_REPAIR_STAGE_PATH "/run/tarit/clone-repair-stage"
 
 /* A sane default PATH so commands (node, python, ...) resolve when we run as
  * init on an OCI-derived rootfs where no login shell exported one. */
@@ -93,6 +112,257 @@ static int write_all(int fd, const void *buf, size_t len) {
     }
     return 0;
 }
+
+#ifdef __linux__
+static int hex_nibble(unsigned char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+static int decode_hex_bytes(const char *encoded, unsigned char *output, size_t output_len) {
+    for (size_t i = 0; i < output_len; i++) {
+        int high = hex_nibble((unsigned char)encoded[i * 2U]);
+        int low = hex_nibble((unsigned char)encoded[i * 2U + 1U]);
+        if (high < 0 || low < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        output[i] = (unsigned char)((high << 4) | low);
+    }
+    return 0;
+}
+
+static int decode_clone_repair_request(const char *command,
+                                       unsigned char nonce[CLONE_REPAIR_NONCE_BYTES],
+                                       struct timespec *host_realtime, int *protocol_version) {
+    size_t prefix_len;
+    size_t timestamp_bytes;
+    if (strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
+        prefix_len = CLONE_REPAIR_PREFIX_V3_LEN;
+        timestamp_bytes = 12U;
+        *protocol_version = 3;
+    } else if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0) {
+        prefix_len = CLONE_REPAIR_PREFIX_V2_LEN;
+        timestamp_bytes = 0U;
+        *protocol_version = 2;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t expected_len = prefix_len + (CLONE_REPAIR_NONCE_BYTES + timestamp_bytes) * 2U;
+    if (strlen(command) != expected_len ||
+        decode_hex_bytes(command + prefix_len, nonce, CLONE_REPAIR_NONCE_BYTES) < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (*protocol_version == 3) {
+        unsigned char encoded_time[12];
+        if (decode_hex_bytes(command + prefix_len + CLONE_REPAIR_NONCE_BYTES * 2U,
+                             encoded_time, sizeof(encoded_time)) < 0) {
+            return -1;
+        }
+        uint64_t seconds = 0;
+        uint32_t nanoseconds = 0;
+        for (size_t i = 0; i < 8U; i++) seconds = (seconds << 8U) | encoded_time[i];
+        for (size_t i = 8U; i < 12U; i++) nanoseconds = (nanoseconds << 8U) | encoded_time[i];
+        time_t converted_seconds = (time_t)seconds;
+        if (nanoseconds >= 1000000000U || converted_seconds < 0 ||
+            (uint64_t)converted_seconds != seconds) {
+            errno = ERANGE;
+            return -1;
+        }
+        host_realtime->tv_sec = converted_seconds;
+        host_realtime->tv_nsec = (long)nanoseconds;
+    }
+    return 0;
+}
+
+static void set_clone_repair_stage(const char *stage) {
+    int fd = open(CLONE_REPAIR_STAGE_PATH,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    (void)write_all(fd, stage, strlen(stage));
+    (void)write_all(fd, "\n", 1);
+    (void)close(fd);
+}
+
+static int run_post_fork_hook(const char *clone_id) {
+    struct stat st;
+    int hook_fd = open(POST_FORK_HOOK_PATH, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (hook_fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (fstat(hook_fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        (st.st_mode & 0022) != 0 || (st.st_mode & 0111) == 0) {
+        close(hook_fd);
+        errno = EPERM;
+        return -1;
+    }
+    if (fcntl(hook_fd, F_SETFD, 0) < 0) {
+        close(hook_fd);
+        return -1;
+    }
+
+    char fd_path[64];
+    char clone_env[64];
+    int fd_path_len = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", hook_fd);
+    int clone_env_len = snprintf(clone_env, sizeof(clone_env), "TARIT_CLONE_ID=%s", clone_id);
+    if (fd_path_len <= 0 || (size_t)fd_path_len >= sizeof(fd_path) || clone_env_len != 47) {
+        close(hook_fd);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    char *const argv[] = { (char *)POST_FORK_HOOK_PATH, NULL };
+    char *const envp[] = {
+        clone_env,
+        (char *)"TARIT_POST_FORK=1",
+        (char *)"PATH=" DEFAULT_PATH,
+        NULL,
+    };
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(hook_fd);
+        return -1;
+    }
+    if (child == 0) {
+        int null_fd = open("/dev/null", O_RDWR);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDIN_FILENO);
+            (void)dup2(null_fd, STDOUT_FILENO);
+            (void)dup2(null_fd, STDERR_FILENO);
+        }
+        for (int fd = 3; fd < 1024; fd++) {
+            if (fd != hook_fd) close(fd);
+        }
+        execve(fd_path, argv, envp);
+        _exit(126);
+    }
+    close(hook_fd);
+
+    /* Do not implement this wait with a guest-clock sleep. Repair runs before
+     * admission specifically while restored timer state is still untrusted.
+     * The VMM's host-monotonic admission deadline bounds the whole exchange. */
+    int status;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        errno = ECANCELED;
+        return -1;
+    }
+    return 0;
+}
+
+static int repair_clone_entropy(const char *command, char clone_id[33], int *protocol_version) {
+    unsigned char nonce[CLONE_REPAIR_NONCE_BYTES];
+    struct {
+        int entropy_count;
+        int buf_size;
+        unsigned char buf[CLONE_REPAIR_SEED_BYTES];
+    } pool;
+    int random_fd = -1;
+    int marker = -1;
+    int boot_id_file = -1;
+    int rc = -1;
+    struct timespec host_realtime = {0};
+
+    if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) {
+        goto out;
+    }
+    set_clone_repair_stage("decode");
+    if (decode_clone_repair_request(command, nonce, &host_realtime, protocol_version) < 0) {
+        goto out;
+    }
+    if (*protocol_version == 3) {
+        set_clone_repair_stage("clock");
+        if (clock_settime(CLOCK_REALTIME, &host_realtime) < 0) goto out;
+    }
+
+    pool.entropy_count = (int)(CLONE_REPAIR_SEED_BYTES * 8U);
+    pool.buf_size = (int)CLONE_REPAIR_SEED_BYTES;
+    memcpy(pool.buf, nonce, CLONE_REPAIR_SEED_BYTES);
+    set_clone_repair_stage("entropy");
+    random_fd = open("/dev/random", O_RDWR | O_CLOEXEC);
+    if (random_fd < 0 || ioctl(random_fd, RNDADDENTROPY, &pool) < 0 ||
+        ioctl(random_fd, RNDRESEEDCRNG, 0) < 0) {
+        goto out;
+    }
+    close(random_fd);
+    random_fd = -1;
+    set_clone_repair_stage("identity");
+
+    /* The clone ID is a separate, non-secret part of the host nonce. Echoing
+     * it proves that the exact repair request was consumed before admission. */
+    for (size_t i = 0; i < CLONE_REPAIR_ID_BYTES; i++) {
+        static const char hex[] = "0123456789abcdef";
+        unsigned char value = nonce[CLONE_REPAIR_SEED_BYTES + i];
+        clone_id[i * 2] = hex[value >> 4];
+        clone_id[i * 2 + 1] = hex[value & 0x0fU];
+    }
+    clone_id[32] = '\0';
+
+    marker = open("/run/tarit/clone-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (marker < 0 || write_all(marker, clone_id, 32) < 0 || write_all(marker, "\n", 1) < 0) {
+        goto out;
+    }
+    close(marker);
+    marker = -1;
+
+    char boot_id[38];
+    int boot_id_len = snprintf(boot_id, sizeof(boot_id),
+                               "%.8s-%.4s-%.4s-%.4s-%.12s\n", clone_id,
+                               clone_id + 8, clone_id + 12, clone_id + 16,
+                               clone_id + 20);
+    if (boot_id_len != 37) {
+        errno = EOVERFLOW;
+        goto out;
+    }
+    boot_id_file = open("/run/tarit/boot-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0444);
+    if (boot_id_file < 0 || write_all(boot_id_file, boot_id, (size_t)boot_id_len) < 0 ||
+        fsync(boot_id_file) < 0) {
+        goto out;
+    }
+    close(boot_id_file);
+    boot_id_file = -1;
+    set_clone_repair_stage("boot-id");
+
+    /* A kernel boot_id is immutable and remains captured in VM RAM. Overlay it
+     * with this incarnation ID before admission. On descendants the existing
+     * bind mount observes the rewritten tmpfs inode, so mounts do not stack. */
+    char current_boot_id[38];
+    int current = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+    ssize_t current_len = current >= 0 ? read(current, current_boot_id, sizeof(current_boot_id)) : -1;
+    if (current >= 0) close(current);
+    if (current_len != boot_id_len || memcmp(current_boot_id, boot_id, (size_t)boot_id_len) != 0) {
+        if (mount("/run/tarit/boot-id", "/proc/sys/kernel/random/boot_id", NULL, MS_BIND, NULL) < 0 ||
+            mount(NULL, "/proc/sys/kernel/random/boot_id", NULL,
+                  MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
+            goto out;
+        }
+    }
+    set_clone_repair_stage("userspace");
+    if (run_post_fork_hook(clone_id) < 0) {
+        goto out;
+    }
+    set_clone_repair_stage("complete");
+    rc = 0;
+
+out:
+    {
+        int saved_errno = errno;
+        if (random_fd >= 0) close(random_fd);
+        if (marker >= 0) close(marker);
+        if (boot_id_file >= 0) close(boot_id_file);
+        memset(nonce, 0, sizeof(nonce));
+        memset(&pool, 0, sizeof(pool));
+        errno = saved_errno;
+    }
+    return rc;
+}
+#endif
 
 static int serial_write(int fd, const void *buf, size_t len) {
     if (write_all(fd, buf, len) < 0) {
@@ -143,6 +413,51 @@ static void ensure_node(const char *path, mode_t mode, unsigned major, unsigned 
     (void)mknod(path, mode, makedev(major, minor));
 }
 
+/* Some small kernels expose the block devices through sysfs but provide only
+ * a plain tmpfs at /dev. devtmpfs and tmpfs have the same statfs magic, so the
+ * fallback above cannot safely infer that device nodes were populated. Build
+ * the missing block nodes from the kernel-owned sysfs class instead. */
+static void ensure_block_nodes(void) {
+    DIR *directory = opendir("/sys/class/block");
+    if (directory == NULL) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        const char *name = entry->d_name;
+        if (name[0] == '.' || strchr(name, '/') != NULL || strlen(name) > 127U) {
+            continue;
+        }
+        char sysfs_path[256];
+        char device_path[256];
+        if (snprintf(sysfs_path, sizeof(sysfs_path), "/sys/class/block/%s/dev", name) < 0 ||
+            snprintf(device_path, sizeof(device_path), "/dev/%s", name) < 0) {
+            continue;
+        }
+        FILE *device = fopen(sysfs_path, "re");
+        if (device == NULL) {
+            continue;
+        }
+        unsigned device_major = 0;
+        unsigned device_minor = 0;
+        int parsed = fscanf(device, "%u:%u", &device_major, &device_minor);
+        fclose(device);
+        if (parsed == 2) {
+            ensure_node(device_path, S_IFBLK | 0600, device_major, device_minor);
+        }
+    }
+    closedir(directory);
+}
+
+/* devtmpfs and tmpfs share TMPFS_MAGIC. At this early PID-1 boundary, an
+ * existing tmpfs mount on /dev is the kernel's CONFIG_DEVTMPFS_MOUNT result;
+ * the OCI rootfs cannot have established a mount before init runs. */
+static bool dev_filesystem_is_mounted(void) {
+    struct statfs state;
+    return statfs("/dev", &state) == 0 &&
+           (unsigned long)state.f_type == 0x01021994UL;
+}
+
 /* PID 1 setup for booting an OCI-derived (initless) rootfs directly: bring up
  * the pseudo-filesystems a normal init would, so /dev/urandom, /dev/null, /proc
  * etc. exist for the workload (node reads /dev/urandom at startup). Must run
@@ -153,17 +468,19 @@ static void setup_as_init(void) {
     /* devtmpfs auto-populates /dev with the kernel's device nodes (ttyS0,
      * null, urandom, ...). If the kernel lacks devtmpfs, fall back to a tmpfs
      * plus the handful of nodes programs actually need. */
-    if (mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755") != 0) {
+    if (mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755") != 0 &&
+        !dev_filesystem_is_mounted()) {
         mount_pseudo("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755");
-        ensure_node("/dev/null", S_IFCHR | 0666, 1, 3);
-        ensure_node("/dev/zero", S_IFCHR | 0666, 1, 5);
-        ensure_node("/dev/full", S_IFCHR | 0666, 1, 7);
-        ensure_node("/dev/random", S_IFCHR | 0666, 1, 8);
-        ensure_node("/dev/urandom", S_IFCHR | 0666, 1, 9);
-        ensure_node("/dev/tty", S_IFCHR | 0666, 5, 0);
-        ensure_node("/dev/console", S_IFCHR | 0600, 5, 1);
-        ensure_node("/dev/ttyS0", S_IFCHR | 0660, 4, 64);
     }
+    ensure_node("/dev/null", S_IFCHR | 0666, 1, 3);
+    ensure_node("/dev/zero", S_IFCHR | 0666, 1, 5);
+    ensure_node("/dev/full", S_IFCHR | 0666, 1, 7);
+    ensure_node("/dev/random", S_IFCHR | 0666, 1, 8);
+    ensure_node("/dev/urandom", S_IFCHR | 0666, 1, 9);
+    ensure_node("/dev/tty", S_IFCHR | 0666, 5, 0);
+    ensure_node("/dev/console", S_IFCHR | 0600, 5, 1);
+    ensure_node("/dev/ttyS0", S_IFCHR | 0660, 4, 64);
+    ensure_block_nodes();
     mount_pseudo("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
     mount_pseudo("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755");
     mount_pseudo("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777");
@@ -341,6 +658,30 @@ static void run_command(int serial_fd, const char *command) {
 
     (void)serial_write(serial_fd, "VMM_EXEC_START\n", 15);
 
+    /* An empty command is the transport-level readiness probe. It proves the
+     * agent can receive and answer requests without requiring /bin/sh, which
+     * intentionally does not exist in distroless OCI images. */
+    if (command[0] == '\0') {
+        serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 0);
+        return;
+    }
+#ifdef __linux__
+    if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0 ||
+        strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
+        char clone_id[33];
+        int protocol_version = 0;
+        if (repair_clone_entropy(command, clone_id, &protocol_version) == 0) {
+            const char *response = protocol_version == 3 ? CLONE_REPAIR_OK_V3 : CLONE_REPAIR_OK_V2;
+            serial_printf(serial_fd, "%s %s\n", response, clone_id);
+            serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 0);
+        } else {
+            serial_printf(serial_fd, "vmm-agent: clone repair failed: %s\n", strerror(errno));
+            serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 1);
+        }
+        return;
+    }
+#endif
+
     if (pipe(pipefd) < 0) {
         serial_printf(serial_fd, "vmm-agent: pipe failed: %s\n", strerror(errno));
         serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", 127);
@@ -393,6 +734,19 @@ static void run_command(int serial_fd, const char *command) {
         (void)serial_write(serial_fd, "\n", 1);
     }
     serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", exit_code);
+}
+
+static void run_probe(int serial_fd, const char *token) {
+    if (strlen(token) != 16U) {
+        return;
+    }
+    for (size_t i = 0; i < 16U; i++) {
+        unsigned char c = (unsigned char)token[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return;
+        }
+    }
+    serial_printf(serial_fd, "VMM_PROBE_OK:%s\n", token);
 }
 
 #ifdef __linux__
@@ -510,6 +864,35 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     int stdout_pipe[2] = { -1, -1 };
     int stderr_pipe[2] = { -1, -1 };
     if (send_exec_start(fd, request_id) < 0) {
+        return;
+    }
+    /* Keep readiness independent of guest shell/userspace availability. */
+    if (command[0] == '\0') {
+        (void)send_exec_exit(fd, request_id, 0);
+        return;
+    }
+    if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0 ||
+        strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
+        char clone_id[33];
+        int protocol_version = 0;
+        if (repair_clone_entropy(command, clone_id, &protocol_version) == 0) {
+            char response[96];
+            const char *marker = protocol_version == 3 ? CLONE_REPAIR_OK_V3 : CLONE_REPAIR_OK_V2;
+            int len = snprintf(response, sizeof(response), "%s %s\n", marker, clone_id);
+            if (len > 0 && (size_t)len < sizeof(response)) {
+                (void)send_exec_chunk(fd, EXEC_FRAME_STDOUT, request_id, response, (uint32_t)len);
+                (void)send_exec_exit(fd, request_id, 0);
+                return;
+            }
+            errno = EOVERFLOW;
+        }
+        char message[160];
+        int len = snprintf(message, sizeof(message), "vmm-agent: clone repair failed: %s\n",
+                           strerror(errno));
+        if (len > 0 && (size_t)len < sizeof(message)) {
+            (void)send_exec_chunk(fd, EXEC_FRAME_STDERR, request_id, message, (uint32_t)len);
+        }
+        (void)send_exec_exit(fd, request_id, 1);
         return;
     }
     if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
@@ -703,22 +1086,6 @@ static size_t json_get_string_array(const char *json, const char *key, char out[
     }
 }
 
-static int run_argv_and_stream_output(int serial_fd, char *const argv[]) {
-    pid_t pid = fork();
-    if (pid < 0) {
-        serial_printf(serial_fd, "fork failed: %s\n", strerror(errno));
-        return 127;
-    }
-    if (pid == 0) {
-        if (dup2(serial_fd, STDOUT_FILENO) < 0 || dup2(serial_fd, STDERR_FILENO) < 0) {
-            _exit(127);
-        }
-        execvp(argv[0], argv);
-        _exit(127);
-    }
-    return wait_for_child(pid);
-}
-
 static int write_resolv_conf(char dns[][64], size_t dns_count) {
     int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -736,6 +1103,193 @@ static int write_resolv_conf(char dns[][64], size_t dns_count) {
     }
     return close(fd);
 }
+
+#ifdef __linux__
+static void init_ipv4_sockaddr(struct sockaddr *address, struct in_addr ipv4) {
+    struct sockaddr_in *inet = (struct sockaddr_in *)address;
+    memset(address, 0, sizeof(*address));
+    inet->sin_family = AF_INET;
+    inet->sin_addr = ipv4;
+}
+
+static int remove_default_routes(int socket_fd) {
+    FILE *routes = fopen("/proc/net/route", "re");
+    if (routes == NULL) {
+        return -1;
+    }
+
+    char line[512];
+    if (fgets(line, sizeof(line), routes) == NULL) {
+        fclose(routes);
+        errno = EIO;
+        return -1;
+    }
+    while (fgets(line, sizeof(line), routes) != NULL) {
+        char interface[IFNAMSIZ];
+        unsigned long destination;
+        unsigned long gateway;
+        unsigned int flags;
+        unsigned long mask;
+        int matched = sscanf(line, "%15s %lx %lx %x %*u %*u %*u %lx",
+                             interface, &destination, &gateway, &flags, &mask);
+        if (matched != 5 || strcmp(interface, "eth0") != 0 || destination != 0 || mask != 0) {
+            continue;
+        }
+
+        struct rtentry route;
+        memset(&route, 0, sizeof(route));
+        struct in_addr zero = {.s_addr = 0};
+        struct in_addr gateway_addr = {.s_addr = (in_addr_t)gateway};
+        init_ipv4_sockaddr(&route.rt_dst, zero);
+        init_ipv4_sockaddr(&route.rt_genmask, zero);
+        init_ipv4_sockaddr(&route.rt_gateway, gateway_addr);
+        route.rt_flags = (unsigned short)(flags | RTF_UP);
+        route.rt_dev = interface;
+        if (ioctl(socket_fd, SIOCDELRT, &route) < 0 && errno != ESRCH && errno != ENOENT) {
+            int saved_errno = errno;
+            fclose(routes);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    return fclose(routes);
+}
+
+static int default_route_matches(struct in_addr expected_gateway) {
+    FILE *routes = fopen("/proc/net/route", "re");
+    if (routes == NULL) {
+        return -1;
+    }
+    char line[512];
+    if (fgets(line, sizeof(line), routes) == NULL) {
+        fclose(routes);
+        errno = EIO;
+        return -1;
+    }
+
+    size_t matches = 0;
+    size_t defaults = 0;
+    while (fgets(line, sizeof(line), routes) != NULL) {
+        char interface[IFNAMSIZ];
+        unsigned long destination;
+        unsigned long gateway;
+        unsigned int flags;
+        unsigned long mask;
+        int matched = sscanf(line, "%15s %lx %lx %x %*u %*u %*u %lx",
+                             interface, &destination, &gateway, &flags, &mask);
+        if (matched != 5 || destination != 0 || mask != 0) {
+            continue;
+        }
+        defaults++;
+        if (strcmp(interface, "eth0") == 0 &&
+            (in_addr_t)gateway == expected_gateway.s_addr &&
+            (flags & (RTF_UP | RTF_GATEWAY)) == (RTF_UP | RTF_GATEWAY)) {
+            matches++;
+        }
+    }
+    if (fclose(routes) < 0) {
+        return -1;
+    }
+    if (defaults != 1 || matches != 1) {
+        errno = EADDRNOTAVAIL;
+        return -1;
+    }
+    return 0;
+}
+
+static int guest_ipv4_matches(int socket_fd, struct in_addr expected_address,
+                              struct in_addr expected_netmask,
+                              struct in_addr expected_gateway) {
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", "eth0");
+    if (ioctl(socket_fd, SIOCGIFADDR, &request) < 0 ||
+        ((struct sockaddr_in *)&request.ifr_addr)->sin_addr.s_addr != expected_address.s_addr) {
+        errno = EADDRNOTAVAIL;
+        return -1;
+    }
+    if (ioctl(socket_fd, SIOCGIFNETMASK, &request) < 0 ||
+        ((struct sockaddr_in *)&request.ifr_netmask)->sin_addr.s_addr != expected_netmask.s_addr) {
+        errno = EADDRNOTAVAIL;
+        return -1;
+    }
+    if (ioctl(socket_fd, SIOCGIFFLAGS, &request) < 0 || (request.ifr_flags & IFF_UP) == 0) {
+        errno = ENETDOWN;
+        return -1;
+    }
+    return default_route_matches(expected_gateway);
+}
+
+static int configure_guest_ipv4(const char *addr, uint16_t prefix, const char *gateway) {
+    struct in_addr address;
+    struct in_addr gateway_addr;
+    if (inet_pton(AF_INET, addr, &address) != 1 ||
+        inet_pton(AF_INET, gateway, &gateway_addr) != 1) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) {
+        return -1;
+    }
+
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", "eth0");
+    init_ipv4_sockaddr(&request.ifr_addr, address);
+    if (ioctl(socket_fd, SIOCSIFADDR, &request) < 0) {
+        goto fail;
+    }
+
+    uint32_t mask_bits = prefix == 0 ? 0U : UINT32_MAX << (32U - prefix);
+    struct in_addr netmask = {.s_addr = htonl(mask_bits)};
+    init_ipv4_sockaddr(&request.ifr_netmask, netmask);
+    if (ioctl(socket_fd, SIOCSIFNETMASK, &request) < 0) {
+        goto fail;
+    }
+
+    if (ioctl(socket_fd, SIOCGIFFLAGS, &request) < 0) {
+        goto fail;
+    }
+    request.ifr_flags = (short)(request.ifr_flags | IFF_UP);
+    if (ioctl(socket_fd, SIOCSIFFLAGS, &request) < 0 || remove_default_routes(socket_fd) < 0) {
+        goto fail;
+    }
+
+    struct rtentry route;
+    memset(&route, 0, sizeof(route));
+    struct in_addr zero = {.s_addr = 0};
+    init_ipv4_sockaddr(&route.rt_dst, zero);
+    init_ipv4_sockaddr(&route.rt_genmask, zero);
+    init_ipv4_sockaddr(&route.rt_gateway, gateway_addr);
+    route.rt_flags = RTF_UP | RTF_GATEWAY;
+    route.rt_dev = request.ifr_name;
+    if (ioctl(socket_fd, SIOCADDRT, &route) < 0) {
+        goto fail;
+    }
+    if (guest_ipv4_matches(socket_fd, address, netmask, gateway_addr) < 0) {
+        goto fail;
+    }
+
+    return close(socket_fd);
+
+fail: {
+        int saved_errno = errno;
+        close(socket_fd);
+        errno = saved_errno;
+        return -1;
+    }
+}
+#else
+static int configure_guest_ipv4(const char *addr, uint16_t prefix, const char *gateway) {
+    (void)addr;
+    (void)prefix;
+    (void)gateway;
+    errno = ENOTSUP;
+    return -1;
+}
+#endif
 
 static void run_guest_network_repair(int serial_fd, const char *json) {
     char addr[64];
@@ -769,36 +1323,9 @@ static void run_guest_network_repair(int serial_fd, const char *json) {
         }
     }
 
-    char prefix[4];
-    snprintf(prefix, sizeof(prefix), "%u", (unsigned)prefix_u16);
-    char cidr[80];
-    snprintf(cidr, sizeof(cidr), "%s/%s", addr, prefix);
-
-    char *flush_argv[] = {"ip", "addr", "flush", "dev", "eth0", "scope", "global", NULL};
-    int exit_code = run_argv_and_stream_output(serial_fd, flush_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
-        return;
-    }
-
-    char *addr_argv[] = {"ip", "addr", "add", cidr, "dev", "eth0", NULL};
-    exit_code = run_argv_and_stream_output(serial_fd, addr_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
-        return;
-    }
-
-    char *link_argv[] = {"ip", "link", "set", "eth0", "up", NULL};
-    exit_code = run_argv_and_stream_output(serial_fd, link_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
-        return;
-    }
-
-    char *route_argv[] = {"ip", "route", "replace", "default", "via", gateway, NULL};
-    exit_code = run_argv_and_stream_output(serial_fd, route_argv);
-    if (exit_code != 0) {
-        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", exit_code);
+    if (configure_guest_ipv4(addr, prefix_u16, gateway) < 0) {
+        serial_printf(serial_fd, "guest IPv4 repair failed: %s\n", strerror(errno));
+        serial_printf(serial_fd, "VMM_REPAIR_NET_EXIT=%d\n", 71);
         return;
     }
 
@@ -1349,6 +1876,8 @@ static void serve_vsock_forever(void) {
             }
             if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
                 run_command(fd, line + EXEC_PREFIX_LEN);
+            } else if (strncmp(line, PROBE_PREFIX, PROBE_PREFIX_LEN) == 0) {
+                run_probe(fd, line + PROBE_PREFIX_LEN);
             } else if (strncmp(line, REPAIR_NET_PREFIX, REPAIR_NET_PREFIX_LEN) == 0) {
                 run_guest_network_repair(fd, line + REPAIR_NET_PREFIX_LEN);
             }
@@ -1417,6 +1946,8 @@ int main(void) {
         }
         if (strncmp(line, EXEC_PREFIX, EXEC_PREFIX_LEN) == 0) {
             run_command(serial_fd, line + EXEC_PREFIX_LEN);
+        } else if (strncmp(line, PROBE_PREFIX, PROBE_PREFIX_LEN) == 0) {
+            run_probe(serial_fd, line + PROBE_PREFIX_LEN);
         } else if (strncmp(line, REPAIR_NET_PREFIX, REPAIR_NET_PREFIX_LEN) == 0) {
             run_guest_network_repair(serial_fd, line + REPAIR_NET_PREFIX_LEN);
         }

@@ -122,6 +122,8 @@ pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, Jail
     let mut launcher_liveness = [-1; 2];
     // The pipe closes atomically with launcher death and closes on any later
     // exec, providing a race-free check around PR_SET_PDEATHSIG installation.
+    // SAFETY: `launcher_liveness` provides space for both descriptors and
+    // remains valid and uniquely borrowed for the duration of `pipe2`.
     if unsafe {
         libc::pipe2(
             launcher_liveness.as_mut_ptr(),
@@ -137,6 +139,8 @@ pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, Jail
     // SAFETY: unshare and fork take no pointer arguments. This runs before any
     // VMM worker threads are created.
     if unsafe { libc::unshare(libc::CLONE_NEWPID) } < 0 {
+        // SAFETY: both descriptors were returned by `pipe2` and have not been
+        // transferred or closed on this path.
         unsafe {
             libc::close(launcher_liveness[0]);
             libc::close(launcher_liveness[1]);
@@ -146,8 +150,11 @@ pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, Jail
             std::io::Error::last_os_error()
         )));
     }
+    // SAFETY: this process is single-threaded at this point and `fork` takes no
+    // pointer arguments.
     let child = unsafe { libc::fork() };
     if child < 0 {
+        // SAFETY: both descriptors are still owned by this process here.
         unsafe {
             libc::close(launcher_liveness[0]);
             libc::close(launcher_liveness[1]);
@@ -158,11 +165,15 @@ pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, Jail
         )));
     }
     if child == 0 {
+        // SAFETY: the child owns both inherited descriptors and closes only its
+        // unused write end before retaining the read end.
         unsafe { libc::close(launcher_liveness[1]) };
         LAUNCHER_LIVENESS_FD.store(launcher_liveness[0], Ordering::Release);
         return Ok(PidNamespaceRole::Child);
     }
 
+    // SAFETY: the parent owns both descriptors and closes only its unused read
+    // end before waiting for the child.
     unsafe { libc::close(launcher_liveness[0]) };
     let last_capability = read_last_capability()?;
     set_no_new_privileges()?;
@@ -176,6 +187,8 @@ pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, Jail
 
     let mut status = 0;
     loop {
+        // SAFETY: `child` is the PID returned by `fork` and `status` is a valid
+        // writable integer for the duration of `waitpid`.
         let waited = unsafe { libc::waitpid(child, &mut status, 0) };
         if waited == child {
             break;
@@ -184,6 +197,7 @@ pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, Jail
             continue;
         }
         if waited < 0 {
+            // SAFETY: the parent still owns the write end on this error path.
             unsafe { libc::close(launcher_liveness[1]) };
             return Err(JailerError::Setup(format!(
                 "wait for PID namespace child: {}",
@@ -191,6 +205,7 @@ pub fn launch_pid_namespace(uid: u32, gid: u32) -> Result<PidNamespaceRole, Jail
             )));
         }
     }
+    // SAFETY: waiting completed and the parent still owns the write end.
     unsafe { libc::close(launcher_liveness[1]) };
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
@@ -209,7 +224,10 @@ fn arm_launcher_parent_death_signal() -> Result<(), JailerError> {
     }
     // Credential changes clear PDEATHSIG, so arm it only after the final
     // setresuid/setresgid transition.
+    // SAFETY: `prctl` receives only scalar arguments for PR_SET_PDEATHSIG.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
+        // SAFETY: `fd` was removed from the process-wide slot and is uniquely
+        // owned by this function.
         unsafe { libc::close(fd) };
         return Err(JailerError::Namespace(format!(
             "set PID namespace parent-death signal: {}",
@@ -217,7 +235,11 @@ fn arm_launcher_parent_death_signal() -> Result<(), JailerError> {
         )));
     }
     let mut byte = 0u8;
+    // SAFETY: `fd` is the open liveness pipe and the one-byte destination is
+    // valid and writable for the duration of `read`.
     let read = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), std::mem::size_of::<u8>()) };
+    // SAFETY: the liveness descriptor is no longer needed and is uniquely
+    // owned by this function.
     unsafe { libc::close(fd) };
     if read == 0 {
         return Err(JailerError::Namespace(

@@ -16,9 +16,12 @@
 //! The VMM binary itself stays lean — the OCI pipeline is an orchestrator
 //! concern. The VMM just boots the resulting ext4 image.
 
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -44,6 +47,10 @@ pub enum OciError {
     InvalidOutput(String),
     #[error("unsafe OCI rootfs path: {0}")]
     UnsafePath(String),
+    #[error("invalid OCI layout: {0}")]
+    InvalidLayout(String),
+    #[error("OCI resource limit exceeded: {0}")]
+    ResourceLimit(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -72,6 +79,78 @@ pub struct OciPullResult {
     pub agent_init: bool,
 }
 
+const MAX_OCI_LAYERS: usize = 128;
+const MAX_OCI_JSON_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_OCI_PATH_BYTES: usize = 4096;
+const OCI_EXPANSION_MULTIPLIER: u64 = 2;
+const OCI_ENTRIES_PER_DISK_MIB: u64 = 256;
+const MIN_OCI_ENTRIES: u64 = 16_384;
+
+#[derive(Debug, Clone, Copy)]
+struct OciResourceLimits {
+    max_layers: usize,
+    max_compressed_bytes: u64,
+    max_expanded_bytes: u64,
+    max_entries: u64,
+    max_single_file_bytes: u64,
+    max_path_bytes: usize,
+}
+
+impl OciResourceLimits {
+    fn for_disk_size(size_mb: u64) -> Result<Self, OciError> {
+        let disk_bytes = size_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| OciError::ResourceLimit("disk size overflows bytes".into()))?;
+        if disk_bytes == 0 {
+            return Err(OciError::ResourceLimit(
+                "disk size must be greater than zero".into(),
+            ));
+        }
+        let stream_budget = disk_bytes
+            .checked_mul(OCI_EXPANSION_MULTIPLIER)
+            .ok_or_else(|| OciError::ResourceLimit("OCI byte budget overflows".into()))?;
+        Ok(Self {
+            max_layers: MAX_OCI_LAYERS,
+            max_compressed_bytes: stream_budget,
+            max_expanded_bytes: stream_budget,
+            max_entries: size_mb
+                .saturating_mul(OCI_ENTRIES_PER_DISK_MIB)
+                .max(MIN_OCI_ENTRIES),
+            max_single_file_bytes: disk_bytes,
+            max_path_bytes: MAX_OCI_PATH_BYTES,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OciPreflightStats {
+    layers: usize,
+    compressed_bytes: u64,
+    expanded_bytes: u64,
+    entries: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OciDescriptor {
+    media_type: String,
+    digest: String,
+    size: u64,
+    #[serde(default)]
+    annotations: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OciIndex {
+    manifests: Vec<OciDescriptor>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OciManifest {
+    config: OciDescriptor,
+    layers: Vec<OciDescriptor>,
+}
+
 /// Pull an OCI image and convert it to a bootable ext4 disk image.
 ///
 /// Steps:
@@ -88,12 +167,13 @@ pub fn pull_and_convert(
 
 /// Like [`pull_and_convert`], but also injects the guest exec agent as the
 /// image's init when `agent_path` is given. OCI/Docker images ship only a root
-/// filesystem — no kernel, no init system (the container runtime runs the
-/// entrypoint as PID 1). To boot one as a microVM we supply the kernel and drop
-/// in the agent as `/usr/sbin/vmm-agent`, pointing `/sbin/init` at it (unless
-/// the image already has an init). Booted with the agent as PID 1 it mounts the
-/// pseudo-filesystems and serves the exec channel, so `node:20`, `python:3` and
-/// friends become directly runnable sandboxes.
+/// filesystem — no kernel, and their configured entrypoint is normally started
+/// by a container runtime. To boot one as a microVM we supply the kernel, install
+/// the agent at `/usr/sbin/vmm-agent`, and atomically point `/sbin/init` at it.
+/// This deliberately replaces an image-provided init: otherwise images such as
+/// Alpine try to start an incomplete OpenRC userspace and never expose the exec
+/// channel. Booted with the agent as PID 1, app images become directly runnable
+/// sandboxes.
 pub fn pull_and_convert_with_agent(
     image: &OciImageRef,
     output_path: &Path,
@@ -101,6 +181,10 @@ pub fn pull_and_convert_with_agent(
     agent_path: Option<&Path>,
 ) -> Result<OciPullResult, OciError> {
     let start = std::time::Instant::now();
+
+    // Reject invalid or overflowing budgets before invoking network tools or
+    // creating a build workspace.
+    let limits = OciResourceLimits::for_disk_size(size_mb)?;
 
     // Check for required tools.
     check_tool("skopeo")?;
@@ -129,6 +213,18 @@ pub fn pull_and_convert_with_agent(
         skopeo_cmd.arg("--authfile").arg(auth);
     }
     run_command(skopeo_cmd, "skopeo copy")?;
+
+    // Descriptor sizes only bound the compressed blobs. Stream every layer
+    // before extraction so a high-ratio archive or inode flood cannot consume
+    // the worker's filesystem while the unpacker is running.
+    let preflight = preflight_oci_layout(&oci_dir, "default", limits)?;
+    log::info!(
+        "oci: admitted {} layers, {} compressed bytes, {} expanded bytes, {} entries",
+        preflight.layers,
+        preflight.compressed_bytes,
+        preflight.expanded_bytes,
+        preflight.entries
+    );
 
     // Step 2: Unpack layers via umoci.
     log::info!("oci: unpacking layers via umoci");
@@ -304,7 +400,25 @@ fn inject_agent_init_unix(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
     }
 
     let usr = open_or_create_directory_at(&root, "usr")?;
-    let usr_sbin = open_or_create_directory_at(&usr, "sbin")?;
+    let usr_sbin = match entry_kind_at(&usr, "sbin")? {
+        None => open_or_create_directory_at(&usr, "sbin")?,
+        Some(EntryKind::Directory) => open_directory_at(&usr, "sbin")?,
+        Some(EntryKind::Symlink) => {
+            let target = read_link_at(&usr, "sbin")?;
+            if target.as_bytes() != b"bin" && target.as_bytes() != b"/usr/bin" {
+                return Err(OciError::UnsafePath(format!(
+                    "unsupported /usr/sbin symlink target {:?}; expected bin",
+                    target
+                )));
+            }
+            open_directory_at(&usr, "bin")?
+        }
+        Some(EntryKind::Other) => {
+            return Err(OciError::UnsafePath(
+                "/usr/sbin exists but is neither a directory nor a safe symlink".into(),
+            ))
+        }
+    };
     install_agent_at(&usr_sbin, agent)?;
 
     let init_dir = match entry_kind_at(&root, "sbin")? {
@@ -533,15 +647,38 @@ fn install_agent_at(destination_dir: &File, agent: &Path) -> Result<(), OciError
 
 #[cfg(unix)]
 fn ensure_init_link_at(sbin_dir: &File) -> Result<(), OciError> {
-    if entry_kind_at(sbin_dir, "init")?.is_some() {
-        return Ok(());
-    }
+    static INIT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let target = c_name("/usr/sbin/vmm-agent")?;
     let init = c_name("init")?;
+    let sequence = INIT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary_name = format!(".tarit-init-{}-{sequence}.tmp", std::process::id());
+    let temporary = c_name(&temporary_name)?;
     // SAFETY: target and leaf name are valid for symlinkat and the held fd
-    // confines creation to the image's /sbin directory.
-    if unsafe { libc::symlinkat(target.as_ptr(), sbin_dir.as_raw_fd(), init.as_ptr()) } < 0 {
+    // confines creation to the image's /sbin directory. O_EXCL-like behavior
+    // from symlinkat prevents an image-controlled temporary leaf from being
+    // followed or overwritten.
+    if unsafe { libc::symlinkat(target.as_ptr(), sbin_dir.as_raw_fd(), temporary.as_ptr()) } < 0 {
         return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: both names are leaf components relative to the held /sbin fd.
+    // renameat atomically replaces a regular file or symlink without following
+    // it. A hostile directory at /sbin/init is rejected by the kernel.
+    if unsafe {
+        libc::renameat(
+            sbin_dir.as_raw_fd(),
+            temporary.as_ptr(),
+            sbin_dir.as_raw_fd(),
+            init.as_ptr(),
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: this is the exact private leaf just created above.
+        unsafe {
+            libc::unlinkat(sbin_dir.as_raw_fd(), temporary.as_ptr(), 0);
+        }
+        return Err(error.into());
     }
     #[cfg(target_os = "linux")]
     sbin_dir.sync_all()?;
@@ -555,6 +692,276 @@ fn check_tool(name: &str) -> Result<(), OciError> {
         "umoci" if which("umoci").is_none() => Err(OciError::UmociNotFound),
         "mke2fs" if which("mke2fs").is_none() => Err(OciError::Mke2fsNotFound),
         _ => Ok(()),
+    }
+}
+
+fn preflight_oci_layout(
+    oci_dir: &Path,
+    tag: &str,
+    limits: OciResourceLimits,
+) -> Result<OciPreflightStats, OciError> {
+    let index_path = oci_dir.join("index.json");
+    let index: OciIndex = read_bounded_json(&index_path, MAX_OCI_JSON_BYTES)?;
+    let manifest_descriptor = index
+        .manifests
+        .iter()
+        .find(|descriptor| {
+            descriptor
+                .annotations
+                .get("org.opencontainers.image.ref.name")
+                .is_some_and(|name| name == tag)
+        })
+        .or_else(|| (index.manifests.len() == 1).then(|| &index.manifests[0]))
+        .ok_or_else(|| {
+            OciError::InvalidLayout(format!(
+                "index does not contain an unambiguous {tag:?} manifest"
+            ))
+        })?;
+    if manifest_descriptor.media_type != "application/vnd.oci.image.manifest.v1+json"
+        && manifest_descriptor.media_type != "application/vnd.docker.distribution.manifest.v2+json"
+    {
+        return Err(OciError::InvalidLayout(format!(
+            "unsupported manifest media type {}",
+            manifest_descriptor.media_type
+        )));
+    }
+    if manifest_descriptor.size > MAX_OCI_JSON_BYTES {
+        return Err(OciError::ResourceLimit(format!(
+            "image manifest is {} bytes; limit is {}",
+            manifest_descriptor.size, MAX_OCI_JSON_BYTES
+        )));
+    }
+    let manifest_path = verify_descriptor_blob(oci_dir, manifest_descriptor)?;
+    let manifest: OciManifest = read_bounded_json(&manifest_path, MAX_OCI_JSON_BYTES)?;
+    if manifest.config.media_type != "application/vnd.oci.image.config.v1+json"
+        && manifest.config.media_type != "application/vnd.docker.container.image.v1+json"
+    {
+        return Err(OciError::InvalidLayout(format!(
+            "unsupported image config media type {}",
+            manifest.config.media_type
+        )));
+    }
+    if manifest.config.size > MAX_OCI_JSON_BYTES {
+        return Err(OciError::ResourceLimit(format!(
+            "image config is {} bytes; limit is {}",
+            manifest.config.size, MAX_OCI_JSON_BYTES
+        )));
+    }
+    let config_path = verify_descriptor_blob(oci_dir, &manifest.config)?;
+    let _: serde_json::Value = read_bounded_json(&config_path, MAX_OCI_JSON_BYTES)?;
+    if manifest.layers.len() > limits.max_layers {
+        return Err(OciError::ResourceLimit(format!(
+            "{} layers exceeds limit {}",
+            manifest.layers.len(),
+            limits.max_layers
+        )));
+    }
+
+    let mut stats = OciPreflightStats {
+        layers: manifest.layers.len(),
+        ..OciPreflightStats::default()
+    };
+    for descriptor in &manifest.layers {
+        stats.compressed_bytes = stats
+            .compressed_bytes
+            .checked_add(descriptor.size)
+            .ok_or_else(|| OciError::ResourceLimit("compressed byte count overflows".into()))?;
+        if stats.compressed_bytes > limits.max_compressed_bytes {
+            return Err(OciError::ResourceLimit(format!(
+                "compressed layers require {} bytes; limit is {}",
+                stats.compressed_bytes, limits.max_compressed_bytes
+            )));
+        }
+        let blob = verify_descriptor_blob(oci_dir, descriptor)?;
+        scan_oci_layer(&blob, descriptor, limits, &mut stats)?;
+    }
+    Ok(stats)
+}
+
+fn read_bounded_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<T, OciError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(OciError::InvalidLayout(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(OciError::ResourceLimit(format!(
+            "JSON document {} is {} bytes; limit is {max_bytes}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| OciError::InvalidLayout(format!("parse {}: {error}", path.display())))
+}
+
+fn verify_descriptor_blob(oci_dir: &Path, descriptor: &OciDescriptor) -> Result<PathBuf, OciError> {
+    let encoded = descriptor
+        .digest
+        .strip_prefix("sha256:")
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or_else(|| {
+            OciError::InvalidLayout(format!("unsupported digest {}", descriptor.digest))
+        })?;
+    let path = oci_dir.join("blobs").join("sha256").join(encoded);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(OciError::InvalidLayout(format!(
+            "blob {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() != descriptor.size {
+        return Err(OciError::InvalidLayout(format!(
+            "blob {} has size {}; descriptor requires {}",
+            path.display(),
+            metadata.len(),
+            descriptor.size
+        )));
+    }
+    let mut file = File::open(&path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != encoded {
+        return Err(OciError::InvalidLayout(format!(
+            "blob {} digest mismatch",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn scan_oci_layer(
+    path: &Path,
+    descriptor: &OciDescriptor,
+    limits: OciResourceLimits,
+    stats: &mut OciPreflightStats,
+) -> Result<(), OciError> {
+    let file = File::open(path)?;
+    let reader: Box<dyn Read> = match descriptor.media_type.as_str() {
+        "application/vnd.oci.image.layer.v1.tar"
+        | "application/vnd.oci.image.layer.nondistributable.v1.tar"
+        | "application/vnd.docker.image.rootfs.diff.tar" => Box::new(file),
+        "application/vnd.oci.image.layer.v1.tar+gzip"
+        | "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip"
+        | "application/vnd.docker.image.rootfs.diff.tar.gzip" => Box::new(GzDecoder::new(file)),
+        "application/vnd.oci.image.layer.v1.tar+zstd"
+        | "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd" => {
+            Box::new(zstd::stream::read::Decoder::new(file)?)
+        }
+        other => {
+            return Err(OciError::InvalidLayout(format!(
+                "unsupported layer media type {other}"
+            )))
+        }
+    };
+    let remaining = limits
+        .max_expanded_bytes
+        .checked_sub(stats.expanded_bytes)
+        .ok_or_else(|| OciError::ResourceLimit("expanded byte budget exhausted".into()))?;
+    let mut limited = ExpandedLimitReader::new(reader, remaining);
+    let scan_result = {
+        let mut archive = tar::Archive::new(&mut limited);
+        (|| -> Result<(), OciError> {
+            for entry in archive.entries()? {
+                let entry = entry?;
+                stats.entries = stats
+                    .entries
+                    .checked_add(1)
+                    .ok_or_else(|| OciError::ResourceLimit("OCI entry count overflows".into()))?;
+                if stats.entries > limits.max_entries {
+                    return Err(OciError::ResourceLimit(format!(
+                        "layer entries exceed limit {}",
+                        limits.max_entries
+                    )));
+                }
+                let size = entry.size();
+                if size > limits.max_single_file_bytes {
+                    return Err(OciError::ResourceLimit(format!(
+                        "layer entry is {size} bytes; per-file limit is {}",
+                        limits.max_single_file_bytes
+                    )));
+                }
+                let path_bytes = entry.path_bytes();
+                if path_bytes.len() > limits.max_path_bytes {
+                    return Err(OciError::ResourceLimit(format!(
+                        "layer path is {} bytes; limit is {}",
+                        path_bytes.len(),
+                        limits.max_path_bytes
+                    )));
+                }
+            }
+            Ok(())
+        })()
+    };
+    if limited.exceeded {
+        return Err(OciError::ResourceLimit(format!(
+            "expanded layers exceed limit {}",
+            limits.max_expanded_bytes
+        )));
+    }
+    scan_result?;
+    stats.expanded_bytes = stats
+        .expanded_bytes
+        .checked_add(limited.consumed)
+        .ok_or_else(|| OciError::ResourceLimit("expanded byte count overflows".into()))?;
+    Ok(())
+}
+
+struct ExpandedLimitReader<R> {
+    inner: R,
+    limit: u64,
+    consumed: u64,
+    exceeded: bool,
+}
+
+impl<R> ExpandedLimitReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            consumed: 0,
+            exceeded: false,
+        }
+    }
+}
+
+impl<R: Read> Read for ExpandedLimitReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.consumed);
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            self.exceeded = true;
+            return Err(std::io::Error::other("expanded OCI byte limit exceeded"));
+        }
+        let allowed = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.consumed = self.consumed.saturating_add(read as u64);
+        Ok(read)
     }
 }
 
@@ -587,6 +994,81 @@ fn run_command(mut cmd: Command, name: &str) -> Result<(), OciError> {
 mod tests {
     use super::*;
 
+    fn test_limits(max_expanded_bytes: u64, max_entries: u64) -> OciResourceLimits {
+        OciResourceLimits {
+            max_layers: 4,
+            max_compressed_bytes: 1024 * 1024,
+            max_expanded_bytes,
+            max_entries,
+            max_single_file_bytes: 1024 * 1024,
+            max_path_bytes: 256,
+        }
+    }
+
+    fn tar_layer(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *contents).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn write_blob(root: &Path, media_type: &str, bytes: &[u8]) -> OciDescriptor {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let blob_dir = root.join("blobs/sha256");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(blob_dir.join(&digest), bytes).unwrap();
+        OciDescriptor {
+            media_type: media_type.into(),
+            digest: format!("sha256:{digest}"),
+            size: bytes.len() as u64,
+            annotations: HashMap::new(),
+        }
+    }
+
+    fn write_layout(root: &Path, layers: Vec<(&str, Vec<u8>)>) {
+        let layer_descriptors = layers
+            .iter()
+            .map(|(media_type, bytes)| write_blob(root, media_type, bytes))
+            .collect();
+        let config = write_blob(
+            root,
+            "application/vnd.oci.image.config.v1+json",
+            br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#,
+        );
+        let manifest = serde_json::to_vec(&OciManifest {
+            config,
+            layers: layer_descriptors,
+        })
+        .unwrap();
+        let mut descriptor = write_blob(
+            root,
+            "application/vnd.oci.image.manifest.v1+json",
+            &manifest,
+        );
+        descriptor
+            .annotations
+            .insert("org.opencontainers.image.ref.name".into(), "default".into());
+        std::fs::write(
+            root.join("index.json"),
+            serde_json::to_vec(&OciIndex {
+                manifests: vec![descriptor],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[cfg(unix)]
     fn test_agent(dir: &Path) -> PathBuf {
         let path = dir.join("vmm-agent");
@@ -602,6 +1084,102 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("docker://ubuntu:22.04"));
+    }
+
+    #[test]
+    fn oci_preflight_accepts_digest_verified_gzip_and_zstd_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = tar_layer(&[("etc/one", b"one"), ("etc/two", b"two")]);
+        let second = tar_layer(&[("usr/bin/tool", b"tool")]);
+        write_layout(
+            temp.path(),
+            vec![
+                ("application/vnd.oci.image.layer.v1.tar+gzip", gzip(&first)),
+                (
+                    "application/vnd.oci.image.layer.v1.tar+zstd",
+                    zstd::stream::encode_all(second.as_slice(), 1).unwrap(),
+                ),
+            ],
+        );
+
+        let stats =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10)).unwrap();
+
+        assert_eq!(stats.layers, 2);
+        assert_eq!(stats.entries, 3);
+        assert!(stats.compressed_bytes > 0);
+        assert!(stats.expanded_bytes > 0);
+    }
+
+    #[test]
+    fn oci_resource_limits_reject_zero_and_overflowing_disk_sizes() {
+        assert!(matches!(
+            OciResourceLimits::for_disk_size(0),
+            Err(OciError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            OciResourceLimits::for_disk_size(u64::MAX),
+            Err(OciError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn oci_preflight_rejects_inode_exhaustion_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = tar_layer(&[("a", b""), ("b", b""), ("c", b"")]);
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar+gzip", gzip(&layer))],
+        );
+
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 2)).unwrap_err();
+
+        assert!(matches!(error, OciError::ResourceLimit(_)));
+        assert!(error.to_string().contains("entries exceed limit"));
+    }
+
+    #[test]
+    fn oci_preflight_rejects_expansion_bomb_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = vec![0u8; 16 * 1024];
+        let layer = tar_layer(&[("large-zero-file", &payload)]);
+        let compressed = gzip(&layer);
+        assert!(compressed.len() < 1024);
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar+gzip", compressed)],
+        );
+
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(4096, 10)).unwrap_err();
+
+        assert!(matches!(error, OciError::ResourceLimit(_)));
+        assert!(error.to_string().contains("expanded layers exceed limit"));
+    }
+
+    #[test]
+    fn oci_preflight_rejects_blob_changed_after_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = tar_layer(&[("proof", b"original")]);
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar", layer)],
+        );
+        let index: OciIndex =
+            read_bounded_json(&temp.path().join("index.json"), MAX_OCI_JSON_BYTES).unwrap();
+        let manifest_path = verify_descriptor_blob(temp.path(), &index.manifests[0]).unwrap();
+        let manifest: OciManifest = read_bounded_json(&manifest_path, MAX_OCI_JSON_BYTES).unwrap();
+        let layer_path = verify_descriptor_blob(temp.path(), &manifest.layers[0]).unwrap();
+        let mut bytes = std::fs::read(&layer_path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&layer_path, bytes).unwrap();
+
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10)).unwrap_err();
+
+        assert!(matches!(error, OciError::InvalidLayout(_)));
+        assert!(error.to_string().contains("digest mismatch"));
     }
 
     #[test]
@@ -633,7 +1211,8 @@ mod tests {
     fn agent_injection_uses_fd_relative_paths_and_supports_usrmerge() {
         let temp = tempfile::tempdir().unwrap();
         let rootfs = temp.path().join("rootfs");
-        std::fs::create_dir(&rootfs).unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("bin", rootfs.join("usr/sbin")).unwrap();
         std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
         let agent = test_agent(temp.path());
 
@@ -698,6 +1277,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn agent_injection_replaces_existing_image_init_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let sbin = rootfs.join("sbin");
+        std::fs::create_dir_all(&sbin).unwrap();
+        let victim = temp.path().join("image-init");
+        std::fs::write(&victim, b"original-init").unwrap();
+        std::os::unix::fs::symlink(&victim, sbin.join("init")).unwrap();
+        let agent = test_agent(temp.path());
+
+        inject_agent_init(&rootfs, &agent).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original-init");
+        assert_eq!(
+            std::fs::read_link(sbin.join("init")).unwrap(),
+            Path::new("/usr/sbin/vmm-agent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn agent_injection_rejects_unsafe_sbin_symlink_target() {
         let temp = tempfile::tempdir().unwrap();
         let rootfs = temp.path().join("rootfs");
@@ -707,6 +1307,23 @@ mod tests {
 
         let error = inject_agent_init(&rootfs, &agent).unwrap_err();
         assert!(matches!(error, OciError::UnsafePath(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_rejects_unsafe_usr_sbin_symlink_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(rootfs.join("usr")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("usr/sbin")).unwrap();
+        std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
+        let agent = test_agent(temp.path());
+
+        let error = inject_agent_init(&rootfs, &agent).unwrap_err();
+        assert!(matches!(error, OciError::UnsafePath(_)));
+        assert!(!outside.join("vmm-agent").exists());
     }
 
     #[cfg(unix)]

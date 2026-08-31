@@ -284,15 +284,26 @@ vmm pull ghcr.io/owner/repo:tag --output app.ext4 --auth ~/.docker/auth.json \
 ```
 
 With `--agent`, the pull path installs the guest exec agent at
-`/usr/sbin/vmm-agent` and points `/sbin/init` at it when the image has no init.
+`/usr/sbin/vmm-agent` and atomically points `/sbin/init` at it. This intentionally
+replaces an OCI image's init because Tarit boots the injected agent as PID 1;
+the image's container entrypoint and init system are not started automatically.
 
 | Flag | Default | Description |
 |---|---|---|
 | `<IMAGE_REF>` | (required) | OCI image reference |
 | `--output <PATH>` | (required) | Output disk image path |
-| `--size <MIB>` | 1024 | Disk image size in MiB |
+| `--size <MIB>` | 1024 | Disk image size in MiB and basis for OCI unpack limits |
 | `--auth <PATH>` | none | Auth file path for private registries |
 | `--agent <PATH>` | none | Compiled guest exec agent to inject |
+
+Before unpack, Tarit verifies every manifest, config, and layer descriptor
+against the referenced regular file and SHA-256 digest. It rejects manifests or
+configs over 8 MiB, more than 128 layers, compressed or expanded layer streams
+over twice the requested disk size, a single file larger than the requested
+disk, paths over 4096 bytes, or more than `max(16384, 256 * MIB)` layer entries.
+Rejection exits non-zero, publishes no output image, and removes the private
+build workspace. Increase `--size` only when the intended filesystem genuinely
+requires a larger image and corresponding unpack budget.
 
 ### Global Flags
 
@@ -425,7 +436,9 @@ the built-in 30 second timeout.
 }
 ```
 The address and gateway must be IPv4 addresses, the prefix must be `0..=32`,
-and each DNS entry must be an IP address.
+and each DNS entry must be an IP address. The guest agent applies and verifies
+the address, netmask, link state, and single default route directly through the
+Linux network API. Restore does not require `iproute2` in the guest image.
 
 #### `attach_pty`: Attach an interactive PTY stream
 ```json
@@ -560,8 +573,8 @@ crates/
   vmm-memory-backend/ Guest memory (mmap), dirty bitmap, KVM registration,
                       dirty-log ioctl, UFFD lazy restore
   vmm-loader/         Kernel load (bzImage/ELF), E820 map, zero page, cmdline
-  vmm-devices/        MMIO bus, virtio-mmio transport, virtio-blk (backend +
-                      transport + vqueue walker), virtio-net, virtio-rng, serial
+  vmm-devices/        MMIO bus, virtio-mmio transport, isolated virtio-blk
+                      queue workers, virtio-net, virtio-rng, serial
   vmm-snapshot/       CRC state file, diff snapshots, clone plans, live
                       snapshot convergence, snapshot format
   vmm-net/            TAP creation, nftables egress compiler, DNS-aware
@@ -580,7 +593,9 @@ guest/                Guest kernel configs, release tooling, and agent
 
 ## Security Model
 
-- **Seccomp confinement**: the jailer seccomp profile blocks process network syscalls (socket, connect, bind, sendto, recvfrom)
+- **Seccomp confinement**: each queue worker has a purpose-specific syscall
+  profile. Block workers can poll and use pre-opened storage descriptors but
+  cannot open paths, create sockets, use network syscalls, or issue ioctls.
 - **VM-to-VM isolation**: each VM gets its own netns, no bridge between VMs
 - **Host-enforced egress**: nftables default-deny + allowlist, guest cannot alter
 - **Jailer**: chroot + mount namespace + privilege drop + seccomp + cgroup v2 limits

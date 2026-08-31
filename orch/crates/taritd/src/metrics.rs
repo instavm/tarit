@@ -630,6 +630,7 @@ fn vm_status_counts(state: &AppState) -> Vec<(&'static str, usize)> {
         VmStatus::Running,
         VmStatus::Paused,
         VmStatus::Suspended,
+        VmStatus::Hibernated,
         VmStatus::Stopped,
         VmStatus::Error,
     ];
@@ -669,7 +670,11 @@ fn tenant_vm_counts(state: &AppState) -> Vec<(String, usize)> {
         for vm in cache.values() {
             if matches!(
                 vm.status,
-                VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                VmStatus::Creating
+                    | VmStatus::Running
+                    | VmStatus::Paused
+                    | VmStatus::Suspended
+                    | VmStatus::Hibernated
             ) {
                 let tenant = vm.owner_key.as_deref().unwrap_or("unknown");
                 *counts.entry(tenant.to_string()).or_default() += 1;
@@ -1008,6 +1013,7 @@ mod tests {
             )])
             .unwrap(),
             host_id: "test-host".into(),
+            host_session_id: Uuid::nil(),
             vmm_bin: PathBuf::from("target/taritd-metrics-test/vmm"),
             kernel: PathBuf::from("target/taritd-metrics-test/kernel"),
             rootfs: PathBuf::from("target/taritd-metrics-test/rootfs"),
@@ -1015,10 +1021,14 @@ mod tests {
             db_path: PathBuf::from("target/taritd-metrics-test/fleet.db"),
             net_state_path: PathBuf::from("target/taritd-metrics-test/net-state.json"),
             images_dir: PathBuf::from("target/taritd-metrics-test/images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
@@ -1063,6 +1073,7 @@ mod tests {
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            activation_gates: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
             lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),

@@ -176,7 +176,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `taritd vm snapshot <id> [--diff]` | Snapshot a VM; prints `path` and `host_id`. |
 | `taritd restore <snapshot_path>` | Restore a VM from a snapshot file. |
 | `taritd exec <id> <command...>` | Run a command in the VM over `POST /v1/execute`; exits with the command's exit code. |
-| `taritd image build --oci <OCI_REF> --name <NAME[:TAG]>` | Build and register a rootfs image from an OCI image. |
+| `taritd image build --oci <OCI_REF> --name <NAME[:TAG]> [--size <MIB>]` | Build and register a rootfs image; size defaults to 1024 MiB and bounds OCI unpack work. |
 | `taritd image ls` | List registered images. |
 | `taritd image rm <NAME[:TAG]>` | Remove an unreferenced image. |
 | `taritd image gc [--older-than-days <DAYS>] [--pattern <PATTERN>] [--dry-run]` | Remove unreferenced images older than a threshold (default 7 days). |
@@ -304,12 +304,16 @@ Create requests can use `--image <name>[:tag]` (or JSON `image`) instead of a ra
 `rootfs_path`; warm-pool classes can set `image = "name[:tag]"`.
 
 ```sh
-taritd image build --oci node:20-slim --name node20
+taritd image build --oci node:20-slim --name node20 --size 2048
 taritd image ls
 taritd vm create --image node20 --vcpus 1 --memory-mib 256
 taritd image rm node20
 taritd image gc --older-than-days 7 --dry-run
 ```
+
+Image build verifies OCI descriptor size and SHA-256 before extraction. Layer,
+compressed-byte, expanded-byte, entry-count, file-size, and path-length limits
+are derived from `--size`; a rejected image is not registered or published.
 
 ## More documentation
 

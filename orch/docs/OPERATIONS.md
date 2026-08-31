@@ -8,7 +8,8 @@ This guide covers building, running, clustering, load balancing, deployment help
 - Rust stable toolchain.
 - The rust-vmm based `vmm` binary from the sibling VMM repository.
 - The release ELF `vmlinux` and optional rootfs image readable by `taritd`.
-- `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`.
+- `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`;
+  `cosign` is additionally required when provenance verification is configured.
 - PostgreSQL for distributed cluster mode.
 - `CAP_NET_ADMIN` or root only if `TARIT_ENABLE_NET=true`.
 
@@ -75,7 +76,7 @@ Build immutable rootfs images from OCI refs on the host that has the VMM binary
 and OCI tooling:
 
 ```sh
-taritd image build --oci node:20-slim --name node20
+taritd image build --oci node:20-slim --name node20 --size 2048
 taritd image ls
 ```
 
@@ -103,6 +104,14 @@ warm-pool classes:
 taritd image gc --older-than-days 7 --dry-run
 taritd image gc --older-than-days 30 --pattern 'node:*'
 ```
+
+`--size` defaults to 1024 MiB and also bounds OCI preprocessing. Tarit verifies
+manifest, config, and layer descriptor size and SHA-256, then streams each
+supported layer before extraction. It rejects excessive layers, compressed or
+expanded bytes, entries, file size, or path length before running the unpacker.
+The command exits non-zero and removes its unpublished output and private
+workspace. The public VM-create API continues to accept only a successfully
+registered `image` name; no partial image becomes API-visible.
 
 ## Run a three-node cluster
 
@@ -273,6 +282,11 @@ When enabled, `taritd`:
    VM pool; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
+Snapshot restore assigns a new host TAP allocation. Before publishing the VM,
+taritd sends a typed IPv4 repair request to the guest agent and verifies
+host-to-guest reachability. The agent applies and checks the configuration
+through the kernel, so minimal OCI images do not need `iproute2` for restore.
+
 Before loading configuration, opening a database, resolving images, or looking
 up VMs, `taritd` enumerates strict `insta<N>` names with structured `ip -j
 link` output and lowers them. A containment, VM-list, or recovery error is
@@ -362,6 +376,68 @@ The c8i rootfs must contain `curl`; `make guest` includes it. The deploy script
 records the remote daemon PID in `~/.taritd/taritd.pid` and verifies the process
 identity before stopping a prior run.
 
+## Continuous lifecycle qualification
+
+`tests/continuous_mixed_oci_soak.sh` runs one bounded epoch at a time while
+keeping three guest workloads active. It rotates entries from a case file with
+the format `name|kernel|rootfs`, writes per-operation JSONL logs, and checks a
+configurable free-space floor. Each guest keeps a background writer active
+while the driver performs live forks, snapshot/restore, hibernate and ingress
+wake, pause/resume, balloon changes, mutations, and concurrent work across all
+anchors. It also issues four concurrent execute requests to one VM immediately
+after pause/resume. Each request verifies a distinct guest-side token before the
+driver rechecks the long-lived workload, detecting cross-transport command
+interleaving, duplicate execution, stale completion, and response loss. The
+status and terminal records include per-action counts and p50, p95, p99, and
+maximum latency. Fork records additionally retain phase distributions, live
+pre-copy rounds, copied and residual dirty pages, downtime, convergence reason,
+and local versus cross-node path counts. Retained snapshots are bounded per
+epoch; live fork artifacts are deleted with their transient children.
+
+When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
+creates a fourth logical VM, arms monotonic and realtime timers, and hibernates
+it while the three resident anchors continue working. At epoch completion,
+concurrent execute requests must single-flight its restore. The driver verifies
+the minimum zero-VMM hold, host-relative realtime repair, paused monotonic time,
+timer delivery, clone identity and session rotation, database state, artifact
+ownership, and capacity cleanup. The installed c8i unit requires at least a
+one-hour hold; its six-hour workload epoch normally yields a hold longer than
+six hours.
+`tests/tarit-continuous-soak.service` is the c8i systemd unit. It archives a
+failed epoch and restarts after 30 seconds so an isolated failure does not stop
+subsequent qualification. Repeated failures remain visible in
+`failures/index.jsonl`; they are not treated as passing epochs.
+
+After each configured number of epochs, the supervisor runs independent
+qualification gates against the same OCI and kernel case. The runtime-crash
+gate kills and re-adopts active VMMs. The ingress gate verifies live fork,
+true scale-to-zero, and single-flight wake through execute, PTY, SSH, and HTTP
+share traffic. The volume gate alternates local block and NFS 4.1-backed block
+storage, writes and flushes a filesystem in the guest, hibernates to zero VMM
+processes, wakes through HTTP, and verifies the durable attachment. Set
+`TARIT_CONTINUOUS_CHAOS_EVERY_EPOCHS`,
+`TARIT_CONTINUOUS_INGRESS_EVERY_EPOCHS`, or
+`TARIT_CONTINUOUS_VOLUME_EVERY_EPOCHS` to `0` to disable a gate or to a larger
+integer to reduce its frequency. Successful auxiliary runs are recorded in
+`qualification.jsonl`; their complete logs use the same 14-day bounded
+retention as epoch logs.
+
+Required environment entries are `TARIT_CONTINUOUS_CASES_FILE`,
+`TARITD_BIN`, `TARIT_VMM_BIN`, and `TARIT_TEST_GUEST_AGENT_BIN`. The case file
+and environment file belong under `/etc/tarit` with mode `0600`. The
+`current.jsonl` symlink follows the active or most recently failed epoch;
+`epochs.jsonl` records completed epochs. Failure bundles and their index are
+stored under `/t/tarit-continuous-soak/failures`.
+
+```sh
+sudo systemctl status tarit-continuous-soak
+sudo journalctl -u tarit-continuous-soak -n 100 --no-pager
+sudo systemctl stop tarit-continuous-soak
+```
+
+Manual KVM gates use the same global lock. Stop the service before running a
+manual gate rather than bypassing the lock.
+
 ## Benchmarks
 
 `tarit-bench` exercises create, execute, poll, and delete flows and writes reports under `./bench-results` by default.
@@ -413,3 +489,22 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 | `spawn vmm` fails | Wrong `TARIT_VMM_BIN` or missing execute bit. | Verify path and permissions. |
 | `wait for socket` times out | VMM child failed to create UDS. | Check VMM logs, kernel/rootfs paths, and KVM availability. |
 | Network provisioning fails | Missing privileges or `ip`/`nft`. | Run with required capabilities and verify host networking tools. |
+## OCI image admission and provenance
+
+`taritd image build` resolves a registry tag once with `skopeo inspect`, verifies
+the resulting digest reference with `cosign verify` when a trusted key is
+configured, and passes only that immutable digest reference to the OCI pull.
+The image row records the registry manifest, generated ext4, injected agent,
+and provenance-key SHA-256 digests. VM admission rehashes the rootfs and rejects
+legacy, truncated, substituted, tag-only, or policy-mismatched records before
+the VMM starts.
+
+Production nodes must set both `TARIT_IMAGE_REQUIRE_SIGNATURE=1` and
+`TARIT_IMAGE_COSIGN_KEY=/absolute/path/to/cosign.pub`. Rotate policy by admitting
+the desired images with the new key before removing the old policy. Restoring
+the prior trusted key permits rollback to a previously admitted digest; Tarit
+never resolves its old mutable tag again.
+
+Use `taritd image verify NAME[:TAG]` during rollout and rollback to rehash the
+published ext4 and confirm that the record was admitted by the currently
+trusted provenance key before directing tenant traffic to it.

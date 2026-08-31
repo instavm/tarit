@@ -29,6 +29,6 @@ pub use backend::GuestMemory;
 pub use kvm_dirty::{read_dirty_log, KvmDirtyError};
 #[cfg(target_os = "linux")]
 pub use uffd_restore::{
-    madvise_dontneed, start_lazy_restore, start_lazy_restore_in_place, LazyRestore,
-    UffdRestoreError,
+    madvise_dontneed, start_lazy_restore, start_lazy_restore_in_place,
+    start_lazy_restore_with_integrity, ChunkIntegrity, LazyRestore, UffdRestoreError,
 };

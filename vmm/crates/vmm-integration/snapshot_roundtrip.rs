@@ -89,6 +89,7 @@ fn restored_clones_get_private_rootfs_overlays() {
             path: base_rootfs.to_string_lossy().into_owned(),
             read_only: true,
             overlay: Some(overlay.to_string_lossy().into_owned()),
+            inherited_fd: None,
         }],
         net: vec![],
     };

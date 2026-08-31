@@ -196,12 +196,67 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                     "live diff snapshots are not supported".into(),
                 ))
             } else if live {
-                controller.live_snapshot_to_path()
+                #[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+                {
+                    controller
+                        .live_snapshot(vmm_core::LiveSnapshotConfig::default())
+                        .map(|result| {
+                            let termination = match result.termination {
+                                vmm_core::LiveSnapshotTermination::Converged => {
+                                    tarit_proto::LiveSnapshotTermination::Converged
+                                }
+                                vmm_core::LiveSnapshotTermination::Diverging => {
+                                    tarit_proto::LiveSnapshotTermination::Diverging
+                                }
+                                vmm_core::LiveSnapshotTermination::Timeout => {
+                                    tarit_proto::LiveSnapshotTermination::Timeout
+                                }
+                                vmm_core::LiveSnapshotTermination::MaxRounds => {
+                                    tarit_proto::LiveSnapshotTermination::MaxRounds
+                                }
+                            };
+                            let live_stats = tarit_proto::LiveSnapshotStats {
+                                rounds: result.rounds,
+                                pages_copied: result.pages_copied,
+                                final_dirty_pages: result.final_dirty_pages,
+                                elapsed_us: result
+                                    .elapsed
+                                    .as_micros()
+                                    .try_into()
+                                    .unwrap_or(u64::MAX),
+                                downtime_us: result
+                                    .downtime
+                                    .as_micros()
+                                    .try_into()
+                                    .unwrap_or(u64::MAX),
+                                termination,
+                            };
+                            (
+                                result.snapshot_path,
+                                result.overlay_path,
+                                result.integrity_path,
+                                Some(live_stats),
+                            )
+                        })
+                }
+                #[cfg(not(all(feature = "boot", target_arch = "x86_64", target_os = "linux")))]
+                {
+                    Err(vmm_core::error::VmmError::Snapshot(
+                        "live snapshots require the Linux x86_64 boot feature".into(),
+                    ))
+                }
             } else {
-                controller.snapshot(diff)
+                controller
+                    .snapshot(diff)
+                    .map(|path| (path, None, None, None))
             };
             match result {
-                Ok(path) => ApiResponse::Snapshot { path },
+                Ok((path, overlay_path, integrity_path, live_stats)) => ApiResponse::Snapshot {
+                    path,
+                    overlay_path,
+                    integrity_path,
+                    live_stats,
+                },
                 Err(e) => ApiResponse::Err {
                     msg: format!("{e}"),
                 },
@@ -217,10 +272,19 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         }
         ApiRequest::Restore {
             snapshot_path,
+            memory_integrity,
             overlay,
             net,
+            volumes,
             memory_policy,
-        } => match controller.restore_with_overrides(&snapshot_path, overlay, net, memory_policy) {
+        } => match controller.restore_with_resource_overrides(
+            &snapshot_path,
+            overlay,
+            net,
+            volumes,
+            memory_policy,
+            memory_integrity,
+        ) {
             Ok(()) => ApiResponse::Restored,
             Err(e) => ApiResponse::Err {
                 msg: format!("{e}"),
@@ -307,12 +371,36 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 }
             }
         }
+        ApiRequest::SetBalloon { target_mib } => {
+            match controller.set_balloon_target_mib(target_mib) {
+                Ok((target_pages, actual_pages)) => balloon_response(target_pages, actual_pages),
+                Err(error) => ApiResponse::Err {
+                    msg: error.to_string(),
+                },
+            }
+        }
+        ApiRequest::Balloon => match controller.balloon_state() {
+            Ok((target_pages, actual_pages)) => balloon_response(target_pages, actual_pages),
+            Err(error) => ApiResponse::Err {
+                msg: error.to_string(),
+            },
+        },
         ApiRequest::Status => match controller.status() {
             Ok(status) => ApiResponse::Status(status),
             Err(e) => ApiResponse::Err {
                 msg: format!("{e}"),
             },
         },
+    }
+}
+
+fn balloon_response(target_pages: u32, actual_pages: u32) -> ApiResponse {
+    const PAGES_PER_MIB: u64 = 1024 * 1024 / 4096;
+    ApiResponse::Balloon {
+        target_mib: u64::from(target_pages) / PAGES_PER_MIB,
+        actual_mib: u64::from(actual_pages) / PAGES_PER_MIB,
+        target_pages,
+        actual_pages,
     }
 }
 
@@ -791,6 +879,19 @@ mod tests {
     fn dispatch_suspend_without_vm_returns_err() {
         let controller = VmmController::new();
         let resp = dispatch(ApiRequest::Suspend, &controller);
+        assert!(matches!(resp, ApiResponse::Err { .. }));
+    }
+
+    #[test]
+    fn dispatch_live_snapshot_without_vm_returns_err() {
+        let controller = VmmController::new();
+        let resp = dispatch(
+            ApiRequest::Snapshot {
+                diff: false,
+                live: true,
+            },
+            &controller,
+        );
         assert!(matches!(resp, ApiResponse::Err { .. }));
     }
 

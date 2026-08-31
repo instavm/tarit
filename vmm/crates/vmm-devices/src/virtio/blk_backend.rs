@@ -3,7 +3,7 @@
 
 use std::cmp;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -412,30 +412,114 @@ pub struct BlkBackend {
     storage: BackendStorage,
     pub read_only: bool,
     pub sectors: u64,
+    #[cfg(feature = "test-failpoints")]
+    service_delay: std::time::Duration,
+}
+
+#[cfg(feature = "test-failpoints")]
+static TEST_DELAYED_SERVICES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "test-failpoints")]
+struct DelayedServiceGuard;
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for DelayedServiceGuard {
+    fn drop(&mut self) {
+        TEST_DELAYED_SERVICES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Number of block service calls currently held in the test-only latency
+/// injection point.
+#[cfg(feature = "test-failpoints")]
+pub fn test_delayed_services() -> usize {
+    TEST_DELAYED_SERVICES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(unix)]
+fn validate_file_access(file: &File, read_only: bool) -> Result<(), BlkBackendError> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let access = flags & libc::O_ACCMODE;
+    if access == libc::O_WRONLY || (!read_only && access != libc::O_RDWR) {
+        return Err(BlkBackendError::Validation(
+            "backing descriptor has incompatible access mode".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_file_access(_file: &File, _read_only: bool) -> Result<(), BlkBackendError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn backing_size_bytes(file: &File) -> Result<u64, BlkBackendError> {
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_file() {
+        return Ok(metadata.len());
+    }
+    #[cfg(target_os = "linux")]
+    if metadata.file_type().is_block_device() {
+        const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+        let mut bytes = 0_u64;
+        if unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut bytes) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        return Ok(bytes);
+    }
+    Err(BlkBackendError::Validation(
+        "backing descriptor is not a regular file or block device".into(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn backing_size_bytes(file: &File) -> Result<u64, BlkBackendError> {
+    Ok(file.metadata()?.len())
 }
 
 impl BlkBackend {
     /// Open a backing file for the block device.
     pub fn open(path: &Path, read_only: bool) -> Result<Self, BlkBackendError> {
-        let file = if read_only {
-            File::open(path)?
-        } else {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?
-        };
-        let metadata = file.metadata()?;
-        let sectors = metadata.len() / 512;
+        let mut options = OpenOptions::new();
+        options.read(true).write(!read_only);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        Self::from_file(file, read_only, &path.display().to_string())
+    }
+
+    /// Adopt an already-open regular file or block device. This is used for
+    /// orchestrator-inherited descriptors so a jailed VMM never re-resolves a
+    /// provider path after admission.
+    pub fn from_file(
+        file: File,
+        read_only: bool,
+        diagnostic_label: &str,
+    ) -> Result<Self, BlkBackendError> {
+        validate_file_access(&file, read_only)?;
+        let bytes = backing_size_bytes(&file)?;
+        if bytes == 0 || bytes % SECTOR_SIZE != 0 {
+            return Err(BlkBackendError::Validation(format!(
+                "backing size {bytes} is not a positive multiple of {SECTOR_SIZE}"
+            )));
+        }
+        let sectors = bytes / SECTOR_SIZE;
         log::info!(
             "blk backend: {} ({} sectors, read_only={read_only})",
-            path.display(),
+            diagnostic_label,
             sectors
         );
         Ok(Self {
             storage: BackendStorage::Raw(file),
             read_only,
             sectors,
+            #[cfg(feature = "test-failpoints")]
+            service_delay: std::time::Duration::ZERO,
         })
     }
 
@@ -454,7 +538,13 @@ impl BlkBackend {
                 base_path.display()
             )));
         }
-        let sectors = metadata.len() / SECTOR_SIZE;
+        let bytes = backing_size_bytes(&base)?;
+        if bytes == 0 || bytes % SECTOR_SIZE != 0 {
+            return Err(BlkBackendError::Validation(format!(
+                "CoW base size {bytes} is not a positive multiple of {SECTOR_SIZE}"
+            )));
+        }
+        let sectors = bytes / SECTOR_SIZE;
         let overlay = open_private_overlay(overlay_path)?;
         let cow = CowOverlay::open(base, overlay, sectors)?;
         log::info!(
@@ -467,7 +557,14 @@ impl BlkBackend {
             storage: BackendStorage::Cow(cow),
             read_only: false,
             sectors,
+            #[cfg(feature = "test-failpoints")]
+            service_delay: std::time::Duration::ZERO,
         })
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub fn set_test_service_delay(&mut self, delay: std::time::Duration) {
+        self.service_delay = delay;
     }
 
     /// Service a single block request.
@@ -477,6 +574,16 @@ impl BlkBackend {
     ///
     /// Returns the status byte to write back to the guest's status descriptor.
     pub fn service(&mut self, header: &BlkReqHeader, data: &mut [u8]) -> u8 {
+        #[cfg(feature = "test-failpoints")]
+        let _delay_guard = if self.service_delay.is_zero() {
+            None
+        } else {
+            TEST_DELAYED_SERVICES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = DelayedServiceGuard;
+            std::thread::sleep(self.service_delay);
+            Some(guard)
+        };
+
         // Validate the request.
         let (op, offset, force_unit_access) = match self.validate_service_req(header, data.len()) {
             Ok(validated) => validated,
@@ -738,6 +845,8 @@ fn read_u64(buf: &[u8], offset: usize) -> Result<u64, BlkBackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
     fn hdr(req_type: u32, sector: u64) -> BlkReqHeader {
@@ -765,6 +874,20 @@ mod tests {
             .join("../../target/test-work")
             .join(format!("{name}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        dir
+    }
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         dir
     }
 
@@ -798,6 +921,29 @@ mod tests {
         let status = backend.service(&header, &mut data);
         assert_eq!(status, status::OK);
         assert!(data.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn from_file_enforces_access_size_and_object_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.blk");
+        std::fs::write(&path, [0u8; 512]).unwrap();
+
+        let read_only = OpenOptions::new().read(true).open(&path).unwrap();
+        assert!(BlkBackend::from_file(read_only, false, "data").is_err());
+
+        let odd_path = dir.path().join("odd.blk");
+        std::fs::write(&odd_path, [0u8; 513]).unwrap();
+        let odd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&odd_path)
+            .unwrap();
+        assert!(BlkBackend::from_file(odd, false, "odd").is_err());
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let socket_fd: OwnedFd = socket.into();
+        assert!(BlkBackend::from_file(File::from(socket_fd), true, "socket").is_err());
     }
 
     #[test]
@@ -866,7 +1012,7 @@ mod tests {
 
     #[test]
     fn cow_write_goes_to_overlay_and_leaves_base_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x11, 0x22]);
@@ -892,7 +1038,7 @@ mod tests {
 
     #[test]
     fn cow_reads_unwritten_blocks_from_base_and_written_blocks_from_overlay() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20, 0x30]);
@@ -916,7 +1062,7 @@ mod tests {
 
     #[test]
     fn cow_overlay_dirty_bitmap_persists_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20]);
@@ -943,7 +1089,7 @@ mod tests {
 
     #[test]
     fn cow_two_overlays_share_base_but_keep_private_writes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay_a = dir.path().join("a.overlay");
         let overlay_b = dir.path().join("b.overlay");
@@ -1008,7 +1154,7 @@ mod tests {
 
     #[test]
     fn cow_flush_and_fua_sync_overlay_without_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x55]);
@@ -1032,7 +1178,7 @@ mod tests {
 
     #[test]
     fn cow_partial_write_preserves_base_bytes_and_handles_last_block() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20, 0x30]);
@@ -1050,7 +1196,7 @@ mod tests {
 
     #[test]
     fn cow_rejects_request_that_crosses_device_end() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20]);
@@ -1101,7 +1247,7 @@ mod tests {
     fn cow_rejects_non_private_or_hardlinked_existing_overlay() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         let alias = dir.path().join("alias.overlay");

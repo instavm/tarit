@@ -2,16 +2,18 @@
 
 pub mod api;
 pub mod config;
+pub mod integrity;
 pub mod pty;
 pub mod state;
 
 pub use api::{
-    ApiRequest, ApiResponse, GuestNetworkRepair, RestoreMemoryPolicy, ScratchIdentity, VmSpec,
-    MAX_API_FRAME_LEN,
+    ApiRequest, ApiResponse, GuestNetworkRepair, LiveSnapshotStats, LiveSnapshotTermination,
+    MemoryIntegrity, RestoreMemoryPolicy, ScratchIdentity, VmSpec, MAX_API_FRAME_LEN,
 };
 pub use config::{
     KernelConfig, MemoryConfig, NetConfig, PortForwardConfig, VcpuConfig, VmConfig, VolumeConfig,
 };
+pub use integrity::{ArtifactIntegrity, ArtifactKind, IntegrityManifest, INTEGRITY_CHUNK_SIZE};
 pub use pty::{
     read_frame, write_error_frame, write_frame, write_json_frame, PtyExit, PtyResize, PtyStart,
     PtyStreamFrame, MAX_FRAME_LEN, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE, TYPE_START,

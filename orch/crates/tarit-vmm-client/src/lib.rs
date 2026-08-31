@@ -478,7 +478,63 @@ impl VmmClient {
     /// explicitly call `release_scratch` only after they hold local ownership.
     pub fn snapshot_unreleased(&self, diff: bool) -> Result<String, VmmError> {
         match self.request_ok(&ApiRequest::Snapshot { diff, live: false })? {
-            ApiResponse::Snapshot { path } => Ok(path),
+            ApiResponse::Snapshot {
+                path,
+                overlay_path: None,
+                integrity_path: None,
+                live_stats: None,
+            } => Ok(path),
+            ApiResponse::Snapshot {
+                integrity_path: Some(_),
+                ..
+            } => Err(VmmError::Api(
+                "non-live snapshot unexpectedly returned a live artifact".into(),
+            )),
+            ApiResponse::Snapshot {
+                overlay_path: Some(_),
+                integrity_path: None,
+                ..
+            } => Err(VmmError::Api(
+                "non-live snapshot unexpectedly returned a disk artifact".into(),
+            )),
+            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
+        }
+    }
+
+    /// Take an atomic live snapshot while the VMM retains cleanup ownership of
+    /// both RAM and the optional reflinked disk upper.
+    pub fn live_snapshot_unreleased(
+        &self,
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            String,
+            tarit_proto::LiveSnapshotStats,
+        ),
+        VmmError,
+    > {
+        match self.request_ok(&ApiRequest::Snapshot {
+            diff: false,
+            live: true,
+        })? {
+            ApiResponse::Snapshot {
+                path,
+                overlay_path,
+                integrity_path: Some(integrity_path),
+                live_stats: Some(live_stats),
+            } => Ok((path, overlay_path, integrity_path, live_stats)),
+            ApiResponse::Snapshot {
+                integrity_path: None,
+                ..
+            } => Err(VmmError::Api(
+                "live snapshot did not return an integrity sidecar".into(),
+            )),
+            ApiResponse::Snapshot {
+                live_stats: None, ..
+            } => Err(VmmError::Api(
+                "live snapshot did not return structured pre-copy statistics".into(),
+            )),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
     }
@@ -523,6 +579,30 @@ impl VmmClient {
             allow_existing,
         })? {
             ApiResponse::EgressUpdated { rules_applied } => Ok(rules_applied),
+            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
+        }
+    }
+
+    pub fn set_balloon(&self, target_mib: u64) -> Result<(u64, u64, u32, u32), VmmError> {
+        match self.request_ok(&ApiRequest::SetBalloon { target_mib })? {
+            ApiResponse::Balloon {
+                target_mib,
+                actual_mib,
+                target_pages,
+                actual_pages,
+            } => Ok((target_mib, actual_mib, target_pages, actual_pages)),
+            other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
+        }
+    }
+
+    pub fn balloon(&self) -> Result<(u64, u64, u32, u32), VmmError> {
+        match self.request_ok(&ApiRequest::Balloon)? {
+            ApiResponse::Balloon {
+                target_mib,
+                actual_mib,
+                target_pages,
+                actual_pages,
+            } => Ok((target_mib, actual_mib, target_pages, actual_pages)),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
     }
@@ -608,11 +688,43 @@ impl VmmClient {
         net: Option<Vec<NetConfig>>,
         memory_policy: RestoreMemoryPolicy,
     ) -> Result<(), VmmError> {
+        self.restore_with_integrity(snapshot_path, overlay, net, memory_policy, None)
+    }
+
+    pub fn restore_with_integrity(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net: Option<Vec<NetConfig>>,
+        memory_policy: RestoreMemoryPolicy,
+        memory_integrity: Option<MemoryIntegrity>,
+    ) -> Result<(), VmmError> {
+        self.restore_with_resource_overrides(
+            snapshot_path,
+            overlay,
+            net,
+            None,
+            memory_policy,
+            memory_integrity,
+        )
+    }
+
+    pub fn restore_with_resource_overrides(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net: Option<Vec<NetConfig>>,
+        volumes: Option<Vec<VolumeConfig>>,
+        memory_policy: RestoreMemoryPolicy,
+        memory_integrity: Option<MemoryIntegrity>,
+    ) -> Result<(), VmmError> {
         match self.request_ok(&ApiRequest::Restore {
             snapshot_path: snapshot_path.to_string(),
             overlay,
             net,
+            volumes,
             memory_policy,
+            memory_integrity,
         })? {
             ApiResponse::Restored | ApiResponse::Ok => Ok(()),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
@@ -682,8 +794,10 @@ mod tests {
     fn restore_request_round_trips_with_lazy_memory_policy() {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),
+            memory_integrity: None,
             overlay: None,
             net: None,
+            volumes: None,
             memory_policy: RestoreMemoryPolicy::Lazy,
         };
 
@@ -813,8 +927,10 @@ mod tests {
     fn restore_request_round_trips_without_overlay() {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),
+            memory_integrity: None,
             overlay: None,
             net: None,
+            volumes: None,
             memory_policy: RestoreMemoryPolicy::Auto,
         };
 
@@ -831,13 +947,17 @@ mod tests {
         match decoded {
             ApiRequest::Restore {
                 snapshot_path,
+                memory_integrity,
                 overlay,
                 net,
+                volumes,
                 memory_policy,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
+                assert!(memory_integrity.is_none());
                 assert_eq!(overlay, None);
                 assert!(net.is_none());
+                assert!(volumes.is_none());
                 assert_eq!(memory_policy, RestoreMemoryPolicy::Auto);
             }
             other => panic!("unexpected request: {other:?}"),
@@ -848,8 +968,10 @@ mod tests {
     fn restore_request_round_trips_with_overlay() {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),
+            memory_integrity: None,
             overlay: Some("/overlays/clone.cow".into()),
             net: None,
+            volumes: None,
             memory_policy: RestoreMemoryPolicy::Auto,
         };
 
@@ -867,13 +989,17 @@ mod tests {
         match decoded {
             ApiRequest::Restore {
                 snapshot_path,
+                memory_integrity,
                 overlay,
                 net,
+                volumes,
                 memory_policy,
             } => {
                 assert_eq!(snapshot_path, "/snapshots/golden.snap");
+                assert!(memory_integrity.is_none());
                 assert_eq!(overlay, Some("/overlays/clone.cow".into()));
                 assert!(net.is_none());
+                assert!(volumes.is_none());
                 assert_eq!(memory_policy, RestoreMemoryPolicy::Auto);
             }
             other => panic!("unexpected request: {other:?}"),
