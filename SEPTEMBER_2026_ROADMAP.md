@@ -395,7 +395,11 @@ passing focused gate does not waive an item in the final column.
   boot-enabled VMM workspace tests and `-D warnings` clippy pass, followed by a
   302-operation c8i lifecycle run covering snapshot, suspend/resume, live fork,
   concurrent fan-out/delete, scale-to-zero single-flight wake, and randomized
-  transitions.
+  transitions. A dedicated Ubuntu OCI gate on Linux 6.6.155 and 5.10.230 now
+  snapshots a two-vCPU guest after offlining its AP, verifies enabled BSP and
+  disabled AP pvclock, async-PF, steal-time, and PV-EOI state, restores that
+  mixed state, onlines the AP, and requires both execution progress and
+  re-enabled paravirtual state.
 
 - Clone admission now combines the `VMGENCTR`/`VM_GEN_COUNTER` ACPI generation
   notification with a synchronous host-to-guest repair barrier. Every restore
@@ -1024,7 +1028,10 @@ passing focused gate does not waive an item in the final column.
   owns each epoch's process group, forwards shutdown to that group, waits for
   cleanup, and gives the process tree 90 seconds before forced termination. It
   atomically publishes a root-only status record after every completed state
-  transition. After each epoch it runs an isolated recovery campaign that kills
+  transition. The status record aggregates fork phase latency, pre-copy rounds,
+  copied and residual dirty pages, guest downtime, convergence reason, and
+  local or cross-node execution path so sustained runs expose performance
+  regressions as well as correctness failures. After each epoch it runs an isolated recovery campaign that kills
   taritd without a drain, re-adopts the exact surviving VMM, hibernates to zero
   VMMs, wakes over HTTP, kills the resumed VMM, reconciles terminal ownership,
   and proves capacity reuse before the next OCI/kernel case starts. Before
@@ -1230,7 +1237,13 @@ passing focused gate does not waive an item in the final column.
   of eight vCPUs. Five injected failure phases on Ubuntu/6.6, plus final-pause
   and state-capture failures on Alpine/5.10, resumed every source vCPU and
   removed all staged live-snapshot files. An already-paused VM rejects a live
-  request without changing its state.
+  request without changing its state. Ordinary and live snapshots now stop
+  descriptor producers before draining and parking independent net/vsock I/O
+  threads. The drain processes queued work before acknowledgement because
+  host event counters are not snapshot state. A Linux regression gate
+  publishes a net TX descriptor without a notification and requires the pause
+  drain to complete it; Ubuntu OCI guests on Linux 6.6.155 and 5.10.230 also
+  passed ordinary and live snapshots while a vsock command remained in flight.
 - The current c8i storage audit does not show the assumed 200 GiB device. It
   exposes one 50 GiB EBS NVMe disk with a 49 GiB root partition and no second
   NVMe block device; `/t` is a 12 GiB Btrfs loop image backed by

@@ -57,6 +57,9 @@ class Soak:
         self.operations = 0
         self.operations_lock = threading.Lock()
         self.action_latencies_ms: dict[str, list[float]] = {}
+        self.fork_metric_samples: dict[str, list[int]] = {}
+        self.fork_paths: dict[str, int] = {}
+        self.fork_terminations: dict[str, int] = {}
         self.started_at = time.monotonic()
 
     @staticmethod
@@ -78,6 +81,68 @@ class Soak:
             }
             for action, values in sorted(self.action_latencies_ms.items())
         }
+
+    def fork_summary(self) -> dict[str, object]:
+        counts = [len(values) for values in self.fork_metric_samples.values()]
+        return {
+            "count": min(counts) if counts else 0,
+            "paths": dict(sorted(self.fork_paths.items())),
+            "terminations": dict(sorted(self.fork_terminations.items())),
+            "measurements": {
+                name: {
+                    "p50": round(self.percentile(values, 0.50), 3),
+                    "p95": round(self.percentile(values, 0.95), 3),
+                    "p99": round(self.percentile(values, 0.99), 3),
+                    "max": max(values),
+                }
+                for name, values in sorted(self.fork_metric_samples.items())
+            },
+        }
+
+    def record_fork_metrics(self, response: dict[str, object]) -> None:
+        metrics = response.get("metrics")
+        assert isinstance(metrics, dict), response
+        path = metrics.get("path")
+        assert path in {"local", "cross_node"}, metrics
+        phase_names = (
+            "source_resolution_us",
+            "operation_claim_us",
+            "snapshot_artifact_us",
+            "child_ready_us",
+            "operation_commit_us",
+        )
+        for name in phase_names:
+            value = metrics.get(name)
+            assert isinstance(value, int) and value > 0, metrics
+        total_us = metrics.get("total_us")
+        assert isinstance(total_us, int) and total_us >= sum(
+            metrics[name] for name in phase_names
+        ), metrics
+        live = metrics.get("live_snapshot")
+        assert isinstance(live, dict), metrics
+        for name in ("rounds", "pages_copied", "elapsed_us", "downtime_us"):
+            value = live.get(name)
+            assert isinstance(value, int) and value > 0, live
+        final_dirty_pages = live.get("final_dirty_pages")
+        assert isinstance(final_dirty_pages, int) and final_dirty_pages >= 0, live
+        assert live["downtime_us"] <= live["elapsed_us"], live
+        termination = live.get("termination")
+        assert termination in {"converged", "diverging", "timeout", "max_rounds"}, live
+
+        values = {
+            **{name: metrics[name] for name in (*phase_names, "total_us")},
+            **{
+                "live_rounds": live["rounds"],
+                "live_pages_copied": live["pages_copied"],
+                "live_final_dirty_pages": final_dirty_pages,
+                "live_elapsed_us": live["elapsed_us"],
+                "live_downtime_us": live["downtime_us"],
+            },
+        }
+        for name, value in values.items():
+            self.fork_metric_samples.setdefault(name, []).append(value)
+        self.fork_paths[path] = self.fork_paths.get(path, 0) + 1
+        self.fork_terminations[termination] = self.fork_terminations.get(termination, 0) + 1
 
     def write_status(self, kind: str, fields: dict[str, object]) -> None:
         if not self.args.status_file:
@@ -102,6 +167,7 @@ class Soak:
             "transient_vms": len(self.transient),
             "hibernated_sentinel": self.sentinel.vm_id if self.sentinel else None,
             "actions": self.action_summary(),
+            "forks": self.fork_summary(),
             **fields,
         }
         descriptor, temporary = tempfile.mkstemp(
@@ -217,6 +283,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         before = self.workload_state(vm_id)
         ticket = self.exec(vm_id, "/usr/local/bin/tarit-clone-repair-workload ticket")
         _, response = self.request("POST", f"/v1/vms/{vm_id}/fork", {}, 201, 360)
+        self.record_fork_metrics(response)
         child = response["vm"]
         child_id = child["id"]
         self.transient.add(child_id)
@@ -517,6 +584,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         fork_ready: dict[str, float] = {}
         for _ in range(2):
             _, response = self.request("POST", f"/v1/vms/{vm_id}/fork", {}, 201, 360)
+            self.record_fork_metrics(response)
             child = response["vm"]
             child_id = child["id"]
             assert child["status"] == "running", child

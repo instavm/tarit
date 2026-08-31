@@ -529,10 +529,11 @@ impl VmmController {
 
         let state_before = vm.state;
 
-        // Pause ALL vCPUs while we copy guest RAM so the dump is crash-consistent
-        // — no vCPU (BSP or AP) can mutate memory mid-copy. Resumed right after,
-        // so a snapshot never stops a running VM. (An idle guest is already
-        // quiescent; this makes an actively-running guest's snapshot consistent.)
+        // Stop every producer of guest-memory writes while we capture device state
+        // and RAM. Pause vCPUs first so the guest cannot enqueue new net/vsock work
+        // after an I/O pump has acknowledged its pause. The pumps are then parked
+        // before capture begins. Resume in the inverse order: vCPUs first, then the
+        // pumps, so a completion interrupt cannot be delivered to a paused LAPIC.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let paused_here = if state_before == VmState::Running {
             match pause_running_vcpus(vm) {
@@ -545,6 +546,8 @@ impl VmmController {
         } else {
             false
         };
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let io_paused_here = paused_here && pause_running_io(vm);
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let mut consumed_dirty = None;
@@ -655,6 +658,10 @@ impl VmmController {
         } else {
             Ok(())
         };
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        if io_paused_here {
+            resume_running_io(vm);
+        }
 
         vm.state = state_before;
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -1061,23 +1068,7 @@ impl VmmController {
         // between the residual copy and the device-state capture. Virtio-blk
         // needs no entry here: its QUEUE_NOTIFY traps to a vCPU thread, so
         // pausing every vCPU already quiesces it.
-        let quiesce = |pause: bool| {
-            if pause {
-                for io_loop in &running.net_io_loops {
-                    io_loop.pause();
-                }
-                if let Some(pump) = running.vsock_pump.as_ref() {
-                    pump.pause();
-                }
-            } else {
-                for io_loop in &running.net_io_loops {
-                    io_loop.resume();
-                }
-                if let Some(pump) = running.vsock_pump.as_ref() {
-                    pump.resume();
-                }
-            }
-        };
+        let quiesce = |pause: bool| set_running_io_paused(&running, pause);
         let memory_stage_path = match unique_scratch_snapshot_path("vmm-live-memory") {
             Ok(path) => path,
             Err(error) => {
@@ -2494,6 +2485,45 @@ fn pause_running_vcpus(vm: &VmInstance) -> Result<bool> {
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+/// Park or release every host I/O thread that can mutate guest memory without
+/// running on a vCPU. The pause methods synchronously acknowledge, so once this
+/// returns with `paused = true`, device state and RAM are stable as long as the
+/// vCPUs are also paused.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn set_running_io_paused(running: &RunningVm, paused: bool) {
+    if paused {
+        for io_loop in &running.net_io_loops {
+            io_loop.pause();
+        }
+        if let Some(pump) = running.vsock_pump.as_ref() {
+            pump.pause();
+        }
+    } else {
+        for io_loop in &running.net_io_loops {
+            io_loop.resume();
+        }
+        if let Some(pump) = running.vsock_pump.as_ref() {
+            pump.resume();
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn pause_running_io(vm: &VmInstance) -> bool {
+    let Some(running) = vm.running.as_ref() else {
+        return false;
+    };
+    set_running_io_paused(running, true);
+    true
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn resume_running_io(vm: &VmInstance) {
+    if let Some(running) = vm.running.as_ref() {
+        set_running_io_paused(running, false);
     }
 }
 

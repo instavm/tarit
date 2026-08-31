@@ -102,9 +102,10 @@ impl Drop for VcpuPauseGuard<'_> {
     }
 }
 
-/// RAII guard around the caller's I/O quiesce hook: engaging it parks every
-/// VMM thread that writes guest memory (net/vsock pumps); disengaging (or
-/// dropping, on error paths) releases them.
+/// RAII guard around the caller's I/O quiesce hook: after vCPUs stop producing
+/// descriptors, engaging it drains and parks every VMM thread that writes
+/// guest memory (net/vsock pumps). Disengaging, or dropping on an error path,
+/// releases them.
 struct IoQuiesceGuard<'a> {
     quiesce: &'a dyn Fn(bool),
     armed: bool,
@@ -590,22 +591,22 @@ where
 
     // Step 4: final stop. Order matters for the "no noticeable pause" goal:
     //
-    //   1. Quiesce the device I/O threads (net/vsock pumps) while the guest
-    //      is still running — their ack handshake stalls guest I/O briefly
-    //      but adds zero guest downtime.
-    //   2. Pause every vCPU. In-flight MMIO (including virtio-blk DMA, which
-    //      runs on a vCPU thread) completes before every pause is acked, so
-    //      after this point nothing writes guest memory.
+    //   1. Pause every vCPU so the guest cannot publish a descriptor and kick
+    //      after a device pump has acknowledged its pause. In-flight MMIO,
+    //      including virtio-blk DMA on a vCPU thread, completes first.
+    //   2. Drain and park the net/vsock pumps. Draining the queues consumes a
+    //      kick that raced with the pause and prevents restoring a published
+    //      descriptor without the non-persistent eventfd notification.
     //   3. Inside the pause do only O(residual) work: read both dirty
     //      sources, copy the residual pages, capture state.
     //
     // On any error below, the guards resume all vCPUs and I/O threads as they
     // drop. Downtime is measured across the whole pause — including the
     // pause/resume handshakes — because that is the blackout the guest sees.
-    log::info!("live_snapshot: final stop — quiescing I/O, pausing all vCPUs");
-    let io_guard = IoQuiesceGuard::engage(quiesce_io);
+    log::info!("live_snapshot: final stop — pausing all vCPUs, draining I/O");
     let final_stop_start = Instant::now();
     let final_pause_guard = VcpuPauseGuard::pause_all(vcpu_threads)?;
+    let io_guard = IoQuiesceGuard::engage(quiesce_io);
     inject_live_snapshot_failure("final_pause")?;
 
     let mut final_dirty = kvm_vm.read_dirty()?;

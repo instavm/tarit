@@ -77,5 +77,10 @@ name = "vsock_exec_transport"
 path = "vsock_exec_transport.rs"
 required-features = ["kvm"]
 
+[[test]]
+name = "pv_msr_snapshot"
+path = "pv_msr_snapshot.rs"
+required-features = ["kvm"]
+
 [lints]
 workspace = true

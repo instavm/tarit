@@ -20,8 +20,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 const MAX_FRAME: usize = 1600;
 
-/// How long the paused loop sleeps between checks of the pause flag. Guest
-/// I/O is stalled (not lost) while paused; the vCPU keeps running.
+/// How long the paused loop sleeps between checks of the pause flag.
 const PAUSE_POLL: std::time::Duration = std::time::Duration::from_micros(100);
 
 /// Handle returned by [`spawn_net_io_loop`]. Dropping it stops the thread.
@@ -47,9 +46,10 @@ impl NetIoLoop {
     }
 
     /// Pause the I/O thread and wait until it acknowledges: after this
-    /// returns, the thread is parked and will not touch guest memory until
-    /// [`Self::resume`]. Callers pause this thread *before* pausing the vCPU,
-    /// so the handshake latency here never contributes to guest downtime.
+    /// returns, the thread has drained pending TX and RX once, then parked
+    /// without touching guest memory until [`Self::resume`]. Callers must
+    /// pause every vCPU first so the guest cannot publish another descriptor
+    /// after this drain.
     pub fn pause(&self) {
         if self.thread_gone() {
             return;
@@ -199,6 +199,13 @@ fn run(
         // performs no guest-memory writes — the live snapshot's final stop
         // relies on that to keep the memory image and device state coherent.
         if pause_req.load(Ordering::SeqCst) {
+            // ioeventfd counters are not part of the snapshot. Process TX even
+            // if the counter is empty so a published descriptor cannot be
+            // restored without the kick that made it visible. Drain TAP RX
+            // while the vCPUs are stopped, then park before capture.
+            if !drain_kick(tx_kick_fd, &device) || !drain_tap(tap_fd, &device, &mut buf) {
+                break;
+            }
             pause_ack.store(true, Ordering::SeqCst);
             while pause_req.load(Ordering::SeqCst) && !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(PAUSE_POLL);
@@ -484,6 +491,46 @@ mod tests {
         };
         assert_eq!(&recv[..n], payload);
         assert_eq!(device.tx_packets.load(Ordering::Relaxed), 1);
+
+        // Publish a second descriptor without writing the kick eventfd. A
+        // snapshot pause must still drain it: the eventfd counter is host-only
+        // state and a restored transport cannot recover a lost notification.
+        const TX_BUF_2: u64 = TX_BUF + 0x100;
+        let pause_payload = b"PAUSE-DRAIN";
+        let mut pause_packet = vec![0u8; super::super::net_transport::VIRTIO_NET_HDR_LEN];
+        pause_packet.extend_from_slice(pause_payload);
+        mem.write_slice(&pause_packet, GuestAddress(TX_BUF_2))
+            .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: TX_BUF_2,
+                len: pause_packet.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(TX_DESC + std::mem::size_of::<Descriptor>() as u64),
+        )
+        .unwrap();
+        mem.write_obj(1u16, GuestAddress(TX_AVAIL + 6)).unwrap();
+        mem.write_obj(2u16, GuestAddress(TX_AVAIL + 2)).unwrap();
+        io_loop.pause();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let n = loop {
+            // SAFETY: `recv` remains a valid writable buffer and `host_fd` is
+            // the live socketpair endpoint owned by this test.
+            let rc =
+                unsafe { libc::read(host_fd, recv.as_mut_ptr() as *mut libc::c_void, recv.len()) };
+            if rc > 0 {
+                break rc as usize;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("snapshot pause did not drain un-kicked TX descriptor");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(&recv[..n], pause_payload);
+        assert_eq!(device.tx_packets.load(Ordering::Relaxed), 2);
+        io_loop.resume();
 
         // --- RX: write a frame on the host side; the loop should inject. ---
         let inbound = b"INBOUND-FRAME";

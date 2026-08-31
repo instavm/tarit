@@ -381,8 +381,10 @@ after pause/resume. Each request verifies a distinct guest-side token before the
 driver rechecks the long-lived workload, detecting cross-transport command
 interleaving, duplicate execution, stale completion, and response loss. The
 status and terminal records include per-action counts and p50, p95, p99, and
-maximum latency. Retained snapshots are bounded per epoch; live fork artifacts
-are deleted with their transient children.
+maximum latency. Fork records additionally retain phase distributions, live
+pre-copy rounds, copied and residual dirty pages, downtime, convergence reason,
+and local versus cross-node path counts. Retained snapshots are bounded per
+epoch; live fork artifacts are deleted with their transient children.
 
 When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
 creates a fourth logical VM, arms monotonic and realtime timers, and hibernates

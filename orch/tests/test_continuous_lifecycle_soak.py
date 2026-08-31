@@ -49,6 +49,7 @@ class StatusPublicationTests(unittest.TestCase):
             self.assertEqual(payload["case"], "ubuntu66")
             self.assertEqual(payload["epoch"], 7)
             self.assertEqual(payload["action"], "fork_anchor")
+            self.assertEqual(payload["forks"]["count"], 0)
             self.assertEqual(stat.S_IMODE(status_file.stat().st_mode), 0o600)
             self.assertEqual(list(status_file.parent.glob(".status.*.tmp")), [])
 
@@ -91,6 +92,72 @@ class StatusPublicationTests(unittest.TestCase):
                     "max_ms": 4.0,
                 },
             })
+
+    def test_fork_metrics_are_validated_and_summarized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            base = {
+                "path": "local",
+                "source_resolution_us": 10,
+                "operation_claim_us": 20,
+                "snapshot_artifact_us": 300,
+                "child_ready_us": 400,
+                "operation_commit_us": 30,
+                "total_us": 800,
+                "live_snapshot": {
+                    "rounds": 3,
+                    "pages_copied": 100,
+                    "final_dirty_pages": 4,
+                    "elapsed_us": 250,
+                    "downtime_us": 25,
+                    "termination": "converged",
+                },
+            }
+            soak.record_fork_metrics({"metrics": base})
+            second = json.loads(json.dumps(base))
+            second["path"] = "cross_node"
+            second["total_us"] = 1200
+            second["live_snapshot"]["termination"] = "max_rounds"
+            second["live_snapshot"]["downtime_us"] = 50
+            soak.record_fork_metrics({"metrics": second})
+
+            summary = soak.fork_summary()
+            self.assertEqual(summary["count"], 2)
+            self.assertEqual(summary["paths"], {"cross_node": 1, "local": 1})
+            self.assertEqual(
+                summary["terminations"], {"converged": 1, "max_rounds": 1}
+            )
+            self.assertEqual(summary["measurements"]["total_us"], {
+                "p50": 800,
+                "p95": 1200,
+                "p99": 1200,
+                "max": 1200,
+            })
+            self.assertEqual(
+                summary["measurements"]["live_downtime_us"]["max"], 50
+            )
+
+    def test_fork_metrics_reject_incoherent_downtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            soak = self.make_soak(Path(directory) / "status.json")
+            with self.assertRaises(AssertionError):
+                soak.record_fork_metrics({"metrics": {
+                    "path": "local",
+                    "source_resolution_us": 1,
+                    "operation_claim_us": 1,
+                    "snapshot_artifact_us": 1,
+                    "child_ready_us": 1,
+                    "operation_commit_us": 1,
+                    "total_us": 5,
+                    "live_snapshot": {
+                        "rounds": 1,
+                        "pages_copied": 1,
+                        "final_dirty_pages": 0,
+                        "elapsed_us": 10,
+                        "downtime_us": 11,
+                        "termination": "converged",
+                    },
+                }})
 
 
 if __name__ == "__main__":
