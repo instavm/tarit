@@ -85,6 +85,19 @@ with socket.socket() as listener:
 PY
 }
 
+detach_loop_device() {
+  local loop_device=$1
+  local _
+  for _ in $(seq 1 20); do
+    if losetup -d -- "$loop_device" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "FAIL: could not detach loop device after bounded retry: $loop_device" >&2
+  return 1
+}
+
 A_CONTROL=$(port)
 A_PEER=$(port)
 B_CONTROL=$(port)
@@ -140,7 +153,7 @@ cleanup() {
     B_STORAGE_MOUNTED=0
   fi
   if [ -n "$B_STORAGE_LOOP" ]; then
-    losetup -d -- "$B_STORAGE_LOOP" 2>/dev/null || status=1
+    detach_loop_device "$B_STORAGE_LOOP" || status=1
     B_STORAGE_LOOP=""
   fi
   if [ "$NFS_EXPORTED" -eq 1 ]; then
