@@ -379,6 +379,16 @@ wake, pause/resume, balloon changes, mutations, and concurrent work across all
 anchors. The status and terminal records include per-action counts and p50,
 p95, p99, and maximum latency. Retained snapshots are bounded per epoch; live
 fork artifacts are deleted with their transient children.
+
+When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
+creates a fourth logical VM, arms monotonic and realtime timers, and hibernates
+it while the three resident anchors continue working. At epoch completion,
+concurrent execute requests must single-flight its restore. The driver verifies
+the minimum zero-VMM hold, host-relative realtime repair, paused monotonic time,
+timer delivery, clone identity and session rotation, database state, artifact
+ownership, and capacity cleanup. The installed c8i unit requires at least a
+one-hour hold; its six-hour workload epoch normally yields a hold longer than
+six hours.
 `tests/tarit-continuous-soak.service` is the c8i systemd unit. It archives a
 failed epoch and restarts after 30 seconds so an isolated failure does not stop
 subsequent qualification. Repeated failures remain visible in

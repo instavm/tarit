@@ -36,6 +36,9 @@ versions may contain breaking changes.
   API, removing the `iproute2` dependency from minimal OCI guests.
 - Continuous lifecycle qualification now carries absolute and monotonic timers
   through two live sibling forks and verifies independent delivery and state.
+- Continuous lifecycle qualification can keep a separate logical VM at true
+  scale-to-zero for the full workload epoch while other VMs continue forking,
+  then verify single-flight wake, clocks, timers, identity, and artifact cleanup.
 - Continuous lifecycle qualification now guarantees live fork,
   snapshot/restore, and concurrent guest-work coverage before randomized
   transitions and reports per-action p50, p95, p99, and maximum latency.

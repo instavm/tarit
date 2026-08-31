@@ -1119,6 +1119,16 @@ passing focused gate does not waive an item in the final column.
   admission because the OCI fixture carried an older agent; the volume gate
   now injects the exact candidate agent into a private CoW image and the full
   rehearsal passes.
+  Each long epoch now also hibernates a fourth logical VM while the three
+  resident anchors continue their workload. A focused rehearsal held the
+  Ubuntu/Linux 6.6 sentinel at zero VMMs for 200.735 seconds and the
+  Alpine/Linux 5.10 sentinel for 194.860 seconds. Concurrent HTTP wake completed
+  in 1.221 and 1.058 seconds, guest uptime advanced only 1.53 and 1.44 seconds,
+  realtime matched the host exactly, both timer classes fired, inherited
+  sessions were rejected, and the private hibernation rows and files retired.
+  The installed six-hour service requires at least a one-hour sentinel hold;
+  its first completed long epoch is still required before this counts as
+  multi-hour qualification.
   The service is enabled and running; completion of
   the full four-case rotation remains a release gate.
 - A bounded runtime-crash gate now covers fresh digest-pinned Ubuntu 24.04 and

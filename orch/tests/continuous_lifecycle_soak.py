@@ -27,6 +27,19 @@ class Anchor:
     operations: int = 0
 
 
+@dataclass
+class HibernationSentinel:
+    vm_id: str
+    proof: str
+    before: dict[str, str]
+    ticket: str
+    uptime_before: float
+    realtime_before: int
+    started_at: float
+    monotonic_marker: str
+    realtime_marker: str
+
+
 class Soak:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -38,6 +51,7 @@ class Soak:
         self.random = random.Random(args.seed)
         self.anchors: dict[str, Anchor] = {}
         self.transient: set[str] = set()
+        self.sentinel: HibernationSentinel | None = None
         self.snapshots = 0
         self.operations = 0
         self.action_latencies_ms: dict[str, list[float]] = {}
@@ -84,6 +98,7 @@ class Soak:
             "snapshots": self.snapshots,
             "anchors": len(self.anchors),
             "transient_vms": len(self.transient),
+            "hibernated_sentinel": self.sentinel.vm_id if self.sentinel else None,
             "actions": self.action_summary(),
             **fields,
         }
@@ -257,6 +272,142 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             f"/usr/local/bin/tarit-clone-repair-workload accept-ticket '{ticket}'",
         ) == "rejected"
         self.event("hibernate_resume_verified", vm_id=vm_id)
+
+    def start_epoch_hibernation(self) -> None:
+        assert self.sentinel is None
+        proof = f"sentinel-{self.args.seed}-{uuid.uuid4().hex[:12]}"
+        _, row = self.request(
+            "POST", "/v1/vms", {"vcpus": 1, "memory_mib": 256}, 201
+        )
+        vm_id = row["id"]
+        assert row["status"] == "running", row
+        self.install_workload(vm_id, proof)
+        before = self.workload_state(vm_id)
+        ticket = self.exec(vm_id, "/usr/local/bin/tarit-clone-repair-workload ticket")
+        token = uuid.uuid4().hex
+        monotonic_marker = f"/tmp/tarit-epoch-monotonic-{token}"
+        realtime_marker = f"/tmp/tarit-epoch-realtime-{token}"
+        timer_seconds = self.args.guest_timer_seconds
+        armed = self.exec(
+            vm_id,
+            "set -eu; "
+            f"rm -f {monotonic_marker} {realtime_marker}; "
+            "read uptime rest < /proc/uptime; "
+            f"busybox setsid sh -c 'sleep {timer_seconds}; printf fired > "
+            f"{monotonic_marker}' </dev/null >/tmp/tarit-epoch-monotonic.log 2>&1 & "
+            f"deadline=$(($(date +%s) + {timer_seconds})); "
+            "busybox setsid sh -c '/usr/local/bin/tarit-clone-repair-workload "
+            f"wait-realtime \"$1\" && printf fired > {realtime_marker}' "
+            "sh \"$deadline\" </dev/null >/tmp/tarit-epoch-realtime.log 2>&1 & "
+            "printf '%s %s\n' \"$uptime\" \"$(date +%s)\"",
+        ).split()
+        assert len(armed) == 2, armed
+        _, hibernated = self.request(
+            "POST", f"/v1/vms/{vm_id}/hibernate", {}, 200, 360
+        )
+        assert hibernated["status"] == "hibernated", hibernated
+        self.sentinel = HibernationSentinel(
+            vm_id=vm_id,
+            proof=proof,
+            before=before,
+            ticket=ticket,
+            uptime_before=float(armed[0]),
+            realtime_before=int(armed[1]),
+            started_at=time.monotonic(),
+            monotonic_marker=monotonic_marker,
+            realtime_marker=realtime_marker,
+        )
+        self.event("epoch_hibernation_started", vm_id=vm_id, proof=proof)
+
+    def finish_epoch_hibernation(self) -> None:
+        sentinel = self.sentinel
+        assert sentinel is not None
+        hold_seconds = time.monotonic() - sentinel.started_at
+        assert hold_seconds >= self.args.epoch_hibernate_min_seconds, (
+            hold_seconds, self.args.epoch_hibernate_min_seconds,
+        )
+        _, row = self.request("GET", f"/v1/vms/{sentinel.vm_id}")
+        assert row["status"] == "hibernated", row
+        resume_started = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(self.exec, sentinel.vm_id, f"echo epoch-wake-{index}")
+                for index in range(4)
+            ]
+            assert [future.result(timeout=360) for future in futures] == [
+                f"epoch-wake-{index}" for index in range(4)
+            ]
+        resume_seconds = time.monotonic() - resume_started
+        after = self.workload_state(sentinel.vm_id)
+        for field in ("clone", "prng", "ticket", "prefix"):
+            assert after[field] != sentinel.before[field], (
+                field, sentinel.before, after,
+            )
+        assert after["counter"] == "0" and after["cache"] == "-", after
+        assert self.exec(
+            sentinel.vm_id,
+            f"/usr/local/bin/tarit-clone-repair-workload accept-ticket '{sentinel.ticket}'",
+        ) == "rejected"
+        immediate = self.exec(
+            sentinel.vm_id,
+            "set -eu; "
+            f"test \"$(cat /root/tarit-soak-proof)\" = {sentinel.proof}; "
+            "read uptime rest < /proc/uptime; "
+            f"if test -e {sentinel.monotonic_marker}; then mono=fired; else mono=pending; fi; "
+            "! dmesg | tail -n 300 | grep -Eiq "
+            "'watchdog: BUG|soft lockup|hard LOCKUP|Kernel panic|BUG:'; "
+            "printf '%s %s %s\n' \"$uptime\" \"$(date +%s)\" \"$mono\"",
+        ).split()
+        assert len(immediate) == 3 and immediate[2] == "pending", immediate
+        uptime_after, realtime_after = float(immediate[0]), int(immediate[1])
+        host_realtime = int(time.time())
+        assert uptime_after >= sentinel.uptime_before, (
+            sentinel.uptime_before, uptime_after,
+        )
+        assert uptime_after - sentinel.uptime_before < self.args.guest_timer_seconds, (
+            sentinel.uptime_before, uptime_after,
+        )
+        assert abs(realtime_after - host_realtime) <= 3, (
+            realtime_after, host_realtime,
+        )
+        assert realtime_after - sentinel.realtime_before >= hold_seconds - 3, (
+            sentinel.realtime_before, realtime_after, hold_seconds,
+        )
+
+        realtime_deadline = time.monotonic() + 2
+        while time.monotonic() < realtime_deadline:
+            if self.exec(
+                sentinel.vm_id,
+                f"if test -e {sentinel.realtime_marker}; then echo fired; else echo pending; fi",
+            ) == "fired":
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("epoch sentinel realtime timer did not fire")
+        monotonic_deadline = time.monotonic() + self.args.guest_timer_seconds + 15
+        while time.monotonic() < monotonic_deadline:
+            if self.exec(
+                sentinel.vm_id,
+                f"if test -e {sentinel.monotonic_marker}; then echo fired; else echo pending; fi",
+            ) == "fired":
+                break
+            time.sleep(0.25)
+        else:
+            raise AssertionError("epoch sentinel monotonic timer did not fire")
+        monotonic_seconds = time.monotonic() - resume_started
+        assert monotonic_seconds >= self.args.guest_timer_seconds - 1, monotonic_seconds
+        self.request("DELETE", f"/v1/vms/{sentinel.vm_id}", expected=204, timeout=360)
+        self.sentinel = None
+        self.event(
+            "epoch_hibernation_verified",
+            vm_id=sentinel.vm_id,
+            hold_seconds=round(hold_seconds, 3),
+            resume_seconds=round(resume_seconds, 3),
+            guest_uptime_delta_seconds=round(uptime_after - sentinel.uptime_before, 3),
+            guest_realtime_delta_seconds=realtime_after - sentinel.realtime_before,
+            host_realtime_error_seconds=realtime_after - host_realtime,
+            monotonic_timer_after_resume_seconds=round(monotonic_seconds, 3),
+        )
 
     def long_hibernate_clock_timer(self, vm_id: str) -> None:
         timer_seconds = self.args.guest_timer_seconds
@@ -569,6 +720,10 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         by_id = {row["id"]: row for row in rows}
         for vm_id in self.anchors:
             assert vm_id in by_id and by_id[vm_id]["status"] == "running", (vm_id, by_id)
+        if self.sentinel:
+            assert by_id.get(self.sentinel.vm_id, {}).get("status") == "hibernated", (
+                self.sentinel, by_id,
+            )
         with sqlite3.connect(self.args.database) as database:
             resident = database.execute(
                 "select id,pid from vms where status in ('running','paused','suspended')"
@@ -576,12 +731,22 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             snapshots = database.execute(
                 "select path,overlay_path,ephemeral_owner_vm_id from snapshots"
             ).fetchall()
+            hibernated = {
+                row[0] for row in database.execute("select vm_id from hibernations")
+            }
         expected = set(self.anchors) | self.transient
         assert {vm_id for vm_id, _ in resident} == expected, (resident, expected)
         for vm_id, pid in resident:
             assert pid and os.path.exists(f"/proc/{pid}"), (vm_id, pid)
-        assert all(owner is None for _, _, owner in snapshots), snapshots
-        assert len(snapshots) == self.snapshots, (snapshots, self.snapshots)
+        expected_hibernated = {self.sentinel.vm_id} if self.sentinel else set()
+        assert hibernated == expected_hibernated, (hibernated, expected_hibernated)
+        ephemeral_owners = {owner for _, _, owner in snapshots if owner is not None}
+        assert ephemeral_owners == expected_hibernated, (
+            ephemeral_owners, expected_hibernated,
+        )
+        assert len(snapshots) == self.snapshots + len(expected_hibernated), (
+            snapshots, self.snapshots, expected_hibernated,
+        )
         expected_snapshot_files = {
             path
             for snapshot_path, overlay_path, _ in snapshots
@@ -619,13 +784,15 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             )
 
     def cleanup(self) -> None:
-        for vm_id in list(self.transient) + list(self.anchors):
+        sentinel_ids = [self.sentinel.vm_id] if self.sentinel else []
+        for vm_id in list(self.transient) + sentinel_ids + list(self.anchors):
             try:
                 self.request("DELETE", f"/v1/vms/{vm_id}", expected={204, 404}, timeout=120)
             except Exception as error:
                 self.event("cleanup_error", vm_id=vm_id, error=str(error))
         self.transient.clear()
         self.anchors.clear()
+        self.sentinel = None
 
     def run_action(self, action, vm_id: str) -> None:
         self.assert_storage_headroom()
@@ -645,6 +812,9 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         for index in range(self.args.anchors):
             self.create_anchor(index)
             self.assert_storage_headroom()
+        if self.args.epoch_hibernate_min_seconds:
+            self.start_epoch_hibernation()
+            self.assert_global_invariants()
         if self.args.hibernate_hold_seconds:
             self.long_hibernate_clock_timer(next(iter(self.anchors)))
             self.assert_global_invariants()
@@ -673,6 +843,9 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             action = self.random.choice(available_actions)
             self.run_action(action, vm_id)
             time.sleep(self.args.interval_seconds)
+        if self.sentinel:
+            self.finish_epoch_hibernation()
+            self.assert_global_invariants()
         minimum_age = min(time.monotonic() - anchor.created_at for anchor in self.anchors.values())
         self.event(
             "soak_pass", seed=self.args.seed, operations=self.operations,
@@ -701,6 +874,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hibernate-hold-seconds", type=int, default=0)
     parser.add_argument("--guest-timer-seconds", type=int, default=5)
     parser.add_argument("--sibling-fork-timer-seconds", type=int, default=0)
+    parser.add_argument("--epoch-hibernate-min-seconds", type=int, default=0)
     parser.add_argument("--storage-path")
     parser.add_argument("--min-free-bytes", type=int, default=0)
     parser.add_argument(
@@ -730,6 +904,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("guest timer must be at least two seconds")
     if args.sibling_fork_timer_seconds and args.sibling_fork_timer_seconds < 10:
         parser.error("sibling fork timer must be at least ten seconds")
+    if args.epoch_hibernate_min_seconds < 0:
+        parser.error("epoch hibernation minimum must not be negative")
     return args
 
 

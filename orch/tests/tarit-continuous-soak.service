@@ -9,6 +9,7 @@ StartLimitIntervalSec=0
 Type=simple
 EnvironmentFile=/etc/tarit/continuous-soak.env
 Environment=TARIT_CONTINUOUS_STATUS_FILE=/run/tarit-continuous-soak/status.json
+Environment=TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS=3600
 WorkingDirectory=/home/ubuntu/tarit-c8i
 ExecStart=/home/ubuntu/tarit-c8i/orch/tests/continuous_mixed_oci_soak.sh
 RuntimeDirectory=tarit-continuous-soak

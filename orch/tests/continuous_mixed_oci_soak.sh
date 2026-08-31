@@ -17,6 +17,7 @@ GUEST_AGENT="${TARIT_TEST_GUEST_AGENT_BIN:-$ROOT/vmm/guest/agent/vmm-agent}"
 RUN_ROOT="${TARIT_CONTINUOUS_RUN_ROOT:-$SOCKET_ROOT/tarit-continuous-soak}"
 LOCK="${TARIT_CONTINUOUS_LOCK:-/run/lock/tarit-september-global.lock}"
 EPOCH_SECONDS="${TARIT_CONTINUOUS_EPOCH_SECONDS:-1800}"
+EPOCH_HIBERNATE_MIN_SECONDS="${TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS:-0}"
 MIN_FREE_BYTES="${TARIT_CONTINUOUS_MIN_FREE_BYTES:-3221225472}"
 MAX_SNAPSHOTS="${TARIT_CONTINUOUS_MAX_SNAPSHOTS:-2}"
 CHAOS_EVERY_EPOCHS="${TARIT_CONTINUOUS_CHAOS_EVERY_EPOCHS:-1}"
@@ -35,6 +36,10 @@ command -v setsid >/dev/null || { echo "FAIL: missing setsid" >&2; exit 1; }
 test -x "$GUEST_AGENT" || { echo "FAIL: guest agent not executable: $GUEST_AGENT" >&2; exit 1; }
 [[ "$EPOCH_SECONDS" =~ ^[1-9][0-9]*$ ]] && [ "$EPOCH_SECONDS" -ge 60 ] || {
   echo "FAIL: epoch duration must be at least 60 seconds" >&2
+  exit 1
+}
+[[ "$EPOCH_HIBERNATE_MIN_SECONDS" =~ ^[0-9]+$ ]] || {
+  echo "FAIL: invalid epoch hibernation minimum" >&2
   exit 1
 }
 [[ "$MIN_FREE_BYTES" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid free-space floor" >&2; exit 1; }
@@ -206,7 +211,7 @@ while :; do
     TARIT_TEST_CLONE_WORKLOAD_BIN="$WORKLOAD_BIN" \
     TARIT_TEST_GUEST_AGENT_BIN="$GUEST_AGENT" \
     TARIT_LIFECYCLE_DRIVER="$DRIVER" \
-    TARIT_LIFECYCLE_DRIVER_ARGS="--duration-seconds $EPOCH_SECONDS --interval-seconds 1 --anchors 3 --anchor-vcpus 1,2,4 --hibernate-hold-seconds 65 --guest-timer-seconds 5 --sibling-fork-timer-seconds 45 --storage-path $SOCKET_ROOT --min-free-bytes $MIN_FREE_BYTES" \
+    TARIT_LIFECYCLE_DRIVER_ARGS="--duration-seconds $EPOCH_SECONDS --interval-seconds 1 --anchors 3 --anchor-vcpus 1,2,4 --hibernate-hold-seconds 65 --guest-timer-seconds 5 --sibling-fork-timer-seconds 45 --epoch-hibernate-min-seconds $EPOCH_HIBERNATE_MIN_SECONDS --storage-path $SOCKET_ROOT --min-free-bytes $MIN_FREE_BYTES" \
     TARIT_LIFECYCLE_SEEDS="$seed" \
     TARIT_LIFECYCLE_MAX_VMS=6 \
     TARIT_LIFECYCLE_MAX_VCPUS=12 \

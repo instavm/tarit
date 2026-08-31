@@ -136,7 +136,11 @@ regression gates, but the following unresolved items now block release:
    from zero VMMs, killed-VMM reconciliation, and capacity reuse. A subsequent
    two-case rehearsal passed Ubuntu/Linux 6.6 and Alpine/Linux 5.10 workload
    epochs, runtime crash recovery, execute/PTY/SSH/share activation, and local-
-   plus NFS-backed volume hibernation. The full Ubuntu/Alpine and Linux
+   plus NFS-backed volume hibernation. The workload now also holds a separate
+   logical VM at zero VMMs for the full epoch while the resident anchors keep
+   working; bounded Ubuntu/6.6 and Alpine/5.10 rehearsals passed clock, timer,
+   identity, single-flight wake, and artifact cleanup. The installed six-hour
+   service requires a hold of at least one hour. The full Ubuntu/Alpine and Linux
    6.6/5.10 service must
    complete sustained rotation
    without this stall before ingress admission is considered qualified.
