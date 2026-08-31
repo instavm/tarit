@@ -580,9 +580,9 @@ impl VmmController {
         // Stop every producer of guest-memory writes while we capture device state
         // and RAM. Pause vCPUs first so the guest cannot enqueue new net/vsock work
         // after an I/O pump has acknowledged its pause. The pumps are then parked
-        // before capture begins. Resume in the inverse order: vCPUs first, then the
-        // pumps before vCPUs so a rapid subsequent pause cannot observe a stale
-        // worker acknowledgement from this snapshot.
+        // before capture begins. Resume the pumps before vCPUs so a rapid
+        // subsequent pause cannot observe a stale worker acknowledgement from
+        // this snapshot.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let paused_here = if state_before == VmState::Running {
             match pause_running_vcpus(vm) {
@@ -604,11 +604,14 @@ impl VmmController {
             match pause_running_io(vm) {
                 Ok(paused) => paused,
                 Err(error) => {
-                    let resume_error = if paused_here {
+                    let resume_error = if paused_here && error.vcpus_may_resume_after_io_error() {
                         resume_running_vcpus(vm).err()
                     } else {
                         None
                     };
+                    if !error.vcpus_may_resume_after_io_error() {
+                        vm.state = VmState::Paused;
+                    }
                     remove_owned_scratch_file(&owned_snapshot);
                     return Err(match resume_error {
                         Some(resume) => VmmError::Snapshot(format!(
@@ -1226,6 +1229,14 @@ impl VmmController {
                 capture_live_state_blob(&running, &base_blob)
             },
         );
+        let source_vcpus_paused = running
+            .vcpu_thread
+            .paused
+            .load(std::sync::atomic::Ordering::Acquire)
+            || running
+                .ap_threads
+                .iter()
+                .any(|thread| thread.paused.load(std::sync::atomic::Ordering::Acquire));
 
         // Put the VM back only if the slot still holds the same instance. A
         // concurrent stop + create would otherwise get this VM's threads and
@@ -1235,6 +1246,9 @@ impl VmmController {
             let mut slot = self.lock();
             match slot.as_mut() {
                 Some(vm) if vm.generation == generation && vm.running.is_none() => {
+                    if source_vcpus_paused {
+                        vm.state = VmState::Paused;
+                    }
                     vm.running = reclaimed.take();
                 }
                 _ => {
@@ -1791,6 +1805,10 @@ impl VmmController {
         pause_running_vcpus(vm)?;
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         if let Err(error) = pause_running_io(vm) {
+            if !error.vcpus_may_resume_after_io_error() {
+                vm.state = VmState::Paused;
+                return Err(error);
+            }
             return match resume_running_vcpus(vm) {
                 Ok(()) => Err(error),
                 Err(resume) => Err(VmmError::Device(format!(
@@ -2630,34 +2648,43 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
         for io_loop in &running.blk_io_loops {
             if let Err(error) = io_loop.pause() {
                 let rollback = resume_running_io_workers(running).err();
-                return Err(VmmError::Device(match rollback {
-                    Some(rollback) => {
-                        format!("quiesce block I/O worker: {error}; rollback failed: {rollback}")
-                    }
-                    None => format!("quiesce block I/O worker: {error}"),
-                }));
+                return Err(VmmError::IoQuiescence {
+                    message: match rollback.as_ref() {
+                        Some(rollback) => format!(
+                            "quiesce block I/O worker: {error}; rollback failed: {rollback}"
+                        ),
+                        None => format!("quiesce block I/O worker: {error}"),
+                    },
+                    vcpus_may_resume: rollback.is_none(),
+                });
             }
         }
         for io_loop in &running.net_io_loops {
             if let Err(error) = io_loop.pause() {
                 let rollback = resume_running_io_workers(running).err();
-                return Err(VmmError::Device(match rollback {
-                    Some(rollback) => {
-                        format!("quiesce network I/O worker: {error}; rollback failed: {rollback}")
-                    }
-                    None => format!("quiesce network I/O worker: {error}"),
-                }));
+                return Err(VmmError::IoQuiescence {
+                    message: match rollback.as_ref() {
+                        Some(rollback) => format!(
+                            "quiesce network I/O worker: {error}; rollback failed: {rollback}"
+                        ),
+                        None => format!("quiesce network I/O worker: {error}"),
+                    },
+                    vcpus_may_resume: rollback.is_none(),
+                });
             }
         }
         if let Some(pump) = running.vsock_pump.as_ref() {
             if let Err(error) = pump.pause() {
                 let rollback = resume_running_io_workers(running).err();
-                return Err(VmmError::Device(match rollback {
-                    Some(rollback) => {
-                        format!("quiesce vsock worker: {error}; rollback failed: {rollback}")
-                    }
-                    None => format!("quiesce vsock worker: {error}"),
-                }));
+                return Err(VmmError::IoQuiescence {
+                    message: match rollback.as_ref() {
+                        Some(rollback) => {
+                            format!("quiesce vsock worker: {error}; rollback failed: {rollback}")
+                        }
+                        None => format!("quiesce vsock worker: {error}"),
+                    },
+                    vcpus_may_resume: rollback.is_none(),
+                });
             }
         }
     } else {
@@ -2687,10 +2714,10 @@ fn resume_running_io_workers(running: &RunningVm) -> Result<()> {
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(VmmError::Device(format!(
-            "resume I/O workers: {}",
-            failures.join("; ")
-        )))
+        Err(VmmError::IoQuiescence {
+            message: format!("resume I/O workers: {}", failures.join("; ")),
+            vcpus_may_resume: false,
+        })
     }
 }
 
@@ -2832,8 +2859,11 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         match pause_running_io(vm) {
             Ok(paused) => paused,
             Err(error) => {
-                if paused_here {
+                if paused_here && error.vcpus_may_resume_after_io_error() {
                     resume_running_vcpus(vm)?;
+                }
+                if !error.vcpus_may_resume_after_io_error() {
+                    vm.state = VmState::Paused;
                 }
                 return Err(error);
             }
@@ -2986,6 +3016,15 @@ pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+#[cfg(test)]
+fn cleanup_private_runtime_dir() {
+    // Unit tests create and drop independent VM instances concurrently inside
+    // one process. They intentionally share the per-process runtime directory,
+    // so one test must not remove it while another is staging an artifact.
+    // Individual test artifacts retain their own exact cleanup guards.
+}
+
+#[cfg(not(test))]
 fn cleanup_private_runtime_dir() {
     use std::io::ErrorKind;
 

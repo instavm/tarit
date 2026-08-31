@@ -152,7 +152,7 @@ async fn observe_and_compensate_vm_status(
     compensate_vm_status(state, prior, control_status(observed.state)?).await
 }
 
-async fn reconcile_snapshot_pause_failure(
+async fn reconcile_failed_live_operation(
     state: &AppState,
     prior: &VmRecord,
     primary: OrchError,
@@ -167,16 +167,16 @@ async fn reconcile_snapshot_pause_failure(
         Ok(Ok(status)) => match control_status(status.state) {
             Ok(status) => status,
             Err(error) => {
-                return retain_snapshot_reconciliation(
+                return retain_live_operation_reconciliation(
                     state,
                     prior,
                     primary,
-                    format!("snapshot pause reconciliation rejected VMM state: {error}"),
+                    format!("live-operation reconciliation rejected VMM state: {error}"),
                 );
             }
         },
         Ok(Err(error)) => {
-            return retain_snapshot_reconciliation(
+            return retain_live_operation_reconciliation(
                 state,
                 prior,
                 primary,
@@ -184,7 +184,7 @@ async fn reconcile_snapshot_pause_failure(
             );
         }
         Err(error) => {
-            return retain_snapshot_reconciliation(
+            return retain_live_operation_reconciliation(
                 state,
                 prior,
                 primary,
@@ -211,11 +211,11 @@ async fn reconcile_snapshot_pause_failure(
                 ));
             }
             OrchError::Internal(format!(
-                "{primary}; VM was fenced {} after snapshot compensation",
+                "{primary}; VM was fenced {} after live-operation compensation",
                 observed.as_str()
             ))
         }
-        Err(compensation) => retain_snapshot_reconciliation(
+        Err(compensation) => retain_live_operation_reconciliation(
             state,
             prior,
             primary,
@@ -227,7 +227,7 @@ async fn reconcile_snapshot_pause_failure(
     }
 }
 
-fn retain_snapshot_reconciliation(
+fn retain_live_operation_reconciliation(
     state: &AppState,
     prior: &VmRecord,
     primary: OrchError,
@@ -2717,10 +2717,10 @@ async fn snapshot_local_locked(
     let mut bundle = match bundle {
         Ok(Ok(bundle)) => bundle,
         Ok(Err(error)) => {
-            return Err(reconcile_snapshot_pause_failure(state, &vm, error).await);
+            return Err(reconcile_failed_live_operation(state, &vm, error).await);
         }
         Err(error) => {
-            return Err(reconcile_snapshot_pause_failure(
+            return Err(reconcile_failed_live_operation(
                 state,
                 &vm,
                 OrchError::Internal(format!("snapshot task failed: {error}")),
@@ -3899,19 +3899,19 @@ where
         TransitionDecision::Apply => {}
     }
     let operation_supervisor = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || op(&operation_supervisor, id))
+    let operation = tokio::task::spawn_blocking(move || op(&operation_supervisor, id))
         .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))?
-        .map_err(|error| {
-            tracing::warn!(
-                vm = %id,
-                from = current.status.as_str(),
-                to = new_status.as_str(),
-                %error,
-                "VMM lifecycle operation failed"
-            );
-            error
-        })?;
+        .map_err(|e| OrchError::Internal(format!("join: {e}")))?;
+    if let Err(error) = operation {
+        tracing::warn!(
+            vm = %id,
+            from = current.status.as_str(),
+            to = new_status.as_str(),
+            %error,
+            "VMM lifecycle operation failed"
+        );
+        return Err(reconcile_failed_live_operation(state, &current, error).await);
+    }
     match vm_set_status(state, id, new_status).await {
         Ok(record) => Ok(record),
         Err(persist_error) => {
@@ -4497,6 +4497,91 @@ mod tests {
                     tarit_vmm_client::ApiRequest::Status,
                     tarit_vmm_client::ApiRequest::Resume,
                     tarit_vmm_client::ApiRequest::Exec { .. },
+                    tarit_vmm_client::ApiRequest::Stop
+                ]
+            ),
+            "unexpected VMM request sequence: {requests:?}"
+        );
+        assert!(!socket.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_pause_is_observed_and_fenced_to_the_actual_vmm_state() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let initial = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+
+        let socket = PathBuf::from(format!(
+            "/tmp/taritd-pause-reconcile-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            let response = match &request {
+                tarit_vmm_client::ApiRequest::Pause => tarit_vmm_client::ApiResponse::Err {
+                    msg: "injected I/O quiescence failure".into(),
+                },
+                tarit_vmm_client::ApiRequest::Status => {
+                    tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                        state: tarit_vmm_client::VmState::Paused,
+                        uptime_ms: 1,
+                        vcpus: 1,
+                        mem_mib: 256,
+                        volumes: 0,
+                        nets: 0,
+                        kernel: "kernel".into(),
+                        vcpu_alive: true,
+                    })
+                }
+                _ => tarit_vmm_client::ApiResponse::Ok,
+            };
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+            let stopped = matches!(request, tarit_vmm_client::ApiRequest::Stop);
+            requests_tx.send(request).unwrap();
+            if stopped {
+                break;
+            }
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(id, socket.clone());
+
+        let error = test_runtime()
+            .block_on(pause_local(&state, id))
+            .expect_err("a failed pause must reconcile an actually paused VMM");
+        assert!(error.to_string().contains("fenced paused"));
+
+        let cached = vm_get(&state, id).unwrap();
+        let durable = state.store.lock().unwrap().get_vm(id).unwrap();
+        assert_eq!(cached.status, VmStatus::Paused);
+        assert_eq!(durable.status, VmStatus::Paused);
+        assert_eq!(cached.revision, initial.revision + 2);
+        assert_eq!(durable.revision, initial.revision + 2);
+
+        state.supervisor.stop_vm(id).unwrap();
+        server.join().unwrap();
+        let requests = requests_rx.into_iter().collect::<Vec<_>>();
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [
+                    tarit_vmm_client::ApiRequest::Pause,
+                    tarit_vmm_client::ApiRequest::Status,
                     tarit_vmm_client::ApiRequest::Stop
                 ]
             ),

@@ -90,6 +90,13 @@ impl<'a> VcpuPauseGuard<'a> {
         }
         Ok(())
     }
+
+    /// Disarm automatic resume while intentionally leaving every vCPU at the
+    /// snapshot pause boundary. Used when device workers could not prove that
+    /// they left quiescence; running the guest in that state would be unsafe.
+    fn keep_paused(mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for VcpuPauseGuard<'_> {
@@ -174,6 +181,60 @@ impl Drop for IoQuiesceGuard<'_> {
         if self.armed {
             let _ = (self.quiesce)(false);
         }
+    }
+}
+
+trait FinalIoRelease {
+    fn release(self) -> Result<()>;
+}
+
+impl FinalIoRelease for IoQuiesceGuard<'_> {
+    fn release(self) -> Result<()> {
+        self.disengage()
+    }
+}
+
+trait FinalVcpuRelease {
+    fn resume(self) -> Result<()>;
+    fn keep_paused(self);
+}
+
+impl FinalVcpuRelease for VcpuPauseGuard<'_> {
+    fn resume(self) -> Result<()> {
+        VcpuPauseGuard::resume(self)
+    }
+
+    fn keep_paused(self) {
+        VcpuPauseGuard::keep_paused(self);
+    }
+}
+
+/// Leave the final-stop boundary in a fail-closed order. Device workers must
+/// prove they are running before vCPUs can leave their pause. Capture failures
+/// still restore the source when that ordering succeeds.
+fn finish_final_stop<T, I, V>(capture: Result<T>, io: I, vcpus: V) -> Result<T>
+where
+    I: FinalIoRelease,
+    V: FinalVcpuRelease,
+{
+    if let Err(io_error) = io.release() {
+        vcpus.keep_paused();
+        return Err(match capture {
+            Ok(_) => io_error,
+            Err(capture_error) => VmmError::Snapshot(format!(
+                "{capture_error}; failed to resume I/O workers: {io_error}"
+            )),
+        });
+    }
+
+    let vcpu_resume = vcpus.resume();
+    match (capture, vcpu_resume) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(capture_error), Err(resume_error)) => Err(VmmError::Snapshot(format!(
+            "{capture_error}; failed to resume vCPUs: {resume_error}"
+        ))),
     }
 }
 
@@ -607,33 +668,52 @@ where
     log::info!("live_snapshot: final stop — pausing all vCPUs, draining I/O");
     let final_stop_start = Instant::now();
     let final_pause_guard = VcpuPauseGuard::pause_all(vcpu_threads)?;
-    let io_guard = IoQuiesceGuard::engage(quiesce_io)?;
-    inject_live_snapshot_failure("final_pause")?;
+    let io_guard = match IoQuiesceGuard::engage(quiesce_io) {
+        Ok(guard) => guard,
+        Err(error) => {
+            if error.vcpus_may_resume_after_io_error() {
+                return match final_pause_guard.resume() {
+                    Ok(()) => Err(error),
+                    Err(resume_error) => Err(VmmError::Snapshot(format!(
+                        "{error}; failed to resume vCPUs after I/O quiescence failure: {resume_error}"
+                    ))),
+                };
+            } else {
+                final_pause_guard.keep_paused();
+            }
+            return Err(error);
+        }
+    };
+    let capture_result = (|| -> Result<(Vec<u8>, u64)> {
+        inject_live_snapshot_failure("final_pause")?;
 
-    let mut final_dirty = kvm_vm.read_dirty()?;
-    final_dirty.merge(&mem.drain_host_dirty());
-    final_dirty.merge(&pending_final_dirty);
-    let final_dirty_pages = final_dirty.len() as u64;
-    consumed_dirty.merge(&final_dirty);
-    let lazy_fence = mem.lazy_snapshot_fence();
-    let _final_read_guard = lazy_fence.as_ref().map(|fence| {
-        fence
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    });
-    total_pages_copied += copy_dirty_pages(mem, memory_file, &final_dirty)?;
-    drop(_final_read_guard);
-    // Every vCPU is paused, so the registers and device state captured here are
-    // coherent with the memory image assembled above.
-    let state_blob = capture_state()?;
-    inject_live_snapshot_failure("state_capture")?;
+        let mut final_dirty = kvm_vm.read_dirty()?;
+        final_dirty.merge(&mem.drain_host_dirty());
+        final_dirty.merge(&pending_final_dirty);
+        let final_dirty_pages = final_dirty.len() as u64;
+        consumed_dirty.merge(&final_dirty);
+        let lazy_fence = mem.lazy_snapshot_fence();
+        let _final_read_guard = lazy_fence.as_ref().map(|fence| {
+            fence
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        total_pages_copied += copy_dirty_pages(mem, memory_file, &final_dirty)?;
+        drop(_final_read_guard);
+        // Every vCPU is paused, so the registers and device state captured here
+        // are coherent with the memory image assembled above.
+        let state_blob = capture_state()?;
+        inject_live_snapshot_failure("state_capture")?;
+        Ok((state_blob, final_dirty_pages))
+    })();
 
     // Release I/O workers first and wait for their pause acknowledgements to
     // clear. This closes the rapid resume/pause race before any vCPU can
-    // publish new descriptors. Then observe every vCPU leave its park, so
-    // downtime covers the complete all-vCPU blackout.
-    io_guard.disengage()?;
-    final_pause_guard.resume()?;
+    // publish new descriptors. An I/O release failure deliberately leaves the
+    // vCPUs paused. Otherwise observe every vCPU leave its park so downtime
+    // covers the complete all-vCPU blackout.
+    let (state_blob, final_dirty_pages) =
+        finish_final_stop(capture_result, io_guard, final_pause_guard)?;
     let downtime = final_stop_start.elapsed();
     // Final residual pages entered the page cache during blackout, but durable
     // writeback is not part of guest downtime.
@@ -671,6 +751,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeIoRelease {
+        actions: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        fail: bool,
+    }
+
+    impl FinalIoRelease for FakeIoRelease {
+        fn release(self) -> Result<()> {
+            self.actions.borrow_mut().push("io-release");
+            if self.fail {
+                Err(VmmError::IoQuiescence {
+                    message: "worker did not resume".into(),
+                    vcpus_may_resume: false,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct FakeVcpuRelease {
+        actions: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl FinalVcpuRelease for FakeVcpuRelease {
+        fn resume(self) -> Result<()> {
+            self.actions.borrow_mut().push("vcpu-resume");
+            Ok(())
+        }
+
+        fn keep_paused(self) {
+            self.actions.borrow_mut().push("vcpu-keep-paused");
+        }
+    }
 
     #[test]
     fn live_snapshot_config_default() {
@@ -843,5 +957,43 @@ mod tests {
 
         assert!(error.to_string().contains("resume failed"));
         assert_eq!(&*calls.borrow(), &[true, false]);
+    }
+
+    #[test]
+    fn final_stop_keeps_vcpus_paused_when_io_release_fails() {
+        let actions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let error = finish_final_stop(
+            Ok(()),
+            FakeIoRelease {
+                actions: std::rc::Rc::clone(&actions),
+                fail: true,
+            },
+            FakeVcpuRelease {
+                actions: std::rc::Rc::clone(&actions),
+            },
+        )
+        .expect_err("I/O release failure unexpectedly resumed the source");
+
+        assert!(error.to_string().contains("worker did not resume"));
+        assert_eq!(&*actions.borrow(), &["io-release", "vcpu-keep-paused"]);
+    }
+
+    #[test]
+    fn final_stop_restores_source_after_capture_failure_when_io_is_running() {
+        let actions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let error = finish_final_stop::<(), _, _>(
+            Err(VmmError::Snapshot("capture failed".into())),
+            FakeIoRelease {
+                actions: std::rc::Rc::clone(&actions),
+                fail: false,
+            },
+            FakeVcpuRelease {
+                actions: std::rc::Rc::clone(&actions),
+            },
+        )
+        .expect_err("capture failure unexpectedly succeeded");
+
+        assert!(error.to_string().contains("capture failed"));
+        assert_eq!(&*actions.borrow(), &["io-release", "vcpu-resume"]);
     }
 }
