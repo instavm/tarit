@@ -957,15 +957,29 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         for action, vm_id in required_actions:
             self.run_action(action, vm_id)
         deadline = time.monotonic() + self.args.duration_seconds
-        actions = [
-            self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
-            self.hibernate_resume, self.pause_resume, self.balloon,
-            self.concurrent_guest_work, self.contended_guest_agent_exec,
-        ]
+        action_by_name = {
+            "assert": self.assert_anchor,
+            "mutate": self.mutate,
+            "fork": self.fork_anchor,
+            "hibernate": self.hibernate_resume,
+            "pause": self.pause_resume,
+            "balloon": self.balloon,
+            "guest-work": self.concurrent_guest_work,
+            "contended-exec": self.contended_guest_agent_exec,
+            "snapshot": self.snapshot_restore,
+        }
+        if self.args.actions:
+            actions = [action_by_name[name] for name in self.args.actions]
+        else:
+            actions = [
+                self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
+                self.hibernate_resume, self.pause_resume, self.balloon,
+                self.concurrent_guest_work, self.contended_guest_agent_exec,
+            ]
         while time.monotonic() < deadline:
             vm_id = self.random.choice(list(self.anchors))
             available_actions = list(actions)
-            if self.snapshots < self.args.max_snapshots:
+            if not self.args.actions and self.snapshots < self.args.max_snapshots:
                 available_actions.append(self.snapshot_restore)
             action = self.random.choice(available_actions)
             self.run_action(action, vm_id)
@@ -998,6 +1012,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--anchors", type=int, default=3)
     parser.add_argument("--anchor-vcpus", default="1,2,4")
+    parser.add_argument(
+        "--actions",
+        help=(
+            "comma-separated loop actions: assert,mutate,fork,hibernate,pause,"
+            "balloon,guest-work,contended-exec,snapshot"
+        ),
+    )
     parser.add_argument("--hibernate-hold-seconds", type=int, default=0)
     parser.add_argument("--guest-timer-seconds", type=int, default=5)
     parser.add_argument("--sibling-fork-timer-seconds", type=int, default=0)
@@ -1021,6 +1042,17 @@ def parse_args() -> argparse.Namespace:
         parser.error("anchor vCPU counts must be comma-separated integers")
     if not args.anchor_vcpus or any(value < 1 or value > 8 for value in args.anchor_vcpus):
         parser.error("anchor vCPU counts must be between one and eight")
+    allowed_actions = {
+        "assert", "mutate", "fork", "hibernate", "pause", "balloon",
+        "guest-work", "contended-exec", "snapshot",
+    }
+    if args.actions:
+        args.actions = [value.strip() for value in args.actions.split(",") if value.strip()]
+        invalid_actions = sorted(set(args.actions) - allowed_actions)
+        if not args.actions or invalid_actions:
+            parser.error(f"unknown loop actions: {','.join(invalid_actions)}")
+    else:
+        args.actions = []
     if args.duration_seconds < 60 or args.anchors < 2 or args.anchors > args.max_vms - 2:
         parser.error("duration must be at least 60 seconds and anchors must leave two transient slots")
     if args.min_free_bytes < 0 or (args.min_free_bytes and not args.storage_path):
