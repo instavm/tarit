@@ -17,6 +17,8 @@ WORK_DIR=$(mktemp -d "$SOCKET_ROOT/tarit-restore-fail-closed.XXXXXX")
 SOCKET="$WORK_DIR/vmm.sock"
 LOG="$WORK_DIR/vmm.log"
 CORRUPT="$WORK_DIR/corrupt.snap"
+INCOMPATIBLE="$WORK_DIR/incompatible.snap"
+DOWNGRADED="$WORK_DIR/downgraded.snap"
 TEST_ROOTFS="$WORK_DIR/rootfs.ext4"
 RESTORE_ERROR="$WORK_DIR/restore-error.log"
 STATUS_ERROR="$WORK_DIR/status-error.log"
@@ -48,7 +50,10 @@ cleanup() {
     wait "$SERVE_PID" 2>/dev/null || true
   fi
   for artifact in "$SNAPSHOT" "$INTEGRITY" "$OVERLAY"; do
-    [[ -z "$artifact" ]] || rm -f -- "$artifact"
+    if [[ -n "$artifact" ]]; then
+      rm -f -- "$artifact"
+      rmdir -- "$(dirname "$artifact")" 2>/dev/null || true
+    fi
   done
   if (( status == 0 )); then
     find "$WORK_DIR" -depth -delete
@@ -225,6 +230,8 @@ OVERLAY=$(json_field overlay_path <<<"$snapshot_json")
 guest_exec 'set -eu; grep -qx strict-restore-proof /root/strict-restore-proof' >/dev/null
 verify_ap_progress source
 cp --reflink=auto --sparse=always -- "$SNAPSHOT" "$CORRUPT"
+cp --reflink=auto --sparse=always -- "$SNAPSHOT" "$INCOMPATIBLE"
+cp --reflink=auto --sparse=always -- "$SNAPSHOT" "$DOWNGRADED"
 
 # Preserve the VMSN envelope and memory image while replacing only the state
 # area. Recompute its CRC so the restore reaches runtime-state decoding instead
@@ -260,6 +267,96 @@ PY
 
 "$VMM_BIN" --socket "$SOCKET" stop >/dev/null
 
+# Change only the named CPU template inside the compatibility trailer and
+# recompute the state CRC. The state remains syntactically valid, so restore
+# must reject it as incompatible rather than as generic corruption.
+python3 - "$INCOMPATIBLE" <<'PY'
+import os
+import struct
+import sys
+import zlib
+
+path = sys.argv[1]
+with open(path, "r+b", buffering=0) as snapshot:
+    header = snapshot.read(32)
+    if len(header) != 32 or header[:4] != b"VMSN":
+        raise SystemExit("not a VMSN snapshot")
+    state_len = struct.unpack_from("<Q", header, 8)[0]
+    if not 1 <= state_len <= 16 * 1024 * 1024:
+        raise SystemExit(f"unsafe state length: {state_len}")
+    state = bytearray(snapshot.read(state_len))
+    trailer = state.find(b"TRTCMP01")
+    if trailer < 0:
+        raise SystemExit("snapshot has no compatibility trailer")
+    template = state.find(b"bare", trailer)
+    if template < 0:
+        raise SystemExit("compatibility trailer has no bare template")
+    state[template:template + 4] = b"fake"
+    snapshot.seek(32)
+    snapshot.write(state)
+    snapshot.seek(16)
+    snapshot.write(struct.pack("<I", zlib.crc32(state) & 0xFFFFFFFF))
+    snapshot.flush()
+    os.fsync(snapshot.fileno())
+PY
+
+if timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
+  --snapshot "$INCOMPATIBLE" --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
+  echo "incompatible CPU template unexpectedly restored" >&2
+  exit 1
+fi
+grep -q 'incompatible snapshot CPU template' "$RESTORE_ERROR"
+if "$VMM_BIN" --socket "$SOCKET" status >"$STATUS_ERROR" 2>&1; then
+  echo "incompatible restore published a VM slot" >&2
+  exit 1
+fi
+grep -q 'no VM' "$STATUS_ERROR"
+
+# Removing the compatibility trailer from a version-2 envelope is a downgrade,
+# not a legacy snapshot. Zero the trailer while preserving the state length and
+# a valid CRC; restore must still fail before VM publication.
+python3 - "$DOWNGRADED" <<'PY'
+import os
+import struct
+import sys
+import zlib
+
+path = sys.argv[1]
+with open(path, "r+b", buffering=0) as snapshot:
+    header = snapshot.read(32)
+    if len(header) != 32 or header[:4] != b"VMSN":
+        raise SystemExit("not a VMSN snapshot")
+    version = struct.unpack_from("<H", header, 4)[0]
+    if version != 2:
+        raise SystemExit(f"downgrade gate requires VMSN version 2, got {version}")
+    state_len = struct.unpack_from("<Q", header, 8)[0]
+    if not 1 <= state_len <= 16 * 1024 * 1024:
+        raise SystemExit(f"unsafe state length: {state_len}")
+    state = bytearray(snapshot.read(state_len))
+    trailer = state.find(b"TRTCMP01")
+    if trailer < 0:
+        raise SystemExit("snapshot has no compatibility trailer")
+    state[trailer:] = b"\0" * (len(state) - trailer)
+    snapshot.seek(32)
+    snapshot.write(state)
+    snapshot.seek(16)
+    snapshot.write(struct.pack("<I", zlib.crc32(state) & 0xFFFFFFFF))
+    snapshot.flush()
+    os.fsync(snapshot.fileno())
+PY
+
+if timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
+  --snapshot "$DOWNGRADED" --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
+  echo "compatibility-manifest downgrade unexpectedly restored" >&2
+  exit 1
+fi
+grep -q 'snapshot compatibility manifest is missing' "$RESTORE_ERROR"
+if "$VMM_BIN" --socket "$SOCKET" status >"$STATUS_ERROR" 2>&1; then
+  echo "downgraded restore published a VM slot" >&2
+  exit 1
+fi
+grep -q 'no VM' "$STATUS_ERROR"
+
 if timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
   --snapshot "$CORRUPT" --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
   echo "malformed runtime state unexpectedly restored" >&2
@@ -287,4 +384,4 @@ if grep -Eiq 'panicked at|thread .* panicked|kernel panic|BUG: unable to handle'
   exit 1
 fi
 
-echo "RESTORE_FAIL_CLOSED_E2E_PASS malformed_state=rejected vm_published=no valid_lazy_restore=passed nested_virtualization=hidden vcpus=$VCPUS live_snapshot=$LIVE_SNAPSHOT"
+echo "RESTORE_FAIL_CLOSED_E2E_PASS malformed_state=rejected incompatible_template=rejected manifest_downgrade=rejected vm_published=no valid_lazy_restore=passed nested_virtualization=hidden vcpus=$VCPUS live_snapshot=$LIVE_SNAPSHOT"

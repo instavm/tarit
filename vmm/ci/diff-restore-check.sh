@@ -4,11 +4,13 @@ set -Eeuo pipefail
 
 REPO_VMM="$(cd "$(dirname "$0")/.." && pwd)"
 VMM="${VMM:-$REPO_VMM/target/debug/vmm}"
+RESTORE_VMM="${RESTORE_VMM:-$VMM}"
 KERNEL="${KERNEL:-/tmp/vmlinux.microvm}"
 AGENT="${AGENT:-$REPO_VMM/guest/agent/vmm-agent}"
 BAKE_AGENT="${BAKE_AGENT:-$REPO_VMM/guest/agent/bake-agent.sh}"
 ROOTFS_SOURCE="${ROOTFS_SOURCE:-/tmp/vsock-rootfs.ext4}"
 TEST_ROOT="${TARIT_TEST_ROOT:-${TMPDIR:-/tmp}}"
+HOST_SWAP_PRESSURE_MIB=${HOST_SWAP_PRESSURE_MIB:-0}
 
 for required in python3 e2fsck sha256sum stat dd od tr; do
   command -v "$required" >/dev/null || {
@@ -18,6 +20,10 @@ for required in python3 e2fsck sha256sum stat dd od tr; do
 done
 test "$(id -u)" -eq 0 || { echo "FAIL: this gate must run as root" >&2; exit 1; }
 test -x "$VMM" || { echo "FAIL: VMM is not executable: $VMM" >&2; exit 1; }
+test -x "$RESTORE_VMM" || {
+  echo "FAIL: restore VMM is not executable: $RESTORE_VMM" >&2
+  exit 1
+}
 test -f "$KERNEL" || { echo "FAIL: kernel not found: $KERNEL" >&2; exit 1; }
 test -x "$AGENT" || { echo "FAIL: guest agent is not executable: $AGENT" >&2; exit 1; }
 test -f "$ROOTFS_SOURCE" || { echo "FAIL: rootfs not found: $ROOTFS_SOURCE" >&2; exit 1; }
@@ -35,6 +41,7 @@ L3="$TEST_DIR/alias-restore.log"
 P1=
 P2=
 P3=
+PRESSURE_PID=
 SNAP_FIRST=
 SNAP_DIFF=
 SNAP_FROM_ALIAS=
@@ -82,6 +89,10 @@ stop_server() {
 }
 
 cleanup() {
+  if [[ -n "$PRESSURE_PID" ]]; then
+    kill "$PRESSURE_PID" >/dev/null 2>&1 || true
+    wait "$PRESSURE_PID" >/dev/null 2>&1 || true
+  fi
   stop_server "$S1" "$P1"
   stop_server "$S2" "$P2"
   stop_server "$S3" "$P3"
@@ -110,6 +121,72 @@ on_error() {
   exit "$status"
 }
 trap on_error ERR
+
+[[ "$HOST_SWAP_PRESSURE_MIB" =~ ^[0-9]+$ ]] || {
+  echo "FAIL: HOST_SWAP_PRESSURE_MIB must be a non-negative integer" >&2
+  exit 1
+}
+
+pressure_vmm_into_swap() {
+  local vmm_pid=$1 pressure_mib=$2
+  local ready="$TEST_DIR/pressure.ready" swap_kib=0 large_mapping_swap_kib=0
+  ((pressure_mib > 0)) || return 0
+  if ! swapon --noheadings --show=NAME | grep -q .; then
+    echo "FAIL: HOST_SWAP_PRESSURE_MIB requires active host swap" >&2
+    return 1
+  fi
+  python3 - "$pressure_mib" "$ready" <<'PY' &
+import mmap
+import pathlib
+import sys
+import time
+
+size = int(sys.argv[1]) * 1024 * 1024
+memory = mmap.mmap(-1, size)
+for offset in range(0, size, 4096):
+    memory[offset] = 1
+pathlib.Path(sys.argv[2]).write_text("ready\n")
+time.sleep(300)
+PY
+  PRESSURE_PID=$!
+  for _ in $(seq 1 180); do
+    kill -0 "$PRESSURE_PID" 2>/dev/null || {
+      echo "FAIL: host pressure process exited before swap was observed" >&2
+      return 1
+    }
+    if [[ -s "$ready" ]]; then
+      swap_kib=$(awk '/^Swap:/ { total += $2 } END { print total + 0 }' "/proc/$vmm_pid/smaps")
+      large_mapping_swap_kib=$(awk '
+        /^[0-9a-f]+-[0-9a-f]+ / {
+          if (size_kib >= 262144) total += swap_kib
+          size_kib = 0
+          swap_kib = 0
+        }
+        /^Size:/ { size_kib = $2 }
+        /^Swap:/ { swap_kib = $2 }
+        END {
+          if (size_kib >= 262144) total += swap_kib
+          print total + 0
+        }
+      ' "/proc/$vmm_pid/smaps")
+      if ((large_mapping_swap_kib > 0)); then
+        echo "SWAP_OBSERVED vmm_pid=$vmm_pid swap_kib=$swap_kib large_mapping_swap_kib=$large_mapping_swap_kib pressure_mib=$pressure_mib"
+        return 0
+      fi
+    fi
+    sleep 0.5
+  done
+  echo "FAIL: VMM pages did not enter swap under ${pressure_mib}MiB host pressure" >&2
+  return 1
+}
+
+release_host_pressure() {
+  if [[ -n "$PRESSURE_PID" ]]; then
+    kill "$PRESSURE_PID" >/dev/null 2>&1 || true
+    wait "$PRESSURE_PID" >/dev/null 2>&1 || true
+    PRESSURE_PID=
+  fi
+}
 
 guest_stdout() {
   local socket=$1 command=$2 response payload
@@ -154,8 +231,8 @@ PY
 }
 
 start_server() {
-  local socket=$1 log=$2 pid_var=$3
-  RUST_LOG=info "$VMM" serve --socket "$socket" >"$log" 2>&1 &
+  local socket=$1 log=$2 pid_var=$3 binary=${4:-$VMM}
+  RUST_LOG=info "$binary" serve --socket "$socket" >"$log" 2>&1 &
   printf -v "$pid_var" '%s' "$!"
   for _ in $(seq 1 40); do
     [[ -S "$socket" ]] && return 0
@@ -200,15 +277,18 @@ INPUT_ALIAS="$(dirname "$SNAP_FIRST")/.$(basename "$SNAP_FIRST").alias-${BASHPID
 ln -- "$SNAP_FIRST" "$INPUT_ALIAS"
 [[ "$(stat -Lc '%d:%i' "$INPUT_ALIAS")" == "$FIRST_ID" ]]
 
+pressure_vmm_into_swap "$P1" "$HOST_SWAP_PRESSURE_MIB"
+
 guest_stdout "$S1" 'dd if=/dev/urandom of=/run/ramcheck/G bs=1M count=32 2>/dev/null; sync'
 SHA_G=$(guest_stdout "$S1" 'sha256sum /run/ramcheck/G | cut -c1-64')
 SNAP_DIFF=$(take_snapshot "$S1" --diff)
 [[ "$(snapshot_kind "$SNAP_DIFF")" == "VMSD:0" ]]
+release_host_pressure
 
 stop_server "$S1" "$P1"
 P1=
 
-start_server "$S2" "$L2" P2
+start_server "$S2" "$L2" P2 "$RESTORE_VMM"
 RESTORE_DIFF=$(python3 - "$SNAP_DIFF" <<'PY'
 import json, sys
 print(json.dumps({"op":"restore","snapshot_path":sys.argv[1]}))
@@ -226,7 +306,7 @@ P2=
 
 # Restore through a hardlink spelling of the full input, then take another full
 # snapshot. The output must be a new inode and the loaded source must not change.
-start_server "$S3" "$L3" P3
+start_server "$S3" "$L3" P3 "$RESTORE_VMM"
 RESTORE_ALIAS=$(python3 - "$INPUT_ALIAS" <<'PY'
 import json, sys
 print(json.dumps({"op":"restore","snapshot_path":sys.argv[1]}))
@@ -253,3 +333,9 @@ fi
 echo "FIRST_DIFF_FULL_PASS path=$SNAP_FIRST identity=$FIRST_ID"
 echo "DIFF_CHAIN_RESTORE_PASS full_sha=$SHA_F diff_sha=$SHA_G"
 echo "SNAPSHOT_ALIAS_ISOLATION_PASS input=$INPUT_ALIAS output=$SNAP_FROM_ALIAS"
+if [[ "$RESTORE_VMM" != "$VMM" ]]; then
+  echo "CROSS_BUILD_RESTORE_PASS source_vmm=$VMM restore_vmm=$RESTORE_VMM"
+fi
+if ((HOST_SWAP_PRESSURE_MIB > 0)); then
+  echo "SWAP_DIFF_RESTORE_PASS pressure_mib=$HOST_SWAP_PRESSURE_MIB"
+fi

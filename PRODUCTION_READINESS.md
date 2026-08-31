@@ -153,9 +153,12 @@ regression gates, but the following unresolved items now block release:
 3. Qualify shared/cloud volume durability and failure recovery, including NFS
    server loss/restart with protected transport and object-store interruption,
    rather than extrapolating from local-block tests.
-4. Complete the cross-build/CPU-template rejection matrix, multi-hour hibernation and
-   ownership-lease qualification, and record 100-sample fork/snapshot/restore
-   latency distributions on a larger reflink-capable fixture.
+4. Complete the incompatible cross-build matrix, multi-hour hibernation and
+   ownership-lease qualification, and record 100-sample
+   fork/snapshot/restore latency distributions on a larger reflink-capable
+   fixture. A version-1 binary to version-2 candidate restore passes on Ubuntu
+   and Alpine with Linux 6.6 and 5.10, as does the checksum-valid CPU-template
+   rejection matrix.
 5. Run the full protected release workflow from an immutable source revision
    and retain its binaries, hashes, configuration, logs, and cleanup audit.
 

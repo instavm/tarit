@@ -1440,6 +1440,7 @@ impl VmmController {
         let RestoredSnapshot {
             mem,
             state_blob,
+            snapshot_version,
             lazy_restore,
         } = restored;
         let mem_len = usize::try_from(mem.size_bytes)
@@ -1448,9 +1449,11 @@ impl VmmController {
         // Deserialize the state blob (shared owned `StateBlob`) to recover the
         // kernel path/cmdline/vcpus, the attached volumes/net, and any captured
         // vCPU state for a faithful resume.
-        let (mut saved, balloon_state) = decode_state_blob(&state_blob).ok_or_else(|| {
-            VmmError::Snapshot("snapshot state blob is malformed or unsupported".into())
-        })?;
+        let (mut saved, balloon_state, compatibility) =
+            decode_state_blob(&state_blob).ok_or_else(|| {
+                VmmError::Snapshot("snapshot state blob is malformed or unsupported".into())
+            })?;
+        validate_snapshot_compatibility(snapshot_version, compatibility.as_ref())?;
 
         let (kernel_path, cmdline, vcpus, volumes, net) = (
             saved.kernel_path.clone(),
@@ -2566,9 +2569,13 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Vec<u
     let vsock_state = vmm_devices::persist::Persist::try_save(&*vsock_pump.device)
         .map_err(|error| VmmError::Snapshot(format!("capture virtio-vsock state: {error}")))?;
 
-    let (mut b, _previous_balloon) = decode_state_blob(existing).ok_or_else(|| {
-        VmmError::Snapshot("running VM base state blob is malformed or unsupported".into())
-    })?;
+    let (mut b, _previous_balloon, compatibility) =
+        decode_state_blob(existing).ok_or_else(|| {
+            VmmError::Snapshot("running VM base state blob is malformed or unsupported".into())
+        })?;
+    if let Some(compatibility) = compatibility {
+        compatibility.validate()?;
+    }
     b.vcpu_full = Some(captured);
     b.vcpu_full_aps = ap_captured;
     b.vm_full = Some(vm_state);
@@ -3477,7 +3484,6 @@ fn write_scratch_snapshot_file_from_memory_file(
     use std::os::fd::AsRawFd;
 
     const MAGIC: &[u8; 4] = b"VMSN";
-    const VERSION: u16 = 1;
     const MEM_CRC_OFFSET: u64 = 28;
     const COPY_BUFFER_BYTES: usize = 4 * 1024 * 1024;
     const WRITEBACK_INTERVAL: u64 = 32 * 1024 * 1024;
@@ -3538,7 +3544,7 @@ fn write_scratch_snapshot_file_from_memory_file(
         .map_err(|error| VmmError::Snapshot(format!("seek snapshot output: {error}")))?;
     output
         .write_all(MAGIC)
-        .and_then(|()| output.write_all(&VERSION.to_le_bytes()))
+        .and_then(|()| output.write_all(&SNAPSHOT_VERSION.to_le_bytes()))
         .and_then(|()| output.write_all(&flags.to_le_bytes()))
         .and_then(|()| output.write_all(&padded_state_len.to_le_bytes()))
         .and_then(|()| output.write_all(&state_crc.to_le_bytes()))
@@ -3632,7 +3638,7 @@ fn write_scratch_snapshot_file_from_memory_file(
         .ok_or_else(|| VmmError::Snapshot("snapshot metadata length overflow".into()))?;
     let mut metadata = Vec::with_capacity(metadata_capacity);
     metadata.extend_from_slice(MAGIC);
-    metadata.extend_from_slice(&VERSION.to_le_bytes());
+    metadata.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
     metadata.extend_from_slice(&flags.to_le_bytes());
     metadata.extend_from_slice(&padded_state_len.to_le_bytes());
     metadata.extend_from_slice(&state_crc.to_le_bytes());
@@ -3714,7 +3720,6 @@ fn write_snapshot_to_file(
 ) -> Result<()> {
     use std::io::Write;
     const MAGIC: &[u8; 4] = b"VMSN";
-    const VERSION: u16 = 1;
 
     let state_crc = crc32fast::hash(state_blob);
     let mem_crc = crc32fast::hash(mem_dump);
@@ -3726,7 +3731,7 @@ fn write_snapshot_to_file(
 
     file.write_all(MAGIC)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&VERSION.to_le_bytes())
+    file.write_all(&SNAPSHOT_VERSION.to_le_bytes())
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.write_all(&flags.to_le_bytes())
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
@@ -3806,7 +3811,6 @@ fn write_diff_snapshot_to_file(
     use std::io::Write;
     use vmm_snapshot::diff::build_diff;
     const MAGIC: &[u8; 4] = b"VMSD";
-    const VERSION: u16 = 1;
 
     let diff = build_diff(mem, dirty, Vec::new());
     let mut wr = |b: &[u8]| -> Result<()> {
@@ -3814,7 +3818,7 @@ fn write_diff_snapshot_to_file(
             .map_err(|e| VmmError::Snapshot(e.to_string()))
     };
     wr(MAGIC)?;
-    wr(&VERSION.to_le_bytes())?;
+    wr(&SNAPSHOT_VERSION.to_le_bytes())?;
     let pbytes = parent.as_bytes();
     let parent_len = u32::try_from(pbytes.len())
         .map_err(|_| VmmError::Snapshot("parent path too long".into()))?;
@@ -3859,8 +3863,16 @@ const FULL_SNAPSHOT_REST_HEADER_LEN: usize = 28;
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
 const FULL_SNAPSHOT_DIFF_FLAG: u16 = 1;
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-const SNAPSHOT_VERSION: u16 = 1;
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+const LEGACY_SNAPSHOT_VERSION: u16 = 1;
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+const SNAPSHOT_VERSION: u16 = 2;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const MAX_SNAPSHOT_STATE_BYTES: u64 = 64 * 1024 * 1024;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -3954,6 +3966,7 @@ struct FullSnapshotLayout {
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FullSnapshotHeader {
+    version: u16,
     flags: u16,
     layout: FullSnapshotLayout,
     state_crc: u32,
@@ -3998,7 +4011,7 @@ fn parse_full_snapshot_header(
     path: &str,
 ) -> Result<FullSnapshotHeader> {
     let version = u16::from_le_bytes(hdr[0..2].try_into().expect("VMSN version field is 2 bytes"));
-    if version != SNAPSHOT_VERSION {
+    if !matches!(version, LEGACY_SNAPSHOT_VERSION | SNAPSHOT_VERSION) {
         return Err(VmmError::Snapshot(format!(
             "unsupported VMSN version {version} in {path}"
         )));
@@ -4049,6 +4062,7 @@ fn parse_full_snapshot_header(
         )));
     }
     Ok(FullSnapshotHeader {
+        version,
         flags,
         layout,
         state_crc,
@@ -4247,15 +4261,17 @@ fn constant_time_ascii_eq(left: &[u8], right: &[u8]) -> bool {
 struct RestoredSnapshot {
     mem: vmm_memory_backend::GuestMemory,
     state_blob: Vec<u8>,
+    snapshot_version: u16,
     lazy_restore: Option<vmm_memory_backend::LazyRestore>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn eager_restore_snapshot(path: &str) -> Result<RestoredSnapshot> {
-    let (mem, state_blob) = load_snapshot_chain(path)?;
+    let (mem, state_blob, snapshot_version) = load_snapshot_chain(path)?;
     Ok(RestoredSnapshot {
         mem,
         state_blob,
+        snapshot_version,
         lazy_restore: None,
     })
 }
@@ -4401,6 +4417,7 @@ fn try_lazy_restore_full_snapshot(
     Ok(Some(RestoredSnapshot {
         mem,
         state_blob,
+        snapshot_version: header.version,
         lazy_restore: Some(lazy_restore),
     }))
 }
@@ -4411,10 +4428,12 @@ enum SnapshotContent {
     Full {
         mem: vmm_memory_backend::GuestMemory,
         state: Vec<u8>,
+        version: u16,
     },
     Diff {
         parent: PathBuf,
         state: Vec<u8>,
+        version: u16,
         pages: Vec<(u64, Vec<u8>)>,
     },
 }
@@ -4550,12 +4569,16 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
         file.seek(SeekFrom::Start(layout.mem_offset))
             .map_err(|e| VmmError::Snapshot(format!("seek mem in {path_display}: {e}")))?;
         rd(&mut file, mem_slice, "read mem")?;
-        Ok(SnapshotContent::Full { mem, state })
+        Ok(SnapshotContent::Full {
+            mem,
+            state,
+            version: header.version,
+        })
     } else if &magic == b"VMSD" {
         let mut u16b = [0u8; 2];
         rd(&mut file, &mut u16b, "read version")?;
         let version = u16::from_le_bytes(u16b);
-        if version != SNAPSHOT_VERSION {
+        if !matches!(version, LEGACY_SNAPSHOT_VERSION | SNAPSHOT_VERSION) {
             return Err(VmmError::Snapshot(format!(
                 "unsupported VMSD version {version} in {path_display}"
             )));
@@ -4670,6 +4693,7 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
         Ok(SnapshotContent::Diff {
             parent,
             state,
+            version,
             pages,
         })
     } else {
@@ -4683,16 +4707,16 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
 /// the tip snapshot's state blob (so restore uses the checkpoint's vCPU state).
 /// Iterative (not recursive) so a chain of hundreds of diffs can't overflow.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>)> {
+fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>, u16)> {
     // Follow the chain tip→base, collecting each diff's (state, pages).
     type DiffPages = Vec<(u64, Vec<u8>)>;
-    type DiffChain = Vec<(Vec<u8>, DiffPages)>;
+    type DiffChain = Vec<(u16, Vec<u8>, DiffPages)>;
 
     let mut diffs: DiffChain = Vec::new();
     let mut chain_page_bytes = 0u64;
     let (mut cur, snapshot_root) = canonical_snapshot_tip(path)?;
     let mut seen = std::collections::HashSet::new();
-    let (mem, base_state) = loop {
+    let (mem, base_state, base_version) = loop {
         if seen.len() >= MAX_DIFF_CHAIN_DEPTH {
             return Err(VmmError::Snapshot("snapshot chain too deep".into()));
         }
@@ -4700,22 +4724,30 @@ fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, V
             return Err(VmmError::Snapshot("snapshot chain cycle".into()));
         }
         match read_snapshot(&cur, &snapshot_root)? {
-            SnapshotContent::Full { mem, state } => break (mem, state),
+            SnapshotContent::Full {
+                mem,
+                state,
+                version,
+            } => break (mem, state, version),
             SnapshotContent::Diff {
                 parent,
                 state,
+                version,
                 pages,
             } => {
                 for (_, bytes) in &pages {
                     chain_page_bytes = validate_diff_payload_budget(chain_page_bytes, bytes.len())?;
                 }
-                diffs.push((state, pages));
+                diffs.push((version, state, pages));
                 cur = parent;
             }
         }
     };
     // The tip is the first diff collected (or the base if no diffs).
-    let tip_state = diffs.first().map(|(s, _)| s.clone()).unwrap_or(base_state);
+    let (tip_version, tip_state) = diffs
+        .first()
+        .map(|(version, state, _)| (*version, state.clone()))
+        .unwrap_or((base_version, base_state));
     // Apply diffs base→tip = reverse of the tip→base collection order.
     let mem_bytes = usize::try_from(mem.size_bytes)
         .map_err(|_| VmmError::Memory("restored memory too large".into()))?;
@@ -4723,7 +4755,7 @@ fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, V
         // SAFETY: `mem` is owned here and sized `mem_bytes`; we only write in-range.
         unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_bytes) }
     };
-    for (_, pages) in diffs.iter().rev() {
+    for (_, _, pages) in diffs.iter().rev() {
         for (gpa, bytes) in pages {
             validate_diff_page_range(*gpa, bytes.len(), mem_bytes)?;
             let start = usize::try_from(*gpa)
@@ -4732,7 +4764,7 @@ fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, V
             mem_slice[start..end].copy_from_slice(bytes);
         }
     }
-    Ok((mem, tip_state))
+    Ok((mem, tip_state, tip_version))
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -4871,37 +4903,148 @@ fn validate_restored_runtime_shape(
 const BALLOON_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTBLN01";
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const COMPATIBILITY_TRAILER_MAGIC: &[u8; 8] = b"TRTCMP01";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const SNAPSHOT_STATE_ABI: u16 = 1;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const DEVICE_MODEL_ABI: u16 = 1;
+
+/// Compatibility boundary for state that is meaningful only to a matching
+/// VMM implementation. The outer file version protects framing; these fields
+/// protect the KVM/device state carried inside that framing.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SnapshotCompatibility {
+    state_abi: u16,
+    device_model_abi: u16,
+    architecture: String,
+    cpu_template: String,
+    cpu_template_digest: String,
+    writer_version: String,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+impl SnapshotCompatibility {
+    fn current() -> std::result::Result<Self, postcard::Error> {
+        use sha2::{Digest as _, Sha256};
+
+        let template = crate::cpu_template::CpuTemplate::bare();
+        let encoded = postcard::to_allocvec(&template)?;
+        Ok(Self {
+            state_abi: SNAPSHOT_STATE_ABI,
+            device_model_abi: DEVICE_MODEL_ABI,
+            architecture: std::env::consts::ARCH.into(),
+            cpu_template: template.name,
+            cpu_template_digest: format!("sha256:{:x}", Sha256::digest(encoded)),
+            writer_version: env!("CARGO_PKG_VERSION").into(),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        let current = Self::current().map_err(|error| {
+            VmmError::Snapshot(format!("compute snapshot compatibility: {error}"))
+        })?;
+        if self.state_abi != current.state_abi {
+            return Err(VmmError::Snapshot(format!(
+                "incompatible snapshot state ABI: snapshot={}, VMM={}",
+                self.state_abi, current.state_abi
+            )));
+        }
+        if self.device_model_abi != current.device_model_abi {
+            return Err(VmmError::Snapshot(format!(
+                "incompatible snapshot device-model ABI: snapshot={}, VMM={}",
+                self.device_model_abi, current.device_model_abi
+            )));
+        }
+        if self.architecture != current.architecture {
+            return Err(VmmError::Snapshot(format!(
+                "incompatible snapshot architecture: snapshot={}, VMM={}",
+                self.architecture, current.architecture
+            )));
+        }
+        if self.cpu_template != current.cpu_template
+            || self.cpu_template_digest != current.cpu_template_digest
+        {
+            return Err(VmmError::Snapshot(format!(
+                "incompatible snapshot CPU template: snapshot={} ({}), VMM={} ({})",
+                self.cpu_template,
+                self.cpu_template_digest,
+                current.cpu_template,
+                current.cpu_template_digest
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn validate_snapshot_compatibility(
+    snapshot_version: u16,
+    compatibility: Option<&SnapshotCompatibility>,
+) -> Result<()> {
+    if let Some(compatibility) = compatibility {
+        return compatibility.validate();
+    }
+    if snapshot_version >= SNAPSHOT_VERSION {
+        return Err(VmmError::Snapshot(
+            "snapshot compatibility manifest is missing".into(),
+        ));
+    }
+    log::warn!("restore: accepting a legacy snapshot without an internal compatibility manifest");
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn decode_trailer<'a, T: serde::de::DeserializeOwned>(
+    trailing: &'a [u8],
+    magic: &[u8; 8],
+) -> Option<(T, &'a [u8])> {
+    if trailing.len() < magic.len() + 4 || &trailing[..magic.len()] != magic {
+        return None;
+    }
+    let length_offset = magic.len();
+    let payload_len =
+        u32::from_le_bytes(trailing[length_offset..length_offset + 4].try_into().ok()?) as usize;
+    let payload_start = length_offset + 4;
+    let payload_end = payload_start.checked_add(payload_len)?;
+    let payload = trailing.get(payload_start..payload_end)?;
+    Some((
+        postcard::from_bytes(payload).ok()?,
+        trailing.get(payload_end..)?,
+    ))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn decode_state_blob(
     bytes: &[u8],
 ) -> Option<(
     StateBlob,
     Option<vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
+    Option<SnapshotCompatibility>,
 )> {
-    let (blob, trailing) = postcard::take_from_bytes::<StateBlob>(bytes).ok()?;
+    let (blob, mut trailing) = postcard::take_from_bytes::<StateBlob>(bytes).ok()?;
     // Full live snapshots may pad the state area with zeroes so the following
     // RAM extent is block-aligned and can be range-reflinked from the pre-copy
     // stage. Zero padding is semantically empty and covered by the state CRC.
     if trailing.iter().all(|byte| *byte == 0) {
-        return Some((blob, None));
+        return Some((blob, None, None));
     }
-    if trailing.len() < BALLOON_STATE_TRAILER_MAGIC.len() + 4
-        || &trailing[..BALLOON_STATE_TRAILER_MAGIC.len()] != BALLOON_STATE_TRAILER_MAGIC
-    {
-        return None;
+    let mut balloon = None;
+    if trailing.starts_with(BALLOON_STATE_TRAILER_MAGIC) {
+        let (decoded, remaining) = decode_trailer(trailing, BALLOON_STATE_TRAILER_MAGIC)?;
+        balloon = Some(decoded);
+        trailing = remaining;
     }
-    let length_offset = BALLOON_STATE_TRAILER_MAGIC.len();
-    let payload_len =
-        u32::from_le_bytes(trailing[length_offset..length_offset + 4].try_into().ok()?) as usize;
-    let payload_and_padding = trailing.get(length_offset + 4..)?;
-    let payload = payload_and_padding.get(..payload_len)?;
-    if !payload_and_padding[payload_len..]
+    let mut compatibility = None;
+    if trailing.starts_with(COMPATIBILITY_TRAILER_MAGIC) {
+        let (decoded, remaining) = decode_trailer(trailing, COMPATIBILITY_TRAILER_MAGIC)?;
+        compatibility = Some(decoded);
+        trailing = remaining;
+    }
+    trailing
         .iter()
         .all(|byte| *byte == 0)
-    {
-        return None;
-    }
-    let balloon = postcard::from_bytes(payload).ok()?;
-    Some((blob, Some(balloon)))
+        .then_some((blob, balloon, compatibility))
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -4918,6 +5061,12 @@ fn encode_state_blob(
         bytes.extend_from_slice(&payload_len.to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
+    let compatibility = postcard::to_allocvec(&SnapshotCompatibility::current()?)?;
+    let compatibility_len =
+        u32::try_from(compatibility.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
+    bytes.extend_from_slice(COMPATIBILITY_TRAILER_MAGIC);
+    bytes.extend_from_slice(&compatibility_len.to_le_bytes());
+    bytes.extend_from_slice(&compatibility);
     Ok(bytes)
 }
 
@@ -6389,21 +6538,63 @@ mod tests {
             vsock: None,
         })
         .unwrap();
-        let (decoded, balloon) = decode_state_blob(&bytes).unwrap();
+        let (decoded, balloon, compatibility) = decode_state_blob(&bytes).unwrap();
         assert_eq!(decoded.kernel_path, "kernel");
         assert!(balloon.is_none());
+        assert!(compatibility.is_none());
         let mut zero_padded = bytes.clone();
         zero_padded.resize(4096, 0);
-        let (decoded_padded, padded_balloon) = decode_state_blob(&zero_padded).unwrap();
+        let (decoded_padded, padded_balloon, padded_compatibility) =
+            decode_state_blob(&zero_padded).unwrap();
         assert_eq!(decoded_padded.kernel_path, "kernel");
         assert!(padded_balloon.is_none());
+        assert!(padded_compatibility.is_none());
 
         let balloon_state = vmm_devices::virtio::balloon::VirtioBalloonMmioState::default();
         let mut encoded = encode_state_blob(&decoded, Some(&balloon_state)).unwrap();
         encoded.resize(4096, 0);
-        let (decoded_with_trailer, decoded_balloon) = decode_state_blob(&encoded).unwrap();
+        let (decoded_with_trailer, decoded_balloon, decoded_compatibility) =
+            decode_state_blob(&encoded).unwrap();
         assert_eq!(decoded_with_trailer.kernel_path, "kernel");
         assert_eq!(decoded_balloon, Some(balloon_state));
+        decoded_compatibility.unwrap().validate().unwrap();
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_compatibility_rejects_build_and_template_boundaries() {
+        let current = SnapshotCompatibility::current().unwrap();
+        current.validate().unwrap();
+
+        let mut incompatible_state = current.clone();
+        incompatible_state.state_abi += 1;
+        assert!(incompatible_state
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("state ABI"));
+
+        let mut incompatible_devices = current.clone();
+        incompatible_devices.device_model_abi += 1;
+        assert!(incompatible_devices
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("device-model ABI"));
+
+        let mut incompatible_template = current;
+        incompatible_template.cpu_template = "different-template".into();
+        assert!(incompatible_template
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("CPU template"));
+
+        validate_snapshot_compatibility(LEGACY_SNAPSHOT_VERSION, None).unwrap();
+        assert!(validate_snapshot_compatibility(SNAPSHOT_VERSION, None)
+            .unwrap_err()
+            .to_string()
+            .contains("manifest is missing"));
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -6489,8 +6680,9 @@ mod tests {
 
         // Restoring the tip (diff 2) must reproduce base+diff1+diff2 byte-for-byte
         // and yield the tip's state blob.
-        let (gm, state) = load_snapshot_chain(d2_s).unwrap();
+        let (gm, state, version) = load_snapshot_chain(d2_s).unwrap();
         assert_eq!(state, b"state2");
+        assert_eq!(version, SNAPSHOT_VERSION);
         let gm_len = usize::try_from(gm.size_bytes).expect("test memory size fits usize");
         // SAFETY: `gm` owns `gm_len` bytes for the duration of this assertion.
         let recon: &[u8] = unsafe { std::slice::from_raw_parts(gm.as_ptr(), gm_len) };
@@ -6499,8 +6691,9 @@ mod tests {
         assert_eq!(&recon[8192..12288], &[0xCC; 4096][..], "page 2 from diff2");
 
         // Restoring an intermediate checkpoint (diff 1) reproduces only up to it.
-        let (gm1, state1) = load_snapshot_chain(d1_s).unwrap();
+        let (gm1, state1, version1) = load_snapshot_chain(d1_s).unwrap();
         assert_eq!(state1, b"state1");
+        assert_eq!(version1, SNAPSHOT_VERSION);
         let gm1_len = usize::try_from(gm1.size_bytes).expect("test memory size fits usize");
         // SAFETY: `gm1` owns `gm1_len` bytes for the duration of this assertion.
         let recon1: &[u8] = unsafe { std::slice::from_raw_parts(gm1.as_ptr(), gm1_len) };

@@ -20,6 +20,9 @@ versions may contain breaking changes.
   between long-lived lifecycle epochs.
 - Cross-node fork operations now persist the target daemon boot session and
   reuse an exact child-bound private artifact across interrupted retries.
+- Version-2 snapshot state now records the state ABI, device-model ABI,
+  architecture, CPU-template identity, and writer version for pre-KVM
+  compatibility checks; version 1 remains the explicit legacy format.
 
 ### Changed
 
@@ -43,6 +46,8 @@ versions may contain breaking changes.
 - Clone-generation qualification now injects the exact candidate guest agent
   into a private OCI rootfs copy, supports minimal images without Python, and
   places large scratch artifacts on a configurable test volume.
+- Differential restore qualification can use separate source and restore VMM
+  binaries to verify rolling snapshot-format upgrades.
 
 ### Fixed
 
@@ -79,6 +84,10 @@ versions may contain breaking changes.
 - Incremental snapshot qualification now proves full-snapshot fallback for the
   first diff request, restores a real parent/diff RAM chain, and verifies that
   a hardlink-spelled input is neither mutated nor reused as snapshot output.
+- Snapshot restore rejects a checksum-valid incompatible CPU template or
+  removed-manifest downgrade before publishing a VM. Differential restore
+  qualification can also force guest-sized VMM mappings into host swap and
+  verify pre-parent and post-parent RAM contents.
 
 ## [0.1.2] - 2026-08-07
 

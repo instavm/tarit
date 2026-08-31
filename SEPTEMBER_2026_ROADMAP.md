@@ -857,8 +857,23 @@ passing focused gate does not waive an item in the final column.
   socket on drop. Caller-owned snapshot cleanup removes an empty per-process
   directory. The repaired matrix held the runtime-directory count constant,
   and 187 stale sockets in 107 audited socket-only or empty directories from
-  earlier runs were removed. Swap negatives, cross-build/template
-  compatibility, and 100-sample latency distributions remain open.
+  earlier runs were removed. New snapshots use envelope version 2 and carry a
+  separate internal compatibility manifest for the state ABI, device-model
+  ABI, architecture, CPU-template name and digest, and writer version. Restore
+  validates it before constructing KVM state; only version 1 uses the explicit
+  legacy path. A checksum-valid template substitution and a checksum-valid
+  removed-manifest downgrade were rejected without publishing a VM in all four
+  Ubuntu/Alpine and Linux 6.6/5.10 combinations; the untouched snapshots then restored and
+  both vCPUs advanced. A separate swap-pressure gate observed 6,916 KiB and
+  4,564 KiB swapped from guest-sized VMM mappings while dirty tracking was
+  active on Ubuntu/Linux 6.6 and Alpine/Linux 5.10,
+  then restored data written both before and after the diff parent. The host
+  swapfile, test artifacts, and runtime directories were removed after the
+  gate. A VMM built from `37f8bbb` then created version-1 full and incremental
+  chains that the version-2 candidate restored on Ubuntu/Linux 6.6 and
+  Alpine/Linux 5.10, including both RAM proofs and source/output isolation.
+  The old test worktree was removed after the gate. Actual incompatible-binary
+  qualification and 100-sample latency distributions remain open.
 - The persistent local-block gate now passes a four-way OCI/kernel matrix:
   Ubuntu and Alpine-derived workloads on Linux 6.6 and 5.10. Each case creates
   a 64 MiB raw volume through the public API, observes it as `/dev/vdb`, formats
