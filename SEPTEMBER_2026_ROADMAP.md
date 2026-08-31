@@ -954,8 +954,11 @@ passing focused gate does not waive an item in the final column.
   snapshot/restore, hibernate with concurrent wake requests, pause/resume, and
   balloon changes while reconciling API, database, process, jail, clone-ID,
   cached-session, and nested-virtualization invariants. It retains one snapshot,
-  refuses to start below 3 GiB free space, records JSONL history for 14 days,
-  and stops on the first failure so evidence is not overwritten. Before service
+  enforces a 3 GiB free-space floor both before and during each epoch, records
+  JSONL history for 14 days, and stops on the first failure so evidence is not
+  overwritten. Failure handling archives the database and service log, removes
+  the multi-gigabyte runtime tree, and trims the CoW filesystem. Service stops
+  signal the complete process group and allow 90 seconds for cleanup. Before
   installation, Alpine/Linux 5.10 runs passed 225 and 278 API operations with
   three guests older than 120 seconds, and Ubuntu/Linux 6.6 runs passed 261 and
   217 operations with three guests older than 122 seconds. Earlier qualification
@@ -965,8 +968,12 @@ passing focused gate does not waive an item in the final column.
   report their last completed stage. Retained state proved the application
   marker had completed while the agent slept on restored guest time. Repair now
   uses a signal plus generation-matched marker, and the agent does not sleep on
-  guest time before admission. The service is enabled and running; completion
-  of the full four-case rotation remains a release gate.
+  guest time before admission. A forced in-epoch capacity-floor test stopped
+  after 54 operations, archived a 335 KiB database and 82 KiB service log, and
+  left no candidate process, mount, or runtime directory. A separate supervised
+  stop after 90 operations produced the same clean result and restored 11 GiB
+  free on the 12 GiB fixture. The service is enabled and running; completion of
+  the full four-case rotation remains a release gate.
 - A bounded runtime-crash gate now covers fresh digest-pinned Ubuntu 24.04 and
   Alpine 3.20 OCI guests on Linux 6.6 and 5.10. It kills taritd without a drain,
   requires exact VMM PID and `/proc` start-time re-adoption with an unchanged

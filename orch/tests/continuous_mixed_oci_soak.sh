@@ -29,7 +29,7 @@ test -x "$GUEST_AGENT" || { echo "FAIL: guest agent not executable: $GUEST_AGENT
 }
 [[ "$MIN_FREE_BYTES" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid free-space floor" >&2; exit 1; }
 
-mkdir -p -m 0700 "$RUN_ROOT/history" "$RUN_ROOT/build"
+mkdir -p -m 0700 "$RUN_ROOT/history" "$RUN_ROOT/build" "$RUN_ROOT/failures"
 WORKLOAD_BIN="$RUN_ROOT/build/clone-repair-workload"
 gcc -std=c11 -O2 -Wall -Wextra -Werror -pedantic -static \
   "$WORKLOAD_SOURCE" -o "$WORKLOAD_BIN.next"
@@ -71,11 +71,12 @@ while :; do
     TARIT_TEST_CLONE_WORKLOAD_BIN="$WORKLOAD_BIN" \
     TARIT_TEST_GUEST_AGENT_BIN="$GUEST_AGENT" \
     TARIT_LIFECYCLE_DRIVER="$DRIVER" \
-    TARIT_LIFECYCLE_DRIVER_ARGS="--duration-seconds $EPOCH_SECONDS --interval-seconds 1 --anchors 3" \
+    TARIT_LIFECYCLE_DRIVER_ARGS="--duration-seconds $EPOCH_SECONDS --interval-seconds 1 --anchors 3 --storage-path $SOCKET_ROOT --min-free-bytes $MIN_FREE_BYTES" \
     TARIT_LIFECYCLE_SEEDS="$seed" \
     TARIT_LIFECYCLE_MAX_VMS=6 \
     TARIT_LIFECYCLE_MAX_SNAPSHOTS=1 \
-    TARIT_E2E_KEEP_FAILED=1 \
+    TARIT_E2E_KEEP_FAILED=0 \
+    TARIT_E2E_FAILURE_ARCHIVE_ROOT="$RUN_ROOT/failures" \
     "$STATE_GATE" >"$log" 2>&1; then
     echo "CONTINUOUS_SOAK_FAILED case=$name seed=$seed log=$log" >&2
     tail -240 "$log" >&2

@@ -133,6 +133,18 @@ cleanup() {
     echo "FAIL: lifecycle state-machine gate exited $status" >&2
     tail -240 "$DIR/taritd.log" 2>/dev/null || true
   fi
+  if [ "$status" -ne 0 ] && [ -n "${TARIT_E2E_FAILURE_ARCHIVE_ROOT:-}" ]; then
+    archive="$TARIT_E2E_FAILURE_ARCHIVE_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$DIR")"
+    if mkdir -p -m 0700 "$archive"; then
+      for artifact in taritd.log fleet.db fleet.db-wal fleet.db-shm; do
+        [ ! -f "$DIR/$artifact" ] || cp --preserve=timestamps -- \
+          "$DIR/$artifact" "$archive/$artifact" || true
+      done
+      echo "FAIL: compact diagnostics archived at $archive" >&2
+    else
+      echo "FAIL: unable to create compact diagnostic archive: $archive" >&2
+    fi
+  fi
   if [ "$status" -ne 0 ] && [ "${TARIT_E2E_KEEP_FAILED:-0}" = 1 ]; then
     echo "FAIL: retained diagnostic directory: $DIR" >&2
   else

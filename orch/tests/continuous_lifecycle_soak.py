@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import os
 import random
+import shutil
 import sqlite3
 import sys
 import time
@@ -227,6 +228,21 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         self.request("DELETE", f"/v1/vms/{vm_id}", expected=204, timeout=360)
         self.transient.discard(vm_id)
 
+    def assert_storage_headroom(self) -> None:
+        if not self.args.storage_path:
+            return
+        free_bytes = shutil.disk_usage(self.args.storage_path).free
+        if free_bytes < self.args.min_free_bytes:
+            self.event(
+                "storage_floor",
+                path=self.args.storage_path,
+                free_bytes=free_bytes,
+                minimum_free_bytes=self.args.min_free_bytes,
+            )
+            raise RuntimeError(
+                f"storage floor reached: {free_bytes} < {self.args.min_free_bytes}"
+            )
+
     def cleanup(self) -> None:
         for vm_id in list(self.transient) + list(self.anchors):
             try:
@@ -237,14 +253,17 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
         self.anchors.clear()
 
     def run(self) -> None:
+        self.assert_storage_headroom()
         for index in range(self.args.anchors):
             self.create_anchor(index)
+            self.assert_storage_headroom()
         deadline = time.monotonic() + self.args.duration_seconds
         actions = [
             self.assert_anchor, self.assert_anchor, self.mutate, self.fork_anchor,
             self.snapshot_restore, self.hibernate_resume, self.pause_resume, self.balloon,
         ]
         while time.monotonic() < deadline:
+            self.assert_storage_headroom()
             vm_id = self.random.choice(list(self.anchors))
             action = self.random.choice(actions)
             started = time.monotonic()
@@ -279,10 +298,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-seconds", type=int, default=1800)
     parser.add_argument("--interval-seconds", type=float, default=1.0)
     parser.add_argument("--anchors", type=int, default=3)
+    parser.add_argument("--storage-path")
+    parser.add_argument("--min-free-bytes", type=int, default=0)
     args = parser.parse_args()
     args.seed = int(args.seeds.split(",", 1)[0])
     if args.duration_seconds < 60 or args.anchors < 2 or args.anchors > args.max_vms - 2:
         parser.error("duration must be at least 60 seconds and anchors must leave two transient slots")
+    if args.min_free_bytes < 0 or (args.min_free_bytes and not args.storage_path):
+        parser.error("a non-negative storage floor requires --storage-path")
     return args
 
 
