@@ -39,6 +39,7 @@ const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SOCKET_WAIT_INITIAL: Duration = Duration::from_millis(1);
 const SOCKET_WAIT_MAX: Duration = Duration::from_millis(4);
 const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const TEARDOWN_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound for VMM ops that copy guest RAM (suspend, snapshot) or fault it
 /// back in (a suspend right after resume). These are silent on the socket for
 /// the whole copy, so they get a generous request deadline instead of the
@@ -2518,10 +2519,19 @@ impl ManagedProcess {
             }
             return Ok(());
         }
-        child
-            .wait()
-            .map(|_| ())
-            .map_err(|error| OrchError::Internal(format!("wait for VMM exit: {error}")))
+        let pid = child.id();
+        let exited = poll_process_exit(TEARDOWN_KILL_TIMEOUT, || {
+            child.try_wait().map(|status| status.is_some())
+        })
+        .map_err(|error| OrchError::Internal(format!("check VMM {pid} exit: {error}")))?;
+        if exited {
+            Ok(())
+        } else {
+            Err(OrchError::Internal(format!(
+                "owned VMM {pid} did not exit after SIGKILL within {:?}",
+                TEARDOWN_KILL_TIMEOUT
+            )))
+        }
     }
 
     /// Terminate a re-adopted VMM through its pidfd. Signalling the pidfd targets
@@ -2557,7 +2567,7 @@ impl ManagedProcess {
             events: libc::POLLIN,
             revents: 0,
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEARDOWN_KILL_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -2601,7 +2611,7 @@ impl ManagedProcess {
                 "kill adopted VMM {pid}: {error}"
             )));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + TEARDOWN_KILL_TIMEOUT;
         loop {
             if unsafe { libc::kill(pid, 0) } != 0
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
@@ -2615,6 +2625,23 @@ impl ManagedProcess {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+fn poll_process_exit<F>(timeout: Duration, mut exited: F) -> std::io::Result<bool>
+where
+    F: FnMut() -> std::io::Result<bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if exited()? {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
     }
 }
 
@@ -4566,11 +4593,21 @@ impl VmmSupervisor {
         vm: &RunningVm,
         cause: OrchError,
     ) -> OrchError {
-        let mut cleanup_failures = self
-            .teardown_vm(id, vm)
-            .err()
-            .map(|error| vec![error.to_string()])
-            .unwrap_or_default();
+        if let Err(error) = self.teardown_vm(id, vm) {
+            let cleanup = error.to_string();
+            let error = OrchError::Internal(format!(
+                "{cause}; shutdown cleanup retained booting VM {id} for retry: {cleanup}"
+            ));
+            self.complete_booting(
+                id,
+                control,
+                Err(OrchError::Internal(format!(
+                    "boot cleanup retained resources for retry: {cleanup}"
+                ))),
+            );
+            return error;
+        }
+        let mut cleanup_failures = Vec::new();
         if vm.net.is_none() {
             if let Some(net) = &self.net {
                 if let Err(error) = net.teardown_vm_id(id) {
@@ -4929,23 +4966,18 @@ impl VmmSupervisor {
     }
 
     fn retry_booting_cleanup(&self, id: Uuid, booting_vm: &BootingVm) -> Result<(), OrchError> {
-        let mut failures = booting_vm
-            .process
-            .as_ref()
-            .and_then(|process| {
-                self.teardown_vm(
-                    id,
-                    &RunningVm::new(
-                        process.pid,
-                        booting_vm.socket_path.clone(),
-                        process.clone(),
-                        None,
-                    ),
-                )
-                .err()
-            })
-            .map(|error| vec![error.to_string()])
-            .unwrap_or_default();
+        if let Some(process) = booting_vm.process.as_ref() {
+            self.teardown_vm(
+                id,
+                &RunningVm::new(
+                    process.pid,
+                    booting_vm.socket_path.clone(),
+                    process.clone(),
+                    None,
+                ),
+            )?;
+        }
+        let mut failures = Vec::new();
         if let Some(net) = &self.net {
             if let Err(error) = net.teardown_vm_id(id) {
                 failures.push(format!("teardown retained network allocation: {error}"));
@@ -6887,12 +6919,22 @@ impl VmmSupervisor {
                     .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
                 warm.iter()
                     .position(|warm_vm| warm_vm.id == id)
-                    .and_then(|index| warm.remove(index))
+                    .and_then(|index| warm.remove(index).map(|vm| (index, vm)))
             };
-            if let Some(warm) = warm {
+            if let Some((index, warm)) = warm {
                 let client = VmmClient::new(&warm.vm.socket_path);
                 let _ = client.stop();
-                return self.teardown_vm(id, &warm.vm);
+                if let Err(error) = self.teardown_vm(id, &warm.vm) {
+                    let mut retained = self.warm.lock().map_err(|_| {
+                        OrchError::Internal(format!(
+                            "warm VM {id} teardown failed ({error}) and supervisor could not retain it for retry"
+                        ))
+                    })?;
+                    let index = index.min(retained.len());
+                    retained.insert(index, warm);
+                    return Err(error);
+                }
+                return Ok(());
             }
             if let Some(net) = &self.net {
                 net.teardown_vm_id(id)?;
@@ -7600,13 +7642,17 @@ impl VmmSupervisor {
     fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
         let mut failures = Vec::new();
         graceful_stop_vmm(&vm.socket_path);
-        let process_exited = match vm.process.kill_wait() {
-            Ok(()) => true,
-            Err(error) => {
-                failures.push(error.to_string());
-                false
-            }
-        };
+        // A process stuck in uninterruptible host I/O can remain alive after
+        // SIGKILL. Keep every runtime artifact intact in that case: unlinking
+        // its socket or overlay, or releasing its jail, cgroup, or network,
+        // would make a still-running VM unmanageable and could allow those
+        // resources to be reused. The caller retains the RunningVm and retries
+        // reconciliation later.
+        vm.process.kill_wait().map_err(|error| {
+            OrchError::Internal(format!(
+                "terminate VMM before releasing runtime resources: {error}"
+            ))
+        })?;
         if let Err(error) = remove_file_if_present(&vm.socket_path) {
             failures.push(format!("remove VMM socket: {error}"));
         }
@@ -7621,21 +7667,19 @@ impl VmmSupervisor {
             }
             Err(error) => failures.push(error.to_string()),
         }
-        // The exact child can only be empty after the process is confirmed
-        // dead. Removing only this UUID-derived child preserves the
-        // operator-owned parent cgroup.
-        if process_exited {
-            if let Some(path) = self.exact_vm_cgroup_path(id) {
-                if let Err(error) = remove_cgroup_dir_after_exit(&path) {
-                    failures.push(format!(
-                        "remove exact VM cgroup {}: {error}",
-                        path.display()
-                    ));
-                }
+        // The exact child is empty now that the process is confirmed dead.
+        // Removing only this UUID-derived child preserves the operator-owned
+        // parent cgroup.
+        if let Some(path) = self.exact_vm_cgroup_path(id) {
+            if let Err(error) = remove_cgroup_dir_after_exit(&path) {
+                failures.push(format!(
+                    "remove exact VM cgroup {}: {error}",
+                    path.display()
+                ));
             }
-            if let Err(error) = self.release_jail(id) {
-                failures.push(format!("remove VM jail: {error}"));
-            }
+        }
+        if let Err(error) = self.release_jail(id) {
+            failures.push(format!("remove VM jail: {error}"));
         }
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
             match self.defer_network_teardown(id, a.clone()) {
@@ -9963,15 +10007,16 @@ mod tests {
 
     #[test]
     fn teardown_vm_stops_vmm_before_killing_process() {
-        let root = PathBuf::from(format!(
-            "target/taritd-supervisor-teardown-{}",
-            Uuid::new_v4()
-        ));
-        let socket_path = PathBuf::from(format!(
-            "target/taritd-teardown-{}-{}.sock",
+        // Keep the Unix socket below sockaddr_un::sun_path even when the host's
+        // configured temporary directory has a long per-user prefix.
+        let test_dir = PathBuf::from("/tmp").join(format!(
+            "tarit-td-{}-{}",
             std::process::id(),
             Uuid::new_v4()
         ));
+        std::fs::create_dir(&test_dir).expect("create teardown test directory");
+        let root = test_dir.join("state");
+        let socket_path = test_dir.join("vmm.sock");
         let listener =
             std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test VMM socket");
         listener
@@ -10064,8 +10109,156 @@ mod tests {
             "teardown must reap the VMM process"
         );
 
-        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn teardown_vm_retains_runtime_artifacts_when_process_exit_is_unconfirmed() {
+        let test_dir = PathBuf::from("/tmp").join(format!(
+            "tarit-retain-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let root = test_dir.join("state");
+        let id = Uuid::new_v4();
+        let socket_path = test_dir.join("vmm.sock");
+        std::fs::create_dir_all(&test_dir).expect("create teardown retention directory");
+        std::fs::write(&socket_path, b"owned socket placeholder")
+            .expect("create socket placeholder");
+
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn test VMM process");
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(child));
+        let poisoned_child = Arc::clone(&child);
+        let poison = std::thread::spawn(move || {
+            let _guard = poisoned_child.lock().expect("lock child before poisoning");
+            panic!("poison child lock to simulate unconfirmed process state");
+        });
+        assert!(poison.join().is_err());
+
+        let process = ManagedProcess {
+            pid,
+            handle: ProcessHandle::Owned(child),
+        };
+        let vm = RunningVm::new(pid, socket_path.clone(), process, None);
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+        let overlay_path = PathBuf::from(supervisor.overlay_path_for(id));
+        std::fs::create_dir_all(overlay_path.parent().expect("overlay parent"))
+            .expect("create overlay directory");
+        std::fs::write(&overlay_path, b"owned overlay").expect("create owned overlay");
+
+        let error = supervisor
+            .teardown_vm(id, &vm)
+            .expect_err("unconfirmed process state must fail closed");
+
+        assert!(error.to_string().contains("terminate VMM before releasing"));
+        assert!(socket_path.exists(), "control socket must remain owned");
+        assert!(overlay_path.exists(), "overlay must remain owned");
+
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn stop_vm_retains_a_warm_vm_when_process_exit_is_unconfirmed() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "tarit-warm-retain-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let id = Uuid::new_v4();
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn warm test VMM process");
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(child));
+        let poisoned_child = Arc::clone(&child);
+        let poison = std::thread::spawn(move || {
+            let _guard = poisoned_child.lock().expect("lock child before poisoning");
+            panic!("poison child lock to simulate unconfirmed process state");
+        });
+        assert!(poison.join().is_err());
+
+        let process = ManagedProcess {
+            pid,
+            handle: ProcessHandle::Owned(child),
+        };
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+        supervisor
+            .warm
+            .lock()
+            .expect("lock warm pool")
+            .push_back(WarmVm {
+                id,
+                vm: RunningVm::new(pid, PathBuf::new(), process, None),
+                spec: spawn_config(false, None),
+            });
+
+        let error = supervisor
+            .stop_vm(id)
+            .expect_err("unconfirmed warm process state must fail closed");
+
+        assert!(error.to_string().contains("terminate VMM before releasing"));
+        let retained = supervisor.warm.lock().expect("lock retained warm pool");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained.front().expect("retained warm VM").id, id);
+        drop(retained);
+
+        let retained = supervisor
+            .warm
+            .lock()
+            .expect("lock retained warm pool for cleanup")
+            .pop_front()
+            .expect("remove retained warm VM");
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), 0);
+        }
+        drop(retained);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_exit_poll_is_bounded_when_the_process_never_exits() {
+        let mut polls = 0;
+        let exited = poll_process_exit(Duration::ZERO, || {
+            polls += 1;
+            Ok(false)
+        })
+        .expect("poll process exit");
+
+        assert!(!exited);
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn process_exit_poll_returns_immediately_for_an_exited_process() {
+        let mut polls = 0;
+        let exited = poll_process_exit(Duration::from_secs(1), || {
+            polls += 1;
+            Ok(true)
+        })
+        .expect("poll process exit");
+
+        assert!(exited);
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn process_exit_poll_propagates_observation_failure() {
+        let error = poll_process_exit(Duration::from_secs(1), || {
+            Err(std::io::Error::other("observation failed"))
+        })
+        .expect_err("poll failure must propagate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 
     #[test]
