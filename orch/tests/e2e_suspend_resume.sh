@@ -65,6 +65,7 @@ BASE_URL="http://127.0.0.1:$PORT"
 mkdir -p "$DIR/sockets"
 
 cleanup() {
+  local status=$?
   if [ -n "${TARITD_PGID:-}" ] && kill -0 -- "-$TARITD_PGID" 2>/dev/null; then
     kill -TERM -- "-$TARITD_PGID" 2>/dev/null || true
     for _ in $(seq 1 50); do
@@ -78,7 +79,16 @@ cleanup() {
   if [ -n "${TARITD_PID:-}" ]; then
     wait "$TARITD_PID" 2>/dev/null || true
   fi
-  rm -rf -- "$DIR"
+  if [ "$status" -ne 0 ]; then
+    echo "FAIL: suspend/resume gate exited $status" >&2
+    tail -240 "$DIR/taritd.log" 2>/dev/null || true
+  fi
+  if [ "$status" -ne 0 ] && [ "${TARIT_E2E_KEEP_FAILED:-0}" = 1 ]; then
+    echo "FAIL: retained diagnostic directory: $DIR" >&2
+  else
+    find "$DIR" -depth -delete 2>/dev/null || true
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -198,7 +208,16 @@ ACTUAL_PGID=$(ps -o pgid= -p "$TARITD_PID" | tr -d ' ')
 }
 
 echo "== create and populate guest memory =="
-VM_JSON=$(api -H 'Content-Type: application/json' -d '{"vcpus":1,"memory_mib":512}' "$BASE_URL/v1/vms")
+CREATE_BODY="$DIR/create-vm.json"
+CREATE_CODE=$(curl -sS --max-time 30 -o "$CREATE_BODY" -w '%{http_code}' \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"vcpus":1,"memory_mib":512}' "$BASE_URL/v1/vms")
+if [ "$CREATE_CODE" != 201 ]; then
+  echo "FAIL: VM create returned HTTP $CREATE_CODE" >&2
+  sed -n '1,120p' "$CREATE_BODY" >&2
+  exit 1
+fi
+VM_JSON=$(<"$CREATE_BODY")
 VM_ID=$(printf '%s' "$VM_JSON" | json_field id)
 printf '%s' "$VM_JSON" | grep -q '"status":"running"'
 VMM_PID=$(vmm_pid_for_socket "$DIR/sockets/$VM_ID.sock")
