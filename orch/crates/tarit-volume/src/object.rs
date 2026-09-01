@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectDigest([u8; 32]);
@@ -18,10 +19,12 @@ impl ObjectDigest {
         &self.0
     }
 
+    #[cfg(feature = "cloud-object-store")]
     pub(crate) fn from_sha256(digest: [u8; 32]) -> Self {
         Self(digest)
     }
 
+    #[cfg(feature = "cloud-object-store")]
     pub(crate) fn hex(&self) -> String {
         self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -40,6 +43,34 @@ impl fmt::Display for ObjectDigest {
 impl fmt::Debug for ObjectDigest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl FromStr for ObjectDigest {
+    type Err = VolumeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let hex = value.strip_prefix("sha256:").ok_or_else(|| {
+            VolumeError::Invalid("immutable object digest must use sha256".into())
+        })?;
+        if hex.len() != 64
+            || !hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(VolumeError::Invalid(
+                "immutable object digest must be canonical lowercase SHA-256".into(),
+            ));
+        }
+        let mut digest = [0_u8; 32];
+        for (index, output) in digest.iter_mut().enumerate() {
+            *output = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| {
+                VolumeError::Invalid(
+                    "immutable object digest must be canonical lowercase SHA-256".into(),
+                )
+            })?;
+        }
+        Ok(Self(digest))
     }
 }
 
@@ -259,5 +290,20 @@ mod tests {
         ));
         fs::remove_file(path).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn object_digest_parser_requires_canonical_sha256() {
+        let digest = ObjectDigest::from_bytes(b"canonical");
+        assert_eq!(digest.to_string().parse::<ObjectDigest>().unwrap(), digest);
+        for value in [
+            "",
+            "md5:00000000000000000000000000000000",
+            "sha256:00",
+            "sha256:GG00000000000000000000000000000000000000000000000000000000000000",
+            "sha256:AA00000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            assert!(value.parse::<ObjectDigest>().is_err(), "{value}");
+        }
     }
 }

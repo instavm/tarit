@@ -319,6 +319,22 @@ pub struct ArtifactReplicaRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Private durable index for an immutable artifact bundle stored outside any
+/// worker filesystem. Provider namespace and manifest locator never cross the
+/// public API boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactObjectReplicaRecord {
+    pub artifact_id: Uuid,
+    pub owner_key: String,
+    pub provider: String,
+    pub manifest_digest: String,
+    pub manifest_size_bytes: u64,
+    pub status: ArtifactReplicaStatus,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Durable metadata for an immutable, tenant-owned artifact.
 ///
 /// Host identity and the storage locator are persistence details and are never

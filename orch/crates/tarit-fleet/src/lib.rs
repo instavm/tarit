@@ -7,10 +7,10 @@ use deadpool_postgres::{Config as PoolConfig, Pool, Runtime};
 use rustls::{ClientConfig, RootCertStore};
 use tarit_store::{HostRecord, SnapshotRecord, VolumeTransition};
 use tarit_types::{
-    ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
-    ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
-    ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ShareRecord,
-    ShareVisibility, UsageEvent, UsageSummary, VmRecord, VmStartupPath, VmStatus,
+    ArtifactKind, ArtifactObjectReplicaRecord, ArtifactRecord, ArtifactReplicaRecord,
+    ArtifactReplicaStatus, ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord,
+    EgressPolicyRecord, ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus,
+    ShareRecord, ShareVisibility, UsageEvent, UsageSummary, VmRecord, VmStartupPath, VmStatus,
     VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord, VolumeStatus,
     VolumeStorageClass,
 };
@@ -1133,6 +1133,86 @@ impl PostgresFleet {
             )
             .await?;
         rows.iter().map(row_to_artifact_replica).collect()
+    }
+
+    pub async fn upsert_artifact_object_replica(
+        &self,
+        replica: &ArtifactObjectReplicaRecord,
+    ) -> Result<(), FleetError> {
+        if replica.provider.is_empty()
+            || replica.manifest_digest.is_empty()
+            || replica.manifest_size_bytes == 0
+        {
+            return Err(FleetError::Conflict(
+                "object replica metadata is incomplete".into(),
+            ));
+        }
+        if replica.status == ArtifactReplicaStatus::Available && replica.verified_at.is_none() {
+            return Err(FleetError::Conflict(
+                "available object replica requires verified_at".into(),
+            ));
+        }
+        let client = self.pool.get().await?;
+        let artifact_exists = client
+            .query_opt(
+                "SELECT 1 FROM fleet_artifacts WHERE artifact_id = $1 AND owner_key = $2",
+                &[&replica.artifact_id, &replica.owner_key],
+            )
+            .await?
+            .is_some();
+        if !artifact_exists {
+            return Err(FleetError::NotFound);
+        }
+        let changed = client
+            .execute(
+                "INSERT INTO fleet_artifact_object_replicas (
+                   artifact_id, owner_key, provider, manifest_digest, manifest_size_bytes,
+                   status, verified_at, created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                 ON CONFLICT (artifact_id, provider) DO UPDATE SET
+                   manifest_digest=EXCLUDED.manifest_digest,
+                   manifest_size_bytes=EXCLUDED.manifest_size_bytes,
+                   status=EXCLUDED.status,
+                   verified_at=EXCLUDED.verified_at,
+                   updated_at=EXCLUDED.updated_at
+                 WHERE fleet_artifact_object_replicas.owner_key=EXCLUDED.owner_key",
+                &[
+                    &replica.artifact_id,
+                    &replica.owner_key,
+                    &replica.provider,
+                    &replica.manifest_digest,
+                    &u64_to_sql_i64(replica.manifest_size_bytes)?,
+                    &replica.status.as_str(),
+                    &replica.verified_at,
+                    &replica.created_at,
+                    &replica.updated_at,
+                ],
+            )
+            .await?;
+        if changed != 1 {
+            return Err(FleetError::Conflict(
+                "object replica belongs to another tenant".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn list_artifact_object_replicas(
+        &self,
+        owner_key: &str,
+        artifact_id: Uuid,
+    ) -> Result<Vec<ArtifactObjectReplicaRecord>, FleetError> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT artifact_id, owner_key, provider, manifest_digest, manifest_size_bytes,
+                        status, verified_at, created_at, updated_at
+                 FROM fleet_artifact_object_replicas
+                 WHERE artifact_id = $1 AND owner_key = $2 ORDER BY provider",
+                &[&artifact_id, &owner_key],
+            )
+            .await?;
+        rows.iter().map(row_to_artifact_object_replica).collect()
     }
 
     /// Recompute logical readiness from replicas whose host heartbeat is both
@@ -2938,6 +3018,20 @@ CREATE INDEX IF NOT EXISTS fleet_artifact_replicas_artifact_status
   ON fleet_artifact_replicas(artifact_id, status);
 CREATE INDEX IF NOT EXISTS fleet_artifact_replicas_failure_domain
   ON fleet_artifact_replicas(failure_domain, status);
+CREATE TABLE IF NOT EXISTS fleet_artifact_object_replicas (
+  artifact_id UUID NOT NULL REFERENCES fleet_artifacts(artifact_id) ON DELETE CASCADE,
+  owner_key TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL UNIQUE,
+  manifest_size_bytes BIGINT NOT NULL CHECK (manifest_size_bytes > 0),
+  status TEXT NOT NULL CHECK (status IN ('staging','available','corrupt','deleting')),
+  verified_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (artifact_id, provider)
+);
+CREATE INDEX IF NOT EXISTS fleet_artifact_object_replicas_artifact_status
+  ON fleet_artifact_object_replicas(artifact_id, status);
 CREATE TABLE IF NOT EXISTS fleet_artifact_repair_leases (
   artifact_id UUID PRIMARY KEY REFERENCES fleet_artifacts(artifact_id) ON DELETE CASCADE,
   holder_host_id TEXT NOT NULL,
@@ -3258,6 +3352,26 @@ fn row_to_artifact_replica(row: &tokio_postgres::Row) -> Result<ArtifactReplicaR
         verified_at: row.get(9),
         created_at: row.get(10),
         updated_at: row.get(11),
+    })
+}
+
+fn row_to_artifact_object_replica(
+    row: &tokio_postgres::Row,
+) -> Result<ArtifactObjectReplicaRecord, FleetError> {
+    let status: String = row.get(5);
+    Ok(ArtifactObjectReplicaRecord {
+        artifact_id: row.get(0),
+        owner_key: row.get(1),
+        provider: row.get(2),
+        manifest_digest: row.get(3),
+        manifest_size_bytes: u64::try_from(row.get::<_, i64>(4))
+            .map_err(|_| FleetError::Config("invalid object replica manifest size".into()))?,
+        status: ArtifactReplicaStatus::parse(&status).ok_or_else(|| {
+            FleetError::Config(format!("invalid object replica status: {status}"))
+        })?,
+        verified_at: row.get(6),
+        created_at: row.get(7),
+        updated_at: row.get(8),
     })
 }
 
@@ -3808,6 +3922,7 @@ mod tests {
         assert!(FLEET_SCHEMA.contains("boot_session_id UUID"));
         assert!(FLEET_SCHEMA.contains("peer_certificate_sha256 TEXT"));
         assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_snapshots"));
+        assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS fleet_artifact_object_replicas"));
         assert!(FLEET_SCHEMA.contains("snapshot_id UUID PRIMARY KEY"));
         assert!(FLEET_SCHEMA.contains("generation BIGINT NOT NULL DEFAULT 1"));
         assert!(FLEET_SCHEMA.contains("CREATE TABLE IF NOT EXISTS tenant_vm_reservations"));
@@ -4258,6 +4373,48 @@ mod tests {
             if fleet.upsert_artifact_replica(&replica).await? != ArtifactReplicationState::Ready {
                 return Err(FleetError::Config(
                     "two verified failure domains did not become ready".into(),
+                ));
+            }
+            let object_replica = ArtifactObjectReplicaRecord {
+                artifact_id: first.artifact_id,
+                owner_key: owner.clone(),
+                provider: "aws_s3_immutable_object".into(),
+                manifest_digest: format!("sha256:{:064x}", suffix.as_u128()),
+                manifest_size_bytes: 4096,
+                status: ArtifactReplicaStatus::Available,
+                verified_at: Some(now),
+                created_at: now,
+                updated_at: now,
+            };
+            fleet
+                .upsert_artifact_object_replica(&object_replica)
+                .await?;
+            fleet
+                .upsert_artifact_object_replica(&object_replica)
+                .await?;
+            if fleet
+                .list_artifact_object_replicas(&owner, first.artifact_id)
+                .await?
+                != vec![object_replica.clone()]
+                || !fleet
+                    .list_artifact_object_replicas(&foreign_owner, first.artifact_id)
+                    .await?
+                    .is_empty()
+            {
+                return Err(FleetError::Config(
+                    "object replica was not idempotent and tenant scoped".into(),
+                ));
+            }
+            let mut unverified_object = object_replica;
+            unverified_object.verified_at = None;
+            if !matches!(
+                fleet
+                    .upsert_artifact_object_replica(&unverified_object)
+                    .await,
+                Err(FleetError::Conflict(_))
+            ) {
+                return Err(FleetError::Config(
+                    "unverified object replica was accepted as available".into(),
                 ));
             }
             let second_replica = ArtifactReplicaRecord {

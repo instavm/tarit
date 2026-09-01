@@ -5,12 +5,12 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
 use tarit_types::{
-    ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
-    ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
-    ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ShareRecord,
-    ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, VmRecord, VmRuntimeLayout, VmStartupPath,
-    VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord,
-    VolumeStatus, VolumeStorageClass,
+    ArtifactKind, ArtifactObjectReplicaRecord, ArtifactRecord, ArtifactReplicaRecord,
+    ArtifactReplicaStatus, ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord,
+    EgressPolicyRecord, ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus,
+    ShareRecord, ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, VmRecord, VmRuntimeLayout,
+    VmStartupPath, VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities,
+    VolumeRecord, VolumeStatus, VolumeStorageClass,
 };
 use uuid::Uuid;
 
@@ -425,6 +425,21 @@ impl Store {
                ON artifact_replicas(artifact_id, status);
              CREATE INDEX IF NOT EXISTS artifact_replicas_failure_domain
                ON artifact_replicas(failure_domain, status);
+             CREATE TABLE IF NOT EXISTS artifact_object_replicas (
+               artifact_id TEXT NOT NULL,
+               owner_key TEXT NOT NULL,
+               provider TEXT NOT NULL,
+               manifest_digest TEXT NOT NULL UNIQUE,
+               manifest_size_bytes INTEGER NOT NULL CHECK (manifest_size_bytes > 0),
+               status TEXT NOT NULL CHECK (status IN ('staging','available','corrupt','deleting')),
+               verified_at TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY (artifact_id, provider),
+               FOREIGN KEY (artifact_id) REFERENCES artifacts(artifact_id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS artifact_object_replicas_artifact_status
+               ON artifact_object_replicas(artifact_id, status);
              CREATE INDEX IF NOT EXISTS branches_owner_created
                ON branches(owner_key, created_at DESC);
              CREATE INDEX IF NOT EXISTS branches_head ON branches(head_artifact_id);
@@ -1011,6 +1026,89 @@ impl Store {
             .query_map(
                 params![artifact_id.to_string(), owner_key],
                 row_to_artifact_replica,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)?;
+        Ok(replicas)
+    }
+
+    pub fn upsert_artifact_object_replica(
+        &self,
+        replica: &ArtifactObjectReplicaRecord,
+    ) -> Result<(), StoreError> {
+        if replica.provider.is_empty()
+            || replica.manifest_digest.is_empty()
+            || replica.manifest_size_bytes == 0
+        {
+            return Err(StoreError::Conflict(
+                "object replica metadata is incomplete".into(),
+            ));
+        }
+        if replica.status == ArtifactReplicaStatus::Available && replica.verified_at.is_none() {
+            return Err(StoreError::Conflict(
+                "available object replica requires verified_at".into(),
+            ));
+        }
+        let artifact_exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifacts WHERE artifact_id = ?1 AND owner_key = ?2)",
+            params![replica.artifact_id.to_string(), replica.owner_key],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !artifact_exists {
+            return Err(StoreError::NotFound);
+        }
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO artifact_object_replicas (
+                   artifact_id, owner_key, provider, manifest_digest, manifest_size_bytes,
+                   status, verified_at, created_at, updated_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                 ON CONFLICT(artifact_id, provider) DO UPDATE SET
+                   manifest_digest=excluded.manifest_digest,
+                   manifest_size_bytes=excluded.manifest_size_bytes,
+                   status=excluded.status,
+                   verified_at=excluded.verified_at,
+                   updated_at=excluded.updated_at
+                 WHERE artifact_object_replicas.owner_key=excluded.owner_key",
+                params![
+                    replica.artifact_id.to_string(),
+                    replica.owner_key,
+                    replica.provider,
+                    replica.manifest_digest,
+                    u64_to_sql_i64(replica.manifest_size_bytes)?,
+                    replica.status.as_str(),
+                    replica.verified_at.map(|value| value.to_rfc3339()),
+                    replica.created_at.to_rfc3339(),
+                    replica.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                constraint_conflict(error, "object replica manifest already exists")
+            })?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "object replica belongs to another tenant".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn list_artifact_object_replicas(
+        &self,
+        owner_key: &str,
+        artifact_id: Uuid,
+    ) -> Result<Vec<ArtifactObjectReplicaRecord>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT artifact_id, owner_key, provider, manifest_digest, manifest_size_bytes,
+                    status, verified_at, created_at, updated_at
+             FROM artifact_object_replicas WHERE artifact_id = ?1 AND owner_key = ?2
+             ORDER BY provider",
+        )?;
+        let replicas = statement
+            .query_map(
+                params![artifact_id.to_string(), owner_key],
+                row_to_artifact_object_replica,
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)?;
@@ -3151,6 +3249,29 @@ fn row_to_artifact_replica(
     })
 }
 
+fn row_to_artifact_object_replica(
+    row: &rusqlite::Row<'_>,
+) -> Result<ArtifactObjectReplicaRecord, rusqlite::Error> {
+    let artifact_id: String = row.get(0)?;
+    let status: String = row.get(5)?;
+    let verified_at: Option<String> = row.get(6)?;
+    let created_at: String = row.get(7)?;
+    let updated_at: String = row.get(8)?;
+    Ok(ArtifactObjectReplicaRecord {
+        artifact_id: parse_uuid_col(&artifact_id, 0)?,
+        owner_key: row.get(1)?,
+        provider: row.get(2)?,
+        manifest_digest: row.get(3)?,
+        manifest_size_bytes: sql_i64_to_u64(row.get(4)?, 4, "invalid manifest size")?,
+        status: ArtifactReplicaStatus::parse(&status).ok_or_else(|| {
+            invalid_text_error(5, format!("invalid object replica status: {status}"))
+        })?,
+        verified_at: verified_at.as_deref().map(parse_ts).transpose()?,
+        created_at: parse_ts(&created_at)?,
+        updated_at: parse_ts(&updated_at)?,
+    })
+}
+
 fn same_immutable_artifact(left: &ArtifactRecord, right: &ArtifactRecord) -> bool {
     left.artifact_id == right.artifact_id
         && left.owner_key == right.owner_key
@@ -3723,6 +3844,59 @@ mod tests {
             store.list_artifact_replicas("tenant-b", artifact.artifact_id),
             Ok(replicas) if replicas.is_empty()
         ));
+    }
+
+    #[test]
+    fn artifact_object_replica_is_tenant_scoped_verified_and_cascade_deleted() {
+        let store = Store::open(":memory:").unwrap();
+        let artifact = test_artifact("tenant-a", "/private/object-primary");
+        store.insert_artifact(&artifact).unwrap();
+        let now = Utc::now();
+        let replica = ArtifactObjectReplicaRecord {
+            artifact_id: artifact.artifact_id,
+            owner_key: artifact.owner_key.clone(),
+            provider: "aws_s3_immutable_object".into(),
+            manifest_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            manifest_size_bytes: 4096,
+            status: ArtifactReplicaStatus::Available,
+            verified_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_artifact_object_replica(&replica).unwrap();
+        store.upsert_artifact_object_replica(&replica).unwrap();
+        assert_eq!(
+            store
+                .list_artifact_object_replicas("tenant-a", artifact.artifact_id)
+                .unwrap(),
+            vec![replica.clone()]
+        );
+        assert!(store
+            .list_artifact_object_replicas("tenant-b", artifact.artifact_id)
+            .unwrap()
+            .is_empty());
+
+        let mut unverified = replica.clone();
+        unverified.verified_at = None;
+        assert!(matches!(
+            store.upsert_artifact_object_replica(&unverified),
+            Err(StoreError::Conflict(_))
+        ));
+        let mut foreign = replica;
+        foreign.owner_key = "tenant-b".into();
+        assert!(matches!(
+            store.upsert_artifact_object_replica(&foreign),
+            Err(StoreError::NotFound)
+        ));
+
+        store
+            .delete_artifact_if_unreferenced("tenant-a", artifact.artifact_id)
+            .unwrap();
+        assert!(store
+            .list_artifact_object_replicas("tenant-a", artifact.artifact_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
