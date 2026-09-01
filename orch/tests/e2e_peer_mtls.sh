@@ -86,6 +86,7 @@ make_ca rogue
 make_leaf node-a old
 make_leaf node-b old
 make_leaf node-new new
+make_leaf node-b-new new
 make_leaf node-rogue rogue
 cat "$DIR/old-ca.pem" "$DIR/new-ca.pem" >"$DIR/overlap-ca.pem"
 
@@ -200,20 +201,100 @@ python3 "$PROBE" "$TARGET_URL" "$DIR/node-a.pem" "$DIR/node-a.key" "$DIR/old-ca.
 
 kill -TERM "$B_PID"
 wait "$B_PID" || true
-start_node node-b "$B_CONTROL" "$B_PEER" "$DIR/node-b.pem" "$DIR/node-b.key" "$DIR/new-ca.pem" "$DIR/node-b.log"
+start_node node-b "$B_CONTROL" "$B_PEER" "$DIR/node-b-new.pem" "$DIR/node-b-new.key" "$DIR/overlap-ca.pem" "$DIR/node-b.log"
 B_PID=$LAST_PID
 wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
-ROTATED_B_SESSION=$(session node-b)
+OVERLAP_B_SESSION=$(session node-b)
+test "$OVERLAP_B_SESSION" != "$B_SESSION"
+python3 "$PROBE" "$TARGET_URL" "$DIR/node-new.pem" "$DIR/node-new.key" "$DIR/new-ca.pem" \
+  "$SECRET" node-a "$ROTATED_A_SESSION" node-b "$OVERLAP_B_SESSION" 404
+
+echo "== remove old CA only after both peers present new leaves =="
+kill -TERM "$A_PID"
+wait "$A_PID" || true
+start_node node-a "$A_CONTROL" "$A_PEER" "$DIR/node-new.pem" "$DIR/node-new.key" "$DIR/new-ca.pem" "$DIR/node-a.log"
+A_PID=$LAST_PID
+wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
+NEW_ONLY_A_SESSION=$(session node-a)
+test "$NEW_ONLY_A_SESSION" != "$ROTATED_A_SESSION"
+
+kill -TERM "$B_PID"
+wait "$B_PID" || true
+start_node node-b "$B_CONTROL" "$B_PEER" "$DIR/node-b-new.pem" "$DIR/node-b-new.key" "$DIR/new-ca.pem" "$DIR/node-b.log"
+B_PID=$LAST_PID
+wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
+NEW_ONLY_B_SESSION=$(session node-b)
+test "$NEW_ONLY_B_SESSION" != "$OVERLAP_B_SESSION"
 if curl -fsS --max-time 5 --cert "$DIR/node-a.pem" --key "$DIR/node-a.key" \
-  --cacert "$DIR/old-ca.pem" "https://localhost:$B_PEER/internal/v1/vms" >/dev/null 2>&1; then
+  --cacert "$DIR/new-ca.pem" "https://localhost:$B_PEER/internal/v1/vms" >/dev/null 2>&1; then
   echo "FAIL: rotated listener accepted an old-CA client" >&2
   exit 1
 fi
 code=$(curl -sS --max-time 5 --cert "$DIR/node-new.pem" --key "$DIR/node-new.key" \
-  --cacert "$DIR/old-ca.pem" -o /dev/null -w '%{http_code}' \
+  --cacert "$DIR/new-ca.pem" -o /dev/null -w '%{http_code}' \
   "https://localhost:$B_PEER/internal/v1/vms")
 test "$code" = 401
-python3 "$PROBE" "$TARGET_URL" "$DIR/node-new.pem" "$DIR/node-new.key" "$DIR/old-ca.pem" \
-  "$SECRET" node-a "$ROTATED_A_SESSION" node-b "$ROTATED_B_SESSION" 404
+python3 "$PROBE" "$TARGET_URL" "$DIR/node-new.pem" "$DIR/node-new.key" "$DIR/new-ca.pem" \
+  "$SECRET" node-a "$NEW_ONLY_A_SESSION" node-b "$NEW_ONLY_B_SESSION" 404
+A_TARGET_URL="https://localhost:$A_PEER/internal/v1/vms/$VM_ID/status"
+python3 "$PROBE" "$A_TARGET_URL" "$DIR/node-b-new.pem" "$DIR/node-b-new.key" "$DIR/new-ca.pem" \
+  "$SECRET" node-b "$NEW_ONLY_B_SESSION" node-a "$NEW_ONLY_A_SESSION" 404
 
-echo "PASS: dedicated peer mTLS + Postgres boot-session fencing + CA rotation"
+echo "== rollback restores overlap before either old leaf =="
+kill -TERM "$A_PID"
+wait "$A_PID" || true
+start_node node-a "$A_CONTROL" "$A_PEER" "$DIR/node-new.pem" "$DIR/node-new.key" "$DIR/overlap-ca.pem" "$DIR/node-a.log"
+A_PID=$LAST_PID
+wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
+ROLLBACK_OVERLAP_A_SESSION=$(session node-a)
+
+kill -TERM "$B_PID"
+wait "$B_PID" || true
+start_node node-b "$B_CONTROL" "$B_PEER" "$DIR/node-b-new.pem" "$DIR/node-b-new.key" "$DIR/overlap-ca.pem" "$DIR/node-b.log"
+B_PID=$LAST_PID
+wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
+ROLLBACK_OVERLAP_B_SESSION=$(session node-b)
+python3 "$PROBE" "$TARGET_URL" "$DIR/node-new.pem" "$DIR/node-new.key" "$DIR/new-ca.pem" \
+  "$SECRET" node-a "$ROLLBACK_OVERLAP_A_SESSION" node-b "$ROLLBACK_OVERLAP_B_SESSION" 404
+
+kill -TERM "$A_PID"
+wait "$A_PID" || true
+start_node node-a "$A_CONTROL" "$A_PEER" "$DIR/node-a.pem" "$DIR/node-a.key" "$DIR/overlap-ca.pem" "$DIR/node-a.log"
+A_PID=$LAST_PID
+wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
+ROLLBACK_A_SESSION=$(session node-a)
+
+kill -TERM "$B_PID"
+wait "$B_PID" || true
+start_node node-b "$B_CONTROL" "$B_PEER" "$DIR/node-b.pem" "$DIR/node-b.key" "$DIR/overlap-ca.pem" "$DIR/node-b.log"
+B_PID=$LAST_PID
+wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
+ROLLBACK_B_SESSION=$(session node-b)
+python3 "$PROBE" "$TARGET_URL" "$DIR/node-a.pem" "$DIR/node-a.key" "$DIR/old-ca.pem" \
+  "$SECRET" node-a "$ROLLBACK_A_SESSION" node-b "$ROLLBACK_B_SESSION" 404
+
+echo "== complete rollback removes the new CA =="
+kill -TERM "$A_PID"
+wait "$A_PID" || true
+start_node node-a "$A_CONTROL" "$A_PEER" "$DIR/node-a.pem" "$DIR/node-a.key" "$DIR/old-ca.pem" "$DIR/node-a.log"
+A_PID=$LAST_PID
+wait_health "http://127.0.0.1:$A_CONTROL" "$A_PID"
+OLD_ONLY_A_SESSION=$(session node-a)
+
+kill -TERM "$B_PID"
+wait "$B_PID" || true
+start_node node-b "$B_CONTROL" "$B_PEER" "$DIR/node-b.pem" "$DIR/node-b.key" "$DIR/old-ca.pem" "$DIR/node-b.log"
+B_PID=$LAST_PID
+wait_health "http://127.0.0.1:$B_CONTROL" "$B_PID"
+OLD_ONLY_B_SESSION=$(session node-b)
+if curl -fsS --max-time 5 --cert "$DIR/node-new.pem" --key "$DIR/node-new.key" \
+  --cacert "$DIR/old-ca.pem" "https://localhost:$B_PEER/internal/v1/vms" >/dev/null 2>&1; then
+  echo "FAIL: rolled-back listener accepted a new-CA client" >&2
+  exit 1
+fi
+python3 "$PROBE" "$TARGET_URL" "$DIR/node-a.pem" "$DIR/node-a.key" "$DIR/old-ca.pem" \
+  "$SECRET" node-a "$OLD_ONLY_A_SESSION" node-b "$OLD_ONLY_B_SESSION" 404
+python3 "$PROBE" "$A_TARGET_URL" "$DIR/node-b.pem" "$DIR/node-b.key" "$DIR/old-ca.pem" \
+  "$SECRET" node-b "$OLD_ONLY_B_SESSION" node-a "$OLD_ONLY_A_SESSION" 404
+
+echo "PASS: dedicated peer mTLS + Postgres boot-session fencing + CA rotation and rollback"
