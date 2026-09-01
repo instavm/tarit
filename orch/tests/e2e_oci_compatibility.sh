@@ -13,6 +13,7 @@ SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
 KEY="oci-compatibility-e2e-key"
 PORT="${OCI_COMPATIBILITY_E2E_PORT:-}"
 IMAGE_SIZE_MIB="${OCI_COMPATIBILITY_IMAGE_SIZE_MIB:-1024}"
+EXPECTED_KERNEL_PREFIX="${TARIT_EXPECT_KERNEL_PREFIX:-}"
 
 for required in curl e2fsck python3 setsid skopeo sqlite3 umoci; do
   command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
@@ -28,6 +29,10 @@ test -r "$KERNEL" || { echo "FAIL: kernel not readable: $KERNEL" >&2; exit 1; }
 }
 grep -Eq '\b(vmx|svm)\b' /proc/cpuinfo || {
   echo "FAIL: worker nested-virtualization feature is unavailable" >&2
+  exit 1
+}
+[[ "$EXPECTED_KERNEL_PREFIX" =~ ^[0-9A-Za-z._+-]*$ ]] || {
+  echo "FAIL: TARIT_EXPECT_KERNEL_PREFIX contains unsupported characters" >&2
   exit 1
 }
 
@@ -287,16 +292,19 @@ PY
 
   if [ "$expectation" = shell ]; then
     SHELL_CASES=$((SHELL_CASES + 1))
-    IDENTITY_COMMAND="set -eu; test -b /dev/vda; test ! -e /dev/kvm; ! grep -Eq '(^|[[:space:]])(vmx|svm)([[:space:]]|$)' /proc/cpuinfo; printf 'PID1_EXE='; readlink /proc/1/exe; printf 'tarit-oci-ok\\n'; if [ -r /etc/os-release ]; then grep -E '^(ID|VERSION_ID)=' /etc/os-release; fi"
+    IDENTITY_COMMAND="set -eu; test -b /dev/vda; test ! -e /dev/kvm; ! grep -Eq '(^|[[:space:]])(vmx|svm)([[:space:]]|$)' /proc/cpuinfo; printf 'KERNEL_RELEASE='; uname -r; printf 'PID1_EXE='; readlink /proc/1/exe; printf 'tarit-oci-ok\\n'; if [ -r /etc/os-release ]; then grep -E '^(ID|VERSION_ID)=' /etc/os-release; fi"
     wait_exec_success "$CURRENT_VM" "$IDENTITY_COMMAND" "$DIR/exec-$name.json"
     BOOT_END=$(now_ms)
-    python3 - "$DIR/exec-$name.json" "$expected_id" "$expected_version" <<'PY'
+    python3 - "$DIR/exec-$name.json" "$expected_id" "$expected_version" "$EXPECTED_KERNEL_PREFIX" <<'PY'
 import json,re,sys
 row=json.load(open(sys.argv[1])); out=row.get("stdout", "")
 assert "tarit-oci-ok" in out, row
+kernel=next((line.removeprefix("KERNEL_RELEASE=") for line in out.splitlines() if line.startswith("KERNEL_RELEASE=")), None)
+expected_kernel=sys.argv[4]
+assert kernel and (not expected_kernel or kernel.startswith(expected_kernel)), (expected_kernel,kernel,row)
 pid1=next((line.removeprefix("PID1_EXE=") for line in out.splitlines() if line.startswith("PID1_EXE=")), None)
 assert pid1 in {"/usr/sbin/vmm-agent", "/usr/bin/vmm-agent"}, (pid1,row)
-expected_id, expected_version=sys.argv[2:]
+expected_id, expected_version=sys.argv[2:4]
 if expected_id:
     ids=dict(match.groups() for match in re.finditer(r'^(ID|VERSION_ID)=["\x27]?([^"\x27\n]+)', out, re.M))
     assert ids.get("ID") == expected_id, (ids,row)
@@ -580,4 +588,4 @@ if command -v systemctl >/dev/null && systemctl list-unit-files postgresql.servi
   systemctl is-active --quiet postgresql
 fi
 
-echo "OCI_COMPATIBILITY_PASS cases=$CASES shell_images=$SHELL_CASES expected_no_shell=$NO_SHELL_CASES"
+echo "OCI_COMPATIBILITY_PASS cases=$CASES shell_images=$SHELL_CASES expected_no_shell=$NO_SHELL_CASES kernel_prefix=${EXPECTED_KERNEL_PREFIX:-unchecked}"
