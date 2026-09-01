@@ -120,7 +120,7 @@ Result: `NET_SCALE_PASS`.
 | Scenario | Expected behavior | Validation |
 | --- | --- | --- |
 | Unauthenticated API call | `/v1/*` returns 401 without a valid `X-API-Key`; `/health` stays public | e2e: `e2e_cluster.sh` (`infra/auth`) |
-| Internal peer API exposed | `/internal/v1/*` returns 401 without the shared `X-Peer-Secret` | e2e: `e2e_cluster.sh` (`peer security`) |
+| Internal peer API isolation | `/internal/v1/*` is absent from the public listener; the peer listener rejects missing/untrusted certificates, mismatched host fingerprints, stale sessions, invalid HMACs, and replay | e2e: `e2e_peer_mtls.sh` + `e2e_cluster.sh` (`peer security`) |
 | Multi-tenant isolation | Hashed multi-key auth; tenants see only their own VMs; per-tenant VM quotas enforced | e2e: `e2e_multitenant.sh` |
 | Admin-only endpoints | `/v1/cluster` and other admin routes require an admin identity | design + `e2e_multitenant.sh` |
 | SSH gateway auth | A session is admitted only if the presented public key is registered and maps to a VM the caller owns | e2e: `e2e_ssh_pty.sh` |

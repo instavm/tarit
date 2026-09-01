@@ -44,7 +44,14 @@ cleanup() {
   find "$DIR" -depth -delete 2>/dev/null || true
 }
 trap cleanup EXIT
-trap 'status=$?; echo "FAIL: peer mTLS gate exited $status" >&2; tail -100 "$DIR"/*.log 2>/dev/null || true' ERR
+on_error() {
+  local exit_status=$?
+  trap - ERR
+  echo "FAIL: peer mTLS gate exited $exit_status" >&2
+  tail -100 "$DIR"/*.log 2>/dev/null || true
+  exit "$exit_status"
+}
+trap on_error ERR
 
 for required in curl openssl python3 psql createdb; do
   command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
@@ -84,7 +91,7 @@ cat "$DIR/old-ca.pem" "$DIR/new-ca.pem" >"$DIR/overlap-ca.pem"
 
 start_node() {
   local name=$1 control=$2 peer=$3 cert=$4 key=$5 ca=$6 log=$7
-  mkdir -m 700 -p "$DIR/$name/sockets" "$DIR/$name/images"
+  install -d -m 0700 "$DIR/$name" "$DIR/$name/sockets" "$DIR/$name/images"
   env \
     TARIT_API_KEY="peer-e2e-api-key-$name" \
     TARIT_HOST_ID="$name" \

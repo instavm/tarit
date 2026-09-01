@@ -131,21 +131,21 @@ export RUST_LOG='taritd=info,tower_http=info'
 
 Each node must differ:
 
-The `:8443` origins below assume a private TLS proxy that denies every route
-except `/internal/v1/*` and forwards those requests to the node's HTTP listener
-on `:8080`. The proxy must support WebSocket upgrades and preserve method, path,
-query, body, and `X-Tarit-*` headers exactly because `taritd` validates them as
-part of the request HMAC. Its certificate SAN must match the advertised
-hostname and chain to the WebPKI roots built into the Rustls clients; a custom
-peer CA cannot currently be configured. For an isolated development cluster
-without a compatible proxy, use the private `http://...:8080` origin and set
-`TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
+The `:8080` public control listener and `:8443` peer listener must be distinct.
+Each peer certificate must be valid for its advertised hostname and issued by a
+CA in every node's peer CA bundle. Store private keys with mode `0600`, owned by
+the service account.
 
 | Node | Required differences |
 | --- | --- |
-| A | `TARIT_HOST_ID=node-a`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-a.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-a/sockets`, `TARIT_DB=$HOME/.taritd/node-a/fleet.db` |
-| B | `TARIT_HOST_ID=node-b`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-b.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-b/sockets`, `TARIT_DB=$HOME/.taritd/node-b/fleet.db` |
-| C | `TARIT_HOST_ID=node-c`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-c.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-c/sockets`, `TARIT_DB=$HOME/.taritd/node-c/fleet.db` |
+| A | `TARIT_HOST_ID=node-a`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_PEER_LISTEN=0.0.0.0:8443`, `TARIT_RPC_ADDR=https://node-a.peer.example.com:8443`, node A certificate/key and local paths |
+| B | `TARIT_HOST_ID=node-b`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_PEER_LISTEN=0.0.0.0:8443`, `TARIT_RPC_ADDR=https://node-b.peer.example.com:8443`, node B certificate/key and local paths |
+| C | `TARIT_HOST_ID=node-c`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_PEER_LISTEN=0.0.0.0:8443`, `TARIT_RPC_ADDR=https://node-c.peer.example.com:8443`, node C certificate/key and local paths |
+
+Configure `TARIT_PEER_TLS_CERT`, `TARIT_PEER_TLS_KEY`, and
+`TARIT_PEER_TLS_CLIENT_CA` on every node. The CA bundle may contain more than
+one CA during a bounded certificate rotation. Production mode refuses to start
+without the dedicated mutual-TLS listener.
 
 Start `./target/release/taritd` on each node. Within one heartbeat interval, every node should show in:
 
@@ -161,6 +161,42 @@ Cluster startup checks:
 4. Each node has its own socket directory and SQLite DB path.
 5. Kernel, rootfs, and VMM binary paths are valid on every node.
 
+### Rotate peer certificates and CAs
+
+Peer TLS configuration is loaded at process start. Use a bounded overlap when
+changing the issuing CA; never replace the trust bundle and leaf certificates
+in one unverified step.
+
+1. Issue a new leaf certificate for every node from the new CA. Preserve each
+   node's advertised hostname in its certificate SAN.
+2. Build an overlap bundle containing the old and new CA certificates. Install
+   it atomically on every node, then restart nodes one at a time. Wait for the
+   restarted node to become healthy and complete an authenticated peer request
+   before proceeding.
+3. Install each node's new leaf chain and private key atomically, retaining the
+   overlap bundle. Restart one node at a time and verify that its new boot
+   session and certificate fingerprint replace the prior registration.
+4. After every node presents a new leaf, replace the overlap bundle with the
+   new CA only. Restart and verify nodes one at a time. Confirm that an old-CA
+   client can no longer establish a peer connection.
+
+Retain the old CA and encrypted private-key backup until the final rejection
+check passes. Before old-CA removal, rollback by restoring the old leaf while
+keeping the overlap bundle. After removal, first restore the overlap bundle on
+all nodes; only then roll leaf certificates back. This ordering avoids a mixed
+cluster in which old and new peers cannot authenticate each other.
+
+`TARIT_PEER_SECRET` has no overlap mechanism. Rotate it during a controlled
+peer-traffic drain: stop accepting lifecycle mutations, install the new secret
+on every node, restart the fleet, verify membership and an authenticated peer
+operation, then resume traffic. Rollback likewise restores the previous secret
+on every node as one coordinated operation. A rolling mixed-secret deployment
+is expected to reject cross-node requests and is not a valid rotation plan.
+
+The repository's `e2e_peer_mtls.sh` acceptance suite exercises missing and
+untrusted certificates, host/fingerprint and boot-session fencing, old/new CA
+overlap, new-leaf registration, and rejection of the old CA after removal.
+
 ## Load balancer
 
 Use `/health` for target health checks. It does not require authentication and always returns `{"status":"ok"}` when the HTTP server is alive.
@@ -172,9 +208,10 @@ Recommended public routing:
 | `/health` | Public or load balancer only. |
 | `/v1/*` | Public through TLS and `X-API-Key`. |
 | `/openapi.yaml`, `/docs` | Optional public exposure. Useful during development, consider restricting in production. |
-| `/internal/v1/*` | Private only. Never route from the public listener. |
+| `/internal/v1/*` | Dedicated peer listener only; absent from the public listener. |
 
-The current binary mounts public and internal routes on the same listener. In production, isolate internal access with network policy, security groups, firewall rules, or a sidecar/proxy that blocks `/internal/v1/*` from public networks.
+Restrict the peer listener with private addressing, security groups, or
+firewall policy even though mutual TLS and request authentication are mandatory.
 
 In fleet mode, asynchronous execution records are stored in PostgreSQL, so
 `GET /v1/executions/{id}` can be polled through any healthy API node.
@@ -473,11 +510,11 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 ## Security checklist
 
 - Use a long random `TARIT_API_KEY`.
-- Use a long random `TARIT_PEER_SECRET` for peers and rotate it with a coordinated restart.
-- Do not expose `/internal/v1/*` publicly.
+- Use a long random `TARIT_PEER_SECRET` for peer request authentication.
+- Expose `/internal/v1/*` only through the dedicated mutual-TLS peer listener.
 - Use TLS for public clients, usually at the load balancer.
-- Peer requests use a replay-protected HMAC; the shared key is never transmitted.
-- A separate internal listener with mandatory mTLS and host-session fencing is still required before hostile multi-tenant production use.
+- Peer requests use mutual TLS, certificate-to-host binding, boot-session
+  fencing, and a replay-protected HMAC; the shared key is never transmitted.
 - Keep `TARIT_RPC_ADDR` values private and stable.
 - Use PostgreSQL TLS and CA validation where available.
 - Restrict VMM, kernel, rootfs, socket, and SQLite paths to trusted local directories.
@@ -491,7 +528,8 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 | Startup fails with `configure at least one API key ...` | No API key configured. | Set `TARIT_API_KEY`, `TARIT_API_KEYS`, or `[api_keys]` in `TARIT_CONFIG`. |
 | Startup fails with peer secret error | Cluster mode without a strong `TARIT_PEER_SECRET`, or an explicit secret shorter than 32 characters. | Set a strong `TARIT_PEER_SECRET` on every node. |
 | `401 unauthorized` on `/v1/*` | Missing or wrong `X-API-Key`. | Check client header and environment value. |
-| `401` on `/internal/v1/*` | Missing or wrong `X-Peer-Secret`. | Ensure all nodes share the same peer secret. |
+| Peer TLS handshake is rejected | Missing client certificate, untrusted CA, hostname mismatch, or inaccessible key. | Verify the leaf chain, SAN, peer CA bundle, key ownership, and mode `0600`. |
+| `401` on `/internal/v1/*` after TLS succeeds | Wrong HMAC secret, stale boot session, wrong target, replay, or certificate registered to another host. | Verify the shared peer secret and inspect current host/session/fingerprint records. Never send `X-Peer-Secret`. |
 | Create returns 429 | All visible nodes are full for the admission window. Response carries `Retry-After`. | Check `/v1/cluster`, `TARIT_MAX_VMS`, max vCPUs, max memory, and stale heartbeats. |
 | Create returns 409 | A VM with the same explicit `id` already exists in the fleet. | Use a fresh id or look up the existing VM. |
 | Peer placement never happens | No PostgreSQL fleet or no healthy peers. | Check `TARIT_DATABASE_URL`, heartbeats, `rpc_addr`, and peer reachability. |

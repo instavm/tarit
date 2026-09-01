@@ -1,13 +1,13 @@
 # Architecture
 
-This document describes the distributed design implemented in `crates/taritd` and `crates/tarit-fleet`. Single-host mode and cluster mode are the same binary; cluster mode is selected by setting `TARIT_DATABASE_URL` and a strong shared `TARIT_PEER_SECRET`.
+This document describes the distributed design implemented in `crates/taritd` and `crates/tarit-fleet`. Single-host mode and cluster mode are the same binary; cluster mode is selected by setting `TARIT_DATABASE_URL`, a strong shared `TARIT_PEER_SECRET`, and the dedicated peer-listener configuration.
 
 ## Components
 
 | Component | Code | Responsibility |
 | --- | --- | --- |
 | Public HTTP API | `crates/taritd/src/api.rs` | Client-facing routes, API key auth, cluster placement, owner resolution, and peer forwarding. |
-| Internal peer API | `crates/taritd/src/internal.rs` | Node-local execution routes protected by `X-Peer-Secret`. |
+| Internal peer API | `crates/taritd/src/internal.rs` | Node-local execution routes on a dedicated mutual-TLS listener with certificate/host binding, request HMACs, replay defense, and boot-session fencing. |
 | Cluster logic | `crates/taritd/src/cluster.rs` | VM owner lookup, peer RPC lookup, placement candidate selection, ownership map maintenance. |
 | Node-local operations | `crates/taritd/src/ops.rs` | Shared local create, restore, stop, pause, resume, snapshot, exec, egress, and get operations. |
 | Peer client | `crates/taritd/src/peer.rs` | Hardened blocking HTTP client for `/internal/v1/*` calls. |
@@ -155,8 +155,8 @@ node B public API
   v
 node B peer client
   |
-  | X-Peer-Secret
-  | PATCH/POST/GET/DELETE http://node-a:8080/internal/v1/...
+  | mutual TLS + signed X-Tarit-Peer-* request headers
+  | PATCH/POST/GET/DELETE https://node-a:8443/internal/v1/...
   v
 node A internal API
   |
@@ -278,8 +278,13 @@ The design is simple and mostly eventually consistent:
 ## Security boundaries
 
 - Public API routes require `X-API-Key`.
-- Peer routes require `X-Peer-Secret`.
+- Peer routes exist only on the dedicated listener and require mutual TLS plus
+  the source/target-bound request HMAC.
+- The authenticated leaf-certificate fingerprint must match the source host's
+  current fleet registration and boot session.
 - Cluster mode refuses the built-in `dev-peer-secret`.
 - Peer URLs are not user supplied. They come from `fleet_hosts.rpc_addr`.
 - The peer HTTP client disables redirects to avoid redirect-based SSRF.
-- Production deployments should use mTLS between peers, restrict peer ports to private networks or security groups, and terminate public TLS at the load balancer or at `taritd` through a sidecar/proxy.
+- Production mode requires peer mutual TLS. Restrict peer ports to private
+  networks or security groups, and terminate public TLS at the load balancer or
+  at `taritd` through a sidecar/proxy.

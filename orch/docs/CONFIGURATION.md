@@ -14,9 +14,9 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | --- | --- | --- | --- |
 | `TARIT_API_KEY` | string | unset | Single public API key. When set, it adds tenant `default`, role `admin`, and unlimited VM quota (`max_vms = 0`). Empty values are rejected. |
 | `TARIT_API_KEYS` | comma-separated string | unset | Multi-key config. Format is `key:tenant:role[:max_vms]`. `role` is `admin` or `user`. Omitted or `0` `max_vms` means unlimited. Entries are added to any TOML keys. |
-| `TARIT_LISTEN` | socket address | `0.0.0.0:8080` | HTTP bind address for public and internal routes. Invalid socket addresses are rejected. |
+| `TARIT_LISTEN` | socket address | `0.0.0.0:8080` | HTTP bind address for the public control API. Invalid socket addresses are rejected. |
 | `TARIT_HOST_ID` | string | output of `hostname`, else `localhost` | Stable node identity used in local records and fleet ownership. |
-| `TARIT_RPC_ADDR` | string | `http://{listen.ip()}:{listen.port()}` | HTTP(S) origin advertised to peers. In cluster mode, set this to an address other nodes can reach; HTTPS is required unless insecure peer HTTP is explicitly enabled for development. |
+| `TARIT_RPC_ADDR` | string | `http://{listen.ip()}:{listen.port()}` | Origin advertised to peers. In cluster mode, set this to the dedicated peer listener's reachable HTTPS origin; insecure HTTP requires an explicit development-only override. |
 | `TARIT_VMM_BIN` | path | `vmm` (looked up on `PATH`) | Path to the rust-vmm based `vmm` binary. `~/` is expanded. |
 | `TARIT_KERNEL` | path | `/tmp/vmlinux.microvm` | Default guest kernel path used when a create request omits `kernel_path`. `make guest` writes the release kernel to `guest-assets/vmlinux`. `~/` is expanded. |
 | `TARIT_ROOTFS` | path | `/tmp/debian-rootfs.ext4` | Default rootfs path used when a create request omits `rootfs_path`. `~/` is expanded. |
@@ -32,6 +32,10 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | --- | --- | --- | --- |
 | `TARIT_DATABASE_URL` | string | unset | PostgreSQL fleet registry URL. Empty string is treated as unset. Setting this enables distributed fleet behavior. |
 | `TARIT_PEER_SECRET` | string | random local-only value | Key for short-lived, source/target-bound peer request HMACs. It is never sent on the wire. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
+| `TARIT_PEER_LISTEN` | socket address | unset | Dedicated bind address for `/internal/v1/*`. Fleet mode requires it. It must not share the public control listener. |
+| `TARIT_PEER_TLS_CERT` | path | unset | PEM certificate chain presented by the dedicated peer listener and peer client. Configure with the key and client-CA bundle. |
+| `TARIT_PEER_TLS_KEY` | path | unset | PEM private key for the peer certificate. Group- or world-accessible key files are rejected on Unix. |
+| `TARIT_PEER_TLS_CLIENT_CA` | path | unset | PEM CA bundle used both to authenticate peer clients and to validate peer servers. Multiple CA certificates provide an explicit rotation-overlap window. |
 | `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. |
 | `TARIT_PRODUCTION` | bool | `false` | Enforce the strict production configuration gates, including per-VM PID and network namespaces. This does not by itself satisfy every release gate in `PRODUCTION_READINESS.md`. |
 | `TARIT_IMAGE_REQUIRE_SIGNATURE` | bool | `false` | Require registered OCI images to have been verified with the currently configured cosign public key. `TARIT_PRODUCTION=1` requires this setting. Non-admin production creates must name a registered image and cannot fall back to the raw node default rootfs. |
@@ -301,8 +305,11 @@ export TARIT_PEER_SECRET='replace-with-a-long-random-peer-secret'
 export TARIT_DATABASE_URL='postgres://user:password@postgres.example:5432/taritd?sslmode=require'
 export TARIT_HOST_ID='node-a'
 export TARIT_LISTEN='0.0.0.0:8080'
-# HTTPS endpoint supplied by the private peer TLS proxy.
+export TARIT_PEER_LISTEN='0.0.0.0:8443'
 export TARIT_RPC_ADDR='https://node-a.peer.example.com:8443'
+export TARIT_PEER_TLS_CERT='/etc/tarit/pki/node-a-chain.pem'
+export TARIT_PEER_TLS_KEY='/etc/tarit/pki/node-a-key.pem'
+export TARIT_PEER_TLS_CLIENT_CA='/etc/tarit/pki/peer-ca-bundle.pem'
 export TARIT_VMM_BIN='/opt/taritd/bin/vmm'
 export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
@@ -315,14 +322,12 @@ export TARIT_MAX_MEMORY_MIB='65536'
 # export TARIT_RDS_CA_FILE="$HOME/.taritd/rds-global-bundle.pem"
 ```
 
-Nodes B and C should use the same API key, peer secret, database URL, VMM binary, kernel, and rootfs, but distinct `TARIT_HOST_ID`, `TARIT_RPC_ADDR`, `TARIT_SOCKET_DIR`, `TARIT_DB`, and usually `TARIT_IMAGES_DIR`.
-The HTTPS proxy must deny every route except `/internal/v1/*`, support WebSocket
-upgrades, and preserve the method, path, query, body, and `X-Tarit-*` headers
-exactly; `taritd` performs the request-HMAC authentication. Its certificate SAN
-must match the `TARIT_RPC_ADDR` host and chain to the WebPKI roots used by the
-built-in Rustls clients. There is no custom peer-CA setting yet. For an isolated
-development cluster without a compatible TLS proxy, use a private `http://`
-origin and set `TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
+Nodes B and C should use the same API key, peer secret, database URL, VMM binary,
+kernel, rootfs, and CA bundle, but distinct host identity, listeners, peer
+certificate and key, RPC origin, socket directory, local database, and usually
+image directory. Each peer certificate must be valid for the hostname in that
+node's `TARIT_RPC_ADDR`. Keep both listeners on private or appropriately
+firewalled networks; only the dedicated peer listener serves `/internal/v1/*`.
 
 ## Startup validation rules
 
@@ -336,6 +341,8 @@ origin and set `TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
 - Cluster peer origins must use HTTPS unless
   `TARIT_ALLOW_INSECURE_PEER_HTTP=1`; production mode always forbids insecure
   peer HTTP.
+- Fleet mode requires `TARIT_PEER_LISTEN`. Peer certificate, key, and client-CA
+  paths are all-or-nothing; production mode requires all three.
 - PTY active-connection limits must be positive; the per-tenant limit must be
   less than the global limit, and the per-VM limit must not exceed the
   per-tenant limit.

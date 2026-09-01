@@ -667,13 +667,14 @@ Status codes: `200`, `401`, `500`.
 
 ## Internal peer API
 
-Internal routes are currently mounted on the same HTTP listener. Each request
-uses a short-lived HMAC bound to method, path, body hash, nonce, source host, and
-target host; caller identity is signed separately and replay protected. The
-shared key is never transmitted, and the legacy `X-Peer-Secret` header is
-rejected. This is not a substitute for a separate internal listener with mTLS
-and host-session fencing; keep `/internal/v1/*` unreachable from public
-networks.
+Internal routes are mounted only on the dedicated `TARIT_PEER_LISTEN` listener;
+the public control listener does not serve them. Fleet deployments authenticate
+the connection with mutual TLS and bind the presented leaf-certificate
+fingerprint to the registered source host and boot session. Each request also
+uses a short-lived HMAC bound to method, path, body hash, nonce, source host,
+source boot session, target host, and target boot session. The shared key is
+never transmitted, replayed requests are rejected, and the legacy
+`X-Peer-Secret` header is not accepted.
 
 ### Internal endpoint table
 
