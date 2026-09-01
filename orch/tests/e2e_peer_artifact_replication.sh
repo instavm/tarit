@@ -13,6 +13,7 @@ TARITD="${TARITD_BIN:-$ORCH_ROOT/target/release/taritd}"
 VMM="${VMM_BIN:-$VMM_ROOT/target/release/vmm}"
 KERNEL="${KERNEL:-/tmp/vmlinux.microvm}"
 AGENT="${AGENT:-$VMM_ROOT/guest/agent/vmm-agent}"
+EXPECTED_KERNEL_PREFIX="${TARIT_EXPECT_KERNEL_PREFIX:-}"
 SECRET="0123456789abcdef0123456789abcdef-artifact-e2e"
 API_KEY="peer-artifact-e2e-key"
 DIR=$(mktemp -d "${TMPDIR:-/tmp}/tarit-peer-artifact.XXXXXX")
@@ -75,6 +76,11 @@ NFS_WAS_ACTIVE=0
 NFS_EXPORTED=0
 NFS_EXPORT_CONFIG=""
 NFS_EXPORT="$DIR/nfs-export"
+
+[[ "$EXPECTED_KERNEL_PREFIX" =~ ^[0-9A-Za-z._+-]*$ ]] || {
+  echo "FAIL: TARIT_EXPECT_KERNEL_PREFIX contains unsupported characters" >&2
+  exit 1
+}
 
 port() {
   python3 - <<'PY'
@@ -360,13 +366,20 @@ wait_exec_ubuntu() {
   for _ in $(seq 1 90); do
     code=$(curl -sS --max-time 5 -o "$response" -w '%{http_code}' \
       -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-      -d "{\"vm_id\":\"$vm_id\",\"command\":\"grep -E '^(ID|VERSION_ID)=' /etc/os-release\",\"timeout_ms\":5000}" \
+      -d "{\"vm_id\":\"$vm_id\",\"command\":\"uname -r; grep -E '^(ID|VERSION_ID)=' /etc/os-release\",\"timeout_ms\":5000}" \
       "$base/v1/execute" || true)
-    if [ "$code" = 200 ] && python3 - "$response" <<'PY'
+    if [ "$code" = 200 ] && python3 - "$response" "$EXPECTED_KERNEL_PREFIX" <<'PY'
 import json, sys
 row=json.load(open(sys.argv[1]))
 out=row.get("stdout", "")
+lines=out.splitlines()
+assert lines, row
+kernel_release=lines[0]
+expected=sys.argv[2]
+if expected:
+    assert kernel_release.startswith(expected), (expected, kernel_release)
 assert "ID=ubuntu" in out and 'VERSION_ID="24.04"' in out, row
+print(f"cross_node_guest_identity kernel={kernel_release} os=ubuntu")
 PY
     then
       return 0
