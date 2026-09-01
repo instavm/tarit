@@ -339,10 +339,58 @@ PY
 REPLACEMENT_JSON=$(api -H 'Content-Type: application/json' -d '{"vcpus":1,"memory_mib":256}' "$BASE_URL/v1/vms")
 REPLACEMENT_ID=$(printf '%s' "$REPLACEMENT_JSON" | json_field id)
 expect_exec "$REPLACEMENT_ID" 'printf replacement-capacity-ok' replacement-capacity-ok
+REPLACEMENT_PID=$(vmm_pid_for_id "$REPLACEMENT_ID")
+[ -n "$REPLACEMENT_PID" ] && kill -0 "$REPLACEMENT_PID"
+IFS='|' read -r REPLACEMENT_JAIL REPLACEMENT_OVERLAY REPLACEMENT_SOCKET <<EOF
+$(sqlite3 -separator '|' "$DIR/fleet.db" \
+  "select coalesce(runtime_jail_path, ''),coalesce(runtime_overlay_path, ''),coalesce(socket_path, '') from vms where id='$REPLACEMENT_ID';")
+EOF
+[ -n "$REPLACEMENT_JAIL" ] && [ -d "$REPLACEMENT_JAIL" ] || {
+  echo "FAIL: replacement VM has no live jail path" >&2
+  exit 1
+}
+[ -n "$REPLACEMENT_OVERLAY" ] && [ -f "$REPLACEMENT_OVERLAY" ] || {
+  echo "FAIL: replacement VM has no live overlay path" >&2
+  exit 1
+}
+[ -n "$REPLACEMENT_SOCKET" ] && [ -S "$REPLACEMENT_SOCKET" ] || {
+  echo "FAIL: replacement VM has no live control socket" >&2
+  exit 1
+}
+
+echo "== SIGSTOP VMM and verify API teardown remains bounded through SIGKILL =="
+kill -STOP "$REPLACEMENT_PID"
+TEARDOWN_START_NS=$(python3 -c 'import time; print(time.monotonic_ns())')
 api -X DELETE "$BASE_URL/v1/vms/$REPLACEMENT_ID" >/dev/null
+TEARDOWN_END_NS=$(python3 -c 'import time; print(time.monotonic_ns())')
+TEARDOWN_MS=$(((TEARDOWN_END_NS - TEARDOWN_START_NS) / 1000000))
+((TEARDOWN_MS <= 10000)) || {
+  echo "FAIL: forced VMM teardown exceeded 10 seconds: ${TEARDOWN_MS}ms" >&2
+  exit 1
+}
+wait_pid_gone "$REPLACEMENT_PID" || {
+  echo "FAIL: forced teardown retained VMM PID $REPLACEMENT_PID" >&2
+  exit 1
+}
+[ ! -e "$REPLACEMENT_SOCKET" ] || { echo "FAIL: forced teardown retained socket" >&2; exit 1; }
+[ ! -e "$REPLACEMENT_OVERLAY" ] || { echo "FAIL: forced teardown retained overlay" >&2; exit 1; }
+[ ! -e "$REPLACEMENT_JAIL" ] || { echo "FAIL: forced teardown retained jail" >&2; exit 1; }
+[ -z "$(vmm_pid_for_id "$REPLACEMENT_ID")" ] || {
+  echo "FAIL: forced teardown retained durable PID ownership" >&2
+  exit 1
+}
+[ -z "$(control_runtime_pids "$REPLACEMENT_ID")" ] || {
+  echo "FAIL: forced teardown retained a control-runtime process" >&2
+  exit 1
+}
+
+FINAL_JSON=$(api -H 'Content-Type: application/json' -d '{"vcpus":1,"memory_mib":256}' "$BASE_URL/v1/vms")
+FINAL_ID=$(printf '%s' "$FINAL_JSON" | json_field id)
+expect_exec "$FINAL_ID" 'printf post-teardown-capacity-ok' post-teardown-capacity-ok
+api -X DELETE "$BASE_URL/v1/vms/$FINAL_ID" >/dev/null
 api -X DELETE "$BASE_URL/v1/vms/$VM_ID" >/dev/null
 
 [ -z "$(vmm_pid_for_id "$REPLACEMENT_ID")" ] || { echo "FAIL: replacement VMM leaked" >&2; exit 1; }
 [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]
 grep -Eq '\b(vmx|svm)\b' /proc/cpuinfo
-echo "RUNTIME_CRASH_RECOVERY_PASS readopted_pid=$READOPTED_PID resumed_pid=$RESUMED_PID"
+echo "RUNTIME_CRASH_RECOVERY_PASS readopted_pid=$READOPTED_PID resumed_pid=$RESUMED_PID forced_teardown_ms=$TEARDOWN_MS"
