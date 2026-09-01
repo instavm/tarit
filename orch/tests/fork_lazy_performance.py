@@ -8,7 +8,9 @@ import json
 import math
 import os
 import pathlib
+import shutil
 import statistics
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -140,7 +142,13 @@ def positive_metric(metrics: dict[str, object], name: str) -> int:
 
 
 def run_case(
-    client: Client, memory_mib: int, vcpus: int, iterations: int
+    client: Client,
+    memory_mib: int,
+    vcpus: int,
+    iterations: int,
+    storage_path: pathlib.Path | None = None,
+    reclaim_every: int = 0,
+    min_free_bytes: int = 0,
 ) -> dict[str, object]:
     source_id = client.create(memory_mib, vcpus)
     child_id: str | None = None
@@ -198,6 +206,27 @@ def run_case(
             samples["downtime_us"].append(positive_metric(live, "downtime_us"))
             client.delete(child_id)
             child_id = None
+            if storage_path is not None:
+                free_bytes = shutil.disk_usage(storage_path).free
+                if free_bytes < min_free_bytes:
+                    raise GateFailure(
+                        f"free-space floor reached: {free_bytes} < {min_free_bytes}"
+                    )
+                if reclaim_every > 0 and (index + 1) % reclaim_every == 0:
+                    os.sync()
+                    try:
+                        subprocess.run(
+                            ["fstrim", str(storage_path)],
+                            check=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            timeout=60,
+                        )
+                    except (OSError, subprocess.SubprocessError) as error:
+                        raise GateFailure(
+                            f"storage reclaim failed for {storage_path}: {error}"
+                        ) from error
             print(
                 f"fork-performance memory_mib={memory_mib} "
                 f"iteration={index + 1}/{iterations}",
@@ -255,6 +284,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--large-memory-mib", type=int, default=4096)
     parser.add_argument("--vcpus", type=int, default=1)
     parser.add_argument("--request-timeout-seconds", type=float, default=180)
+    parser.add_argument("--storage-path", type=pathlib.Path)
+    parser.add_argument("--reclaim-every", type=int, default=0)
+    parser.add_argument("--min-free-bytes", type=int, default=0)
     parser.add_argument("--max-p99-total-us", type=int, default=8_000_000)
     parser.add_argument("--max-p99-downtime-us", type=int, default=50_000)
     parser.add_argument("--max-large-small-p99-ratio", type=float, default=1.25)
@@ -269,14 +301,31 @@ def parse_args() -> argparse.Namespace:
         parser.error("--request-timeout-seconds must be positive")
     if args.max_large_small_p99_ratio < 1:
         parser.error("--max-large-small-p99-ratio must be at least 1")
+    if args.reclaim_every < 0:
+        parser.error("--reclaim-every cannot be negative")
+    if args.reclaim_every > 0 and args.storage_path is None:
+        parser.error("--reclaim-every requires --storage-path")
+    if args.storage_path is not None and not args.storage_path.is_dir():
+        parser.error("--storage-path must be a directory")
+    if args.min_free_bytes < 0:
+        parser.error("--min-free-bytes cannot be negative")
     return args
 
 
 def main() -> None:
     args = parse_args()
     client = Client(args.base_url, args.api_key, args.request_timeout_seconds)
-    small = run_case(client, args.small_memory_mib, args.vcpus, args.iterations)
-    large = run_case(client, args.large_memory_mib, args.vcpus, args.iterations)
+    case_options = {
+        "storage_path": args.storage_path,
+        "reclaim_every": args.reclaim_every,
+        "min_free_bytes": args.min_free_bytes,
+    }
+    small = run_case(
+        client, args.small_memory_mib, args.vcpus, args.iterations, **case_options
+    )
+    large = run_case(
+        client, args.large_memory_mib, args.vcpus, args.iterations, **case_options
+    )
     small_metrics = small["metrics_us"]
     large_metrics = large["metrics_us"]
     assert isinstance(small_metrics, dict) and isinstance(large_metrics, dict)

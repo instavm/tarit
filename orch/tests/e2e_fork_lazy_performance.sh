@@ -124,6 +124,9 @@ python3 "$ROOT/orch/tests/fork_lazy_performance.py" \
   --iterations "$ITERATIONS" \
   --small-memory-mib "$SMALL_MEMORY_MIB" \
   --large-memory-mib "$LARGE_MEMORY_MIB" \
+  --storage-path "$SOCKET_ROOT" \
+  --reclaim-every 10 \
+  --min-free-bytes 3221225472 \
   --max-p99-total-us "$MAX_P99_TOTAL_US" \
   --max-p99-downtime-us "$MAX_P99_DOWNTIME_US" \
   --max-large-small-p99-ratio "$MAX_SIZE_RATIO"
