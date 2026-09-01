@@ -1170,12 +1170,12 @@ impl PostgresFleet {
                    status, verified_at, created_at, updated_at
                  ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                  ON CONFLICT (artifact_id, provider) DO UPDATE SET
-                   manifest_digest=EXCLUDED.manifest_digest,
-                   manifest_size_bytes=EXCLUDED.manifest_size_bytes,
                    status=EXCLUDED.status,
                    verified_at=EXCLUDED.verified_at,
                    updated_at=EXCLUDED.updated_at
-                 WHERE fleet_artifact_object_replicas.owner_key=EXCLUDED.owner_key",
+                 WHERE fleet_artifact_object_replicas.owner_key=EXCLUDED.owner_key
+                   AND fleet_artifact_object_replicas.manifest_digest=EXCLUDED.manifest_digest
+                   AND fleet_artifact_object_replicas.manifest_size_bytes=EXCLUDED.manifest_size_bytes",
                 &[
                     &replica.artifact_id,
                     &replica.owner_key,
@@ -1191,7 +1191,7 @@ impl PostgresFleet {
             .await?;
         if changed != 1 {
             return Err(FleetError::Conflict(
-                "object replica belongs to another tenant".into(),
+                "object replica identity is immutable or belongs to another tenant".into(),
             ));
         }
         Ok(())
@@ -4403,6 +4403,17 @@ mod tests {
             {
                 return Err(FleetError::Config(
                     "object replica was not idempotent and tenant scoped".into(),
+                ));
+            }
+            let mut rebound_object = object_replica.clone();
+            rebound_object.manifest_digest =
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+            if !matches!(
+                fleet.upsert_artifact_object_replica(&rebound_object).await,
+                Err(FleetError::Conflict(_))
+            ) {
+                return Err(FleetError::Config(
+                    "object replica immutable identity was rebound".into(),
                 ));
             }
             let mut unverified_object = object_replica;

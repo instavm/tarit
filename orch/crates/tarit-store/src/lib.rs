@@ -1065,12 +1065,12 @@ impl Store {
                    status, verified_at, created_at, updated_at
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
                  ON CONFLICT(artifact_id, provider) DO UPDATE SET
-                   manifest_digest=excluded.manifest_digest,
-                   manifest_size_bytes=excluded.manifest_size_bytes,
                    status=excluded.status,
                    verified_at=excluded.verified_at,
                    updated_at=excluded.updated_at
-                 WHERE artifact_object_replicas.owner_key=excluded.owner_key",
+                 WHERE artifact_object_replicas.owner_key=excluded.owner_key
+                   AND artifact_object_replicas.manifest_digest=excluded.manifest_digest
+                   AND artifact_object_replicas.manifest_size_bytes=excluded.manifest_size_bytes",
                 params![
                     replica.artifact_id.to_string(),
                     replica.owner_key,
@@ -1088,7 +1088,7 @@ impl Store {
             })?;
         if changed != 1 {
             return Err(StoreError::Conflict(
-                "object replica belongs to another tenant".into(),
+                "object replica identity is immutable or belongs to another tenant".into(),
             ));
         }
         Ok(())
@@ -3876,6 +3876,14 @@ mod tests {
             .list_artifact_object_replicas("tenant-b", artifact.artifact_id)
             .unwrap()
             .is_empty());
+
+        let mut rebound = replica.clone();
+        rebound.manifest_digest =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        assert!(matches!(
+            store.upsert_artifact_object_replica(&rebound),
+            Err(StoreError::Conflict(_))
+        ));
 
         let mut unverified = replica.clone();
         unverified.verified_at = None;
