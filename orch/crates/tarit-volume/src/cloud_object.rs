@@ -204,11 +204,19 @@ mod tests {
 
     async fn remote_round_trip(provider: RemoteImmutableObjectProvider) {
         let payload = format!("tarit-object-transport-{}", uuid::Uuid::new_v4());
-        let object = provider.put_if_absent(payload.as_bytes()).await.unwrap();
-        assert_eq!(
-            provider.put_if_absent(payload.as_bytes()).await.unwrap(),
-            object
-        );
+        let provider = Arc::new(provider);
+        let mut writes = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let provider = Arc::clone(&provider);
+            let payload = payload.clone();
+            writes.spawn(async move { provider.put_if_absent(payload.as_bytes()).await });
+        }
+        let mut object = None;
+        while let Some(result) = writes.join_next().await {
+            let written = result.unwrap().unwrap();
+            assert_eq!(*object.get_or_insert(written.clone()), written);
+        }
+        let object = object.expect("at least one conditional write completed");
         assert_eq!(
             provider.get_verified(&object).await.unwrap(),
             payload.as_bytes()

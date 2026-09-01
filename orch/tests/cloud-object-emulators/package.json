@@ -1,0 +1,11 @@
+{
+  "name": "tarit-cloud-object-emulators",
+  "private": true,
+  "version": "0.0.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "azurite": "3.35.0"
+  }
+}
