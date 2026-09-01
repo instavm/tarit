@@ -206,12 +206,12 @@ impl Store {
              CREATE INDEX IF NOT EXISTS vm_fork_operations_source
                ON vm_fork_operations(owner_key, source_vm_id);
              CREATE TABLE IF NOT EXISTS volume_fork_clones (
-               child_vm_id TEXT NOT NULL,
+               child_vm_id TEXT NOT NULL REFERENCES vm_fork_operations(child_vm_id) ON DELETE CASCADE,
                source_vm_id TEXT NOT NULL,
                owner_key TEXT NOT NULL,
                source_volume_id TEXT NOT NULL,
                child_volume_id TEXT NOT NULL UNIQUE,
-               device_index INTEGER NOT NULL,
+               device_index INTEGER NOT NULL CHECK (device_index BETWEEN 0 AND 14),
                mode TEXT NOT NULL CHECK (mode IN ('read_only','read_write')),
                source_generation INTEGER NOT NULL CHECK (source_generation > 0),
                child_generation INTEGER NOT NULL CHECK (child_generation > 0),
@@ -1951,6 +1951,7 @@ impl Store {
                 || record.owner_key != owner_key
                 || record.source_generation == 0
                 || record.child_generation == 0
+                || record.device_index > 14
                 || record.status != VolumeForkCloneStatus::Preparing
         }) {
             return Err(StoreError::Conflict(
@@ -1959,6 +1960,24 @@ impl Store {
         }
 
         let tx = self.conn.unchecked_transaction()?;
+        let operation = tx
+            .query_row(
+                "SELECT source_vm_id, owner_key FROM vm_fork_operations
+                 WHERE child_vm_id = ?1 AND status = 'preparing'",
+                params![child_vm_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if operation
+            .as_ref()
+            .is_none_or(|(durable_source, durable_owner)| {
+                durable_source != &source_vm_id.to_string() || durable_owner != owner_key
+            })
+        {
+            return Err(StoreError::Conflict(format!(
+                "fork child {child_vm_id} has no matching preparing operation"
+            )));
+        }
         for record in records {
             let source_generation = u64_to_sql_i64(record.source_generation)?;
             let child_generation = u64_to_sql_i64(record.child_generation)?;
@@ -4354,6 +4373,24 @@ mod tests {
         let now = Utc::now();
         let child_vm_id = Uuid::new_v4();
         let source_vm_id = Uuid::new_v4();
+        let operation = ForkOperationRecord {
+            child_vm_id,
+            source_vm_id,
+            owner_key: "tenant-a".into(),
+            source_host_id: "source-host".into(),
+            target_host_id: "target-host".into(),
+            target_boot_session_id: Some(Uuid::new_v4()),
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            store
+                .claim_fork_operation(&operation, 4, now + chrono::Duration::minutes(1))
+                .unwrap(),
+            ForkOperationClaimOutcome::New
+        );
         let first = VolumeForkCloneRecord {
             child_vm_id,
             source_vm_id,
@@ -4402,6 +4439,16 @@ mod tests {
             ..second.clone()
         };
         let another_child = Uuid::new_v4();
+        let another_operation = ForkOperationRecord {
+            child_vm_id: another_child,
+            ..operation.clone()
+        };
+        assert_eq!(
+            store
+                .claim_fork_operation(&another_operation, 4, now + chrono::Duration::minutes(1))
+                .unwrap(),
+            ForkOperationClaimOutcome::New
+        );
         assert!(matches!(
             store.claim_volume_fork_clones(&[
                 VolumeForkCloneRecord {
@@ -4416,8 +4463,19 @@ mod tests {
             Err(StoreError::Conflict(_))
         ));
 
+        let oversized_child = Uuid::new_v4();
+        let oversized_operation = ForkOperationRecord {
+            child_vm_id: oversized_child,
+            ..operation
+        };
+        assert_eq!(
+            store
+                .claim_fork_operation(&oversized_operation, 4, now + chrono::Duration::minutes(1))
+                .unwrap(),
+            ForkOperationClaimOutcome::New
+        );
         let oversized_generation = VolumeForkCloneRecord {
-            child_vm_id: Uuid::new_v4(),
+            child_vm_id: oversized_child,
             source_generation: u64::MAX,
             ..first.clone()
         };
