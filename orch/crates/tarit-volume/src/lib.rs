@@ -182,7 +182,9 @@ pub trait BlockVolumeProvider: Send + Sync {
     /// Clone a volume while the orchestrator holds the source VM's device-I/O
     /// quiescence boundary. Implementations must create an independent
     /// point-in-time child or fail; sharing the writable source and dense-copy
-    /// fallbacks are forbidden.
+    /// fallbacks are forbidden. Replaying the exact source/child generations
+    /// and size must return the previously completed clone. A pre-existing
+    /// child that cannot prove that exact origin must fail with `Conflict`.
     fn clone_quiesced(
         &self,
         _source_volume_id: Uuid,
@@ -411,17 +413,43 @@ impl BlockVolumeProvider for LocalBlockProvider {
                 "local atomic fork clones require a verified reflink filesystem".into(),
             ));
         }
-        clone_local_reflink(
-            &self.open_existing(&self.path(source_volume_id), true, Some(size_bytes))?,
-            &self.path(child_volume_id),
-            &self.root,
-        )?;
+        let provenance = clone_provenance(
+            source_volume_id,
+            source_generation,
+            child_volume_id,
+            child_generation,
+            size_bytes,
+        );
+        let child_path = self.path(child_volume_id);
+        match self.open_existing(&child_path, true, Some(size_bytes)) {
+            Ok(existing) => validate_clone_provenance(&existing, &provenance)?,
+            Err(VolumeError::NotFound) => clone_local_reflink(
+                &self.open_existing(&self.path(source_volume_id), true, Some(size_bytes))?,
+                &child_path,
+                &self.root,
+                &provenance,
+            )?,
+            Err(error) => return Err(error),
+        }
         Ok(ProviderVolume {
             volume_id: child_volume_id,
             size_bytes,
             constraint: PlacementConstraint::local_host(self.host_id.clone()),
         })
     }
+}
+
+fn clone_provenance(
+    source_volume_id: Uuid,
+    source_generation: u64,
+    child_volume_id: Uuid,
+    child_generation: u64,
+    size_bytes: u64,
+) -> Vec<u8> {
+    format!(
+        "v1:{source_volume_id}:{source_generation}:{child_volume_id}:{child_generation}:{size_bytes}"
+    )
+    .into_bytes()
 }
 
 #[cfg(target_os = "linux")]
@@ -443,7 +471,12 @@ fn supports_atomic_reflink(_root: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn clone_local_reflink(source: &File, destination: &Path, root: &Path) -> Result<(), VolumeError> {
+fn clone_local_reflink(
+    source: &File,
+    destination: &Path,
+    root: &Path,
+    provenance: &[u8],
+) -> Result<(), VolumeError> {
     const FICLONE: libc::Ioctl = 0x4004_9409;
     let mut options = OpenOptions::new();
     options
@@ -475,6 +508,9 @@ fn clone_local_reflink(source: &File, destination: &Path, root: &Path) -> Result
             _ => VolumeError::Io(error),
         });
     }
+    set_clone_provenance(&child, provenance).inspect_err(|_| {
+        let _ = fs::remove_file(destination);
+    })?;
     if let Err(error) = child.sync_all().and_then(|_| sync_directory(root)) {
         drop(child);
         let _ = fs::remove_file(destination);
@@ -493,9 +529,64 @@ fn clone_local_reflink(
     _source: &File,
     _destination: &Path,
     _root: &Path,
+    _provenance: &[u8],
 ) -> Result<(), VolumeError> {
     Err(VolumeError::Unsupported(
         "local atomic fork clones require Linux FICLONE".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn set_clone_provenance(file: &File, provenance: &[u8]) -> Result<(), VolumeError> {
+    const NAME: &[u8] = b"user.tarit.clone_origin\0";
+    // SAFETY: NAME is NUL-terminated, provenance remains valid for the call,
+    // and the file descriptor is owned by this process.
+    if unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            NAME.as_ptr().cast(),
+            provenance.as_ptr().cast(),
+            provenance.len(),
+            libc::XATTR_CREATE,
+        )
+    } != 0
+    {
+        return Err(VolumeError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_clone_provenance(file: &File, expected: &[u8]) -> Result<(), VolumeError> {
+    const NAME: &[u8] = b"user.tarit.clone_origin\0";
+    let mut actual = vec![0u8; expected.len()];
+    // SAFETY: NAME is NUL-terminated and `actual` is a writable buffer of the
+    // supplied length for the duration of the call.
+    let length = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            NAME.as_ptr().cast(),
+            actual.as_mut_ptr().cast(),
+            actual.len(),
+        )
+    };
+    if length < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENODATA | libc::ERANGE) => Err(VolumeError::Conflict),
+            _ => Err(VolumeError::Io(error)),
+        };
+    }
+    if usize::try_from(length).ok() != Some(expected.len()) || actual != expected {
+        return Err(VolumeError::Conflict);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn validate_clone_provenance(_file: &File, _expected: &[u8]) -> Result<(), VolumeError> {
+    Err(VolumeError::Unsupported(
+        "local atomic fork clones require Linux extended attributes".into(),
     ))
 }
 
@@ -646,8 +737,12 @@ mod tests {
                 .clone_quiesced(source_id, 3, child_id, 1, size)
                 .expect("reflink clone");
             assert_eq!(cloned.volume_id, child_id);
+            let replayed = provider
+                .clone_quiesced(source_id, 3, child_id, 1, size)
+                .expect("exact clone replay");
+            assert_eq!(replayed, cloned);
             assert!(matches!(
-                provider.clone_quiesced(source_id, 3, child_id, 1, size),
+                provider.clone_quiesced(source_id, 4, child_id, 1, size),
                 Err(VolumeError::Conflict)
             ));
 
