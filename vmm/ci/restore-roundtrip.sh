@@ -7,14 +7,26 @@
 #
 # Run on the c8i KVM host (needs sudo for /dev/kvm):
 #   sudo bash /tmp/restore-roundtrip.sh
-set -uo pipefail
+set -Eeuo pipefail
 
 VMM="${VMM:-$HOME/tarit/vmm/target/release/vmm}"
 KERNEL="${KERNEL:-/tmp/vmlinux.microvm}"
 ROOTFS="${ROOTFS:-/tmp/debian-rootfs.ext4}"
 SOCK=/tmp/vmm-restore.sock
 LOG=/tmp/vmm-restore-server.log
-rm -f "$SOCK" "$LOG"
+PERSISTED_SNAP="/tmp/vmm-restore-persisted-$$.snap"
+PERSISTED_INTEGRITY="/tmp/vmm-restore-persisted-$$.integrity.json"
+SERVE_PID=
+rm -f -- "$SOCK" "$LOG" "$PERSISTED_SNAP" "$PERSISTED_INTEGRITY"
+
+cleanup() {
+  if [[ -n "$SERVE_PID" ]]; then
+    kill "$SERVE_PID" 2>/dev/null || true
+    wait "$SERVE_PID" 2>/dev/null || true
+  fi
+  rm -f -- "$SOCK" "$PERSISTED_SNAP" "$PERSISTED_INTEGRITY"
+}
+trap cleanup EXIT
 
 api() {
   python3 - "$SOCK" "$1" <<'PY'
@@ -40,7 +52,7 @@ finally:
 PY
 }
 
-RUST_LOG=info "$VMM" serve --socket "$SOCK" --allow-unverified-restore >"$LOG" 2>&1 &
+RUST_LOG=info "$VMM" serve --socket "$SOCK" >"$LOG" 2>&1 &
 SERVE_PID=$!
 sleep 1
 
@@ -53,9 +65,10 @@ echo "  (booting 12s)"
 sleep 12
 
 echo "=== snapshot A ==="
-RA=$(api '{"op":"snapshot","diff":false}')
+RA=$(api '{"op":"snapshot","diff":false,"live":true}')
 echo "  $RA"
 SNAP=$(echo "$RA" | python3 -c "import sys,json;print(json.loads(sys.stdin.read()).get('path',''))" 2>/dev/null)
+INTEGRITY=$(echo "$RA" | python3 -c "import sys,json;print(json.loads(sys.stdin.read()).get('integrity_path',''))" 2>/dev/null)
 echo "  snap=$SNAP"
 if [ -z "$SNAP" ]; then
   echo "snapshot response did not include a path" >&2
@@ -65,18 +78,37 @@ if [ ! -f "$SNAP" ]; then
   echo "snapshot file does not exist: $SNAP" >&2
   exit 1
 fi
+if [ -z "$INTEGRITY" ] || [ ! -f "$INTEGRITY" ]; then
+  echo "snapshot response did not include an integrity manifest" >&2
+  exit 1
+fi
 # Snapshot paths returned by the VMM are process-owned scratch files. Preserve
-# a private test copy before stop, which correctly releases the scratch file.
-cp --reflink=auto --sparse=always "$SNAP" "$PERSISTED_SNAP"
+# private test copy before stop.
+cp --reflink=auto --sparse=always -- "$SNAP" "$PERSISTED_SNAP"
+cp --reflink=auto --sparse=always -- "$INTEGRITY" "$PERSISTED_INTEGRITY"
 test -s "$PERSISTED_SNAP"
+test -s "$PERSISTED_INTEGRITY"
+MANIFEST_SHA=$(sha256sum "$PERSISTED_INTEGRITY" | awk '{print $1}')
+[[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]]
 
 echo "=== stop ==="
 api '{"op":"stop"}'
 sleep 1
+test ! -e "$SNAP"
+test ! -e "$INTEGRITY"
 
 MARK=$(wc -l < "$LOG")
+echo "=== unauthenticated restore (expect: rejected) ==="
+UNVERIFIED=$(api '{"op":"restore","snapshot_path":"'"$PERSISTED_SNAP"'"}')
+echo "  $UNVERIFIED"
+python3 -c 'import json,sys; response=json.load(sys.stdin); assert response.get("status") == "err"; assert "unverified snapshot restore is disabled" in response.get("msg", "")' <<<"$UNVERIFIED"
+EMPTY_STATUS=$(api '{"op":"status"}')
+python3 -c 'import json,sys; response=json.load(sys.stdin); assert response.get("status") == "err"; assert "no VM" in response.get("msg", "")' <<<"$EMPTY_STATUS"
+
 echo "=== restore (expect: running) ==="
-api '{"op":"restore","snapshot_path":"'"$SNAP"'"}'
+RESTORED=$(api '{"op":"restore","snapshot_path":"'"$PERSISTED_SNAP"'","memory_integrity":{"manifest_path":"'"$PERSISTED_INTEGRITY"'","manifest_sha256":"'"$MANIFEST_SHA"'"}}')
+echo "  $RESTORED"
+python3 -c 'import json,sys; assert json.load(sys.stdin).get("status") == "restored"' <<<"$RESTORED"
 echo "  (running 5s post-restore)"
 sleep 5
 
@@ -88,14 +120,18 @@ echo "=== stop ==="
 api '{"op":"stop"}'
 sleep 1
 kill "$SERVE_PID" 2>/dev/null || true
+wait "$SERVE_PID" 2>/dev/null || true
+SERVE_PID=
 sleep 1
 
 echo ""
 echo "=== restore outcome ==="
-grep -nE "restored|reconstruct|could not" "$LOG" | tail -8
+grep -nE "restored|reconstruct|could not" "$LOG" | tail -8 || true
 echo ""
 echo "=== post-restore serial/log (lines after restore call) ==="
-tail -n +"$MARK" "$LOG" | grep -vE "^\s*$" | tail -60
+tail -n +"$MARK" "$LOG" | grep -vE "^\s*$" | tail -60 || true
 echo ""
 echo "=== any KVM errors / guest panic anywhere ==="
-grep -niE "panic|SHUTDOWN|triple|KVM_RUN|internal error|fault|BUG:" "$LOG" | tail -30
+grep -niE "panic|SHUTDOWN|triple|KVM_RUN|internal error|fault|BUG:" "$LOG" | tail -30 || true
+
+echo "AUTHENTICATED_RESTORE_E2E_PASS"

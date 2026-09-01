@@ -183,7 +183,7 @@ ROOTFS_MOUNT=
 e2fsck -pf "$TEST_ROOTFS" >/dev/null
 echo "restore-e2e: candidate guest agent sha256=$(sha256sum "$GUEST_AGENT_BIN" | awk '{print $1}')"
 TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE="$FAIL_PHASE" \
-  "$VMM_BIN" --socket "$SOCKET" serve >"$LOG" 2>&1 &
+  "$VMM_BIN" --socket "$SOCKET" serve --allow-unverified-restore >"$LOG" 2>&1 &
 SERVE_PID=$!
 for _ in $(seq 1 100); do
   [[ -S "$SOCKET" ]] && break
@@ -355,7 +355,8 @@ with open(path, "r+b", buffering=0) as snapshot:
 PY
 
 if timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
-  --snapshot "$INCOMPATIBLE" --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
+  --snapshot "$INCOMPATIBLE" --memory-policy lazy --allow-unverified-restore \
+  >"$RESTORE_ERROR" 2>&1; then
   echo "incompatible CPU template unexpectedly restored" >&2
   exit 1
 fi
@@ -400,7 +401,8 @@ with open(path, "r+b", buffering=0) as snapshot:
 PY
 
 if timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
-  --snapshot "$DOWNGRADED" --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
+  --snapshot "$DOWNGRADED" --memory-policy lazy --allow-unverified-restore \
+  >"$RESTORE_ERROR" 2>&1; then
   echo "compatibility-manifest downgrade unexpectedly restored" >&2
   exit 1
 fi
@@ -412,7 +414,8 @@ fi
 grep -q 'no VM' "$STATUS_ERROR"
 
 if timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
-  --snapshot "$CORRUPT" --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
+  --snapshot "$CORRUPT" --memory-policy lazy --allow-unverified-restore \
+  >"$RESTORE_ERROR" 2>&1; then
   echo "malformed runtime state unexpectedly restored" >&2
   exit 1
 fi
@@ -426,7 +429,7 @@ grep -q 'no VM' "$STATUS_ERROR"
 
 # The same server must remain usable after rejecting the corrupt artifact.
 timeout "$RESTORE_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore \
-  --snapshot "$SNAPSHOT" --memory-policy lazy >/dev/null
+  --snapshot "$SNAPSHOT" --memory-policy lazy --allow-unverified-restore >/dev/null
 wait_for_exec
 proof=$(guest_exec 'set -eu; cat /root/strict-restore-proof; test ! -e /dev/kvm; ! grep -Eq "(^|[[:space:]])(vmx|svm)([[:space:]]|$)" /proc/cpuinfo')
 grep -q strict-restore-proof <<<"$proof"
