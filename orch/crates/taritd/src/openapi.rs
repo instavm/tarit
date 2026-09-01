@@ -10,7 +10,7 @@ const DOCS_HTML: &str = r##"<!DOCTYPE html>
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>InstaVM Orchestrator API</title>
+  <title>Tarit API</title>
   <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
 </head>
 <body>
@@ -34,4 +34,15 @@ pub async fn spec(headers: HeaderMap) -> impl IntoResponse {
 
 pub async fn docs() -> Html<&'static str> {
     Html(DOCS_HTML)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DOCS_HTML;
+
+    #[test]
+    fn documentation_page_uses_the_standalone_product_name() {
+        assert!(DOCS_HTML.contains("<title>Tarit API</title>"));
+        assert!(!DOCS_HTML.contains("InstaVM"));
+    }
 }

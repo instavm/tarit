@@ -36,11 +36,21 @@ class OssBoundaryTest(unittest.TestCase):
     def test_rejects_out_of_tree_path_dependency(self) -> None:
         errors = self.check(
             {
-                "Cargo.toml": '[dependencies]\nlegacy = { path = "../legacy" }\n',
-                "package.json": '{"dependencies":{"legacy":"file:../legacy"}}',
+                "Cargo.toml": (
+                    '[workspace]\nmembers = ["../member"]\n'
+                    '[dependencies]\nlegacy = { path = "../legacy" }\n'
+                ),
+                "package.json": (
+                    '{"workspaces":["../packages/*"],'
+                    '"dependencies":{"legacy":"file:../legacy"}}'
+                ),
+                "pyproject.toml": (
+                    '[project]\nname="x"\nversion="0.1"\n'
+                    '[tool.uv.sources]\nlegacy={path="../python-legacy"}\n'
+                ),
             }
         )
-        self.assertEqual(sum("escapes repository" in error for error in errors), 2, errors)
+        self.assertEqual(sum("escapes repository" in error for error in errors), 5, errors)
 
     def test_rejects_product_dependencies_and_imports(self) -> None:
         errors = self.check(
@@ -50,9 +60,14 @@ class OssBoundaryTest(unittest.TestCase):
                 "package.json": '{"dependencies":{"@instavm/runtime":"1.0.0"}}',
                 "src/consumer.py": "from instavm_sdk import Client\n",
                 "src/consumer.rs": "use instavm::Client;\n",
+                "src/legacy.py": "from app.domain.firecracker import MicroVM\n",
+                "nested/package.json": (
+                    '{"dependencies":{"legacy":'
+                    '"git+https://github.com/BandarLabs/sandbox.git"}}'
+                ),
             }
         )
-        self.assertEqual(len(errors), 5, errors)
+        self.assertEqual(len(errors), 7, errors)
 
 
 if __name__ == "__main__":

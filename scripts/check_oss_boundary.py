@@ -28,11 +28,15 @@ NPM_DEPENDENCY_TABLES = {
 SOURCE_SUFFIXES = {".rs", ".py", ".ts", ".tsx", ".js", ".mjs", ".cjs"}
 IGNORED_DIRECTORIES = {".git", "node_modules", "target", "dist", "__pycache__"}
 PRODUCT_DEPENDENCY = re.compile(
-    r"(?:^|[/@_.-])instavm(?:$|[/_.-])|github\.com/instavm/(?!tarit(?:$|[/.#]))",
+    r"(?:^|[/@_.-])instavm(?:$|[/_.-])"
+    r"|github\.com/instavm/(?!tarit(?:$|[/.#]))"
+    r"|github\.com/bandarlabs/sandbox(?:$|[/.#])"
+    r"|@bandarlabs/sandbox(?:$|[/_.-])",
     re.IGNORECASE,
 )
 SOURCE_IMPORT = re.compile(
-    r"^\s*(?:use|extern\s+crate|import|from)\s+[^\n]*(?:@instavm/|instavm\b|instavm[_-])",
+    r"^\s*(?:use|extern\s+crate|import|from)\s+[^\n]*"
+    r"(?:@instavm/|instavm\b|instavm[_-]|@bandarlabs/sandbox|app\.domain\.firecracker)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -82,6 +86,11 @@ def check_cargo(root: Path, manifest: Path) -> list[str]:
                 and (error := check_local_path(root, manifest, specification["path"]))
             ):
                 errors.append(error)
+    workspace = data.get("workspace", {})
+    for field in ("members", "default-members"):
+        for raw_path in workspace.get(field, []):
+            if error := check_local_path(root, manifest, str(raw_path)):
+                errors.append(error)
     return errors
 
 
@@ -90,6 +99,9 @@ def check_python(root: Path, manifest: Path) -> list[str]:
     project = data.get("project", {})
     values = list(project.get("dependencies", []))
     for group in project.get("optional-dependencies", {}).values():
+        values.extend(group)
+    values.extend(data.get("build-system", {}).get("requires", []))
+    for group in data.get("dependency-groups", {}).values():
         values.extend(group)
     errors = []
     for value in values:
@@ -101,6 +113,16 @@ def check_python(root: Path, manifest: Path) -> list[str]:
             raw_path = raw_path.removeprefix("//")
             if error := check_local_path(root, manifest, raw_path):
                 errors.append(error)
+    uv = data.get("tool", {}).get("uv", {})
+    for name, specification in uv.get("sources", {}).items():
+        if PRODUCT_DEPENDENCY.search(dependency_text(name, specification)):
+            errors.append(f"{manifest}: product-specific Python source {name!r}")
+        if isinstance(specification, dict) and isinstance(specification.get("path"), str):
+            if error := check_local_path(root, manifest, specification["path"]):
+                errors.append(error)
+    for raw_path in uv.get("workspace", {}).get("members", []):
+        if error := check_local_path(root, manifest, str(raw_path)):
+            errors.append(error)
     return errors
 
 
@@ -121,6 +143,12 @@ def check_npm(root: Path, manifest: Path) -> list[str]:
                 )
             ):
                 errors.append(error)
+    workspaces = data.get("workspaces", [])
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages", [])
+    for raw_path in workspaces:
+        if error := check_local_path(root, manifest, str(raw_path)):
+            errors.append(error)
     return errors
 
 
