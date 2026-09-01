@@ -60,6 +60,7 @@ NFS_EXPORTED=0
 NFS_EXPORT_CONFIG=""
 NFS_EXPORT=""
 NFS_MOUNTS=""
+NFS_IO_PID=""
 
 if [ "$VOLUME_PROVIDER" = nfs_v4_1_block ]; then
   for required in exportfs mount.nfs4 systemctl; do
@@ -133,6 +134,11 @@ ROOTFS="$STAGED_ROOTFS"
 
 cleanup() {
   local status=$?
+  if [ -n "$NFS_IO_PID" ] && kill -0 "$NFS_IO_PID" 2>/dev/null; then
+    kill -TERM "$NFS_IO_PID" 2>/dev/null || true
+    wait "$NFS_IO_PID" 2>/dev/null || true
+  fi
+  NFS_IO_PID=""
   if [ -n "$ROOTFS_MOUNT" ] && mountpoint -q "$ROOTFS_MOUNT"; then
     umount "$ROOTFS_MOUNT" || status=1
   fi
@@ -154,6 +160,11 @@ cleanup() {
         status=1
       fi
     done < <(findmnt -rn -t nfs4 -o TARGET || true)
+  fi
+  if [ -n "$NFS_UNIT" ] && ! systemctl is-active --quiet "$NFS_UNIT" &&
+     ! systemctl start "$NFS_UNIT" >/dev/null 2>&1; then
+    echo "FAIL: could not restore $NFS_UNIT for NFS cleanup" >&2
+    status=1
   fi
   if [ "$NFS_EXPORTED" -eq 1 ]; then
     if ! exportfs -u "127.0.0.1:$NFS_EXPORT" 2>/dev/null; then
@@ -247,6 +258,67 @@ assert_no_provider_mounts() {
   fi
 }
 
+verify_nfs_reconnect() {
+  [ "$VOLUME_PROVIDER" = nfs_v4_1_block ] || return 0
+  local command response started deadline io_status
+  response="$DIR/nfs-reconnect-response.json"
+  if [ "$GUEST_VOLUME_MODE" = raw ]; then
+    command="printf 'tarit-nfs-reconnect' | dd of=/dev/vdb bs=1 seek=8192 conv=fsync && dd if=/dev/vdb bs=1 skip=8192 count=19"
+  else
+    command="printf 'tarit-nfs-reconnect' > /mnt/persist/reconnect && sync && cat /mnt/persist/reconnect"
+  fi
+
+  systemctl stop "$NFS_UNIT"
+  systemctl is-active --quiet "$NFS_UNIT" && {
+    echo "FAIL: NFS service remained active during reconnect gate" >&2
+    return 1
+  }
+  started=$(now_ms)
+  exec_request "$VM_ID" "$command" >"$response" &
+  NFS_IO_PID=$!
+  sleep 2
+  if ! kill -0 "$NFS_IO_PID" 2>/dev/null; then
+    wait "$NFS_IO_PID" || true
+    NFS_IO_PID=""
+    echo "FAIL: durable volume I/O did not wait for the unavailable NFS server" >&2
+    [ ! -f "$response" ] || cat "$response" >&2
+    return 1
+  fi
+
+  systemctl start "$NFS_UNIT"
+  exportfs -ra
+  deadline=$((SECONDS + 90))
+  while kill -0 "$NFS_IO_PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 0.2
+  done
+  if kill -0 "$NFS_IO_PID" 2>/dev/null; then
+    kill -TERM "$NFS_IO_PID" 2>/dev/null || true
+    wait "$NFS_IO_PID" 2>/dev/null || true
+    NFS_IO_PID=""
+    echo "FAIL: durable volume I/O did not recover after NFS restart" >&2
+    return 1
+  fi
+  set +e
+  wait "$NFS_IO_PID"
+  io_status=$?
+  set -e
+  NFS_IO_PID=""
+  [ "$io_status" -eq 0 ] || {
+    echo "FAIL: durable volume I/O failed after NFS restart" >&2
+    [ ! -f "$response" ] || cat "$response" >&2
+    return 1
+  }
+  python3 - "$response" <<'PY'
+import json,sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    result=json.load(source)
+assert result["exit_code"] == 0, result
+assert "tarit-nfs-reconnect" in result.get("stdout", ""), result
+PY
+  NFS_RECONNECT_MS=$(( $(now_ms) - started ))
+  assert_no_provider_mounts
+}
+
 TARIT_API_KEY="$KEY" \
 TARIT_LISTEN="127.0.0.1:$PORT" \
 TARIT_RPC_ADDR="$BASE_URL" \
@@ -338,6 +410,8 @@ else
   expect_exec "$VM_ID" "export PATH=/usr/sbin:/usr/bin:/sbin:/bin; mkdir -p /mnt/persist && mount /dev/vdb /mnt/persist && printf 'tarit-volume-proof' > /mnt/persist/proof && sync && cat /mnt/persist/proof" tarit-volume-proof
 fi
 assert_no_provider_mounts
+NFS_RECONNECT_MS=0
+verify_nfs_reconnect
 
 echo "== reject non-cloning snapshot and fork before artifact work =="
 SNAPSHOT_REJECT_BODY="$DIR/snapshot-volume-reject.json"
@@ -439,4 +513,4 @@ if command -v systemctl >/dev/null && systemctl list-unit-files postgresql.servi
   systemctl is-active --quiet postgresql || { echo "FAIL: PostgreSQL is unhealthy" >&2; exit 1; }
 fi
 
-echo "VOLUME_E2E_PASS provider=$VOLUME_PROVIDER guest_mode=$GUEST_VOLUME_MODE kernel=$GUEST_KERNEL_RELEASE os=$EXPECTED_OS_ID vm_id=$VM_ID volume_id=$VOLUME_ID http_resume_ms=$((RESUME_END-RESUME_START)) credentials_in_guest=0 snapshot_fork_preflight=pass"
+echo "VOLUME_E2E_PASS provider=$VOLUME_PROVIDER guest_mode=$GUEST_VOLUME_MODE kernel=$GUEST_KERNEL_RELEASE os=$EXPECTED_OS_ID vm_id=$VM_ID volume_id=$VOLUME_ID http_resume_ms=$((RESUME_END-RESUME_START)) nfs_reconnect_ms=$NFS_RECONNECT_MS credentials_in_guest=0 snapshot_fork_preflight=pass"

@@ -35,4 +35,4 @@ for provider in local_block nfs_v4_1_block; do
 done
 
 [ "$passed" -eq 8 ] || { echo "FAIL: incomplete matrix: passed=$passed expected=8" >&2; exit 1; }
-echo "PASS: all 8 persistent-volume OCI/kernel/provider cases passed"
+echo "PASS: all 8 persistent-volume OCI/kernel/provider cases passed, including NFS outage recovery"
