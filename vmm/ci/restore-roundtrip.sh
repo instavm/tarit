@@ -11,22 +11,55 @@ set -Eeuo pipefail
 
 VMM="${VMM:-$HOME/tarit/vmm/target/release/vmm}"
 KERNEL="${KERNEL:-/tmp/vmlinux.microvm}"
-ROOTFS="${ROOTFS:-/tmp/debian-rootfs.ext4}"
-SOCK=/tmp/vmm-restore.sock
-LOG=/tmp/vmm-restore-server.log
-PERSISTED_SNAP="/tmp/vmm-restore-persisted-$$.snap"
-PERSISTED_INTEGRITY="/tmp/vmm-restore-persisted-$$.integrity.json"
+ROOTFS_SOURCE="${ROOTFS:-/tmp/debian-rootfs.ext4}"
+GUEST_AGENT_BIN="${GUEST_AGENT_BIN:-}"
+SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-/tmp}"
+WORK_DIR=$(mktemp -d "${SOCKET_ROOT%/}/tarit-authenticated-restore.XXXXXX")
+SOCK="$WORK_DIR/vmm.sock"
+LOG="$WORK_DIR/vmm.log"
+PERSISTED_SNAP="$WORK_DIR/persisted.snap"
+PERSISTED_INTEGRITY="$WORK_DIR/persisted.integrity.json"
+TEST_ROOTFS=
+ROOTFS_MOUNT=
 SERVE_PID=
-rm -f -- "$SOCK" "$LOG" "$PERSISTED_SNAP" "$PERSISTED_INTEGRITY"
 
 cleanup() {
   if [[ -n "$SERVE_PID" ]]; then
     kill "$SERVE_PID" 2>/dev/null || true
     wait "$SERVE_PID" 2>/dev/null || true
   fi
+  if [[ -n "$ROOTFS_MOUNT" ]] && mountpoint -q "$ROOTFS_MOUNT"; then
+    umount "$ROOTFS_MOUNT" 2>/dev/null || true
+  fi
   rm -f -- "$SOCK" "$PERSISTED_SNAP" "$PERSISTED_INTEGRITY"
+  if [[ -n "$TEST_ROOTFS" ]]; then
+    rm -f -- "$TEST_ROOTFS"
+  fi
+  if [[ -n "$ROOTFS_MOUNT" ]]; then
+    rmdir -- "$ROOTFS_MOUNT" 2>/dev/null || true
+  fi
+  rm -f -- "$LOG"
+  rmdir -- "$WORK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+ROOTFS="$ROOTFS_SOURCE"
+if [[ -n "$GUEST_AGENT_BIN" ]]; then
+  [[ -x "$GUEST_AGENT_BIN" ]]
+  TEST_ROOTFS="$WORK_DIR/rootfs.ext4"
+  cp --reflink=auto --sparse=always -- "$ROOTFS_SOURCE" "$TEST_ROOTFS"
+  chmod 0600 "$TEST_ROOTFS"
+  ROOTFS_MOUNT="$WORK_DIR/rootfs-mount"
+  mkdir -m 0700 "$ROOTFS_MOUNT"
+  mount -o loop,rw -- "$TEST_ROOTFS" "$ROOTFS_MOUNT"
+  install -D -m 0755 -- "$GUEST_AGENT_BIN" "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  sync -f "$ROOTFS_MOUNT/usr/sbin/vmm-agent"
+  umount "$ROOTFS_MOUNT"
+  rmdir -- "$ROOTFS_MOUNT"
+  ROOTFS_MOUNT=
+  e2fsck -pf "$TEST_ROOTFS" >/dev/null
+  ROOTFS="$TEST_ROOTFS"
+fi
 
 api() {
   python3 - "$SOCK" "$1" <<'PY'
@@ -57,6 +90,9 @@ SERVE_PID=$!
 sleep 1
 
 CMDLINE="console=ttyS0 reboot=k panic=-1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw"
+if [[ -n "$GUEST_AGENT_BIN" ]]; then
+  CMDLINE="$CMDLINE init=/usr/sbin/vmm-agent"
+fi
 
 echo "=== create (real kernel + rootfs, full boot) ==="
 CFG='{"op":"create","config":{"kernel":{"path":"'"$KERNEL"'","cmdline":"'"$CMDLINE"'","initramfs":null},"memory":{"size_mib":256},"vcpus":{"count":1},"volumes":[{"path":"'"$ROOTFS"'","read_only":false}],"net":[]}}'
