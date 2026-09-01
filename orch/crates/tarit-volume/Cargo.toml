@@ -4,8 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+cloud-object-store = ["dep:object_store"]
+cloud-object-store-aws = ["cloud-object-store", "object_store/aws"]
+cloud-object-store-azure = ["cloud-object-store", "object_store/azure"]
+
 [dependencies]
 libc = "0.2"
+object_store = { workspace = true, optional = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+object_store.workspace = true
+tokio.workspace = true

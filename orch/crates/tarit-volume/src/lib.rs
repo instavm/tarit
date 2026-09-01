@@ -13,12 +13,16 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod attached_block;
+#[cfg(feature = "cloud-object-store")]
+mod cloud_object;
 mod nfs;
 mod object;
 
 pub use attached_block::{
     AttachedBlockKind, AttachedBlockProvider, BlockDeviceIdentity, BlockDeviceRegistration,
 };
+#[cfg(feature = "cloud-object-store")]
+pub use cloud_object::RemoteImmutableObjectProvider;
 pub use nfs::{
     NfsBackedBlockProvider, NfsDialect, NfsMountSpec, NfsProvider, NfsSecurityFlavor,
     PreparedFilesystemAttachment, SystemNfsMounter,
