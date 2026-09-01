@@ -179,14 +179,8 @@ impl BlockVolumeProvider for AttachedBlockProvider {
             read_only_many: true,
             read_write_once: true,
             read_write_many: false,
-            snapshots: matches!(
-                self.kind,
-                AttachedBlockKind::AwsEbs | AttachedBlockKind::AzureDisk
-            ),
-            clones: matches!(
-                self.kind,
-                AttachedBlockKind::AwsEbs | AttachedBlockKind::AzureDisk
-            ),
+            snapshots: false,
+            clones: false,
         }
     }
 

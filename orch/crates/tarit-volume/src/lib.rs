@@ -7,6 +7,10 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -174,6 +178,24 @@ pub trait BlockVolumeProvider: Send + Sync {
         mode: AccessMode,
         generation: u64,
     ) -> Result<PreparedBlockAttachment, VolumeError>;
+
+    /// Clone a volume while the orchestrator holds the source VM's device-I/O
+    /// quiescence boundary. Implementations must create an independent
+    /// point-in-time child or fail; sharing the writable source and dense-copy
+    /// fallbacks are forbidden.
+    fn clone_quiesced(
+        &self,
+        _source_volume_id: Uuid,
+        _source_generation: u64,
+        _child_volume_id: Uuid,
+        _child_generation: u64,
+        _size_bytes: u64,
+    ) -> Result<ProviderVolume, VolumeError> {
+        Err(VolumeError::Unsupported(format!(
+            "{} does not support atomic fork clones",
+            self.provider_name()
+        )))
+    }
 }
 
 /// A single-host provider useful for development, bare-metal installations,
@@ -184,6 +206,7 @@ pub struct LocalBlockProvider {
     root: PathBuf,
     host_id: String,
     max_size_bytes: u64,
+    atomic_reflink: bool,
 }
 
 impl LocalBlockProvider {
@@ -203,10 +226,12 @@ impl LocalBlockProvider {
         }
         let root = root.into();
         ensure_private_root(&root)?;
+        let atomic_reflink = supports_atomic_reflink(&root);
         Ok(Self {
             root,
             host_id,
             max_size_bytes,
+            atomic_reflink,
         })
     }
 
@@ -262,7 +287,7 @@ impl BlockVolumeProvider for LocalBlockProvider {
             read_write_once: true,
             read_write_many: false,
             snapshots: false,
-            clones: false,
+            clones: self.atomic_reflink,
         }
     }
 
@@ -361,6 +386,117 @@ impl BlockVolumeProvider for LocalBlockProvider {
             private_path: path,
         })
     }
+
+    fn clone_quiesced(
+        &self,
+        source_volume_id: Uuid,
+        source_generation: u64,
+        child_volume_id: Uuid,
+        child_generation: u64,
+        size_bytes: u64,
+    ) -> Result<ProviderVolume, VolumeError> {
+        self.validate_size(size_bytes)?;
+        if source_volume_id == child_volume_id {
+            return Err(VolumeError::Invalid(
+                "source and child volume identities must differ".into(),
+            ));
+        }
+        if source_generation == 0 || child_generation == 0 {
+            return Err(VolumeError::Invalid(
+                "source and child generations must be positive".into(),
+            ));
+        }
+        if !self.atomic_reflink {
+            return Err(VolumeError::Unsupported(
+                "local atomic fork clones require a verified reflink filesystem".into(),
+            ));
+        }
+        clone_local_reflink(
+            &self.open_existing(&self.path(source_volume_id), true, Some(size_bytes))?,
+            &self.path(child_volume_id),
+            &self.root,
+        )?;
+        Ok(ProviderVolume {
+            volume_id: child_volume_id,
+            size_bytes,
+            constraint: PlacementConstraint::local_host(self.host_id.clone()),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn supports_atomic_reflink(root: &Path) -> bool {
+    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683e;
+    let Ok(path) = std::ffi::CString::new(root.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `path` is NUL-terminated and `filesystem` points to writable,
+    // correctly sized storage initialized by statfs on success.
+    let result = unsafe { libc::statfs(path.as_ptr(), filesystem.as_mut_ptr()) };
+    result == 0 && unsafe { filesystem.assume_init() }.f_type == BTRFS_SUPER_MAGIC
+}
+
+#[cfg(not(target_os = "linux"))]
+fn supports_atomic_reflink(_root: &Path) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn clone_local_reflink(source: &File, destination: &Path, root: &Path) -> Result<(), VolumeError> {
+    const FICLONE: libc::Ioctl = 0x4004_9409;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let child = match options.open(destination) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(VolumeError::Conflict)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // SAFETY: both descriptors remain open for the ioctl. The destination was
+    // exclusively created above and the source was identity-checked by the
+    // provider before this function was called.
+    if unsafe { libc::ioctl(child.as_raw_fd(), FICLONE, source.as_raw_fd()) } != 0 {
+        let error = io::Error::last_os_error();
+        drop(child);
+        let _ = fs::remove_file(destination);
+        return Err(match error.raw_os_error() {
+            Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::ENOTTY) => {
+                VolumeError::Unsupported(
+                    "filesystem refused the required atomic reflink clone".into(),
+                )
+            }
+            _ => VolumeError::Io(error),
+        });
+    }
+    if let Err(error) = child.sync_all().and_then(|_| sync_directory(root)) {
+        drop(child);
+        let _ = fs::remove_file(destination);
+        return Err(error.into());
+    }
+    if let Err(error) = validate_owned_file(&child, Some(source.metadata()?.len())) {
+        drop(child);
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn clone_local_reflink(
+    _source: &File,
+    _destination: &Path,
+    _root: &Path,
+) -> Result<(), VolumeError> {
+    Err(VolumeError::Unsupported(
+        "local atomic fork clones require Linux FICLONE".into(),
+    ))
 }
 
 fn ensure_private_root(root: &Path) -> Result<(), VolumeError> {
@@ -486,6 +622,63 @@ mod tests {
             Err(VolumeError::Invalid(_))
         ));
         provider.delete(id).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn local_fork_clone_is_independent_or_explicitly_unsupported() {
+        let root = test_root("fork-clone");
+        let provider = LocalBlockProvider::open(&root, "host-a", 8 * MIN_BLOCK_VOLUME_BYTES)
+            .expect("provider");
+        let source_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let size = 2 * MIN_BLOCK_VOLUME_BYTES;
+        provider.create(source_id, size).unwrap();
+        let mut source = provider
+            .prepare(source_id, size, AccessMode::ReadWriteOnce, 3)
+            .unwrap();
+        source.file.write_all(b"source-before-fork").unwrap();
+        source.file.sync_all().unwrap();
+        drop(source);
+
+        if provider.capabilities().clones {
+            let cloned = provider
+                .clone_quiesced(source_id, 3, child_id, 1, size)
+                .expect("reflink clone");
+            assert_eq!(cloned.volume_id, child_id);
+            assert!(matches!(
+                provider.clone_quiesced(source_id, 3, child_id, 1, size),
+                Err(VolumeError::Conflict)
+            ));
+
+            let mut child = provider
+                .prepare(child_id, size, AccessMode::ReadWriteOnce, 1)
+                .unwrap();
+            let mut inherited = vec![0; b"source-before-fork".len()];
+            child.file.read_exact(&mut inherited).unwrap();
+            assert_eq!(&inherited, b"source-before-fork");
+            child.file.seek(SeekFrom::Start(0)).unwrap();
+            child.file.write_all(b"child-independent").unwrap();
+            child.file.sync_all().unwrap();
+            drop(child);
+
+            let mut source = provider
+                .prepare(source_id, size, AccessMode::ReadOnlyMany, 3)
+                .unwrap();
+            let mut unchanged = vec![0; b"source-before-fork".len()];
+            source.file.read_exact(&mut unchanged).unwrap();
+            assert_eq!(&unchanged, b"source-before-fork");
+            drop(source);
+            provider.delete(child_id).unwrap();
+        } else {
+            assert!(matches!(
+                provider.clone_quiesced(source_id, 3, child_id, 1, size),
+                Err(VolumeError::Unsupported(_))
+            ));
+            assert!(!provider.path(child_id).exists());
+        }
+
+        provider.delete(source_id).unwrap();
         fs::remove_dir(root).unwrap();
     }
 
