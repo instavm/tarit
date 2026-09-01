@@ -632,8 +632,16 @@ if [ "${TARIT_TEST_OBJECT_FALLBACK:-0}" = 1 ]; then
       "delete from images where source_digest='$IMAGE_SOURCE_DIGEST'"
     rm -f -- "$CACHED_ROOTFS"
   fi
-  kill -TERM "$A_PID"
-  wait "$A_PID"
+  SOURCE_VMM_PID=$(sqlite3 "$DIR/node-a/store.db" \
+    "select pid from vms where id='$SOURCE_VM' and status='running'")
+  test -n "$SOURCE_VMM_PID"
+  kill -KILL "$A_PID" "$SOURCE_VMM_PID"
+  wait "$A_PID" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    ! kill -0 "$SOURCE_VMM_PID" 2>/dev/null && break
+    sleep 0.1
+  done
+  ! kill -0 "$SOURCE_VMM_PID" 2>/dev/null
   A_PID=""
   OWNER_STALE=0
   for _ in $(seq 1 40); do
