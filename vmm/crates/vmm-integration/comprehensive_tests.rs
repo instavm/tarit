@@ -290,6 +290,50 @@ fn live_snapshot_consistency_harness() {
     eprintln!("live snapshot consistency: PASS (payload + restore + diff + 2x snapshot)");
 }
 
+/// The provider callback must run inside the same final-stop boundary as RAM,
+/// device state, and the writable root overlay. Aborting that callback must
+/// resume the authoritative source and leave no snapshot artifacts behind.
+#[test]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
+fn live_snapshot_clone_boundary_commit_and_abort() {
+    let controller = VmmController::new();
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("create live source");
+    assert_guest_exec(&controller, "printf boundary-source", "boundary-source");
+
+    let error = controller
+        .live_snapshot_with_final_stop(LiveSnapshotConfig::default(), || {
+            Err(vmm_core::error::VmmError::Snapshot(
+                "injected provider clone abort".into(),
+            ))
+        })
+        .expect_err("provider abort must fail the snapshot");
+    assert!(error.to_string().contains("provider clone abort"));
+    assert_guest_exec(
+        &controller,
+        "printf source-resumed-after-abort",
+        "source-resumed-after-abort",
+    );
+
+    let boundary_entered = std::sync::atomic::AtomicBool::new(false);
+    let result = controller
+        .live_snapshot_with_final_stop(LiveSnapshotConfig::default(), || {
+            boundary_entered.store(true, std::sync::atomic::Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Ok(())
+        })
+        .expect("committed clone boundary snapshot");
+    assert!(boundary_entered.load(std::sync::atomic::Ordering::Acquire));
+    assert!(result.downtime >= std::time::Duration::from_millis(25));
+    assert_guest_exec(
+        &controller,
+        "printf source-resumed-after-commit",
+        "source-resumed-after-commit",
+    );
+    controller.stop().expect("stop source");
+}
+
 /// Device-DMA staleness regression. KVM's dirty log only records guest vCPU
 /// writes; pages that virtio devices DMA into (block reads filling the page
 /// cache, net/vsock RX buffers, used rings) are written by VMM userspace and
