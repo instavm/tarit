@@ -50,7 +50,8 @@ cleanup() {
     kill -KILL -- "-$TARITD_PGID" 2>/dev/null || true
   fi
   [[ -z "$TARITD_PID" ]] || wait "$TARITD_PID" 2>/dev/null || true
-  if [[ "${TARIT_TEST_KEEP_DIR:-0}" == 1 ]]; then
+  if [[ "${TARIT_TEST_KEEP_DIR:-0}" == 1 ]] ||
+     { [[ "$status" -ne 0 ]] && [[ "${TARIT_TEST_KEEP_FAILED:-0}" == 1 ]]; }; then
     echo "retained fork performance artifacts at $DIR" >&2
   else
     find "$DIR" -depth -delete 2>/dev/null || true
