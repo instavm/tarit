@@ -1,7 +1,14 @@
 use crate::{ImmutableObject, ObjectDigest, VolumeError};
+use futures_util::StreamExt;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, WriteMultipart};
+use sha2::{Digest, Sha256};
+use std::fs::OpenOptions;
+use std::io::{Read, Seek};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path as FilePath;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Content-addressed immutable blobs backed by a remote object store.
 ///
@@ -55,6 +62,10 @@ impl RemoteImmutableObjectProvider {
         Path::from(format!("{}/{}.blob", self.prefix, digest.hex()))
     }
 
+    fn staging_location(&self) -> Path {
+        Path::from(format!("{}/.staging/{}", self.prefix, uuid::Uuid::new_v4()))
+    }
+
     pub async fn put_if_absent(&self, bytes: &[u8]) -> Result<ImmutableObject, VolumeError> {
         let size_bytes = u64::try_from(bytes.len())
             .map_err(|_| VolumeError::Invalid("object length overflows u64".into()))?;
@@ -97,6 +108,182 @@ impl RemoteImmutableObjectProvider {
             return Err(VolumeError::IdentityMismatch);
         }
         Ok(bytes.to_vec())
+    }
+
+    /// Stream a regular file into a temporary remote object and publish it to
+    /// its content-addressed location only after the complete upload succeeds.
+    pub async fn put_file_if_absent(
+        &self,
+        source: &FilePath,
+    ) -> Result<ImmutableObject, VolumeError> {
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(source)
+            .map_err(VolumeError::Io)?;
+        let metadata = source.metadata().map_err(VolumeError::Io)?;
+        if !metadata.file_type().is_file() {
+            return Err(VolumeError::UnsafeObject);
+        }
+        self.validate_size(metadata.len())?;
+        if metadata.len() == 0 {
+            let mut probe = [0_u8; 1];
+            match source.read(&mut probe).map_err(VolumeError::Io)? {
+                0 => return self.put_if_absent(&[]).await,
+                _ => source.rewind().map_err(VolumeError::Io)?,
+            }
+        }
+
+        let staging = self.staging_location();
+        let upload = self
+            .store
+            .put_multipart(&staging)
+            .await
+            .map_err(map_store_error)?;
+        let mut writer = WriteMultipart::new(upload);
+        let mut source = tokio::fs::File::from_std(source);
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut digest = Sha256::new();
+        let mut size_bytes = 0_u64;
+
+        loop {
+            let read = match source.read(&mut buffer).await {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = writer.abort().await;
+                    return Err(VolumeError::Io(error));
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            size_bytes = match size_bytes.checked_add(read as u64) {
+                Some(size_bytes) => size_bytes,
+                None => {
+                    let _ = writer.abort().await;
+                    return Err(VolumeError::Invalid("object size overflows u64".into()));
+                }
+            };
+            if let Err(error) = self.validate_size(size_bytes) {
+                let _ = writer.abort().await;
+                return Err(error);
+            }
+            digest.update(&buffer[..read]);
+            writer.write(&buffer[..read]);
+            if let Err(error) = writer.wait_for_capacity(4).await {
+                let _ = writer.abort().await;
+                return Err(map_store_error(error));
+            }
+        }
+        writer.finish().await.map_err(map_store_error)?;
+
+        let object = ImmutableObject {
+            digest: ObjectDigest::from_sha256(digest.finalize().into()),
+            size_bytes,
+        };
+        let location = self.location(object.digest);
+        let publication = self.store.copy_if_not_exists(&staging, &location).await;
+        let cleanup = self.store.delete(&staging).await;
+        match publication {
+            Ok(()) | Err(object_store::Error::AlreadyExists { .. }) => {
+                cleanup.map_err(map_store_error)?;
+                self.verify_remote_object(&object).await?;
+                Ok(object)
+            }
+            Err(error) => {
+                let _ = cleanup;
+                Err(map_store_error(error))
+            }
+        }
+    }
+
+    /// Download an immutable object to a newly-created regular file while
+    /// verifying its declared size and SHA-256 digest before success.
+    pub async fn get_to_new_file_verified(
+        &self,
+        object: &ImmutableObject,
+        destination: &FilePath,
+    ) -> Result<(), VolumeError> {
+        self.validate_size(object.size_bytes)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(destination)
+            .map_err(VolumeError::Io)?;
+        let result = self
+            .download_to_file(object, tokio::fs::File::from_std(file))
+            .await;
+        if result.is_err() {
+            let _ = std::fs::remove_file(destination);
+        }
+        result
+    }
+
+    async fn verify_remote_object(&self, object: &ImmutableObject) -> Result<(), VolumeError> {
+        let result = self
+            .store
+            .get(&self.location(object.digest))
+            .await
+            .map_err(map_store_error)?;
+        if result.meta.size != object.size_bytes {
+            return Err(VolumeError::IdentityMismatch);
+        }
+        let mut stream = result.into_stream();
+        let mut digest = Sha256::new();
+        let mut size_bytes = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(map_store_error)?;
+            size_bytes = size_bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| VolumeError::Invalid("object size overflows u64".into()))?;
+            self.validate_size(size_bytes)?;
+            digest.update(&chunk);
+        }
+        if size_bytes != object.size_bytes
+            || ObjectDigest::from_sha256(digest.finalize().into()) != object.digest
+        {
+            return Err(VolumeError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    async fn download_to_file(
+        &self,
+        object: &ImmutableObject,
+        mut destination: tokio::fs::File,
+    ) -> Result<(), VolumeError> {
+        let result = self
+            .store
+            .get(&self.location(object.digest))
+            .await
+            .map_err(map_store_error)?;
+        if result.meta.size != object.size_bytes {
+            return Err(VolumeError::IdentityMismatch);
+        }
+        let mut stream = result.into_stream();
+        let mut digest = Sha256::new();
+        let mut size_bytes = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(map_store_error)?;
+            size_bytes = size_bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| VolumeError::Invalid("object size overflows u64".into()))?;
+            self.validate_size(size_bytes)?;
+            digest.update(&chunk);
+            destination
+                .write_all(&chunk)
+                .await
+                .map_err(VolumeError::Io)?;
+        }
+        destination.sync_all().await.map_err(VolumeError::Io)?;
+        if size_bytes != object.size_bytes
+            || ObjectDigest::from_sha256(digest.finalize().into()) != object.digest
+        {
+            return Err(VolumeError::IdentityMismatch);
+        }
+        Ok(())
     }
 
     pub async fn delete_verified(&self, object: &ImmutableObject) -> Result<(), VolumeError> {
@@ -226,6 +413,55 @@ mod tests {
             provider.get_verified(&object).await,
             Err(VolumeError::NotFound)
         ));
+
+        let token = uuid::Uuid::new_v4();
+        let source = std::env::temp_dir().join(format!("tarit-object-source-{token}"));
+        let destination = std::env::temp_dir().join(format!("tarit-object-destination-{token}"));
+        let mut payload = vec![0_u8; 13 * 1024 * 1024 + 137];
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        std::fs::write(&source, &payload).unwrap();
+        let streamed = provider.put_file_if_absent(&source).await.unwrap();
+        assert_eq!(streamed.digest, ObjectDigest::from_bytes(&payload));
+        assert_eq!(streamed.size_bytes, payload.len() as u64);
+        provider
+            .get_to_new_file_verified(&streamed, &destination)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+        provider.delete_verified(&streamed).await.unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(destination).unwrap();
+
+        let empty_source = std::env::temp_dir().join(format!("tarit-empty-source-{token}"));
+        let empty_destination =
+            std::env::temp_dir().join(format!("tarit-empty-destination-{token}"));
+        std::fs::write(&empty_source, []).unwrap();
+        let empty = provider.put_file_if_absent(&empty_source).await.unwrap();
+        assert_eq!(empty.digest, ObjectDigest::from_bytes(&[]));
+        assert_eq!(empty.size_bytes, 0);
+        provider
+            .get_to_new_file_verified(&empty, &empty_destination)
+            .await
+            .unwrap();
+        assert!(std::fs::read(&empty_destination).unwrap().is_empty());
+        provider.delete_verified(&empty).await.unwrap();
+        std::fs::remove_file(empty_source).unwrap();
+        std::fs::remove_file(empty_destination).unwrap();
+    }
+
+    #[tokio::test]
+    async fn streaming_round_trip_is_bounded_verified_and_deletable() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let provider = RemoteImmutableObjectProvider::new(
+            "test_object",
+            store,
+            "tenant/artifacts",
+            20 * 1024 * 1024,
+        )
+        .unwrap();
+        remote_round_trip(provider).await;
     }
 
     #[tokio::test]

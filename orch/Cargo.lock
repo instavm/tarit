@@ -3335,6 +3335,7 @@ dependencies = [
 name = "tarit-volume"
 version = "0.1.2"
 dependencies = [
+ "futures-util",
  "libc",
  "object_store",
  "sha2 0.10.9",

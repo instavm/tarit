@@ -18,6 +18,10 @@ impl ObjectDigest {
         &self.0
     }
 
+    pub(crate) fn from_sha256(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     pub(crate) fn hex(&self) -> String {
         self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
