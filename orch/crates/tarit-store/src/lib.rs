@@ -9,8 +9,8 @@ use tarit_types::{
     ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
     ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ShareRecord,
     ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, VmRecord, VmRuntimeLayout, VmStartupPath,
-    VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord,
-    VolumeStatus, VolumeStorageClass,
+    VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities,
+    VolumeForkCloneRecord, VolumeForkCloneStatus, VolumeRecord, VolumeStatus, VolumeStorageClass,
 };
 use uuid::Uuid;
 
@@ -205,6 +205,24 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS vm_fork_operations_source
                ON vm_fork_operations(owner_key, source_vm_id);
+             CREATE TABLE IF NOT EXISTS volume_fork_clones (
+               child_vm_id TEXT NOT NULL,
+               source_vm_id TEXT NOT NULL,
+               owner_key TEXT NOT NULL,
+               source_volume_id TEXT NOT NULL,
+               child_volume_id TEXT NOT NULL UNIQUE,
+               device_index INTEGER NOT NULL,
+               mode TEXT NOT NULL CHECK (mode IN ('read_only','read_write')),
+               source_generation INTEGER NOT NULL CHECK (source_generation > 0),
+               child_generation INTEGER NOT NULL CHECK (child_generation > 0),
+               status TEXT NOT NULL CHECK (status IN ('preparing','cloned','bound')),
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               PRIMARY KEY (child_vm_id, device_index),
+               UNIQUE (child_vm_id, source_volume_id)
+             );
+             CREATE INDEX IF NOT EXISTS volume_fork_clones_source
+               ON volume_fork_clones(owner_key, source_vm_id);
              CREATE TABLE IF NOT EXISTS hosts (
                host_id TEXT PRIMARY KEY NOT NULL,
                boot_session_id TEXT,
@@ -1914,6 +1932,154 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Atomically reserve the complete volume-clone plan for a fork. Exact
+    /// replay is idempotent; any changed source, child, ordering, mode, or
+    /// generation is a conflict before a provider object can be created.
+    pub fn claim_volume_fork_clones(
+        &self,
+        records: &[VolumeForkCloneRecord],
+    ) -> Result<Vec<VolumeForkCloneRecord>, StoreError> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let child_vm_id = records[0].child_vm_id;
+        let source_vm_id = records[0].source_vm_id;
+        let owner_key = records[0].owner_key.as_str();
+        if records.iter().any(|record| {
+            record.child_vm_id != child_vm_id
+                || record.source_vm_id != source_vm_id
+                || record.owner_key != owner_key
+                || record.source_generation == 0
+                || record.child_generation == 0
+                || record.status != VolumeForkCloneStatus::Preparing
+        }) {
+            return Err(StoreError::Conflict(
+                "volume fork clone plan has inconsistent immutable fields".into(),
+            ));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for record in records {
+            let source_generation = u64_to_sql_i64(record.source_generation)?;
+            let child_generation = u64_to_sql_i64(record.child_generation)?;
+            let existing = tx
+                .query_row(
+                    "SELECT child_vm_id, source_vm_id, owner_key, source_volume_id,
+                            child_volume_id, device_index, mode, source_generation,
+                            child_generation, status, created_at, updated_at
+                     FROM volume_fork_clones
+                     WHERE child_vm_id = ?1 AND device_index = ?2",
+                    params![record.child_vm_id.to_string(), record.device_index],
+                    row_to_volume_fork_clone,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.child_vm_id != record.child_vm_id
+                    || existing.source_vm_id != record.source_vm_id
+                    || existing.owner_key != record.owner_key
+                    || existing.source_volume_id != record.source_volume_id
+                    || existing.child_volume_id != record.child_volume_id
+                    || existing.device_index != record.device_index
+                    || existing.mode != record.mode
+                    || existing.source_generation != record.source_generation
+                    || existing.child_generation != record.child_generation
+                {
+                    return Err(StoreError::Conflict(format!(
+                        "fork child {} volume slot {} is already bound to another clone",
+                        record.child_vm_id, record.device_index
+                    )));
+                }
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO volume_fork_clones (
+                   child_vm_id, source_vm_id, owner_key, source_volume_id,
+                   child_volume_id, device_index, mode, source_generation,
+                   child_generation, status, created_at, updated_at
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    record.child_vm_id.to_string(),
+                    record.source_vm_id.to_string(),
+                    record.owner_key,
+                    record.source_volume_id.to_string(),
+                    record.child_volume_id.to_string(),
+                    record.device_index,
+                    record.mode.as_str(),
+                    source_generation,
+                    child_generation,
+                    record.status.as_str(),
+                    record.created_at.to_rfc3339(),
+                    record.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| {
+                constraint_conflict(error, "volume fork clone plan contains duplicate bindings")
+            })?;
+        }
+        let claimed = query_volume_fork_clones(&tx, owner_key, child_vm_id)?;
+        if claimed.len() != records.len() {
+            return Err(StoreError::Conflict(format!(
+                "fork child {child_vm_id} volume plan changed concurrently"
+            )));
+        }
+        tx.commit()?;
+        Ok(claimed)
+    }
+
+    pub fn list_volume_fork_clones(
+        &self,
+        owner_key: &str,
+        child_vm_id: Uuid,
+    ) -> Result<Vec<VolumeForkCloneRecord>, StoreError> {
+        query_volume_fork_clones(&self.conn, owner_key, child_vm_id)
+    }
+
+    /// Advance one clone phase with compare-and-swap semantics. Replaying the
+    /// same completed transition succeeds; skipping or reversing a phase does
+    /// not.
+    pub fn advance_volume_fork_clone(
+        &self,
+        owner_key: &str,
+        child_vm_id: Uuid,
+        child_volume_id: Uuid,
+        expected: VolumeForkCloneStatus,
+        status: VolumeForkCloneStatus,
+        updated_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let valid = matches!(
+            (expected, status),
+            (
+                VolumeForkCloneStatus::Preparing,
+                VolumeForkCloneStatus::Cloned
+            ) | (VolumeForkCloneStatus::Cloned, VolumeForkCloneStatus::Bound)
+        );
+        if !valid {
+            return Err(StoreError::Conflict(
+                "invalid volume fork clone phase transition".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE volume_fork_clones
+             SET status = ?5, updated_at = ?6
+             WHERE child_vm_id = ?1 AND child_volume_id = ?2 AND owner_key = ?3
+               AND (status = ?4 OR status = ?5)",
+            params![
+                child_vm_id.to_string(),
+                child_volume_id.to_string(),
+                owner_key,
+                expected.as_str(),
+                status.as_str(),
+                updated_at.to_rfc3339(),
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Conflict(format!(
+                "fork child {child_vm_id} volume clone changed concurrently"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn commit_fork_operation(
         &self,
         child_vm_id: Uuid,
@@ -2912,6 +3078,61 @@ fn row_to_fork_operation(row: &rusqlite::Row<'_>) -> Result<ForkOperationRecord,
             .transpose()?,
         status,
         child_created_at: child_created_at.as_deref().map(parse_ts).transpose()?,
+        created_at: parse_ts(&created_at)?,
+        updated_at: parse_ts(&updated_at)?,
+    })
+}
+
+fn query_volume_fork_clones(
+    connection: &Connection,
+    owner_key: &str,
+    child_vm_id: Uuid,
+) -> Result<Vec<VolumeForkCloneRecord>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT child_vm_id, source_vm_id, owner_key, source_volume_id,
+                child_volume_id, device_index, mode, source_generation,
+                child_generation, status, created_at, updated_at
+         FROM volume_fork_clones
+         WHERE owner_key = ?1 AND child_vm_id = ?2
+         ORDER BY device_index ASC",
+    )?;
+    let records = statement
+        .query_map(
+            params![owner_key, child_vm_id.to_string()],
+            row_to_volume_fork_clone,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)?;
+    Ok(records)
+}
+
+fn row_to_volume_fork_clone(
+    row: &rusqlite::Row<'_>,
+) -> Result<VolumeForkCloneRecord, rusqlite::Error> {
+    let child_vm_id: String = row.get(0)?;
+    let source_vm_id: String = row.get(1)?;
+    let source_volume_id: String = row.get(3)?;
+    let child_volume_id: String = row.get(4)?;
+    let device_index = sql_i64_to_u64(row.get(5)?, 5, "invalid clone device index")?;
+    let mode: String = row.get(6)?;
+    let status: String = row.get(9)?;
+    let created_at: String = row.get(10)?;
+    let updated_at: String = row.get(11)?;
+    Ok(VolumeForkCloneRecord {
+        child_vm_id: parse_uuid_col(&child_vm_id, 0)?,
+        source_vm_id: parse_uuid_col(&source_vm_id, 1)?,
+        owner_key: row.get(2)?,
+        source_volume_id: parse_uuid_col(&source_volume_id, 3)?,
+        child_volume_id: parse_uuid_col(&child_volume_id, 4)?,
+        device_index: u8::try_from(device_index)
+            .map_err(|_| invalid_text_error(5, "clone device index exceeds u8".into()))?,
+        mode: VolumeAttachmentMode::parse(&mode)
+            .ok_or_else(|| invalid_text_error(6, format!("invalid clone mode: {mode}")))?,
+        source_generation: sql_i64_to_u64(row.get(7)?, 7, "invalid source volume generation")?,
+        child_generation: sql_i64_to_u64(row.get(8)?, 8, "invalid child volume generation")?,
+        status: VolumeForkCloneStatus::parse(&status).ok_or_else(|| {
+            invalid_text_error(9, format!("invalid volume fork clone status: {status}"))
+        })?,
         created_at: parse_ts(&created_at)?,
         updated_at: parse_ts(&updated_at)?,
     })
@@ -4125,6 +4346,139 @@ mod tests {
             VmQuotaReservationOutcome::IdConflict,
             "a committed fork id must never be recycled into another VM incarnation"
         );
+    }
+
+    #[test]
+    fn volume_fork_clone_plan_is_exact_ordered_and_phase_fenced() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let child_vm_id = Uuid::new_v4();
+        let source_vm_id = Uuid::new_v4();
+        let first = VolumeForkCloneRecord {
+            child_vm_id,
+            source_vm_id,
+            owner_key: "tenant-a".into(),
+            source_volume_id: Uuid::new_v4(),
+            child_volume_id: Uuid::new_v4(),
+            device_index: 0,
+            mode: VolumeAttachmentMode::ReadWrite,
+            source_generation: 7,
+            child_generation: 1,
+            status: VolumeForkCloneStatus::Preparing,
+            created_at: now,
+            updated_at: now,
+        };
+        let second = VolumeForkCloneRecord {
+            source_volume_id: Uuid::new_v4(),
+            child_volume_id: Uuid::new_v4(),
+            device_index: 1,
+            mode: VolumeAttachmentMode::ReadOnly,
+            source_generation: 11,
+            ..first.clone()
+        };
+
+        let claimed = store
+            .claim_volume_fork_clones(&[second.clone(), first.clone()])
+            .unwrap();
+        assert_eq!(claimed, vec![first.clone(), second.clone()]);
+        assert_eq!(
+            store
+                .claim_volume_fork_clones(&[first.clone(), second.clone()])
+                .unwrap(),
+            claimed
+        );
+
+        let changed_slot = VolumeForkCloneRecord {
+            child_volume_id: Uuid::new_v4(),
+            ..first.clone()
+        };
+        assert!(matches!(
+            store.claim_volume_fork_clones(&[changed_slot, second.clone()]),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let duplicate_source = VolumeForkCloneRecord {
+            source_volume_id: first.source_volume_id,
+            ..second.clone()
+        };
+        let another_child = Uuid::new_v4();
+        assert!(matches!(
+            store.claim_volume_fork_clones(&[
+                VolumeForkCloneRecord {
+                    child_vm_id: another_child,
+                    ..first.clone()
+                },
+                VolumeForkCloneRecord {
+                    child_vm_id: another_child,
+                    ..duplicate_source
+                },
+            ]),
+            Err(StoreError::Conflict(_))
+        ));
+
+        let oversized_generation = VolumeForkCloneRecord {
+            child_vm_id: Uuid::new_v4(),
+            source_generation: u64::MAX,
+            ..first.clone()
+        };
+        assert!(matches!(
+            store.claim_volume_fork_clones(&[oversized_generation]),
+            Err(StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(
+                _
+            )))
+        ));
+
+        assert!(matches!(
+            store.advance_volume_fork_clone(
+                "tenant-a",
+                child_vm_id,
+                first.child_volume_id,
+                VolumeForkCloneStatus::Cloned,
+                VolumeForkCloneStatus::Bound,
+                Utc::now(),
+            ),
+            Err(StoreError::Conflict(_))
+        ));
+        store
+            .advance_volume_fork_clone(
+                "tenant-a",
+                child_vm_id,
+                first.child_volume_id,
+                VolumeForkCloneStatus::Preparing,
+                VolumeForkCloneStatus::Cloned,
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .advance_volume_fork_clone(
+                "tenant-a",
+                child_vm_id,
+                first.child_volume_id,
+                VolumeForkCloneStatus::Preparing,
+                VolumeForkCloneStatus::Cloned,
+                Utc::now(),
+            )
+            .expect("completed transition replay");
+        store
+            .advance_volume_fork_clone(
+                "tenant-a",
+                child_vm_id,
+                first.child_volume_id,
+                VolumeForkCloneStatus::Cloned,
+                VolumeForkCloneStatus::Bound,
+                Utc::now(),
+            )
+            .unwrap();
+
+        let persisted = store
+            .list_volume_fork_clones("tenant-a", child_vm_id)
+            .unwrap();
+        assert_eq!(persisted[0].status, VolumeForkCloneStatus::Bound);
+        assert_eq!(persisted[1].status, VolumeForkCloneStatus::Preparing);
+        assert!(store
+            .list_volume_fork_clones("tenant-b", child_vm_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

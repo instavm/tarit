@@ -555,6 +555,55 @@ pub struct ForkOperationRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Durable phase of one source-volume clone belonging to a live-fork
+/// operation. A child VM may not start until every planned clone is `Cloned`;
+/// `Bound` means the exact child generation is attached to the published VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeForkCloneStatus {
+    Preparing,
+    Cloned,
+    Bound,
+}
+
+impl VolumeForkCloneStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Cloned => "cloned",
+            Self::Bound => "bound",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "preparing" => Some(Self::Preparing),
+            "cloned" => Some(Self::Cloned),
+            "bound" => Some(Self::Bound),
+            _ => None,
+        }
+    }
+}
+
+/// Private, locator-free journal entry for an attached-volume clone. The
+/// provider object is addressed only by opaque volume UUID and fenced
+/// generation; provider credentials and host paths never enter this record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeForkCloneRecord {
+    pub child_vm_id: Uuid,
+    pub source_vm_id: Uuid,
+    pub owner_key: String,
+    pub source_volume_id: Uuid,
+    pub child_volume_id: Uuid,
+    pub device_index: u8,
+    pub mode: VolumeAttachmentMode,
+    pub source_generation: u64,
+    pub child_generation: u64,
+    pub status: VolumeForkCloneStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Whether a shared VM port is public or requires a valid private-share token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
