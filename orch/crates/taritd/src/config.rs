@@ -587,6 +587,72 @@ pub struct SharedBlockConfig {
     pub operation_timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudObjectStoreKind {
+    AwsS3,
+    AzureBlob,
+}
+
+#[derive(Clone)]
+pub struct CloudObjectStoreConfig {
+    pub kind: CloudObjectStoreKind,
+    pub bucket_or_container: String,
+    pub prefix: String,
+    pub max_object_bytes: u64,
+    pub allow_insecure_http: bool,
+}
+
+impl CloudObjectStoreConfig {
+    pub fn open(&self) -> Result<tarit_volume::RemoteImmutableObjectProvider> {
+        if self.bucket_or_container.is_empty() || self.prefix.is_empty() {
+            bail!("object-store physical namespace is empty");
+        }
+        match self.kind {
+            CloudObjectStoreKind::AwsS3 => {
+                #[cfg(feature = "cloud-object-store-aws")]
+                {
+                    tarit_volume::RemoteImmutableObjectProvider::s3_from_env(
+                        &self.bucket_or_container,
+                        self.prefix.clone(),
+                        self.max_object_bytes,
+                        self.allow_insecure_http,
+                    )
+                    .map_err(|error| anyhow::anyhow!("initialize AWS S3 object store: {error}"))
+                }
+                #[cfg(not(feature = "cloud-object-store-aws"))]
+                bail!("AWS S3 object storage support is not compiled into this taritd binary");
+            }
+            CloudObjectStoreKind::AzureBlob => {
+                #[cfg(feature = "cloud-object-store-azure")]
+                {
+                    tarit_volume::RemoteImmutableObjectProvider::azure_from_env(
+                        &self.bucket_or_container,
+                        self.prefix.clone(),
+                        self.max_object_bytes,
+                        self.allow_insecure_http,
+                    )
+                    .map_err(|error| anyhow::anyhow!("initialize Azure Blob object store: {error}"))
+                }
+                #[cfg(not(feature = "cloud-object-store-azure"))]
+                bail!("Azure Blob object storage support is not compiled into this taritd binary");
+            }
+        }
+    }
+}
+
+impl fmt::Debug for CloudObjectStoreConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CloudObjectStoreConfig")
+            .field("kind", &self.kind)
+            .field("bucket_or_container", &"[REDACTED]")
+            .field("prefix", &"[REDACTED]")
+            .field("max_object_bytes", &self.max_object_bytes)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
+}
+
 impl fmt::Debug for SharedBlockConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -621,6 +687,9 @@ pub struct Config {
     /// Optional shared NFS-backed raw block provider. Endpoint and export are
     /// private host configuration and never enter public volume records.
     pub shared_block: Option<SharedBlockConfig>,
+    /// Optional immutable artifact/blob provider. Physical namespace and
+    /// credentials remain host-private and never enter public records.
+    pub cloud_object_store: Option<CloudObjectStoreConfig>,
     /// Immutable OCI admission and signature policy captured at startup.
     pub image_admission_policy: crate::image::ImageAdmissionPolicy,
     /// Max concurrent sandboxes on this host (placement guard).
@@ -792,6 +861,7 @@ impl Config {
             &env::var("TARIT_IMAGES_DIR").unwrap_or_else(|_| "~/.taritd/images".into()),
         );
         let shared_block = parse_shared_block_config()?;
+        let cloud_object_store = parse_cloud_object_store_config()?;
         let image_admission_policy = crate::image::ImageAdmissionPolicy::from_env()?;
 
         let max_vms = env_positive_usize("TARIT_MAX_VMS", 32)?;
@@ -953,6 +1023,7 @@ impl Config {
                 &vm_net_quota,
                 &disk_pressure,
                 shared_block.as_ref(),
+                cloud_object_store.as_ref(),
                 allow_insecure_peer_http,
             )?;
         }
@@ -970,6 +1041,7 @@ impl Config {
             net_state_path,
             images_dir,
             shared_block,
+            cloud_object_store,
             image_admission_policy,
             max_vms,
             max_vcpus,
@@ -1028,6 +1100,7 @@ impl fmt::Debug for Config {
             .field("net_state_path", &self.net_state_path)
             .field("images_dir", &self.images_dir)
             .field("shared_block", &self.shared_block)
+            .field("cloud_object_store", &self.cloud_object_store)
             .field("image_admission_policy", &self.image_admission_policy)
             .field("max_vms", &self.max_vms)
             .field("max_vcpus", &self.max_vcpus)
@@ -1306,6 +1379,7 @@ fn validate_production_requirements(
     vm_net_quota: &VmNetQuotaConfig,
     disk_pressure: &DiskPressureConfig,
     shared_block: Option<&SharedBlockConfig>,
+    cloud_object_store: Option<&CloudObjectStoreConfig>,
     allow_insecure_peer_http: bool,
 ) -> Result<()> {
     if !cfg!(target_os = "linux") {
@@ -1361,6 +1435,9 @@ fn validate_production_requirements(
     if let Some(shared_block) = shared_block {
         validate_production_shared_block(shared_block)?;
     }
+    if let Some(cloud_object_store) = cloud_object_store {
+        validate_production_cloud_object_store(cloud_object_store)?;
+    }
     for (name, path) in [
         ("TARIT_VMM_BIN", vmm_bin),
         ("TARIT_KERNEL", kernel),
@@ -1381,6 +1458,13 @@ fn validate_production_shared_block(shared_block: &SharedBlockConfig) -> Result<
         && shared_block.security != tarit_volume::NfsSecurityFlavor::Krb5Privacy
     {
         bail!("TARIT_PRODUCTION generic NFS volumes require TARIT_SHARED_BLOCK_SECURITY=krb5p");
+    }
+    Ok(())
+}
+
+fn validate_production_cloud_object_store(store: &CloudObjectStoreConfig) -> Result<()> {
+    if store.allow_insecure_http {
+        bail!("TARIT_PRODUCTION forbids TARIT_OBJECT_STORE_ALLOW_HTTP");
     }
     Ok(())
 }
@@ -1883,6 +1967,75 @@ fn parse_shared_block_config() -> Result<Option<SharedBlockConfig>> {
     }))
 }
 
+fn parse_cloud_object_store_config() -> Result<Option<CloudObjectStoreConfig>> {
+    const RELATED: &[&str] = &[
+        "TARIT_OBJECT_STORE_BUCKET",
+        "TARIT_OBJECT_STORE_CONTAINER",
+        "TARIT_OBJECT_STORE_PREFIX",
+        "TARIT_OBJECT_STORE_MAX_BYTES",
+        "TARIT_OBJECT_STORE_ALLOW_HTTP",
+    ];
+    let provider = env::var("TARIT_OBJECT_STORE_PROVIDER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(provider) = provider else {
+        if RELATED.iter().any(|key| env::var(key).is_ok()) {
+            bail!("TARIT_OBJECT_STORE_PROVIDER is required when object-store settings are present");
+        }
+        return Ok(None);
+    };
+
+    let bucket = env::var("TARIT_OBJECT_STORE_BUCKET")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let container = env::var("TARIT_OBJECT_STORE_CONTAINER")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let (kind, bucket_or_container) = match provider.as_str() {
+        "aws_s3" => {
+            if container.is_some() {
+                bail!("TARIT_OBJECT_STORE_CONTAINER is invalid for provider aws_s3");
+            }
+            (
+                CloudObjectStoreKind::AwsS3,
+                bucket.context("TARIT_OBJECT_STORE_BUCKET must be set for provider aws_s3")?,
+            )
+        }
+        "azure_blob" => {
+            if bucket.is_some() {
+                bail!("TARIT_OBJECT_STORE_BUCKET is invalid for provider azure_blob");
+            }
+            (
+                CloudObjectStoreKind::AzureBlob,
+                container.context(
+                    "TARIT_OBJECT_STORE_CONTAINER must be set for provider azure_blob",
+                )?,
+            )
+        }
+        _ => bail!(
+            "unsupported TARIT_OBJECT_STORE_PROVIDER={provider:?}; supported providers are aws_s3 and azure_blob"
+        ),
+    };
+    if bucket_or_container.trim() != bucket_or_container {
+        bail!("object-store bucket or container name must not contain surrounding whitespace");
+    }
+    let prefix =
+        env::var("TARIT_OBJECT_STORE_PREFIX").context("TARIT_OBJECT_STORE_PREFIX must be set")?;
+    let max_object_bytes =
+        env_positive_u64("TARIT_OBJECT_STORE_MAX_BYTES", 1024 * 1024 * 1024 * 1024)?;
+    tarit_volume::RemoteImmutableObjectProvider::validate_namespace(&prefix, max_object_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid object-store namespace: {error}"))?;
+
+    Ok(Some(CloudObjectStoreConfig {
+        kind,
+        bucket_or_container,
+        prefix,
+        max_object_bytes,
+        allow_insecure_http: env_bool_checked("TARIT_OBJECT_STORE_ALLOW_HTTP", false)?,
+    }))
+}
+
 fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
     let base_dir = env::var("TARIT_VM_JAIL_BASE")
         .ok()
@@ -2048,10 +2201,73 @@ mod tests {
         "TARIT_SHARED_BLOCK_SECURITY",
     ];
 
+    const CLOUD_OBJECT_STORE_ENV: &[&str] = &[
+        "TARIT_OBJECT_STORE_PROVIDER",
+        "TARIT_OBJECT_STORE_BUCKET",
+        "TARIT_OBJECT_STORE_CONTAINER",
+        "TARIT_OBJECT_STORE_PREFIX",
+        "TARIT_OBJECT_STORE_MAX_BYTES",
+        "TARIT_OBJECT_STORE_ALLOW_HTTP",
+    ];
+
     fn clear_shared_block_env() {
         for key in SHARED_BLOCK_ENV {
             std::env::remove_var(key);
         }
+    }
+
+    fn clear_cloud_object_store_env() {
+        for key in CLOUD_OBJECT_STORE_ENV {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn cloud_object_store_config_is_all_or_none_and_provider_specific() {
+        let _guard = env_lock();
+        clear_cloud_object_store_env();
+        assert!(parse_cloud_object_store_config().unwrap().is_none());
+
+        std::env::set_var("TARIT_OBJECT_STORE_BUCKET", "private-bucket");
+        let error = parse_cloud_object_store_config().expect_err("partial config must fail");
+        assert!(error.to_string().contains("TARIT_OBJECT_STORE_PROVIDER"));
+
+        clear_cloud_object_store_env();
+        std::env::set_var("TARIT_OBJECT_STORE_PROVIDER", "aws_s3");
+        std::env::set_var("TARIT_OBJECT_STORE_BUCKET", "private-bucket");
+        std::env::set_var("TARIT_OBJECT_STORE_CONTAINER", "wrong-provider");
+        std::env::set_var("TARIT_OBJECT_STORE_PREFIX", "fleet/artifacts");
+        let error = parse_cloud_object_store_config()
+            .expect_err("cross-provider physical locator must fail");
+        assert!(error.to_string().contains("invalid for provider aws_s3"));
+        clear_cloud_object_store_env();
+    }
+
+    #[test]
+    fn cloud_object_store_config_is_strict_and_redacted() {
+        let _guard = env_lock();
+        clear_cloud_object_store_env();
+        std::env::set_var("TARIT_OBJECT_STORE_PROVIDER", "azure_blob");
+        std::env::set_var("TARIT_OBJECT_STORE_CONTAINER", "private-container");
+        std::env::set_var("TARIT_OBJECT_STORE_PREFIX", "fleet/artifacts");
+        std::env::set_var("TARIT_OBJECT_STORE_MAX_BYTES", "16777216");
+        std::env::set_var("TARIT_OBJECT_STORE_ALLOW_HTTP", "true");
+
+        let config = parse_cloud_object_store_config().unwrap().unwrap();
+        assert_eq!(config.kind, CloudObjectStoreKind::AzureBlob);
+        assert_eq!(config.max_object_bytes, 16 * 1024 * 1024);
+        assert!(config.allow_insecure_http);
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("private-container"));
+        assert!(!debug.contains("fleet/artifacts"));
+        let error = validate_production_cloud_object_store(&config)
+            .expect_err("plaintext object transport must fail in production");
+        assert!(error.to_string().contains("forbids"));
+
+        std::env::set_var("TARIT_OBJECT_STORE_PREFIX", "fleet/../foreign");
+        let error = parse_cloud_object_store_config().expect_err("unsafe prefix must fail");
+        assert!(error.to_string().contains("namespace"));
+        clear_cloud_object_store_env();
     }
 
     #[test]

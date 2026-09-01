@@ -27,7 +27,7 @@ mod warmpool;
 use anyhow::Context;
 use api::{router, AppState};
 use clap::Parser;
-use config::{Config, PtyConnectionLimits};
+use config::{CloudObjectStoreConfig, Config, PtyConnectionLimits};
 use peer::PeerClient;
 use scheduler::Scheduler;
 use std::collections::{HashMap, HashSet};
@@ -221,6 +221,14 @@ async fn run_server(
         share,
         ssh,
     } = bind_server_listeners(&config).await?;
+
+    let artifact_object_store = config
+        .cloud_object_store
+        .as_ref()
+        .map(CloudObjectStoreConfig::open)
+        .transpose()
+        .context("initialize immutable artifact object store")?
+        .map(Arc::new);
 
     std::fs::create_dir_all(&config.socket_dir).ok();
     std::fs::create_dir_all(&config.images_dir).ok();
@@ -578,10 +586,17 @@ async fn run_server(
         scheduler: scheduler.clone(),
         peer: Arc::new(peer),
         shares,
+        artifact_object_store,
         fleet,
         metrics: Arc::new(metrics::Metrics::default()),
         share_runtime: Arc::clone(&share_runtime),
     };
+    if let Some(provider) = state.artifact_object_store.as_ref() {
+        tracing::info!(
+            provider = provider.provider_name(),
+            "immutable artifact object store configured"
+        );
+    }
 
     // Start every background worker only after all listener binds succeeded.
     let store_writer = {
@@ -2620,6 +2635,7 @@ mod tests {
             net_state_path: PathBuf::from("target/taritd-main-test/net-state.json"),
             images_dir: PathBuf::from("target/taritd-main-test/images"),
             shared_block: None,
+            cloud_object_store: None,
             image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
@@ -2684,6 +2700,7 @@ mod tests {
             scheduler: Arc::new(Scheduler::new(config)),
             peer: Arc::new(PeerClient::new("peer-secret".into())),
             shares,
+            artifact_object_store: None,
             fleet: None,
             metrics: Arc::new(metrics::Metrics::default()),
             share_runtime: Arc::new(share_gateway::ShareRuntime::default()),

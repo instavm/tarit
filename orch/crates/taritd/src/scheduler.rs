@@ -305,6 +305,7 @@ mod tests {
             net_state_path: PathBuf::from("net-state.json"),
             images_dir: PathBuf::from("images"),
             shared_block: None,
+            cloud_object_store: None,
             image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms,
             max_vcpus,

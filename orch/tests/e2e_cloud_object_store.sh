@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_root/orch/tests/cloud-object-emulators"
 cache_dir="${TARIT_E2E_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tarit-e2e-cloud-object}"
 runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/tarit-cloud-object.XXXXXX")"
+expected_source="${TARIT_EXPECT_SOURCE:-}"
 
 minio_version="RELEASE.2025-07-23T15-54-02Z"
 minio_sha256="eef6581f6509f43ece007a6f2eb4c5e3ce41498c8956e919a7ac7b4b170fa431"
@@ -43,6 +44,27 @@ for command in cargo curl npm node openssl python3 sha256sum; do
     exit 1
   }
 done
+
+if [[ -n "$expected_source" ]]; then
+  [[ -f "$repo_root/SOURCE_COMMIT" ]] || {
+    echo "SOURCE_COMMIT is required when TARIT_EXPECT_SOURCE is set" >&2
+    exit 1
+  }
+  [[ "$(<"$repo_root/SOURCE_COMMIT")" == "$expected_source" ]] || {
+    echo "staged source identity does not match TARIT_EXPECT_SOURCE" >&2
+    exit 1
+  }
+fi
+
+(
+  cd "$repo_root/orch"
+  cargo check -p taritd --all-targets --no-default-features
+  cargo clippy -p tarit-volume -p taritd --all-targets \
+    --features taritd/cloud-object-store-aws,taritd/cloud-object-store-azure -- -D warnings
+  cargo test -p taritd -- --test-threads=1
+  cargo test -p tarit-volume \
+    --features cloud-object-store-aws,cloud-object-store-azure
+)
 
 install -d -m 0700 "$cache_dir/bin" "$cache_dir/node"
 
@@ -199,4 +221,4 @@ if [[ -n "$("$mc_bin" --config-dir "$mc_config" find "local/$s3_bucket" --name '
   exit 1
 fi
 
-echo "CLOUD_OBJECT_STORE_E2E_PASS providers=s3,azure conditional_writers=16 cleanup=verified"
+echo "CLOUD_OBJECT_STORE_E2E_PASS providers=s3,azure conditional_writers=16 cleanup=verified source=${expected_source:-local}"

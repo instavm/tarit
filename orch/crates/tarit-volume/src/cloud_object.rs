@@ -3,6 +3,7 @@ use futures_util::StreamExt;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, WriteMultipart};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek};
 use std::os::unix::fs::OpenOptionsExt;
@@ -15,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// The provider intentionally exposes no filesystem, random-write, append,
 /// rename, or locking operation. Callers must retain their own durable
 /// references and invoke deletion only after reference-counted GC permits it.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct RemoteImmutableObjectProvider {
     provider_name: &'static str,
     store: Arc<dyn ObjectStore>,
@@ -23,7 +24,28 @@ pub struct RemoteImmutableObjectProvider {
     max_object_bytes: u64,
 }
 
+impl fmt::Debug for RemoteImmutableObjectProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteImmutableObjectProvider")
+            .field("provider_name", &self.provider_name)
+            .field("store", &"[REDACTED]")
+            .field("prefix", &"[REDACTED]")
+            .field("max_object_bytes", &self.max_object_bytes)
+            .finish()
+    }
+}
+
 impl RemoteImmutableObjectProvider {
+    pub fn validate_namespace(prefix: &str, max_object_bytes: u64) -> Result<(), VolumeError> {
+        if max_object_bytes == 0 {
+            return Err(VolumeError::Invalid(
+                "maximum immutable object size must be positive".into(),
+            ));
+        }
+        validate_prefix(prefix)
+    }
+
     pub fn new(
         provider_name: &'static str,
         store: Arc<dyn ObjectStore>,
@@ -40,12 +62,7 @@ impl RemoteImmutableObjectProvider {
                 "remote object provider name is invalid".into(),
             ));
         }
-        if max_object_bytes == 0 {
-            return Err(VolumeError::Invalid(
-                "maximum immutable object size must be positive".into(),
-            ));
-        }
-        validate_prefix(&prefix)?;
+        Self::validate_namespace(&prefix, max_object_bytes)?;
         Ok(Self {
             provider_name,
             store,
@@ -56,6 +73,16 @@ impl RemoteImmutableObjectProvider {
 
     pub fn provider_name(&self) -> &'static str {
         self.provider_name
+    }
+
+    pub fn scoped(&self, suffix: &str) -> Result<Self, VolumeError> {
+        validate_prefix(suffix)?;
+        Self::new(
+            self.provider_name,
+            Arc::clone(&self.store),
+            format!("{}/{suffix}", self.prefix),
+            self.max_object_bytes,
+        )
     }
 
     fn location(&self, digest: ObjectDigest) -> Path {
@@ -526,6 +553,23 @@ mod tests {
         assert!(
             RemoteImmutableObjectProvider::new("UPPERCASE", store, "tenant/artifacts", 1,).is_err()
         );
+    }
+
+    #[test]
+    fn scoped_provider_is_strict_and_debug_redacted() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let provider = RemoteImmutableObjectProvider::new(
+            "test_object",
+            store,
+            "private-fleet/artifacts",
+            1024,
+        )
+        .unwrap();
+        let scoped = provider.scoped("tenant-digest/snapshots").unwrap();
+        let debug = format!("{scoped:?}");
+        assert!(!debug.contains("private-fleet"));
+        assert!(!debug.contains("tenant-digest"));
+        assert!(scoped.scoped("../foreign").is_err());
     }
 
     #[cfg(feature = "cloud-object-store-aws")]

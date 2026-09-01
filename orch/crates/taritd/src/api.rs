@@ -245,6 +245,7 @@ pub struct AppState {
     pub scheduler: Arc<Scheduler>,
     pub peer: Arc<PeerClient>,
     pub shares: ShareRepository,
+    pub artifact_object_store: Option<Arc<tarit_volume::RemoteImmutableObjectProvider>>,
     /// Global fleet registry (Postgres). `None` in single-host mode; when set,
     /// enables cross-node placement, VM->owner routing, and membership.
     pub fleet: Option<Arc<tarit_fleet::PostgresFleet>>,
@@ -6024,6 +6025,7 @@ mod tests {
             net_state_path: test_root.join("net-state.json"),
             images_dir: test_root.join("images"),
             shared_block: None,
+            cloud_object_store: None,
             image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
@@ -6085,6 +6087,7 @@ mod tests {
                 scheduler: Arc::new(Scheduler::new(config)),
                 peer: Arc::new(PeerClient::new("peer-secret".into())),
                 shares,
+                artifact_object_store: None,
                 fleet: None,
                 metrics: Arc::new(Metrics::default()),
                 share_runtime: Arc::new(crate::share_gateway::ShareRuntime::default()),

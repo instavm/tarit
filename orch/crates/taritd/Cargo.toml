@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+default = ["cloud-object-store-aws", "cloud-object-store-azure"]
+cloud-object-store-aws = ["tarit-volume/cloud-object-store-aws"]
+cloud-object-store-azure = ["tarit-volume/cloud-object-store-azure"]
 test-failpoints = []
 
 [[bin]]
@@ -27,7 +30,7 @@ tarit-fleet = { path = "../tarit-fleet" }
 tarit-proto = { path = "../../../proto" }
 tarit-store = { path = "../tarit-store" }
 tarit-types = { path = "../tarit-types" }
-tarit-volume = { path = "../tarit-volume" }
+tarit-volume = { path = "../tarit-volume", features = ["cloud-object-store"] }
 tarit-vmm-client = { path = "../tarit-vmm-client" }
 reqwest = { workspace = true }
 rustls = { workspace = true }

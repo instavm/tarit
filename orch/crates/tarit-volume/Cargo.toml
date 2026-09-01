@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-cloud-object-store = ["dep:futures-util", "dep:object_store", "dep:tokio"]
+cloud-object-store = [
+    "dep:futures-util",
+    "dep:object_store",
+    "dep:tokio",
+    "object_store/tokio",
+]
 cloud-object-store-aws = ["cloud-object-store", "object_store/aws"]
 cloud-object-store-azure = ["cloud-object-store", "object_store/azure"]
 
