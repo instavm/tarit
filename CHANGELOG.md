@@ -23,7 +23,8 @@ versions may contain breaking changes.
 - The continuous mixed-OCI supervisor now publishes an atomically replaced,
   root-only status record and runs bounded orchestrator/VMM crash recovery,
   multi-ingress wake qualification, and persistent-volume hibernation between
-  long-lived lifecycle epochs.
+  long-lived lifecycle epochs. A cumulative workload-duration gate now requires
+  every configured OCI/kernel case to complete before the run can pass.
 - Cross-node fork operations now persist the target daemon boot session and
   reuse an exact child-bound private artifact across interrupted retries.
 - Version-2 snapshot state now records the state ABI, device-model ABI,

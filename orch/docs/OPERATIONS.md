@@ -407,15 +407,21 @@ randomized actions for every value in `--seeds`. Duration mode is intended for
 continuous qualification and requires one explicit seed so a failure remains
 reproducible.
 
+Set `TARIT_CONTINUOUS_TOTAL_WORKLOAD_SECONDS` to qualify a cumulative duration
+across rotating epochs. The value must be at least one complete epoch for every
+configured case, and the supervisor cannot pass until every case has run. It is
+mutually exclusive with `TARIT_CONTINUOUS_MAX_EPOCHS`. Auxiliary crash, ingress,
+and volume gates do not count toward the workload-duration budget.
+
 When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
 creates a fourth logical VM, arms monotonic and realtime timers, and hibernates
 it while the three resident anchors continue working. At epoch completion,
 concurrent execute requests must single-flight its restore. The driver verifies
 the minimum zero-VMM hold, host-relative realtime repair, paused monotonic time,
 timer delivery, clone identity and session rotation, database state, artifact
-ownership, and capacity cleanup. The installed c8i unit requires at least a
-one-hour hold; its six-hour workload epoch normally yields a hold longer than
-six hours.
+ownership, and capacity cleanup. Configure the hold below the epoch duration so
+each case can prove both the zero-VMM interval and its later wake before
+rotating.
 `tests/tarit-continuous-soak.service` is the c8i systemd unit. It archives a
 failed epoch and restarts after 30 seconds so an isolated failure does not stop
 subsequent qualification. Repeated failures remain visible in

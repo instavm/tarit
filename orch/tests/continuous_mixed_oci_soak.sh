@@ -24,6 +24,7 @@ CHAOS_EVERY_EPOCHS="${TARIT_CONTINUOUS_CHAOS_EVERY_EPOCHS:-1}"
 INGRESS_EVERY_EPOCHS="${TARIT_CONTINUOUS_INGRESS_EVERY_EPOCHS:-1}"
 VOLUME_EVERY_EPOCHS="${TARIT_CONTINUOUS_VOLUME_EVERY_EPOCHS:-1}"
 MAX_EPOCHS="${TARIT_CONTINUOUS_MAX_EPOCHS:-0}"
+TOTAL_WORKLOAD_SECONDS="${TARIT_CONTINUOUS_TOTAL_WORKLOAD_SECONDS:-0}"
 STATUS_FILE="${TARIT_CONTINUOUS_STATUS_FILE:-$RUN_ROOT/status.json}"
 CASES="${TARIT_CONTINUOUS_CASES:-}"
 CASES_FILE="${TARIT_CONTINUOUS_CASES_FILE:-}"
@@ -48,6 +49,14 @@ test -x "$GUEST_AGENT" || { echo "FAIL: guest agent not executable: $GUEST_AGENT
 [[ "$INGRESS_EVERY_EPOCHS" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid ingress interval" >&2; exit 1; }
 [[ "$VOLUME_EVERY_EPOCHS" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid volume interval" >&2; exit 1; }
 [[ "$MAX_EPOCHS" =~ ^[0-9]+$ ]] || { echo "FAIL: invalid maximum epoch count" >&2; exit 1; }
+[[ "$TOTAL_WORKLOAD_SECONDS" =~ ^[0-9]+$ ]] || {
+  echo "FAIL: invalid cumulative workload duration" >&2
+  exit 1
+}
+if [ "$MAX_EPOCHS" -gt 0 ] && [ "$TOTAL_WORKLOAD_SECONDS" -gt 0 ]; then
+  echo "FAIL: maximum epochs and cumulative workload duration are mutually exclusive" >&2
+  exit 1
+fi
 [ "$CHAOS_EVERY_EPOCHS" -eq 0 ] || test -r "$CRASH_GATE" || {
   echo "FAIL: runtime crash gate not readable: $CRASH_GATE" >&2
   exit 1
@@ -75,6 +84,11 @@ else
   mapfile -t case_rows < <(printf '%s\n' "$CASES" | sed '/^[[:space:]]*$/d')
 fi
 [ "${#case_rows[@]}" -gt 0 ] || { echo "FAIL: no continuous soak cases" >&2; exit 1; }
+if [ "$TOTAL_WORKLOAD_SECONDS" -gt 0 ] &&
+   [ "$TOTAL_WORKLOAD_SECONDS" -lt $((EPOCH_SECONDS * ${#case_rows[@]})) ]; then
+  echo "FAIL: cumulative workload duration must cover every configured case epoch" >&2
+  exit 1
+fi
 
 write_supervisor_status() {
   local state=$1 kind=$2 case_name=${3:-} seed_value=${4:-0} log_value=${5:-}
@@ -284,6 +298,14 @@ while :; do
     fstrim "$mount_target" >/dev/null 2>&1 || true
   fi
   epoch=$completed_epochs
+  workload_seconds=$((completed_epochs * EPOCH_SECONDS))
+  if [ "$TOTAL_WORKLOAD_SECONDS" -gt 0 ] &&
+     [ "$workload_seconds" -ge "$TOTAL_WORKLOAD_SECONDS" ] &&
+     [ "$completed_epochs" -ge "${#case_rows[@]}" ]; then
+    write_supervisor_status stopped cumulative_duration_reached "$name" "$seed" "$log_ref"
+    echo "CONTINUOUS_SOAK_COMPLETE epochs=$epoch workload_seconds=$workload_seconds cases=${#case_rows[@]}"
+    exit 0
+  fi
   if [ "$MAX_EPOCHS" -gt 0 ] && [ "$epoch" -ge "$MAX_EPOCHS" ]; then
     write_supervisor_status stopped maximum_epochs_reached "$name" "$seed" "$log_ref"
     echo "CONTINUOUS_SOAK_COMPLETE epochs=$epoch"
