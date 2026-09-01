@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import os
 import random
+import shlex
 import shutil
 import sqlite3
 import sys
@@ -261,6 +262,10 @@ class Soak:
             self.exec(vm_id, "/usr/local/bin/tarit-clone-repair-workload state")
         )
 
+    @staticmethod
+    def proof_write_command(proof: str) -> str:
+        return f"printf '%s' {shlex.quote(proof)} > /root/tarit-soak-proof; sync"
+
     def install_workload(self, vm_id: str, proof: str) -> None:
         command = r'''set -eu
 mkdir -p /usr/libexec/tarit /run/tarit
@@ -346,7 +351,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             f"/usr/local/bin/tarit-clone-repair-workload accept-ticket '{ticket}'",
         ) == "rejected"
         child_proof = f"child-{uuid.uuid4().hex[:16]}"
-        self.exec(child_id, f"printf '%s\n' {child_proof} > /root/tarit-soak-proof; sync")
+        self.exec(child_id, self.proof_write_command(child_proof))
         assert self.exec(vm_id, "cat /root/tarit-soak-proof") == self.anchors[vm_id].proof
         self.delete_vm(child_id)
         self.event("fork_verified", source=vm_id, child=child_id)
@@ -798,7 +803,7 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
     def mutate(self, vm_id: str) -> None:
         anchor = self.anchors[vm_id]
         proof = f"anchor-{self.args.seed}-{anchor.operations}-{uuid.uuid4().hex[:12]}"
-        self.exec(vm_id, f"printf '%s\n' {proof} > /root/tarit-soak-proof; sync")
+        self.exec(vm_id, self.proof_write_command(proof))
         anchor.proof = proof
         self.assert_anchor(vm_id)
         self.event("guest_work_verified", vm_id=vm_id, proof=proof)

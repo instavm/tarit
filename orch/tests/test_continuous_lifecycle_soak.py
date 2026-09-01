@@ -199,6 +199,16 @@ class StatusPublicationTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 soak.assert_guest_identity("vm-1")
 
+    def test_proof_write_command_is_single_line_and_shell_quoted(self) -> None:
+        command = MODULE.Soak.proof_write_command("child-'quoted value'")
+
+        self.assertNotIn("\n", command)
+        self.assertEqual(
+            command,
+            "printf '%s' 'child-'\"'\"'quoted value'\"'\"'' "
+            "> /root/tarit-soak-proof; sync",
+        )
+
     def parse_args(self, *extra: str):
         argv = [
             "continuous_lifecycle_soak.py",
