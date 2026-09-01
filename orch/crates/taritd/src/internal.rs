@@ -224,6 +224,16 @@ async fn internal_artifact_descriptor(
 ) -> Result<Json<crate::peer::ArtifactTransferDescriptor>, ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|identity| &identity.0))?;
     let (artifact, snapshot) = local_artifact_export(&state, identity, artifact_id)?;
+    Ok(Json(artifact_transfer_descriptor(
+        &state, &artifact, &snapshot,
+    )?))
+}
+
+pub(crate) fn artifact_transfer_descriptor(
+    state: &AppState,
+    artifact: &tarit_types::ArtifactRecord,
+    snapshot: &tarit_store::SnapshotRecord,
+) -> Result<crate::peer::ArtifactTransferDescriptor, ApiError> {
     let (_, ram_bytes) = open_private_artifact_component(&PathBuf::from(&snapshot.path))?;
     let overlay_bytes = match snapshot.overlay_path.as_deref() {
         Some(path) => open_private_artifact_component(&PathBuf::from(path))?.1,
@@ -237,7 +247,7 @@ async fn internal_artifact_descriptor(
     let vcpus = snapshot.vcpus.ok_or_else(|| {
         tarit_types::OrchError::Unprocessable("artifact is missing vCPU metadata".into())
     })?;
-    let cmdline = snapshot.cmdline.ok_or_else(|| {
+    let cmdline = snapshot.cmdline.clone().ok_or_else(|| {
         tarit_types::OrchError::Unprocessable("artifact is missing command-line metadata".into())
     })?;
     let kernel_path = snapshot.kernel_path.as_deref().ok_or_else(|| {
@@ -313,13 +323,13 @@ async fn internal_artifact_descriptor(
         )
         .into());
     }
-    Ok(Json(crate::peer::ArtifactTransferDescriptor {
-        artifact_id,
-        content_digest: artifact.content_digest,
+    Ok(crate::peer::ArtifactTransferDescriptor {
+        artifact_id: artifact.artifact_id,
+        content_digest: artifact.content_digest.clone(),
         size_bytes: artifact.size_bytes,
-        immutable_image_digest: artifact.immutable_image_digest,
-        agent_digest: artifact.agent_digest,
-        boot_manifest_digest: artifact.boot_manifest_digest,
+        immutable_image_digest: artifact.immutable_image_digest.clone(),
+        agent_digest: artifact.agent_digest.clone(),
+        boot_manifest_digest: artifact.boot_manifest_digest.clone(),
         kernel_digest,
         kernel_bytes,
         rootfs_digest,
@@ -328,7 +338,7 @@ async fn internal_artifact_descriptor(
         provenance_key_digest: image.provenance_key_digest,
         provenance_verified_at: image.provenance_verified_at,
         creation_revision: artifact.creation_revision,
-        integrity_manifest_digest: artifact.integrity_manifest_digest,
+        integrity_manifest_digest: artifact.integrity_manifest_digest.clone(),
         chunk_size_bytes: artifact.chunk_size_bytes,
         chunk_count: artifact.chunk_count,
         source_vm_id,
@@ -340,7 +350,7 @@ async fn internal_artifact_descriptor(
         ram_bytes,
         overlay_bytes,
         integrity_bytes,
-    }))
+    })
 }
 
 async fn internal_localize_artifact(

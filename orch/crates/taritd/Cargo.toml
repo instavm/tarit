@@ -50,6 +50,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+object_store.workspace = true
 rcgen = "0.13"
 tower = { version = "0.5", features = ["util"] }
 

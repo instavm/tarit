@@ -221,4 +221,48 @@ if [[ -n "$("$mc_bin" --config-dir "$mc_config" find "local/$s3_bucket" --name '
   exit 1
 fi
 
-echo "CLOUD_OBJECT_STORE_E2E_PASS providers=s3,azure conditional_writers=16 cleanup=verified source=${expected_source:-local}"
+if [[ "${TARIT_TEST_KVM_ARTIFACTS:-0}" == 1 ]]; then
+  [[ "$(uname -s)" == Linux ]] || {
+    echo "KVM artifact qualification requires Linux" >&2
+    exit 1
+  }
+  [[ "$(id -u)" == 0 ]] || {
+    echo "KVM artifact qualification must run as root" >&2
+    exit 1
+  }
+  command -v make >/dev/null || {
+    echo "required command is unavailable: make" >&2
+    exit 1
+  }
+  make -C "$repo_root" build
+
+  AWS_ACCESS_KEY_ID="$s3_access_key" \
+  AWS_SECRET_ACCESS_KEY="$s3_secret_key" \
+  AWS_DEFAULT_REGION=us-east-1 \
+  AWS_ENDPOINT_URL_S3="$s3_endpoint" \
+  AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
+  AWS_ALLOW_HTTP=true \
+  TARIT_OBJECT_STORE_PROVIDER=aws_s3 \
+  TARIT_OBJECT_STORE_BUCKET="$s3_bucket" \
+  TARIT_OBJECT_STORE_PREFIX="runtime-s3-$(openssl rand -hex 8)" \
+  TARIT_OBJECT_STORE_MAX_BYTES=4294967296 \
+  TARIT_OBJECT_STORE_ALLOW_HTTP=true \
+  TARIT_TEST_OBJECT_FALLBACK=1 \
+  TARIT_SOURCE_REVISION="${expected_source:-local}" \
+    "$repo_root/orch/tests/e2e_peer_artifact_replication.sh"
+
+  AZURE_STORAGE_ACCOUNT_NAME="$azure_account" \
+  AZURE_STORAGE_ACCOUNT_KEY="$azure_key" \
+  AZURE_STORAGE_ENDPOINT="$azure_endpoint" \
+  AZURE_ALLOW_HTTP=true \
+  TARIT_OBJECT_STORE_PROVIDER=azure_blob \
+  TARIT_OBJECT_STORE_CONTAINER="$azure_container" \
+  TARIT_OBJECT_STORE_PREFIX="runtime-azure-$(openssl rand -hex 8)" \
+  TARIT_OBJECT_STORE_MAX_BYTES=4294967296 \
+  TARIT_OBJECT_STORE_ALLOW_HTTP=true \
+  TARIT_TEST_OBJECT_FALLBACK=1 \
+  TARIT_SOURCE_REVISION="${expected_source:-local}" \
+    "$repo_root/orch/tests/e2e_peer_artifact_replication.sh"
+fi
+
+echo "CLOUD_OBJECT_STORE_E2E_PASS providers=s3,azure conditional_writers=16 cleanup=verified kvm_artifacts=${TARIT_TEST_KVM_ARTIFACTS:-0} source=${expected_source:-local}"

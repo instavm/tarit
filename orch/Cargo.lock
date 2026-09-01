@@ -3360,6 +3360,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "libc",
+ "object_store",
  "rcgen",
  "reqwest 0.12.28",
  "russh",

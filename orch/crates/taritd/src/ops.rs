@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tarit_types::{
-    ArtifactBootMetadata, ArtifactKind, ArtifactRecord, ArtifactReplicationState, ArtifactStatus,
-    CreateVmRequest, EgressPolicyRecord, OrchError, VmRecord, VmStartupPath, VmStatus,
-    VmVolumeAttachmentRecord, VolumeAttachmentMode,
+    ArtifactBootMetadata, ArtifactKind, ArtifactObjectComponents, ArtifactObjectManifest,
+    ArtifactObjectReference, ArtifactObjectReplicaRecord, ArtifactRecord, ArtifactReplicaStatus,
+    ArtifactReplicationState, ArtifactStatus, CreateVmRequest, EgressPolicyRecord, OrchError,
+    VmRecord, VmStartupPath, VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode,
 };
 use uuid::Uuid;
 
@@ -2916,10 +2917,153 @@ async fn snapshot_local_locked(
             }
         }
     }
+    if snapshot_id.is_none() {
+        if let Some(artifact) = artifact.as_ref() {
+            if let Err(error) = publish_artifact_object_bundle(state, artifact, &record).await {
+                if let Some(fleet) = state.fleet.as_ref() {
+                    let _ = fleet
+                        .delete_artifact_if_unreferenced(&artifact.owner_key, artifact.artifact_id)
+                        .await;
+                    let _ = fleet.delete_snapshot(&record).await;
+                }
+                if let Ok(store) = state.store.lock() {
+                    let _ = store
+                        .delete_artifact_if_unreferenced(&artifact.owner_key, artifact.artifact_id);
+                    let _ = store.delete_snapshot(&record.path);
+                }
+                drop(bundle);
+                return Err(error);
+            }
+        }
+    }
     let path = record.path;
     let live_stats = bundle.live_stats().cloned();
     bundle.persist();
     Ok(ForkSnapshotOutcome { path, live_stats })
+}
+
+async fn publish_artifact_object_bundle(
+    state: &AppState,
+    artifact: &ArtifactRecord,
+    snapshot: &tarit_store::SnapshotRecord,
+) -> Result<Option<ArtifactObjectReplicaRecord>, OrchError> {
+    let Some(root_provider) = state.artifact_object_store.as_ref() else {
+        return Ok(None);
+    };
+    let descriptor = crate::internal::artifact_transfer_descriptor(state, artifact, snapshot)
+        .map_err(|error| error.0)?;
+    let owner_binding = ArtifactObjectManifest::owner_binding(&artifact.owner_key);
+    let owner_digest = owner_binding.strip_prefix("sha256:").ok_or_else(|| {
+        OrchError::Internal("artifact object owner binding is not canonical SHA-256".into())
+    })?;
+    let provider = root_provider
+        .scoped(&format!("tenants/{owner_digest}/artifacts"))
+        .map_err(|error| OrchError::Internal(format!("scope artifact object store: {error}")))?;
+
+    let ram_path = PathBuf::from(&snapshot.path);
+    let overlay_path = snapshot.overlay_path.as_deref().map(PathBuf::from);
+    let integrity_path = PathBuf::from(format!("{}.integrity", snapshot.path));
+    let kernel_path = snapshot
+        .kernel_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| OrchError::Unprocessable("artifact is missing kernel metadata".into()))?;
+    let rootfs_path = snapshot
+        .rootfs_path
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| OrchError::Unprocessable("artifact is missing rootfs metadata".into()))?;
+
+    let overlay_upload = async {
+        match overlay_path.as_deref() {
+            Some(path) => provider.put_file_if_absent(path).await.map(Some),
+            None => Ok(None),
+        }
+    };
+    let (ram, overlay, integrity, kernel, rootfs) = tokio::join!(
+        provider.put_file_if_absent(&ram_path),
+        overlay_upload,
+        provider.put_file_if_absent(&integrity_path),
+        provider.put_file_if_absent(&kernel_path),
+        provider.put_file_if_absent(&rootfs_path),
+    );
+    let map_upload_error =
+        |error| OrchError::Unavailable(format!("publish artifact component object: {error}"));
+    let ram = ram.map_err(map_upload_error)?;
+    let overlay = overlay.map_err(map_upload_error)?;
+    let integrity = integrity.map_err(map_upload_error)?;
+    let kernel = kernel.map_err(map_upload_error)?;
+    let rootfs = rootfs.map_err(map_upload_error)?;
+
+    let components = ArtifactObjectComponents {
+        ram: artifact_object_reference(ram),
+        overlay: overlay.map(artifact_object_reference),
+        integrity: artifact_object_reference(integrity),
+        kernel: artifact_object_reference(kernel),
+        rootfs: artifact_object_reference(rootfs),
+    };
+    let manifest = ArtifactObjectManifest {
+        version: ArtifactObjectManifest::VERSION,
+        owner_binding,
+        descriptor,
+        components,
+    };
+    manifest
+        .validate_for(&artifact.owner_key, artifact)
+        .map_err(|error| {
+            OrchError::Unavailable(format!("validate artifact object bundle: {error}"))
+        })?;
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|error| {
+        OrchError::Internal(format!("encode artifact object manifest: {error}"))
+    })?;
+    if manifest_bytes.is_empty()
+        || u64::try_from(manifest_bytes.len()).unwrap_or(u64::MAX)
+            > MAX_ARTIFACT_OBJECT_MANIFEST_BYTES
+    {
+        return Err(OrchError::Unavailable(
+            "artifact object manifest exceeds its storage bound".into(),
+        ));
+    }
+    let manifest_object = provider
+        .put_if_absent(&manifest_bytes)
+        .await
+        .map_err(|error| {
+            OrchError::Unavailable(format!("publish artifact object manifest: {error}"))
+        })?;
+    let now = Utc::now();
+    let replica = ArtifactObjectReplicaRecord {
+        artifact_id: artifact.artifact_id,
+        owner_key: artifact.owner_key.clone(),
+        provider: root_provider.provider_name().to_string(),
+        manifest_digest: manifest_object.digest.to_string(),
+        manifest_size_bytes: manifest_object.size_bytes,
+        status: ArtifactReplicaStatus::Available,
+        verified_at: Some(now),
+        created_at: now,
+        updated_at: now,
+    };
+    state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .upsert_artifact_object_replica(&replica)
+        .map_err(crate::api::store_err)?;
+    if let Some(fleet) = state.fleet.as_ref() {
+        fleet
+            .upsert_artifact_object_replica(&replica)
+            .await
+            .map_err(|error| {
+                OrchError::Internal(format!("publish fleet artifact object replica: {error}"))
+            })?;
+    }
+    Ok(Some(replica))
+}
+
+fn artifact_object_reference(object: tarit_volume::ImmutableObject) -> ArtifactObjectReference {
+    ArtifactObjectReference {
+        digest: object.digest.to_string(),
+        size_bytes: object.size_bytes,
+    }
 }
 
 /// R-006: confirm the caller may restore the snapshot at `snapshot_path`.
@@ -3098,6 +3242,305 @@ fn verify_artifact_boot_metadata(
     Ok(())
 }
 
+const MAX_ARTIFACT_OBJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone)]
+enum ArtifactTransferSource {
+    Peer(cluster::PeerTarget),
+    Object {
+        provider: tarit_volume::RemoteImmutableObjectProvider,
+        manifest: Box<ArtifactObjectManifest>,
+        replica: ArtifactObjectReplicaRecord,
+    },
+}
+
+async fn artifact_object_transfer_source(
+    state: &AppState,
+    fleet: &tarit_fleet::PostgresFleet,
+    artifact: &ArtifactRecord,
+    owner_key: &str,
+) -> Result<Option<ArtifactTransferSource>, OrchError> {
+    let Some(root_provider) = state.artifact_object_store.as_ref() else {
+        return Ok(None);
+    };
+    let replicas = fleet
+        .list_artifact_object_replicas(owner_key, artifact.artifact_id)
+        .await
+        .map_err(|error| OrchError::Internal(format!("list object replicas: {error}")))?;
+    let replica = replicas.into_iter().find(|replica| {
+        replica.provider == root_provider.provider_name()
+            && replica.status == ArtifactReplicaStatus::Available
+            && replica.verified_at.is_some()
+            && replica.manifest_size_bytes > 0
+            && replica.manifest_size_bytes <= MAX_ARTIFACT_OBJECT_MANIFEST_BYTES
+    });
+    let Some(replica) = replica else {
+        return Ok(None);
+    };
+    let owner_binding = ArtifactObjectManifest::owner_binding(owner_key);
+    let owner_digest = owner_binding.strip_prefix("sha256:").ok_or_else(|| {
+        OrchError::Internal("artifact object owner binding is not canonical SHA-256".into())
+    })?;
+    let provider = root_provider
+        .scoped(&format!("tenants/{owner_digest}/artifacts"))
+        .map_err(|error| OrchError::Internal(format!("scope artifact object store: {error}")))?;
+    let manifest_object = immutable_object(
+        &ArtifactObjectReference {
+            digest: replica.manifest_digest.clone(),
+            size_bytes: replica.manifest_size_bytes,
+        },
+        "manifest",
+    )?;
+    let bytes = provider
+        .get_verified(&manifest_object)
+        .await
+        .map_err(|error| {
+            OrchError::Unavailable(format!("read artifact object manifest: {error}"))
+        })?;
+    let manifest: ArtifactObjectManifest = serde_json::from_slice(&bytes)
+        .map_err(|_| OrchError::Unavailable("artifact object manifest is invalid".into()))?;
+    manifest
+        .validate_for(owner_key, artifact)
+        .map_err(|error| {
+            OrchError::Unavailable(format!("validate artifact object bundle: {error}"))
+        })?;
+    tracing::info!(
+        artifact_id = %artifact.artifact_id,
+        provider = root_provider.provider_name(),
+        "localized artifact from immutable object store"
+    );
+    Ok(Some(ArtifactTransferSource::Object {
+        provider,
+        manifest: Box::new(manifest),
+        replica,
+    }))
+}
+
+fn immutable_object(
+    reference: &ArtifactObjectReference,
+    component: &str,
+) -> Result<tarit_volume::ImmutableObject, OrchError> {
+    let digest = reference.digest.parse().map_err(|_| {
+        OrchError::Unavailable(format!("artifact {component} object digest is invalid"))
+    })?;
+    Ok(tarit_volume::ImmutableObject {
+        digest,
+        size_bytes: reference.size_bytes,
+    })
+}
+
+async fn download_artifact_boot_components(
+    state: &AppState,
+    source: &ArtifactTransferSource,
+    identity: &crate::config::ApiIdentity,
+    descriptor: &crate::peer::ArtifactTransferDescriptor,
+    kernel_path: Option<&std::path::Path>,
+    rootfs_path: Option<&std::path::Path>,
+) -> Result<(), OrchError> {
+    let need_kernel = kernel_path.is_some();
+    let need_rootfs = rootfs_path.is_some();
+    match source {
+        ArtifactTransferSource::Peer(target) => {
+            let peer = Arc::clone(&state.peer);
+            let target = target.clone();
+            let identity = identity.clone();
+            let descriptor = descriptor.clone();
+            let kernel_path = kernel_path.map(std::path::Path::to_path_buf);
+            let rootfs_path = rootfs_path.map(std::path::Path::to_path_buf);
+            tokio::task::spawn_blocking(move || {
+                if let Some(kernel_path) = kernel_path.as_deref() {
+                    let mut kernel = create_private_replica_file(kernel_path)?;
+                    let (bytes, digest) = peer.download_artifact_component(
+                        &target,
+                        descriptor.artifact_id,
+                        "kernel",
+                        &identity,
+                        &mut kernel,
+                        descriptor.kernel_bytes,
+                    )?;
+                    if bytes != descriptor.kernel_bytes || digest != descriptor.kernel_digest {
+                        return Err(OrchError::Unprocessable(
+                            "peer kernel digest or length mismatch".into(),
+                        ));
+                    }
+                }
+                if let Some(rootfs_path) = rootfs_path.as_deref() {
+                    let mut rootfs = create_private_replica_file(rootfs_path)?;
+                    let (bytes, digest) = peer.download_artifact_component(
+                        &target,
+                        descriptor.artifact_id,
+                        "rootfs",
+                        &identity,
+                        &mut rootfs,
+                        descriptor.rootfs_bytes,
+                    )?;
+                    if bytes != descriptor.rootfs_bytes || digest != descriptor.rootfs_digest {
+                        return Err(OrchError::Unprocessable(
+                            "peer rootfs digest or length mismatch".into(),
+                        ));
+                    }
+                }
+                Ok::<(), OrchError>(())
+            })
+            .await
+            .map_err(|error| OrchError::Internal(format!("boot-input transfer join: {error}")))?
+        }
+        ArtifactTransferSource::Object {
+            provider, manifest, ..
+        } => {
+            let kernel = immutable_object(&manifest.components.kernel, "kernel")?;
+            let rootfs = immutable_object(&manifest.components.rootfs, "rootfs")?;
+            let kernel_transfer = async {
+                if need_kernel {
+                    provider
+                        .get_to_new_file_verified(
+                            &kernel,
+                            kernel_path.expect("kernel path accompanies transfer flag"),
+                        )
+                        .await
+                        .map_err(|error| {
+                            OrchError::Unavailable(format!(
+                                "download artifact kernel object: {error}"
+                            ))
+                        })?;
+                }
+                Ok::<(), OrchError>(())
+            };
+            let rootfs_transfer = async {
+                if need_rootfs {
+                    provider
+                        .get_to_new_file_verified(
+                            &rootfs,
+                            rootfs_path.expect("rootfs path accompanies transfer flag"),
+                        )
+                        .await
+                        .map_err(|error| {
+                            OrchError::Unavailable(format!(
+                                "download artifact rootfs object: {error}"
+                            ))
+                        })?;
+                }
+                Ok::<(), OrchError>(())
+            };
+            tokio::try_join!(kernel_transfer, rootfs_transfer)?;
+            Ok(())
+        }
+    }
+}
+
+async fn download_artifact_runtime_components(
+    state: &AppState,
+    source: &ArtifactTransferSource,
+    identity: &crate::config::ApiIdentity,
+    descriptor: &crate::peer::ArtifactTransferDescriptor,
+    ram_path: &std::path::Path,
+    overlay_path: &std::path::Path,
+    integrity_path: &std::path::Path,
+) -> Result<(), OrchError> {
+    match source {
+        ArtifactTransferSource::Peer(target) => {
+            let peer = Arc::clone(&state.peer);
+            let target = target.clone();
+            let identity = identity.clone();
+            let descriptor = descriptor.clone();
+            let ram_path = ram_path.to_path_buf();
+            let overlay_path = overlay_path.to_path_buf();
+            let integrity_path = integrity_path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let mut ram = create_private_replica_file(&ram_path)?;
+                let (ram_bytes, _) = peer.download_artifact_component(
+                    &target,
+                    descriptor.artifact_id,
+                    "ram",
+                    &identity,
+                    &mut ram,
+                    descriptor.ram_bytes,
+                )?;
+                if ram_bytes != descriptor.ram_bytes {
+                    return Err(OrchError::Unprocessable(
+                        "peer RAM artifact length mismatch".into(),
+                    ));
+                }
+                if descriptor.has_overlay {
+                    let mut overlay = create_private_replica_file(&overlay_path)?;
+                    let (bytes, _) = peer.download_artifact_component(
+                        &target,
+                        descriptor.artifact_id,
+                        "overlay",
+                        &identity,
+                        &mut overlay,
+                        descriptor.overlay_bytes,
+                    )?;
+                    if bytes != descriptor.overlay_bytes {
+                        return Err(OrchError::Unprocessable(
+                            "peer overlay artifact length mismatch".into(),
+                        ));
+                    }
+                }
+                let manifest_bound = descriptor
+                    .chunk_count
+                    .checked_mul(128)
+                    .and_then(|bytes| bytes.checked_add(MAX_ARTIFACT_OBJECT_MANIFEST_BYTES))
+                    .ok_or_else(|| {
+                        OrchError::Unprocessable("manifest size bound overflow".into())
+                    })?;
+                if descriptor.integrity_bytes > manifest_bound {
+                    return Err(OrchError::Unprocessable(
+                        "peer integrity manifest exceeds its authenticated bound".into(),
+                    ));
+                }
+                let mut integrity = create_private_replica_file(&integrity_path)?;
+                let (bytes, digest) = peer.download_artifact_component(
+                    &target,
+                    descriptor.artifact_id,
+                    "integrity",
+                    &identity,
+                    &mut integrity,
+                    manifest_bound,
+                )?;
+                if bytes != descriptor.integrity_bytes
+                    || digest != descriptor.integrity_manifest_digest
+                {
+                    return Err(OrchError::Unprocessable(
+                        "peer integrity manifest digest or length mismatch".into(),
+                    ));
+                }
+                Ok::<(), OrchError>(())
+            })
+            .await
+            .map_err(|error| OrchError::Internal(format!("artifact transfer join: {error}")))?
+        }
+        ArtifactTransferSource::Object {
+            provider, manifest, ..
+        } => {
+            let ram = immutable_object(&manifest.components.ram, "RAM")?;
+            let overlay = manifest
+                .components
+                .overlay
+                .as_ref()
+                .map(|reference| immutable_object(reference, "overlay"))
+                .transpose()?;
+            let integrity = immutable_object(&manifest.components.integrity, "integrity")?;
+            let ram_transfer = provider.get_to_new_file_verified(&ram, ram_path);
+            let overlay_transfer = async {
+                if let Some(overlay) = overlay.as_ref() {
+                    provider
+                        .get_to_new_file_verified(overlay, overlay_path)
+                        .await?;
+                }
+                Ok::<(), tarit_volume::VolumeError>(())
+            };
+            let integrity_transfer = provider.get_to_new_file_verified(&integrity, integrity_path);
+            tokio::try_join!(ram_transfer, overlay_transfer, integrity_transfer).map_err(
+                |error| {
+                    OrchError::Unavailable(format!("download artifact runtime object: {error}"))
+                },
+            )?;
+            Ok(())
+        }
+    }
+}
+
 pub async fn localize_branch_artifact(
     state: &AppState,
     artifact: &ArtifactRecord,
@@ -3192,18 +3635,29 @@ pub async fn localize_branch_artifact(
             Err(error) => return Err(error),
         }
     }
-    let source = source.ok_or_else(|| {
-        OrchError::Unavailable("no healthy verified artifact replica is reachable".into())
-    })?;
-    let peer = Arc::clone(&state.peer);
-    let descriptor_target = source.clone();
-    let descriptor_identity = identity.clone();
-    let artifact_id = artifact.artifact_id;
-    let descriptor = tokio::task::spawn_blocking(move || {
-        peer.artifact_descriptor(&descriptor_target, artifact_id, &descriptor_identity)
-    })
-    .await
-    .map_err(|error| OrchError::Internal(format!("artifact descriptor join: {error}")))??;
+    let transfer_source = if let Some(source) = source {
+        ArtifactTransferSource::Peer(source)
+    } else {
+        artifact_object_transfer_source(state, fleet, artifact, &identity.tenant)
+            .await?
+            .ok_or_else(|| {
+                OrchError::Unavailable("no healthy verified artifact replica is reachable".into())
+            })?
+    };
+    let descriptor = match &transfer_source {
+        ArtifactTransferSource::Peer(source) => {
+            let peer = Arc::clone(&state.peer);
+            let descriptor_target = source.clone();
+            let descriptor_identity = identity.clone();
+            let artifact_id = artifact.artifact_id;
+            tokio::task::spawn_blocking(move || {
+                peer.artifact_descriptor(&descriptor_target, artifact_id, &descriptor_identity)
+            })
+            .await
+            .map_err(|error| OrchError::Internal(format!("artifact descriptor join: {error}")))??
+        }
+        ArtifactTransferSource::Object { manifest, .. } => manifest.descriptor.clone(),
+    };
     if descriptor.artifact_id != artifact.artifact_id
         || descriptor.content_digest != artifact.content_digest
         || descriptor.size_bytes != artifact.size_bytes
@@ -3218,7 +3672,7 @@ pub async fn localize_branch_artifact(
         || descriptor.has_overlay != (descriptor.overlay_bytes > 0)
     {
         return Err(OrchError::Unavailable(
-            "peer artifact descriptor does not match the fleet manifest".into(),
+            "artifact transfer descriptor does not match the fleet manifest".into(),
         ));
     }
     let boot_metadata = ArtifactBootMetadata {
@@ -3233,11 +3687,11 @@ pub async fn localize_branch_artifact(
         rootfs_read_only: descriptor.rootfs_read_only,
     };
     if boot_metadata.digest().map_err(|error| {
-        OrchError::Internal(format!("encode peer artifact boot metadata: {error}"))
+        OrchError::Internal(format!("encode artifact transfer boot metadata: {error}"))
     })? != artifact.boot_manifest_digest
     {
         return Err(OrchError::Unavailable(
-            "peer artifact boot metadata failed authentication".into(),
+            "artifact transfer boot metadata failed authentication".into(),
         ));
     }
     let local_kernel = image::sha256_regular_file(&state.config.kernel)
@@ -3285,55 +3739,17 @@ pub async fn localize_branch_artifact(
     let final_kernel = boot_dir.join(format!("kernel-{}-{boot_token}", artifact.artifact_id));
     let final_rootfs = boot_dir.join(format!("rootfs-{}-{boot_token}.ext4", artifact.artifact_id));
     if local_kernel.is_none() || local_image.is_none() {
-        let peer = Arc::clone(&state.peer);
-        let target = source.clone();
-        let transfer_identity = identity.clone();
-        let transfer_descriptor = descriptor.clone();
         let need_kernel = local_kernel.is_none();
         let need_rootfs = local_image.is_none();
-        let kernel_stage = staging_kernel.clone();
-        let rootfs_stage = staging_rootfs.clone();
-        let transfer = tokio::task::spawn_blocking(move || {
-            if need_kernel {
-                let mut kernel = create_private_replica_file(&kernel_stage)?;
-                let (bytes, digest) = peer.download_artifact_component(
-                    &target,
-                    transfer_descriptor.artifact_id,
-                    "kernel",
-                    &transfer_identity,
-                    &mut kernel,
-                    transfer_descriptor.kernel_bytes,
-                )?;
-                if bytes != transfer_descriptor.kernel_bytes
-                    || digest != transfer_descriptor.kernel_digest
-                {
-                    return Err(OrchError::Unprocessable(
-                        "peer kernel digest or length mismatch".into(),
-                    ));
-                }
-            }
-            if need_rootfs {
-                let mut rootfs = create_private_replica_file(&rootfs_stage)?;
-                let (bytes, digest) = peer.download_artifact_component(
-                    &target,
-                    transfer_descriptor.artifact_id,
-                    "rootfs",
-                    &transfer_identity,
-                    &mut rootfs,
-                    transfer_descriptor.rootfs_bytes,
-                )?;
-                if bytes != transfer_descriptor.rootfs_bytes
-                    || digest != transfer_descriptor.rootfs_digest
-                {
-                    return Err(OrchError::Unprocessable(
-                        "peer rootfs digest or length mismatch".into(),
-                    ));
-                }
-            }
-            Ok::<(), OrchError>(())
-        })
-        .await
-        .map_err(|error| OrchError::Internal(format!("boot-input transfer join: {error}")))?;
+        let transfer = download_artifact_boot_components(
+            state,
+            &transfer_source,
+            identity,
+            &descriptor,
+            need_kernel.then_some(staging_kernel.as_path()),
+            need_rootfs.then_some(staging_rootfs.as_path()),
+        )
+        .await;
         if let Err(error) = transfer {
             cleanup_replica_paths([&staging_kernel, &staging_rootfs]);
             return Err(error);
@@ -3440,75 +3856,16 @@ pub async fn localize_branch_artifact(
     let final_ram = snapshot_dir.join(format!("replica-{}-{token}.ram", artifact.artifact_id));
     let final_overlay = snapshot_dir.join(format!("replica-{}-{token}.cow", artifact.artifact_id));
     let final_integrity = PathBuf::from(format!("{}.integrity", final_ram.display()));
-    let transfer_result = {
-        let peer = Arc::clone(&state.peer);
-        let target = source.clone();
-        let identity = identity.clone();
-        let ram_path = staging_ram.clone();
-        let overlay_path = staging_overlay.clone();
-        let integrity_path = staging_integrity.clone();
-        let descriptor = descriptor.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut ram = create_private_replica_file(&ram_path)?;
-            let (ram_bytes, _) = peer.download_artifact_component(
-                &target,
-                descriptor.artifact_id,
-                "ram",
-                &identity,
-                &mut ram,
-                descriptor.ram_bytes,
-            )?;
-            if ram_bytes != descriptor.ram_bytes {
-                return Err(OrchError::Unprocessable(
-                    "peer RAM artifact length mismatch".into(),
-                ));
-            }
-            if descriptor.has_overlay {
-                let mut overlay = create_private_replica_file(&overlay_path)?;
-                let (bytes, _) = peer.download_artifact_component(
-                    &target,
-                    descriptor.artifact_id,
-                    "overlay",
-                    &identity,
-                    &mut overlay,
-                    descriptor.overlay_bytes,
-                )?;
-                if bytes != descriptor.overlay_bytes {
-                    return Err(OrchError::Unprocessable(
-                        "peer overlay artifact length mismatch".into(),
-                    ));
-                }
-            }
-            let manifest_bound = descriptor
-                .chunk_count
-                .checked_mul(128)
-                .and_then(|bytes| bytes.checked_add(1024 * 1024))
-                .ok_or_else(|| OrchError::Unprocessable("manifest size bound overflow".into()))?;
-            if descriptor.integrity_bytes > manifest_bound {
-                return Err(OrchError::Unprocessable(
-                    "peer integrity manifest exceeds its authenticated bound".into(),
-                ));
-            }
-            let mut integrity = create_private_replica_file(&integrity_path)?;
-            let (bytes, digest) = peer.download_artifact_component(
-                &target,
-                descriptor.artifact_id,
-                "integrity",
-                &identity,
-                &mut integrity,
-                manifest_bound,
-            )?;
-            if bytes != descriptor.integrity_bytes || digest != descriptor.integrity_manifest_digest
-            {
-                return Err(OrchError::Unprocessable(
-                    "peer integrity manifest digest or length mismatch".into(),
-                ));
-            }
-            Ok::<(), OrchError>(())
-        })
-        .await
-        .map_err(|error| OrchError::Internal(format!("artifact transfer join: {error}")))?
-    };
+    let transfer_result = download_artifact_runtime_components(
+        state,
+        &transfer_source,
+        identity,
+        &descriptor,
+        &staging_ram,
+        &staging_overlay,
+        &staging_integrity,
+    )
+    .await;
     if let Err(error) = transfer_result {
         cleanup_replica_paths([&staging_ram, &staging_overlay, &staging_integrity]);
         return Err(error);
@@ -3574,6 +3931,10 @@ pub async fn localize_branch_artifact(
         updated_at: final_snapshot.created_at,
         ..artifact.clone()
     };
+    let object_replica = match &transfer_source {
+        ArtifactTransferSource::Object { replica, .. } => Some(replica.clone()),
+        ArtifactTransferSource::Peer(_) => None,
+    };
     let local_insert = {
         let store = state
             .store
@@ -3582,6 +3943,11 @@ pub async fn localize_branch_artifact(
         store
             .insert_snapshot(&final_snapshot)
             .and_then(|_| store.insert_artifact(&local_artifact))
+            .and_then(|_| {
+                object_replica.as_ref().map_or(Ok(()), |replica| {
+                    store.upsert_artifact_object_replica(replica)
+                })
+            })
     };
     if let Err(error) = local_insert {
         if let Ok(store) = state.store.lock() {
@@ -5538,6 +5904,252 @@ mod tests {
             .block_on(cluster::resolve_owner(&state, id))
             .expect("a registered Creating record must be routable for DELETE");
         assert!(matches!(owner, cluster::Owner::Local));
+    }
+
+    #[test]
+    fn object_bundle_publication_is_verified_tenant_bound_and_durable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (mut state, _) = test_state_with_durable_writer();
+        let root = std::env::temp_dir().join(format!("tarit-object-bundle-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ram_path = root.join("snapshot.ram");
+        let overlay_path = root.join("snapshot.cow");
+        let integrity_path = root.join("snapshot.ram.integrity");
+        let kernel_path = root.join("kernel");
+        let rootfs_path = root.join("rootfs.ext4");
+        for (path, bytes) in [
+            (&ram_path, b"ram-state".as_slice()),
+            (&overlay_path, b"disk-upper".as_slice()),
+            (&integrity_path, b"integrity-manifest".as_slice()),
+            (&kernel_path, b"kernel-image".as_slice()),
+            (&rootfs_path, b"rootfs-image".as_slice()),
+        ] {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let backend: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let provider = tarit_volume::RemoteImmutableObjectProvider::new(
+            "test_object",
+            backend,
+            "artifacts",
+            1024 * 1024,
+        )
+        .unwrap();
+        state.artifact_object_store = Some(Arc::new(provider.clone()));
+
+        let source_digest = format!("sha256:{}", "a".repeat(64));
+        let agent_digest = format!("sha256:{}", "b".repeat(64));
+        let rootfs_digest = image::sha256_regular_file(&rootfs_path).unwrap();
+        let kernel_digest = image::sha256_regular_file(&kernel_path).unwrap();
+        let image = tarit_store::ImageRecord {
+            name: "bundle-test".into(),
+            tag: "immutable".into(),
+            rootfs_path: rootfs_path.display().to_string(),
+            created_at: Utc::now(),
+            size_bytes: std::fs::metadata(&rootfs_path).unwrap().len(),
+            source_ref: format!("registry.invalid/bundle@{source_digest}"),
+            source_digest: Some(source_digest.clone()),
+            rootfs_digest: Some(rootfs_digest.clone()),
+            agent_digest: Some(agent_digest.clone()),
+            provenance_key_digest: None,
+            provenance_verified_at: None,
+            golden_snapshot_path: None,
+        };
+        state.store.lock().unwrap().upsert_image(&image).unwrap();
+
+        let owner_key = "private-tenant".to_string();
+        let artifact_id = Uuid::new_v4();
+        let source_vm_id = Uuid::new_v4();
+        let now = Utc::now();
+        let boot_manifest_digest = ArtifactBootMetadata {
+            version: ArtifactBootMetadata::VERSION,
+            kernel_digest,
+            immutable_image_digest: source_digest.clone(),
+            rootfs_digest,
+            agent_digest: agent_digest.clone(),
+            memory_mib: 256,
+            vcpus: 1,
+            cmdline: "console=ttyS0".into(),
+            rootfs_read_only: true,
+        }
+        .digest()
+        .unwrap();
+        let integrity_digest = image::sha256_regular_file(&integrity_path).unwrap();
+        let snapshot_size = std::fs::metadata(&ram_path).unwrap().len()
+            + std::fs::metadata(&overlay_path).unwrap().len();
+        let snapshot = tarit_store::SnapshotRecord {
+            snapshot_id: artifact_id,
+            path: ram_path.display().to_string(),
+            overlay_path: Some(overlay_path.display().to_string()),
+            host_id: state.config.host_id.clone(),
+            owner_key: Some(owner_key.clone()),
+            api_key_id: Some("test-key".into()),
+            vm_id: source_vm_id,
+            ephemeral_owner_vm_id: None,
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: Some(kernel_path.display().to_string()),
+            rootfs_path: Some(rootfs_path.display().to_string()),
+            rootfs_read_only: Some(true),
+            cmdline: Some("console=ttyS0".into()),
+            content_digest: Some(integrity_digest.clone()),
+            size_bytes: Some(snapshot_size),
+            created_at: now,
+        };
+        let artifact = ArtifactRecord {
+            artifact_id,
+            owner_key: owner_key.clone(),
+            host_id: state.config.host_id.clone(),
+            storage_locator: snapshot.path.clone(),
+            kind: ArtifactKind::VmSnapshot,
+            status: ArtifactStatus::Available,
+            content_digest: integrity_digest.clone(),
+            size_bytes: snapshot_size,
+            immutable_image_digest: source_digest,
+            agent_digest,
+            boot_manifest_digest,
+            parent_artifact_id: None,
+            source_vm_id: Some(source_vm_id),
+            creation_revision: 3,
+            integrity_manifest_digest: integrity_digest,
+            chunk_size_bytes: 65_536,
+            chunk_count: 1,
+            replication_state: ArtifactReplicationState::Ready,
+            reference_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_snapshot(&snapshot).unwrap();
+            store.insert_artifact(&artifact).unwrap();
+        }
+
+        let replica = test_runtime()
+            .block_on(publish_artifact_object_bundle(&state, &artifact, &snapshot))
+            .unwrap()
+            .unwrap();
+        assert_eq!(replica.provider, "test_object");
+        assert_eq!(replica.status, ArtifactReplicaStatus::Available);
+        assert!(replica.verified_at.is_some());
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .list_artifact_object_replicas(&owner_key, artifact_id)
+                .unwrap(),
+            vec![replica.clone()]
+        );
+
+        let owner_binding = ArtifactObjectManifest::owner_binding(&owner_key);
+        let owner_digest = owner_binding.strip_prefix("sha256:").unwrap();
+        let scoped = provider
+            .scoped(&format!("tenants/{owner_digest}/artifacts"))
+            .unwrap();
+        let manifest_object = immutable_object(
+            &ArtifactObjectReference {
+                digest: replica.manifest_digest.clone(),
+                size_bytes: replica.manifest_size_bytes,
+            },
+            "manifest",
+        )
+        .unwrap();
+        let manifest_bytes = test_runtime()
+            .block_on(scoped.get_verified(&manifest_object))
+            .unwrap();
+        let manifest: ArtifactObjectManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        manifest.validate_for(&owner_key, &artifact).unwrap();
+        let encoded = String::from_utf8(manifest_bytes).unwrap();
+        assert!(!encoded.contains(&owner_key));
+        assert!(!encoded.contains(root.to_str().unwrap()));
+        assert!(!encoded.contains("test-host"));
+
+        let source = ArtifactTransferSource::Object {
+            provider: scoped,
+            manifest: Box::new(manifest.clone()),
+            replica,
+        };
+        let identity = crate::config::ApiIdentity {
+            tenant: owner_key,
+            role: ApiRole::User,
+            max_vms: None,
+            api_key_id: "test-key".into(),
+        };
+        let localized_kernel = root.join("localized-kernel");
+        let localized_rootfs = root.join("localized-rootfs");
+        let localized_ram = root.join("localized.ram");
+        let localized_overlay = root.join("localized.cow");
+        let localized_integrity = root.join("localized.ram.integrity");
+        let runtime = test_runtime();
+        runtime
+            .block_on(download_artifact_boot_components(
+                &state,
+                &source,
+                &identity,
+                &manifest.descriptor,
+                Some(&localized_kernel),
+                Some(&localized_rootfs),
+            ))
+            .unwrap();
+        runtime
+            .block_on(download_artifact_runtime_components(
+                &state,
+                &source,
+                &identity,
+                &manifest.descriptor,
+                &localized_ram,
+                &localized_overlay,
+                &localized_integrity,
+            ))
+            .unwrap();
+        for (localized, original) in [
+            (&localized_kernel, &kernel_path),
+            (&localized_rootfs, &rootfs_path),
+            (&localized_ram, &ram_path),
+            (&localized_overlay, &overlay_path),
+            (&localized_integrity, &integrity_path),
+        ] {
+            assert_eq!(
+                std::fs::read(localized).unwrap(),
+                std::fs::read(original).unwrap()
+            );
+            assert_eq!(
+                std::fs::metadata(localized).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let mut corrupt_manifest = manifest;
+        corrupt_manifest.components.ram.digest = format!("sha256:{}", "0".repeat(64));
+        let corrupt_source = match source {
+            ArtifactTransferSource::Object {
+                provider, replica, ..
+            } => ArtifactTransferSource::Object {
+                provider,
+                manifest: Box::new(corrupt_manifest.clone()),
+                replica,
+            },
+            ArtifactTransferSource::Peer(_) => unreachable!(),
+        };
+        assert!(matches!(
+            runtime.block_on(download_artifact_runtime_components(
+                &state,
+                &corrupt_source,
+                &identity,
+                &corrupt_manifest.descriptor,
+                &root.join("corrupt.ram"),
+                &root.join("corrupt.cow"),
+                &root.join("corrupt.integrity"),
+            )),
+            Err(OrchError::Unavailable(_))
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn test_state_with_durable_writer() -> (AppState, tokio::sync::mpsc::Receiver<StoreWrite>) {

@@ -607,10 +607,53 @@ PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
   "select replication_state || ':' || count(*) from fleet_artifacts a join fleet_artifact_replicas r using (artifact_id) where a.artifact_id='$ARTIFACT_ID' group by replication_state" | \
   grep -qx 'degraded:1'
 
+BRANCH_CONTROL=$A_CONTROL
+if [ "${TARIT_TEST_OBJECT_FALLBACK:-0}" = 1 ]; then
+  echo '== verify object publication, lose A, and require object-only localization =='
+  case "${TARIT_OBJECT_STORE_PROVIDER:-}" in
+    aws_s3) OBJECT_PROVIDER=aws_s3_immutable_object ;;
+    azure_blob) OBJECT_PROVIDER=azure_blob_immutable_object ;;
+    *)
+      echo 'FAIL: object fallback requires aws_s3 or azure_blob object-store configuration' >&2
+      exit 1
+      ;;
+  esac
+  PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+    "select provider || ':' || status || ':' || (verified_at is not null) from fleet_artifact_object_replicas where artifact_id='$ARTIFACT_ID'" | \
+    grep -qx "$OBJECT_PROVIDER:available:t"
+  sqlite3 "$DIR/node-a/store.db" \
+    "select provider || ':' || status || ':' || (verified_at is not null) from artifact_object_replicas where artifact_id='$ARTIFACT_ID'" | \
+    grep -qx "$OBJECT_PROVIDER:available:1"
+
+  CACHED_ROOTFS=$(sqlite3 "$DIR/node-b/store.db" \
+    "select rootfs_path from images where source_digest='$IMAGE_SOURCE_DIGEST' limit 1")
+  if [ -n "$CACHED_ROOTFS" ]; then
+    sqlite3 "$DIR/node-b/store.db" \
+      "delete from images where source_digest='$IMAGE_SOURCE_DIGEST'"
+    rm -f -- "$CACHED_ROOTFS"
+  fi
+  kill -TERM "$A_PID"
+  wait "$A_PID"
+  A_PID=""
+  OWNER_STALE=0
+  for _ in $(seq 1 40); do
+    OWNER_AGE=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+      "select extract(epoch from (now() - last_heartbeat))::integer from fleet_hosts where host_id='node-a'")
+    if [ "${OWNER_AGE:-0}" -gt 15 ]; then
+      OWNER_STALE=1
+      break
+    fi
+    sleep 0.5
+  done
+  test "$OWNER_STALE" = 1
+  BRANCH_CONTROL=$B_CONTROL
+fi
+
 echo '== branch creation triggers authenticated cross-zone localization =='
 BRANCH_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
 BRANCH_BODY="{\"branch_id\":\"$BRANCH_ID\",\"name\":\"ubuntu-peer-main\",\"head_artifact_id\":\"$ARTIFACT_ID\",\"source_vm_id\":\"$SOURCE_VM\"}"
 
+if [ "${TARIT_TEST_OBJECT_FALLBACK:-0}" != 1 ]; then
 echo '== tampered boot metadata fails closed before replica publication =='
 python3 - "$DIR/node-a/store.db" "$ARTIFACT_ID" "$DIR/original-cmdline" <<'PY'
 import sqlite3, sys
@@ -621,6 +664,7 @@ with sqlite3.connect(db_path, timeout=30) as db:
     open(output, "w").write(row[0])
     db.execute("update snapshots set cmdline=? where snapshot_id=?", (row[0] + " init=/bin/sh", artifact_id))
 PY
+fi
 TAMPER_STATUS=$(curl -sS --max-time 180 -o "$DIR/tamper-response.json" -w '%{http_code}' \
   -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' -d "$BRANCH_BODY" \
   "http://127.0.0.1:$A_CONTROL/v1/branches")
@@ -751,7 +795,7 @@ fi
 
 BRANCH_STATUS=$(curl -sS --max-time 180 -o "$DIR/branch-response.json" -w '%{http_code}' \
   -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' -d "$BRANCH_BODY" \
-  "http://127.0.0.1:$A_CONTROL/v1/branches")
+  "http://127.0.0.1:$BRANCH_CONTROL/v1/branches")
 if [ "$BRANCH_STATUS" != 201 ]; then
   echo "FAIL: clean branch localization returned HTTP $BRANCH_STATUS" >&2
   cat "$DIR/branch-response.json" >&2
@@ -783,6 +827,23 @@ test "sha256:$(sha256sum "$LOCALIZED_KERNEL" | cut -d' ' -f1)" = \
 test "sha256:$(sha256sum "$LOCALIZED_ROOTFS" | cut -d' ' -f1)" = "$IMAGE_ROOTFS_DIGEST"
 sqlite3 "$DIR/node-b/store.db" \
   "select count(*) from artifacts where artifact_id='$ARTIFACT_ID' and status='available' and replication_state='ready'" | grep -qx 1
+
+if [ "${TARIT_TEST_OBJECT_FALLBACK:-0}" = 1 ]; then
+  sqlite3 "$DIR/node-b/store.db" \
+    "select provider || ':' || status || ':' || (verified_at is not null) from artifact_object_replicas where artifact_id='$ARTIFACT_ID'" | \
+    grep -qx "$OBJECT_PROVIDER:available:1"
+  grep -Fq 'localized artifact from immutable object store' "$DIR/node-b.log"
+  RESTORED_VM=$(api_json POST \
+    "http://127.0.0.1:$B_CONTROL/v1/branches/$BRANCH_ID/restore" '{}' | \
+    python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["startup_path"] == "snapshot_restore", row; print(row["id"])')
+  wait_exec_ubuntu "http://127.0.0.1:$B_CONTROL" "$RESTORED_VM"
+  assert_nested_virtualization_hidden "http://127.0.0.1:$B_CONTROL" "$RESTORED_VM"
+  api_json POST "http://127.0.0.1:$B_CONTROL/v1/execute" \
+    "{\"vm_id\":\"$RESTORED_VM\",\"command\":\"test \$(cat /root/tarit-cross-node-fork-proof) = cross-node-live-fork && echo object-restore-state-ok\",\"timeout_ms\":30000}" | \
+    python3 -c 'import json,sys; row=json.load(sys.stdin); assert row.get("exit_code") == 0 and "object-restore-state-ok" in row.get("stdout", ""), row'
+  echo "PASS source=${TARIT_SOURCE_REVISION:-unknown}: Ubuntu OCI snapshot published an authenticated $OBJECT_PROVIDER bundle through the API; node A was lost; node B localized RAM, disk, integrity, kernel, and rootfs without a peer; branch restore booted and preserved guest state"
+  exit 0
+fi
 
 echo '== non-owner HTTP hibernate replicates before true scale-to-zero; HTTP resume routes back to owner =='
 api_json POST "http://127.0.0.1:$B_CONTROL/v1/vms/$SOURCE_VM/hibernate" '{}' >"$DIR/hibernate.json"
