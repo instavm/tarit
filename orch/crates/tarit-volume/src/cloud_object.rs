@@ -11,6 +11,14 @@ use std::path::Path as FilePath;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const NAMESPACE_DELETION_MARKER: &str = ".deleting";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteObjectMetadata {
+    pub relative_key: String,
+    pub size_bytes: u64,
+}
+
 /// Content-addressed immutable blobs backed by a remote object store.
 ///
 /// The provider intentionally exposes no filesystem, random-write, append,
@@ -91,6 +99,108 @@ impl RemoteImmutableObjectProvider {
 
     fn staging_location(&self) -> Path {
         Path::from(format!("{}/.staging/{}", self.prefix, uuid::Uuid::new_v4()))
+    }
+
+    fn deletion_marker_location(&self) -> Path {
+        Path::from(format!("{}/{}", self.prefix, NAMESPACE_DELETION_MARKER))
+    }
+
+    /// Refuse publication into a namespace already claimed for deletion.
+    /// Artifact metadata must exist before callers perform this check; a GC
+    /// claimant rechecks that metadata after publishing its marker.
+    pub async fn ensure_namespace_writable(&self) -> Result<(), VolumeError> {
+        match self.store.head(&self.deletion_marker_location()).await {
+            Ok(_) => Err(VolumeError::Conflict),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(map_store_error(error)),
+        }
+    }
+
+    /// Claim this exact scoped namespace for deletion. Existing markers are
+    /// idempotent so an interrupted sweep can resume without replacing state.
+    pub async fn mark_namespace_deleting(&self) -> Result<(), VolumeError> {
+        let marker = self.deletion_marker_location();
+        match self
+            .store
+            .put_opts(
+                &marker,
+                b"tarit-object-namespace-deleting-v1".as_slice().into(),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(error) => Err(map_store_error(error)),
+        }
+    }
+
+    pub async fn clear_namespace_deleting(&self) -> Result<(), VolumeError> {
+        match self.store.delete(&self.deletion_marker_location()).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(map_store_error(error)),
+        }
+    }
+
+    /// Delete every object below this already-scoped namespace. Callers must
+    /// publish a deletion marker and recheck authoritative references first.
+    pub async fn delete_marked_namespace(&self) -> Result<u64, VolumeError> {
+        let marker = self.deletion_marker_location();
+        self.store.head(&marker).await.map_err(map_store_error)?;
+        let prefix = Path::from(self.prefix.clone());
+        let mut objects = self.store.list(Some(&prefix));
+        let mut locations = Vec::new();
+        while let Some(object) = objects.next().await {
+            let object = object.map_err(map_store_error)?;
+            locations.push(object.location);
+        }
+        locations.sort_by_key(|location| location == &marker);
+        let mut removed = 0_u64;
+        for location in locations {
+            match self.store.delete(&location).await {
+                Ok(()) => removed = removed.saturating_add(1),
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(map_store_error(error)),
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Return bounded object metadata relative to this provider's configured
+    /// root. This is used only to discover versioned artifact namespaces; raw
+    /// bucket/container names and credentials never leave the provider.
+    pub async fn list_relative_objects(
+        &self,
+        maximum_entries: usize,
+    ) -> Result<Vec<RemoteObjectMetadata>, VolumeError> {
+        if maximum_entries == 0 {
+            return Err(VolumeError::Invalid(
+                "remote object listing bound must be positive".into(),
+            ));
+        }
+        let prefix = Path::from(self.prefix.clone());
+        let relative_prefix = format!("{}/", self.prefix);
+        let mut objects = self.store.list(Some(&prefix));
+        let mut result = Vec::new();
+        while let Some(object) = objects.next().await {
+            let object = object.map_err(map_store_error)?;
+            if result.len() == maximum_entries {
+                return Err(VolumeError::Invalid(
+                    "remote object listing exceeds configured bound".into(),
+                ));
+            }
+            let key = object.location.to_string();
+            let relative_key = key
+                .strip_prefix(&relative_prefix)
+                .ok_or(VolumeError::UnsafeObject)?;
+            if relative_key.is_empty() {
+                return Err(VolumeError::UnsafeObject);
+            }
+            result.push(RemoteObjectMetadata {
+                relative_key: relative_key.to_string(),
+                size_bytes: object.size,
+            });
+        }
+        Ok(result)
     }
 
     pub async fn put_if_absent(&self, bytes: &[u8]) -> Result<ImmutableObject, VolumeError> {
@@ -587,6 +697,55 @@ mod tests {
         assert!(matches!(
             provider.get_verified(&first).await,
             Err(VolumeError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn marked_namespace_deletion_is_exact_and_resumable() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = provider(Arc::clone(&store));
+        let first = root.scoped("first").unwrap();
+        let sibling = root.scoped("sibling").unwrap();
+        let first_object = first.put_if_absent(b"first-object").await.unwrap();
+        let sibling_object = sibling.put_if_absent(b"sibling-object").await.unwrap();
+
+        first.ensure_namespace_writable().await.unwrap();
+        first.mark_namespace_deleting().await.unwrap();
+        first.mark_namespace_deleting().await.unwrap();
+        assert!(matches!(
+            first.ensure_namespace_writable().await,
+            Err(VolumeError::Conflict)
+        ));
+        assert!(first.delete_marked_namespace().await.unwrap() >= 2);
+        assert!(matches!(
+            first.get_verified(&first_object).await,
+            Err(VolumeError::NotFound)
+        ));
+        assert_eq!(
+            sibling.get_verified(&sibling_object).await.unwrap(),
+            b"sibling-object"
+        );
+        assert!(matches!(
+            first.delete_marked_namespace().await,
+            Err(VolumeError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn relative_listing_is_bounded_and_hides_the_configured_root() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let root = provider(store);
+        let child = root.scoped("artifact-id").unwrap();
+        let object = child.put_if_absent(b"listed-object").await.unwrap();
+
+        let listed = root.list_relative_objects(1).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].size_bytes, object.size_bytes);
+        assert!(listed[0].relative_key.starts_with("artifact-id/"));
+        assert!(!listed[0].relative_key.contains("tenant/artifacts"));
+        assert!(matches!(
+            root.list_relative_objects(0).await,
+            Err(VolumeError::Invalid(_))
         ));
     }
 

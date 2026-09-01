@@ -26,6 +26,9 @@ versions may contain breaking changes.
   long-lived lifecycle epochs.
 - Cross-node fork operations now persist the target daemon boot session and
   reuse an exact child-bound private artifact across interrupted retries.
+- Immutable artifact replicas can use S3-compatible or Azure Blob storage with
+  conditional publication, verified streaming recovery, per-artifact runtime
+  namespaces, tenant boot-object reuse, and reference-safe remote collection.
 - Version-2 snapshot state now records the state ABI, device-model ABI,
   architecture, CPU-template identity, and writer version for pre-KVM
   compatibility checks; version 1 remains the explicit legacy format.

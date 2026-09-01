@@ -43,6 +43,24 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 `TARIT_RPC_ADDR` is listed in Core / identity because it is always present. In cluster mode it should be a stable private URL reachable by every peer.
 
+### Immutable artifact object storage
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_OBJECT_STORE_PROVIDER` | string | unset | Enables remote immutable artifact replicas. Supported values are `aws_s3` and `azure_blob`. |
+| `TARIT_OBJECT_STORE_BUCKET` | string | unset | Required bucket name for `aws_s3`; rejected for `azure_blob`. |
+| `TARIT_OBJECT_STORE_CONTAINER` | string | unset | Required container name for `azure_blob`; rejected for `aws_s3`. |
+| `TARIT_OBJECT_STORE_PREFIX` | object-key prefix | unset | Required private prefix below which Tarit owns artifact objects. Empty segments and path traversal are rejected. |
+| `TARIT_OBJECT_STORE_MAX_BYTES` | positive u64 | `1099511627776` | Maximum accepted size of one immutable object, in bytes. |
+| `TARIT_OBJECT_STORE_ALLOW_HTTP` | bool | `false` | Permit an unencrypted object-store endpoint for isolated development tests. Production mode forbids it. |
+
+Provider credentials and endpoint overrides use the provider SDK environment.
+Keep credentials in the daemon's secret store; they are never placed in guest
+configuration. Runtime snapshot objects are isolated by tenant and artifact.
+Immutable kernel and rootfs objects use a tenant-scoped boot cache. Publication
+is conditional and every download is checked against its declared size and
+SHA-256 digest.
+
 ## Capacity and admission limits
 
 | Variable | Type | Default | Description |
@@ -122,7 +140,6 @@ obsolete network limits.
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `TARIT_DISK_BYTES_HIGH_WATERMARK` | positive u64 | unset | Used-byte threshold that enters disk pressure. Must be paired with the byte low watermark. |
-| `TARIT_DISK_BYTES_LOW_WATERMARK` | positive u64 | unset | Used-byte threshold below which byte pressure clears. Must be lower than the byte high watermark. |
 | `TARIT_DISK_INODES_HIGH_WATERMARK` | positive u64 | unset | Used-inode threshold that enters disk pressure. Must be paired with the inode low watermark. |
 | `TARIT_DISK_INODES_LOW_WATERMARK` | positive u64 | unset | Used-inode threshold below which inode pressure clears. Must be lower than the inode high watermark. |
 | `TARIT_ARTIFACT_GC_INTERVAL_SECS` | positive u64 | `30` | Pressure refresh and owned-artifact sweep interval. |
@@ -135,6 +152,12 @@ watermark. While active, VM create, restore, snapshot reservation, and warm-pool
 refill return or apply backpressure. GC only removes recognized Tarit-owned
 artifacts that are old enough and absent from the active runtime and snapshot
 reference sets.
+
+The same interval also reclaims remote per-artifact namespaces after both the
+local store and fleet registry confirm that the artifact no longer exists. A
+deletion marker and a second authoritative reference check fence concurrent
+publication. Tenant boot-cache objects and legacy shared-layout bundles are
+retained by this collector.
 
 ## Autoscaling
 

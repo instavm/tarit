@@ -436,7 +436,8 @@ pub struct ArtifactObjectManifest {
 }
 
 impl ArtifactObjectManifest {
-    pub const VERSION: u8 = 1;
+    pub const LEGACY_SHARED_NAMESPACE_VERSION: u8 = 1;
+    pub const VERSION: u8 = 2;
 
     pub fn owner_binding(owner_key: &str) -> String {
         let mut digest = Sha256::new();
@@ -447,7 +448,10 @@ impl ArtifactObjectManifest {
     }
 
     pub fn validate_for(&self, owner_key: &str, artifact: &ArtifactRecord) -> Result<(), String> {
-        if self.version != Self::VERSION {
+        if !matches!(
+            self.version,
+            Self::LEGACY_SHARED_NAMESPACE_VERSION | Self::VERSION
+        ) {
             return Err("unsupported artifact object manifest version".into());
         }
         if self.owner_binding != Self::owner_binding(owner_key) {

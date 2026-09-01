@@ -24,7 +24,7 @@ mod usage;
 mod volume_provider;
 mod warmpool;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use api::{router, AppState};
 use clap::Parser;
 use config::{CloudObjectStoreConfig, Config, PtyConnectionLimits};
@@ -910,8 +910,109 @@ fn spawn_artifact_gc(
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "periodic owned-artifact sweep failed"),
             }
+            match sweep_remote_artifact_namespaces(&state).await {
+                Ok(removed) if removed > 0 => {
+                    tracing::info!(
+                        removed_objects = removed,
+                        "unreferenced remote artifact namespaces removed"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "remote artifact namespace sweep failed"),
+            }
         }
     })
+}
+
+const MAX_REMOTE_OBJECT_GC_LISTING: usize = 100_000;
+
+fn remote_artifact_namespace(relative_key: &str) -> Option<(String, uuid::Uuid)> {
+    let mut parts = relative_key.split('/');
+    if parts.next()? != "tenants" {
+        return None;
+    }
+    let owner_digest = parts.next()?;
+    if owner_digest.len() != 64
+        || !owner_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parts.next()? != "artifacts"
+    {
+        return None;
+    }
+    let artifact_id = parts.next()?.parse().ok()?;
+    parts.next()?;
+    Some((owner_digest.to_string(), artifact_id))
+}
+
+async fn sweep_remote_artifact_namespaces(state: &AppState) -> anyhow::Result<u64> {
+    let Some(root_provider) = state.artifact_object_store.as_ref() else {
+        return Ok(0);
+    };
+    let namespaces = root_provider
+        .list_relative_objects(MAX_REMOTE_OBJECT_GC_LISTING)
+        .await
+        .map_err(|error| anyhow!("list remote artifact objects: {error}"))?
+        .into_iter()
+        .filter_map(|object| remote_artifact_namespace(&object.relative_key))
+        .collect::<HashSet<_>>();
+    let mut removed = 0_u64;
+    for (owner_digest, artifact_id) in namespaces {
+        let local_exists = state
+            .store
+            .lock()
+            .map_err(|_| anyhow!("store lock poisoned during remote GC"))?
+            .artifact_exists_by_id(artifact_id)
+            .map_err(|error| anyhow!("query local artifact GC guard: {error}"))?;
+        let fleet_exists = match state.fleet.as_ref() {
+            Some(fleet) => fleet
+                .artifact_exists_by_id(artifact_id)
+                .await
+                .map_err(|error| anyhow!("fleet artifact GC guard: {error}"))?,
+            None => false,
+        };
+        if local_exists || fleet_exists {
+            continue;
+        }
+        let provider = root_provider
+            .scoped(&format!("tenants/{owner_digest}/artifacts/{artifact_id}"))
+            .map_err(|error| anyhow!("scope remote artifact GC namespace: {error}"))?;
+        provider
+            .mark_namespace_deleting()
+            .await
+            .map_err(|error| anyhow!("mark remote artifact deleting: {error}"))?;
+
+        // The marker is visible before this authoritative second check. A
+        // publisher inserts metadata before inspecting the marker, so either
+        // this check observes the new artifact or that publisher fails closed.
+        let local_exists = state
+            .store
+            .lock()
+            .map_err(|_| anyhow!("store lock poisoned during remote GC"))?
+            .artifact_exists_by_id(artifact_id)
+            .map_err(|error| anyhow!("recheck local artifact GC guard: {error}"))?;
+        let fleet_exists = match state.fleet.as_ref() {
+            Some(fleet) => fleet
+                .artifact_exists_by_id(artifact_id)
+                .await
+                .map_err(|error| anyhow!("fleet artifact GC recheck: {error}"))?,
+            None => false,
+        };
+        if local_exists || fleet_exists {
+            provider
+                .clear_namespace_deleting()
+                .await
+                .map_err(|error| anyhow!("clear remote artifact deletion marker: {error}"))?;
+            continue;
+        }
+        removed = removed.saturating_add(
+            provider
+                .delete_marked_namespace()
+                .await
+                .map_err(|error| anyhow!("delete remote artifact namespace: {error}"))?,
+        );
+    }
+    Ok(removed)
 }
 
 fn spawn_artifact_repair(
@@ -2705,5 +2806,103 @@ mod tests {
             metrics: Arc::new(metrics::Metrics::default()),
             share_runtime: Arc::new(share_gateway::ShareRuntime::default()),
         }
+    }
+
+    #[test]
+    fn remote_namespace_parser_accepts_only_versioned_artifact_paths() {
+        let id = Uuid::new_v4();
+        let owner = "a".repeat(64);
+        assert_eq!(
+            remote_artifact_namespace(&format!(
+                "tenants/{owner}/artifacts/{id}/sha256-object.blob"
+            )),
+            Some((owner.clone(), id))
+        );
+        for key in [
+            format!("tenants/{owner}/artifacts/legacy-object.blob"),
+            format!("tenants/{owner}/boot/{id}/object.blob"),
+            format!("tenants/{}/artifacts/{id}/object.blob", "A".repeat(64)),
+            format!("tenants/{owner}/artifacts/{id}"),
+        ] {
+            assert_eq!(remote_artifact_namespace(&key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn remote_namespace_gc_deletes_only_metadata_orphans() {
+        let backend: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let provider = Arc::new(
+            tarit_volume::RemoteImmutableObjectProvider::new(
+                "test_object",
+                backend,
+                "gc-test",
+                1024,
+            )
+            .unwrap(),
+        );
+        let mut state = test_state();
+        state.artifact_object_store = Some(Arc::clone(&provider));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let orphan_id = Uuid::new_v4();
+            let owner_digest = "b".repeat(64);
+            let orphan = provider
+                .scoped(&format!("tenants/{owner_digest}/artifacts/{orphan_id}"))
+                .unwrap();
+            let orphan_object = orphan.put_if_absent(b"orphan").await.unwrap();
+            assert!(sweep_remote_artifact_namespaces(&state).await.unwrap() >= 2);
+            assert!(matches!(
+                orphan.get_verified(&orphan_object).await,
+                Err(tarit_volume::VolumeError::NotFound)
+            ));
+
+            let artifact_id = Uuid::new_v4();
+            let owner_key = "tenant-a";
+            let owner_binding = tarit_types::ArtifactObjectManifest::owner_binding(owner_key);
+            let owner_digest = owner_binding.strip_prefix("sha256:").unwrap();
+            let live = provider
+                .scoped(&format!("tenants/{owner_digest}/artifacts/{artifact_id}"))
+                .unwrap();
+            let live_object = live.put_if_absent(b"live").await.unwrap();
+            let now = chrono::Utc::now();
+            state
+                .store
+                .lock()
+                .unwrap()
+                .insert_artifact(&tarit_types::ArtifactRecord {
+                    artifact_id,
+                    owner_key: owner_key.into(),
+                    host_id: "test-host".into(),
+                    storage_locator: "/private/snapshot".into(),
+                    kind: tarit_types::ArtifactKind::VmSnapshot,
+                    status: tarit_types::ArtifactStatus::Available,
+                    content_digest: format!("sha256:{}", "1".repeat(64)),
+                    size_bytes: 4,
+                    immutable_image_digest: format!("sha256:{}", "2".repeat(64)),
+                    agent_digest: format!("sha256:{}", "3".repeat(64)),
+                    boot_manifest_digest: format!("sha256:{}", "4".repeat(64)),
+                    parent_artifact_id: None,
+                    source_vm_id: Some(Uuid::new_v4()),
+                    creation_revision: 1,
+                    integrity_manifest_digest: format!("sha256:{}", "5".repeat(64)),
+                    chunk_size_bytes: 4096,
+                    chunk_count: 1,
+                    replication_state: tarit_types::ArtifactReplicationState::Ready,
+                    reference_count: 0,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            assert_eq!(sweep_remote_artifact_namespaces(&state).await.unwrap(), 0);
+            assert_eq!(live.get_verified(&live_object).await.unwrap(), b"live");
+            live.ensure_namespace_writable().await.unwrap();
+        });
+        drop(runtime);
+        drop(state);
     }
 }

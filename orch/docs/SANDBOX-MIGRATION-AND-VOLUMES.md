@@ -113,8 +113,11 @@ foundations:
   verified-get, and exact-delete operations. The local implementation uses
   private immutable files and rehashes content on every read. There is no mount,
   append, random-write, rename, or lock API, making it impossible to silently
-  advertise S3/Blob semantics as POSIX storage. S3 and Azure Blob transports
-  still require conditional-write/checksum adapters and real-provider gates.
+  advertise object storage as POSIX storage. Remote transports use conditional
+  publication, bounded streaming, and size plus SHA-256 verification. Runtime
+  objects are isolated by tenant and artifact; immutable boot objects use a
+  tenant-scoped cache. Reference-safe collection fences concurrent publication
+  and never reclaims shared boot objects or legacy bundles.
 
 For descriptor-backed block volumes, taritd opens and validates the private
 provider path once with no-follow and exact owner/mode/size checks. The VMM gets
@@ -161,8 +164,10 @@ attachment and replaces the VMM's inherited descriptor on same-host resume.
   generic `AUTH_SYS` and accepts only Kerberos privacy.
 - AWS and Azure gates use real disposable volumes, exercise attach timeout/node
   loss/stale generation cleanup, and leave no billable resource behind.
-- Object-provider tests cover immutable blob/checkpoint behavior and reject
-  requests that imply unsupported POSIX, locking, or block semantics.
+- Object-provider gates cover conditional publication, interrupted transfer,
+  checksum rejection, source-loss recovery, legacy-layout restore, and
+  reference-safe namespace collection. They also reject requests that imply
+  unsupported POSIX, locking, or block semantics.
 - Sandbox cutover tests run product CRUD against Tarit's public API with the
   legacy Firecracker/VMD processes disabled and assert equivalent user-visible
   behavior.

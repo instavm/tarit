@@ -1135,6 +1135,18 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// Internal GC guard for globally unique artifact ids. No tenant or
+    /// storage-locator metadata is returned.
+    pub fn artifact_exists_by_id(&self, artifact_id: Uuid) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifacts WHERE artifact_id = ?1)",
+                params![artifact_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
     pub fn list_artifacts(&self, owner_key: &str) -> Result<Vec<ArtifactRecord>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT artifact_id, owner_key, host_id, storage_locator, kind, status,

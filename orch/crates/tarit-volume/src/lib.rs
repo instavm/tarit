@@ -22,7 +22,7 @@ pub use attached_block::{
     AttachedBlockKind, AttachedBlockProvider, BlockDeviceIdentity, BlockDeviceRegistration,
 };
 #[cfg(feature = "cloud-object-store")]
-pub use cloud_object::RemoteImmutableObjectProvider;
+pub use cloud_object::{RemoteImmutableObjectProvider, RemoteObjectMetadata};
 pub use nfs::{
     NfsBackedBlockProvider, NfsDialect, NfsMountSpec, NfsProvider, NfsSecurityFlavor,
     PreparedFilesystemAttachment, SystemNfsMounter,

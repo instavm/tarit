@@ -1009,6 +1009,19 @@ impl PostgresFleet {
         row_to_artifact(&row)
     }
 
+    /// Internal GC guard for globally unique artifact ids. No tenant or
+    /// storage-locator metadata is returned.
+    pub async fn artifact_exists_by_id(&self, artifact_id: Uuid) -> Result<bool, FleetError> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM fleet_artifacts WHERE artifact_id = $1)",
+                &[&artifact_id],
+            )
+            .await?
+            .get(0))
+    }
+
     /// Publish one physical replica after its bytes and manifest were verified.
     /// The logical state is derived transactionally from verified copies and
     /// distinct failure domains, never accepted from a peer as a claim.

@@ -2956,9 +2956,21 @@ async fn publish_artifact_object_bundle(
     let owner_digest = owner_binding.strip_prefix("sha256:").ok_or_else(|| {
         OrchError::Internal("artifact object owner binding is not canonical SHA-256".into())
     })?;
-    let provider = root_provider
-        .scoped(&format!("tenants/{owner_digest}/artifacts"))
+    let artifact_provider = root_provider
+        .scoped(&format!(
+            "tenants/{owner_digest}/artifacts/{}",
+            artifact.artifact_id
+        ))
         .map_err(|error| OrchError::Internal(format!("scope artifact object store: {error}")))?;
+    artifact_provider
+        .ensure_namespace_writable()
+        .await
+        .map_err(|error| {
+            OrchError::Unavailable(format!("artifact object namespace is unavailable: {error}"))
+        })?;
+    let boot_provider = root_provider
+        .scoped(&format!("tenants/{owner_digest}/boot"))
+        .map_err(|error| OrchError::Internal(format!("scope boot object store: {error}")))?;
 
     let ram_path = PathBuf::from(&snapshot.path);
     let overlay_path = snapshot.overlay_path.as_deref().map(PathBuf::from);
@@ -2997,16 +3009,16 @@ async fn publish_artifact_object_bundle(
 
     let overlay_upload = async {
         match overlay_path.as_deref() {
-            Some(path) => provider.put_file_if_absent(path).await.map(Some),
+            Some(path) => artifact_provider.put_file_if_absent(path).await.map(Some),
             None => Ok(None),
         }
     };
     let (ram, overlay, integrity, kernel, rootfs) = tokio::join!(
-        provider.put_file_if_absent(&ram_path),
+        artifact_provider.put_file_if_absent(&ram_path),
         overlay_upload,
-        provider.put_file_with_identity_if_absent(&integrity_path, &integrity_identity),
-        provider.put_file_with_identity_if_absent(&kernel_path, &kernel_identity),
-        provider.put_file_with_identity_if_absent(&rootfs_path, &rootfs_identity),
+        artifact_provider.put_file_with_identity_if_absent(&integrity_path, &integrity_identity),
+        boot_provider.put_file_with_identity_if_absent(&kernel_path, &kernel_identity),
+        boot_provider.put_file_with_identity_if_absent(&rootfs_path, &rootfs_identity),
     );
     let map_upload_error =
         |error| OrchError::Unavailable(format!("publish artifact component object: {error}"));
@@ -3045,7 +3057,7 @@ async fn publish_artifact_object_bundle(
             "artifact object manifest exceeds its storage bound".into(),
         ));
     }
-    let manifest_object = provider
+    let manifest_object = artifact_provider
         .put_if_absent(&manifest_bytes)
         .await
         .map_err(|error| {
@@ -3269,9 +3281,10 @@ const MAX_ARTIFACT_OBJECT_MANIFEST_BYTES: u64 = 1024 * 1024;
 enum ArtifactTransferSource {
     Peer(cluster::PeerTarget),
     Object {
-        provider: tarit_volume::RemoteImmutableObjectProvider,
+        runtime_provider: tarit_volume::RemoteImmutableObjectProvider,
+        boot_provider: tarit_volume::RemoteImmutableObjectProvider,
         manifest: Box<ArtifactObjectManifest>,
-        replica: ArtifactObjectReplicaRecord,
+        replica: Box<ArtifactObjectReplicaRecord>,
     },
 }
 
@@ -3302,9 +3315,6 @@ async fn artifact_object_transfer_source(
     let owner_digest = owner_binding.strip_prefix("sha256:").ok_or_else(|| {
         OrchError::Internal("artifact object owner binding is not canonical SHA-256".into())
     })?;
-    let provider = root_provider
-        .scoped(&format!("tenants/{owner_digest}/artifacts"))
-        .map_err(|error| OrchError::Internal(format!("scope artifact object store: {error}")))?;
     let manifest_object = immutable_object(
         &ArtifactObjectReference {
             digest: replica.manifest_digest.clone(),
@@ -3312,14 +3322,13 @@ async fn artifact_object_transfer_source(
         },
         "manifest",
     )?;
-    let bytes = provider
-        .get_verified(&manifest_object)
-        .await
-        .map_err(|error| {
-            OrchError::Unavailable(format!("read artifact object manifest: {error}"))
-        })?;
-    let manifest: ArtifactObjectManifest = serde_json::from_slice(&bytes)
-        .map_err(|_| OrchError::Unavailable("artifact object manifest is invalid".into()))?;
+    let (runtime_provider, boot_provider, manifest) = read_artifact_object_manifest(
+        root_provider,
+        owner_digest,
+        artifact.artifact_id,
+        &manifest_object,
+    )
+    .await?;
     manifest
         .validate_for(owner_key, artifact)
         .map_err(|error| {
@@ -3331,10 +3340,72 @@ async fn artifact_object_transfer_source(
         "localized artifact from immutable object store"
     );
     Ok(Some(ArtifactTransferSource::Object {
-        provider,
+        runtime_provider,
+        boot_provider,
         manifest: Box::new(manifest),
-        replica,
+        replica: Box::new(replica),
     }))
+}
+
+async fn read_artifact_object_manifest(
+    root_provider: &tarit_volume::RemoteImmutableObjectProvider,
+    owner_digest: &str,
+    artifact_id: Uuid,
+    manifest_object: &tarit_volume::ImmutableObject,
+) -> Result<
+    (
+        tarit_volume::RemoteImmutableObjectProvider,
+        tarit_volume::RemoteImmutableObjectProvider,
+        ArtifactObjectManifest,
+    ),
+    OrchError,
+> {
+    let legacy_provider = root_provider
+        .scoped(&format!("tenants/{owner_digest}/artifacts"))
+        .map_err(|error| OrchError::Internal(format!("scope artifact object store: {error}")))?;
+    let artifact_provider = legacy_provider
+        .scoped(&artifact_id.to_string())
+        .map_err(|error| OrchError::Internal(format!("scope artifact object store: {error}")))?;
+    let boot_provider = root_provider
+        .scoped(&format!("tenants/{owner_digest}/boot"))
+        .map_err(|error| OrchError::Internal(format!("scope boot object store: {error}")))?;
+    let (bytes, versioned_namespace) = match artifact_provider.get_verified(manifest_object).await {
+        Ok(bytes) => (bytes, true),
+        Err(tarit_volume::VolumeError::NotFound) => (
+            legacy_provider
+                .get_verified(manifest_object)
+                .await
+                .map_err(|error| {
+                    OrchError::Unavailable(format!("read artifact object manifest: {error}"))
+                })?,
+            false,
+        ),
+        Err(error) => {
+            return Err(OrchError::Unavailable(format!(
+                "read artifact object manifest: {error}"
+            )))
+        }
+    };
+    let manifest: ArtifactObjectManifest = serde_json::from_slice(&bytes)
+        .map_err(|_| OrchError::Unavailable("artifact object manifest is invalid".into()))?;
+    if versioned_namespace != (manifest.version == ArtifactObjectManifest::VERSION) {
+        return Err(OrchError::Unavailable(
+            "artifact object manifest namespace version mismatch".into(),
+        ));
+    }
+    Ok((
+        if versioned_namespace {
+            artifact_provider
+        } else {
+            legacy_provider.clone()
+        },
+        if versioned_namespace {
+            boot_provider
+        } else {
+            legacy_provider
+        },
+        manifest,
+    ))
 }
 
 fn immutable_object(
@@ -3407,13 +3478,15 @@ async fn download_artifact_boot_components(
             .map_err(|error| OrchError::Internal(format!("boot-input transfer join: {error}")))?
         }
         ArtifactTransferSource::Object {
-            provider, manifest, ..
+            boot_provider,
+            manifest,
+            ..
         } => {
             let kernel = immutable_object(&manifest.components.kernel, "kernel")?;
             let rootfs = immutable_object(&manifest.components.rootfs, "rootfs")?;
             let kernel_transfer = async {
                 if need_kernel {
-                    provider
+                    boot_provider
                         .get_to_new_file_verified(
                             &kernel,
                             kernel_path.expect("kernel path accompanies transfer flag"),
@@ -3429,7 +3502,7 @@ async fn download_artifact_boot_components(
             };
             let rootfs_transfer = async {
                 if need_rootfs {
-                    provider
+                    boot_provider
                         .get_to_new_file_verified(
                             &rootfs,
                             rootfs_path.expect("rootfs path accompanies transfer flag"),
@@ -3532,7 +3605,9 @@ async fn download_artifact_runtime_components(
             .map_err(|error| OrchError::Internal(format!("artifact transfer join: {error}")))?
         }
         ArtifactTransferSource::Object {
-            provider, manifest, ..
+            runtime_provider,
+            manifest,
+            ..
         } => {
             let ram = immutable_object(&manifest.components.ram, "RAM")?;
             let overlay = manifest
@@ -3542,16 +3617,17 @@ async fn download_artifact_runtime_components(
                 .map(|reference| immutable_object(reference, "overlay"))
                 .transpose()?;
             let integrity = immutable_object(&manifest.components.integrity, "integrity")?;
-            let ram_transfer = provider.get_to_new_file_verified(&ram, ram_path);
+            let ram_transfer = runtime_provider.get_to_new_file_verified(&ram, ram_path);
             let overlay_transfer = async {
                 if let Some(overlay) = overlay.as_ref() {
-                    provider
+                    runtime_provider
                         .get_to_new_file_verified(overlay, overlay_path)
                         .await?;
                 }
                 Ok::<(), tarit_volume::VolumeError>(())
             };
-            let integrity_transfer = provider.get_to_new_file_verified(&integrity, integrity_path);
+            let integrity_transfer =
+                runtime_provider.get_to_new_file_verified(&integrity, integrity_path);
             tokio::try_join!(ram_transfer, overlay_transfer, integrity_transfer).map_err(
                 |error| {
                     OrchError::Unavailable(format!("download artifact runtime object: {error}"))
@@ -6072,6 +6148,10 @@ mod tests {
         let scoped = provider
             .scoped(&format!("tenants/{owner_digest}/artifacts"))
             .unwrap();
+        let artifact_scoped = scoped.scoped(&artifact.artifact_id.to_string()).unwrap();
+        let boot_scoped = provider
+            .scoped(&format!("tenants/{owner_digest}/boot"))
+            .unwrap();
         let manifest_object = immutable_object(
             &ArtifactObjectReference {
                 digest: replica.manifest_digest.clone(),
@@ -6081,7 +6161,7 @@ mod tests {
         )
         .unwrap();
         let manifest_bytes = test_runtime()
-            .block_on(scoped.get_verified(&manifest_object))
+            .block_on(artifact_scoped.get_verified(&manifest_object))
             .unwrap();
         let manifest: ArtifactObjectManifest = serde_json::from_slice(&manifest_bytes).unwrap();
         manifest.validate_for(&owner_key, &artifact).unwrap();
@@ -6091,9 +6171,10 @@ mod tests {
         assert!(!encoded.contains("test-host"));
 
         let source = ArtifactTransferSource::Object {
-            provider: scoped,
+            runtime_provider: artifact_scoped,
+            boot_provider: boot_scoped,
             manifest: Box::new(manifest.clone()),
-            replica,
+            replica: Box::new(replica.clone()),
         };
         let identity = crate::config::ApiIdentity {
             tenant: owner_key,
@@ -6145,13 +6226,100 @@ mod tests {
             );
         }
 
+        let legacy_manifest = ArtifactObjectManifest {
+            version: ArtifactObjectManifest::LEGACY_SHARED_NAMESPACE_VERSION,
+            owner_binding: manifest.owner_binding.clone(),
+            descriptor: manifest.descriptor.clone(),
+            components: ArtifactObjectComponents {
+                ram: artifact_object_reference(
+                    runtime
+                        .block_on(scoped.put_file_if_absent(&ram_path))
+                        .unwrap(),
+                ),
+                overlay: Some(artifact_object_reference(
+                    runtime
+                        .block_on(scoped.put_file_if_absent(&overlay_path))
+                        .unwrap(),
+                )),
+                integrity: artifact_object_reference(
+                    runtime
+                        .block_on(scoped.put_file_if_absent(&integrity_path))
+                        .unwrap(),
+                ),
+                kernel: artifact_object_reference(
+                    runtime
+                        .block_on(scoped.put_file_if_absent(&kernel_path))
+                        .unwrap(),
+                ),
+                rootfs: artifact_object_reference(
+                    runtime
+                        .block_on(scoped.put_file_if_absent(&rootfs_path))
+                        .unwrap(),
+                ),
+            },
+        };
+        legacy_manifest
+            .validate_for(&identity.tenant, &artifact)
+            .unwrap();
+        let legacy_manifest_bytes = serde_json::to_vec(&legacy_manifest).unwrap();
+        let legacy_manifest_object = runtime
+            .block_on(scoped.put_if_absent(&legacy_manifest_bytes))
+            .unwrap();
+        let (legacy_runtime_provider, legacy_boot_provider, loaded_legacy_manifest) = runtime
+            .block_on(read_artifact_object_manifest(
+                &provider,
+                owner_digest,
+                artifact_id,
+                &legacy_manifest_object,
+            ))
+            .unwrap();
+        assert_eq!(
+            loaded_legacy_manifest.version,
+            ArtifactObjectManifest::LEGACY_SHARED_NAMESPACE_VERSION
+        );
+        let legacy_source = ArtifactTransferSource::Object {
+            runtime_provider: legacy_runtime_provider,
+            boot_provider: legacy_boot_provider,
+            manifest: Box::new(loaded_legacy_manifest.clone()),
+            replica: Box::new(ArtifactObjectReplicaRecord {
+                manifest_digest: legacy_manifest_object.digest.to_string(),
+                manifest_size_bytes: legacy_manifest_object.size_bytes,
+                ..replica.clone()
+            }),
+        };
+        runtime
+            .block_on(download_artifact_boot_components(
+                &state,
+                &legacy_source,
+                &identity,
+                &loaded_legacy_manifest.descriptor,
+                Some(&root.join("legacy-kernel")),
+                Some(&root.join("legacy-rootfs")),
+            ))
+            .unwrap();
+        runtime
+            .block_on(download_artifact_runtime_components(
+                &state,
+                &legacy_source,
+                &identity,
+                &loaded_legacy_manifest.descriptor,
+                &root.join("legacy.ram"),
+                &root.join("legacy.cow"),
+                &root.join("legacy.ram.integrity"),
+            ))
+            .unwrap();
+
         let mut corrupt_manifest = manifest;
         corrupt_manifest.components.ram.digest = format!("sha256:{}", "0".repeat(64));
         let corrupt_source = match source {
             ArtifactTransferSource::Object {
-                provider, replica, ..
+                runtime_provider,
+                boot_provider,
+                replica,
+                ..
             } => ArtifactTransferSource::Object {
-                provider,
+                runtime_provider,
+                boot_provider,
                 manifest: Box::new(corrupt_manifest.clone()),
                 replica,
             },
