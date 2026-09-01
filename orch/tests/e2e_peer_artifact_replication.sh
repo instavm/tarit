@@ -37,6 +37,11 @@ CROSS_NODE_FORK_VM=""
 REQUESTED_CROSS_NODE_FORK_VM=""
 B_FORK_PAUSE_MS=0
 B_FORK_PAUSE_PHASE=""
+B_LOCALIZE_PAUSE_MS=0
+B_STORAGE_IMAGE=""
+B_STORAGE_LOOP=""
+B_STORAGE_MOUNTED=0
+PRESSURE_CURL_PID=""
 if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
   B_FORK_PAUSE_MS=30000
   B_FORK_PAUSE_PHASE="${TARIT_TEST_CROSS_NODE_FORK_DEATH_PHASE:-after_child}"
@@ -47,6 +52,19 @@ if [ "${TARIT_TEST_CROSS_NODE_FORK_DEATH:-0}" = 1 ]; then
       exit 1
       ;;
   esac
+fi
+if [ "${TARIT_TEST_NEAR_ENOSPC:-0}" = 1 ]; then
+  B_LOCALIZE_PAUSE_MS="${TARIT_TEST_LOCALIZE_PAUSE_AFTER_RESERVE_MS:-30000}"
+  case "$B_LOCALIZE_PAUSE_MS" in
+    ''|*[!0-9]*)
+      echo "FAIL: near-ENOSPC localization pause must be an integer" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$B_LOCALIZE_PAUSE_MS" -lt 5000 ]; then
+    echo "FAIL: near-ENOSPC localization pause must be at least 5000 ms" >&2
+    exit 1
+  fi
 fi
 VOLUME_VM=""
 VOLUME_ID=""
@@ -67,6 +85,19 @@ with socket.socket() as listener:
 PY
 }
 
+detach_loop_device() {
+  local loop_device=$1
+  local _
+  for _ in $(seq 1 20); do
+    if losetup --detach "$loop_device" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "FAIL: could not detach loop device after bounded retry: $loop_device" >&2
+  return 1
+}
+
 A_CONTROL=$(port)
 A_PEER=$(port)
 B_CONTROL=$(port)
@@ -76,6 +107,10 @@ C_PEER=$(port)
 
 cleanup() {
   local status=$?
+  if [ -n "$PRESSURE_CURL_PID" ] && kill -0 "$PRESSURE_CURL_PID" 2>/dev/null; then
+    kill -TERM "$PRESSURE_CURL_PID" 2>/dev/null || true
+    wait "$PRESSURE_CURL_PID" 2>/dev/null || true
+  fi
   if [ -n "$FIRST_FORK_CURL_PID" ] && kill -0 "$FIRST_FORK_CURL_PID" 2>/dev/null; then
     kill -TERM "$FIRST_FORK_CURL_PID" 2>/dev/null || true
     wait "$FIRST_FORK_CURL_PID" 2>/dev/null || true
@@ -113,6 +148,19 @@ cleanup() {
     timeout --signal=TERM --kill-after=2s 10s umount -- "$mounted_target" 2>/dev/null ||
       umount -l -- "$mounted_target" 2>/dev/null || status=1
   done < <(findmnt -rn -t nfs4 -o TARGET || true)
+  if [ "$B_STORAGE_MOUNTED" -eq 1 ]; then
+    if timeout --signal=TERM --kill-after=2s 10s \
+      umount -- "$DIR/node-b" 2>/dev/null || \
+      umount -l -- "$DIR/node-b" 2>/dev/null; then
+      B_STORAGE_MOUNTED=0
+    else
+      status=1
+    fi
+  fi
+  if [ -n "$B_STORAGE_LOOP" ]; then
+    detach_loop_device "$B_STORAGE_LOOP" || status=1
+    B_STORAGE_LOOP=""
+  fi
   if [ "$NFS_EXPORTED" -eq 1 ]; then
     exportfs -u "127.0.0.1:$NFS_EXPORT" 2>/dev/null || status=1
   fi
@@ -140,6 +188,11 @@ trap 'status=$?; echo "FAIL: peer artifact gate exited $status" >&2; tail -120 "
 for required in curl exportfs findmnt mount.nfs4 openssl python3 psql createdb sqlite3 skopeo systemctl timeout umoci e2fsck; do
   command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
 done
+if [ "${TARIT_TEST_NEAR_ENOSPC:-0}" = 1 ]; then
+  for required in fallocate losetup mkfs.btrfs mount truncate; do
+    command -v "$required" >/dev/null || { echo "FAIL: missing $required" >&2; exit 1; }
+  done
+fi
 test -x "$TARITD" || { echo "FAIL: taritd not executable: $TARITD" >&2; exit 1; }
 test -x "$VMM" || { echo "FAIL: vmm not executable: $VMM" >&2; exit 1; }
 test -x "$AGENT" || { echo "FAIL: guest agent not executable: $AGENT" >&2; exit 1; }
@@ -148,6 +201,29 @@ test "$(stat -f -c %T "$DIR")" = btrfs || {
   echo "FAIL: TMPDIR must reside on btrfs for exact CoW artifact validation" >&2
   exit 1
 }
+
+if [ "${TARIT_TEST_NEAR_ENOSPC:-0}" = 1 ]; then
+  echo '== create isolated node-B filesystem for near-ENOSPC fault injection =='
+  ENOSPC_FS_BYTES="${TARIT_TEST_ENOSPC_FS_BYTES:-5368709120}"
+  case "$ENOSPC_FS_BYTES" in
+    ''|*[!0-9]*)
+      echo "FAIL: near-ENOSPC filesystem size must be an integer" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$ENOSPC_FS_BYTES" -lt 1073741824 ]; then
+    echo "FAIL: near-ENOSPC filesystem must be at least 1 GiB" >&2
+    exit 1
+  fi
+  B_STORAGE_IMAGE="$DIR/node-b-storage.img"
+  truncate -s "$ENOSPC_FS_BYTES" "$B_STORAGE_IMAGE"
+  B_STORAGE_LOOP=$(losetup --find --show "$B_STORAGE_IMAGE")
+  mkfs.btrfs -q -f "$B_STORAGE_LOOP"
+  mkdir -m 700 "$DIR/node-b"
+  mount -o noatime,space_cache=v2 "$B_STORAGE_LOOP" "$DIR/node-b"
+  B_STORAGE_MOUNTED=1
+  chmod 700 "$DIR/node-b"
+fi
 
 for candidate in nfs-server.service nfs-kernel-server.service; do
   if systemctl cat "$candidate" >/dev/null 2>&1; then
@@ -195,6 +271,7 @@ start_node() {
   local node_kernel=$KERNEL
   local fork_pause_ms=0
   local fork_pause_phase=""
+  local localize_pause_ms=0
   # Peers deliberately start with a different readable kernel. Artifact
   # localization must fetch the authenticated source kernel rather than rely
   # on a shared host path or manual pre-provisioning.
@@ -204,6 +281,7 @@ start_node() {
   if [ "$name" = node-b ]; then
     fork_pause_ms=$B_FORK_PAUSE_MS
     fork_pause_phase=$B_FORK_PAUSE_PHASE
+    localize_pause_ms=$B_LOCALIZE_PAUSE_MS
   fi
   install -d -m 0700 "$DIR/$name/sockets" "$DIR/$name/images"
   install -d -m 0700 "$DIR/$name/nfs-mounts"
@@ -249,6 +327,7 @@ start_node() {
     TARIT_TEST_FORK_PAUSE_PHASE="$fork_pause_phase" \
     TARIT_TEST_FORK_PAUSE_MS="$fork_pause_ms" \
     TARIT_TEST_FORK_PAUSE_AFTER_CHILD_MS="$fork_pause_ms" \
+    TARIT_TEST_LOCALIZE_PAUSE_AFTER_RESERVE_MS="$localize_pause_ms" \
     RUST_LOG=info \
     "$TARITD" serve >"$log" 2>&1 &
   LAST_PID=$!
@@ -563,6 +642,113 @@ with sqlite3.connect(db_path, timeout=30) as db:
     db.execute("update snapshots set cmdline=? where snapshot_id=?", (open(source).read(), artifact_id))
 PY
 
+if [ "${TARIT_TEST_NEAR_ENOSPC:-0}" = 1 ]; then
+  echo '== exhaust node-B storage after reservation and require lossless rollback =='
+  ENOSPC_LOCALIZATION_BYTES=$(python3 - "$DIR/node-a/store.db" "$ARTIFACT_ID" <<'PY'
+import os, sqlite3, sys
+db_path, artifact_id = sys.argv[1:]
+with sqlite3.connect(db_path, timeout=30) as db:
+    row = db.execute(
+        "select path, coalesce(overlay_path, '') from snapshots where snapshot_id=?",
+        (artifact_id,),
+    ).fetchone()
+assert row and row[0], row
+paths = [row[0], row[0] + ".integrity"]
+if row[1]:
+    paths.append(row[1])
+print(sum(os.stat(path).st_size for path in paths))
+PY
+  )
+  test "$ENOSPC_LOCALIZATION_BYTES" -gt 134217728
+  ENOSPC_AVAILABLE_BEFORE_RESERVE=$(df -B1 --output=avail "$DIR/node-b" | \
+    tail -1 | tr -d '[:space:]')
+  ENOSPC_RESERVATION_HEADROOM=67108864
+  if [ "$ENOSPC_AVAILABLE_BEFORE_RESERVE" -le "$((ENOSPC_LOCALIZATION_BYTES + ENOSPC_RESERVATION_HEADROOM))" ]; then
+    echo "FAIL: near-ENOSPC fixture cannot admit localization before fault injection" >&2
+    echo "available_bytes=$ENOSPC_AVAILABLE_BEFORE_RESERVE" \
+      "localization_bytes=$ENOSPC_LOCALIZATION_BYTES" \
+      "required_headroom=$ENOSPC_RESERVATION_HEADROOM" >&2
+    exit 1
+  fi
+  curl -sS --max-time 180 -o "$DIR/enospc-response.json" -w '%{http_code}' \
+    -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' -d "$BRANCH_BODY" \
+    "http://127.0.0.1:$A_CONTROL/v1/branches" \
+    >"$DIR/enospc-status" &
+  PRESSURE_CURL_PID=$!
+  ENOSPC_PAUSED=0
+  for _ in $(seq 1 300); do
+    if grep -F 'test artifact localization paused after disk reservation' "$DIR/node-b.log" | \
+      grep -Fq "$ARTIFACT_ID"; then
+      ENOSPC_PAUSED=1
+      break
+    fi
+    sleep 0.1
+  done
+  test "$ENOSPC_PAUSED" = 1
+  ENOSPC_TARGET_FREE=$((ENOSPC_LOCALIZATION_BYTES / 4))
+  [ "$ENOSPC_TARGET_FREE" -ge 33554432 ] || ENOSPC_TARGET_FREE=33554432
+  [ "$ENOSPC_TARGET_FREE" -lt "$ENOSPC_LOCALIZATION_BYTES" ]
+  ENOSPC_FILLER="$DIR/node-b/.near-enospc-filler"
+  : >"$ENOSPC_FILLER"
+  ENOSPC_PRESSURE_CONVERGED=0
+  for ENOSPC_PRESSURE_ROUND in $(seq 1 16); do
+    ENOSPC_AVAILABLE=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
+    if [ "$ENOSPC_AVAILABLE" -lt "$ENOSPC_LOCALIZATION_BYTES" ]; then
+      ENOSPC_PRESSURE_CONVERGED=1
+      break
+    fi
+    ENOSPC_FILL_SIZE=$(stat -c %s "$ENOSPC_FILLER")
+    ENOSPC_FILL_DELTA=$((ENOSPC_AVAILABLE - ENOSPC_TARGET_FREE))
+    [ "$ENOSPC_FILL_DELTA" -gt 0 ] || break
+    ENOSPC_FILL_TARGET=$((ENOSPC_FILL_SIZE + ENOSPC_FILL_DELTA))
+    if ! fallocate -l "$ENOSPC_FILL_TARGET" "$ENOSPC_FILLER"; then
+      echo "near-ENOSPC pressure allocation stopped at round $ENOSPC_PRESSURE_ROUND" >&2
+    fi
+    if ! sync -f "$ENOSPC_FILLER"; then
+      echo "near-ENOSPC pressure sync reported exhausted storage at round $ENOSPC_PRESSURE_ROUND" >&2
+    fi
+    ENOSPC_AFTER=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
+    echo "near_enospc_pressure round=$ENOSPC_PRESSURE_ROUND before=$ENOSPC_AVAILABLE after=$ENOSPC_AFTER target=$ENOSPC_TARGET_FREE localization=$ENOSPC_LOCALIZATION_BYTES" >&2
+    if [ "$ENOSPC_AFTER" -ge "$ENOSPC_AVAILABLE" ]; then
+      echo "FAIL: near-ENOSPC pressure made no forward progress" >&2
+      exit 1
+    fi
+  done
+  ENOSPC_REMAINING=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
+  if [ "$ENOSPC_REMAINING" -lt "$ENOSPC_LOCALIZATION_BYTES" ]; then
+    ENOSPC_PRESSURE_CONVERGED=1
+  fi
+  if [ "$ENOSPC_PRESSURE_CONVERGED" != 1 ]; then
+    echo "FAIL: near-ENOSPC pressure did not reach the localization threshold" >&2
+    echo "remaining_bytes=$ENOSPC_REMAINING localization_bytes=$ENOSPC_LOCALIZATION_BYTES" >&2
+    exit 1
+  fi
+  wait "$PRESSURE_CURL_PID"
+  PRESSURE_CURL_PID=""
+  test "$(cat "$DIR/enospc-status")" = 503
+  python3 - "$DIR/enospc-response.json" "$DIR" <<'PY'
+import json, sys
+row = json.load(open(sys.argv[1]))
+assert row == {"error": "service unavailable"}, row
+assert sys.argv[2] not in json.dumps(row), row
+PY
+  grep -Fq 'No space left on device' "$DIR/node-b.log"
+  test "$(sqlite3 "$DIR/node-b/store.db" \
+    "select (select count(*) from artifacts where artifact_id='$ARTIFACT_ID') +
+            (select count(*) from snapshots where snapshot_id='$ARTIFACT_ID')")" = 0
+  test -z "$(find "$DIR/node-b/sockets/snapshots" -maxdepth 1 -type f \
+    \( -name '.replica-stage-*' -o -name "replica-$ARTIFACT_ID-*" \) -print 2>/dev/null)"
+  PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+    "select count(*) from fleet_artifact_replicas where artifact_id='$ARTIFACT_ID'" | grep -qx 1
+  PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+    "select count(*) from fleet_branches where branch_id='$BRANCH_ID'" | grep -qx 0
+  wait_exec_ubuntu "http://127.0.0.1:$A_CONTROL" "$SOURCE_VM"
+  rm -f -- "$ENOSPC_FILLER"
+  sync -f "$DIR/node-b"
+  ENOSPC_RECOVERED=$(df -B1 --output=avail "$DIR/node-b" | tail -1 | tr -d '[:space:]')
+  [ "$ENOSPC_RECOVERED" -gt "$ENOSPC_LOCALIZATION_BYTES" ]
+fi
+
 BRANCH_STATUS=$(curl -sS --max-time 180 -o "$DIR/branch-response.json" -w '%{http_code}' \
   -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' -d "$BRANCH_BODY" \
   "http://127.0.0.1:$A_CONTROL/v1/branches")
@@ -803,4 +989,4 @@ for deleted in \
   [ -z "$deleted" ] || test ! -e "$deleted"
 done
 
-echo 'PASS: atomic live fork started its isolated child across nodes; boot metadata failed closed; Ubuntu OCI artifacts used peer mTLS; hibernate reached zero; stale owner was fenced; HTTP exec woke the same VM ID on B with durable egress and its shared-volume attachment; cross-node volume deletion removed the backing object; branch restored; node C repaired degradation; last-branch deletion preserved the live lazy restore and physical replica GC converged'
+echo "PASS source=${TARIT_SOURCE_REVISION:-unknown}: atomic live fork started its isolated child across nodes; boot metadata failed closed; Ubuntu OCI artifacts used peer mTLS; hibernate reached zero; stale owner was fenced; HTTP exec woke the same VM ID on B with durable egress and its shared-volume attachment; cross-node volume deletion removed the backing object; branch restored; node C repaired degradation; last-branch deletion preserved the live lazy restore and physical replica GC converged"

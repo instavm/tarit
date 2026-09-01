@@ -3432,6 +3432,7 @@ pub async fn localize_branch_artifact(
         localization_bytes,
         if descriptor.has_overlay { 3 } else { 2 },
     )?;
+    artifact_localization_reservation_failpoint(artifact.artifact_id).await;
     let token = Uuid::new_v4();
     let staging_ram = snapshot_dir.join(format!(".replica-stage-{token}.ram"));
     let staging_overlay = snapshot_dir.join(format!(".replica-stage-{token}.cow"));
@@ -3617,6 +3618,28 @@ pub async fn localize_branch_artifact(
     }
     Ok(final_snapshot.path)
 }
+
+#[cfg(feature = "test-failpoints")]
+async fn artifact_localization_reservation_failpoint(artifact_id: Uuid) {
+    let Ok(value) = std::env::var("TARIT_TEST_LOCALIZE_PAUSE_AFTER_RESERVE_MS") else {
+        return;
+    };
+    let Ok(milliseconds) = value.parse::<u64>() else {
+        return;
+    };
+    if milliseconds == 0 {
+        return;
+    }
+    tracing::warn!(
+        %artifact_id,
+        milliseconds,
+        "test artifact localization paused after disk reservation"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(milliseconds)).await;
+}
+
+#[cfg(not(feature = "test-failpoints"))]
+async fn artifact_localization_reservation_failpoint(_artifact_id: Uuid) {}
 
 fn create_private_replica_file(path: &std::path::Path) -> Result<std::fs::File, OrchError> {
     use std::os::unix::fs::OpenOptionsExt;
