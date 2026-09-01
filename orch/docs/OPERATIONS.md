@@ -476,6 +476,22 @@ cargo run --release -p tarit-bench -- all \
 
 Modes are `sequential`, `staggered`, `burst`, or `all`.
 
+The real-KVM lazy-fork gate uses the public create, execute, fork, and delete
+routes and requires at least 100 successful samples at each of two guest-memory
+sizes. It records API-to-ready latency, total server time, snapshot/artifact
+time, child-ready time, and final-stop downtime. The gate applies absolute p99
+ceilings and a large/small p99 ratio so increasing configured but untouched RAM
+cannot silently turn lazy fork into a size-proportional path. Run it only on an
+otherwise reserved worker with reflink-capable test storage:
+
+```sh
+sudo -E env \
+  TARIT_KERNEL=/path/to/vmlinux \
+  TARIT_ROOTFS=/path/to/oci-rootfs.ext4 \
+  TARIT_TEST_SOCKET_ROOT=/t \
+  bash orch/tests/e2e_fork_lazy_performance.sh
+```
+
 ## Security checklist
 
 - Use a long random `TARIT_API_KEY`.

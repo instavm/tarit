@@ -127,7 +127,9 @@ jobs:
         if: matrix.workspace == 'orch'
         run: |
           python3 -m unittest orch/tests/test_continuous_lifecycle_soak.py
+          python3 -m unittest orch/tests/test_fork_lazy_performance.py
           bash -n orch/tests/continuous_mixed_oci_soak.sh
+          bash -n orch/tests/e2e_fork_lazy_performance.sh
 
       - name: Type-check KVM/Linux code paths
         if: matrix.workspace == 'vmm'

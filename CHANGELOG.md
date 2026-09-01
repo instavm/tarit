@@ -12,6 +12,10 @@ versions may contain breaking changes.
 
 ### Added
 
+- The hardware qualification suite now measures 100 live forks at both small
+  and large guest-memory sizes through the public API. It enforces total and
+  final-stop p99 ceilings, validates server phase metrics, and rejects a lazy
+  path whose tail latency scales materially with untouched virtual RAM.
 - Generated Python and TypeScript clients now cover the public OpenAPI contract.
   Their handwritten layers provide API-key setup, typed failures,
   deadline-bounded execution polling, stable-child-id live-fork retries, and
