@@ -849,7 +849,24 @@ if [ "${TARIT_TEST_OBJECT_FALLBACK:-0}" = 1 ]; then
   api_json POST "http://127.0.0.1:$B_CONTROL/v1/execute" \
     "{\"vm_id\":\"$RESTORED_VM\",\"command\":\"test \$(cat /root/tarit-cross-node-fork-proof) = cross-node-live-fork && echo object-restore-state-ok\",\"timeout_ms\":30000}" | \
     python3 -c 'import json,sys; row=json.load(sys.stdin); assert row.get("exit_code") == 0 and "object-restore-state-ok" in row.get("stdout", ""), row'
-  echo "PASS source=${TARIT_SOURCE_REVISION:-unknown}: Ubuntu OCI snapshot published an authenticated $OBJECT_PROVIDER bundle through the API; node A was lost; node B localized RAM, disk, integrity, kernel, and rootfs without a peer; branch restore booted and preserved guest state"
+  api_json DELETE "http://127.0.0.1:$B_CONTROL/v1/branches/$BRANCH_ID" >/dev/null
+  api_json DELETE "http://127.0.0.1:$B_CONTROL/v1/vms/$RESTORED_VM" >/dev/null
+  RESTORED_VM=""
+  OBJECT_GC_CONVERGED=0
+  for _ in $(seq 1 90); do
+    GLOBAL_COUNT=$(PGPASSWORD="$DB_PASSWORD" psql "$DATABASE_URL" -qAtc \
+      "select count(*) from fleet_artifacts where artifact_id='$ARTIFACT_ID'")
+    B_LOCAL=$(sqlite3 "$DIR/node-b/store.db" \
+      "select (select count(*) from artifacts where artifact_id='$ARTIFACT_ID') + (select count(*) from snapshots where snapshot_id='$ARTIFACT_ID')")
+    if [ "$GLOBAL_COUNT:$B_LOCAL" = '0:0' ] &&
+      grep -Fq 'unreferenced remote artifact namespaces removed' "$DIR/node-b.log"; then
+      OBJECT_GC_CONVERGED=1
+      break
+    fi
+    sleep 1
+  done
+  test "$OBJECT_GC_CONVERGED" = 1
+  echo "PASS source=${TARIT_SOURCE_REVISION:-unknown}: Ubuntu OCI snapshot published an authenticated $OBJECT_PROVIDER bundle through the API; node A was lost; node B localized RAM, disk, integrity, kernel, and rootfs without a peer; branch restore preserved guest state; remote artifact collection converged"
   exit 0
 fi
 
