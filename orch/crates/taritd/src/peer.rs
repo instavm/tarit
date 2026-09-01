@@ -14,7 +14,7 @@ use axum::{
     },
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::blocking::Client;
@@ -110,35 +110,7 @@ struct RemoteRestoreRequest<'a> {
     api_key_id: &'a str,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ArtifactTransferDescriptor {
-    pub artifact_id: Uuid,
-    pub content_digest: String,
-    pub size_bytes: u64,
-    pub immutable_image_digest: String,
-    pub agent_digest: String,
-    pub boot_manifest_digest: String,
-    pub kernel_digest: String,
-    pub kernel_bytes: u64,
-    pub rootfs_digest: String,
-    pub rootfs_bytes: u64,
-    pub image_source_ref: String,
-    pub provenance_key_digest: Option<String>,
-    pub provenance_verified_at: Option<DateTime<Utc>>,
-    pub creation_revision: u64,
-    pub integrity_manifest_digest: String,
-    pub chunk_size_bytes: u64,
-    pub chunk_count: u64,
-    pub source_vm_id: Uuid,
-    pub memory_mib: u64,
-    pub vcpus: u8,
-    pub cmdline: String,
-    pub rootfs_read_only: bool,
-    pub has_overlay: bool,
-    pub ram_bytes: u64,
-    pub overlay_bytes: u64,
-    pub integrity_bytes: u64,
-}
+pub(crate) use tarit_types::ArtifactTransferDescriptor;
 
 impl PeerClient {
     #[cfg(test)]

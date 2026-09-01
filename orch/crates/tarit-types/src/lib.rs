@@ -372,6 +372,158 @@ pub struct ArtifactRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Path-independent description of every input needed to localize and boot an
+/// immutable snapshot artifact. This is an internal storage/peer contract, not
+/// a public API projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactTransferDescriptor {
+    pub artifact_id: Uuid,
+    pub content_digest: String,
+    pub size_bytes: u64,
+    pub immutable_image_digest: String,
+    pub agent_digest: String,
+    pub boot_manifest_digest: String,
+    pub kernel_digest: String,
+    pub kernel_bytes: u64,
+    pub rootfs_digest: String,
+    pub rootfs_bytes: u64,
+    pub image_source_ref: String,
+    pub provenance_key_digest: Option<String>,
+    pub provenance_verified_at: Option<DateTime<Utc>>,
+    pub creation_revision: u64,
+    pub integrity_manifest_digest: String,
+    pub chunk_size_bytes: u64,
+    pub chunk_count: u64,
+    pub source_vm_id: Uuid,
+    pub memory_mib: u64,
+    pub vcpus: u8,
+    pub cmdline: String,
+    pub rootfs_read_only: bool,
+    pub has_overlay: bool,
+    pub ram_bytes: u64,
+    pub overlay_bytes: u64,
+    pub integrity_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactObjectReference {
+    pub digest: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactObjectComponents {
+    pub ram: ArtifactObjectReference,
+    pub overlay: Option<ArtifactObjectReference>,
+    pub integrity: ArtifactObjectReference,
+    pub kernel: ArtifactObjectReference,
+    pub rootfs: ArtifactObjectReference,
+}
+
+/// Versioned immutable bundle manifest stored as a content-addressed object.
+/// It binds the logical artifact and every component without exposing a raw
+/// tenant name, worker path, bucket, container, endpoint, or credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactObjectManifest {
+    pub version: u8,
+    pub owner_binding: String,
+    pub descriptor: ArtifactTransferDescriptor,
+    pub components: ArtifactObjectComponents,
+}
+
+impl ArtifactObjectManifest {
+    pub const VERSION: u8 = 1;
+
+    pub fn owner_binding(owner_key: &str) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"tarit-artifact-owner-v1\0");
+        digest.update(owner_key.as_bytes());
+        let digest = digest.finalize();
+        format!("sha256:{digest:x}")
+    }
+
+    pub fn validate_for(&self, owner_key: &str, artifact: &ArtifactRecord) -> Result<(), String> {
+        if self.version != Self::VERSION {
+            return Err("unsupported artifact object manifest version".into());
+        }
+        if self.owner_binding != Self::owner_binding(owner_key) {
+            return Err("artifact object manifest owner binding mismatch".into());
+        }
+        let descriptor = &self.descriptor;
+        if descriptor.artifact_id != artifact.artifact_id
+            || descriptor.content_digest != artifact.content_digest
+            || descriptor.size_bytes != artifact.size_bytes
+            || descriptor.immutable_image_digest != artifact.immutable_image_digest
+            || descriptor.agent_digest != artifact.agent_digest
+            || descriptor.boot_manifest_digest != artifact.boot_manifest_digest
+            || descriptor.creation_revision != artifact.creation_revision
+            || descriptor.integrity_manifest_digest != artifact.integrity_manifest_digest
+            || descriptor.chunk_size_bytes != artifact.chunk_size_bytes
+            || descriptor.chunk_count != artifact.chunk_count
+            || artifact.source_vm_id != Some(descriptor.source_vm_id)
+        {
+            return Err("artifact object manifest does not match logical artifact".into());
+        }
+        if descriptor.ram_bytes.checked_add(descriptor.overlay_bytes) != Some(descriptor.size_bytes)
+            || descriptor.has_overlay != (descriptor.overlay_bytes > 0)
+            || self.components.ram.size_bytes != descriptor.ram_bytes
+            || self.components.integrity.size_bytes != descriptor.integrity_bytes
+            || self.components.kernel.size_bytes != descriptor.kernel_bytes
+            || self.components.rootfs.size_bytes != descriptor.rootfs_bytes
+            || self
+                .components
+                .overlay
+                .as_ref()
+                .map(|object| object.size_bytes)
+                != descriptor.has_overlay.then_some(descriptor.overlay_bytes)
+        {
+            return Err("artifact object manifest component shape mismatch".into());
+        }
+        let manifest_bound = descriptor
+            .chunk_count
+            .checked_mul(128)
+            .and_then(|bytes| bytes.checked_add(1024 * 1024))
+            .ok_or_else(|| "artifact object manifest size bound overflow".to_string())?;
+        if descriptor.integrity_bytes == 0 || descriptor.integrity_bytes > manifest_bound {
+            return Err("artifact integrity object exceeds its authenticated bound".into());
+        }
+        for object in [
+            Some(&self.components.ram),
+            self.components.overlay.as_ref(),
+            Some(&self.components.integrity),
+            Some(&self.components.kernel),
+            Some(&self.components.rootfs),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !is_canonical_sha256(&object.digest) {
+                return Err("artifact object digest is not canonical SHA-256".into());
+            }
+        }
+        if self.components.integrity.digest != descriptor.integrity_manifest_digest
+            || self.components.kernel.digest != descriptor.kernel_digest
+            || self.components.rootfs.digest != descriptor.rootfs_digest
+        {
+            return Err("artifact object component identity mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Path-independent boot inputs authenticated by an artifact record. A peer
 /// may transport this structure, but the receiver must recompute its digest
 /// and verify the exact local kernel and admitted image before guest execution.
@@ -1556,5 +1708,115 @@ mod tests {
         }
         assert!(!value.to_string().contains("private-host"));
         assert!(!value.to_string().contains("/private/provider/path"));
+    }
+
+    #[test]
+    fn artifact_object_manifest_is_tenant_bound_strict_and_component_complete() {
+        let digest = |byte: char| format!("sha256:{}", byte.to_string().repeat(64));
+        let artifact_id = Uuid::new_v4();
+        let source_vm_id = Uuid::new_v4();
+        let now = Utc::now();
+        let artifact = ArtifactRecord {
+            artifact_id,
+            owner_key: "tenant-secret".into(),
+            host_id: "private-worker".into(),
+            storage_locator: "/private/snapshot.ram".into(),
+            kind: ArtifactKind::VmSnapshot,
+            status: ArtifactStatus::Available,
+            content_digest: digest('a'),
+            size_bytes: 12,
+            immutable_image_digest: digest('b'),
+            agent_digest: digest('c'),
+            boot_manifest_digest: digest('d'),
+            parent_artifact_id: None,
+            source_vm_id: Some(source_vm_id),
+            creation_revision: 7,
+            integrity_manifest_digest: digest('e'),
+            chunk_size_bytes: 65_536,
+            chunk_count: 1,
+            replication_state: ArtifactReplicationState::Ready,
+            reference_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let manifest = ArtifactObjectManifest {
+            version: ArtifactObjectManifest::VERSION,
+            owner_binding: ArtifactObjectManifest::owner_binding("tenant-secret"),
+            descriptor: ArtifactTransferDescriptor {
+                artifact_id,
+                content_digest: artifact.content_digest.clone(),
+                size_bytes: artifact.size_bytes,
+                immutable_image_digest: artifact.immutable_image_digest.clone(),
+                agent_digest: artifact.agent_digest.clone(),
+                boot_manifest_digest: artifact.boot_manifest_digest.clone(),
+                kernel_digest: digest('f'),
+                kernel_bytes: 8,
+                rootfs_digest: digest('1'),
+                rootfs_bytes: 16,
+                image_source_ref: "registry.invalid/image@sha256:immutable".into(),
+                provenance_key_digest: Some(digest('2')),
+                provenance_verified_at: Some(now),
+                creation_revision: artifact.creation_revision,
+                integrity_manifest_digest: artifact.integrity_manifest_digest.clone(),
+                chunk_size_bytes: artifact.chunk_size_bytes,
+                chunk_count: artifact.chunk_count,
+                source_vm_id,
+                memory_mib: 256,
+                vcpus: 1,
+                cmdline: "console=ttyS0".into(),
+                rootfs_read_only: true,
+                has_overlay: true,
+                ram_bytes: 10,
+                overlay_bytes: 2,
+                integrity_bytes: 100,
+            },
+            components: ArtifactObjectComponents {
+                ram: ArtifactObjectReference {
+                    digest: digest('3'),
+                    size_bytes: 10,
+                },
+                overlay: Some(ArtifactObjectReference {
+                    digest: digest('4'),
+                    size_bytes: 2,
+                }),
+                integrity: ArtifactObjectReference {
+                    digest: artifact.integrity_manifest_digest.clone(),
+                    size_bytes: 100,
+                },
+                kernel: ArtifactObjectReference {
+                    digest: digest('f'),
+                    size_bytes: 8,
+                },
+                rootfs: ArtifactObjectReference {
+                    digest: digest('1'),
+                    size_bytes: 16,
+                },
+            },
+        };
+        manifest.validate_for("tenant-secret", &artifact).unwrap();
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        let encoded_text = String::from_utf8(encoded.clone()).unwrap();
+        assert!(!encoded_text.contains("tenant-secret"));
+        assert!(!encoded_text.contains("private-worker"));
+        assert!(!encoded_text.contains("/private/snapshot.ram"));
+        let decoded: ArtifactObjectManifest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, manifest);
+
+        let mut wrong_owner = manifest.clone();
+        wrong_owner.owner_binding = ArtifactObjectManifest::owner_binding("tenant-other");
+        assert!(wrong_owner
+            .validate_for("tenant-secret", &artifact)
+            .is_err());
+        let mut wrong_component = manifest.clone();
+        wrong_component.components.kernel.digest = digest('9');
+        assert!(wrong_component
+            .validate_for("tenant-secret", &artifact)
+            .is_err());
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::json!(true));
+        assert!(serde_json::from_value::<ArtifactObjectManifest>(value).is_err());
     }
 }
