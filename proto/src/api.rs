@@ -76,6 +76,15 @@ pub enum ApiRequest {
         #[serde(default)]
         live: bool,
     },
+    /// Begin a live snapshot whose coherent final stop is held for one
+    /// orchestrator-managed provider-clone operation on this same connection.
+    SnapshotForClone,
+    /// Complete the in-band final-stop handshake. This request is valid only
+    /// as the immediate reply to `SnapshotBoundary` on the same connection.
+    ContinueSnapshot {
+        boundary_id: u64,
+        commit: bool,
+    },
     /// Transfer one exact VMM-owned scratch file to the caller.
     ReleaseScratch {
         path: String,
@@ -167,6 +176,12 @@ pub struct LiveSnapshotStats {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ApiResponse {
     Ok,
+    /// Intermediate response emitted while all vCPUs and device workers are
+    /// quiesced. The client must acknowledge this exact boundary on the same
+    /// connection; disconnect, timeout, or abort resumes the source.
+    SnapshotBoundary {
+        boundary_id: u64,
+    },
     Snapshot {
         path: String,
         /// Disk upper captured at the same atomic boundary as a live memory
@@ -364,6 +379,31 @@ mod tests {
         // Wire compat: requests from clients predating the `live` flag.
         let back: ApiRequest = serde_json::from_str(r#"{"op":"snapshot","diff":true}"#).unwrap();
         assert!(matches!(back, ApiRequest::Snapshot { diff, live } if diff && !live));
+    }
+
+    #[test]
+    fn snapshot_clone_boundary_handshake_round_trips() {
+        let start = serde_json::to_value(ApiRequest::SnapshotForClone).unwrap();
+        assert_eq!(start, serde_json::json!({"op": "snapshot_for_clone"}));
+        let boundary =
+            serde_json::to_value(ApiResponse::SnapshotBoundary { boundary_id: 41 }).unwrap();
+        assert_eq!(
+            boundary,
+            serde_json::json!({"status": "snapshot_boundary", "boundary_id": 41})
+        );
+        let acknowledgement = serde_json::to_value(ApiRequest::ContinueSnapshot {
+            boundary_id: 41,
+            commit: true,
+        })
+        .unwrap();
+        assert_eq!(
+            acknowledgement,
+            serde_json::json!({
+                "op": "continue_snapshot",
+                "boundary_id": 41,
+                "commit": true,
+            })
+        );
     }
 
     #[test]

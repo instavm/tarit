@@ -12,6 +12,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+#[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use vmm_core::controller::VmmController;
 
@@ -24,6 +26,10 @@ pub const MAX_FRAME_BYTES: usize = tarit_proto::MAX_API_FRAME_LEN;
 const SOCKET_DIR_MODE: u32 = 0o700;
 const SOCKET_FILE_MODE: u32 = 0o600;
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+const SNAPSHOT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+static NEXT_SNAPSHOT_BOUNDARY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A framed request: 4-byte big-endian length + JSON body.
 pub fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
@@ -262,6 +268,9 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 },
             }
         }
+        ApiRequest::SnapshotForClone | ApiRequest::ContinueSnapshot { .. } => ApiResponse::Err {
+            msg: "snapshot clone handshake requires one negotiated control connection".into(),
+        },
         ApiRequest::ReleaseScratch { path, identity } => {
             match controller.release_scratch(&path, identity) {
                 Ok(()) => ApiResponse::Ok,
@@ -451,6 +460,26 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
                 continue;
             }
         };
+        if matches!(req, ApiRequest::SnapshotForClone) {
+            let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                serve_snapshot_for_clone(&mut stream, &controller)
+            }))
+            .unwrap_or_else(|payload| {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                log::error!("snapshot clone handler panicked: {msg}");
+                ApiResponse::Err {
+                    msg: format!("internal error: {msg}"),
+                }
+            });
+            if let Err(error) = write_frame(&mut stream, &encode_response_for_frame(&resp)) {
+                log::warn!("write snapshot clone response: {error}");
+            }
+            continue;
+        }
         if let ApiRequest::AttachPty { cols, rows, shell } = req {
             // PTY sessions are intentionally long-lived. The absolute framing
             // deadline protects only their initial authenticated request.
@@ -488,6 +517,100 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
         }
     }
     Ok(())
+}
+
+fn serve_snapshot_for_clone(stream: &mut UnixStream, controller: &VmmController) -> ApiResponse {
+    #[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+    {
+        let boundary_id = NEXT_SNAPSHOT_BOUNDARY_ID.fetch_add(1, Ordering::Relaxed);
+        let final_stop = || -> Result<(), vmm_core::error::VmmError> {
+            let boundary = ApiResponse::SnapshotBoundary { boundary_id };
+            write_frame_with_timeout(
+                stream,
+                &encode_response_for_frame(&boundary),
+                CONTROL_IO_TIMEOUT,
+            )
+            .map_err(|error| {
+                vmm_core::error::VmmError::Api(format!("publish snapshot clone boundary: {error}"))
+            })?;
+            let acknowledgement = read_frame_with_timeout(stream, SNAPSHOT_BOUNDARY_TIMEOUT)
+                .map_err(|error| {
+                    vmm_core::error::VmmError::Api(format!(
+                        "snapshot clone boundary acknowledgement: {error}"
+                    ))
+                })?;
+            let request: ApiRequest =
+                serde_json::from_slice(&acknowledgement).map_err(|error| {
+                    vmm_core::error::VmmError::Api(format!(
+                        "decode snapshot clone boundary acknowledgement: {error}"
+                    ))
+                })?;
+            match request {
+                ApiRequest::ContinueSnapshot {
+                    boundary_id: acknowledged,
+                    commit: true,
+                } if acknowledged == boundary_id => Ok(()),
+                ApiRequest::ContinueSnapshot {
+                    boundary_id: acknowledged,
+                    ..
+                } if acknowledged != boundary_id => Err(vmm_core::error::VmmError::Api(
+                    "snapshot clone boundary identity mismatch".into(),
+                )),
+                ApiRequest::ContinueSnapshot { commit: false, .. } => {
+                    Err(vmm_core::error::VmmError::Snapshot(
+                        "snapshot clone boundary was aborted by the orchestrator".into(),
+                    ))
+                }
+                _ => Err(vmm_core::error::VmmError::Api(
+                    "unexpected snapshot clone boundary acknowledgement".into(),
+                )),
+            }
+        };
+        return match controller
+            .live_snapshot_with_final_stop(vmm_core::LiveSnapshotConfig::default(), final_stop)
+        {
+            Ok(result) => live_snapshot_response(result),
+            Err(error) => ApiResponse::Err {
+                msg: error.to_string(),
+            },
+        };
+    }
+    #[cfg(not(all(feature = "boot", target_arch = "x86_64", target_os = "linux")))]
+    {
+        let _ = (stream, controller);
+        ApiResponse::Err {
+            msg: "live snapshots require the Linux x86_64 boot feature".into(),
+        }
+    }
+}
+
+#[cfg(all(feature = "boot", target_arch = "x86_64", target_os = "linux"))]
+fn live_snapshot_response(result: vmm_core::LiveSnapshotResult) -> ApiResponse {
+    let termination = match result.termination {
+        vmm_core::LiveSnapshotTermination::Converged => {
+            tarit_proto::LiveSnapshotTermination::Converged
+        }
+        vmm_core::LiveSnapshotTermination::Diverging => {
+            tarit_proto::LiveSnapshotTermination::Diverging
+        }
+        vmm_core::LiveSnapshotTermination::Timeout => tarit_proto::LiveSnapshotTermination::Timeout,
+        vmm_core::LiveSnapshotTermination::MaxRounds => {
+            tarit_proto::LiveSnapshotTermination::MaxRounds
+        }
+    };
+    ApiResponse::Snapshot {
+        path: result.snapshot_path,
+        overlay_path: result.overlay_path,
+        integrity_path: result.integrity_path,
+        live_stats: Some(tarit_proto::LiveSnapshotStats {
+            rounds: result.rounds,
+            pages_copied: result.pages_copied,
+            final_dirty_pages: result.final_dirty_pages,
+            elapsed_us: result.elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+            downtime_us: result.downtime.as_micros().try_into().unwrap_or(u64::MAX),
+            termination,
+        }),
+    }
 }
 
 fn serve_attach_pty(

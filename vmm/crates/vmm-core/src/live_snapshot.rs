@@ -476,6 +476,36 @@ pub fn live_snapshot<F>(
 where
     F: FnOnce() -> Result<Vec<u8>>,
 {
+    live_snapshot_with_final_stop(
+        kvm_vm,
+        mem,
+        vcpu_threads,
+        config,
+        memory_file,
+        quiesce_io,
+        capture_state,
+        || Ok(()),
+    )
+}
+
+/// Execute a live snapshot and invoke one bounded external operation while
+/// every vCPU and device worker remains at the coherent final-stop boundary.
+/// Any hook error follows the ordinary capture-failure rollback and resumes
+/// the source before returning the error.
+pub fn live_snapshot_with_final_stop<F, H>(
+    kvm_vm: &KvmVm,
+    mem: &GuestMemory,
+    vcpu_threads: &[&VcpuThread],
+    config: &LiveSnapshotConfig,
+    memory_file: &File,
+    quiesce_io: &dyn Fn(bool) -> Result<()>,
+    capture_state: F,
+    final_stop_hook: H,
+) -> Result<LiveSnapshotOutput>
+where
+    F: FnOnce() -> Result<Vec<u8>>,
+    H: FnOnce() -> Result<()>,
+{
     let start = Instant::now();
     let timeout = Duration::from_secs(config.timeout_secs);
     let mem_size = usize::try_from(mem.size_bytes)
@@ -723,6 +753,7 @@ where
         // are coherent with the memory image assembled above.
         let state_blob = capture_state()?;
         inject_live_snapshot_failure("state_capture")?;
+        final_stop_hook()?;
         Ok((state_blob, final_dirty_pages))
     })();
 

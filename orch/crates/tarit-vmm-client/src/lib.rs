@@ -514,10 +514,111 @@ impl VmmClient {
         ),
         VmmError,
     > {
-        match self.request_ok(&ApiRequest::Snapshot {
+        Self::parse_live_snapshot_response(self.request_ok(&ApiRequest::Snapshot {
             diff: false,
             live: true,
-        })? {
+        })?)
+    }
+
+    /// Take a live snapshot with one in-band provider-clone callback at the
+    /// coherent final stop. The VMM resumes the source on callback failure,
+    /// timeout, malformed acknowledgement, or connection loss.
+    pub fn live_snapshot_for_clone_unreleased<F>(
+        &self,
+        at_boundary: F,
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            String,
+            tarit_proto::LiveSnapshotStats,
+        ),
+        VmmError,
+    >
+    where
+        F: FnOnce() -> Result<(), VmmError>,
+    {
+        let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
+        let mut stream = self.connect_for_request(deadline)?;
+        let request = serde_json::to_vec(&ApiRequest::SnapshotForClone)?;
+        if let Some(deadline) = deadline {
+            write_api_frame_until(&mut stream, &request, deadline)?;
+        } else {
+            write_api_frame(&mut stream, &request)?;
+        }
+        let boundary_body = if let Some(deadline) = deadline {
+            read_api_frame_until(&mut stream, deadline)?
+        } else {
+            read_api_frame(&mut stream)?
+        };
+        let boundary: ApiResponse = serde_json::from_slice(&boundary_body)?;
+        let boundary_id = match boundary {
+            ApiResponse::SnapshotBoundary { boundary_id } => boundary_id,
+            ApiResponse::Err { msg } => return Err(VmmError::Api(msg)),
+            other => {
+                return Err(VmmError::Api(format!(
+                    "unexpected snapshot clone boundary response: {other:?}"
+                )))
+            }
+        };
+
+        let callback_error = at_boundary().err();
+        let acknowledgement = serde_json::to_vec(&ApiRequest::ContinueSnapshot {
+            boundary_id,
+            commit: callback_error.is_none(),
+        })?;
+        let acknowledgement_result = if let Some(deadline) = deadline {
+            write_api_frame_until(&mut stream, &acknowledgement, deadline)
+        } else {
+            write_api_frame(&mut stream, &acknowledgement)
+        };
+        if let Err(error) = acknowledgement_result {
+            return Err(match callback_error {
+                Some(callback) => VmmError::Api(format!(
+                    "{callback}; snapshot boundary abort delivery failed: {error}"
+                )),
+                None => error,
+            });
+        }
+        let final_body = if let Some(deadline) = deadline {
+            read_api_frame_until(&mut stream, deadline)
+        } else {
+            read_api_frame(&mut stream)
+        };
+        let final_response = match final_body {
+            Ok(body) => serde_json::from_slice::<ApiResponse>(&body).map_err(VmmError::from),
+            Err(error) => Err(error),
+        };
+        if let Some(callback) = callback_error {
+            return match final_response {
+                Ok(ApiResponse::Err { .. }) => Err(callback),
+                Ok(other) => Err(VmmError::Api(format!(
+                    "{callback}; VMM returned unexpected response after boundary abort: {other:?}"
+                ))),
+                Err(error) => Err(VmmError::Api(format!(
+                    "{callback}; source resume confirmation failed: {error}"
+                ))),
+            };
+        }
+        let response = match final_response? {
+            ApiResponse::Err { msg } => return Err(VmmError::Api(msg)),
+            response => response,
+        };
+        Self::parse_live_snapshot_response(response)
+    }
+
+    fn parse_live_snapshot_response(
+        response: ApiResponse,
+    ) -> Result<
+        (
+            String,
+            Option<String>,
+            String,
+            tarit_proto::LiveSnapshotStats,
+        ),
+        VmmError,
+    > {
+        match response {
             ApiResponse::Snapshot {
                 path,
                 overlay_path,
@@ -920,6 +1021,114 @@ mod tests {
             .with_request_timeout(Duration::from_secs(5))
             .suspend()
             .expect("a slow suspend within the request budget must succeed");
+        server.join().expect("join server");
+    }
+
+    #[test]
+    fn live_snapshot_clone_handshake_commits_exact_boundary() {
+        let socket = socket_path();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket.0).expect("bind test VMM socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let request: ApiRequest = serde_json::from_slice(
+                &read_api_frame(&mut stream).expect("read snapshot request"),
+            )
+            .expect("decode snapshot request");
+            assert!(matches!(request, ApiRequest::SnapshotForClone));
+            write_api_frame(
+                &mut stream,
+                &serde_json::to_vec(&ApiResponse::SnapshotBoundary { boundary_id: 73 })
+                    .expect("encode boundary"),
+            )
+            .expect("write boundary");
+            let acknowledgement: ApiRequest =
+                serde_json::from_slice(&read_api_frame(&mut stream).expect("read acknowledgement"))
+                    .expect("decode acknowledgement");
+            assert!(matches!(
+                acknowledgement,
+                ApiRequest::ContinueSnapshot {
+                    boundary_id: 73,
+                    commit: true
+                }
+            ));
+            let response = ApiResponse::Snapshot {
+                path: "/scratch/ram".into(),
+                overlay_path: Some("/scratch/disk".into()),
+                integrity_path: Some("/scratch/integrity".into()),
+                live_stats: Some(LiveSnapshotStats {
+                    rounds: 2,
+                    pages_copied: 10,
+                    final_dirty_pages: 1,
+                    elapsed_us: 20,
+                    downtime_us: 3,
+                    termination: LiveSnapshotTermination::Converged,
+                }),
+            };
+            write_api_frame(
+                &mut stream,
+                &serde_json::to_vec(&response).expect("encode final response"),
+            )
+            .expect("write final response");
+        });
+
+        let mut called = false;
+        let result = VmmClient::new(&socket.0)
+            .with_request_timeout(Duration::from_secs(2))
+            .live_snapshot_for_clone_unreleased(|| {
+                called = true;
+                Ok(())
+            })
+            .expect("snapshot clone handshake");
+        assert!(called);
+        assert_eq!(result.0, "/scratch/ram");
+        assert_eq!(result.1.as_deref(), Some("/scratch/disk"));
+        assert_eq!(result.2, "/scratch/integrity");
+        assert_eq!(result.3.downtime_us, 3);
+        server.join().expect("join server");
+    }
+
+    #[test]
+    fn live_snapshot_clone_handshake_aborts_and_preserves_provider_error() {
+        let socket = socket_path();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket.0).expect("bind test VMM socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            read_api_frame(&mut stream).expect("read snapshot request");
+            write_api_frame(
+                &mut stream,
+                &serde_json::to_vec(&ApiResponse::SnapshotBoundary { boundary_id: 91 })
+                    .expect("encode boundary"),
+            )
+            .expect("write boundary");
+            let acknowledgement: ApiRequest =
+                serde_json::from_slice(&read_api_frame(&mut stream).expect("read acknowledgement"))
+                    .expect("decode acknowledgement");
+            assert!(matches!(
+                acknowledgement,
+                ApiRequest::ContinueSnapshot {
+                    boundary_id: 91,
+                    commit: false
+                }
+            ));
+            write_api_frame(
+                &mut stream,
+                &serde_json::to_vec(&ApiResponse::Err {
+                    msg: "source resumed after boundary abort".into(),
+                })
+                .expect("encode abort response"),
+            )
+            .expect("write abort response");
+        });
+
+        let error = VmmClient::new(&socket.0)
+            .with_request_timeout(Duration::from_secs(2))
+            .live_snapshot_for_clone_unreleased(|| {
+                Err(VmmError::Api("provider clone failed".into()))
+            })
+            .expect_err("provider error must abort boundary");
+        assert!(error.to_string().contains("provider clone failed"));
         server.join().expect("join server");
     }
 

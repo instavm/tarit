@@ -96,7 +96,6 @@ impl Drop for VmInstance {
             self.lazy_restore = None;
         }
         self.transient_files.cleanup();
-        cleanup_private_runtime_dir();
     }
 }
 
@@ -326,6 +325,31 @@ pub struct VmmController {
     /// FIFO.
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     guest_agent: Mutex<()>,
+    // Keep the shared per-process runtime directory alive until the last
+    // controller has dropped all VM-owned scratch artifacts.
+    _runtime_dir_lease: RuntimeDirLease,
+}
+
+static ACTIVE_RUNTIME_DIR_LEASES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct RuntimeDirLease;
+
+impl RuntimeDirLease {
+    fn acquire() -> Self {
+        ACTIVE_RUNTIME_DIR_LEASES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for RuntimeDirLease {
+    fn drop(&mut self) {
+        let previous = ACTIVE_RUNTIME_DIR_LEASES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        debug_assert!(previous > 0, "runtime directory lease underflow");
+        if previous == 1 {
+            cleanup_private_runtime_dir();
+        }
+    }
 }
 
 #[cfg_attr(
@@ -446,6 +470,7 @@ impl VmmController {
             lifecycle: Mutex::new(None),
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             guest_agent: Mutex::new(()),
+            _runtime_dir_lease: RuntimeDirLease::acquire(),
         }
     }
 
@@ -1142,6 +1167,18 @@ impl VmmController {
         &self,
         snapshot_config: crate::live_snapshot::LiveSnapshotConfig,
     ) -> Result<crate::live_snapshot::LiveSnapshotResult> {
+        self.live_snapshot_with_final_stop(snapshot_config, || Ok(()))
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn live_snapshot_with_final_stop<H>(
+        &self,
+        snapshot_config: crate::live_snapshot::LiveSnapshotConfig,
+        final_stop_hook: H,
+    ) -> Result<crate::live_snapshot::LiveSnapshotResult>
+    where
+        H: FnOnce() -> Result<()>,
+    {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::LiveSnapshot)?;
         let (running, mem, base_blob, generation, overlay_source) = {
             let mut slot = self.lock();
@@ -1235,7 +1272,7 @@ impl VmmController {
         let vcpu_threads = std::iter::once(&running.vcpu_thread)
             .chain(running.ap_threads.iter())
             .collect::<Vec<_>>();
-        let snap_result = crate::live_snapshot::live_snapshot(
+        let snap_result = crate::live_snapshot::live_snapshot_with_final_stop(
             &running.kvm_vm,
             &mem,
             &vcpu_threads,
@@ -1248,6 +1285,7 @@ impl VmmController {
                 }
                 capture_live_state_blob(&running, &base_blob)
             },
+            final_stop_hook,
         );
         let source_vcpus_paused = running
             .vcpu_thread
@@ -3060,15 +3098,6 @@ pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-#[cfg(test)]
-fn cleanup_private_runtime_dir() {
-    // Unit tests create and drop independent VM instances concurrently inside
-    // one process. They intentionally share the per-process runtime directory,
-    // so one test must not remove it while another is staging an artifact.
-    // Individual test artifacts retain their own exact cleanup guards.
-}
-
-#[cfg(not(test))]
 fn cleanup_private_runtime_dir() {
     use std::io::ErrorKind;
 
