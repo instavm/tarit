@@ -18,6 +18,8 @@ CACHE_MIB=${BALLOON_CACHE_MIB:-32}
 RESIDENT_FREE_MIB=${BALLOON_RESIDENT_FREE_MIB:-128}
 ACTIVE_TARGET_MIB=${BALLOON_ACTIVE_TARGET_MIB:-16}
 MIN_ACTUAL_MIB=${BALLOON_MIN_ACTUAL_MIB:-8}
+EXPECTED_KERNEL_PREFIX=${TARIT_EXPECT_KERNEL_PREFIX:-}
+EXPECTED_OS_ID=${TARIT_EXPECT_OS_ID:-}
 SNAPSHOT=
 INTEGRITY_SIDECAR=
 SERVE_PID=
@@ -194,6 +196,29 @@ CMDLINE='console=tty0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on n
 "$VMM_BIN" --socket "$SOCKET" create \
   --kernel "$KERNEL" --rootfs "$ROOTFS" --mem 512 --vcpus 1 --cmdline "$CMDLINE" >/dev/null
 wait_for_exec
+
+if [[ -n "$EXPECTED_KERNEL_PREFIX" || -n "$EXPECTED_OS_ID" ]]; then
+  # Expansion is intentionally performed by the guest shell.
+  # shellcheck disable=SC2016
+  identity_json=$(guest_exec 'set -eu; uname -r; . /etc/os-release; printf "%s\n" "$ID"')
+  identity_output=$(json_field stdout <<<"$identity_json")
+  mapfile -t identity_lines <<<"$identity_output"
+  [[ ${#identity_lines[@]} -eq 2 ]] || {
+    echo "unexpected guest identity output: $identity_output" >&2
+    exit 1
+  }
+  kernel_release=${identity_lines[0]}
+  os_id=${identity_lines[1]}
+  if [[ -n "$EXPECTED_KERNEL_PREFIX" && "$kernel_release" != "$EXPECTED_KERNEL_PREFIX"* ]]; then
+    echo "guest kernel mismatch: expected prefix $EXPECTED_KERNEL_PREFIX, got $kernel_release" >&2
+    exit 1
+  fi
+  if [[ -n "$EXPECTED_OS_ID" && "$os_id" != "$EXPECTED_OS_ID" ]]; then
+    echo "guest OS mismatch: expected $EXPECTED_OS_ID, got $os_id" >&2
+    exit 1
+  fi
+  echo "balloon-e2e: guest identity verified kernel=$kernel_release os=$os_id"
+fi
 
 # Worker KVM remains available, but nested virtualization and /dev/kvm must be
 # absent from the customer Ubuntu guest.

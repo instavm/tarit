@@ -69,6 +69,8 @@ for kernel_case in "6.6:$KERNEL_66" "5.10:$KERNEL_510"; do
       LOG="$log" \
       BALLOON_RESTORE_CYCLES="$CYCLES" \
       BALLOON_CGROUP_ENFORCE=1 \
+      TARIT_EXPECT_KERNEL_PREFIX="$kernel_name." \
+      TARIT_EXPECT_OS_ID="$os_id" \
       "$ROOT/ci/balloon-validate.sh"; then
       echo "FAIL: retained balloon evidence at $CASE_DIR" >&2
       CASE_DIR=
