@@ -137,7 +137,9 @@ forces the final stop and downtime grows with the residual — the reported
 full snapshots similarly use a disk-consistency pause. They use
 FICLONE/reflink when available; the correctness-preserving sparse-copy
 fallback is not a low-latency path, so production latency gates require
-reflink-capable storage. See
+reflink-capable storage. Restore overlay publication logs `copy_mode=reflink`
+or `copy_mode=sparse_extent`; on Linux it fails closed rather than falling back
+to a dense copy when allocated extents cannot be discovered. See
 [vmm/docs/STANDALONE.md](vmm/docs/STANDALONE.md) for the full device, egress,
 jailer, and PTY surface.
 

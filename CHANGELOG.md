@@ -32,6 +32,10 @@ versions may contain breaking changes.
 
 ### Changed
 
+- Restore overlay publication now records whether it used a reflink or the
+  Linux allocated-extent fallback. Linux continues to reject publication when
+  neither mechanism is available instead of silently copying the full virtual
+  disk.
 - Live snapshots now pause, capture, and resume every configured vCPU through
   one bounded barrier; live fork supports SMP guests instead of rejecting them.
 - Hibernated exec, PTY, SSH, and public-share requests now join the same

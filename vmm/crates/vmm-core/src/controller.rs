@@ -3567,7 +3567,7 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
     }
 
     let mut owned_target = staged_owned_output(target)?;
-    let copy_result = (|| -> std::io::Result<()> {
+    let copy_result = (|| -> std::io::Result<RestoreOverlayCopyMode> {
         let source_owned = OwnedScratchFile::adopt_private(source)?;
         let mut source_file = source_owned.file().try_clone()?;
         let mut target_file = owned_target.file().try_clone()?;
@@ -3578,19 +3578,57 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
         result
     })();
 
-    if let Err(e) = copy_result {
-        remove_owned_scratch_file(&owned_target);
-        return Err(VmmError::Snapshot(format!(
-            "seed restore overlay {} -> {}: {e}",
-            source.display(),
-            target.display()
-        )));
-    }
+    let copy_mode = match copy_result {
+        Ok(copy_mode) => copy_mode,
+        Err(e) => {
+            remove_owned_scratch_file(&owned_target);
+            return Err(VmmError::Snapshot(format!(
+                "seed restore overlay {} -> {}: {e}",
+                source.display(),
+                target.display()
+            )));
+        }
+    };
     if let Err(error) = persist_owned_output(&mut owned_target, target) {
         remove_owned_scratch_file(&owned_target);
         return Err(error);
     }
+    log::info!(
+        "restore overlay seed published (copy_mode={})",
+        copy_mode.as_str()
+    );
     Ok(owned_target)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreOverlayCopyMode {
+    #[cfg(target_os = "linux")]
+    Reflink,
+    #[cfg(target_os = "linux")]
+    SparseExtent,
+    #[cfg(not(target_os = "linux"))]
+    Dense,
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+impl RestoreOverlayCopyMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Reflink => "reflink",
+            #[cfg(target_os = "linux")]
+            Self::SparseExtent => "sparse_extent",
+            #[cfg(not(target_os = "linux"))]
+            Self::Dense => "dense",
+        }
+    }
 }
 
 #[cfg(any(
@@ -3600,7 +3638,7 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
 fn copy_restore_overlay(
     source: &mut std::fs::File,
     target: &mut std::fs::File,
-) -> std::io::Result<()> {
+) -> std::io::Result<RestoreOverlayCopyMode> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -3608,7 +3646,8 @@ fn copy_restore_overlay(
         const FICLONE: libc::Ioctl = 0x4004_9409;
         let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE, source.as_raw_fd()) };
         if cloned == 0 {
-            return target.sync_all();
+            target.sync_all()?;
+            return Ok(RestoreOverlayCopyMode::Reflink);
         }
         let error = std::io::Error::last_os_error();
         if !matches!(
@@ -3617,12 +3656,14 @@ fn copy_restore_overlay(
         ) {
             return Err(error);
         }
-        copy_sparse_restore_overlay(source, target)
+        copy_sparse_restore_overlay(source, target)?;
+        Ok(RestoreOverlayCopyMode::SparseExtent)
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        copy_dense_restore_overlay(source, target)
+        copy_dense_restore_overlay(source, target)?;
+        Ok(RestoreOverlayCopyMode::Dense)
     }
 }
 
@@ -6577,6 +6618,80 @@ mod tests {
             .expect_err("SEEK_DATA must not move backwards from the current offset");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_restore_overlay_fallback_copies_only_allocated_extents() {
+        use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+
+        const VIRTUAL_LEN: u64 = 128 * 1024 * 1024;
+        const MIDDLE_OFFSET: u64 = 32 * 1024 * 1024 + 37;
+        const TAIL_OFFSET: u64 = VIRTUAL_LEN - 4096;
+
+        let dir = private_runtime_dir().expect("private test runtime");
+        let unique = format!(
+            "restore-overlay-sparse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos()
+        );
+        let source_path = dir.join(format!("{unique}-source.cow"));
+        let target_path = dir.join(format!("{unique}-target.cow"));
+        let mut source = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&source_path)
+            .expect("create sparse source");
+        let mut target = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target_path)
+            .expect("create sparse target");
+
+        source.set_len(VIRTUAL_LEN).expect("size sparse source");
+        source.write_all_at(b"header", 0).expect("write header");
+        source
+            .write_all_at(b"unaligned-middle", MIDDLE_OFFSET)
+            .expect("write middle extent");
+        source
+            .write_all_at(b"tail", TAIL_OFFSET)
+            .expect("write tail extent");
+        source.sync_all().expect("sync sparse source");
+
+        copy_sparse_restore_overlay(&mut source, &mut target)
+            .expect("copy allocated extents without reflink");
+        let metadata = target.metadata().expect("target metadata");
+        assert_eq!(metadata.len(), VIRTUAL_LEN);
+        assert!(
+            metadata.blocks() * 512 < VIRTUAL_LEN / 32,
+            "fallback allocated {} bytes for a {VIRTUAL_LEN}-byte sparse overlay",
+            metadata.blocks() * 512
+        );
+        let mut bytes = vec![0; b"unaligned-middle".len()];
+        target
+            .read_exact_at(&mut bytes, MIDDLE_OFFSET)
+            .expect("read copied middle extent");
+        assert_eq!(bytes, b"unaligned-middle");
+
+        target
+            .write_all_at(b"clone-private!!", MIDDLE_OFFSET)
+            .expect("mutate target extent");
+        source
+            .read_exact_at(&mut bytes, MIDDLE_OFFSET)
+            .expect("reread source extent");
+        assert_eq!(bytes, b"unaligned-middle");
+
+        drop(target);
+        drop(source);
+        std::fs::remove_file(target_path).expect("remove sparse target");
+        std::fs::remove_file(source_path).expect("remove sparse source");
     }
 
     #[test]
