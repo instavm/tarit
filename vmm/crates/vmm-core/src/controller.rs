@@ -96,7 +96,6 @@ impl Drop for VmInstance {
             self.lazy_restore = None;
         }
         self.transient_files.cleanup();
-        cleanup_private_runtime_dir();
     }
 }
 
@@ -328,6 +327,8 @@ pub struct VmmController {
     guest_agent: Mutex<()>,
 }
 
+static LIVE_CONTROLLERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg_attr(
     not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")),
     allow(dead_code)
@@ -441,6 +442,7 @@ impl VmmController {
     }
 
     pub fn new() -> Self {
+        LIVE_CONTROLLERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Self {
             vm: Arc::new(Mutex::new(None)),
             lifecycle: Mutex::new(None),
@@ -2422,6 +2424,22 @@ impl VmmController {
     }
 }
 
+impl Drop for VmmController {
+    fn drop(&mut self) {
+        // Drop the VM and its exact-inode scratch ownership before considering
+        // the shared per-process directory for removal. Multiple controllers
+        // can coexist in tests and embedding applications, so a VM-instance
+        // drop must never remove another controller's staging directory.
+        self.vm
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if LIVE_CONTROLLERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            cleanup_private_runtime_dir();
+        }
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn build_clone_repair_v3_command(
     encoded_nonce: &str,
@@ -3060,15 +3078,6 @@ pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-#[cfg(test)]
-fn cleanup_private_runtime_dir() {
-    // Unit tests create and drop independent VM instances concurrently inside
-    // one process. They intentionally share the per-process runtime directory,
-    // so one test must not remove it while another is staging an artifact.
-    // Individual test artifacts retain their own exact cleanup guards.
-}
-
-#[cfg(not(test))]
 fn cleanup_private_runtime_dir() {
     use std::io::ErrorKind;
 
