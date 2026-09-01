@@ -21,6 +21,11 @@ import uuid
 from dataclasses import dataclass
 
 
+def shell_write_command(path: str, value: str) -> str:
+    """Build a shell command that writes one exact line to a guest file."""
+    return f"printf '%s\\n' {shlex.quote(value)} > {shlex.quote(path)}; sync"
+
+
 @dataclass
 class Anchor:
     proof: str
@@ -262,10 +267,6 @@ class Soak:
             self.exec(vm_id, "/usr/local/bin/tarit-clone-repair-workload state")
         )
 
-    @staticmethod
-    def proof_write_command(proof: str) -> str:
-        return f"printf '%s' {shlex.quote(proof)} > /root/tarit-soak-proof; sync"
-
     def install_workload(self, vm_id: str, proof: str) -> None:
         command = r'''set -eu
 mkdir -p /usr/libexec/tarit /run/tarit
@@ -351,7 +352,10 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
             f"/usr/local/bin/tarit-clone-repair-workload accept-ticket '{ticket}'",
         ) == "rejected"
         child_proof = f"child-{uuid.uuid4().hex[:16]}"
-        self.exec(child_id, self.proof_write_command(child_proof))
+        self.exec(
+            child_id,
+            shell_write_command("/root/tarit-soak-proof", child_proof),
+        )
         assert self.exec(vm_id, "cat /root/tarit-soak-proof") == self.anchors[vm_id].proof
         self.delete_vm(child_id)
         self.event("fork_verified", source=vm_id, child=child_id)
@@ -803,7 +807,10 @@ test "$(cat /root/tarit-soak-proof)" = PROOF_VALUE
     def mutate(self, vm_id: str) -> None:
         anchor = self.anchors[vm_id]
         proof = f"anchor-{self.args.seed}-{anchor.operations}-{uuid.uuid4().hex[:12]}"
-        self.exec(vm_id, self.proof_write_command(proof))
+        self.exec(
+            vm_id,
+            shell_write_command("/root/tarit-soak-proof", proof),
+        )
         anchor.proof = proof
         self.assert_anchor(vm_id)
         self.event("guest_work_verified", vm_id=vm_id, proof=proof)
