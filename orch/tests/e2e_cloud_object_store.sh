@@ -249,6 +249,7 @@ if [[ "${TARIT_TEST_KVM_ARTIFACTS:-0}" == 1 ]]; then
   TARIT_OBJECT_STORE_ALLOW_HTTP=true \
   TARIT_TEST_OBJECT_FALLBACK=1 \
   TARIT_SOURCE_REVISION="${expected_source:-local}" \
+  KERNEL="${TARIT_TEST_S3_KERNEL:-${KERNEL:-/tmp/vmlinux.microvm}}" \
     "$repo_root/orch/tests/e2e_peer_artifact_replication.sh"
 
   AZURE_STORAGE_ACCOUNT_NAME="$azure_account" \
@@ -262,6 +263,7 @@ if [[ "${TARIT_TEST_KVM_ARTIFACTS:-0}" == 1 ]]; then
   TARIT_OBJECT_STORE_ALLOW_HTTP=true \
   TARIT_TEST_OBJECT_FALLBACK=1 \
   TARIT_SOURCE_REVISION="${expected_source:-local}" \
+  KERNEL="${TARIT_TEST_AZURE_KERNEL:-${KERNEL:-/tmp/vmlinux.microvm}}" \
     "$repo_root/orch/tests/e2e_peer_artifact_replication.sh"
 fi
 
