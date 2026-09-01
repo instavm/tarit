@@ -1295,7 +1295,7 @@ paths:
     post:
       operationId: forkVm
       summary: Atomically fork a running sandbox
-      description: Takes a bounded live snapshot of the running source, including RAM, device state, and its private disk upper at one fork point, then restores an isolated child with lazy UFFD memory and a new writable disk overlay. In fleet mode, a request received by a healthy non-owner node securely snapshots the source through session-fenced mTLS, localizes and verifies the artifact, requires the configured replica policy, and starts the child on that receiving node. Placement identifiers and host paths are never caller-controlled or returned. The source and child must belong to the authenticated tenant.
+      description: Takes a bounded live snapshot of the running source, including RAM, device state, and its private disk upper at one fork point, then restores an isolated child with lazy UFFD memory and a new writable disk overlay. In fleet mode, a request received by a healthy non-owner node securely snapshots the source through session-fenced mTLS, localizes and verifies the artifact, requires the configured replica policy, and starts the child on that receiving node. Placement identifiers and host paths are never caller-controlled or returned. The source and child must belong to the authenticated tenant. Sources with attached persistent volumes are rejected before snapshot work until the configured provider supports atomic child-volume cloning.
       parameters:
         - name: id
           in: path
@@ -1323,7 +1323,7 @@ paths:
         "404":
           description: Source VM not found
         "409":
-          description: Source is not running or the requested child id already exists
+          description: Source is not running, has attached persistent volumes without provider clone support, or the requested child id already exists
         "429":
           description: Host capacity is unavailable
         "503":

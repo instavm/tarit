@@ -348,6 +348,33 @@ DELETE_ATTACHED_STATUS=$(curl -sS --max-time 20 -o "$DELETE_ATTACHED_BODY" -w '%
 }
 [ -f "$VOLUME_PATH" ] || { echo "FAIL: rejected deletion removed physical volume" >&2; exit 1; }
 
+FORK_CHILD_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+FORK_ATTACHED_BODY="$DIR/fork-attached.json"
+FORK_ATTACHED_STATUS=$(curl -sS --max-time 20 -o "$FORK_ATTACHED_BODY" -w '%{http_code}' \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d "{\"id\":\"$FORK_CHILD_ID\"}" "$BASE_URL/v1/vms/$VM_ID/fork")
+[ "$FORK_ATTACHED_STATUS" = 409 ] || {
+  echo "FAIL: attached-volume fork returned HTTP $FORK_ATTACHED_STATUS: $(cat "$FORK_ATTACHED_BODY")" >&2
+  exit 1
+}
+python3 - "$DIR/fleet.db" "$FORK_CHILD_ID" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as db:
+    child = db.execute("select count(*) from vms where id=?", (sys.argv[2],)).fetchone()[0]
+    operation = db.execute(
+        "select count(*) from vm_fork_operations where child_vm_id=?", (sys.argv[2],)
+    ).fetchone()[0]
+    snapshot = db.execute(
+        "select count(*) from snapshots where snapshot_id=? or ephemeral_owner_vm_id=?",
+        (sys.argv[2], sys.argv[2]),
+    ).fetchone()[0]
+assert (child, operation, snapshot) == (0, 0, 0), (child, operation, snapshot)
+PY
+expect_exec "$VM_ID" "test -b /dev/vdb && echo FORK_REJECTION_SOURCE_INTACT" FORK_REJECTION_SOURCE_INTACT
+[ -f "$VOLUME_PATH" ] || { echo "FAIL: rejected fork removed physical volume" >&2; exit 1; }
+
 api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$VM_ID/hibernate" | grep -q '"status":"hibernated"'
 wait_for_no_vmm "$VM_ID" || { echo "FAIL: VMM survived hibernate" >&2; exit 1; }
 [ -f "$VOLUME_PATH" ] || { echo "FAIL: hibernate removed persistent volume" >&2; exit 1; }

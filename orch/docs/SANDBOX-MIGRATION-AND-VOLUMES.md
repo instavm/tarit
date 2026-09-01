@@ -75,7 +75,9 @@ An attachment is tenant scoped, idempotent, generation fenced, and durable
 before provider mutation. The controller reconciles `attaching`, `attached`,
 `detaching`, and `error` states after crashes. A writable single-writer lease is
 fenced by VM incarnation and host boot session. Delete refuses live attachments;
-force deletion is not a public shortcut.
+force deletion is not a public shortcut. Live fork rejects any attached
+persistent volume before reserving a child or taking a snapshot until the
+provider can atomically clone and publish child volume bindings.
 
 The implemented foundation currently includes the provider-neutral types,
 durable volume/attachment tables, generation and single-writer fencing, atomic

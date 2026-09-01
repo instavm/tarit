@@ -2860,6 +2860,7 @@ async fn fork_vm(
         ))
         .into());
     }
+    ops::ensure_live_fork_has_no_persistent_volumes(&state, &identity.tenant, source_id).await?;
     if let Some(operation) = &existing_operation {
         if source.host_id != operation.source_host_id {
             return Err(OrchError::Conflict(format!(
@@ -4438,6 +4439,71 @@ mod tests {
             serde_json::json!({}),
         ));
         assert_eq!(paused_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn live_fork_rejects_attached_persistent_volumes_before_vmm_access() {
+        let state = test_state();
+        let source_id = Uuid::new_v4();
+        let volume_id = Uuid::new_v4();
+        let now = Utc::now();
+        insert_vm(&state, source_id, "tenant-a", VmStatus::Running);
+        let volume = VolumeRecord {
+            id: volume_id,
+            owner_key: "tenant-a".into(),
+            name: "fork-source-data".into(),
+            provider: "local_block".into(),
+            storage_class: VolumeStorageClass::Block,
+            size_bytes: 4 * 1024 * 1024,
+            status: VolumeStatus::Available,
+            capabilities: VolumeCapabilities {
+                read_only_many: true,
+                read_write_once: true,
+                read_write_many: false,
+                snapshots: false,
+                clones: false,
+            },
+            host_id: Some(state.config.host_id.clone()),
+            region: None,
+            zone: None,
+            generation: 1,
+            revision: 1,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let attachment = tarit_types::VmVolumeAttachmentRecord {
+            vm_id: source_id,
+            volume_id,
+            device_index: 0,
+            owner_key: "tenant-a".into(),
+            mode: tarit_types::VolumeAttachmentMode::ReadWrite,
+            volume_generation: 1,
+            created_at: now,
+        };
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_volume(&volume).unwrap();
+            store.bind_vm_volumes(&[attachment]).unwrap();
+        }
+        let app = router(state.clone());
+        let rt = test_runtime();
+
+        let response = rt.block_on(request_json(
+            app,
+            "POST",
+            &format!("/v1/vms/{source_id}/fork"),
+            "tenant-a-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .list_snapshots()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

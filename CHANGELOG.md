@@ -62,6 +62,9 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Live fork now rejects VMs with attached persistent volumes before reserving a
+  child or starting snapshot work. A fork cannot silently omit or share a
+  writable volume while provider-native cloning is unavailable.
 - Pause, suspend, and snapshot now require block, network, and vsock workers to
   acknowledge quiescence before capturing state or releasing guest RAM. Resume
   waits for every worker to leave its parked state before restarting vCPUs, so

@@ -1544,6 +1544,35 @@ async fn attached_volume_spawn_config(
     Ok(spawn)
 }
 
+/// A live fork must never silently drop or share a persistent block device.
+/// Provider-native cloning will replace this guard once the provider contract
+/// can publish child volumes atomically with the child VM reservation.
+pub(crate) async fn ensure_live_fork_has_no_persistent_volumes(
+    state: &AppState,
+    owner_key: &str,
+    vm_id: Uuid,
+) -> Result<(), OrchError> {
+    let attachments = if let Some(fleet) = &state.fleet {
+        fleet
+            .list_vm_volume_attachments(owner_key, vm_id)
+            .await
+            .map_err(crate::api::volume_fleet_err)?
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .list_vm_volume_attachments(owner_key, vm_id)
+            .map_err(crate::api::store_err)?
+    };
+    if attachments.is_empty() {
+        return Ok(());
+    }
+    Err(OrchError::Conflict(
+        "live fork requires provider clone support for attached persistent volumes".into(),
+    ))
+}
+
 /// Restore a VM from a node-local snapshot file on THIS node. Reserves a slot,
 /// spawns `vmm serve`, and resumes. `Conflict` if the host is at capacity.
 pub async fn restore_local(

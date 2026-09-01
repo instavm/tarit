@@ -95,7 +95,8 @@ def sync_detailed(
     snapshots the source through session-fenced mTLS, localizes and verifies the artifact, requires the
     configured replica policy, and starts the child on that receiving node. Placement identifiers and
     host paths are never caller-controlled or returned. The source and child must belong to the
-    authenticated tenant.
+    authenticated tenant. Sources with attached persistent volumes are rejected before snapshot work
+    until the configured provider supports atomic child-volume cloning.
 
     Args:
         id (UUID):
@@ -135,7 +136,8 @@ def sync(
     snapshots the source through session-fenced mTLS, localizes and verifies the artifact, requires the
     configured replica policy, and starts the child on that receiving node. Placement identifiers and
     host paths are never caller-controlled or returned. The source and child must belong to the
-    authenticated tenant.
+    authenticated tenant. Sources with attached persistent volumes are rejected before snapshot work
+    until the configured provider supports atomic child-volume cloning.
 
     Args:
         id (UUID):
@@ -170,7 +172,8 @@ async def asyncio_detailed(
     snapshots the source through session-fenced mTLS, localizes and verifies the artifact, requires the
     configured replica policy, and starts the child on that receiving node. Placement identifiers and
     host paths are never caller-controlled or returned. The source and child must belong to the
-    authenticated tenant.
+    authenticated tenant. Sources with attached persistent volumes are rejected before snapshot work
+    until the configured provider supports atomic child-volume cloning.
 
     Args:
         id (UUID):
@@ -208,7 +211,8 @@ async def asyncio(
     snapshots the source through session-fenced mTLS, localizes and verifies the artifact, requires the
     configured replica policy, and starts the child on that receiving node. Placement identifiers and
     host paths are never caller-controlled or returned. The source and child must belong to the
-    authenticated tenant.
+    authenticated tenant. Sources with attached persistent volumes are rejected before snapshot work
+    until the configured provider supports atomic child-volume cloning.
 
     Args:
         id (UUID):
