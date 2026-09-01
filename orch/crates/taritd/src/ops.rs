@@ -2973,6 +2973,27 @@ async fn publish_artifact_object_bundle(
         .as_deref()
         .map(PathBuf::from)
         .ok_or_else(|| OrchError::Unprocessable("artifact is missing rootfs metadata".into()))?;
+    let integrity_identity = immutable_object(
+        &ArtifactObjectReference {
+            digest: descriptor.integrity_manifest_digest.clone(),
+            size_bytes: descriptor.integrity_bytes,
+        },
+        "integrity",
+    )?;
+    let kernel_identity = immutable_object(
+        &ArtifactObjectReference {
+            digest: descriptor.kernel_digest.clone(),
+            size_bytes: descriptor.kernel_bytes,
+        },
+        "kernel",
+    )?;
+    let rootfs_identity = immutable_object(
+        &ArtifactObjectReference {
+            digest: descriptor.rootfs_digest.clone(),
+            size_bytes: descriptor.rootfs_bytes,
+        },
+        "rootfs",
+    )?;
 
     let overlay_upload = async {
         match overlay_path.as_deref() {
@@ -2983,9 +3004,9 @@ async fn publish_artifact_object_bundle(
     let (ram, overlay, integrity, kernel, rootfs) = tokio::join!(
         provider.put_file_if_absent(&ram_path),
         overlay_upload,
-        provider.put_file_if_absent(&integrity_path),
-        provider.put_file_if_absent(&kernel_path),
-        provider.put_file_if_absent(&rootfs_path),
+        provider.put_file_with_identity_if_absent(&integrity_path, &integrity_identity),
+        provider.put_file_with_identity_if_absent(&kernel_path, &kernel_identity),
+        provider.put_file_with_identity_if_absent(&rootfs_path, &rootfs_identity),
     );
     let map_upload_error =
         |error| OrchError::Unavailable(format!("publish artifact component object: {error}"));

@@ -224,6 +224,64 @@ impl RemoteImmutableObjectProvider {
         }
     }
 
+    /// Publish a file whose content identity was already derived by the
+    /// caller's immutable admission path. The local file is rehashed before an
+    /// existing content-addressed object is reused. A missing object falls
+    /// back to the full conditional multipart publication path.
+    pub async fn put_file_with_identity_if_absent(
+        &self,
+        source: &FilePath,
+        expected: &ImmutableObject,
+    ) -> Result<ImmutableObject, VolumeError> {
+        self.validate_size(expected.size_bytes)?;
+        let source_path = source.to_path_buf();
+        let source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(source)
+            .map_err(VolumeError::Io)?;
+        let metadata = source.metadata().map_err(VolumeError::Io)?;
+        if !metadata.file_type().is_file() || metadata.len() != expected.size_bytes {
+            return Err(VolumeError::IdentityMismatch);
+        }
+        let mut source = tokio::fs::File::from_std(source);
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut digest = Sha256::new();
+        let mut size_bytes = 0_u64;
+        loop {
+            let read = source.read(&mut buffer).await.map_err(VolumeError::Io)?;
+            if read == 0 {
+                break;
+            }
+            size_bytes = size_bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| VolumeError::Invalid("object size overflows u64".into()))?;
+            self.validate_size(size_bytes)?;
+            digest.update(&buffer[..read]);
+        }
+        if size_bytes != expected.size_bytes
+            || ObjectDigest::from_sha256(digest.finalize().into()) != expected.digest
+        {
+            return Err(VolumeError::IdentityMismatch);
+        }
+
+        match self.store.head(&self.location(expected.digest)).await {
+            Ok(metadata) if metadata.size == expected.size_bytes => Ok(expected.clone()),
+            Ok(_) => Err(VolumeError::IdentityMismatch),
+            Err(object_store::Error::NotFound { .. }) => self
+                .put_file_if_absent(&source_path)
+                .await
+                .and_then(|published| {
+                    if published == *expected {
+                        Ok(published)
+                    } else {
+                        Err(VolumeError::IdentityMismatch)
+                    }
+                }),
+            Err(error) => Err(map_store_error(error)),
+        }
+    }
+
     /// Download an immutable object to a newly-created regular file while
     /// verifying its declared size and SHA-256 digest before success.
     pub async fn get_to_new_file_verified(
@@ -314,7 +372,7 @@ impl RemoteImmutableObjectProvider {
     }
 
     pub async fn delete_verified(&self, object: &ImmutableObject) -> Result<(), VolumeError> {
-        self.get_verified(object).await?;
+        self.verify_remote_object(object).await?;
         self.store
             .delete(&self.location(object.digest))
             .await
@@ -452,6 +510,23 @@ mod tests {
         let streamed = provider.put_file_if_absent(&source).await.unwrap();
         assert_eq!(streamed.digest, ObjectDigest::from_bytes(&payload));
         assert_eq!(streamed.size_bytes, payload.len() as u64);
+        assert_eq!(
+            provider
+                .put_file_with_identity_if_absent(&source, &streamed)
+                .await
+                .unwrap(),
+            streamed
+        );
+        let mut wrong_payload = payload.clone();
+        wrong_payload[0] ^= 0xff;
+        std::fs::write(&source, &wrong_payload).unwrap();
+        assert!(matches!(
+            provider
+                .put_file_with_identity_if_absent(&source, &streamed)
+                .await,
+            Err(VolumeError::IdentityMismatch)
+        ));
+        std::fs::write(&source, &payload).unwrap();
         provider
             .get_to_new_file_verified(&streamed, &destination)
             .await
@@ -579,9 +654,13 @@ mod tests {
         let bucket = std::env::var("TARIT_TEST_S3_BUCKET").expect("TARIT_TEST_S3_BUCKET");
         let allow_http = std::env::var("TARIT_TEST_OBJECT_ALLOW_HTTP").as_deref() == Ok("1");
         let prefix = format!("tarit-e2e/{}", uuid::Uuid::new_v4());
-        let provider =
-            RemoteImmutableObjectProvider::s3_from_env(&bucket, prefix, 1024 * 1024, allow_http)
-                .unwrap();
+        let provider = RemoteImmutableObjectProvider::s3_from_env(
+            &bucket,
+            prefix,
+            20 * 1024 * 1024,
+            allow_http,
+        )
+        .unwrap();
         remote_round_trip(provider).await;
     }
 
@@ -596,7 +675,7 @@ mod tests {
         let provider = RemoteImmutableObjectProvider::azure_from_env(
             &container,
             prefix,
-            1024 * 1024,
+            20 * 1024 * 1024,
             allow_http,
         )
         .unwrap();
