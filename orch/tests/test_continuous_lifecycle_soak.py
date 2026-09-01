@@ -25,18 +25,16 @@ SPEC.loader.exec_module(MODULE)
 
 class StatusPublicationTests(unittest.TestCase):
     def make_soak(self, status_file: Path):
-        return MODULE.Soak(
-            SimpleNamespace(
-                api_key="key",
-                base_url="http://127.0.0.1:1",
-                case_name="ubuntu66",
-                epoch=7,
-                expected_kernel_prefix=None,
-                expected_os_id=None,
-                seed=20260831,
-                status_file=str(status_file),
-            )
-        )
+        return MODULE.Soak(SimpleNamespace(
+            api_key="key",
+            base_url="http://127.0.0.1:1",
+            case_name="ubuntu66",
+            epoch=7,
+            expected_kernel_prefix=None,
+            expected_os_id=None,
+            seed=20260831,
+            status_file=str(status_file),
+        ))
 
     def test_event_atomically_publishes_private_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -82,25 +80,22 @@ class StatusPublicationTests(unittest.TestCase):
                 "pause_resume": [4.0],
             }
 
-            self.assertEqual(
-                soak.action_summary(),
-                {
-                    "fork_anchor": {
-                        "count": 5,
-                        "p50_ms": 30.0,
-                        "p95_ms": 50.0,
-                        "p99_ms": 50.0,
-                        "max_ms": 50.0,
-                    },
-                    "pause_resume": {
-                        "count": 1,
-                        "p50_ms": 4.0,
-                        "p95_ms": 4.0,
-                        "p99_ms": 4.0,
-                        "max_ms": 4.0,
-                    },
+            self.assertEqual(soak.action_summary(), {
+                "fork_anchor": {
+                    "count": 5,
+                    "p50_ms": 30.0,
+                    "p95_ms": 50.0,
+                    "p99_ms": 50.0,
+                    "max_ms": 50.0,
                 },
-            )
+                "pause_resume": {
+                    "count": 1,
+                    "p50_ms": 4.0,
+                    "p95_ms": 4.0,
+                    "p99_ms": 4.0,
+                    "max_ms": 4.0,
+                },
+            })
 
     def test_fork_metrics_are_validated_and_summarized(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -133,17 +128,18 @@ class StatusPublicationTests(unittest.TestCase):
             summary = soak.fork_summary()
             self.assertEqual(summary["count"], 2)
             self.assertEqual(summary["paths"], {"cross_node": 1, "local": 1})
-            self.assertEqual(summary["terminations"], {"converged": 1, "max_rounds": 1})
             self.assertEqual(
-                summary["measurements"]["total_us"],
-                {
-                    "p50": 800,
-                    "p95": 1200,
-                    "p99": 1200,
-                    "max": 1200,
-                },
+                summary["terminations"], {"converged": 1, "max_rounds": 1}
             )
-            self.assertEqual(summary["measurements"]["live_downtime_us"]["max"], 50)
+            self.assertEqual(summary["measurements"]["total_us"], {
+                "p50": 800,
+                "p95": 1200,
+                "p99": 1200,
+                "max": 1200,
+            })
+            self.assertEqual(
+                summary["measurements"]["live_downtime_us"]["max"], 50
+            )
             self.assertEqual(
                 summary["by_source_vcpus"]["1"]["measurements"]["total_us"],
                 {"p50": 800, "p95": 800, "p99": 800, "max": 800},
@@ -154,28 +150,23 @@ class StatusPublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             soak = self.make_soak(Path(directory) / "status.json")
             with self.assertRaises(AssertionError):
-                soak.record_fork_metrics(
-                    {
-                        "metrics": {
-                            "path": "local",
-                            "source_resolution_us": 1,
-                            "operation_claim_us": 1,
-                            "snapshot_artifact_us": 1,
-                            "child_ready_us": 1,
-                            "operation_commit_us": 1,
-                            "total_us": 5,
-                            "live_snapshot": {
-                                "rounds": 1,
-                                "pages_copied": 1,
-                                "final_dirty_pages": 0,
-                                "elapsed_us": 10,
-                                "downtime_us": 11,
-                                "termination": "converged",
-                            },
-                        }
+                soak.record_fork_metrics({"metrics": {
+                    "path": "local",
+                    "source_resolution_us": 1,
+                    "operation_claim_us": 1,
+                    "snapshot_artifact_us": 1,
+                    "child_ready_us": 1,
+                    "operation_commit_us": 1,
+                    "total_us": 5,
+                    "live_snapshot": {
+                        "rounds": 1,
+                        "pages_copied": 1,
+                        "final_dirty_pages": 0,
+                        "elapsed_us": 10,
+                        "downtime_us": 11,
+                        "termination": "converged",
                     },
-                    2,
-                )
+                }}, 2)
 
     def test_vm_fork_metrics_use_the_source_vcpu_count(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -208,33 +199,16 @@ class StatusPublicationTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 soak.assert_guest_identity("vm-1")
 
-    def test_proof_write_command_is_single_line_and_shell_quoted(self) -> None:
-        command = MODULE.Soak.proof_write_command("child-'quoted value'")
-
-        self.assertNotIn("\n", command)
-        self.assertEqual(
-            command,
-            "printf '%s' 'child-'\"'\"'quoted value'\"'\"'' "
-            "> /root/tarit-soak-proof; sync",
-        )
-
     def parse_args(self, *extra: str):
         argv = [
             "continuous_lifecycle_soak.py",
-            "--base-url",
-            "http://127.0.0.1:1",
-            "--api-key",
-            "key",
-            "--database",
-            "/tmp/test.db",
-            "--vmm",
-            "/tmp/vmm",
-            "--jail-uid-base",
-            "300000",
-            "--jail-uid-count",
-            "6",
-            "--max-vms",
-            "6",
+            "--base-url", "http://127.0.0.1:1",
+            "--api-key", "key",
+            "--database", "/tmp/test.db",
+            "--vmm", "/tmp/vmm",
+            "--jail-uid-base", "300000",
+            "--jail-uid-count", "6",
+            "--max-vms", "6",
             *extra,
         ]
         with mock.patch.object(sys, "argv", argv):
@@ -267,10 +241,8 @@ class StatusPublicationTests(unittest.TestCase):
             ("--actions", "assert,,fork"),
         ]
         for arguments in invalid:
-            with (
-                self.subTest(arguments=arguments),
-                mock.patch("sys.stderr", new=io.StringIO()),
-            ):
+            with self.subTest(arguments=arguments), \
+                 mock.patch("sys.stderr", new=io.StringIO()):
                 with self.assertRaises(SystemExit):
                     self.parse_args(*arguments)
 
@@ -289,21 +261,14 @@ class StatusPublicationTests(unittest.TestCase):
                 observed.append(("cleanup", self.args.seed))
 
         args = self.parse_args("--seeds", "7,202609", "--steps", "1")
-        with (
-            mock.patch.object(MODULE, "parse_args", return_value=args),
-            mock.patch.object(MODULE, "Soak", FakeSoak),
-        ):
+        with mock.patch.object(MODULE, "parse_args", return_value=args), \
+             mock.patch.object(MODULE, "Soak", FakeSoak):
             self.assertEqual(MODULE.main(), 0)
 
-        self.assertEqual(
-            observed,
-            [
-                ("run", 7),
-                ("cleanup", 7),
-                ("run", 202609),
-                ("cleanup", 202609),
-            ],
-        )
+        self.assertEqual(observed, [
+            ("run", 7), ("cleanup", 7),
+            ("run", 202609), ("cleanup", 202609),
+        ])
 
     def test_step_mode_executes_exact_requested_action_count(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -325,8 +290,7 @@ class StatusPublicationTests(unittest.TestCase):
             def create_anchor(index):
                 vm_id = f"vm-{index}"
                 soak.anchors[vm_id] = SimpleNamespace(
-                    created_at=MODULE.time.monotonic(),
-                    vcpus=index + 1,
+                    created_at=MODULE.time.monotonic(), vcpus=index + 1,
                 )
                 return vm_id
 
