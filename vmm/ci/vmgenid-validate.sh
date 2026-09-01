@@ -181,7 +181,7 @@ cp --reflink=auto -- "$SNAPSHOT" "$SNAPSHOT_COPY"
 
 restore_clone() {
   local socket=$1 log=$2 overlay=$3 pid_var=$4
-  RUST_LOG=info "$VMM" serve --socket "$socket" >"$log" 2>&1 &
+  RUST_LOG=info "$VMM" serve --socket "$socket" --allow-unverified-restore >"$log" 2>&1 &
   printf -v "$pid_var" '%s' "$!"
   for _ in $(seq 1 40); do [[ -S "$socket" ]] && break; sleep 0.1; done
   local restore

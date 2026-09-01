@@ -71,7 +71,7 @@ probe_nproc() {
   echo "$out (last, wanted $want)"; return 1
 }
 
-RUST_LOG=info "$VMM" serve --socket "$SOCK" >"$LOG" 2>&1 &
+RUST_LOG=info "$VMM" serve --socket "$SOCK" --allow-unverified-restore >"$LOG" 2>&1 &
 SERVE_PID=$!
 sleep 1
 

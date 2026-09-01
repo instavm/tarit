@@ -32,6 +32,10 @@ versions may contain breaking changes.
 
 ### Changed
 
+- Direct VMM restore now requires authenticated RAM integrity metadata by
+  default. Unverified standalone and socket restores require an explicit
+  development-only override; orchestrated restores remain authenticated.
+
 - Live snapshots now pause, capture, and resume every configured vCPU through
   one bounded barrier; live fork supports SMP guests instead of rejecting them.
 - Hibernated exec, PTY, SSH, and public-share requests now join the same

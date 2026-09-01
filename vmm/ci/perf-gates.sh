@@ -338,7 +338,13 @@ try:
         environment = os.environ.copy()
         environment["RUST_LOG"] = "error"
         process = subprocess.Popen(
-            [str(VMM), "serve", "--socket", str(sock_path)],
+            [
+                str(VMM),
+                "serve",
+                "--socket",
+                str(sock_path),
+                "--allow-unverified-restore",
+            ],
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             env=environment,

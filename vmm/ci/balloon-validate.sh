@@ -160,7 +160,7 @@ assert_guest_kernel_live() {
 }
 
 rm -f -- "$SOCKET" "$LOG"
-"$VMM_BIN" --socket "$SOCKET" serve >"$LOG" 2>&1 &
+"$VMM_BIN" --socket "$SOCKET" serve --allow-unverified-restore >"$LOG" 2>&1 &
 SERVE_PID=$!
 for _ in $(seq 1 100); do
   [[ -S "$SOCKET" ]] && break
@@ -321,7 +321,7 @@ INTEGRITY_SIDECAR=$(json_field integrity_path <<<"$snapshot_json")
 [[ -s "$INTEGRITY_SIDECAR" ]]
 "$VMM_BIN" --socket "$SOCKET" stop >/dev/null
 for cycle in $(seq 1 "$RESTORE_CYCLES"); do
-  timeout "$SNAPSHOT_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore --snapshot "$SNAPSHOT" --memory-policy lazy >/dev/null
+  timeout "$SNAPSHOT_TIMEOUT_SECS" "$VMM_BIN" --socket "$SOCKET" restore --snapshot "$SNAPSHOT" --memory-policy lazy --allow-unverified-restore >/dev/null
   wait_for_exec
   restored=$("$VMM_BIN" --socket "$SOCKET" balloon)
   [[ $(json_field target_mib <<<"$restored") == 8 ]]

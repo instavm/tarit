@@ -95,7 +95,7 @@ echo "full snapshot: $SNAP  SHA=$SHA"
 api "$S1" '{"op":"stop"}' >/dev/null; stop_serve "$P1"; sleep 1
 
 echo "=== restore into a fresh serve ==="
-RUST_LOG=warn "$VMM" serve --socket "$S2" >/tmp/full2.log 2>&1 & P2=$!
+RUST_LOG=warn "$VMM" serve --socket "$S2" --allow-unverified-restore >/tmp/full2.log 2>&1 & P2=$!
 sleep 1
 api "$S2" "{\"op\":\"restore\",\"snapshot_path\":\"$SNAP\"}"; echo
 wait_guest_ready "$S2"

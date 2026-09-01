@@ -289,6 +289,7 @@ PY
 if [[ -n "$INCOMPATIBLE_VMM_BIN" ]]; then
   rm -f -- "$INCOMPATIBLE_SOCKET" "$INCOMPATIBLE_LOG"
   "$INCOMPATIBLE_VMM_BIN" --socket "$INCOMPATIBLE_SOCKET" serve \
+    --allow-unverified-restore \
     >"$INCOMPATIBLE_LOG" 2>&1 &
   INCOMPATIBLE_SERVE_PID=$!
   for _ in $(seq 1 100); do
@@ -302,7 +303,7 @@ if [[ -n "$INCOMPATIBLE_VMM_BIN" ]]; then
   [[ -S "$INCOMPATIBLE_SOCKET" ]]
   if timeout "$RESTORE_TIMEOUT_SECS" "$INCOMPATIBLE_VMM_BIN" \
     --socket "$INCOMPATIBLE_SOCKET" restore --snapshot "$SNAPSHOT" \
-    --memory-policy lazy >"$RESTORE_ERROR" 2>&1; then
+    --memory-policy lazy --allow-unverified-restore >"$RESTORE_ERROR" 2>&1; then
     echo "incompatible VMM binary unexpectedly restored the snapshot" >&2
     exit 1
   fi

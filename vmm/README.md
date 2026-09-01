@@ -34,6 +34,8 @@ and `create` commands offer that install when `--kernel` is omitted.
 - One-shot foreground boot with `vmm run`, including `--full-boot` for normal userspace boot.
 - Single-VM UDS API server with `vmm serve`.
 - Snapshot, diff snapshot, restore, suspend, and resume.
+- Authenticated snapshot restore by default; unverified direct restore requires
+  an explicit development-only override.
 - Restore with optional CoW overlays for clone-style workflows.
 - Guest exec and interactive PTY through the guest agent and vsock path.
 - Host TAP backed virtio-net plus live egress rule updates.

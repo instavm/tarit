@@ -114,10 +114,22 @@ Set `diff` to `true` to request an incremental snapshot when the VMM has a previ
 ### `restore`
 
 ```json
-{ "op": "restore", "snapshot_path": "/path/to/vm.snap", "overlay": null }
+{
+  "op": "restore",
+  "snapshot_path": "/path/to/vm.snap",
+  "memory_integrity": {
+    "manifest_path": "/path/to/vm.memory-integrity.json",
+    "manifest_sha256": "<64 lowercase hexadecimal characters>"
+  },
+  "overlay": null
+}
 ```
 
-`overlay` is optional. Use it when restoring a clone with a private CoW overlay.
+`memory_integrity` anchors the private RAM chunk manifest and is required by a
+production-default server. `overlay` is optional. Use it when restoring a clone
+with a private CoW overlay. A low-level compatibility harness may start
+`vmm serve` with `--allow-unverified-restore`; do not enable that override for
+an orchestrated or tenant-accessible VMM.
 
 ### `stop`
 

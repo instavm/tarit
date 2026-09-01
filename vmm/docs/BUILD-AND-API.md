@@ -158,6 +158,7 @@ vmm serve [OPTIONS] [--socket <PATH>]
 | `--cgroup-cpu-max <QUOTA/PERIOD\|MILLICPU>` | none | Set `cpu.max` |
 | `--cgroup-pids-max <N>` | none | Set `pids.max` |
 | `--cpuset <CPUS>` | none | Set `cpuset.cpus` |
+| `--allow-unverified-restore` | disabled | Development only: accept restore requests without authenticated RAM integrity metadata |
 
 **Example:**
 ```sh
@@ -180,6 +181,10 @@ vmm restore --snapshot <PATH> [OPTIONS]
 | `--jail <DIR>` | none | Run inside a jail rooted at `DIR` |
 | `--uid <UID>` | 1000 | UID to drop to when jailed |
 | `--gid <GID>` | 1000 | GID to drop to when jailed |
+| `--allow-unverified-restore` | disabled | Development only: restore a trusted snapshot without authenticated RAM integrity metadata |
+
+Production restores use `taritd`, which supplies authenticated RAM integrity
+metadata. The standalone command fails closed without the explicit override.
 
 ### `vmm snapshot` (`snap`): Snapshot a running VM (via API)
 
@@ -412,9 +417,20 @@ Set `diff` to `true` to request a diff snapshot.
 
 #### `restore`: Restore from a snapshot file
 ```json
-{ "op": "restore", "snapshot_path": "/tmp/vmm-vm-1.snap", "overlay": null }
+{
+  "op": "restore",
+  "snapshot_path": "/tmp/vmm-vm-1.snap",
+  "memory_integrity": {
+    "manifest_path": "/tmp/vmm-vm-1.memory-integrity.json",
+    "manifest_sha256": "<64 lowercase hexadecimal characters>"
+  },
+  "overlay": null
+}
 ```
-`overlay` is optional. Use it for a private CoW overlay on restore.
+`memory_integrity` is required by the default server policy. `overlay` is
+optional. Use it for a private CoW overlay on restore. The server-side
+`--allow-unverified-restore` switch exists only for controlled compatibility
+testing.
 
 #### `exec`: Execute a command in the guest
 ```json

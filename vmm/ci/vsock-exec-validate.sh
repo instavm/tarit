@@ -41,7 +41,7 @@ PY
 gx() { api "$(req "$1")" | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("stdout") or d.get("msg") or "").strip())'; }
 
 CMDLINE="console=ttyS0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw"
-RUST_LOG=info "$VMM" serve --socket "$SOCK" >"$LOG" 2>&1 &
+RUST_LOG=info "$VMM" serve --socket "$SOCK" --allow-unverified-restore >"$LOG" 2>&1 &
 SP=$!
 sleep 1
 api "{\"op\":\"create\",\"config\":{\"kernel\":{\"path\":\"$KERNEL\",\"cmdline\":\"$CMDLINE\",\"initramfs\":null},\"memory\":{\"size_mib\":256},\"vcpus\":{\"count\":1},\"volumes\":[{\"path\":\"$ROOTFS\",\"read_only\":false}],\"net\":[]}}" >/dev/null

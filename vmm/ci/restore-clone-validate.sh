@@ -54,7 +54,7 @@ if [ -z "$SNAP" ]; then echo "FAIL: no snapshot path"; exit 1; fi
 
 echo ""
 echo "=== restore clone A (overlay $OVA) ==="
-RUST_LOG=warn "$VMM" serve --socket "$SA" >/tmp/clone-a.log 2>&1 & AP=$!
+RUST_LOG=warn "$VMM" serve --socket "$SA" --allow-unverified-restore >/tmp/clone-a.log 2>&1 & AP=$!
 sleep 1
 api "$SA" "{\"op\":\"restore\",\"snapshot_path\":\"$SNAP\",\"overlay\":\"$OVA\"}"; echo
 sleep 4
@@ -63,7 +63,7 @@ echo "  A write+read: $A_WRITE"
 
 echo ""
 echo "=== restore clone B (overlay $OVB) ==="
-RUST_LOG=warn "$VMM" serve --socket "$SB" >/tmp/clone-b.log 2>&1 & BP=$!
+RUST_LOG=warn "$VMM" serve --socket "$SB" --allow-unverified-restore >/tmp/clone-b.log 2>&1 & BP=$!
 sleep 1
 api "$SB" "{\"op\":\"restore\",\"snapshot_path\":\"$SNAP\",\"overlay\":\"$OVB\"}"; echo
 sleep 4

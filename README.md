@@ -121,8 +121,12 @@ sudo vmm --socket /tmp/vm.sock snapshot --diff       # incremental (dirty pages 
 sudo vmm --socket /tmp/vm.sock snapshot --live       # live: guest keeps running
 sudo vmm --socket /tmp/vm.sock suspend               # release resident guest RAM
 sudo vmm --socket /tmp/vm.sock resume
-sudo vmm restore --snapshot /path/to.snap            # restore into a new VMM process
+sudo vmm restore --snapshot /path/to.snap --allow-unverified-restore  # trusted development snapshot only
 ```
+
+Production restores go through `taritd`, which supplies authenticated RAM
+integrity metadata. Direct VMM restore is fail-closed unless the explicit
+development override is enabled.
 
 Tarit also does **live snapshots** (`snapshot --live`): pre-copy rounds run
 while the guest executes, then a final stop copies only the residual dirty

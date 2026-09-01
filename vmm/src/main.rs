@@ -14,7 +14,7 @@
 //! vmm serve --socket /tmp/vmm.sock
 //!
 //! # Restore from a snapshot
-//! vmm restore --snapshot /tmp/vmm-vm1.snap
+//! vmm restore --snapshot /tmp/vmm-vm1.snap --allow-unverified-restore
 //! ```
 //!
 //! # API Protocol
@@ -401,6 +401,13 @@ enum Cmd {
         /// GID to drop to when jailed.
         #[arg(long, default_value = "1000", value_name = "GID")]
         gid: u32,
+
+        /// Allow restore without authenticated RAM integrity metadata.
+        ///
+        /// Development compatibility only. Production restores should use
+        /// the orchestrator, which supplies and verifies integrity metadata.
+        #[arg(long)]
+        allow_unverified_restore: bool,
     },
 
     /// Start the API server on a Unix socket.
@@ -436,6 +443,12 @@ enum Cmd {
         /// automatically, and jail mode cannot disable it.
         #[arg(long, requires = "jail")]
         seccomp: bool,
+
+        /// Accept restore requests without authenticated RAM integrity metadata.
+        ///
+        /// Development compatibility only. Do not enable on production VMMs.
+        #[arg(long)]
+        allow_unverified_restore: bool,
 
         #[command(flatten)]
         cgroup: ServeCgroupArgs,
@@ -617,7 +630,16 @@ fn main() -> Result<()> {
             jail,
             uid,
             gid,
-        } => restore(&cli.socket, snapshot, memory_policy, jail, uid, gid),
+            allow_unverified_restore,
+        } => restore(
+            &cli.socket,
+            snapshot,
+            memory_policy,
+            jail,
+            uid,
+            gid,
+            allow_unverified_restore,
+        ),
         Cmd::Serve {
             jail,
             uid,
@@ -626,6 +648,7 @@ fn main() -> Result<()> {
             isolate_network,
             pid_namespace,
             seccomp,
+            allow_unverified_restore,
             cgroup,
         } => serve(
             &cli.socket,
@@ -639,6 +662,7 @@ fn main() -> Result<()> {
                 seccomp,
             },
             cgroup,
+            allow_unverified_restore,
         ),
         Cmd::Snapshot { diff, live } => api_snapshot(&cli.socket, diff, live),
         Cmd::Create {
@@ -1132,7 +1156,14 @@ fn restore(
     jail_dir: Option<String>,
     uid: u32,
     gid: u32,
+    allow_unverified_restore: bool,
 ) -> Result<()> {
+    anyhow::ensure!(
+        allow_unverified_restore,
+        "standalone restore has no authenticated RAM integrity metadata; rerun with \
+         --allow-unverified-restore only for an explicitly trusted development snapshot, or \
+         restore through taritd"
+    );
     if api_socket_is_listening(socket)? {
         anyhow::ensure!(
             jail_dir.is_none(),
@@ -1218,7 +1249,12 @@ struct ServeJailOptions {
     seccomp: bool,
 }
 
-fn serve(socket: &str, jail: ServeJailOptions, cgroup: ServeCgroupArgs) -> Result<()> {
+fn serve(
+    socket: &str,
+    jail: ServeJailOptions,
+    cgroup: ServeCgroupArgs,
+    allow_unverified_restore: bool,
+) -> Result<()> {
     let ServeJailOptions {
         jail_dir,
         uid,
@@ -1302,8 +1338,17 @@ fn serve(socket: &str, jail: ServeJailOptions, cgroup: ServeCgroupArgs) -> Resul
         );
     }
 
+    if allow_unverified_restore {
+        log::warn!("serve: unverified snapshot restore development override enabled");
+    }
     log::info!("serve: API on {socket}");
-    vmm_api::rpc::serve(socket).map_err(|e| anyhow::anyhow!("api serve: {e}"))
+    vmm_api::rpc::serve_with_policy(
+        socket,
+        vmm_api::rpc::ServerPolicy {
+            allow_unverified_restore,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("api serve: {e}"))
 }
 
 fn resolve_jailed_seccomp(jail_dir: Option<&str>, compatibility_flag: bool) -> Result<bool> {
@@ -1846,6 +1891,52 @@ mod tests {
     fn serve_cgroup_limit_flags_require_cgroup_path() {
         assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-memory-max", "512M",]).is_err());
         assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-io-max", "8:0 rbps=1"]).is_err());
+    }
+
+    #[test]
+    fn unverified_restore_override_is_explicit_and_scoped() {
+        let restore =
+            Cli::try_parse_from(["vmm", "restore", "--snapshot", "/tmp/vm.snap"]).unwrap();
+        assert!(matches!(
+            restore.cmd,
+            Cmd::Restore {
+                allow_unverified_restore: false,
+                ..
+            }
+        ));
+
+        let restore = Cli::try_parse_from([
+            "vmm",
+            "restore",
+            "--snapshot",
+            "/tmp/vm.snap",
+            "--allow-unverified-restore",
+        ])
+        .unwrap();
+        assert!(matches!(
+            restore.cmd,
+            Cmd::Restore {
+                allow_unverified_restore: true,
+                ..
+            }
+        ));
+
+        let serve = Cli::try_parse_from(["vmm", "serve"]).unwrap();
+        assert!(matches!(
+            serve.cmd,
+            Cmd::Serve {
+                allow_unverified_restore: false,
+                ..
+            }
+        ));
+        let serve = Cli::try_parse_from(["vmm", "serve", "--allow-unverified-restore"]).unwrap();
+        assert!(matches!(
+            serve.cmd,
+            Cmd::Serve {
+                allow_unverified_restore: true,
+                ..
+            }
+        ));
     }
 
     #[test]

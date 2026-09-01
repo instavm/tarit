@@ -169,7 +169,8 @@ target/release/vmm --socket /tmp/vmm.sock update-egress \
 target/release/vmm --socket /tmp/vmm.sock stop
 ```
 
-Restore inside a `vmm serve` process by sending the API `restore` request. `overlay` is optional.
+Restore inside a `vmm serve` process by sending an authenticated API `restore`
+request. `overlay` is optional.
 
 ```sh
 python3 - <<'PY'
@@ -187,7 +188,15 @@ def recvn(sock, n):
         data += chunk
     return data
 
-req = {"op": "restore", "snapshot_path": SNAPSHOT, "overlay": None}
+req = {
+    "op": "restore",
+    "snapshot_path": SNAPSHOT,
+    "memory_integrity": {
+        "manifest_path": "/path/to/snapshot.memory-integrity.json",
+        "manifest_sha256": "<64 lowercase hexadecimal characters>",
+    },
+    "overlay": None,
+}
 body = json.dumps(req).encode()
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
     s.connect(SOCK)
@@ -197,11 +206,17 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
 PY
 ```
 
-To restore as a separate foreground VMM process, use the local restore command instead:
+The standalone restore command cannot supply a control-plane integrity anchor.
+It therefore requires an explicit override and is limited to trusted
+development snapshots:
 
 ```sh
-sudo target/release/vmm restore --snapshot /path/to/snapshot.snap
+sudo target/release/vmm restore --snapshot /path/to/snapshot.snap \
+  --allow-unverified-restore
 ```
+
+For production, restore through `taritd`, which passes the authenticated
+manifest anchor to the VMM.
 
 ### `serve` flags
 

@@ -232,7 +232,7 @@ PY
 
 start_server() {
   local socket=$1 log=$2 pid_var=$3 binary=${4:-$VMM}
-  RUST_LOG=info "$binary" serve --socket "$socket" >"$log" 2>&1 &
+  RUST_LOG=info "$binary" serve --socket "$socket" --allow-unverified-restore >"$log" 2>&1 &
   printf -v "$pid_var" '%s' "$!"
   for _ in $(seq 1 40); do
     [[ -S "$socket" ]] && return 0

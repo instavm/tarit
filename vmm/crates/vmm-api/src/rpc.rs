@@ -163,8 +163,26 @@ fn clear_control_timeouts(stream: &UnixStream) -> std::io::Result<()> {
     stream.set_write_timeout(None)
 }
 
-/// Dispatch a single `ApiRequest` using the VMM controller.
+/// Security policy for one VMM API server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServerPolicy {
+    /// Permit restore requests that do not carry authenticated RAM chunk
+    /// metadata. This is intended only for low-level development and
+    /// compatibility tests; orchestrated restores always provide integrity.
+    pub allow_unverified_restore: bool,
+}
+
+/// Dispatch a single `ApiRequest` using the production-default policy.
 pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
+    dispatch_with_policy(req, controller, ServerPolicy::default())
+}
+
+/// Dispatch a single `ApiRequest` using an explicit server security policy.
+pub fn dispatch_with_policy(
+    req: ApiRequest,
+    controller: &VmmController,
+    policy: ServerPolicy,
+) -> ApiResponse {
     match req {
         ApiRequest::Create(spec) => match controller.create_live(spec.config) {
             Ok(()) => ApiResponse::Ok,
@@ -277,19 +295,26 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             net,
             volumes,
             memory_policy,
-        } => match controller.restore_with_resource_overrides(
-            &snapshot_path,
-            overlay,
-            net,
-            volumes,
-            memory_policy,
-            memory_integrity,
-        ) {
-            Ok(()) => ApiResponse::Restored,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
-        },
+        } => {
+            if memory_integrity.is_none() && !policy.allow_unverified_restore {
+                return ApiResponse::Err {
+                    msg: "unverified snapshot restore is disabled; supply authenticated integrity metadata or start the VMM with the explicit development override".into(),
+                };
+            }
+            match controller.restore_with_resource_overrides(
+                &snapshot_path,
+                overlay,
+                net,
+                volumes,
+                memory_policy,
+                memory_integrity,
+            ) {
+                Ok(()) => ApiResponse::Restored,
+                Err(e) => ApiResponse::Err {
+                    msg: format!("{e}"),
+                },
+            }
+        }
         ApiRequest::RepairGuestNetwork { network } => {
             match controller.repair_guest_network(network) {
                 Ok(()) => ApiResponse::GuestNetworkRepaired,
@@ -407,11 +432,26 @@ fn balloon_response(target_pages: u32, actual_pages: u32) -> ApiResponse {
 /// Run the API server on `socket_path`. Blocks the calling thread.
 pub fn serve(socket_path: &str) -> std::io::Result<()> {
     let controller = VmmController::new();
-    serve_with_controller(socket_path, controller)
+    serve_with_controller_and_policy(socket_path, controller, ServerPolicy::default())
 }
 
-/// Run the API server with a pre-existing controller.
+/// Run the API server with an explicit security policy.
+pub fn serve_with_policy(socket_path: &str, policy: ServerPolicy) -> std::io::Result<()> {
+    let controller = VmmController::new();
+    serve_with_controller_and_policy(socket_path, controller, policy)
+}
+
+/// Run the API server with a pre-existing controller and production defaults.
 pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> std::io::Result<()> {
+    serve_with_controller_and_policy(socket_path, controller, ServerPolicy::default())
+}
+
+/// Run the API server with a pre-existing controller and explicit policy.
+pub fn serve_with_controller_and_policy(
+    socket_path: &str,
+    controller: VmmController,
+    policy: ServerPolicy,
+) -> std::io::Result<()> {
     let controller = std::sync::Arc::new(controller);
     remove_stale_socket(socket_path)?;
     ensure_socket_parent(socket_path)?;
@@ -470,19 +510,20 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
         // Isolate handler panics: a panic in dispatch must not crash the whole
         // `vmm serve` process (which would orphan the VM before the orchestrator
         // can stop it cleanly). Catch it and return a framed error instead.
-        let resp =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(req, &controller)))
-                .unwrap_or_else(|payload| {
-                    let msg = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
-                    log::error!("request handler panicked: {msg}");
-                    ApiResponse::Err {
-                        msg: format!("internal error: {msg}"),
-                    }
-                });
+        let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dispatch_with_policy(req, &controller, policy)
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            log::error!("request handler panicked: {msg}");
+            ApiResponse::Err {
+                msg: format!("internal error: {msg}"),
+            }
+        });
         if let Err(e) = write_frame(&mut stream, &encode_response_for_frame(&resp)) {
             log::warn!("write_frame: {e}");
         }
@@ -893,6 +934,56 @@ mod tests {
             &controller,
         );
         assert!(matches!(resp, ApiResponse::Err { .. }));
+    }
+
+    fn restore_request(memory_integrity: Option<tarit_proto::MemoryIntegrity>) -> ApiRequest {
+        ApiRequest::Restore {
+            snapshot_path: "/snapshot-that-does-not-exist".into(),
+            memory_integrity,
+            overlay: None,
+            net: None,
+            volumes: None,
+            memory_policy: crate::types::RestoreMemoryPolicy::Auto,
+        }
+    }
+
+    #[test]
+    fn dispatch_rejects_unverified_restore_by_default() {
+        let response = dispatch(restore_request(None), &VmmController::new());
+        assert!(matches!(
+            response,
+            ApiResponse::Err { msg } if msg.contains("unverified snapshot restore is disabled")
+        ));
+    }
+
+    #[test]
+    fn dispatch_allows_explicit_unverified_restore_development_policy() {
+        let response = dispatch_with_policy(
+            restore_request(None),
+            &VmmController::new(),
+            ServerPolicy {
+                allow_unverified_restore: true,
+            },
+        );
+        assert!(matches!(
+            response,
+            ApiResponse::Err { msg } if !msg.contains("unverified snapshot restore is disabled")
+        ));
+    }
+
+    #[test]
+    fn dispatch_accepts_authenticated_restore_under_default_policy() {
+        let response = dispatch(
+            restore_request(Some(tarit_proto::MemoryIntegrity {
+                manifest_path: "/manifest-that-does-not-exist".into(),
+                manifest_sha256: "00".repeat(32),
+            })),
+            &VmmController::new(),
+        );
+        assert!(matches!(
+            response,
+            ApiResponse::Err { msg } if !msg.contains("unverified snapshot restore is disabled")
+        ));
     }
 
     #[test]
