@@ -34,7 +34,8 @@ def validate_guest(cpu, memory, actual_cpu, actual_kib):
         raise AssertionError(f"guest CPUs: {actual_cpu}, requested {cpu}")
     # MemTotal excludes kernel reservations. Reject lost high RAM and
     # accidentally oversized guests without assuming identical kernel overhead.
-    if not memory * 1024 * 0.80 <= actual_kib <= memory * 1024:
+    minimum_kib = max(memory * 1024 * 0.80, (memory - 128) * 1024)
+    if not minimum_kib <= actual_kib <= memory * 1024:
         raise AssertionError(f"guest MemTotal: {actual_kib} KiB, requested {memory} MiB")
 
 

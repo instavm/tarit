@@ -18,6 +18,8 @@ class ShapeTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_guest(8, 4096, 8, 3072 * 1024)
         with self.assertRaises(AssertionError):
+            validate_guest(8, 4096, 8, 3328 * 1024)
+        with self.assertRaises(AssertionError):
             validate_guest(8, 4096, 2, 4000 * 1024)
         with self.assertRaises(AssertionError):
             validate_guest(1, 256, 1, 512 * 1024)
