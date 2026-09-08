@@ -197,6 +197,7 @@ pub(crate) enum LifecyclePause {
     Fleet,
     SQLite,
     Cache,
+    ForkCapture,
 }
 
 #[cfg(test)]

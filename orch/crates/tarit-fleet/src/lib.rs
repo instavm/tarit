@@ -133,6 +133,7 @@ impl PostgresFleet {
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
              ALTER TABLE fleet_vm_fork_operations ADD COLUMN IF NOT EXISTS target_boot_session_id UUID;
              ALTER TABLE fleet_vm_volume_attachments ADD COLUMN IF NOT EXISTS device_identity UUID;
+             ALTER TABLE fleet_volume_fork_clones ADD COLUMN IF NOT EXISTS device_identity UUID;
              CREATE UNIQUE INDEX IF NOT EXISTS fleet_vm_volume_device_identity
                ON fleet_vm_volume_attachments(vm_id, COALESCE(device_identity, volume_id));
              CREATE INDEX IF NOT EXISTS fleet_vms_owner_status ON fleet_vms (owner_key, status);
@@ -1890,6 +1891,20 @@ impl PostgresFleet {
         {
             return Err(FleetError::Conflict("volume is attached to a VM".into()));
         }
+        if tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM fleet_volume_fork_clones c
+             JOIN fleet_vm_fork_operations f ON f.child_vm_id = c.child_vm_id
+             WHERE c.child_volume_id = $1 AND f.status = 'preparing')",
+                &[&id],
+            )
+            .await?
+            .get::<_, bool>(0)
+        {
+            return Err(FleetError::Conflict(
+                "volume belongs to an unfinished fork".into(),
+            ));
+        }
         let next_revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| FleetError::Conflict("volume revision exhausted".into()))?;
@@ -2009,6 +2024,18 @@ impl PostgresFleet {
                     "volume is unavailable, belongs to another tenant, or lacks the requested access mode"
                         .into(),
                 ));
+            }
+            if tx.query_one(
+                "SELECT EXISTS(SELECT 1 FROM fleet_volume_fork_clones c
+                 JOIN fleet_vm_fork_operations f ON f.child_vm_id = c.child_vm_id
+                 WHERE c.child_volume_id = $1 AND f.status = 'preparing'
+                   AND (c.status = 'preparing' OR c.child_vm_id != $2 OR COALESCE(c.device_identity, c.source_volume_id) != $3
+                        OR c.child_generation != $4 OR c.device_index != $5 OR c.mode != $6))",
+                &[&attachment.volume_id, &attachment.vm_id, &attachment.device_identity,
+                    &u64_to_sql_i64(attachment.volume_generation)?, &i16::from(attachment.device_index),
+                    &attachment.mode.as_str()],
+            ).await?.get::<_, bool>(0) {
+                return Err(FleetError::Conflict("volume is reserved for another fork binding".into()));
             }
             if let Some(existing) = tx
                 .query_opt(
@@ -2456,12 +2483,14 @@ impl PostgresFleet {
                 || record.source_vm_id != source_vm_id
                 || record.owner_key != owner_key
                 || record.source_generation == 0
+                || record.device_identity.is_nil()
                 || record.child_generation == 0
                 || record.device_index > 14
                 || record.status != VolumeForkCloneStatus::Preparing
         }) || desired.iter().enumerate().any(|(index, record)| {
             desired[..index].iter().any(|previous| {
                 previous.device_index == record.device_index
+                    || previous.device_identity == record.device_identity
                     || previous.source_volume_id == record.source_volume_id
                     || previous.child_volume_id == record.child_volume_id
             })
@@ -2492,7 +2521,8 @@ impl PostgresFleet {
             .query(
                 "SELECT child_vm_id, source_vm_id, owner_key, source_volume_id,
                         child_volume_id, device_index, mode, source_generation,
-                        child_generation, status, created_at, updated_at
+                        child_generation, status, created_at, updated_at,
+                        COALESCE(device_identity, source_volume_id)
                  FROM fleet_volume_fork_clones
                  WHERE owner_key = $1 AND child_vm_id = $2
                  ORDER BY device_index ASC",
@@ -2525,8 +2555,8 @@ impl PostgresFleet {
                 "INSERT INTO fleet_volume_fork_clones (
                    child_vm_id, source_vm_id, owner_key, source_volume_id,
                    child_volume_id, device_index, mode, source_generation,
-                   child_generation, status, created_at, updated_at
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                   child_generation, status, created_at, updated_at, device_identity
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
                 &[
                     &record.child_vm_id,
                     &record.source_vm_id,
@@ -2540,6 +2570,7 @@ impl PostgresFleet {
                     &record.status.as_str(),
                     &record.created_at,
                     &record.updated_at,
+                    &record.device_identity,
                 ],
             )
             .await
@@ -2549,7 +2580,8 @@ impl PostgresFleet {
             .query(
                 "SELECT child_vm_id, source_vm_id, owner_key, source_volume_id,
                         child_volume_id, device_index, mode, source_generation,
-                        child_generation, status, created_at, updated_at
+                        child_generation, status, created_at, updated_at,
+                        COALESCE(device_identity, source_volume_id)
                  FROM fleet_volume_fork_clones
                  WHERE owner_key = $1 AND child_vm_id = $2
                  ORDER BY device_index ASC",
@@ -2574,7 +2606,8 @@ impl PostgresFleet {
             .query(
                 "SELECT child_vm_id, source_vm_id, owner_key, source_volume_id,
                         child_volume_id, device_index, mode, source_generation,
-                        child_generation, status, created_at, updated_at
+                        child_generation, status, created_at, updated_at,
+                        COALESCE(device_identity, source_volume_id)
                  FROM fleet_volume_fork_clones
                  WHERE owner_key = $1 AND child_vm_id = $2
                  ORDER BY device_index ASC",
@@ -3438,6 +3471,7 @@ fn row_to_volume_fork_clone(
         owner_key: row.get(2),
         source_volume_id: row.get(3),
         child_volume_id: row.get(4),
+        device_identity: row.get(12),
         device_index,
         mode: VolumeAttachmentMode::parse(&mode)
             .ok_or_else(|| FleetError::Config(format!("invalid volume clone mode: {mode}")))?,
@@ -3460,6 +3494,7 @@ fn same_immutable_volume_fork_clone(
         && left.source_vm_id == right.source_vm_id
         && left.owner_key == right.owner_key
         && left.source_volume_id == right.source_volume_id
+        && left.device_identity == right.device_identity
         && left.child_volume_id == right.child_volume_id
         && left.device_index == right.device_index
         && left.mode == right.mode
@@ -4274,6 +4309,7 @@ mod tests {
             owner_key: operation.owner_key.clone(),
             source_volume_id: Uuid::new_v4(),
             child_volume_id: Uuid::new_v4(),
+            device_identity: Uuid::new_v4(),
             device_index: 0,
             mode: VolumeAttachmentMode::ReadWrite,
             source_generation: 7,
@@ -4285,6 +4321,7 @@ mod tests {
         let second = VolumeForkCloneRecord {
             source_volume_id: Uuid::new_v4(),
             child_volume_id: Uuid::new_v4(),
+            device_identity: Uuid::new_v4(),
             device_index: 1,
             mode: VolumeAttachmentMode::ReadOnly,
             source_generation: 11,
@@ -4308,6 +4345,20 @@ mod tests {
             assert_eq!(claimed.len(), 2);
             assert_eq!(claimed[0].device_index, 0);
             assert_eq!(claimed[1].device_index, 1);
+            assert_eq!(claimed[0].device_identity, first.device_identity);
+            assert_eq!(claimed[1].device_identity, second.device_identity);
+            for identity in [Uuid::nil(), Uuid::new_v4(), second.device_identity] {
+                let changed_identity = VolumeForkCloneRecord {
+                    device_identity: identity,
+                    ..first.clone()
+                };
+                assert!(matches!(
+                    fleet
+                        .claim_volume_fork_clones(&[changed_identity, second.clone()])
+                        .await,
+                    Err(FleetError::Conflict(_))
+                ));
+            }
             assert_eq!(
                 fleet
                     .claim_volume_fork_clones(&[first.clone(), second.clone()])
@@ -4452,6 +4503,7 @@ mod tests {
                 owner_key: race_operation.owner_key.clone(),
                 source_volume_id: Uuid::new_v4(),
                 child_volume_id: Uuid::new_v4(),
+                device_identity: Uuid::new_v4(),
                 device_index: 0,
                 mode: VolumeAttachmentMode::ReadWrite,
                 source_generation: 1,
@@ -4542,6 +4594,7 @@ mod tests {
         let vm_a = test_vm(Uuid::new_v4(), &host, &owner);
         let vm_b = test_vm(Uuid::new_v4(), &host, &owner);
         let vm_c = test_vm(Uuid::new_v4(), &host, &owner);
+        let fork_vm = test_vm(Uuid::new_v4(), &host, &owner);
 
         let result = async {
             assert_eq!(fleet.insert_volume(&volume).await?, volume);
@@ -4696,6 +4749,47 @@ mod tests {
             fleet.delete_vm(&vm_c).await?;
             assert_eq!(fleet.volume_attachment_count(&owner, volume.id).await?, 0);
 
+            let now = Utc::now();
+            let operation = ForkOperationRecord {
+                child_vm_id: fork_vm.id, source_vm_id: vm_a.id, owner_key: owner.clone(),
+                source_host_id: host.clone(), target_host_id: host.clone(),
+                target_boot_session_id: Some(Uuid::new_v4()), status: ForkOperationStatus::Preparing,
+                child_created_at: None, created_at: now, updated_at: now,
+            };
+            fleet.claim_fork_operation(&operation, 4, now + chrono::Duration::minutes(1)).await?;
+            let clone = VolumeForkCloneRecord {
+                child_vm_id: fork_vm.id, source_vm_id: vm_a.id, owner_key: owner.clone(),
+                source_volume_id: Uuid::new_v4(), child_volume_id: volume.id,
+                device_identity: Uuid::new_v4(), device_index: 0, mode: VolumeAttachmentMode::ReadWrite,
+                source_generation: 1, child_generation: 1, status: VolumeForkCloneStatus::Preparing,
+                created_at: now, updated_at: now,
+            };
+            fleet.claim_volume_fork_clones(std::slice::from_ref(&clone)).await?;
+            assert!(matches!(fleet.begin_volume_delete(&owner, volume.id, VolumeStatus::Available, 2, now).await,
+                Err(FleetError::Conflict(_))));
+            fleet.upsert_vm(&fork_vm).await?;
+            fleet.upsert_vm(&vm_b).await?;
+            let binding = VmVolumeAttachmentRecord {
+                vm_id: fork_vm.id, volume_id: volume.id, device_identity: clone.device_identity,
+                device_index: 0, owner_key: owner.clone(), mode: clone.mode,
+                volume_generation: 1, created_at: now,
+            };
+            assert!(matches!(fleet.bind_vm_volumes(std::slice::from_ref(&binding)).await, Err(FleetError::Conflict(_))));
+            fleet.advance_volume_fork_clone(&owner, fork_vm.id, volume.id,
+                VolumeForkCloneStatus::Preparing, VolumeForkCloneStatus::Cloned, now).await?;
+            for changed in [
+                VmVolumeAttachmentRecord { vm_id: vm_b.id, ..binding.clone() },
+                VmVolumeAttachmentRecord { device_identity: Uuid::new_v4(), ..binding.clone() },
+                VmVolumeAttachmentRecord { mode: VolumeAttachmentMode::ReadOnly, ..binding.clone() },
+            ] {
+                assert!(matches!(fleet.bind_vm_volumes(&[changed]).await, Err(FleetError::Conflict(_))));
+            }
+            fleet.bind_vm_volumes(std::slice::from_ref(&binding)).await?;
+            fleet.unbind_vm_volumes(&owner, fork_vm.id).await?;
+            fleet.advance_volume_fork_clone(&owner, fork_vm.id, volume.id,
+                VolumeForkCloneStatus::Cloned, VolumeForkCloneStatus::Bound, now).await?;
+            fleet.commit_fork_operation(fork_vm.id, vm_a.id, &owner, fork_vm.created_at, now).await?;
+
             let deleting = fleet
                 .begin_volume_delete(&owner, volume.id, VolumeStatus::Available, 2, Utc::now())
                 .await?;
@@ -4720,7 +4814,19 @@ mod tests {
         client
             .execute(
                 "DELETE FROM fleet_vms WHERE id = ANY($1)",
-                &[&vec![vm_a.id, vm_b.id, vm_c.id]],
+                &[&vec![vm_a.id, vm_b.id, vm_c.id, fork_vm.id]],
+            )
+            .await?;
+        client
+            .execute(
+                "DELETE FROM tenant_vm_reservations WHERE id = $1",
+                &[&fork_vm.id],
+            )
+            .await?;
+        client
+            .execute(
+                "DELETE FROM fleet_vm_fork_operations WHERE child_vm_id = $1",
+                &[&fork_vm.id],
             )
             .await?;
         client

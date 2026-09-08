@@ -595,6 +595,7 @@ pub struct VolumeForkCloneRecord {
     pub owner_key: String,
     pub source_volume_id: Uuid,
     pub child_volume_id: Uuid,
+    pub device_identity: Uuid,
     pub device_index: u8,
     pub mode: VolumeAttachmentMode,
     pub source_generation: u64,

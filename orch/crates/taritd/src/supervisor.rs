@@ -4348,6 +4348,15 @@ impl VmmSupervisor {
             .unwrap_or(true)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn owned_task_cancelled(&self, id: Uuid) -> bool {
+        self.owned_tasks
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|task| task.is_cancelled())
+    }
+
     fn request_boot_cancellation(&self, id: Uuid) {
         if let Ok(booting) = self.booting.lock() {
             if let Some(booting_vm) = booting.get(&id) {
@@ -7278,6 +7287,7 @@ impl VmmSupervisor {
         id: Uuid,
         memory_mib: u64,
         expects_overlay: bool,
+        at_boundary: Option<Box<dyn FnOnce() -> Result<(), tarit_vmm_client::VmmError> + Send>>,
     ) -> Result<SnapshotBundle, OrchError> {
         let _reservation = self.reserve_snapshot_space(id, memory_mib, expects_overlay)?;
         let client = self.lifecycle_client_for(id)?;
@@ -7286,9 +7296,11 @@ impl VmmSupervisor {
             scratch_overlay_vmm_path,
             scratch_integrity_vmm_path,
             live_stats,
-        ) = client
-            .live_snapshot_unreleased()
-            .map_err(|error| OrchError::Vmm(format!("atomic live snapshot: {error}")))?;
+        ) = match at_boundary {
+            Some(callback) => client.live_snapshot_for_clone_unreleased(callback),
+            None => client.live_snapshot_unreleased(),
+        }
+        .map_err(|error| OrchError::Vmm(format!("atomic live snapshot: {error}")))?;
         if scratch_overlay_vmm_path.is_some() != expects_overlay {
             return Err(OrchError::Vmm(format!(
                 "atomic live snapshot disk mismatch: expected overlay={expects_overlay}, VMM returned overlay={}",

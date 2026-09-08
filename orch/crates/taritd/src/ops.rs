@@ -2091,7 +2091,7 @@ pub async fn hibernate_local(
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
-    let snapshot_path = snapshot_local_locked(state, id, false, Some(id), None)
+    let snapshot_path = snapshot_local_locked(state, id, false, Some(id), None, None)
         .await?
         .path;
     let snapshot =
@@ -2633,7 +2633,7 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     ensure_no_persistent_volume_attachments(state, vm.owner_key.as_deref(), id, "snapshot").await?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
-    Ok(snapshot_local_locked(state, id, diff, None, None)
+    Ok(snapshot_local_locked(state, id, diff, None, None, None)
         .await?
         .path)
 }
@@ -2650,6 +2650,30 @@ pub async fn snapshot_local_for_fork(
     state: &AppState,
     source_id: Uuid,
     child_id: Uuid,
+) -> Result<ForkSnapshotOutcome, OrchError> {
+    if source_id == child_id {
+        return Err(OrchError::Conflict(
+            "fork source and child must differ".into(),
+        ));
+    }
+    let worker_state = state.clone();
+    run_supervised_lifecycle(state, child_id, move |task| async move {
+        let result = snapshot_local_for_fork_owned(&worker_state, source_id, child_id, &task).await;
+        if task.is_cancelled() {
+            cleanup_ephemeral_snapshots_for_vm(&worker_state, child_id).await?;
+            task.mark_terminal_converged();
+            return Err(lifecycle_cancelled_error());
+        }
+        result
+    })
+    .await
+}
+
+async fn snapshot_local_for_fork_owned(
+    state: &AppState,
+    source_id: Uuid,
+    child_id: Uuid,
+    task: &OwnedTaskControl,
 ) -> Result<ForkSnapshotOutcome, OrchError> {
     if let Some(existing) = state
         .store
@@ -2678,7 +2702,20 @@ pub async fn snapshot_local_for_fork(
     .await?;
     let gate = state.supervisor.operation_gate(source_id)?;
     let _operation = gate.lock_owned().await;
-    snapshot_local_locked(state, source_id, false, Some(child_id), Some(child_id)).await
+    #[cfg(test)]
+    wait_lifecycle_pause(state, LifecyclePause::ForkCapture).await;
+    if task.is_cancelled() {
+        return Err(lifecycle_cancelled_error());
+    }
+    snapshot_local_locked(
+        state,
+        source_id,
+        false,
+        Some(child_id),
+        Some(child_id),
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn ensure_no_persistent_volume_attachments(
@@ -2732,6 +2769,7 @@ async fn snapshot_local_locked(
     diff: bool,
     ephemeral_owner_vm_id: Option<Uuid>,
     snapshot_id: Option<Uuid>,
+    at_boundary: Option<Box<dyn FnOnce() -> Result<(), tarit_vmm_client::VmmError> + Send>>,
 ) -> Result<ForkSnapshotOutcome, OrchError> {
     let vm = ensure_vm_status(
         state,
@@ -2740,6 +2778,11 @@ async fn snapshot_local_locked(
         &[VmStatus::Running, VmStatus::Paused],
     )?;
     let running = vm.status == VmStatus::Running;
+    if at_boundary.is_some() && !running {
+        return Err(OrchError::Conflict(
+            "volume clone capture requires a running source VM".into(),
+        ));
+    }
     let overlay_path = vm
         .runtime_layout
         .as_ref()
@@ -2749,7 +2792,7 @@ async fn snapshot_local_locked(
     let sup = Arc::clone(&state.supervisor);
     let bundle = tokio::task::spawn_blocking(move || {
         if running {
-            sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some())
+            sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some(), at_boundary)
         } else {
             sup.snapshot_bundle_vm(id, diff, false, overlay_path, memory_mib)
         }
@@ -4888,6 +4931,86 @@ mod tests {
             "unexpected VMM request sequence: {requests:?}"
         );
         assert!(!socket.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropped_fork_request_retains_source_gate_until_owned_capture_converges() {
+        let (state, _) = test_state_with_durable_writer();
+        let source_id = insert_running_vm(&state);
+        let child_id = Uuid::new_v4();
+        let socket = std::env::temp_dir().join(format!("fork-cancel-{source_id}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            assert!(
+                matches!(request, tarit_vmm_client::ApiRequest::Stop),
+                "cancelled capture must not reach the VMM"
+            );
+            let response = serde_json::to_vec(&tarit_vmm_client::ApiResponse::Ok).unwrap();
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(source_id, socket);
+        let pause = pause_lifecycle(&state, LifecyclePause::ForkCapture);
+        test_runtime().block_on(async {
+            let request_state = state.clone();
+            let request = tokio::spawn(async move {
+                snapshot_local_for_fork(&request_state, source_id, child_id).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+                .await
+                .unwrap();
+            request.abort();
+            assert!(request.await.is_err());
+            assert!(state.supervisor.has_owned_task(child_id));
+            let source_gate = state.supervisor.operation_gate(source_id).unwrap();
+            assert!(
+                source_gate.try_lock().is_err(),
+                "the request must not own the capture lock"
+            );
+            let supervisor = Arc::clone(&state.supervisor);
+            let cancelled = tokio::task::spawn_blocking(move || {
+                supervisor.cancel_and_wait_owned_task(child_id)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !state.supervisor.owned_task_cancelled(child_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!cancelled.is_finished());
+            pause.release.notify_one();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), cancelled)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+            );
+            assert!(!state.supervisor.has_owned_task(child_id));
+            assert!(source_gate.try_lock().is_ok());
+            assert_eq!(vm_get(&state, source_id).unwrap().status, VmStatus::Running);
+            assert!(state
+                .store
+                .lock()
+                .unwrap()
+                .list_ephemeral_snapshots_for_vm(child_id)
+                .unwrap()
+                .is_empty());
+        });
+        state.supervisor.stop_vm(source_id).unwrap();
+        server.join().unwrap();
     }
 
     #[cfg(target_os = "linux")]

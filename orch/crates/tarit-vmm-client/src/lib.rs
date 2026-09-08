@@ -1133,6 +1133,46 @@ mod tests {
     }
 
     #[test]
+    fn live_snapshot_clone_disconnect_after_provider_work_never_publishes() {
+        let socket = socket_path();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket.0).expect("bind test VMM socket");
+        let (provider_started, wait_provider) = std::sync::mpsc::channel();
+        let (disconnected, wait_disconnect) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            read_api_frame(&mut stream).expect("read snapshot request");
+            write_api_frame(
+                &mut stream,
+                &serde_json::to_vec(&ApiResponse::SnapshotBoundary { boundary_id: 92 })
+                    .expect("encode boundary"),
+            )
+            .expect("write boundary");
+            wait_provider
+                .recv_timeout(Duration::from_secs(5))
+                .expect("provider callback started");
+            stream
+                .shutdown(std::net::Shutdown::Both)
+                .expect("disconnect source");
+            disconnected.send(()).expect("signal disconnected source");
+        });
+        let result = VmmClient::new(&socket.0)
+            .with_request_timeout(Duration::from_secs(5))
+            .live_snapshot_for_clone_unreleased(|| {
+                provider_started.send(()).expect("signal provider work");
+                wait_disconnect
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("source disconnected");
+                Ok(())
+            });
+        assert!(
+            result.is_err(),
+            "provider success is not snapshot publication"
+        );
+        server.join().expect("join server");
+    }
+
+    #[test]
     fn restore_request_round_trips_without_overlay() {
         let req = ApiRequest::Restore {
             snapshot_path: "/snapshots/golden.snap".into(),

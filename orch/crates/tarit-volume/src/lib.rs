@@ -198,6 +198,23 @@ pub trait BlockVolumeProvider: Send + Sync {
             self.provider_name()
         )))
     }
+
+    /// Remove only the exact unpublished clone identified by its provenance.
+    /// Absence is an idempotent success. The caller must fence the operation
+    /// against attachment, publication, and another capture before cleanup.
+    fn discard_clone(
+        &self,
+        _source_volume_id: Uuid,
+        _source_generation: u64,
+        _child_volume_id: Uuid,
+        _child_generation: u64,
+        _size_bytes: u64,
+    ) -> Result<(), VolumeError> {
+        Err(VolumeError::Unsupported(format!(
+            "{} does not support verified clone cleanup",
+            self.provider_name()
+        )))
+    }
 }
 
 /// A single-host provider useful for development, bare-metal installations,
@@ -275,6 +292,26 @@ impl LocalBlockProvider {
         validate_owned_file(&file, expected_size)?;
         Ok(file)
     }
+
+    fn remove_opened(&self, path: &Path, file: &File) -> Result<(), VolumeError> {
+        let opened = file.metadata()?;
+        let current = fs::symlink_metadata(path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                VolumeError::NotFound
+            } else {
+                VolumeError::Io(error)
+            }
+        })?;
+        if !current.file_type().is_file()
+            || current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+        {
+            return Err(VolumeError::UnsafeObject);
+        }
+        fs::remove_file(path)?;
+        sync_directory(&self.root)?;
+        Ok(())
+    }
 }
 
 impl BlockVolumeProvider for LocalBlockProvider {
@@ -339,23 +376,7 @@ impl BlockVolumeProvider for LocalBlockProvider {
     fn delete(&self, volume_id: Uuid) -> Result<(), VolumeError> {
         let path = self.path(volume_id);
         let file = self.open_existing(&path, false, None)?;
-        let opened = file.metadata()?;
-        let current = fs::symlink_metadata(&path).map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                VolumeError::NotFound
-            } else {
-                VolumeError::Io(error)
-            }
-        })?;
-        if !current.file_type().is_file()
-            || current.dev() != opened.dev()
-            || current.ino() != opened.ino()
-        {
-            return Err(VolumeError::UnsafeObject);
-        }
-        fs::remove_file(&path)?;
-        sync_directory(&self.root)?;
-        Ok(())
+        self.remove_opened(&path, &file)
     }
 
     fn prepare(
@@ -440,6 +461,41 @@ impl BlockVolumeProvider for LocalBlockProvider {
             size_bytes,
             constraint: PlacementConstraint::local_host(self.host_id.clone()),
         })
+    }
+    fn discard_clone(
+        &self,
+        source_volume_id: Uuid,
+        source_generation: u64,
+        child_volume_id: Uuid,
+        child_generation: u64,
+        size_bytes: u64,
+    ) -> Result<(), VolumeError> {
+        self.validate_size(size_bytes)?;
+        if source_volume_id == child_volume_id || source_generation == 0 || child_generation == 0 {
+            return Err(VolumeError::Invalid(
+                "invalid clone cleanup identity".into(),
+            ));
+        }
+        let path = self.path(child_volume_id);
+        let file = match self.open_existing(&path, true, Some(size_bytes)) {
+            Ok(file) => file,
+            Err(VolumeError::NotFound) => {
+                sync_directory(&self.root)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        validate_clone_provenance(
+            &file,
+            &clone_provenance(
+                source_volume_id,
+                source_generation,
+                child_volume_id,
+                child_generation,
+                size_bytes,
+            ),
+        )?;
+        self.remove_opened(&path, &file)
     }
 }
 
@@ -832,6 +888,32 @@ mod tests {
             source.file.read_exact(&mut unchanged).unwrap();
             assert_eq!(&unchanged, b"source-after-fork!");
             drop(source);
+            for (origin, generation, child_generation, bytes) in [
+                (Uuid::new_v4(), 3, 1, size),
+                (source_id, 4, 1, size),
+                (source_id, 3, 2, size),
+                (source_id, 3, 1, size + MIN_BLOCK_VOLUME_BYTES),
+            ] {
+                assert!(provider
+                    .discard_clone(origin, generation, child_id, child_generation, bytes)
+                    .is_err());
+                assert!(provider.path(child_id).exists());
+            }
+            provider
+                .discard_clone(source_id, 3, child_id, 1, size)
+                .unwrap();
+            provider
+                .discard_clone(source_id, 3, child_id, 1, size)
+                .unwrap();
+            assert!(!provider.path(child_id).exists());
+            provider.create(child_id, size).unwrap();
+            assert!(provider
+                .discard_clone(source_id, 3, child_id, 1, size)
+                .is_err());
+            assert!(
+                provider.path(child_id).exists(),
+                "replacement volume must survive stale cleanup"
+            );
             provider.delete(child_id).unwrap();
         } else {
             assert!(matches!(
@@ -842,6 +924,27 @@ mod tests {
         }
 
         provider.delete(source_id).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn clone_cleanup_preserves_a_replaced_inode() {
+        let root = test_root("clone-cleanup-replacement");
+        let provider =
+            LocalBlockProvider::open(&root, "host-a", 8 * MIN_BLOCK_VOLUME_BYTES).unwrap();
+        let id = Uuid::new_v4();
+        provider.create(id, MIN_BLOCK_VOLUME_BYTES).unwrap();
+        let path = provider.path(id);
+        let opened = provider.open_existing(&path, true, None).unwrap();
+        provider.delete(id).unwrap();
+        provider.create(id, MIN_BLOCK_VOLUME_BYTES).unwrap();
+        assert!(matches!(
+            provider.remove_opened(&path, &opened),
+            Err(VolumeError::UnsafeObject)
+        ));
+        assert!(path.exists());
+        drop(opened);
+        provider.delete(id).unwrap();
         fs::remove_dir(root).unwrap();
     }
 
