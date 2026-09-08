@@ -813,6 +813,8 @@ enum ReadinessCheck {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VmDataVolumeConfig {
     pub id: Uuid,
+    /// Stable snapshot device label, independent of the provider backing UUID.
+    pub device_identity: Uuid,
     pub provider: String,
     pub size_bytes: u64,
     pub read_only: bool,
@@ -5212,7 +5214,8 @@ impl VmmSupervisor {
             vm.net.as_ref(),
             runtime.guest_overlay.clone(),
             &runtime.data_volumes,
-        );
+        )
+        .map_err(|error| self.cleanup_boot_failure(id, &ticket.control, &vm, error))?;
         let client = VmmClient::new(&vm.socket_path);
         if let Err(e) = client.create(vmm_config) {
             return Err(self.cleanup_boot_failure(
@@ -5475,7 +5478,9 @@ impl VmmSupervisor {
         // lifecycle deadline used by the other snapshot operations.
         let client = VmmClient::new(&vm.socket_path).with_request_timeout(LIFECYCLE_OP_TIMEOUT);
         let restore_path = runtime.guest_snapshot.as_deref().unwrap_or(snapshot_path);
-        let volume_override = runtime_volume_configs(&runtime.data_volumes);
+        let volume_override =
+            runtime_volume_configs(&runtime.data_volumes, &runtime.vm_config.data_volumes)
+                .map_err(|error| self.cleanup_boot_failure(id, &ticket.control, &vm, error))?;
         if let Err(e) = client.restore_with_resource_overrides(
             restore_path,
             overlay.clone(),
@@ -8807,7 +8812,7 @@ fn build_vmm_config(
     net: Option<&NetAlloc>,
     overlay: Option<String>,
     data_volumes: &[PreparedBlockAttachment],
-) -> VmConfig {
+) -> Result<VmConfig, OrchError> {
     let mut volumes = Vec::new();
     // Every rootfs is an immutable base with a per-VM sparse CoW overlay. Never
     // attach a shared base read-write: one unsafe default or request must not let
@@ -8820,7 +8825,7 @@ fn build_vmm_config(
             inherited_fd: None,
         });
     }
-    volumes.extend(runtime_volume_configs(data_volumes));
+    volumes.extend(runtime_volume_configs(data_volumes, &cfg.data_volumes)?);
 
     // Host isolation always uses a CoW overlay. This independent flag controls
     // whether the guest itself mounts the root filesystem read-only.
@@ -8840,7 +8845,7 @@ fn build_vmm_config(
         None => (vec![], base_cmdline),
     };
 
-    VmConfig {
+    Ok(VmConfig {
         kernel: KernelConfig {
             path: cfg.kernel_path.display().to_string(),
             cmdline,
@@ -8852,17 +8857,42 @@ fn build_vmm_config(
         vcpus: VcpuConfig { count: cfg.vcpus },
         volumes,
         net: nets,
-    }
+    })
 }
 
-fn runtime_volume_configs(volumes: &[PreparedBlockAttachment]) -> Vec<VolumeConfig> {
+fn runtime_volume_configs(
+    volumes: &[PreparedBlockAttachment],
+    desired: &[VmDataVolumeConfig],
+) -> Result<Vec<VolumeConfig>, OrchError> {
+    if volumes.len() != desired.len() {
+        return Err(OrchError::Internal(
+            "prepared volume count does not match device bindings".into(),
+        ));
+    }
+    let mut identities = HashSet::new();
+    let mut backing_ids = HashSet::new();
     volumes
         .iter()
-        .map(|volume| VolumeConfig {
-            path: format!("volume:{}", volume.volume_id),
-            read_only: volume.read_only,
-            overlay: None,
-            inherited_fd: Some(volume.file.as_raw_fd()),
+        .zip(desired)
+        .map(|(volume, binding)| {
+            if volume.volume_id != binding.id
+                || binding.device_identity.is_nil()
+                || volume.generation != binding.generation
+                || volume.size_bytes != binding.size_bytes
+                || volume.read_only != binding.read_only
+                || !identities.insert(binding.device_identity)
+                || !backing_ids.insert(binding.id)
+            {
+                return Err(OrchError::Internal(
+                    "prepared volume does not match its immutable device binding".into(),
+                ));
+            }
+            Ok(VolumeConfig {
+                path: format!("volume:{}", binding.device_identity),
+                read_only: volume.read_only,
+                overlay: None,
+                inherited_fd: Some(volume.file.as_raw_fd()),
+            })
         })
         .collect()
 }
@@ -10115,7 +10145,7 @@ mod tests {
             Some(expected.clone())
         );
 
-        let vmm_config = build_vmm_config(&cfg, None, Some(expected.clone()), &[]);
+        let vmm_config = build_vmm_config(&cfg, None, Some(expected.clone()), &[]).unwrap();
         assert_eq!(vmm_config.volumes.len(), 1);
         assert_eq!(vmm_config.volumes[0].overlay, Some(expected));
         assert!(!vmm_config.volumes[0].read_only);
@@ -10131,7 +10161,8 @@ mod tests {
             None,
             supervisor.overlay_path_for_config(id, &configured_rw),
             &[],
-        );
+        )
+        .unwrap();
         assert!(rw_config.kernel.cmdline.contains("root=/dev/vda rw"));
     }
 
@@ -10153,6 +10184,7 @@ mod tests {
         let mut cfg = spawn_config(false, None);
         cfg.data_volumes.push(VmDataVolumeConfig {
             id: volume_id,
+            device_identity: volume_id,
             provider: "local_block".into(),
             size_bytes: 4 * 1024 * 1024,
             read_only: false,
@@ -10168,13 +10200,106 @@ mod tests {
             unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
             0
         );
-        let vmm = build_vmm_config(&runtime.vm_config, None, None, &runtime.data_volumes);
+        let vmm = build_vmm_config(&runtime.vm_config, None, None, &runtime.data_volumes).unwrap();
         assert_eq!(vmm.volumes.len(), 1);
         assert_eq!(vmm.volumes[0].path, format!("volume:{volume_id}"));
         assert_eq!(vmm.volumes[0].inherited_fd, Some(raw_fd));
         assert!(!vmm.volumes[0]
             .path
             .contains(root.to_string_lossy().as_ref()));
+
+        let mut binding = runtime.vm_config.data_volumes[0].clone();
+        binding.device_identity = Uuid::new_v4();
+        let inherited =
+            runtime_volume_configs(&runtime.data_volumes, std::slice::from_ref(&binding)).unwrap();
+        assert_eq!(
+            inherited[0].path,
+            format!("volume:{}", binding.device_identity)
+        );
+        assert_eq!(inherited[0].inherited_fd, Some(raw_fd));
+        assert_eq!(runtime.data_volumes[0].volume_id, volume_id);
+        assert!(runtime_volume_configs(&runtime.data_volumes, &[]).is_err());
+        for changed in [
+            VmDataVolumeConfig {
+                device_identity: Uuid::nil(),
+                ..binding.clone()
+            },
+            VmDataVolumeConfig {
+                id: Uuid::new_v4(),
+                ..binding.clone()
+            },
+            VmDataVolumeConfig {
+                generation: 2,
+                ..binding.clone()
+            },
+            VmDataVolumeConfig {
+                size_bytes: binding.size_bytes + 512,
+                ..binding.clone()
+            },
+            VmDataVolumeConfig {
+                read_only: true,
+                ..binding.clone()
+            },
+        ] {
+            assert!(runtime_volume_configs(&runtime.data_volumes, &[changed]).is_err());
+        }
+
+        let second_id = Uuid::new_v4();
+        provider.create(second_id, 4 * 1024 * 1024).unwrap();
+        let prepared = vec![
+            provider
+                .prepare(volume_id, binding.size_bytes, AccessMode::ReadWriteOnce, 1)
+                .unwrap(),
+            provider
+                .prepare(second_id, binding.size_bytes, AccessMode::ReadWriteOnce, 1)
+                .unwrap(),
+        ];
+        let second_binding = VmDataVolumeConfig {
+            id: second_id,
+            ..binding.clone()
+        };
+        assert!(
+            runtime_volume_configs(&prepared, &[binding.clone(), second_binding.clone()]).is_err(),
+            "two backing volumes cannot share one guest device identity"
+        );
+        let distinct_second = VmDataVolumeConfig {
+            device_identity: Uuid::new_v4(),
+            ..second_binding
+        };
+        let repeated_backing = vec![
+            provider
+                .prepare(volume_id, binding.size_bytes, AccessMode::ReadWriteOnce, 1)
+                .unwrap(),
+            provider
+                .prepare(volume_id, binding.size_bytes, AccessMode::ReadWriteOnce, 1)
+                .unwrap(),
+        ];
+        assert!(
+            runtime_volume_configs(
+                &repeated_backing,
+                &[
+                    binding.clone(),
+                    VmDataVolumeConfig {
+                        device_identity: Uuid::new_v4(),
+                        ..binding.clone()
+                    },
+                ],
+            )
+            .is_err(),
+            "distinct guest labels must not alias the same backing volume"
+        );
+        drop(repeated_backing);
+        assert!(
+            runtime_volume_configs(&prepared, &[distinct_second.clone(), binding.clone()]).is_err(),
+            "swapped backing descriptors must be rejected"
+        );
+        assert_eq!(
+            runtime_volume_configs(&prepared, &[binding, distinct_second])
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(prepared);
 
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();

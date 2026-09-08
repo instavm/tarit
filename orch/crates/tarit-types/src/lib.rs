@@ -865,6 +865,8 @@ pub struct VmVolumeAttachmentRequest {
 pub struct VmVolumeAttachmentRecord {
     pub vm_id: Uuid,
     pub volume_id: Uuid,
+    /// Guest device label retained when the backing volume is cloned.
+    pub device_identity: Uuid,
     pub device_index: u8,
     pub owner_key: String,
     pub mode: VolumeAttachmentMode,

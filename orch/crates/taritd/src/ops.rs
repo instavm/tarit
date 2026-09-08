@@ -1431,6 +1431,7 @@ async fn bind_requested_vm_volumes(
         let record = VmVolumeAttachmentRecord {
             vm_id,
             volume_id: volume.id,
+            device_identity: volume.id,
             device_index: u8::try_from(index).map_err(|_| {
                 OrchError::BadRequest("persistent volume device index overflow".into())
             })?,
@@ -1442,6 +1443,7 @@ async fn bind_requested_vm_volumes(
         bindings.push(record);
         spawn.push(VmDataVolumeConfig {
             id: volume.id,
+            device_identity: volume.id,
             provider: volume.provider.clone(),
             size_bytes: volume.size_bytes,
             read_only,
@@ -1527,6 +1529,7 @@ async fn attached_volume_spawn_config(
         }
         spawn.push(VmDataVolumeConfig {
             id: volume.id,
+            device_identity: attachment.device_identity,
             provider: volume.provider,
             size_bytes: volume.size_bytes,
             read_only: attachment.mode == VolumeAttachmentMode::ReadOnly,

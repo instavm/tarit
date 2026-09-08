@@ -453,6 +453,11 @@ impl Store {
              CREATE INDEX IF NOT EXISTS vm_quota_reservations_owner_expiry
                ON vm_quota_reservations(owner_key, expires_at);",
         )?;
+        ensure_column(&conn, "vm_volume_attachments", "device_identity", "TEXT")?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_vm_volume_device_identity
+             ON vm_volume_attachments(vm_id, COALESCE(device_identity, volume_id));",
+        )?;
         ensure_column(&conn, "vms", "owner_key", "TEXT")?;
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
@@ -2747,6 +2752,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         for attachment in attachments {
             if attachment.owner_key.is_empty()
+                || attachment.device_identity.is_nil()
                 || attachment.volume_generation == 0
                 || usize::from(attachment.device_index) >= attachments.len()
             {
@@ -2786,7 +2792,8 @@ impl Store {
             }
             let existing = tx
                 .query_row(
-                    "SELECT device_index, owner_key, mode, volume_generation
+                    "SELECT device_index, owner_key, mode, volume_generation,
+                            COALESCE(device_identity, volume_id)
                      FROM vm_volume_attachments WHERE vm_id = ?1 AND volume_id = ?2",
                     params![
                         attachment.vm_id.to_string(),
@@ -2798,6 +2805,7 @@ impl Store {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             sql_i64_to_u64(row.get(3)?, 3, "invalid attachment generation")?,
+                            row.get::<_, String>(4)?,
                         ))
                     },
                 )
@@ -2809,6 +2817,7 @@ impl Store {
                         attachment.owner_key.clone(),
                         attachment.mode.as_str().to_string(),
                         attachment.volume_generation,
+                        attachment.device_identity.to_string(),
                     )
                 {
                     return Err(StoreError::Conflict(
@@ -2833,8 +2842,8 @@ impl Store {
             }
             tx.execute(
                 "INSERT INTO vm_volume_attachments
-                 (vm_id, volume_id, device_index, owner_key, mode, volume_generation, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (vm_id, volume_id, device_index, owner_key, mode, volume_generation, created_at, device_identity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     attachment.vm_id.to_string(),
                     attachment.volume_id.to_string(),
@@ -2843,6 +2852,7 @@ impl Store {
                     attachment.mode.as_str(),
                     u64_to_sql_i64(attachment.volume_generation)?,
                     attachment.created_at.to_rfc3339(),
+                    attachment.device_identity.to_string(),
                 ],
             )
             .map_err(|error| {
@@ -2862,7 +2872,8 @@ impl Store {
         vm_id: Uuid,
     ) -> Result<Vec<VmVolumeAttachmentRecord>, StoreError> {
         let mut statement = self.conn.prepare(
-            "SELECT vm_id, volume_id, device_index, owner_key, mode, volume_generation, created_at
+            "SELECT vm_id, volume_id, device_index, owner_key, mode, volume_generation, created_at,
+                    COALESCE(device_identity, volume_id)
              FROM vm_volume_attachments WHERE vm_id = ?1 AND owner_key = ?2
              ORDER BY device_index",
         )?;
@@ -2873,6 +2884,7 @@ impl Store {
             Ok(VmVolumeAttachmentRecord {
                 vm_id: parse_uuid_col(&vm_id, 0)?,
                 volume_id: parse_uuid_col(&volume_id, 1)?,
+                device_identity: parse_uuid_col(&row.get::<_, String>(7)?, 7)?,
                 device_index: row.get(2)?,
                 owner_key: row.get(3)?,
                 mode: VolumeAttachmentMode::parse(&mode).ok_or_else(|| {
@@ -4756,7 +4768,9 @@ mod tests {
 
     #[test]
     fn volume_attachments_are_atomic_tenant_scoped_and_single_writer_fenced() {
-        let store = Store::open(":memory:").unwrap();
+        let path =
+            std::env::temp_dir().join(format!("tarit-volume-identity-{}.db", Uuid::new_v4()));
+        let store = Store::open(path.to_str().unwrap()).unwrap();
         let now = Utc::now();
         let volume = VolumeRecord {
             id: Uuid::new_v4(),
@@ -4791,6 +4805,7 @@ mod tests {
         let first = VmVolumeAttachmentRecord {
             vm_id: first_vm,
             volume_id: volume.id,
+            device_identity: Uuid::new_v4(),
             device_index: 0,
             owner_key: "tenant-a".into(),
             mode: VolumeAttachmentMode::ReadWrite,
@@ -4799,12 +4814,39 @@ mod tests {
         };
         store.bind_vm_volumes(std::slice::from_ref(&first)).unwrap();
         store.bind_vm_volumes(std::slice::from_ref(&first)).unwrap();
+        for identity in [Uuid::nil(), Uuid::new_v4()] {
+            let changed = VmVolumeAttachmentRecord {
+                device_identity: identity,
+                ..first.clone()
+            };
+            assert!(matches!(
+                store.bind_vm_volumes(&[changed]),
+                Err(StoreError::Conflict(_))
+            ));
+        }
+        drop(store);
+        let store = Store::open(path.to_str().unwrap()).unwrap();
         assert_eq!(
             store
                 .list_vm_volume_attachments("tenant-a", first_vm)
                 .unwrap(),
-            vec![first]
+            vec![first.clone()]
         );
+        // An old database has only the backing UUID as its guest device label.
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX idx_vm_volume_device_identity;
+             ALTER TABLE vm_volume_attachments DROP COLUMN device_identity;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let migrated = store
+            .list_vm_volume_attachments("tenant-a", first_vm)
+            .unwrap();
+        assert_eq!(migrated[0].device_identity, volume.id);
+        store.bind_vm_volumes(&migrated).unwrap();
         assert!(store
             .list_vm_volume_attachments("tenant-b", first_vm)
             .unwrap()
@@ -4813,6 +4855,7 @@ mod tests {
         let second = VmVolumeAttachmentRecord {
             vm_id: second_vm,
             volume_id: volume.id,
+            device_identity: volume.id,
             device_index: 0,
             owner_key: "tenant-a".into(),
             mode: VolumeAttachmentMode::ReadOnly,
@@ -4833,6 +4876,8 @@ mod tests {
             .begin_volume_delete("tenant-a", volume.id, VolumeStatus::Available, 1, now)
             .unwrap();
         assert_eq!(deleting.status, VolumeStatus::Deleting);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -4873,6 +4918,7 @@ mod tests {
                 .bind_vm_volumes(&[VmVolumeAttachmentRecord {
                     vm_id,
                     volume_id: volume.id,
+                    device_identity: volume.id,
                     device_index: 0,
                     owner_key: "tenant-a".into(),
                     mode: VolumeAttachmentMode::ReadWrite,

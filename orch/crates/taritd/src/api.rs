@@ -4477,6 +4477,7 @@ mod tests {
             .bind_vm_volumes(&[tarit_types::VmVolumeAttachmentRecord {
                 vm_id: source_id,
                 volume_id,
+                device_identity: volume_id,
                 device_index: 0,
                 owner_key: "tenant-a".into(),
                 mode: tarit_types::VolumeAttachmentMode::ReadWrite,

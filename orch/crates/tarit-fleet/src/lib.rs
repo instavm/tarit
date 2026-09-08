@@ -132,6 +132,9 @@ impl PostgresFleet {
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS rootfs_read_only BOOLEAN NOT NULL DEFAULT FALSE;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
              ALTER TABLE fleet_vm_fork_operations ADD COLUMN IF NOT EXISTS target_boot_session_id UUID;
+             ALTER TABLE fleet_vm_volume_attachments ADD COLUMN IF NOT EXISTS device_identity UUID;
+             CREATE UNIQUE INDEX IF NOT EXISTS fleet_vm_volume_device_identity
+               ON fleet_vm_volume_attachments(vm_id, COALESCE(device_identity, volume_id));
              CREATE INDEX IF NOT EXISTS fleet_vms_owner_status ON fleet_vms (owner_key, status);
              CREATE TABLE IF NOT EXISTS fleet_schema_migrations (
                version BIGINT PRIMARY KEY,
@@ -1977,6 +1980,7 @@ impl PostgresFleet {
         ordered_attachments.sort_unstable_by_key(|attachment| attachment.volume_id);
         for attachment in ordered_attachments {
             if attachment.owner_key.is_empty()
+                || attachment.device_identity.is_nil()
                 || attachment.volume_generation == 0
                 || usize::from(attachment.device_index) >= attachments.len()
             {
@@ -2008,7 +2012,8 @@ impl PostgresFleet {
             }
             if let Some(existing) = tx
                 .query_opt(
-                    "SELECT device_index, owner_key, mode, volume_generation
+                    "SELECT device_index, owner_key, mode, volume_generation,
+                            COALESCE(device_identity, volume_id)
                      FROM fleet_vm_volume_attachments WHERE vm_id = $1 AND volume_id = $2",
                     &[&attachment.vm_id, &attachment.volume_id],
                 )
@@ -2018,6 +2023,7 @@ impl PostgresFleet {
                     || existing.get::<_, String>(1) != attachment.owner_key
                     || existing.get::<_, String>(2) != attachment.mode.as_str()
                     || existing.get::<_, i64>(3) != u64_to_sql_i64(attachment.volume_generation)?
+                    || existing.get::<_, Uuid>(4) != attachment.device_identity
                 {
                     return Err(FleetError::Conflict(
                         "VM volume attachment replay changed immutable properties".into(),
@@ -2044,8 +2050,8 @@ impl PostgresFleet {
             }
             tx.execute(
                 "INSERT INTO fleet_vm_volume_attachments
-                 (vm_id, volume_id, device_index, owner_key, mode, volume_generation, created_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                 (vm_id, volume_id, device_index, owner_key, mode, volume_generation, created_at, device_identity)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                 &[
                     &attachment.vm_id,
                     &attachment.volume_id,
@@ -2054,6 +2060,7 @@ impl PostgresFleet {
                     &attachment.mode.as_str(),
                     &u64_to_sql_i64(attachment.volume_generation)?,
                     &attachment.created_at,
+                    &attachment.device_identity,
                 ],
             )
             .await?;
@@ -2089,7 +2096,7 @@ impl PostgresFleet {
         let rows = client
             .query(
                 "SELECT vm_id, volume_id, device_index, owner_key, mode,
-                        volume_generation, created_at
+                        volume_generation, created_at, COALESCE(device_identity, volume_id)
                  FROM fleet_vm_volume_attachments
                  WHERE vm_id = $1 AND owner_key = $2
                  ORDER BY device_index",
@@ -2110,6 +2117,7 @@ impl PostgresFleet {
                 Ok(VmVolumeAttachmentRecord {
                     vm_id: row.get(0),
                     volume_id: row.get(1),
+                    device_identity: row.get(7),
                     device_index,
                     owner_key: row.get(3),
                     mode,
@@ -4590,6 +4598,7 @@ mod tests {
             let rwx_attachment = |vm_id, volume_id, device_index| VmVolumeAttachmentRecord {
                 vm_id,
                 volume_id,
+                device_identity: volume_id,
                 device_index,
                 owner_key: owner.clone(),
                 mode: VolumeAttachmentMode::ReadWrite,
@@ -4616,9 +4625,14 @@ mod tests {
             assert_eq!(fleet.volume_attachment_count(&owner, rwx_b.id).await?, 2);
             fleet.unbind_vm_volumes(&owner, vm_b.id).await?;
             fleet.unbind_vm_volumes(&owner, vm_c.id).await?;
+            let mut duplicate_identity = forward.clone();
+            duplicate_identity[1].device_identity = duplicate_identity[0].device_identity;
+            assert!(fleet.bind_vm_volumes(&duplicate_identity).await.is_err());
+            assert!(fleet.list_vm_volume_attachments(&owner, vm_b.id).await?.is_empty());
             let attachment = |vm_id, device_index, mode| VmVolumeAttachmentRecord {
                 vm_id,
                 volume_id: volume.id,
+                device_identity: Uuid::new_v4(),
                 device_index,
                 owner_key: owner.clone(),
                 mode,
@@ -4632,10 +4646,32 @@ mod tests {
             assert_eq!(listed.len(), 1);
             assert_eq!(listed[0].vm_id, writer.vm_id);
             assert_eq!(listed[0].volume_id, writer.volume_id);
+            assert_eq!(listed[0].device_identity, writer.device_identity);
+            for identity in [Uuid::nil(), Uuid::new_v4()] {
+                let changed = VmVolumeAttachmentRecord {
+                    device_identity: identity,
+                    ..writer.clone()
+                };
+                assert!(matches!(
+                    fleet.bind_vm_volumes(&[changed]).await,
+                    Err(FleetError::Conflict(_))
+                ));
+            }
             assert_eq!(listed[0].device_index, writer.device_index);
             assert_eq!(listed[0].owner_key, writer.owner_key);
             assert_eq!(listed[0].mode, writer.mode);
             assert_eq!(listed[0].volume_generation, writer.volume_generation);
+            // Legacy rows did not store a separate snapshot device identity.
+            {
+                let client = fleet.pool.get().await?;
+                client.execute(
+                    "UPDATE fleet_vm_volume_attachments SET device_identity = NULL WHERE vm_id = $1",
+                    &[&writer.vm_id],
+                ).await?;
+            }
+            let legacy = fleet.list_vm_volume_attachments(&owner, vm_a.id).await?;
+            assert_eq!(legacy[0].device_identity, volume.id);
+            fleet.bind_vm_volumes(&legacy).await?;
             assert_eq!(fleet.volume_attachment_count(&owner, volume.id).await?, 1);
             assert!(matches!(
                 fleet
