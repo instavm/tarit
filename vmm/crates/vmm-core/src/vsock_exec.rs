@@ -474,7 +474,15 @@ impl VsockExecChannel {
                 stdout,
                 stderr,
                 duration_ms,
-            } => (Ok((-1, stdout, stderr, duration_ms)), false),
+            } => {
+                log::warn!(
+                    "vsock exec completion timeout: conn={connection_id} request={request_id} \
+                     protocol={protocol:?} duration_ms={duration_ms} stdout_bytes={} stderr_bytes={}",
+                    stdout.len(),
+                    stderr.len()
+                );
+                (Ok((-1, stdout, stderr, duration_ms)), false)
+            }
             RunExecOutcome::TimedOut { started: false, .. } => (
                 Err(VsockExecError::Ambiguous(
                     "timed out before the guest acknowledged the command".into(),

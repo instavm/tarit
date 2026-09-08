@@ -274,6 +274,8 @@ struct Connection {
     stream: Box<dyn HostVsockStream>,
     peer_buf_alloc: u32,
     peer_fwd_cnt: u32,
+    tx_cnt: u32,
+    credit_requested: bool,
     fwd_cnt: u32,
     established: bool,
 }
@@ -494,6 +496,8 @@ impl VirtioVsockMmio {
                     stream: Box::new(device_stream),
                     peer_buf_alloc: DEFAULT_BUF_ALLOC,
                     peer_fwd_cnt: 0,
+                    tx_cnt: 0,
+                    credit_requested: false,
                     fwd_cnt: 0,
                     established: false,
                 },
@@ -786,7 +790,25 @@ impl VirtioVsockMmio {
                     continue;
                 }
                 let mut buf = [0u8; HOST_READ_CHUNK];
-                match conn.stream.read(&mut buf) {
+                let credit = conn
+                    .peer_buf_alloc
+                    .saturating_sub(conn.tx_cnt.wrapping_sub(conn.peer_fwd_cnt))
+                    as usize;
+                if credit == 0 {
+                    if !conn.credit_requested {
+                        packets.push(host_packet(
+                            *key,
+                            op::CREDIT_REQUEST,
+                            0,
+                            Vec::new(),
+                            conn.fwd_cnt,
+                        ));
+                        conn.credit_requested = true;
+                    }
+                    continue;
+                }
+                let read_limit = credit.min(buf.len());
+                match conn.stream.read(&mut buf[..read_limit]) {
                     Ok(0) => {
                         packets.push(host_packet(
                             *key,
@@ -798,6 +820,7 @@ impl VirtioVsockMmio {
                         closed.push(*key);
                     }
                     Ok(n) => {
+                        conn.tx_cnt = conn.tx_cnt.wrapping_add(n as u32);
                         // NB: fwd_cnt must be the count of bytes we've received
                         // from the guest (updated in handle_rw), NOT host→guest
                         // bytes. Sending host→guest bytes here made fwd_cnt exceed
@@ -913,6 +936,8 @@ impl VirtioVsockMmio {
                         stream,
                         peer_buf_alloc: header.buf_alloc,
                         peer_fwd_cnt: header.fwd_cnt,
+                        tx_cnt: 0,
+                        credit_requested: false,
                         fwd_cnt: 0,
                         established: true,
                     },
@@ -963,6 +988,7 @@ impl VirtioVsockMmio {
                 conn.fwd_cnt = conn.fwd_cnt.wrapping_add(data.len() as u32);
                 conn.peer_buf_alloc = header.buf_alloc;
                 conn.peer_fwd_cnt = header.fwd_cnt;
+                conn.credit_requested = false;
             } else {
                 reset = true;
             }
@@ -984,6 +1010,7 @@ impl VirtioVsockMmio {
         {
             conn.peer_buf_alloc = header.buf_alloc;
             conn.peer_fwd_cnt = header.fwd_cnt;
+            conn.credit_requested = false;
         }
         Ok(())
     }
@@ -1721,6 +1748,63 @@ mod tests {
             assert_eq!(restored.mmio_read(reg::QUEUE_READY, 4).unwrap(), 1);
             assert_eq!(restored.mmio_read(reg::QUEUE_NUM, 4).unwrap(), size);
         }
+    }
+
+    #[test]
+    fn host_stream_waits_for_guest_receive_credit() {
+        check_host_stream_receive_credit(0);
+    }
+
+    #[test]
+    fn host_stream_receive_credit_wraps_at_u32_boundary() {
+        check_host_stream_receive_credit(u32::MAX - 1);
+    }
+
+    fn check_host_stream_receive_credit(initial_count: u32) {
+        let mem = new_mem();
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let rx_bufs = setup_queues(&dev, &mem, 6);
+        let state = Arc::new(Mutex::new(FakeStreamState::default()));
+        state
+            .lock()
+            .unwrap()
+            .inbound
+            .extend(b"abcdef".iter().copied());
+        dev.set_host_listener(Arc::new(FakeListener {
+            state: state.clone(),
+            connects: AtomicUsize::new(0),
+        }));
+        let mut request = guest_packet(GUEST_PORT, op::REQUEST, &[]);
+        request.header.buf_alloc = 3;
+        submit_tx(&dev, &mem, 0, 0, &request);
+        {
+            let mut connections = dev.connections.lock().unwrap();
+            let conn = connections.values_mut().next().unwrap();
+            conn.tx_cnt = initial_count;
+            conn.peer_fwd_cnt = initial_count;
+        }
+        dev.pump_host_streams().unwrap();
+        assert_eq!(read_rx_packet(&mem, rx_bufs[1]).data, b"abc");
+        dev.pump_host_streams().unwrap();
+        assert_eq!(state.lock().unwrap().inbound.len(), 3);
+        assert_eq!(
+            read_rx_packet(&mem, rx_bufs[2]).header.op,
+            op::CREDIT_REQUEST
+        );
+        let mut credit = guest_packet(GUEST_PORT, op::CREDIT_UPDATE, &[]);
+        credit.header.buf_alloc = 3;
+        credit.header.fwd_cnt = initial_count.wrapping_add(3);
+        submit_tx(&dev, &mem, 1, 1, &credit);
+        dev.pump_host_streams().unwrap();
+        assert!(state.lock().unwrap().inbound.is_empty());
+        assert_eq!(read_rx_packet(&mem, rx_bufs[3]).data, b"def");
+        dev.pump_host_streams().unwrap();
+        assert_eq!(
+            read_rx_packet(&mem, rx_bufs[4]).header.op,
+            op::CREDIT_REQUEST
+        );
+        // Repeated pump cycles must not flood the guest with credit requests.
+        assert_eq!(dev.pump_host_streams().unwrap(), 0);
     }
 
     #[test]
