@@ -78,6 +78,27 @@ class Matrix:
         assert actual_proof == proof, output
         validate_guest(cpu, memory, int(actual_cpu), int(actual_kib))
 
+    def reject_shape(self, cpu, memory):
+        before = self.request('GET', '/v1/vms')
+        vm_id = str(uuid.uuid4())
+        self.owned.add(vm_id)
+        self.request('POST', '/v1/vms',
+                     {'id': vm_id, 'vcpus': cpu, 'memory_mib': memory}, 429)
+        after = self.request('GET', '/v1/vms')
+        # Compare identities and lifecycle state, not timestamps or telemetry.
+        identity = lambda rows: {(row['id'], row['status']) for row in rows}
+        assert identity(after) == identity(before), (before, after)
+        assert all(row['id'] != vm_id for row in after), after
+        self.owned.remove(vm_id)
+        print(json.dumps({'event': 'admission_rejection_pass',
+                          'vcpus': cpu, 'memory_mib': memory}), flush=True)
+
+    def check_empty_server_limits(self):
+        assert self.request('GET', '/v1/vms') == [], 'admission lane requires an empty server'
+        # With no VM present, the VM-count ceiling cannot mask these limits.
+        self.reject_shape(9, 256)
+        self.reject_shape(1, 4097)
+
     def run_shape(self, cpu, memory):
         available = meminfo(Path('/proc/meminfo').read_text())['MemAvailable']
         if available < (memory + self.args.host_reserve_mib) * 1024:
@@ -96,6 +117,8 @@ class Matrix:
                            {'id': vm_id, 'vcpus': cpu, 'memory_mib': memory}, 201)
         assert row['id'] == vm_id and row['status'] == 'running', row
         self.execute(vm_id, f"printf '%s' {proof} > /root/tarit-shape-proof; sync")
+        self.verify(vm_id, cpu, memory, proof)
+        self.reject_shape(1, 256)
         self.verify(vm_id, cpu, memory, proof)
         row = self.request('POST', f'/v1/vms/{vm_id}/hibernate', {})
         assert row['status'] == 'hibernated', row
@@ -126,6 +149,7 @@ def main():
         parser.error('host headroom checks require a local server')
     matrix = Matrix(args)
     try:
+        matrix.check_empty_server_limits()
         for cpu, memory in shapes():
             matrix.run_shape(cpu, memory)
     except BaseException:
