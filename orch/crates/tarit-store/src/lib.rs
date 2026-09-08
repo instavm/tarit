@@ -1953,6 +1953,12 @@ impl Store {
                 || record.child_generation == 0
                 || record.device_index > 14
                 || record.status != VolumeForkCloneStatus::Preparing
+        }) || records.iter().enumerate().any(|(index, record)| {
+            records[..index].iter().any(|previous| {
+                previous.device_index == record.device_index
+                    || previous.source_volume_id == record.source_volume_id
+                    || previous.child_volume_id == record.child_volume_id
+            })
         }) {
             return Err(StoreError::Conflict(
                 "volume fork clone plan has inconsistent immutable fields".into(),
@@ -1976,6 +1982,12 @@ impl Store {
         {
             return Err(StoreError::Conflict(format!(
                 "fork child {child_vm_id} has no matching preparing operation"
+            )));
+        }
+        let existing_plan = query_volume_fork_clones(&tx, owner_key, child_vm_id)?;
+        if !existing_plan.is_empty() && existing_plan.len() != records.len() {
+            return Err(StoreError::Conflict(format!(
+                "fork child {child_vm_id} volume clone plan changed concurrently"
             )));
         }
         for record in records {
@@ -4429,6 +4441,31 @@ mod tests {
             child_volume_id: Uuid::new_v4(),
             ..first.clone()
         };
+        let additional_slot = VolumeForkCloneRecord {
+            source_volume_id: Uuid::new_v4(),
+            child_volume_id: Uuid::new_v4(),
+            device_index: 2,
+            ..first.clone()
+        };
+        assert!(matches!(
+            store.claim_volume_fork_clones(&[first.clone(), second.clone(), additional_slot,]),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(
+            store
+                .list_volume_fork_clones("tenant-a", child_vm_id)
+                .unwrap(),
+            claimed,
+            "a retry must not expand the durable clone plan"
+        );
+        assert!(matches!(
+            store.claim_volume_fork_clones(std::slice::from_ref(&first)),
+            Err(StoreError::Conflict(_))
+        ));
+        assert!(matches!(
+            store.claim_volume_fork_clones(&[first.clone(), first.clone()]),
+            Err(StoreError::Conflict(_))
+        ));
         assert!(matches!(
             store.claim_volume_fork_clones(&[changed_slot, second.clone()]),
             Err(StoreError::Conflict(_))
