@@ -215,9 +215,17 @@ register_ssh_key() {
 }
 register_ssh_key
 
+check_cli_exec_stream() {
+  local vm_id=$1
+  TARIT_API_KEY="$KEY" "$TARITD" --base-url "$BASE_URL" --json exec "$vm_id" \
+    "head -c 1048576 /dev/zero | tr '\\000' x" \
+    | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["exit_code"] == 0, r; assert r.get("error") is None, r; assert r["stdout"] == "x" * 1048576; assert not r.get("stderr")'
+}
+
 echo "== live fork preserves RAM/disk state and isolates future writes =="
 PARENT_JSON=$(api -H 'Content-Type: application/json' -d '{"vcpus":1,"memory_mib":256}' "$BASE_URL/v1/vms")
 PARENT_ID=$(printf '%s' "$PARENT_JSON" | json_field id)
+check_cli_exec_stream "$PARENT_ID"
 expect_exec "$PARENT_ID" "grep '^ID=$EXPECTED_OS_ID$' /etc/os-release" "ID=$EXPECTED_OS_ID"
 echo "== cold-boot SSH PTY control =="
 exec_request "$PARENT_ID" \
@@ -243,6 +251,7 @@ fi
 FORK_JSON=$(cat "$FORK_BODY")
 FORK_END=$(now_ms)
 CHILD_ID=$(printf '%s' "$FORK_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["vm"]["id"])')
+check_cli_exec_stream "$CHILD_ID"
 printf '%s' "$FORK_JSON" | python3 -c '
 import json,sys
 row=json.load(sys.stdin)
@@ -508,12 +517,14 @@ assert json.loads(row[2]) == ["1.1.1.1:443/tcp"] and row[3] == 1, row
 PY
 fi
 echo "hibernate_http_resume_ms=$((RESUME_END-RESUME_START))"
+check_cli_exec_stream "$PARENT_ID"
 
 echo "== PTY API is also an activation source =="
 api -H 'Content-Type: application/json' -d '{}' "$BASE_URL/v1/vms/$CHILD_ID/hibernate" | grep -q '"status":"hibernated"'
 [ -z "$(vmm_pids_for_id "$CHILD_ID")" ] || { echo "FAIL: child VMM survived hibernate"; exit 1; }
 api -H 'Content-Type: application/json' -d '{"cols":80,"rows":24}' "$BASE_URL/v1/vms/$CHILD_ID/pty/sessions" | grep -q '"pty_id"'
 api "$BASE_URL/v1/vms/$CHILD_ID" | grep -q '"status":"running"'
+check_cli_exec_stream "$CHILD_ID"
 [ "$(vmm_pids_for_id "$CHILD_ID" | sed '/^$/d' | wc -l)" -eq 1 ]
 
 echo "== corrupted hibernation artifact fails closed without booting =="
