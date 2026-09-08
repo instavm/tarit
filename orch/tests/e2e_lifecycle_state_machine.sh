@@ -12,7 +12,12 @@ ROOTFS="${TARIT_ROOTFS:?set TARIT_ROOTFS to an Ubuntu ext4 rootfs containing vmm
 SOCKET_ROOT="${TARIT_TEST_SOCKET_ROOT:-${TMPDIR:-/tmp}}"
 CLONE_WORKLOAD_BIN="${TARIT_TEST_CLONE_WORKLOAD_BIN:-}"
 GUEST_AGENT_BIN="${TARIT_TEST_GUEST_AGENT_BIN:-}"
-DRIVER="${TARIT_LIFECYCLE_DRIVER:-$ROOT/orch/tests/lifecycle_state_machine.py}"
+MODE="${TARIT_LIFECYCLE_MODE:-state_machine}"
+case "$MODE" in
+  state_machine) DRIVER="${TARIT_LIFECYCLE_DRIVER:-$ROOT/orch/tests/lifecycle_state_machine.py}" ;;
+  resource_shapes) DRIVER="$ROOT/orch/tests/resource_shape_matrix.py" ;;
+  *) echo "FAIL: unknown lifecycle mode: $MODE" >&2; exit 1 ;;
+esac
 PORT="${TARIT_LIFECYCLE_STATE_PORT:-}"
 KEY="lifecycle-state-machine-e2e-key"
 JAIL_UID_BASE="${TARIT_LIFECYCLE_JAIL_UID_BASE:-300000}"
@@ -231,7 +236,14 @@ for driver_arg in "${DRIVER_ARGS[@]}"; do
     --duration-seconds|--duration-seconds=*) DURATION_MODE=1 ;;
   esac
 done
-python3 "$DRIVER" \
+if [ "$MODE" = resource_shapes ]; then
+  TARIT_API_KEY="$KEY" python3 "$DRIVER" \
+    --base-url "$BASE_URL" --cli "$TARITD" \
+    --os-id "${TARIT_EXPECT_OS_ID:?set TARIT_EXPECT_OS_ID}" \
+    --kernel-prefix "${TARIT_EXPECT_KERNEL_PREFIX:?set TARIT_EXPECT_KERNEL_PREFIX}" \
+    --storage-path "$DIR"
+else
+  python3 "$DRIVER" \
   --base-url "$BASE_URL" \
   --api-key "$KEY" \
   --database "$DIR/fleet.db" \
@@ -243,6 +255,7 @@ python3 "$DRIVER" \
   --seeds "$LIFECYCLE_SEEDS" \
   --steps "$LIFECYCLE_STEPS" \
   "${DRIVER_ARGS[@]}"
+fi
 
 if pgrep -f -- "${VMM} serve .*${DIR}" >/dev/null; then
   echo "FAIL: lifecycle state-machine left a VMM process" >&2
@@ -250,7 +263,9 @@ if pgrep -f -- "${VMM} serve .*${DIR}" >/dev/null; then
 fi
 [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]
 grep -Eq '\b(vmx|svm)\b' /proc/cpuinfo
-if [ "$DURATION_MODE" -eq 1 ]; then
+if [ "$MODE" = resource_shapes ]; then
+  echo "RESOURCE_SHAPE_SERVER_PASS"
+elif [ "$DURATION_MODE" -eq 1 ]; then
   echo "LIFECYCLE_DURATION_PASS seeds=$LIFECYCLE_SEEDS"
 else
   echo "LIFECYCLE_STATE_MACHINE_PASS seeds=$LIFECYCLE_SEEDS steps_per_seed=$LIFECYCLE_STEPS"
