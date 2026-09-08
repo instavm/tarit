@@ -531,17 +531,19 @@ fn serve_snapshot_for_clone(stream: &mut UnixStream, controller: &VmmController)
                 CONTROL_IO_TIMEOUT,
             )
             .map_err(|error| {
-                vmm_core::error::VmmError::Api(format!("publish snapshot clone boundary: {error}"))
+                vmm_core::error::VmmError::Snapshot(format!(
+                    "publish snapshot clone boundary: {error}"
+                ))
             })?;
             let acknowledgement = read_frame_with_timeout(stream, SNAPSHOT_BOUNDARY_TIMEOUT)
                 .map_err(|error| {
-                    vmm_core::error::VmmError::Api(format!(
+                    vmm_core::error::VmmError::Snapshot(format!(
                         "snapshot clone boundary acknowledgement: {error}"
                     ))
                 })?;
             let request: ApiRequest =
                 serde_json::from_slice(&acknowledgement).map_err(|error| {
-                    vmm_core::error::VmmError::Api(format!(
+                    vmm_core::error::VmmError::Snapshot(format!(
                         "decode snapshot clone boundary acknowledgement: {error}"
                     ))
                 })?;
@@ -553,7 +555,7 @@ fn serve_snapshot_for_clone(stream: &mut UnixStream, controller: &VmmController)
                 ApiRequest::ContinueSnapshot {
                     boundary_id: acknowledged,
                     ..
-                } if acknowledged != boundary_id => Err(vmm_core::error::VmmError::Api(
+                } if acknowledged != boundary_id => Err(vmm_core::error::VmmError::Snapshot(
                     "snapshot clone boundary identity mismatch".into(),
                 )),
                 ApiRequest::ContinueSnapshot { commit: false, .. } => {
@@ -561,7 +563,7 @@ fn serve_snapshot_for_clone(stream: &mut UnixStream, controller: &VmmController)
                         "snapshot clone boundary was aborted by the orchestrator".into(),
                     ))
                 }
-                _ => Err(vmm_core::error::VmmError::Api(
+                _ => Err(vmm_core::error::VmmError::Snapshot(
                     "unexpected snapshot clone boundary acknowledgement".into(),
                 )),
             }
