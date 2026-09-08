@@ -2634,12 +2634,25 @@ impl PostgresFleet {
     ) -> Result<(), FleetError> {
         let child_created_at = normalize_timestamp_for_postgres(child_created_at);
         let updated_at = normalize_timestamp_for_postgres(updated_at);
-        let client = self.pool.get().await?;
-        let changed = client
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // Serialize with clone-plan publication before reading the plan in a
+        // fresh statement snapshot. A commit must not miss a concurrent plan.
+        tx.query_opt(
+            "SELECT child_vm_id FROM fleet_vm_fork_operations
+             WHERE child_vm_id = $1 FOR UPDATE",
+            &[&child_vm_id],
+        )
+        .await?;
+        let changed = tx
             .execute(
                 "UPDATE fleet_vm_fork_operations
                  SET status = 'committed', child_created_at = $4, updated_at = $5
                  WHERE child_vm_id = $1 AND source_vm_id = $2 AND owner_key = $3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM fleet_volume_fork_clones
+                       WHERE child_vm_id = $1 AND status != 'bound'
+                   )
                    AND (status = 'preparing'
                         OR (status = 'committed' AND child_created_at = $4))",
                 &[
@@ -2656,6 +2669,7 @@ impl PostgresFleet {
                 "fork child {child_vm_id} operation changed concurrently"
             )));
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4341,6 +4355,78 @@ mod tests {
                 .await?;
             assert_eq!(persisted[0].status, VolumeForkCloneStatus::Cloned);
             assert_eq!(persisted[1].status, VolumeForkCloneStatus::Preparing);
+            assert!(matches!(
+                fleet
+                    .commit_fork_operation(
+                        operation.child_vm_id,
+                        operation.source_vm_id,
+                        &operation.owner_key,
+                        now,
+                        now
+                    )
+                    .await,
+                Err(FleetError::Conflict(_))
+            ));
+            fleet
+                .advance_volume_fork_clone(
+                    &operation.owner_key,
+                    operation.child_vm_id,
+                    first.child_volume_id,
+                    VolumeForkCloneStatus::Cloned,
+                    VolumeForkCloneStatus::Bound,
+                    now,
+                )
+                .await?;
+            fleet
+                .advance_volume_fork_clone(
+                    &operation.owner_key,
+                    operation.child_vm_id,
+                    second.child_volume_id,
+                    VolumeForkCloneStatus::Preparing,
+                    VolumeForkCloneStatus::Cloned,
+                    now,
+                )
+                .await?;
+            assert!(matches!(
+                fleet
+                    .commit_fork_operation(
+                        operation.child_vm_id,
+                        operation.source_vm_id,
+                        &operation.owner_key,
+                        now,
+                        now
+                    )
+                    .await,
+                Err(FleetError::Conflict(_))
+            ));
+            fleet
+                .advance_volume_fork_clone(
+                    &operation.owner_key,
+                    operation.child_vm_id,
+                    second.child_volume_id,
+                    VolumeForkCloneStatus::Cloned,
+                    VolumeForkCloneStatus::Bound,
+                    now,
+                )
+                .await?;
+            fleet
+                .commit_fork_operation(
+                    operation.child_vm_id,
+                    operation.source_vm_id,
+                    &operation.owner_key,
+                    now,
+                    now,
+                )
+                .await?;
+            fleet
+                .commit_fork_operation(
+                    operation.child_vm_id,
+                    operation.source_vm_id,
+                    &operation.owner_key,
+                    now,
+                    now,
+                )
+                .await?;
             assert!(fleet
                 .list_volume_fork_clones("another-tenant", operation.child_vm_id)
                 .await?

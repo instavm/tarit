@@ -2123,6 +2123,10 @@ impl Store {
             "UPDATE vm_fork_operations
              SET status = 'committed', child_created_at = ?4, updated_at = ?5
              WHERE child_vm_id = ?1 AND source_vm_id = ?2 AND owner_key = ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM volume_fork_clones
+                   WHERE child_vm_id = ?1 AND status != 'bound'
+               )
                AND (status = 'preparing'
                     OR (status = 'committed' AND child_created_at = ?4))",
             params![
@@ -4570,6 +4574,40 @@ mod tests {
             .unwrap();
         assert_eq!(persisted[0].status, VolumeForkCloneStatus::Bound);
         assert_eq!(persisted[1].status, VolumeForkCloneStatus::Preparing);
+        assert!(matches!(
+            store.commit_fork_operation(child_vm_id, source_vm_id, "tenant-a", now, now),
+            Err(StoreError::Conflict(_))
+        ));
+        store
+            .advance_volume_fork_clone(
+                "tenant-a",
+                child_vm_id,
+                second.child_volume_id,
+                VolumeForkCloneStatus::Preparing,
+                VolumeForkCloneStatus::Cloned,
+                now,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.commit_fork_operation(child_vm_id, source_vm_id, "tenant-a", now, now),
+            Err(StoreError::Conflict(_))
+        ));
+        store
+            .advance_volume_fork_clone(
+                "tenant-a",
+                child_vm_id,
+                second.child_volume_id,
+                VolumeForkCloneStatus::Cloned,
+                VolumeForkCloneStatus::Bound,
+                now,
+            )
+            .unwrap();
+        store
+            .commit_fork_operation(child_vm_id, source_vm_id, "tenant-a", now, now)
+            .unwrap();
+        store
+            .commit_fork_operation(child_vm_id, source_vm_id, "tenant-a", now, now)
+            .unwrap();
         assert!(store
             .list_volume_fork_clones("tenant-b", child_vm_id)
             .unwrap()
