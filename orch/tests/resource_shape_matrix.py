@@ -2,6 +2,7 @@
 """Serial API/CLI shape qualification against an isolated local taritd."""
 
 import argparse
+import concurrent.futures
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,8 @@ import uuid
 
 VCPUS = (1, 2, 4, 8)
 MEMORY_MIB = (256, 512, 1024, 2048, 3072, 4096)
+CPU_CEILING = 12
+MIXED_SHAPES = ((1, 256), (2, 512), (4, 1024))
 
 
 def shapes():
@@ -96,7 +99,7 @@ class Matrix:
     def check_empty_server_limits(self):
         assert self.request('GET', '/v1/vms') == [], 'admission lane requires an empty server'
         # With no VM present, the VM-count ceiling cannot mask these limits.
-        self.reject_shape(9, 256)
+        self.reject_shape(CPU_CEILING + 1, 256)
         self.reject_shape(1, 4097)
 
     def run_shape(self, cpu, memory):
@@ -118,7 +121,7 @@ class Matrix:
         assert row['id'] == vm_id and row['status'] == 'running', row
         self.execute(vm_id, f"printf '%s' {proof} > /root/tarit-shape-proof; sync")
         self.verify(vm_id, cpu, memory, proof)
-        self.reject_shape(1, 256)
+        self.reject_shape(CPU_CEILING, 256)
         self.verify(vm_id, cpu, memory, proof)
         row = self.request('POST', f'/v1/vms/{vm_id}/hibernate', {})
         assert row['status'] == 'hibernated', row
@@ -131,6 +134,60 @@ class Matrix:
                           'memory_mib': memory, 'os': self.args.os_id,
                           'kernel': self.args.kernel_prefix,
                           'oversubscribed': cpu > os.cpu_count()}), flush=True)
+
+    def run_mixed(self):
+        assert self.request('GET', '/v1/vms') == [], 'mixed lane requires an empty server'
+        # Include the largest fork child in the reservation, although its RAM
+        # is populated lazily. Never infer safety from lazy allocation alone.
+        required = sum(memory for _, memory in MIXED_SHAPES) + 1024
+        available = meminfo(Path('/proc/meminfo').read_text())['MemAvailable']
+        if available < (required + self.args.host_reserve_mib) * 1024:
+            raise RuntimeError('insufficient host headroom for mixed shapes and fork')
+        if shutil.disk_usage(self.args.storage_path).free < 4096 * 1024 * 1024:
+            raise RuntimeError('insufficient storage for mixed fork')
+        guests = [(str(uuid.uuid4()), cpu, memory, uuid.uuid4().hex)
+                  for cpu, memory in MIXED_SHAPES]
+        self.owned.update(vm_id for vm_id, _, _, _ in guests)
+
+        def create(guest):
+            vm_id, cpu, memory, proof = guest
+            row = self.request('POST', '/v1/vms',
+                               {'id': vm_id, 'vcpus': cpu, 'memory_mib': memory}, 201)
+            assert row['id'] == vm_id and row['status'] == 'running', row
+            self.execute(vm_id, f"printf '%s' {proof} > /root/tarit-shape-proof; sync")
+            self.verify(vm_id, cpu, memory, proof)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(create, guests))
+
+        source, cpu, memory, proof = guests[-1]
+        child_id = str(uuid.uuid4())
+        self.owned.add(child_id)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            # Bounded guest writes overlap the fork request and preserve each
+            # guest's identity proof for verification afterward.
+            work = [pool.submit(self.execute, vm_id,
+                    "set -eu; i=0; while [ $i -lt 20 ]; do "
+                    "i=$((i+1)); printf '%s' $i > /root/shape-work; sync; "
+                    "sleep 1; done; cat /root/shape-work")
+                    for vm_id, _, _, _ in guests[:2]]
+            response = self.request('POST', f'/v1/vms/{source}/fork', {'id': child_id}, 201)
+            assert response['vm']['id'] == child_id, response
+            self.verify(child_id, cpu, memory, proof)
+            child_proof = uuid.uuid4().hex
+            self.execute(child_id, f"printf '%s' {child_proof} > /root/tarit-shape-proof; sync")
+            self.verify(source, cpu, memory, proof)
+            self.verify(child_id, cpu, memory, child_proof)
+            for future in work:
+                assert future.result(timeout=180) == '20'
+        for guest in guests:
+            self.verify(*guest)
+        for vm_id in [child_id] + [guest[0] for guest in guests]:
+            self.request('DELETE', f'/v1/vms/{vm_id}', expected=204)
+            self.owned.remove(vm_id)
+        assert self.request('GET', '/v1/vms') == [], 'mixed lane leaked a VM'
+        print(json.dumps({'event': 'mixed_shapes_pass', 'shapes': MIXED_SHAPES,
+                          'fork_shape': [cpu, memory]}), flush=True)
 
 
 def main():
@@ -152,12 +209,13 @@ def main():
         matrix.check_empty_server_limits()
         for cpu, memory in shapes():
             matrix.run_shape(cpu, memory)
+        matrix.run_mixed()
     except BaseException:
         # Retain identifiers and server evidence for inspection. Do not delete
         # a potentially live failure specimen automatically.
         print(json.dumps({'event': 'shape_failure', 'owned_vm_ids': sorted(matrix.owned)}), flush=True)
         raise
-    print('RESOURCE_SHAPE_LANE_PASS cases=24', flush=True)
+    print('RESOURCE_SHAPE_LANE_PASS cases=24 mixed_fork_cases=1', flush=True)
 
 
 if __name__ == '__main__':

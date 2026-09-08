@@ -21,8 +21,8 @@ flock -n 9 || { echo "FAIL: qualification worker is reserved" >&2; exit 1; }
 for kernel_case in "5.10.:$KERNEL_510" "6.6.:$KERNEL_66"; do
   for image_case in "ubuntu:$UBUNTU" "alpine:$ALPINE"; do
     TARIT_LIFECYCLE_MODE=resource_shapes \
-    TARIT_LIFECYCLE_MAX_VMS=1 \
-    TARIT_LIFECYCLE_MAX_VCPUS=8 \
+    TARIT_LIFECYCLE_MAX_VMS=4 \
+    TARIT_LIFECYCLE_MAX_VCPUS=12 \
     TARIT_LIFECYCLE_MAX_MEMORY_MIB=4096 \
     TARIT_KERNEL="${kernel_case#*:}" \
     TARIT_EXPECT_KERNEL_PREFIX="${kernel_case%%:*}" \
@@ -31,4 +31,4 @@ for kernel_case in "5.10.:$KERNEL_510" "6.6.:$KERNEL_66"; do
       bash "$ROOT/orch/tests/e2e_lifecycle_state_machine.sh"
   done
 done
-echo "RESOURCE_SHAPE_MATRIX_PASS cases=96 scope=boot_hibernate_cli_wake"
+echo "RESOURCE_SHAPE_MATRIX_PASS cases=96 mixed_fork_cases=4 scope=resource_lifecycle"

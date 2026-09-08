@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 from resource_shape_matrix import Matrix, meminfo, shapes, validate_guest
 
@@ -43,6 +44,33 @@ class ShapeTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             matrix.reject_shape(1, 256)
         self.assertEqual(len(matrix.owned), 1, 'retain rejected request ID on failure')
+
+    def test_mixed_lane_tracks_and_deletes_all_requested_identities(self):
+        matrix = object.__new__(Matrix)
+        matrix.args = SimpleNamespace(host_reserve_mib=1536, storage_path='/fixture')
+        matrix.owned = set()
+        rows = {}
+
+        def request(method, path, body=None, expected=200):
+            if method == 'GET':
+                return list(rows.values())
+            if method == 'DELETE':
+                del rows[path.rsplit('/', 1)[1]]
+                return None
+            self.assertIn(body['id'], matrix.owned)
+            row = {'id': body['id'], 'status': 'running'}
+            rows[body['id']] = row
+            return {'vm': row} if path.endswith('/fork') else row
+
+        matrix.request = request
+        matrix.execute = Mock(side_effect=lambda _, command: '20' if 'while' in command else '')
+        matrix.verify = Mock()
+        with patch('resource_shape_matrix.Path.read_text', return_value='MemAvailable: 8000000 kB'), \
+             patch('resource_shape_matrix.shutil.disk_usage', return_value=SimpleNamespace(free=8 * 1024**3)):
+            matrix.run_mixed()
+        self.assertFalse(rows)
+        self.assertFalse(matrix.owned)
+        self.assertEqual(matrix.verify.call_count, 9)
 
 
 if __name__ == '__main__':
