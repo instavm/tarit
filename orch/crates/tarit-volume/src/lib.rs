@@ -422,7 +422,11 @@ impl BlockVolumeProvider for LocalBlockProvider {
         );
         let child_path = self.path(child_volume_id);
         match self.open_existing(&child_path, true, Some(size_bytes)) {
-            Ok(existing) => validate_clone_provenance(&existing, &provenance)?,
+            Ok(existing) => {
+                validate_clone_provenance(&existing, &provenance)?;
+                existing.sync_all()?;
+                sync_directory(&self.root)?;
+            }
             Err(VolumeError::NotFound) => clone_local_reflink(
                 &self.open_existing(&self.path(source_volume_id), true, Some(size_bytes))?,
                 &child_path,
@@ -482,23 +486,15 @@ fn clone_local_reflink(
     options
         .read(true)
         .write(true)
-        .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    let child = match options.open(destination) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(VolumeError::Conflict)
-        }
-        Err(error) => return Err(error.into()),
-    };
-    // SAFETY: both descriptors remain open for the ioctl. The destination was
-    // exclusively created above and the source was identity-checked by the
-    // provider before this function was called.
+        .custom_flags(libc::O_CLOEXEC | libc::O_TMPFILE);
+    // An unnamed inode disappears automatically on a crash before publication.
+    // No retry can observe a partial clone or an object without provenance.
+    let child = options.open(root)?;
+    // SAFETY: both descriptors remain open for the ioctl. The destination is
+    // the private unnamed inode and the source was identity-checked above.
     if unsafe { libc::ioctl(child.as_raw_fd(), FICLONE, source.as_raw_fd()) } != 0 {
         let error = io::Error::last_os_error();
-        drop(child);
-        let _ = fs::remove_file(destination);
         return Err(match error.raw_os_error() {
             Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::ENOTTY) => {
                 VolumeError::Unsupported(
@@ -508,19 +504,36 @@ fn clone_local_reflink(
             _ => VolumeError::Io(error),
         });
     }
-    set_clone_provenance(&child, provenance).inspect_err(|_| {
-        let _ = fs::remove_file(destination);
-    })?;
-    if let Err(error) = child.sync_all().and_then(|_| sync_directory(root)) {
-        drop(child);
-        let _ = fs::remove_file(destination);
-        return Err(error.into());
+    set_clone_provenance(&child, provenance)?;
+    child.sync_all()?;
+    let source_fd_path = std::ffi::CString::new(format!("/proc/self/fd/{}", child.as_raw_fd()))
+        .expect("numeric descriptor contains no NUL");
+    let destination_path = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| VolumeError::Invalid("clone destination contains NUL".into()))?;
+    // SAFETY: both paths are NUL-terminated and the unnamed inode remains
+    // open. Following this process-owned procfs FD avoids requiring
+    // CAP_DAC_READ_SEARCH for AT_EMPTY_PATH. linkat never replaces a target.
+    if unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source_fd_path.as_ptr(),
+            libc::AT_FDCWD,
+            destination_path.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+            VolumeError::Conflict
+        } else {
+            VolumeError::Io(error)
+        });
     }
-    if let Err(error) = validate_owned_file(&child, Some(source.metadata()?.len())) {
-        drop(child);
-        let _ = fs::remove_file(destination);
-        return Err(error);
-    }
+    // A directory-sync error leaves a complete, identifiable clone. Replay
+    // re-syncs it rather than deleting an ambiguously durable publication.
+    sync_directory(root)?;
+    validate_owned_file(&child, Some(source.metadata()?.len()))?;
     Ok(())
 }
 
@@ -749,6 +762,21 @@ mod tests {
         drop(source);
 
         if provider.capabilities().clones {
+            #[cfg(target_os = "linux")]
+            {
+                let failed_child = provider.path(Uuid::new_v4());
+                let source = provider
+                    .prepare(source_id, size, AccessMode::ReadOnlyMany, 3)
+                    .unwrap();
+                // Exceed Linux's xattr value limit after the data clone, before
+                // publication. Failure must leave no named staging object.
+                assert!(
+                    clone_local_reflink(&source.file, &failed_child, &root, &vec![0; 65_537],)
+                        .is_err()
+                );
+                assert!(!failed_child.exists());
+                assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+            }
             let cloned = provider
                 .clone_quiesced(source_id, 3, child_id, 1, size)
                 .expect("reflink clone");
