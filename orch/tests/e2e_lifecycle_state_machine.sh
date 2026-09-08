@@ -220,10 +220,17 @@ TARITD_PID=$!
 TARITD_PGID=$TARITD_PID
 
 for _ in $(seq 1 100); do
-  curl -fsS --max-time 1 "$BASE_URL/health" >/dev/null 2>&1 && break
   kill -0 "$TARITD_PID" 2>/dev/null || { tail -160 "$DIR/taritd.log"; exit 1; }
+  if python3 "$ROOT/orch/tests/listener_owner.py" "$TARITD_PID" "$PORT" && \
+     curl -fsS --max-time 1 "$BASE_URL/health" >/dev/null 2>&1; then
+    break
+  fi
   sleep 0.2
 done
+python3 "$ROOT/orch/tests/listener_owner.py" "$TARITD_PID" "$PORT" || {
+  echo "FAIL: spawned taritd does not own the control listener" >&2
+  exit 1
+}
 curl -fsS "$BASE_URL/health" >/dev/null
 
 DRIVER_ARGS_RAW=${TARIT_LIFECYCLE_DRIVER_ARGS:-}

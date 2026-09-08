@@ -23,6 +23,7 @@ flock -n 9 || { echo "FAIL: qualification worker is reserved" >&2; exit 1; }
 echo "RESOURCE_SHAPE_INPUT_SHA256"
 sha256sum "$TARITD" "$VMM" "$UBUNTU" "$ALPINE" "$KERNEL_510" "$KERNEL_66" \
   "$ROOT/orch/tests/resource_shape_matrix.py" \
+  "$ROOT/orch/tests/listener_owner.py" \
   "$ROOT/orch/tests/e2e_lifecycle_state_machine.sh"
 for kernel_case in "5.10.:$KERNEL_510" "6.6.:$KERNEL_66"; do
   for image_case in "ubuntu:$UBUNTU" "alpine:$ALPINE"; do
