@@ -718,9 +718,25 @@ mod tests {
 
     #[test]
     fn local_fork_clone_is_independent_or_explicitly_unsupported() {
+        check_local_fork_clone(false);
+    }
+
+    #[test]
+    #[ignore = "requires TMPDIR on a private Linux btrfs filesystem"]
+    fn local_fork_clone_requires_reflink_and_preserves_replay() {
+        check_local_fork_clone(true);
+    }
+
+    fn check_local_fork_clone(require_reflink: bool) {
         let root = test_root("fork-clone");
         let provider = LocalBlockProvider::open(&root, "host-a", 8 * MIN_BLOCK_VOLUME_BYTES)
             .expect("provider");
+        if require_reflink {
+            assert!(
+                provider.capabilities().clones,
+                "reflink lane must execute a clone"
+            );
+        }
         let source_id = Uuid::new_v4();
         let child_id = Uuid::new_v4();
         let size = 2 * MIN_BLOCK_VOLUME_BYTES;
@@ -757,12 +773,36 @@ mod tests {
             child.file.sync_all().unwrap();
             drop(child);
 
+            let mut changed_source = provider
+                .prepare(source_id, size, AccessMode::ReadWriteOnce, 3)
+                .unwrap();
+            let mut source_bytes = vec![0; b"source-before-fork".len()];
+            changed_source.file.read_exact(&mut source_bytes).unwrap();
+            assert_eq!(&source_bytes, b"source-before-fork");
+            changed_source.file.seek(SeekFrom::Start(0)).unwrap();
+            changed_source
+                .file
+                .write_all(b"source-after-fork!")
+                .unwrap();
+            changed_source.file.sync_all().unwrap();
+            drop(changed_source);
+            provider
+                .clone_quiesced(source_id, 3, child_id, 1, size)
+                .expect("replay must preserve the existing child, not reclone the source");
+            let mut replayed_child = provider
+                .prepare(child_id, size, AccessMode::ReadOnlyMany, 1)
+                .unwrap();
+            let mut replayed_bytes = vec![0; b"child-independent".len()];
+            replayed_child.file.read_exact(&mut replayed_bytes).unwrap();
+            assert_eq!(&replayed_bytes, b"child-independent");
+            drop(replayed_child);
+
             let mut source = provider
                 .prepare(source_id, size, AccessMode::ReadOnlyMany, 3)
                 .unwrap();
             let mut unchanged = vec![0; b"source-before-fork".len()];
             source.file.read_exact(&mut unchanged).unwrap();
-            assert_eq!(&unchanged, b"source-before-fork");
+            assert_eq!(&unchanged, b"source-after-fork!");
             drop(source);
             provider.delete(child_id).unwrap();
         } else {
