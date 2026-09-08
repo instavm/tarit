@@ -138,6 +138,7 @@ jobs:
           --features vmm-core/boot
           --features vmm-memory-backend/kvm
           --features vmm-integration/kvm
+          --features vmm-api/boot
 
       - name: Lint KVM/Linux code paths
         if: matrix.workspace == 'vmm'
@@ -148,7 +149,13 @@ jobs:
           --features vmm-core/boot
           --features vmm-memory-backend/kvm
           --features vmm-integration/kvm
+          --features vmm-api/boot
           -- -D warnings
+
+      - name: Test Linux API control paths
+        if: matrix.workspace == 'vmm'
+        working-directory: ${{ matrix.workspace }}
+        run: cargo test -p vmm-api --features boot --lib
 
 # The full KVM integration suite
 # (cargo test --workspace --features kvm -- --include-ignored) requires a Linux
