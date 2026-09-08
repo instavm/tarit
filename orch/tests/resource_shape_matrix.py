@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import urllib.error
 import urllib.request
@@ -39,6 +40,33 @@ def validate_guest(cpu, memory, actual_cpu, actual_kib):
         raise AssertionError(f"guest MemTotal: {actual_kib} KiB, requested {memory} MiB")
 
 
+def process_identity(pid, proc=Path('/proc')):
+    try:
+        # comm may contain spaces and parentheses; fields after its final ')'
+        # begin with state, ppid, ... starttime.
+        fields = (proc / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+        return int(fields[1]), int(fields[19])
+    except FileNotFoundError:
+        return None
+
+
+def runtime_tree(pid):
+    processes = {}
+    for entry in Path('/proc').iterdir():
+        if entry.name.isdigit():
+            identity = process_identity(int(entry.name))
+            if identity is not None:
+                processes[int(entry.name)] = identity
+    assert pid in processes, f'VMM PID {pid} is not live'
+    owned = {pid: processes[pid]}
+    while True:
+        children = {child: identity for child, identity in processes.items()
+                    if identity[0] in owned and child not in owned}
+        if not children:
+            return owned
+        owned.update(children)
+
+
 class Matrix:
     def __init__(self, args):
         self.args = args
@@ -68,6 +96,27 @@ class Matrix:
         if row.get('exit_code') != 0 or row.get('error') or row.get('stderr'):
             raise AssertionError(row)
         return row['stdout'].strip()
+
+    def runtime_record(self, vm_id):
+        connection = sqlite3.connect(Path(self.args.database).resolve().as_uri() + '?mode=ro', uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                'SELECT status,pid,socket_path,runtime_jail_path,runtime_overlay_path '
+                'FROM vms WHERE id=?', (vm_id,)).fetchone()
+            assert row is not None, f'missing durable VM {vm_id}'
+            return dict(row)
+        finally:
+            connection.close()
+
+    def verify_hibernated(self, vm_id, previous_tree):
+        row = self.runtime_record(vm_id)
+        assert row['status'] == 'hibernated', row
+        assert all(row[field] is None for field in
+                   ('pid', 'socket_path', 'runtime_jail_path', 'runtime_overlay_path')), row
+        for pid, identity in previous_tree.items():
+            current = process_identity(pid)
+            assert current is None or current[1] != identity[1], f'VMM process {pid} survived hibernation'
 
     def verify(self, vm_id, cpu, memory, proof):
         output = self.execute(vm_id,
@@ -124,8 +173,12 @@ class Matrix:
         self.verify(vm_id, cpu, memory, proof)
         self.reject_shape(CPU_CEILING, 256)
         self.verify(vm_id, cpu, memory, proof)
+        before = self.runtime_record(vm_id)
+        assert before['status'] == 'running' and before['pid'], before
+        previous_tree = runtime_tree(before['pid'])
         row = self.request('POST', f'/v1/vms/{vm_id}/hibernate', {})
         assert row['status'] == 'hibernated', row
+        self.verify_hibernated(vm_id, previous_tree)
         # The user's CLI exec must activate the VM without an explicit resume.
         self.verify(vm_id, cpu, memory, proof)
         self.request('DELETE', f'/v1/vms/{vm_id}', expected=204)
@@ -195,6 +248,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base-url', required=True)
     parser.add_argument('--cli', required=True)
+    parser.add_argument('--database', required=True)
     parser.add_argument('--os-id', required=True, choices=['ubuntu', 'alpine'])
     parser.add_argument('--kernel-prefix', required=True, choices=['5.10.', '6.6.'])
     parser.add_argument('--host-reserve-mib', type=int, default=1536)

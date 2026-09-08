@@ -246,6 +246,7 @@ done
 if [ "$MODE" = resource_shapes ]; then
   TARIT_API_KEY="$KEY" python3 "$DRIVER" \
     --base-url "$BASE_URL" --cli "$TARITD" \
+    --database "$DIR/fleet.db" \
     --os-id "${TARIT_EXPECT_OS_ID:?set TARIT_EXPECT_OS_ID}" \
     --kernel-prefix "${TARIT_EXPECT_KERNEL_PREFIX:?set TARIT_EXPECT_KERNEL_PREFIX}" \
     --storage-path "$DIR"

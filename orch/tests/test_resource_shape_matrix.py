@@ -1,11 +1,36 @@
 import unittest
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
+import tempfile
+from pathlib import Path
 
-from resource_shape_matrix import Matrix, meminfo, shapes, validate_guest
+from resource_shape_matrix import Matrix, meminfo, process_identity, shapes, validate_guest
 
 
 class ShapeTests(unittest.TestCase):
+    def test_process_identity_handles_parentheses_in_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            (proc / '42').mkdir()
+            (proc / '42/stat').write_text('42 (a weird ) name) S 1 ' + '0 ' * 17 + '123 0')
+            self.assertEqual(process_identity(42, proc), (1, 123))
+            self.assertIsNone(process_identity(43, proc))
+
+    def test_hibernation_rejects_surviving_process_and_stale_pid(self):
+        matrix = object.__new__(Matrix)
+        row = {'status': 'hibernated', 'pid': None, 'socket_path': None,
+               'runtime_jail_path': None, 'runtime_overlay_path': None}
+        matrix.runtime_record = Mock(return_value=row)
+        with patch('resource_shape_matrix.process_identity', return_value=(1, 123)):
+            with self.assertRaises(AssertionError):
+                matrix.verify_hibernated('vm', {42: (1, 123)})
+        with patch('resource_shape_matrix.process_identity', return_value=(1, 456)):
+            matrix.verify_hibernated('vm', {42: (1, 123)})
+        row['pid'] = 42
+        with patch('resource_shape_matrix.process_identity', return_value=None):
+            with self.assertRaises(AssertionError):
+                matrix.verify_hibernated('vm', {42: (1, 123)})
+
     def test_exact_shape_coverage(self):
         cases = shapes()
         self.assertEqual(len(cases), 24)
