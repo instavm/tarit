@@ -22,6 +22,7 @@ export interface ForkOptions {
 
 export interface ExecuteOptions {
   timeoutMs?: number;
+  /** Total wait budget, including submission and HTTP polling in execute(). */
   deadlineMs?: number;
   pollIntervalMs?: number;
 }
@@ -104,6 +105,41 @@ export class TaritPtyConnectionError extends Error {
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function validatePollInterval(milliseconds: number): void {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) {
+    throw new RangeError("pollIntervalMs must be a finite nonnegative number");
+  }
+}
+
+async function withExecutionDeadline<T>(
+  milliseconds: number,
+  message: string,
+  operation: (signal: AbortSignal, deadline: number) => Promise<T>,
+): Promise<T> {
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
+    throw new RangeError("deadlineMs must be a finite positive number");
+  }
+  const deadline = performance.now() + milliseconds;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expire = () => {
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) controller.abort();
+    else timer = setTimeout(expire, Math.min(Math.ceil(remaining), 2_147_483_647));
+  };
+  expire();
+  try {
+    const result = await operation(controller.signal, deadline);
+    if (controller.signal.aborted || performance.now() >= deadline) throw new TaritDeadlineExceeded(message);
+    return result;
+  } catch (error) {
+    if (controller.signal.aborted) throw new TaritDeadlineExceeded(message);
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function retryDelay(attempt: number): number {
@@ -492,29 +528,52 @@ export class TaritClient {
 
   async execute(vmId: string, command: string, options: ExecuteOptions = {}): Promise<ExecutionRecord> {
     const timeoutMs = options.timeoutMs ?? 30_000;
-    const result = await this.raw.POST("/v1/execute_async", {
-      body: { vm_id: vmId, command, timeout_ms: timeoutMs },
-    });
-    if (result.response.status !== 202 || result.data === undefined) {
-      throw new TaritApiError(
-        "execute command",
-        result.response.status,
-        errorMessage(result.error),
-        result.error,
-      );
-    }
-    return this.waitExecution(result.data.id, {
-      deadlineMs: options.deadlineMs ?? Math.max(timeoutMs + 5_000, 5_000),
-      ...(options.pollIntervalMs === undefined ? {} : { pollIntervalMs: options.pollIntervalMs }),
-    });
+    const pollInterval = options.pollIntervalMs ?? 100;
+    validatePollInterval(pollInterval);
+    return withExecutionDeadline(
+      options.deadlineMs ?? Math.max(timeoutMs + 5_000, 5_000),
+      `execute command on VM ${vmId} exceeded its deadline`,
+      async (signal, deadline) => {
+        const result = await this.raw.POST("/v1/execute_async", {
+          body: { vm_id: vmId, command, timeout_ms: timeoutMs },
+          signal,
+        });
+        if (result.response.status !== 202 || result.data === undefined) {
+          throw new TaritApiError(
+            "execute command",
+            result.response.status,
+            errorMessage(result.error),
+            result.error,
+          );
+        }
+        return this.waitExecutionUntil(result.data.id, signal, deadline, pollInterval);
+      },
+    );
   }
 
   async waitExecution(executionId: string, options: Omit<ExecuteOptions, "timeoutMs"> = {}): Promise<ExecutionRecord> {
-    const deadline = Date.now() + (options.deadlineMs ?? 35_000);
     const pollInterval = options.pollIntervalMs ?? 100;
+    validatePollInterval(pollInterval);
+    return withExecutionDeadline(
+      options.deadlineMs ?? 35_000,
+      `execution ${executionId} exceeded its deadline`,
+      (signal, deadline) => this.waitExecutionUntil(executionId, signal, deadline, pollInterval),
+    );
+  }
+
+  private async waitExecutionUntil(
+    executionId: string,
+    signal: AbortSignal,
+    deadline: number,
+    pollInterval: number,
+  ): Promise<ExecutionRecord> {
     while (true) {
+      if (signal.aborted || performance.now() >= deadline) {
+        throw new TaritDeadlineExceeded(`execution ${executionId} exceeded its deadline`);
+      }
       const result = await this.raw.GET("/v1/executions/{id}", {
         params: { path: { id: executionId } },
+        signal,
       });
       if (result.response.status !== 200 || result.data === undefined) {
         throw new TaritApiError(
@@ -525,9 +584,9 @@ export class TaritClient {
         );
       }
       if (TERMINAL_EXECUTION_STATUS.has(result.data.status)) return result.data;
-      const remaining = deadline - Date.now();
+      const remaining = deadline - performance.now();
       if (remaining <= 0) throw new TaritDeadlineExceeded(`execution ${executionId} exceeded its deadline`);
-      await sleep(Math.min(pollInterval, remaining));
+      await sleep(Math.min(Math.ceil(Math.min(pollInterval, remaining)), 2_147_483_647));
     }
   }
 }
