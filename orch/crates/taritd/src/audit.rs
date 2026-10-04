@@ -58,7 +58,12 @@ pub fn record(
         detail,
         created_at: chrono::Utc::now(),
     };
-    let _ = state.store_tx.send(StoreWrite::Audit(event));
+    if let Err(error) = state.store_tx.try_send(StoreWrite::Audit(event.clone())) {
+        state.metrics.inc_store_enqueue_failure();
+        if state.audit_outbox.enqueue(&event).is_err() {
+            tracing::error!(%error, "audit outbox queue and synchronous fallback unavailable");
+        }
+    }
 }
 
 /// Record an audit event synchronously in the durable local outbox. The fleet
@@ -108,5 +113,10 @@ pub fn record_parts(
         detail,
         created_at: chrono::Utc::now(),
     };
-    let _ = state.store_tx.send(StoreWrite::Audit(event));
+    if let Err(error) = state.store_tx.try_send(StoreWrite::Audit(event.clone())) {
+        state.metrics.inc_store_enqueue_failure();
+        if state.audit_outbox.enqueue(&event).is_err() {
+            tracing::error!(%error, "audit outbox queue and synchronous fallback unavailable");
+        }
+    }
 }

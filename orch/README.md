@@ -23,7 +23,15 @@ cargo build --release -p taritd
 
 cd /path/to/tarit/vmm
 cargo build --release --features "vmm-core/kvm vmm-core/boot vmm-memory-backend/kvm"
+
+cd /path/to/tarit
+sudo make guest
+sudo install -d -m 0755 /var/lib/taritd
+sudo install -m 0644 guest-assets/vmlinux guest-assets/rootfs.ext4 /var/lib/taritd/
 ```
+
+`make guest` verifies the pinned release kernel checksum and falls back to the
+same checksum-pinned source build if the artifact is unavailable.
 
 Start one Linux/KVM host:
 
@@ -34,7 +42,7 @@ export TARIT_LISTEN='0.0.0.0:8080'
 export TARIT_HOST_ID="$(hostname)"
 export TARIT_RPC_ADDR='http://127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"
@@ -143,7 +151,7 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 | POST/GET/DELETE | `/v1/ssh-keys[/{key_id}]` | Register, list, and deactivate caller-scoped OpenSSH public keys. |
 | POST/GET/DELETE | `/v1/vms/{id}/pty/sessions[/{pty_id}]` | Manage local PTY session records for a VM. |
 | POST | `/v1/vms/{id}/pty/sessions/{pty_id}/resize` | Update a PTY session's recorded dimensions. |
-| WS | `/v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` | Bridge WebSocket PTY bytes to the owning local VMM stream. The token comes from the create-session response. |
+| WS | `/v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` | Bridge WebSocket PTY bytes to the owning local VMM stream. One connection is active per session; the session can reconnect after disconnect. |
 | GET | `/v1/cluster` | Admin-only cluster capacity and health summary. |
 | GET | `/v1/usage` | Per-key usage stats from the primary store (admin: all keys; user: own). |
 | GET | `/v1/audit` | Per-key audit trail from the primary store (admin: all keys; user: own). |
@@ -168,7 +176,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `taritd vm snapshot <id> [--diff]` | Snapshot a VM; prints `path` and `host_id`. |
 | `taritd restore <snapshot_path>` | Restore a VM from a snapshot file. |
 | `taritd exec <id> <command...>` | Run a command in the VM over `POST /v1/execute`; exits with the command's exit code. |
-| `taritd image build --oci <OCI_REF> --name <NAME[:TAG]>` | Build and register a rootfs image from an OCI image. |
+| `taritd image build --oci <OCI_REF> --name <NAME[:TAG]> [--size <MIB>]` | Build and register a rootfs image; size defaults to 1024 MiB and bounds OCI unpack work. |
 | `taritd image ls` | List registered images. |
 | `taritd image rm <NAME[:TAG]>` | Remove an unreferenced image. |
 | `taritd image gc [--older-than-days <DAYS>] [--pattern <PATTERN>] [--dry-run]` | Remove unreferenced images older than a threshold (default 7 days). |
@@ -204,6 +212,15 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_ROOTFS_READONLY` | No | `false` | Attach rootfs read-only and rewrite `root=/dev/vda rw` to `ro`. Use for shared immutable images. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | No | `60000` | How long create waits and retries when the cluster is full before returning 429. |
 | `TARIT_REAP_ON_SHUTDOWN` | No | `true` | On SIGTERM/SIGINT, stop all local `vmm serve` children and remove their sockets/overlays after HTTP drain. Set `false` only for debugging. |
+| `TARIT_VM_CGROUP_PARENT` | No | unset | Dedicated cgroup v2 parent for per-VM CPU, memory, PID, and optional I/O enforcement. |
+| `TARIT_VM_CGROUP_PIDS_MAX` | No | `1024` | Per-VM `pids.max` when cgroup enforcement is enabled. |
+| `TARIT_VM_IO_READ_BPS_MAX` / `TARIT_VM_IO_WRITE_BPS_MAX` | No | unset | Rootfs and overlay block bandwidth limits. Requires `TARIT_VM_CGROUP_PARENT`. |
+| `TARIT_VM_IO_READ_IOPS_MAX` / `TARIT_VM_IO_WRITE_IOPS_MAX` | No | unset | Rootfs and overlay block IOPS limits. Requires `TARIT_VM_CGROUP_PARENT`. |
+| `TARIT_VM_NET_INGRESS_BPS_MAX` / `TARIT_VM_NET_EGRESS_BPS_MAX` | No | unset | Per-TAP guest ingress and egress limits. Requires `TARIT_ENABLE_NET=true`. |
+| `TARIT_DISK_BYTES_HIGH_WATERMARK` / `TARIT_DISK_BYTES_LOW_WATERMARK` | No | unset | Absolute used-byte thresholds for pressure entry and recovery. Both must be set together. |
+| `TARIT_DISK_INODES_HIGH_WATERMARK` / `TARIT_DISK_INODES_LOW_WATERMARK` | No | unset | Absolute used-inode thresholds for pressure entry and recovery. Both must be set together. |
+| `TARIT_ARTIFACT_GC_INTERVAL_SECS` | No | `30` | Disk-pressure refresh and owned-artifact sweep interval. |
+| `TARIT_ARTIFACT_GC_MIN_AGE_SECS` | No | `300` | Minimum age for collection of unreferenced Tarit-owned artifacts. |
 | `TARIT_CONFIG` | No | `~/.taritd/config.toml` | Optional TOML file for warm-pool configuration. Missing file is allowed. |
 | `TARIT_WARM_POOL` | No | `false` | Enable warm-pool replenishment. Accepts `1` or `true`. |
 | `TARIT_WARM_POOL_TARGET` | No | `8` for the default class | Override target count for the first warm-pool class. If watermarks are unset, effective hard/low/high watermarks derive from this target. |
@@ -287,12 +304,16 @@ Create requests can use `--image <name>[:tag]` (or JSON `image`) instead of a ra
 `rootfs_path`; warm-pool classes can set `image = "name[:tag]"`.
 
 ```sh
-taritd image build --oci node:20-slim --name node20
+taritd image build --oci node:20-slim --name node20 --size 2048
 taritd image ls
 taritd vm create --image node20 --vcpus 1 --memory-mib 256
 taritd image rm node20
 taritd image gc --older-than-days 7 --dry-run
 ```
+
+Image build verifies OCI descriptor size and SHA-256 before extraction. Layer,
+compressed-byte, expanded-byte, entry-count, file-size, and path-length limits
+are derived from `--size`; a rejected image is not registered or published.
 
 ## More documentation
 

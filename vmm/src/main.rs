@@ -6,8 +6,9 @@
 //! # Quick Start
 //!
 //! ```sh
-//! # Boot a VM from a bzImage kernel
-//! vmm run --kernel guest/bzImage --mem 256
+//! # Install the pinned release kernel, then boot a VM
+//! vmm kernel install
+//! vmm run --mem 256
 //!
 //! # Start the API server
 //! vmm serve --socket /tmp/vmm.sock
@@ -23,9 +24,28 @@
 //! the full request schema.
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+mod kernel_install;
 
 const DEFAULT_CPU_PERIOD_US: u64 = 100_000;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum RestoreMemoryPolicyArg {
+    Auto,
+    Eager,
+    Lazy,
+}
+
+impl From<RestoreMemoryPolicyArg> for vmm_api::types::RestoreMemoryPolicy {
+    fn from(value: RestoreMemoryPolicyArg) -> Self {
+        match value {
+            RestoreMemoryPolicyArg::Auto => Self::Auto,
+            RestoreMemoryPolicyArg::Eager => Self::Eager,
+            RestoreMemoryPolicyArg::Lazy => Self::Lazy,
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -73,6 +93,15 @@ struct ServeCgroupArgs {
     #[arg(long, value_name = "N", value_parser = parse_positive_u64, requires = "cgroup")]
     cgroup_pids_max: Option<u64>,
 
+    /// io.weight limit for the served VM process.
+    #[arg(long, value_name = "WEIGHT", value_parser = parse_positive_u64, requires = "cgroup")]
+    cgroup_io_weight: Option<u64>,
+
+    /// io.max limits for the served VM process. Repeat newline-separated
+    /// DEVICE LIMIT entries in one value, e.g. "8:0 rbps=1048576".
+    #[arg(long, value_name = "DEVICE LIMITS", value_parser = parse_cgroup_io_max, requires = "cgroup")]
+    cgroup_io_max: Option<String>,
+
     /// cpuset.cpus limit for the served VM process, e.g. 0-3 or 0,2.
     #[arg(long, value_name = "CPUS", requires = "cgroup")]
     cpuset: Option<String>,
@@ -85,6 +114,8 @@ impl ServeCgroupArgs {
             cpuset_cpus: self.cpuset.clone(),
             memory_max: self.cgroup_memory_max,
             pids_max: self.cgroup_pids_max,
+            io_weight: self.cgroup_io_weight,
+            io_max: self.cgroup_io_max.clone(),
             ..Default::default()
         };
         (!limits.is_empty()).then_some(limits)
@@ -186,14 +217,72 @@ fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
     }
 }
 
+fn parse_cgroup_io_max(value: &str) -> std::result::Result<String, String> {
+    const KEYS: [&str; 4] = ["rbps", "wbps", "riops", "wiops"];
+
+    let mut devices = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for raw_line in value.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let device = fields
+            .next()
+            .ok_or_else(|| "io.max entry must include a major:minor device".to_string())?;
+        let (major, minor) = device
+            .split_once(':')
+            .ok_or_else(|| format!("invalid io.max device {device:?}; expected MAJOR:MINOR"))?;
+        major
+            .parse::<u32>()
+            .map_err(|e| format!("invalid io.max major {major:?}: {e}"))?;
+        minor
+            .parse::<u32>()
+            .map_err(|e| format!("invalid io.max minor {minor:?}: {e}"))?;
+        if !devices.insert(device.to_string()) {
+            return Err(format!("duplicate io.max device {device}"));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut limits = Vec::new();
+        for field in fields {
+            let (key, limit) = field
+                .split_once('=')
+                .ok_or_else(|| format!("invalid io.max limit {field:?}; expected KEY=VALUE"))?;
+            if !KEYS.contains(&key) {
+                return Err(format!(
+                    "invalid io.max key {key:?}; expected rbps, wbps, riops, or wiops"
+                ));
+            }
+            if !seen.insert(key) {
+                return Err(format!("duplicate io.max key {key:?} for device {device}"));
+            }
+            if limit != "max" {
+                parse_positive_u64(limit)
+                    .map_err(|e| format!("invalid io.max {key} value {limit:?}: {e}"))?;
+            }
+            limits.push(format!("{key}={limit}"));
+        }
+        if limits.is_empty() {
+            return Err(format!("io.max device {device} has no limits"));
+        }
+        normalized.push(format!("{device} {}", limits.join(" ")));
+    }
+    if normalized.is_empty() {
+        return Err("io.max must include at least one device limit".into());
+    }
+    Ok(normalized.join("\n"))
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Boot a fresh VM from a kernel image.
     #[command(alias = "start")]
     Run {
-        /// Path to the kernel image (bzImage or vmlinux).
+        /// Kernel path. If omitted, use or offer to install the pinned vmlinux.
         #[arg(long, value_name = "PATH")]
-        kernel: String,
+        kernel: Option<String>,
 
         /// Kernel command line (overrides the default).
         #[arg(long, value_name = "CMDLINE")]
@@ -256,9 +345,9 @@ enum Cmd {
     /// Send this to a `vmm serve` socket to boot the single VM from flags,
     /// then drive it with `exec`, `status`, `snapshot`, and `stop`.
     Create {
-        /// Path to the kernel image (bzImage or vmlinux).
+        /// Kernel path. If omitted, use or offer to install the pinned vmlinux.
         #[arg(long, value_name = "PATH")]
-        kernel: String,
+        kernel: Option<String>,
 
         /// Kernel command line. Defaults to a fast-boot cmdline (plus
         /// `root=/dev/vda rw` when `--rootfs` is given).
@@ -297,6 +386,10 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         snapshot: String,
 
+        /// Restore memory backend policy.
+        #[arg(long, default_value = "auto", value_enum)]
+        memory_policy: RestoreMemoryPolicyArg,
+
         /// Enable jailer confinement (chroot + namespaces + privilege drop).
         #[arg(long, value_name = "CHROOT_DIR")]
         jail: Option<String>,
@@ -329,6 +422,21 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         netns: Option<String>,
 
+        /// Create an empty network namespace while retaining inherited TAP fds.
+        #[arg(long, requires = "jail", conflicts_with = "netns")]
+        isolate_network: bool,
+
+        /// Run the VMM child as PID 1 in a new PID namespace.
+        #[arg(long, requires = "jail")]
+        pid_namespace: bool,
+
+        /// Select the mandatory built-in seccomp profile for a jailed VMM.
+        ///
+        /// This compatibility flag is optional: --jail enables the profile
+        /// automatically, and jail mode cannot disable it.
+        #[arg(long, requires = "jail")]
+        seccomp: bool,
+
         #[command(flatten)]
         cgroup: ServeCgroupArgs,
     },
@@ -339,6 +447,11 @@ enum Cmd {
         /// Create a diff (incremental) snapshot.
         #[arg(long)]
         diff: bool,
+
+        /// Take a live (pre-copy) snapshot: the guest keeps running and only
+        /// blacks out for a sub-millisecond final stop.
+        #[arg(long, conflicts_with = "diff")]
+        live: bool,
     },
 
     /// Execute a command in the guest VM (via the API).
@@ -388,6 +501,13 @@ enum Cmd {
     #[command(alias = "info")]
     Status,
 
+    /// Get or update the virtio-balloon target (via the API).
+    Balloon {
+        /// New balloon target in MiB. Omit to query current target/actual size.
+        #[arg(long, value_name = "MIB")]
+        target: Option<u64>,
+    },
+
     /// Update egress policy on the running VM (via the API).
     #[command(alias = "egress")]
     UpdateEgress {
@@ -411,7 +531,7 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         output: String,
 
-        /// Disk image size in MiB.
+        /// Disk image size in MiB. This also determines OCI unpack limits.
         #[arg(long, default_value = "1024", value_name = "MIB")]
         size: u64,
 
@@ -424,6 +544,26 @@ enum Cmd {
         /// node:20 (which has no init system) boots straight to the exec agent.
         #[arg(long, value_name = "PATH")]
         agent: Option<String>,
+    },
+
+    /// Install and verify Tarit's pinned guest kernel.
+    Kernel {
+        #[command(subcommand)]
+        command: KernelCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KernelCommand {
+    /// Download the pinned vmlinux release artifact.
+    Install {
+        /// Install path. Defaults to TARIT_KERNEL or the versioned Tarit data directory.
+        #[arg(long, value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+
+        /// Replace an existing file whose checksum does not match.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -457,23 +597,50 @@ fn main() -> Result<()> {
             uid,
             gid,
         } => run(
-            kernel, cmdline, initramfs, mem, vcpus, rootfs, volume, overlay, net, full_boot, jail,
-            uid, gid,
-        ),
-        Cmd::Restore {
-            snapshot,
+            kernel_install::resolve(kernel)?,
+            cmdline,
+            initramfs,
+            mem,
+            vcpus,
+            rootfs,
+            volume,
+            overlay,
+            net,
+            full_boot,
             jail,
             uid,
             gid,
-        } => restore(snapshot, jail, uid, gid),
+        ),
+        Cmd::Restore {
+            snapshot,
+            memory_policy,
+            jail,
+            uid,
+            gid,
+        } => restore(&cli.socket, snapshot, memory_policy, jail, uid, gid),
         Cmd::Serve {
             jail,
             uid,
             gid,
             netns,
+            isolate_network,
+            pid_namespace,
+            seccomp,
             cgroup,
-        } => serve(&cli.socket, jail, uid, gid, netns, cgroup),
-        Cmd::Snapshot { diff } => api_snapshot(&cli.socket, diff),
+        } => serve(
+            &cli.socket,
+            ServeJailOptions {
+                jail_dir: jail,
+                uid,
+                gid,
+                netns,
+                isolate_network,
+                pid_namespace,
+                seccomp,
+            },
+            cgroup,
+        ),
+        Cmd::Snapshot { diff, live } => api_snapshot(&cli.socket, diff, live),
         Cmd::Create {
             kernel,
             cmdline,
@@ -485,7 +652,7 @@ fn main() -> Result<()> {
             overlay,
         } => cmd_create(
             &cli.socket,
-            kernel,
+            kernel_install::resolve(kernel)?,
             cmdline,
             initramfs,
             mem,
@@ -508,6 +675,12 @@ fn main() -> Result<()> {
         Cmd::Suspend => api_request(&cli.socket, &vmm_api::types::ApiRequest::Suspend),
         Cmd::Resume => api_request(&cli.socket, &vmm_api::types::ApiRequest::Resume),
         Cmd::Status => api_request(&cli.socket, &vmm_api::types::ApiRequest::Status),
+        Cmd::Balloon { target } => api_request(
+            &cli.socket,
+            &target.map_or(vmm_api::types::ApiRequest::Balloon, |target_mib| {
+                vmm_api::types::ApiRequest::SetBalloon { target_mib }
+            }),
+        ),
         Cmd::UpdateEgress {
             allow,
             allow_existing,
@@ -525,6 +698,11 @@ fn main() -> Result<()> {
             auth,
             agent,
         } => pull_oci(image, output, size, auth, agent),
+        Cmd::Kernel { command } => match command {
+            KernelCommand::Install { output, force } => {
+                kernel_install::install(output, force).map(|_| ())
+            }
+        },
     }
 }
 
@@ -567,6 +745,7 @@ fn run(
             rlimit_nofile: 4096,
             rlimit_as,
             netns: String::new(),
+            isolate_network: false,
         };
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
@@ -700,6 +879,7 @@ fn build_volume_configs(
             path: rfs.into(),
             read_only: false,
             overlay: None,
+            inherited_fd: None,
         });
     }
 
@@ -722,6 +902,7 @@ fn parse_volume_spec(spec: &str) -> vmm_core::config::VolumeConfig {
         path: path.into(),
         read_only,
         overlay: None,
+        inherited_fd: None,
     }
 }
 
@@ -847,14 +1028,14 @@ fn boot_on_kvm(
     if full_boot {
         // Build the device list for ACPI DSDT: each volume + net gets
         // a virtio-mmio device entry at its MMIO address with its GSI.
-        let mut acpi_devices: Vec<(u64, u64, u32)> = Vec::new();
+        let mut acpi_devices: Vec<(u64, u64, u32, bool)> = Vec::new();
         let mut acpi_mmio = 0xd000_0000u64;
         for i in 0..volumes.len() {
-            acpi_devices.push((acpi_mmio, 0x1000, 5 + i as u32));
+            acpi_devices.push((acpi_mmio, 0x1000, 5 + i as u32, true));
             acpi_mmio += 0x1000;
         }
         if net_spec.is_some() {
-            acpi_devices.push((acpi_mmio, 0x1000, 5 + volumes.len() as u32));
+            acpi_devices.push((acpi_mmio, 0x1000, 5 + volumes.len() as u32, true));
         }
         vmm_core::vcpu_setup::write_acpi_tables_with_devices(mem, vcpus, &acpi_devices)?;
     }
@@ -862,6 +1043,13 @@ fn boot_on_kvm(
     let template = vmm_core::cpu_template::CpuTemplate::bare();
     let vm = KvmVm::new_with_options(mem.clone(), devices, template, full_boot)
         .map_err(|e| anyhow::anyhow!("KvmVm: {e}"))?;
+
+    // Even the direct CLI boot path exposes a non-zero generation value. The
+    // controller restore path additionally queues a change notification before
+    // any restored vCPU enters KVM_RUN.
+    let vmgenid = vmm_core::vmgenid::VmGenId::new(mem)?;
+    vm.register_irqfd(vmgenid.eventfd(), vmm_core::vmgenid::VMGENID_GSI)
+        .map_err(|e| anyhow::anyhow!("VM Generation ID irqfd: {e}"))?;
 
     // Register irqfds + ioeventfds with KVM.
     for (i, evt) in irq_evts.iter().enumerate() {
@@ -937,7 +1125,31 @@ fn boot_on_kvm(
     let _ = vcpus;
     Ok(())
 }
-fn restore(snapshot: String, jail_dir: Option<String>, uid: u32, gid: u32) -> Result<()> {
+fn restore(
+    socket: &str,
+    snapshot: String,
+    memory_policy: RestoreMemoryPolicyArg,
+    jail_dir: Option<String>,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    if api_socket_is_listening(socket)? {
+        anyhow::ensure!(
+            jail_dir.is_none(),
+            "--jail is available only for standalone restore without a running API socket"
+        );
+        return api_request(
+            socket,
+            &vmm_api::types::ApiRequest::Restore {
+                snapshot_path: snapshot,
+                memory_integrity: None,
+                overlay: None,
+                net: None,
+                volumes: None,
+                memory_policy: memory_policy.into(),
+            },
+        );
+    }
     // Apply jailer confinement before restoring, if requested.
     #[cfg(target_os = "linux")]
     if let Some(chroot_dir) = &jail_dir {
@@ -950,6 +1162,7 @@ fn restore(snapshot: String, jail_dir: Option<String>, uid: u32, gid: u32) -> Re
             rlimit_nofile: 4096,
             rlimit_as: 0,
             netns: String::new(),
+            isolate_network: false,
         };
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
@@ -962,31 +1175,73 @@ fn restore(snapshot: String, jail_dir: Option<String>, uid: u32, gid: u32) -> Re
     log::info!("restore: snapshot={snapshot}");
     let controller = vmm_core::VmmController::new();
     controller
-        .restore(&snapshot, None)
+        .restore_with_overrides(&snapshot, None, None, memory_policy.into())
         .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
     println!("Restored VM from {snapshot}");
     Ok(())
 }
 
-fn serve(
-    socket: &str,
+fn api_socket_is_listening(socket: &str) -> Result<bool> {
+    use std::os::unix::fs::FileTypeExt as _;
+    use std::os::unix::net::UnixStream;
+
+    let path = std::path::Path::new(socket);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_socket() {
+        return Ok(false);
+    }
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct ServeJailOptions {
     jail_dir: Option<String>,
     uid: u32,
     gid: u32,
     netns: Option<String>,
-    cgroup: ServeCgroupArgs,
-) -> Result<()> {
+    isolate_network: bool,
+    pid_namespace: bool,
+    seccomp: bool,
+}
+
+fn serve(socket: &str, jail: ServeJailOptions, cgroup: ServeCgroupArgs) -> Result<()> {
+    let ServeJailOptions {
+        jail_dir,
+        uid,
+        gid,
+        netns,
+        isolate_network,
+        pid_namespace,
+        seccomp,
+    } = jail;
     // Apply jailer confinement before serving, if requested. The RPC server
     // binds the Unix socket after chroot, so `socket` is interpreted inside the
     // jail; the orchestrator must make <chroot>/<socket> reachable externally.
     // It must also provide /dev/kvm inside the jail and choose a uid/gid with
     // KVM access (for example via the kvm group) before launching this process.
     let cgroup_limits = cgroup.limits();
+    let jailed_seccomp = resolve_jailed_seccomp(jail_dir.as_deref(), seccomp)?;
+    if jailed_seccomp {
+        log::info!("serve: mandatory built-in seccomp profile enabled for jail mode");
+    }
     #[cfg(target_os = "linux")]
     let mut netns_entered = false;
     #[cfg(target_os = "linux")]
     if let Some(chroot_dir) = &jail_dir {
-        let requested_netns = netns.as_deref().is_some_and(|path| !path.is_empty());
         let cfg = vmm_jailer::jailer::JailerConfig {
             chroot_dir: chroot_dir.clone(),
             uid,
@@ -996,9 +1251,24 @@ fn serve(
             rlimit_nofile: 4096,
             rlimit_as: 0,
             netns: netns.clone().unwrap_or_default(),
+            isolate_network,
         };
+        if pid_namespace {
+            if !cfg.cgroup.is_empty() {
+                vmm_jailer::cgroups::apply_current_process(&cfg.cgroup, cfg.cgroup_limits.as_ref())
+                    .map_err(|e| anyhow::anyhow!("PID namespace launcher cgroup: {e}"))?;
+            }
+            match vmm_jailer::launch_pid_namespace(uid, gid)
+                .map_err(|e| anyhow::anyhow!("PID namespace launcher: {e}"))?
+            {
+                vmm_jailer::PidNamespaceRole::Child => {}
+                vmm_jailer::PidNamespaceRole::ParentExit(code) => {
+                    std::process::exit(code);
+                }
+            }
+        }
         vmm_jailer::jail(&cfg).map_err(|e| anyhow::anyhow!("jail: {e}"))?;
-        netns_entered = requested_netns;
+        netns_entered = netns.is_some();
         log::info!("jailer confinement applied: chroot={chroot_dir} uid={uid} gid={gid}");
     }
     #[cfg(target_os = "linux")]
@@ -1019,11 +1289,29 @@ fn serve(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (jail_dir, uid, gid, netns, cgroup, cgroup_limits);
+        let _ = (
+            jail_dir,
+            uid,
+            gid,
+            netns,
+            isolate_network,
+            pid_namespace,
+            seccomp,
+            cgroup,
+            cgroup_limits,
+        );
     }
 
     log::info!("serve: API on {socket}");
     vmm_api::rpc::serve(socket).map_err(|e| anyhow::anyhow!("api serve: {e}"))
+}
+
+fn resolve_jailed_seccomp(jail_dir: Option<&str>, compatibility_flag: bool) -> Result<bool> {
+    anyhow::ensure!(
+        jail_dir.is_some() || !compatibility_flag,
+        "--seccomp requires --jail"
+    );
+    Ok(jail_dir.is_some())
 }
 
 #[cfg(target_os = "linux")]
@@ -1037,28 +1325,43 @@ fn apply_serve_cgroup(
     Ok(())
 }
 
-fn api_snapshot(socket: &str, diff: bool) -> Result<()> {
-    let request = vmm_api::types::ApiRequest::Snapshot { diff };
+fn api_snapshot(socket: &str, diff: bool, live: bool) -> Result<()> {
+    let request = vmm_api::types::ApiRequest::Snapshot { diff, live };
     let body = serde_json::to_vec(&request)?;
     let response = send_raw(socket, &body)?;
     let response: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;
-    let path = match &response {
-        vmm_api::types::ApiResponse::Snapshot { path } => path,
+    let (path, overlay_path, integrity_path) = match &response {
+        vmm_api::types::ApiResponse::Snapshot {
+            path,
+            overlay_path,
+            integrity_path,
+            ..
+        } => (path, overlay_path, integrity_path),
         vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("snapshot failed: {msg}"),
         other => anyhow::bail!("unexpected snapshot response: {other:?}"),
     };
-    let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
-        .map_err(|error| anyhow::anyhow!("capture snapshot identity {path}: {error}"))?;
-    let release = vmm_api::types::ApiRequest::ReleaseScratch {
-        path: path.clone(),
-        identity,
-    };
-    let release = serde_json::to_vec(&release)?;
-    let release = send_raw(socket, &release)?;
-    match serde_json::from_slice::<vmm_api::types::ApiResponse>(&release)? {
-        vmm_api::types::ApiResponse::Ok => {}
-        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("release snapshot: {msg}"),
-        other => anyhow::bail!("unexpected release response: {other:?}"),
+    for owned_path in std::iter::once(path)
+        .chain(overlay_path.iter())
+        .chain(integrity_path.iter())
+    {
+        let identity =
+            vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(owned_path))
+                .map_err(|error| {
+                    anyhow::anyhow!("capture snapshot identity {owned_path}: {error}")
+                })?;
+        let release = vmm_api::types::ApiRequest::ReleaseScratch {
+            path: owned_path.clone(),
+            identity,
+        };
+        let release = serde_json::to_vec(&release)?;
+        let release = send_raw(socket, &release)?;
+        match serde_json::from_slice::<vmm_api::types::ApiResponse>(&release)? {
+            vmm_api::types::ApiResponse::Ok => {}
+            vmm_api::types::ApiResponse::Err { msg } => {
+                anyhow::bail!("release snapshot artifact: {msg}")
+            }
+            other => anyhow::bail!("unexpected release response: {other:?}"),
+        }
     }
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -1068,6 +1371,9 @@ fn api_request(socket: &str, req: &vmm_api::types::ApiRequest) -> Result<()> {
     let body = serde_json::to_vec(req)?;
     let resp = send_raw(socket, &body)?;
     let resp: vmm_api::types::ApiResponse = serde_json::from_slice(&resp)?;
+    if let vmm_api::types::ApiResponse::Err { msg } = &resp {
+        anyhow::bail!(msg.clone());
+    }
     println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
@@ -1109,6 +1415,10 @@ fn attach_pty(socket: &str, shell: Option<String>) -> Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     vmm_api::rpc::write_frame(&mut stream, &body)?;
     stream.flush()?;
+    // The initial control frame has a bounded deadline; the PTY stream itself
+    // is intentionally long-lived and uses poll-driven backpressure.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
 
     let _raw = RawTerminal::enter(libc::STDIN_FILENO)?;
     install_sigwinch_handler();
@@ -1321,31 +1631,34 @@ fn pull_oci(
 }
 
 fn send_raw(socket: &str, body: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Read;
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(socket)?;
     vmm_api::rpc::write_frame(&mut stream, body)?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let declared_len = u32::from_be_bytes(len_buf);
-    let len = usize::try_from(declared_len)
-        .map_err(|_| anyhow::anyhow!("api response frame length does not fit usize"))?;
-    if len > vmm_api::rpc::MAX_FRAME_BYTES {
-        anyhow::bail!(
-            "api response frame too large: {len} bytes (max {})",
-            vmm_api::rpc::MAX_FRAME_BYTES
-        );
-    }
-    let mut resp_buf = vec![0u8; len];
-    stream.read_exact(&mut resp_buf)?;
-    Ok(resp_buf)
+    // Requests are small and framed writes keep the control deadline; the
+    // response wait is unbounded because exec, snapshot, and restore can
+    // legitimately take longer than the control-plane I/O timeout.
+    Ok(vmm_api::rpc::read_frame_unbounded(&mut stream)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_socket_probe_distinguishes_live_stale_and_regular_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("vmm.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(api_socket_is_listening(socket.to_str().unwrap()).unwrap());
+
+        drop(listener);
+        assert!(!api_socket_is_listening(socket.to_str().unwrap()).unwrap());
+
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::write(&socket, b"not a socket").unwrap();
+        assert!(!api_socket_is_listening(socket.to_str().unwrap()).unwrap());
+    }
 
     #[test]
     fn cli_accepts_overlay_for_volume() {
@@ -1369,6 +1682,40 @@ mod tests {
                 assert_eq!(overlay, vec!["/overlay.cow"]);
             }
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_allows_default_kernel_for_run() {
+        let cli = Cli::try_parse_from(["vmm", "run"]).unwrap();
+        match cli.cmd {
+            Cmd::Run { kernel, .. } => assert!(kernel.is_none()),
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn cli_accepts_kernel_install() {
+        let cli = Cli::try_parse_from([
+            "vmm",
+            "kernel",
+            "install",
+            "--output",
+            "/tmp/vmlinux",
+            "--force",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Kernel {
+                command: KernelCommand::Install { output, force },
+            } => {
+                assert_eq!(
+                    output.as_deref(),
+                    Some(std::path::Path::new("/tmp/vmlinux"))
+                );
+                assert!(force);
+            }
+            _ => panic!("expected kernel install command"),
         }
     }
 
@@ -1466,6 +1813,10 @@ mod tests {
             "1000m",
             "--cgroup-pids-max",
             "64",
+            "--cgroup-io-weight",
+            "500",
+            "--cgroup-io-max",
+            "8:0 rbps=1048576 wiops=200\n8:16 wbps=max",
             "--cpuset",
             "0-1",
         ])
@@ -1479,8 +1830,10 @@ mod tests {
                     Some(vmm_jailer::cgroups::CgroupLimits {
                         cpu_max: Some("100000 100000".into()),
                         cpuset_cpus: Some("0-1".into()),
+                        io_weight: Some(500),
                         memory_max: Some(536_870_912),
                         pids_max: Some(64),
+                        io_max: Some("8:0 rbps=1048576 wiops=200\n8:16 wbps=max".into()),
                         ..Default::default()
                     })
                 );
@@ -1492,5 +1845,87 @@ mod tests {
     #[test]
     fn serve_cgroup_limit_flags_require_cgroup_path() {
         assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-memory-max", "512M",]).is_err());
+        assert!(Cli::try_parse_from(["vmm", "serve", "--cgroup-io-max", "8:0 rbps=1"]).is_err());
+    }
+
+    #[test]
+    fn jailed_serve_automatically_enables_seccomp_profile() {
+        let cli = Cli::try_parse_from([
+            "vmm",
+            "serve",
+            "--jail",
+            "/srv/jails/vm-1",
+            "--uid",
+            "20000",
+            "--gid",
+            "30000",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Serve {
+                jail,
+                seccomp,
+                netns,
+                ..
+            } => {
+                assert!(!seccomp);
+                assert!(netns.is_none());
+                assert!(resolve_jailed_seccomp(jail.as_deref(), seccomp).unwrap());
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn jailed_serve_accepts_legacy_seccomp_flag_but_rejects_disable() {
+        let cli = Cli::try_parse_from(["vmm", "serve", "--jail", "/srv/jails/vm-1", "--seccomp"])
+            .unwrap();
+        match cli.cmd {
+            Cmd::Serve { jail, seccomp, .. } => {
+                assert!(seccomp);
+                assert!(resolve_jailed_seccomp(jail.as_deref(), seccomp).unwrap());
+            }
+            _ => panic!("expected serve command"),
+        }
+
+        assert!(Cli::try_parse_from(["vmm", "serve", "--seccomp"]).is_err());
+        assert!(Cli::try_parse_from(
+            ["vmm", "serve", "--jail", "/srv/jails/vm-1", "--no-seccomp",]
+        )
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "vmm",
+            "serve",
+            "--jail",
+            "/srv/jails/vm-1",
+            "--seccomp=false",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn serve_help_describes_mandatory_automatic_seccomp() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--jail enables the profile automatically"));
+        assert!(help.contains("jail mode cannot disable it"));
+    }
+
+    #[test]
+    fn io_max_parser_rejects_malformed_or_duplicate_devices() {
+        assert_eq!(
+            parse_cgroup_io_max("8:0 rbps=1024 wiops=max\n8:16 wbps=2048").unwrap(),
+            "8:0 rbps=1024 wiops=max\n8:16 wbps=2048"
+        );
+        assert!(parse_cgroup_io_max("8 rbps=1").is_err());
+        assert!(parse_cgroup_io_max("8:0 rbps=0").is_err());
+        assert!(parse_cgroup_io_max("8:0 unknown=1").is_err());
+        assert!(parse_cgroup_io_max("8:0 rbps=1\n8:0 wbps=2").is_err());
     }
 }

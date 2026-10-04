@@ -6,7 +6,7 @@
 
 At least one API key is required. Configure it with `TARIT_API_KEY`, `TARIT_API_KEYS`, or `[api_keys]` in `TARIT_CONFIG`. In cluster mode, also set `TARIT_PEER_SECRET` to the same strong value on every node. All other daemon settings have code defaults, although host paths such as the VMM binary, kernel, and rootfs must still point to usable files for VM creation to work.
 
-Boolean environment variables that use `env_bool` accept `1`, `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off` for false. Invalid boolean and numeric values usually fall back to the default or file value unless listed under startup validation.
+Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off` for false. Invalid booleans fail startup.
 
 ## Core / identity
 
@@ -16,11 +16,11 @@ Boolean environment variables that use `env_bool` accept `1`, `true`, `yes`, or 
 | `TARIT_API_KEYS` | comma-separated string | unset | Multi-key config. Format is `key:tenant:role[:max_vms]`. `role` is `admin` or `user`. Omitted or `0` `max_vms` means unlimited. Entries are added to any TOML keys. |
 | `TARIT_LISTEN` | socket address | `0.0.0.0:8080` | HTTP bind address for public and internal routes. Invalid socket addresses are rejected. |
 | `TARIT_HOST_ID` | string | output of `hostname`, else `localhost` | Stable node identity used in local records and fleet ownership. |
-| `TARIT_RPC_ADDR` | string | `http://{listen.ip()}:{listen.port()}` | HTTP base address advertised to peers. In cluster mode, set this to an address other nodes can reach. |
+| `TARIT_RPC_ADDR` | string | `http://{listen.ip()}:{listen.port()}` | HTTP(S) origin advertised to peers. In cluster mode, set this to an address other nodes can reach; HTTPS is required unless insecure peer HTTP is explicitly enabled for development. |
 | `TARIT_VMM_BIN` | path | `vmm` (looked up on `PATH`) | Path to the rust-vmm based `vmm` binary. `~/` is expanded. |
-| `TARIT_KERNEL` | path | `/tmp/vmlinux.microvm` | Default guest kernel path used when a create request omits `kernel_path`. `~/` is expanded. |
+| `TARIT_KERNEL` | path | `/tmp/vmlinux.microvm` | Default guest kernel path used when a create request omits `kernel_path`. `make guest` writes the release kernel to `guest-assets/vmlinux`. `~/` is expanded. |
 | `TARIT_ROOTFS` | path | `/tmp/debian-rootfs.ext4` | Default rootfs path used when a create request omits `rootfs_path`. `~/` is expanded. |
-| `TARIT_ROOTFS_READONLY` | bool | `false` | Attach the rootfs read-only and use a read-only root kernel command-line mode. |
+| `TARIT_ROOTFS_READONLY` | bool | `false` | Request read-only guest mount semantics (`ro` kernel cmdline). The host base is always immutable and every VM gets a private CoW overlay. |
 | `TARIT_SOCKET_DIR` | path | `~/.taritd/sockets` | Directory for per-VM VMM Unix domain sockets. `~/` is expanded. |
 | `TARIT_DB` | path | `~/.taritd/fleet.db` | Node-local SQLite database path. `~/` is expanded. |
 | `TARIT_IMAGES_DIR` | path | `~/.taritd/images` | Directory for registered rootfs images. `~/` is expanded. |
@@ -31,9 +31,15 @@ Boolean environment variables that use `env_bool` accept `1`, `true`, `yes`, or 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `TARIT_DATABASE_URL` | string | unset | PostgreSQL fleet registry URL. Empty string is treated as unset. Setting this enables distributed fleet behavior. |
-| `TARIT_PEER_SECRET` | string | random local-only value | Shared secret for peer requests. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
+| `TARIT_PEER_SECRET` | string | random local-only value | Key for short-lived, source/target-bound peer request HMACs. It is never sent on the wire. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
+| `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. |
+| `TARIT_PRODUCTION` | bool | `false` | Enforce the strict production configuration gates, including per-VM PID and network namespaces. This does not by itself satisfy every release gate in `PRODUCTION_READINESS.md`. |
+| `TARIT_IMAGE_REQUIRE_SIGNATURE` | bool | `false` | Require registered OCI images to have been verified with the currently configured cosign public key. `TARIT_PRODUCTION=1` requires this setting. Non-admin production creates must name a registered image and cannot fall back to the raw node default rootfs. |
+| `TARIT_IMAGE_COSIGN_KEY` | path | unset | Trusted cosign public key used at image admission. The key is hashed into the immutable image record; rotating the configured key fences images admitted by the old policy until they are explicitly readmitted or the old key is restored. |
 | `TARIT_REAP_ON_SHUTDOWN` | bool | `true` | On SIGTERM or SIGINT, stop local `vmm serve` children after HTTP drain. |
 | `TARIT_RDS_CA_FILE` | path | unset | Extra CA bundle for PostgreSQL TLS. This is read by the fleet connector, not by `Config::from_env()`. Empty string is ignored. |
+| `TARIT_ARTIFACT_MIN_REPLICAS` | positive u64 | `1` development, `2` production | Minimum verified available physical copies before a fleet artifact is `ready`. PostgreSQL recomputes existing rows at startup; callers cannot self-declare readiness. |
+| `TARIT_ARTIFACT_MIN_FAILURE_DOMAINS` | positive u64 | `1` development, `2` production | Minimum distinct replica failure-domain labels required for readiness. Must not exceed `TARIT_ARTIFACT_MIN_REPLICAS`. |
 
 `TARIT_RPC_ADDR` is listed in Core / identity because it is always present. In cluster mode it should be a stable private URL reachable by every peer.
 
@@ -46,6 +52,9 @@ Boolean environment variables that use `env_bool` accept `1`, `true`, `yes`, or 
 | `TARIT_MAX_MEMORY_MIB` | u64 | `65536` | Local memory placement ceiling in MiB. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | u64 | `60000` | Time a create operation may wait for capacity before admission gives up. |
 | `TARIT_CPU_OVERCOMMIT` | f64 | `4.0` | Warm-pool CPU overcommit ratio. Also affects derived `TARIT_MAX_VCPUS` when the warm pool is enabled and `TARIT_MAX_VCPUS` is unset. |
+| `TARIT_PTY_MAX_ACTIVE_CONNECTIONS` | positive usize | `1024` | Node-wide active guest PTY WebSocket limit. |
+| `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT` | positive usize | `128` | Active guest PTY limit for one authenticated tenant. Must be less than the node-wide limit so one tenant cannot consume every slot. |
+| `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM` | positive usize | `16` | Active guest PTY limit for one VM. Must not exceed the per-tenant limit. |
 
 ## Warm pool
 
@@ -63,6 +72,69 @@ Boolean environment variables that use `env_bool` accept `1`, `true`, `yes`, or 
 | `TARIT_REFILL_CPU_WEIGHT` | u64 | `10` | cgroup v2 `cpu.weight` for refill children. Values are clamped to `1..=10000`. |
 
 The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = false`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
+
+## VMM jail
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_VM_JAIL_BASE` | path | unset | Absolute parent directory for private per-VM jail roots. |
+| `TARIT_VM_JAIL_UID_BASE` | positive u32 | unset | First uid in the dedicated per-VM identity range. |
+| `TARIT_VM_JAIL_GID_BASE` | positive u32 | unset | First gid in the dedicated per-VM identity range. |
+| `TARIT_VM_JAIL_ID_COUNT` | positive u32 | `TARIT_MAX_VMS` | Number of uid/gid identities reserved for VMMs. |
+| `TARIT_VM_JAIL_PROFILE` | string | `chroot-mount-uts-ipc-v1` | Supported jail profile. |
+| `TARIT_VM_JAIL_SECCOMP` | bool | `true` | Mandatory built-in VMM seccomp policy. |
+| `TARIT_VM_JAIL_PID_NAMESPACE` | bool | `false` | Launch the VMM child as PID 1 in a dedicated PID namespace. Required by `TARIT_PRODUCTION=1`. |
+| `TARIT_VM_JAIL_NETWORK_NAMESPACE` | bool | `false` | Put the VMM process in an empty network namespace. taritd passes the host-owned TAP queue as an inherited descriptor. Required by `TARIT_PRODUCTION=1`. |
+
+Network namespace isolation does not move the TAP out of the host namespace.
+The host retains the TAP, nftables, routing, and traffic-control topology;
+only the VMM process is isolated. taritd opens the provisioned TAP before
+launch and transfers that queue descriptor to the jailed VMM.
+
+## Per-VM resource limits
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_VM_CGROUP_PARENT` | absolute path | unset | Dedicated cgroup v2 parent for one `tarit-<vm_id>` child per VM. When set, taritd applies CPU, memory, and PID limits to cold boots, restores, and recovered VMs. |
+| `TARIT_VM_CGROUP_PIDS_MAX` | positive u64 | `1024` | Per-VM `pids.max`. Used only with `TARIT_VM_CGROUP_PARENT`. |
+| `TARIT_VM_IO_READ_BPS_MAX` | positive u64 | unset | Per-VM block read bandwidth limit in bytes per second. |
+| `TARIT_VM_IO_WRITE_BPS_MAX` | positive u64 | unset | Per-VM block write bandwidth limit in bytes per second. |
+| `TARIT_VM_IO_READ_IOPS_MAX` | positive u64 | unset | Per-VM block read operations per second limit. |
+| `TARIT_VM_IO_WRITE_IOPS_MAX` | positive u64 | unset | Per-VM block write operations per second limit. |
+| `TARIT_VM_NET_INGRESS_BPS_MAX` | positive u64 | unset | Guest ingress bandwidth limit on the TAP root qdisc. Requires `TARIT_ENABLE_NET=1`. |
+| `TARIT_VM_NET_EGRESS_BPS_MAX` | positive u64 | unset | Guest egress policer on the TAP ingress hook. Requires `TARIT_ENABLE_NET=1`. |
+
+The cgroup parent must be below `/sys/fs/cgroup`, have the `cpu`, `memory`,
+`pids`, and `io` controllers delegated, and be writable by taritd. I/O limits
+apply to every distinct block device backing the rootfs and its overlay.
+Partition-backed filesystems are resolved to their parent block device before
+writing `io.max`. Any configured I/O limit requires
+`TARIT_VM_CGROUP_PARENT`.
+
+The CPU limit is derived from the reserved vCPU count. The memory limit is the
+guest memory plus 50 percent and 256 MiB for VMM overhead. Reconciliation
+rewrites and verifies the expected cgroup and traffic-control state after a
+taritd restart, including reset of obsolete `io.max` entries and removal of
+obsolete network limits.
+
+## Disk pressure and artifact GC
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `TARIT_DISK_BYTES_HIGH_WATERMARK` | positive u64 | unset | Used-byte threshold that enters disk pressure. Must be paired with the byte low watermark. |
+| `TARIT_DISK_BYTES_LOW_WATERMARK` | positive u64 | unset | Used-byte threshold below which byte pressure clears. Must be lower than the byte high watermark. |
+| `TARIT_DISK_INODES_HIGH_WATERMARK` | positive u64 | unset | Used-inode threshold that enters disk pressure. Must be paired with the inode low watermark. |
+| `TARIT_DISK_INODES_LOW_WATERMARK` | positive u64 | unset | Used-inode threshold below which inode pressure clears. Must be lower than the inode high watermark. |
+| `TARIT_ARTIFACT_GC_INTERVAL_SECS` | positive u64 | `30` | Pressure refresh and owned-artifact sweep interval. |
+| `TARIT_ARTIFACT_GC_MIN_AGE_SECS` | positive u64 | `300` | Minimum age before an unreferenced Tarit-owned artifact can be collected. |
+
+Watermarks are absolute filesystem usage values, not percentages. Configure
+them from the usable capacity and operating reserve of each host image.
+Pressure is latched at the high watermark and clears only below the matching low
+watermark. While active, VM create, restore, snapshot reservation, and warm-pool
+refill return or apply backpressure. GC only removes recognized Tarit-owned
+artifacts that are old enough and absent from the active runtime and snapshot
+reference sets.
 
 ## Autoscaling
 
@@ -214,7 +286,7 @@ export TARIT_LISTEN='0.0.0.0:8080'
 export TARIT_HOST_ID="$(hostname)"
 export TARIT_RPC_ADDR='http://127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"
@@ -229,9 +301,10 @@ export TARIT_PEER_SECRET='replace-with-a-long-random-peer-secret'
 export TARIT_DATABASE_URL='postgres://user:password@postgres.example:5432/taritd?sslmode=require'
 export TARIT_HOST_ID='node-a'
 export TARIT_LISTEN='0.0.0.0:8080'
-export TARIT_RPC_ADDR='http://10.0.1.10:8080'
+# HTTPS endpoint supplied by the private peer TLS proxy.
+export TARIT_RPC_ADDR='https://node-a.peer.example.com:8443'
 export TARIT_VMM_BIN='/opt/taritd/bin/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/node-a/sockets"
 export TARIT_DB="$HOME/.taritd/node-a/fleet.db"
@@ -243,6 +316,13 @@ export TARIT_MAX_MEMORY_MIB='65536'
 ```
 
 Nodes B and C should use the same API key, peer secret, database URL, VMM binary, kernel, and rootfs, but distinct `TARIT_HOST_ID`, `TARIT_RPC_ADDR`, `TARIT_SOCKET_DIR`, `TARIT_DB`, and usually `TARIT_IMAGES_DIR`.
+The HTTPS proxy must deny every route except `/internal/v1/*`, support WebSocket
+upgrades, and preserve the method, path, query, body, and `X-Tarit-*` headers
+exactly; `taritd` performs the request-HMAC authentication. Its certificate SAN
+must match the `TARIT_RPC_ADDR` host and chain to the WebPKI roots used by the
+built-in Rustls clients. There is no custom peer-CA setting yet. For an isolated
+development cluster without a compatible TLS proxy, use a private `http://`
+origin and set `TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
 
 ## Startup validation rules
 
@@ -253,6 +333,12 @@ Nodes B and C should use the same API key, peer secret, database URL, VMM binary
 - If `TARIT_CONFIG` exists, it must be readable and valid TOML. Error contexts are `read config file {path}` and `parse config file {path}`.
 - At least one API key must be configured: `configure at least one API key with TARIT_API_KEY, TARIT_API_KEYS, or [api_keys] in TARIT_CONFIG`.
 - `TARIT_API_KEY` must not be empty: `TARIT_API_KEY must not be empty`.
+- Cluster peer origins must use HTTPS unless
+  `TARIT_ALLOW_INSECURE_PEER_HTTP=1`; production mode always forbids insecure
+  peer HTTP.
+- PTY active-connection limits must be positive; the per-tenant limit must be
+  less than the global limit, and the per-VM limit must not exceed the
+  per-tenant limit.
 - `TARIT_API_KEYS` must not be empty when set: `TARIT_API_KEYS must not be empty when set`.
 - Each `TARIT_API_KEYS` entry must have three or four fields: `TARIT_API_KEYS entries must be key:tenant:role[:max_vms]`.
 - `TARIT_API_KEYS` entries reject empty keys and tenants: `TARIT_API_KEYS entries must not contain empty keys` and `TARIT_API_KEYS entries must not contain empty tenants`.
@@ -262,5 +348,7 @@ Nodes B and C should use the same API key, peer secret, database URL, VMM binary
 - API keys from all sources must not be empty or duplicated: `API keys must not be empty` and `duplicate API key configured`.
 - Tenant IDs must be non-empty and contain only ASCII letters, digits, `.`, `_`, or `-`: `tenant id must not be empty` and `tenant id may only contain ASCII letters, digits, '.', '_', or '-'`.
 - Cluster mode requires a strong peer secret: `TARIT_PEER_SECRET must be set to a strong value when TARIT_DATABASE_URL is configured for a fleet`.
+- `TARIT_PRODUCTION=1` requires the per-VM jail, PID namespace, network
+  namespace, cgroup, and path-staging controls to be enabled together.
 - Warm-pool watermarks must be ordered: `warm-pool watermarks for {vcpus} vCPU/{memory_mib} MiB must satisfy hard_floor <= low_watermark <= target <= high_watermark (got {hard_floor} <= {low_watermark} <= {target} <= {high_watermark})`.
 - A warm-pool class cannot set both `image` and `rootfs`: `warm-pool class for {vcpus} vCPU/{memory_mib} MiB cannot set both image and rootfs`.

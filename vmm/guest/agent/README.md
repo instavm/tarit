@@ -4,7 +4,7 @@
 (`/dev/ttyS0`) and vsock port 1024, plus interactive PTY sessions over vsock
 port 1025.
 
-For exec, the host writes one line to the 8250 serial port (`/dev/ttyS0`):
+For serial exec, the host writes one line to the 8250 serial port (`/dev/ttyS0`):
 
 ```text
 VMM_EXEC:<command>\n
@@ -19,6 +19,12 @@ VMM_EXEC_EXIT=<exit-code>
 ```
 
 Blank lines and non-`VMM_EXEC:` lines are ignored. Failed commands do not stop the agent.
+
+For vsock exec, the agent still announces `VMM_AGENT_READY`, then advertises
+`VMM_VSOCK_EXEC_PROTO=2`. Hosts that understand protocol v2 switch to chunked
+frames (`VEX2`) with a request id plus separate stdout, stderr, and exit
+messages; older hosts ignore the capability line and keep using the legacy
+newline-delimited `VMM_EXEC:` transport.
 
 For PTY sessions, the VMM connects to guest vsock port 1025, sends a START
 frame (`{"cols":N,"rows":N,"shell":...}`), and the agent allocates a fresh PTY

@@ -13,17 +13,50 @@ reads hit overlay-or-base). The base file stays byte-for-byte unchanged, so:
 
 - **Isolated:** VM A's writes land in `A`'s overlay only; VM B never sees them,
   and vice-versa. Deleting a VM removes its overlay.
-- **Writable:** the guest mounts `/` read-write (writes go to the overlay).
+- **Writable by default:** the guest mounts `/` read-write and writes go to the
+  overlay. `TARIT_ROOTFS_READONLY=true` instead requests a read-only guest mount
+  without changing host-side base isolation.
 - **Thin-provisioned / inflatable:** the overlay stores only written sectors, so
   it costs ~0 bytes until filled, up to the base's virtual size. Make the base a
   large sparse ext4 (e.g. 3 GB) to hand every VM a big writable disk for free.
 
 Wiring: `tarit-vmm-client::VolumeConfig.overlay`, set per VM in
-`taritd`'s `build_vmm_config` as `/tmp/vmm-ov-<vm-uuid>.cow`; removed in
-`stop_vm`. Restore-based warm-pool clones pass the same per-VM path as the VMM
+`taritd`'s `build_vmm_config` under the protected
+`<TARIT_SOCKET_DIR>/overlays/<vm-uuid>.cow` directory; removed in `stop_vm`.
+Restore-based warm-pool clones pass the same per-VM path as the VMM
 `Restore.overlay` override, so clones restored from one golden snapshot do not
-share writable disk state. A read-only base with an overlay boots
-`root=/dev/vda rw`.
+share writable disk state. Jailed restores use a VM-specific in-jail overlay
+name, and taritd persists that runtime path so a restored VM can be snapshotted
+and restored again without aliasing the source disk.
+
+## Production confinement gate
+
+`TARIT_PRODUCTION=1` fails closed unless the per-VM jail, cgroup, PID namespace,
+and process network namespace are enabled together. taritd keeps each TAP,
+routing policy, nftables state, and traffic control in the host namespace. It
+opens the TAP queue before launch and passes the validated descriptor to the
+VMM child after that child enters an otherwise empty network namespace.
+
+The launch boundary:
+
+- allocate a unique nonzero UID/GID and a private PID, mount and network
+  namespace for every VM;
+- create a root-owned, non-writable jail root and bind/pre-open `/dev/kvm`, the
+  kernel/initramfs and base disks read-only, with only the VM overlay and
+  runtime/snapshot directory writable by the VM identity;
+- map the host control socket to an in-jail path and rewrite every Create,
+  Restore and snapshot asset path so chroot cannot turn it into a missing or
+  host-relative path;
+- apply mandatory cgroup v2 CPU, memory, swap, PIDs and I/O limits before guest
+  code runs, then verify the child is in the intended cgroup and namespaces;
+- retain mount, namespace, pidfd and artifact ownership in the supervisor until
+  confirmed process exit, then unmount and remove them in a retryable cleanup
+  path.
+
+Partial staging must fail the VM spawn. Falling back to an unjailed process is
+never a production recovery path. The privilege-dropped launcher remains in the
+host PID and network namespaces only to supervise the namespace child; it holds
+no Linux capabilities and does not process guest requests.
 
 ## Verified (bare metal, c8i.metal-48xl)
 

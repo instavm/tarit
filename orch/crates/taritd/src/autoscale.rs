@@ -322,10 +322,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let started = root.join("started");
+        let child_started = root.join("child-started");
         let survived = root.join("survived");
         let command = format!(
-            "echo started > '{}'; (sleep 0.2; echo survived > '{}') & wait",
+            "echo started > '{}'; (echo child-started > '{}'; sleep 5; echo survived > '{}') & wait",
             started.display(),
+            child_started.display(),
             survived.display()
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(None);
@@ -337,7 +339,7 @@ mod tests {
         ));
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !started.exists() {
+            while !started.exists() || !child_started.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -350,7 +352,7 @@ mod tests {
             .expect("shutdown must terminate and reap the provider child")
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !survived.exists(),
             "shutdown must terminate the provider process group, not only its shell"

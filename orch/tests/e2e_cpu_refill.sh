@@ -8,7 +8,7 @@ ORCH_ROOT="${ORCH_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 VMM_ROOT="${VMM_ROOT:-$ORCH_ROOT/../vmm}"
 TARITD_HOME="${TARITD_HOME:-$HOME/.taritd}"
 TARIT="${TARIT:-$ORCH_ROOT/target/debug/taritd}"
-BASE_ROOTFS="${BASE_ROOTFS:-/tmp/vsock-rootfs.ext4}"
+BASE_ROOTFS="${BASE_ROOTFS:-${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}}"
 ROOTFS=/tmp/refill-base.ext4
 CONFIG="${CONFIG:-$TARITD_HOME/refill.toml}"
 REFILL_CG=/sys/fs/cgroup/taritd-refill
@@ -17,7 +17,7 @@ TARGET=2
 export TARIT_API_KEY="refill-key"
 export TARIT_LISTEN="127.0.0.1:8080"
 export TARIT_VMM_BIN="$VMM_ROOT/target/debug/vmm"
-export TARIT_KERNEL="/tmp/vmlinux.microvm"
+export TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}"
 export TARIT_ROOTFS="$ROOTFS"
 export TARIT_ROOTFS_READONLY="1"
 export TARIT_ENABLE_NET="0"
@@ -83,4 +83,16 @@ echo "=== verdict ==="
 [ "$WEIGHT" = "10" ] || { echo "FAIL: refill cgroup cpu.weight != 10"; PASS=0; }
 [ "$N_REFILL" -ge "$TARGET" ] || { echo "FAIL: fewer than $TARGET refill pids in the cgroup (got $N_REFILL)"; PASS=0; }
 grep -qw "$TARIT_PID" "$REFILL_CG/cgroup.procs" 2>/dev/null && { echo "FAIL: taritd itself is in the refill cgroup"; PASS=0; }
+echo "=== claim restored warm VMs and execute in each guest ==="
+for index in 1 2; do
+  VM_ID=$("$TARIT" --json vm create --vcpus 1 --memory-mib 512 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
+  if [ -z "$VM_ID" ] ||
+      ! "$TARIT" exec "$VM_ID" "bash -c 'echo refill-runtime-$index-ok'" 2>&1 |
+        grep -q "refill-runtime-$index-ok"; then
+    echo "FAIL: restored warm VM $index did not execute"
+    PASS=0
+  fi
+  [ -z "$VM_ID" ] || "$TARIT" vm delete "$VM_ID" >/dev/null 2>&1 || true
+done
 if [ "$PASS" = 1 ]; then echo "RESULT: CPU_REFILL_PASS"; exit 0; else echo "RESULT: CPU_REFILL_FAIL"; exit 1; fi

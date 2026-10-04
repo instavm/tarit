@@ -69,6 +69,16 @@ const CR4_PAE: u64 = 1 << 5;
 /// ACPI RSDP address.
 const RSDP_ADDR: u64 = 0xe0000;
 
+// Guest-visible virtualization capabilities. The worker must retain KVM and
+// nested virtualization, but a customer sandbox is never itself a nested-
+// virtualization host. KVM derives nested-VMX/SVM availability from the CPUID
+// installed with KVM_SET_CPUID2, so these bits are cleared for every vCPU.
+const CPUID_1_ECX_VMX: u32 = 1 << 5;
+const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
+const CPUID_1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+const CPUID_1_EDX_APIC: u32 = 1 << 9;
+const CPUID_8000_0001_ECX_SVM: u32 = 1 << 2;
+
 // ============================================================
 // Cached CPUID
 // ============================================================
@@ -80,11 +90,15 @@ pub fn setup_cpuid(vcpu: &VcpuFd) -> Result<()> {
 }
 
 pub(crate) fn setup_cpuid_with_template(vcpu: &VcpuFd, template: &CpuTemplate) -> Result<()> {
+    // Populate the process-wide snapshot MSR policy before this vCPU is handed
+    // to its seccomp-confined run thread. KVM_GET_MSR_INDEX_LIST is a system
+    // ioctl and opening /dev/kvm is intentionally forbidden in that thread.
+    let _ = snapshot_msr_indices()?;
+
     let cpuid = {
         let mut guard = CACHED_CPUID.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            let kvm = kvm_ioctls::Kvm::new()
-                .map_err(|e| VmmError::Kvm(format!("Kvm::new for cpuid: {e}")))?;
+            let kvm = crate::kvm::open_kvm()?;
             let c = kvm
                 .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
                 .map_err(|e| VmmError::Kvm(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
@@ -107,12 +121,15 @@ pub(crate) fn setup_cpuid_with_template(vcpu: &VcpuFd, template: &CpuTemplate) -
 
 fn normalize_boot_cpuid(cpuid: &mut kvm_bindings::CpuId, apic_id: u8) {
     for entry in cpuid.as_mut_slice().iter_mut() {
-        if entry.function == 1 && entry.index == 0 {
-            entry.ebx = (entry.ebx & 0x00FF_FFFF) | ((apic_id as u32) << 24);
-            entry.edx |= 1 << 9; // APIC
-            entry.ecx |= 1 << 24; // TSC-Deadline
-            entry.ecx &= !(1 << 21); // mask x2APIC (nested-virt safety)
-            break;
+        match (entry.function, entry.index) {
+            (1, 0) => {
+                entry.ebx = (entry.ebx & 0x00FF_FFFF) | ((apic_id as u32) << 24);
+                entry.edx |= CPUID_1_EDX_APIC;
+                entry.ecx |= CPUID_1_ECX_TSC_DEADLINE;
+                entry.ecx &= !(CPUID_1_ECX_X2APIC | CPUID_1_ECX_VMX);
+            }
+            (0x8000_0001, 0) => entry.ecx &= !CPUID_8000_0001_ECX_SVM,
+            _ => {}
         }
     }
 }
@@ -246,11 +263,11 @@ pub fn write_acpi_tables(mem: &GuestMemory, nr_vcpus: u8) -> Result<()> {
 }
 
 /// Write ACPI tables including DSDT entries for virtio-mmio devices.
-/// Each device entry has (mmio_addr, mmio_size, gsi_irq).
+/// Each device entry has (mmio_addr, mmio_size, gsi_irq, edge_triggered).
 pub fn write_acpi_tables_with_devices(
     mem: &GuestMemory,
     nr_vcpus: u8,
-    devices: &[(u64, u64, u32)],
+    devices: &[(u64, u64, u32, bool)],
 ) -> Result<()> {
     use acpi_tables::fadt::{
         FADT_F_HW_REDUCED_ACPI, FADT_F_PWR_BUTTON, FADT_F_SLP_BUTTON,
@@ -339,14 +356,78 @@ pub fn write_acpi_tables_with_devices(
 /// Build a minimal DSDT AML body with Device() entries for virtio-mmio.
 /// Uses the conventional microVM DSDT layout: virtio devices first, then
 /// the legacy port-IO devices.
-fn build_dsdt(devices: &[(u64, u64, u32)]) -> Result<Vec<u8>> {
+fn build_dsdt(devices: &[(u64, u64, u32, bool)]) -> Result<Vec<u8>> {
     let mut aml = Vec::new();
     // Virtio first.
-    for &(mmio_addr, mmio_size, gsi) in devices {
-        append_virtio_aml(&mut aml, mmio_addr, mmio_size, gsi)?;
+    for &(mmio_addr, mmio_size, gsi, edge_triggered) in devices {
+        append_virtio_aml(&mut aml, mmio_addr, mmio_size, gsi, edge_triggered)?;
     }
+    append_vmgenid_aml(&mut aml)?;
     append_legacy_aml(&mut aml)?;
     Ok(aml)
+}
+
+fn append_vmgenid_aml(aml: &mut Vec<u8>) -> Result<()> {
+    use acpi_tables::aml::{self, AmlError};
+    use acpi_tables::Aml;
+
+    fn map_aml(error: AmlError) -> VmmError {
+        VmmError::Memory(format!("AML encode: {error}"))
+    }
+
+    let address_low = crate::vmgenid::VMGENID_GPA as u32;
+    let address_high = (crate::vmgenid::VMGENID_GPA >> 32) as u32;
+    aml::Device::new(
+        "_SB_.VGEN".try_into().map_err(map_aml)?,
+        vec![
+            &aml::Name::new("_HID".try_into().map_err(map_aml)?, &"VMGENCTR").map_err(map_aml)?,
+            &aml::Name::new("_CID".try_into().map_err(map_aml)?, &"VM_GEN_COUNTER")
+                .map_err(map_aml)?,
+            &aml::Name::new("_DDN".try_into().map_err(map_aml)?, &"VM_Gen_Counter")
+                .map_err(map_aml)?,
+            &aml::Name::new(
+                "ADDR".try_into().map_err(map_aml)?,
+                &aml::Package::new(vec![&address_low, &address_high]),
+            )
+            .map_err(map_aml)?,
+        ],
+    )
+    .append_aml_bytes(aml)
+    .map_err(map_aml)?;
+
+    aml::Device::new(
+        "_SB_.GED_".try_into().map_err(map_aml)?,
+        vec![
+            &aml::Name::new("_HID".try_into().map_err(map_aml)?, &"ACPI0013").map_err(map_aml)?,
+            &aml::Name::new(
+                "_CRS".try_into().map_err(map_aml)?,
+                &aml::ResourceTemplate::new(vec![&aml::Interrupt::new(
+                    true,
+                    true,
+                    false,
+                    false,
+                    crate::vmgenid::VMGENID_GSI,
+                )]),
+            )
+            .map_err(map_aml)?,
+            &aml::Method::new(
+                "_EVT".try_into().map_err(map_aml)?,
+                1,
+                true,
+                vec![&aml::If::new(
+                    &aml::Equal::new(&aml::Arg(0), &(crate::vmgenid::VMGENID_GSI as u8)),
+                    vec![&aml::Notify::new(
+                        &aml::Path::new("\\_SB_.VGEN").map_err(map_aml)?,
+                        &0x80usize,
+                    )],
+                )],
+            ),
+        ],
+    )
+    .append_aml_bytes(aml)
+    .map_err(map_aml)?;
+
+    Ok(())
 }
 
 /// First legacy GSIs start at 5 (IRQ0–4 are timer/kbd/cascade/COM1).
@@ -418,7 +499,13 @@ fn append_legacy_aml(aml: &mut Vec<u8>) -> Result<()> {
 }
 
 /// Virtio-mmio device AML entry (memory range + GSI interrupt in _CRS).
-fn append_virtio_aml(aml: &mut Vec<u8>, mmio_addr: u64, mmio_size: u64, gsi: u32) -> Result<()> {
+fn append_virtio_aml(
+    aml: &mut Vec<u8>,
+    mmio_addr: u64,
+    mmio_size: u64,
+    gsi: u32,
+    edge_triggered: bool,
+) -> Result<()> {
     use acpi_tables::aml::{self, AmlError};
     use acpi_tables::Aml;
 
@@ -448,7 +535,7 @@ fn append_virtio_aml(aml: &mut Vec<u8>, mmio_addr: u64, mmio_size: u64, gsi: u32
                             .try_into()
                             .map_err(|_| map_aml(AmlError::AddressRange))?,
                     ),
-                    &aml::Interrupt::new(true, true, false, false, gsi),
+                    &aml::Interrupt::new(true, edge_triggered, false, false, gsi),
                 ]),
             )
             .map_err(map_aml)?,
@@ -557,20 +644,27 @@ pub fn setup_vcpu_for_bzimage_boot(vcpu: &VcpuFd, loaded: &LoadedKernel) -> Resu
 
 /// Apply the boot CPUID to a vCPU with a specific local-APIC id.
 ///
-/// Host CPUID passthrough (no normalization) with three
+/// Host CPUID passthrough with security and boot normalization.
+///
 /// deltas on leaf 1: the initial APIC id (EBX[31:24]) is set to `apic_id`, the
 /// APIC feature (EDX[9]) and TSC-Deadline (ECX[24]) are forced on, and x2APIC
-/// (ECX[21]) is masked (it destabilizes nested virt). The BSP uses id 0; each
-/// AP uses its vCPU id, so the guest's per-CPU APIC ids are distinct — required
-/// for SMP (otherwise Linux sees every CPU with APIC id 0). Also used on SMP
-/// restore to give each recreated AP its correct APIC id before its saved state.
+/// (ECX[21]) is masked because it destabilizes nested virt. Intel VMX
+/// (leaf 1 ECX[5]) and AMD SVM (leaf 0x80000001 ECX[2]) are always masked so
+/// nested virtualization remains available to the worker but is unavailable
+/// inside customer sandboxes. The BSP uses id 0; each AP uses its vCPU id, so
+/// the guest's per-CPU APIC ids are distinct — required for SMP (otherwise
+/// Linux sees every CPU with APIC id 0). Also used on SMP restore to give each
+/// recreated AP its correct APIC id before its saved state.
 pub(crate) fn apply_boot_cpuid_with_template(
     vcpu: &VcpuFd,
     apic_id: u8,
     template: &CpuTemplate,
 ) -> Result<()> {
-    let kvm =
-        kvm_ioctls::Kvm::new().map_err(|e| VmmError::Kvm(format!("Kvm::new for cpuid: {e}")))?;
+    // Initial boot uses this path directly (rather than setup_cpuid), so warm
+    // the MSR policy here as well, before the vCPU enters its seccomp profile.
+    let _ = snapshot_msr_indices()?;
+
+    let kvm = crate::kvm::open_kvm()?;
     let mut cpuid = kvm
         .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
         .map_err(|e| VmmError::Kvm(format!("KVM_GET_SUPPORTED_CPUID: {e}")))?;
@@ -732,10 +826,10 @@ pub(crate) fn setup_vcpu_for_bzimage_boot_full_with_template(
         sregs.idt.limit = 7;
         sregs.cs = kvm_segment_from_gdt(BOOT_GDT[1], 1);
         sregs.ds = kvm_segment_from_gdt(BOOT_GDT[2], 2);
-        sregs.es = sregs.ds.clone();
-        sregs.fs = sregs.ds.clone();
-        sregs.gs = sregs.ds.clone();
-        sregs.ss = sregs.ds.clone();
+        sregs.es = sregs.ds;
+        sregs.fs = sregs.ds;
+        sregs.gs = sregs.ds;
+        sregs.ss = sregs.ds;
         sregs.tr = kvm_segment_from_gdt(BOOT_GDT[3], 3);
         setup_page_tables(mem)?;
         sregs.cr3 = PML4_ADDR;
@@ -750,10 +844,10 @@ pub(crate) fn setup_vcpu_for_bzimage_boot_full_with_template(
         sregs.gdt.limit = (GDT32.len() * 8) as u16 - 1;
         sregs.cs = flat_seg32(true, 0x08);
         sregs.ds = flat_seg32(false, 0x10);
-        sregs.es = sregs.ds.clone();
-        sregs.ss = sregs.ds.clone();
-        sregs.fs = sregs.ds.clone();
-        sregs.gs = sregs.ds.clone();
+        sregs.es = sregs.ds;
+        sregs.ss = sregs.ds;
+        sregs.fs = sregs.ds;
+        sregs.gs = sregs.ds;
         sregs.cr0 |= CR0_PE | CR0_MP | CR0_ET | CR0_NE;
         sregs.cr4 = 0;
         sregs.efer = 0;
@@ -797,6 +891,83 @@ pub fn setup_vcpu_for_kernel_boot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extended_irq_flags(aml: &[u8], gsi: u32) -> u8 {
+        let number = gsi.to_le_bytes();
+        aml.windows(9)
+            .find(|window| {
+                window[0] == 0x89
+                    && window[1..3] == 6u16.to_le_bytes()
+                    && window[4] == 1
+                    && window[5..9] == number
+            })
+            .map(|window| window[3])
+            .expect("extended IRQ descriptor")
+    }
+
+    #[test]
+    fn virtio_aml_distinguishes_level_and_edge_interrupts() {
+        let level = build_dsdt(&[(0xd000_0000, 0x1000, 11, false)]).unwrap();
+        let edge = build_dsdt(&[(0xd000_0000, 0x1000, 12, true)]).unwrap();
+        assert_eq!(extended_irq_flags(&level, 11) & 0b10, 0);
+        assert_eq!(extended_irq_flags(&edge, 12) & 0b10, 0b10);
+    }
+
+    #[test]
+    fn guest_cpuid_hides_nested_virtualization_without_disabling_boot_features() {
+        let leaf1 = kvm_bindings::kvm_cpuid_entry2 {
+            function: 1,
+            index: 0,
+            ebx: 0x00ab_cdef,
+            ecx: u32::MAX,
+            edx: 0,
+            ..Default::default()
+        };
+        let extended = kvm_bindings::kvm_cpuid_entry2 {
+            function: 0x8000_0001,
+            index: 0,
+            ecx: u32::MAX,
+            ..Default::default()
+        };
+        let unrelated = kvm_bindings::kvm_cpuid_entry2 {
+            function: 7,
+            index: 0,
+            eax: 0x1234_5678,
+            ..Default::default()
+        };
+        let mut cpuid = kvm_bindings::CpuId::from_entries(&[leaf1, extended, unrelated])
+            .expect("synthetic CPUID");
+
+        normalize_boot_cpuid(&mut cpuid, 3);
+
+        let leaf1 = cpuid
+            .as_slice()
+            .iter()
+            .find(|entry| entry.function == 1 && entry.index == 0)
+            .unwrap();
+        assert_eq!(leaf1.ebx >> 24, 3, "APIC id must remain normalized");
+        assert_ne!(leaf1.edx & CPUID_1_EDX_APIC, 0);
+        assert_ne!(leaf1.ecx & CPUID_1_ECX_TSC_DEADLINE, 0);
+        assert_eq!(leaf1.ecx & CPUID_1_ECX_X2APIC, 0);
+        assert_eq!(leaf1.ecx & CPUID_1_ECX_VMX, 0);
+
+        let extended = cpuid
+            .as_slice()
+            .iter()
+            .find(|entry| entry.function == 0x8000_0001 && entry.index == 0)
+            .unwrap();
+        assert_eq!(extended.ecx & CPUID_8000_0001_ECX_SVM, 0);
+        assert_eq!(
+            cpuid
+                .as_slice()
+                .iter()
+                .find(|entry| entry.function == 7)
+                .unwrap()
+                .eax,
+            0x1234_5678,
+            "unrelated host features must not be accidentally rewritten"
+        );
+    }
 
     /// Dump DSDT bytes for manual verification against iasl reference.
     /// Run with: cargo test -p vmm-core --features kvm dump_dsdt_bytes -- --nocapture
@@ -870,9 +1041,15 @@ pub struct VcpuFullState {
     pub msrs: Vec<(u32, u64)>,
 }
 
-/// MSRs we save/restore: TSC, syscall/segment bases, sysenter, misc-enable and
-/// TSC-deadline — the set that matters for a correct x86_64 resume.
-const SNAPSHOT_MSRS: &[u32] = &[
+/// Architectural MSRs required for the Linux configuration Tarit exposes.
+///
+/// Architectural MSRs come from this fixed baseline. KVM paravirtual MSRs are
+/// added from KVM_GET_MSR_INDEX_LIST when they fall in KVM's reserved custom
+/// range. Keeping that selection dynamic lets Linux add paravirtual state
+/// without requiring a Tarit change (async-PF INT/ACK are a concrete example).
+/// The exact selected indices are serialized, so a destination can reject an
+/// incompatible snapshot before partially restoring a vCPU.
+const SNAPSHOT_ARCH_MSRS: &[u32] = &[
     0x0000_0010, // IA32_TSC
     0x0000_0174, // IA32_SYSENTER_CS
     0x0000_0175, // IA32_SYSENTER_ESP
@@ -889,19 +1066,113 @@ const SNAPSHOT_MSRS: &[u32] = &[
     0xc000_0102, // KERNEL_GS_BASE
 ];
 
+const KVM_CUSTOM_MSR_START: u32 = 0x4b56_4d00;
+const KVM_CUSTOM_MSR_END: u32 = 0x4b56_4dff;
+const MSR_KVM_ASYNC_PF_EN: u32 = 0x4b56_4d02;
+const MSR_KVM_ASYNC_PF_INT: u32 = 0x4b56_4d06;
+const MSR_IA32_TSC: u32 = 0x0000_0010;
+const MSR_IA32_TSC_DEADLINE: u32 = 0x0000_06e0;
+
+static CACHED_SNAPSHOT_MSRS: std::sync::Mutex<Option<Vec<u32>>> = std::sync::Mutex::new(None);
+
+fn select_snapshot_msr_indices(supported: &[u32]) -> Vec<u32> {
+    // KVM_GET_MSR_INDEX_LIST is authoritative for KVM's dynamically evolving
+    // custom range, but is not an exhaustive list of architectural MSRs that
+    // KVM_GET_MSRS accepts (for example, c8i KVM omits IA32_EFER here). The
+    // fixed architectural set remains guarded by strict GET/SET counts.
+    let mut selected = SNAPSHOT_ARCH_MSRS.to_vec();
+    selected.extend(
+        supported
+            .iter()
+            .copied()
+            .filter(|index| (KVM_CUSTOM_MSR_START..=KVM_CUSTOM_MSR_END).contains(index)),
+    );
+    selected.sort_unstable();
+    selected.dedup();
+    selected
+}
+
+fn snapshot_msr_indices() -> Result<Vec<u32>> {
+    let mut guard = CACHED_SNAPSHOT_MSRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(indices) = guard.as_ref() {
+        return Ok(indices.clone());
+    }
+
+    let kvm = crate::kvm::open_kvm()?;
+    let supported = kvm
+        .get_msr_index_list()
+        .map_err(|e| VmmError::Kvm(format!("KVM_GET_MSR_INDEX_LIST: {e}")))?;
+    let indices = select_snapshot_msr_indices(supported.as_slice());
+    *guard = Some(indices.clone());
+    Ok(indices)
+}
+
+fn capture_msrs(vcpu: &VcpuFd, indices: &[u32]) -> Result<Vec<(u32, u64)>> {
+    let mut values = Vec::with_capacity(indices.len());
+    for chunk in indices.chunks(kvm_bindings::KVM_MAX_MSR_ENTRIES) {
+        let entries: Vec<kvm_bindings::kvm_msr_entry> = chunk
+            .iter()
+            .map(|&index| kvm_bindings::kvm_msr_entry {
+                index,
+                ..Default::default()
+            })
+            .collect();
+        let mut msrs = kvm_bindings::Msrs::from_entries(&entries)
+            .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries(snapshot): {e:?}")))?;
+        get_msrs_checked(vcpu, &mut msrs, "KVM_GET_MSRS(snapshot)")?;
+        values.extend(
+            msrs.as_slice()
+                .iter()
+                .map(|entry| (entry.index, entry.data)),
+        );
+    }
+    Ok(values)
+}
+
+fn msr_restore_priority(index: u32) -> u8 {
+    match index {
+        // The async-PF interrupt vector must be installed before async-PF is
+        // enabled or KVM may inject vector 0 into the restored guest.
+        MSR_KVM_ASYNC_PF_INT => 0,
+        MSR_IA32_TSC => 1,
+        MSR_KVM_ASYNC_PF_EN => 2,
+        // KVM primes the deadline using the current TSC.
+        MSR_IA32_TSC_DEADLINE => 3,
+        _ => 1,
+    }
+}
+
+fn restore_msrs(vcpu: &VcpuFd, saved: &[(u32, u64)]) -> Result<()> {
+    let supported = snapshot_msr_indices()?;
+    if let Some(&(index, _)) = saved.iter().find(|(index, _)| !supported.contains(index)) {
+        return Err(VmmError::Kvm(format!(
+            "snapshot requires unsupported destination MSR {index:#010x}"
+        )));
+    }
+
+    let mut ordered = saved.to_vec();
+    ordered.sort_by_key(|&(index, _)| msr_restore_priority(index));
+    for chunk in ordered.chunks(kvm_bindings::KVM_MAX_MSR_ENTRIES) {
+        let entries: Vec<kvm_bindings::kvm_msr_entry> = chunk
+            .iter()
+            .map(|&(index, data)| kvm_bindings::kvm_msr_entry {
+                index,
+                data,
+                ..Default::default()
+            })
+            .collect();
+        let msrs = kvm_bindings::Msrs::from_entries(&entries)
+            .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries(restore): {e:?}")))?;
+        set_msrs_checked(vcpu, &msrs, "KVM_SET_MSRS(restore)")?;
+    }
+    Ok(())
+}
+
 /// Capture the full vCPU state. Call with the vCPU stopped (paused).
 pub fn capture_vcpu_full_state(vcpu: &VcpuFd) -> Result<VcpuFullState> {
-    let entries: Vec<kvm_bindings::kvm_msr_entry> = SNAPSHOT_MSRS
-        .iter()
-        .map(|&index| kvm_bindings::kvm_msr_entry {
-            index,
-            ..Default::default()
-        })
-        .collect();
-    let mut msrs = kvm_bindings::Msrs::from_entries(&entries)
-        .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries: {e:?}")))?;
-    get_msrs_checked(vcpu, &mut msrs, "KVM_GET_MSRS(snapshot)")?;
-    let msr_vals: Vec<(u32, u64)> = msrs.as_slice().iter().map(|e| (e.index, e.data)).collect();
+    let msr_vals = capture_msrs(vcpu, &snapshot_msr_indices()?)?;
 
     Ok(VcpuFullState {
         regs: vcpu
@@ -931,34 +1202,64 @@ pub fn capture_vcpu_full_state(vcpu: &VcpuFd) -> Result<VcpuFullState> {
 
 /// Re-apply a captured vCPU state. Call after KVM_SET_CPUID2 on a fresh vCPU.
 pub fn restore_vcpu_full_state(vcpu: &VcpuFd, s: &VcpuFullState) -> Result<()> {
-    vcpu.set_sregs(&s.sregs)
-        .map_err(|e| VmmError::Kvm(format!("KVM_SET_SREGS: {e}")))?;
+    // KVM restore order is significant:
+    // - MP state depends on which vCPU KVM recognizes as the BSP.
+    // - SET_SREGS restores APIC_BASE, so it must precede SET_LAPIC.
+    // - SET_LAPIC must precede the TSC-deadline MSR or restored local timers
+    //   can remain disarmed even though the vCPU continues executing.
+    // - SET_REGS clears pending exceptions, so vCPU events are restored last.
+    vcpu.set_mp_state(s.mp_state)
+        .map_err(|e| VmmError::Kvm(format!("KVM_SET_MP_STATE: {e}")))?;
     vcpu.set_regs(&s.regs)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_REGS: {e}")))?;
+    vcpu.set_sregs(&s.sregs)
+        .map_err(|e| VmmError::Kvm(format!("KVM_SET_SREGS: {e}")))?;
     vcpu.set_xsave(&s.xsave)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_XSAVE: {e}")))?;
     vcpu.set_xcrs(&s.xcrs)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_XCRS: {e}")))?;
-    // Set IA32_TSC before IA32_TSC_DEADLINE (KVM primes the deadline off the
-    // current TSC), hence the deferred-MSR ordering below.
-    let mut ordered = s.msrs.clone();
-    ordered.sort_by_key(|&(index, _)| u8::from(index == 0x0000_06e0));
-    let entries: Vec<kvm_bindings::kvm_msr_entry> = ordered
-        .iter()
-        .map(|&(index, data)| kvm_bindings::kvm_msr_entry {
-            index,
-            data,
-            ..Default::default()
-        })
-        .collect();
-    let msrs = kvm_bindings::Msrs::from_entries(&entries)
-        .map_err(|e| VmmError::Kvm(format!("Msrs::from_entries: {e:?}")))?;
-    set_msrs_checked(vcpu, &msrs, "KVM_SET_MSRS(restore)")?;
     vcpu.set_lapic(&s.lapic)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_LAPIC: {e}")))?;
+    restore_msrs(vcpu, &s.msrs)?;
     vcpu.set_vcpu_events(&s.vcpu_events)
         .map_err(|e| VmmError::Kvm(format!("KVM_SET_VCPU_EVENTS: {e}")))?;
-    vcpu.set_mp_state(s.mp_state)
-        .map_err(|e| VmmError::Kvm(format!("KVM_SET_MP_STATE: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_msr_tests {
+    use super::*;
+
+    #[test]
+    fn selection_includes_supported_full_kvm_custom_range() {
+        let mut supported = SNAPSHOT_ARCH_MSRS.to_vec();
+        supported.extend([
+            KVM_CUSTOM_MSR_START,
+            MSR_KVM_ASYNC_PF_EN,
+            MSR_KVM_ASYNC_PF_INT,
+            KVM_CUSTOM_MSR_END,
+            0xdead_beef,
+        ]);
+        let selected = select_snapshot_msr_indices(&supported);
+        assert!(selected.contains(&KVM_CUSTOM_MSR_START));
+        assert!(selected.contains(&MSR_KVM_ASYNC_PF_INT));
+        assert!(selected.contains(&KVM_CUSTOM_MSR_END));
+        assert!(!selected.contains(&0xdead_beef));
+    }
+
+    #[test]
+    fn architectural_set_does_not_depend_on_kvm_index_enumeration() {
+        let selected = select_snapshot_msr_indices(&[]);
+        for required in SNAPSHOT_ARCH_MSRS {
+            assert!(selected.contains(required));
+        }
+    }
+
+    #[test]
+    fn restore_order_satisfies_async_pf_and_tsc_dependencies() {
+        assert!(
+            msr_restore_priority(MSR_KVM_ASYNC_PF_INT) < msr_restore_priority(MSR_KVM_ASYNC_PF_EN)
+        );
+        assert!(msr_restore_priority(MSR_IA32_TSC) < msr_restore_priority(MSR_IA32_TSC_DEADLINE));
+    }
 }

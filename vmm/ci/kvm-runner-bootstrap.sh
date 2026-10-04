@@ -10,6 +10,8 @@ VM_NAME="${VM_NAME:-vmm-kvm}"
 CPUS="${CPUS:-4}"
 MEM="${MEM:-8}"
 DISK="${DISK:-50}"
+VMM_TEST_KERNEL="${VMM_TEST_KERNEL:?set VMM_TEST_KERNEL to the candidate path inside Colima}"
+VMM_TEST_ROOTFS="${VMM_TEST_ROOTFS:?set VMM_TEST_ROOTFS to the agent rootfs path inside Colima}"
 
 echo "==> Ensuring colima + qemu are installed"
 if ! command -v colima >/dev/null; then
@@ -22,6 +24,7 @@ if ! colima list | grep -q "^$VM_NAME .* running"; then
 fi
 
 echo "==> Inside the VM: install KVM + rust toolchain"
+# shellcheck disable=SC2016 # The script expands inside Colima.
 colima ssh "$VM_NAME" -- bash -lc '
   set -e
   if ! command -v cargo >/dev/null; then
@@ -36,10 +39,25 @@ colima ssh "$VM_NAME" -- bash -lc '
 '
 
 echo "==> Sync repo into the VM and run integration tests"
-colima ssh "$VM_NAME" -- bash -lc '
+# shellcheck disable=SC2016 # The script expands inside Colima.
+colima ssh "$VM_NAME" -- env \
+  VMM_TEST_KERNEL="$VMM_TEST_KERNEL" \
+  VMM_TEST_ROOTFS="$VMM_TEST_ROOTFS" \
+  bash -lc '
   set -e
-  cd ~/vmm 2>/dev/null || true
-  cargo test --workspace --features kvm -- --include-ignored
+  cd ~/vmm
+  test -r "$VMM_TEST_KERNEL" || {
+    echo "error: VMM_TEST_KERNEL is not readable inside Colima: $VMM_TEST_KERNEL" >&2
+    exit 1
+  }
+  test -r "$VMM_TEST_ROOTFS" || {
+    echo "error: VMM_TEST_ROOTFS is not readable inside Colima: $VMM_TEST_ROOTFS" >&2
+    exit 1
+  }
+  env \
+    VMM_TEST_KERNEL="$VMM_TEST_KERNEL" \
+    VMM_TEST_ROOTFS="$VMM_TEST_ROOTFS" \
+    cargo test --workspace --features kvm -- --include-ignored
 '
 
 echo "done."

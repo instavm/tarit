@@ -17,12 +17,11 @@ pub fn summarize(samples: &[u64]) -> Option<TtiStats> {
     sorted.sort_unstable();
     let min = *sorted.first()?;
     let max = *sorted.last()?;
-    let trimmed = trim(&sorted);
 
     Some(TtiStats {
-        median: nearest_rank(trimmed, 50.0),
-        p95: nearest_rank(trimmed, 95.0),
-        p99: nearest_rank(trimmed, 99.0),
+        median: nearest_rank(&sorted, 50.0),
+        p95: nearest_rank(&sorted, 95.0),
+        p99: nearest_rank(&sorted, 99.0),
         min,
         max,
     })
@@ -40,20 +39,6 @@ pub fn composite_score(stats: Option<TtiStats>, success_rate: f64) -> f64 {
     timing_score * success_rate
 }
 
-fn trim(sorted: &[u64]) -> &[u64] {
-    if sorted.len() < 20 {
-        return sorted;
-    }
-
-    let trim_count = ((sorted.len() as f64) * 0.05).ceil() as usize;
-    let end = sorted.len().saturating_sub(trim_count);
-    if trim_count >= end {
-        sorted
-    } else {
-        &sorted[trim_count..end]
-    }
-}
-
 fn nearest_rank(sorted: &[u64], percentile: f64) -> u64 {
     let rank = ((percentile / 100.0) * sorted.len() as f64).ceil() as usize;
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
@@ -68,7 +53,7 @@ mod tests {
     use super::summarize;
 
     #[test]
-    fn skips_trim_for_small_sets() {
+    fn summarizes_small_sets() {
         let stats = summarize(&[10, 20, 30]).unwrap();
         assert_eq!(stats.median, 20);
         assert_eq!(stats.p95, 30);
@@ -77,13 +62,13 @@ mod tests {
     }
 
     #[test]
-    fn trims_five_percent_for_large_sets() {
+    fn tail_percentiles_include_all_samples() {
         let samples = (1..=100).collect::<Vec<_>>();
         let stats = summarize(&samples).unwrap();
         assert_eq!(stats.min, 1);
         assert_eq!(stats.max, 100);
         assert_eq!(stats.median, 50);
-        assert_eq!(stats.p95, 91);
-        assert_eq!(stats.p99, 95);
+        assert_eq!(stats.p95, 95);
+        assert_eq!(stats.p99, 99);
     }
 }

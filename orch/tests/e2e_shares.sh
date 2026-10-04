@@ -182,7 +182,9 @@ path_is_not_mountpoint() {
   else
     mount_status=$?
   fi
-  [[ "$mount_status" == "1" ]] || {
+  # util-linux < 2.39 returns 1 for "not a mountpoint"; >= 2.39 returns 32
+  # and reserves 1 for errors (e.g. missing path, which we exclude above).
+  [[ "$mount_status" == "1" || "$mount_status" == "32" ]] || {
     fail "could not determine whether $label is a mountpoint"
     return 1
   }
@@ -2278,10 +2280,14 @@ verify_real_kvm_vmm() {
   local kvm_fds=0
 
   api_empty a GET "/v1/vms/$vm_id"
-  expect_status 200 "resolve exact VMM PID after VM creation"
-  resolved_pid="$(json_get "$LAST_BODY" pid)"
+  expect_status 200 "resolve VM record after VM creation"
+  if json_get "$LAST_BODY" pid >/dev/null 2>&1; then
+    fail "public VM record must not expose the VMM PID"
+  fi
+  resolved_pid="$(node_a_tracked_vmm_pid "$vm_id")" ||
+    fail "node A store did not track a VMM PID for the created VM"
   [[ "$resolved_pid" == "$reported_pid" ]] ||
-    fail "VM record did not resolve to the VMM PID returned by creation"
+    fail "VM record did not resolve to the tracked VMM PID"
   pid_matches_owned_binary "$resolved_pid" "$VMM_BIN_REAL" ||
     fail "resolved VMM PID is not this run's expected VMM executable"
   [[ -d "/proc/$resolved_pid/fd" ]] ||
@@ -2301,15 +2307,50 @@ create_vm_on_node_a() {
   local vm_id=""
   local vmm_pid=""
   vm_id="$(json_get "$LAST_BODY" id)"
-  vmm_pid="$(json_get "$LAST_BODY" pid)"
   [[ "$vm_id" =~ ^[0-9a-f-]{36}$ ]] ||
     fail "VM creation did not return a UUID"
+  vmm_pid="$(node_a_tracked_vmm_pid "$vm_id")" ||
+    fail "node A store did not track the created VM's VMM PID"
   [[ "$vmm_pid" =~ ^[0-9]+$ ]] ||
-    fail "VM creation did not return its tracked VMM PID"
+    fail "node A store did not track a numeric VMM PID"
   verify_real_kvm_vmm "$vm_id" "$vmm_pid"
   VM_IDS+=("$vm_id")
   VMM_PIDS+=("$vmm_pid")
   CREATED_VM_ID="$vm_id"
+}
+
+# The public API deliberately hides process identifiers, so the harness
+# resolves the VMM PID from node A's authoritative local store.
+node_a_tracked_vmm_pid() {
+  local vm_id="$1"
+  local attempt=0
+  local pid=""
+
+  while ((attempt < 40)); do
+    pid="$(VM_ID="$vm_id" NODE_DB="$NODE_A_DIR/taritd.sqlite" \
+      "$TIMEOUT_BIN" 10s python3 - <<'PY'
+import os
+import sqlite3
+
+connection = sqlite3.connect(f"file:{os.environ['NODE_DB']}?mode=ro", uri=True)
+try:
+    row = connection.execute(
+        "SELECT pid FROM vms WHERE id = ?", (os.environ["VM_ID"],)
+    ).fetchone()
+finally:
+    connection.close()
+if row is None or row[0] is None:
+    raise SystemExit(1)
+print(row[0])
+PY
+    )" && [[ -n "$pid" ]] && {
+      printf '%s\n' "$pid"
+      return 0
+    }
+    ((attempt += 1))
+    sleep 0.25
+  done
+  return 1
 }
 
 create_share_payload() {
@@ -2779,6 +2820,7 @@ start_node() {
     export TARIT_SHARE_CONNECT_TIMEOUT_MS="${TARIT_E2E_CONNECT_TIMEOUT_MS:-5000}"
     export TARIT_SHARE_IDLE_TIMEOUT_SECS="${TARIT_E2E_IDLE_TIMEOUT_SECS:-45}"
     export TARIT_RPC_ADDR="http://127.0.0.1:$control_port"
+    export TARIT_ALLOW_INSECURE_PEER_HTTP=1
     export TARIT_VMM_BIN="$VMM_LAUNCHER"
     export TARIT_E2E_VMM_REAL="$VMM_BIN_REAL"
     export TARIT_E2E_VMM_RACE_ARM="$RACE_VMM_ARM"
@@ -2842,7 +2884,7 @@ start_local_postgres() {
   LOCAL_POSTGRES_STOP_CONFIRMED=0
   run_as_pg_user "$PG_CTL_BIN" -D "$PG_DATA_DIR" \
     -l "$PG_DATA_DIR/postgres.log" \
-    -o "-h 127.0.0.1 -p $PG_PORT" \
+    -o "-h 127.0.0.1 -p $PG_PORT -k $PG_DATA_DIR" \
     -w -t 30 start >/dev/null || {
     record_local_postgres_pid || true
     fail "isolated PostgreSQL did not start; inspect $PG_DATA_DIR/postgres.log"
@@ -3611,7 +3653,20 @@ main() {
 
   api_empty b GET "/v1/vms/$VM1"
   expect_status 200 "non-owner VM lookup"
-  json_assert_eq "$LAST_BODY" host_id "$NODE_A_HOST"
+  json_assert_eq "$LAST_BODY" id "$VM1"
+  if json_get "$LAST_BODY" host_id >/dev/null 2>&1; then
+    fail "public VM record must not expose its host id"
+  fi
+  local fleet_vm_host=""
+  fleet_vm_host="$(
+    TARIT_E2E_SQL_VM_ID="$VM1" \
+      psql_execute <<'SQL'
+\getenv vm_id TARIT_E2E_SQL_VM_ID
+SELECT host_id FROM fleet_vms WHERE id = :'vm_id';
+SQL
+  )" || fail "could not resolve the created VM's fleet host"
+  [[ "$fleet_vm_host" == "$NODE_A_HOST" ]] ||
+    fail "fleet state does not place the created VM on node A"
 
   assert_listener_isolation
   assert_caddy_internal_route_blocked

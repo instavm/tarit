@@ -6,18 +6,16 @@
 
 use std::path::PathBuf;
 use std::time::Instant;
-use vmm_core::config::{KernelConfig, MemoryConfig, VcpuConfig, VmConfig};
 use vmm_core::controller::VmmController;
 use vmm_core::live_snapshot::LiveSnapshotConfig;
 
-fn kernel_path() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    PathBuf::from(manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("guest/bzImage"))
-        .unwrap_or_else(|| PathBuf::from("guest/bzImage"))
-}
+mod test_support;
+use test_support::{agent_vm_config, assert_guest_exec, guest_stdout, private_overlay_path};
+
+/// Guest-RAM-only directory used by the live-snapshot consistency harness.
+/// The harness mounts its own tmpfs there so the payload is guaranteed to live
+/// in guest memory and never on the (restore-time discarded) disk overlay.
+const GUEST_RAM_DIR: &str = "/run/livesnap";
 
 /// Perf-gate strictness. Boot latency and creation rate are dominated by the
 /// host's virtualization nesting (on nested KVM every guest exit traps to L0,
@@ -29,20 +27,6 @@ fn perf_strict() -> bool {
     std::env::var("VMM_PERF_STRICT").is_ok()
 }
 
-fn vm_config() -> VmConfig {
-    VmConfig {
-        kernel: KernelConfig {
-            path: kernel_path().to_string_lossy().to_string(),
-            cmdline: "console=ttyS0 reboot=k panic=1 nokaslr".into(),
-            initramfs: None,
-        },
-        memory: MemoryConfig { size_mib: 128 },
-        vcpus: VcpuConfig { count: 1 },
-        volumes: vec![],
-        net: vec![],
-    }
-}
-
 fn retain_snapshot(controller: &VmmController, path: &str) {
     let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
         .expect("snapshot identity");
@@ -52,50 +36,93 @@ fn retain_snapshot(controller: &VmmController, path: &str) {
 }
 
 /// Memory-consistency harness for live snapshot.
-/// Boot a VM with `create_live` (vCPU executing in background), then take a
-/// live snapshot while it runs and verify the snapshot is a consistent
-/// point-in-time image. The on-disk artifact must be page-aligned and
-/// carry the canonical VMSN snapshot magic so it can be restored later.
+/// Boot a VM with `create_live` (vCPU executing in background), write a known
+/// payload inside the running guest, then take a live snapshot while it runs.
+/// The restored VM must observe the *same* payload — that is what proves the
+/// snapshot pairs a coherent memory image with the vCPU/device state captured
+/// during the final stop, rather than boot-time registers.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn live_snapshot_consistency_harness() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let controller = VmmController::new();
 
     // Step 1: launch the VM with its vCPU running in the background.
-    controller.create_live(vm_config()).expect("create_live");
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("create_live");
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo live-snapshot-source-ok'",
+        "live-snapshot-source-ok",
+    );
 
-    // Give the kernel a moment to start executing before we start tracking.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // Step 2: write a payload that only exists in guest RAM (tmpfs), and
+    // record its digest. A snapshot that captures stale memory or stale vCPU
+    // state cannot reproduce this after a restore.
+    let ready = guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'mkdir -p {GUEST_RAM_DIR} && mount -t tmpfs -o size=128m tmpfs \
+             {GUEST_RAM_DIR} && grep -c \" {GUEST_RAM_DIR} tmpfs \" /proc/mounts'"
+        ),
+    );
+    assert_eq!(
+        ready.trim(),
+        "1",
+        "guest payload directory is not a tmpfs: {ready}"
+    );
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'dd if=/dev/urandom of={GUEST_RAM_DIR}/live-marker bs=1M count=8 && sync'"
+        ),
+    );
+    let source_digest = guest_stdout(
+        &controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/live-marker | cut -d\" \" -f1'"),
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        source_digest.len(),
+        64,
+        "unexpected digest: {source_digest}"
+    );
 
-    // Step 2: take a live snapshot while the vCPU keeps running.
+    // Step 3: take a live snapshot while the vCPU keeps running.
     let cfg = LiveSnapshotConfig::default();
     let result = controller.live_snapshot(cfg).expect("live snapshot");
 
     eprintln!(
-        "Live snapshot: {} rounds, {} pages, {} final dirty, {:?} elapsed",
-        result.rounds, result.pages_copied, result.final_dirty_pages, result.elapsed
+        "Live snapshot: {} rounds, {} pages copied, {} residual, {:?} downtime, {:?} elapsed",
+        result.rounds,
+        result.pages_copied,
+        result.final_dirty_pages,
+        result.downtime,
+        result.elapsed
     );
 
+    assert_eq!(result.mem_bytes, 256 * 1024 * 1024, "snapshot memory size");
+    assert_eq!(result.mem_bytes % 4096, 0, "snapshot must be page-aligned");
+    // The pre-copy loop must actually copy: at minimum the bulk round.
     assert!(
-        !result.mem_snapshot.is_empty(),
-        "snapshot must contain memory"
+        result.pages_copied >= result.mem_bytes / 4096,
+        "pre-copy copied {} pages, less than the {} page bulk round",
+        result.pages_copied,
+        result.mem_bytes / 4096
     );
-    assert_eq!(
-        result.mem_snapshot.len() % 4096,
-        0,
-        "snapshot must be page-aligned"
+    // The blackout must be a residual copy, not a full-RAM copy. A full 256 MiB
+    // copy is tens of milliseconds even on fast hosts; allow generous slack for
+    // nested virtualization but still catch a whole-RAM stop-and-copy.
+    assert!(
+        result.downtime < std::time::Duration::from_secs(2),
+        "final stop blacked the guest out for {:?}",
+        result.downtime
     );
 
-    // Step 3: verify the on-disk snapshot file exists and has the correct
-    // header — this proves the live snapshot is restorable, not just an
-    // in-memory byte buffer. The controller writes it to a private per-process
-    // scratch path (not a fixed /tmp name), reported back on the result.
+    // Step 4: verify the on-disk snapshot file exists and has the correct
+    // header. The controller writes it to a private per-process scratch path
+    // (not a fixed /tmp name), reported back on the result.
     let snap_path = result.snapshot_path.clone();
     assert!(
         !snap_path.is_empty(),
@@ -109,20 +136,13 @@ fn live_snapshot_consistency_harness() {
     );
 
     eprintln!(
-        "Snapshot size: {} bytes ({} pages); on-disk: {} bytes at {}",
-        result.mem_snapshot.len(),
-        result.mem_snapshot.len() / 4096,
+        "Snapshot: {} bytes on disk at {snap_path}; decision {:?}",
         snap_bytes.len(),
-        snap_path,
+        result.final_decision
     );
-    eprintln!("Final decision: {:?}", result.final_decision);
 
-    // Step 4: verify the snapshot bytes pass a few structural checks that
-    // would fail if the pre-copy loop captured a torn page or wrote a
-    // corrupted state blob.
-    //
-    // (a) The state blob (parsed from the on-disk file) must be present
-    //     and bounded within the snapshot artifact. VMSN header layout:
+    // (a) The state blob must be present and bounded within the artifact.
+    //     VMSN header layout:
     //     [4B magic][2B version][2B flags][8B state_len][4B state_crc]
     //     [8B mem_len][4B mem_crc] = 32B, then state_blob, then mem_dump
     //     (matches write_snapshot_file / restore's own parsing).
@@ -134,59 +154,597 @@ fn live_snapshot_consistency_harness() {
         state_end <= snap_bytes.len(),
         "state blob must fit in snapshot"
     );
+    assert!(state_len > 0, "live snapshot must carry a state blob");
     assert_eq!(
-        mem_len,
-        result.mem_snapshot.len(),
-        "on-disk mem_len must match in-memory snapshot length"
+        mem_len as u64, result.mem_bytes,
+        "on-disk mem_len must match the reported memory size"
     );
 
-    // (b) Restore the snapshot — the surest test of consistency. If the
-    //     pre-copy loop produced a torn page or wrote an inconsistent state
-    //     blob, the restore path will reject it or produce a corrupt VM.
+    // (b) Restore the snapshot and re-read the payload. This is the real
+    //     consistency assertion: a snapshot carrying boot-time vCPU registers
+    //     against post-boot memory cannot come back with the same digest.
     let restore_controller = VmmController::new();
     restore_controller
-        .restore(&snap_path, None)
+        .restore(
+            &snap_path,
+            Some(
+                test_support::private_overlay_path("live-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
         .expect("restore from live snapshot");
-    eprintln!("restored live snapshot");
+    assert_guest_exec(
+        &restore_controller,
+        "bash -c 'echo live-snapshot-restore-ok'",
+        "live-snapshot-restore-ok",
+    );
+    let restored_digest = guest_stdout(
+        &restore_controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/live-marker | cut -d\" \" -f1'"),
+    );
+    assert_eq!(
+        restored_digest.trim(),
+        source_digest,
+        "restored guest RAM does not match the live-snapshotted guest"
+    );
+    eprintln!("restored live snapshot; payload digest matches");
 
-    // (c) Take a SECOND live snapshot while the source VM keeps running.
-    //     The two snapshots are independent — they must each parse, but
-    //     their memory contents may legitimately differ (the guest mutated
-    //     pages between them). What we assert is that taking back-to-back
-    //     live snapshots does not interfere: both succeed, both produce
-    //     valid restorable artifacts.
+    // (c) Take a SECOND live snapshot while the source VM keeps running. The
+    //     two snapshots are independent: both must succeed, both must produce
+    //     valid artifacts, and — the regression this covers — taking the
+    //     second must NOT delete the first one's file.
     let cfg2 = LiveSnapshotConfig::default();
     let result2 = controller
         .live_snapshot(cfg2)
         .expect("second live snapshot");
     assert_eq!(
-        result2.mem_snapshot.len(),
-        result.mem_snapshot.len(),
+        result2.mem_bytes, result.mem_bytes,
         "back-to-back snapshots must have the same memory size"
     );
-    eprintln!(
-        "second live snapshot: {} rounds, {} pages, {:?} elapsed",
-        result2.rounds, result2.pages_copied, result2.elapsed
+    assert_ne!(
+        result2.snapshot_path, snap_path,
+        "each live snapshot must get its own path"
     );
+    assert!(
+        std::path::Path::new(&snap_path).exists(),
+        "a second live snapshot must not delete the first snapshot's file"
+    );
+    assert!(
+        std::path::Path::new(&result2.snapshot_path).exists(),
+        "second live snapshot file is missing"
+    );
+    eprintln!(
+        "second live snapshot: {} rounds, {} pages, {:?} downtime",
+        result2.rounds, result2.pages_copied, result2.downtime
+    );
+
+    // (d) A diff snapshot taken after live snapshots must still restore
+    //     correctly. The live snapshot drains KVM's dirty bitmap, so without
+    //     replaying those bits into the host-dirty tracker the diff would
+    //     silently omit pages the guest had written.
+    let full_snap = controller.snapshot(false).expect("full snapshot");
+    retain_snapshot(&controller, &full_snap);
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'dd if=/dev/urandom of={GUEST_RAM_DIR}/diff-marker bs=1M count=4 && sync'"
+        ),
+    );
+    let diff_digest = guest_stdout(
+        &controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/diff-marker | cut -d\" \" -f1'"),
+    )
+    .trim()
+    .to_string();
+    let _ = controller
+        .live_snapshot(LiveSnapshotConfig::default())
+        .expect("live snapshot between full and diff");
+    let diff_snap = controller.snapshot(true).expect("diff snapshot");
+    retain_snapshot(&controller, &diff_snap);
+
+    let diff_controller = VmmController::new();
+    diff_controller
+        .restore(
+            &diff_snap,
+            Some(
+                test_support::private_overlay_path("live-diff-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore from diff snapshot taken after a live snapshot");
+    let restored_diff_digest = guest_stdout(
+        &diff_controller,
+        &format!("bash -c 'sha256sum {GUEST_RAM_DIR}/diff-marker | cut -d\" \" -f1'"),
+    );
+    assert_eq!(
+        restored_diff_digest.trim(),
+        diff_digest,
+        "a live snapshot dropped dirty pages from the following diff snapshot"
+    );
+    diff_controller.stop().ok();
+    // The diff must stay a diff: replaying the live snapshot's consumed dirty
+    // bits must not mark all of guest RAM dirty and silently turn every
+    // subsequent incremental snapshot into a full-RAM copy.
+    let diff_len = std::fs::metadata(&diff_snap).expect("diff metadata").len();
+    let full_len = std::fs::metadata(&full_snap).expect("full metadata").len();
+    eprintln!("diff after live snapshot: {diff_len} bytes vs full {full_len} bytes");
+    assert!(
+        diff_len < full_len / 2,
+        "a live snapshot inflated the following diff to {diff_len} bytes (full is {full_len})"
+    );
+    let _ = std::fs::remove_file(&full_snap);
+    let _ = std::fs::remove_file(&diff_snap);
+    eprintln!("diff snapshot after live snapshot: consistent");
 
     // Step 5: cleanly stop the running VM (joins the background vCPU thread).
     restore_controller.stop().ok();
+    let second_path = result2.snapshot_path.clone();
     controller.stop().expect("stop");
-    let _ = std::fs::remove_file(&snap_path);
-    eprintln!("live snapshot consistency: PASS (struct + restore + 2x snapshot)");
+    // Stopping the VM releases every live snapshot it still owns.
+    assert!(
+        !std::path::Path::new(&snap_path).exists() && !std::path::Path::new(&second_path).exists(),
+        "stopping the VM must remove the live snapshots it still owns"
+    );
+    eprintln!("live snapshot consistency: PASS (payload + restore + diff + 2x snapshot)");
+}
+
+/// Device-DMA staleness regression. KVM's dirty log only records guest vCPU
+/// writes; pages that virtio devices DMA into (block reads filling the page
+/// cache, net/vsock RX buffers, used rings) are written by VMM userspace and
+/// are invisible to it. A live snapshot that consults only KVM's log captures
+/// those pages as they were during the bulk copy — stale.
+///
+/// Witness: the guest DMA-reads a disk range into its page cache *while* the
+/// pre-copy loop runs (a vCPU-side churn loop keeps the loop going long
+/// enough), and nothing touches those cache pages afterwards. After a
+/// restore, re-reading the range is served from the restored page cache, so
+/// the digest only matches if the image carried the DMA'd pages.
+#[test]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
+fn live_snapshot_captures_device_dma() {
+    let controller = VmmController::new();
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("create_live");
+    assert_guest_exec(&controller, "bash -c 'echo dma-src-ok'", "dma-src-ok");
+    guest_stdout(
+        &controller,
+        &format!("bash -c 'mkdir -p {GUEST_RAM_DIR} && mount -t tmpfs -o size=64m tmpfs {GUEST_RAM_DIR}'"),
+    );
+
+    // Witness range: 16 MiB of /dev/vda past the ext4 journal area.
+    let witness = "dd if=/dev/vda bs=1M skip=32 count=16 2>/dev/null";
+
+    // Evict any cached copy of the witness range so the only way its pages
+    // get into guest RAM is the DMA performed during the snapshot.
+    guest_stdout(
+        &controller,
+        "bash -c 'sync && echo 3 > /proc/sys/vm/drop_caches && echo dropped'",
+    );
+
+    // vCPU-side churn: keeps the pre-copy loop iterating (its writes are in
+    // KVM's log) so the witness DMA below lands between the bulk copy and the
+    // final stop. Stopped via sentinel file so the restored guest can halt it.
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'nohup bash -c \"while [ ! -f {GUEST_RAM_DIR}/stop-churn ]; do \
+             dd if=/dev/zero of={GUEST_RAM_DIR}/churn bs=1M count=8 conv=notrunc 2>/dev/null; \
+             done\" >/dev/null 2>&1 & echo churn-started'"
+        ),
+    );
+
+    // Witness DMA, delayed past the bulk copy.
+    guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'nohup bash -c \"sleep 0.1; {witness} >/dev/null; \
+             touch {GUEST_RAM_DIR}/witness-done\" >/dev/null 2>&1 & echo witness-started'"
+        ),
+    );
+
+    let result = controller
+        .live_snapshot(LiveSnapshotConfig::default())
+        .expect("live snapshot during device DMA");
+    eprintln!(
+        "DMA snapshot: {} rounds, {} pages, {} residual, {:?} downtime",
+        result.rounds, result.pages_copied, result.final_dirty_pages, result.downtime
+    );
+    // The churn loop must have kept the snapshot in its pre-copy rounds long
+    // enough for the delayed witness DMA to overlap it.
+    assert!(
+        result.rounds >= 3,
+        "snapshot converged after only {} rounds — the witness DMA cannot have \
+         overlapped the pre-copy loop",
+        result.rounds
+    );
+    let snap_path = result.snapshot_path.clone();
+
+    // Ground truth: the source guest's own (cached) view of the range. The
+    // wait must observe witness-done — if the witness DMA never ran, the
+    // restored guest's read would silently fall back to disk and mask a
+    // staleness bug as a passing digest match.
+    let witness_sync = guest_stdout(
+        &controller,
+        &format!(
+            "bash -c 'for i in $(seq 50); do [ -f {GUEST_RAM_DIR}/witness-done ] && break; \
+             sleep 0.1; done; [ -f {GUEST_RAM_DIR}/witness-done ] && echo synced || echo missing'"
+        ),
+    );
+    assert!(
+        witness_sync.contains("synced"),
+        "witness DMA never completed in the source guest: {witness_sync}"
+    );
+    let source_digest = guest_stdout(
+        &controller,
+        &format!("bash -c '{witness} | sha256sum | cut -d\" \" -f1'"),
+    )
+    .trim()
+    .to_string();
+    assert_eq!(source_digest.len(), 64, "bad digest: {source_digest}");
+
+    // Restore and compare. The restored guest's read is served from the
+    // restored page cache — the pages the snapshot must have carried.
+    let restore_controller = VmmController::new();
+    restore_controller
+        .restore(
+            &snap_path,
+            Some(
+                private_overlay_path("live-dma-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore from DMA-window live snapshot");
+    guest_stdout(
+        &restore_controller,
+        &format!("bash -c 'touch {GUEST_RAM_DIR}/stop-churn; echo churn-stopped'"),
+    );
+    let restored_digest = guest_stdout(
+        &restore_controller,
+        &format!("bash -c '{witness} | sha256sum | cut -d\" \" -f1'"),
+    );
+    assert_eq!(
+        restored_digest.trim(),
+        source_digest,
+        "restored page cache does not match the source: device-DMA'd pages \
+         went stale in the live snapshot image"
+    );
+
+    restore_controller.stop().ok();
+    controller.stop().expect("stop");
+    eprintln!("live snapshot device DMA: PASS");
+}
+
+#[cfg(feature = "test-failpoints")]
+struct LiveSnapshotFailpointGuard;
+
+#[cfg(feature = "test-failpoints")]
+impl LiveSnapshotFailpointGuard {
+    fn arm(phase: &str) -> Self {
+        std::env::set_var("TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE", phase);
+        Self
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for LiveSnapshotFailpointGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("TARIT_TEST_LIVE_SNAPSHOT_FAIL_PHASE");
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+fn regular_file_count(path: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                regular_file_count(&path)
+            } else {
+                usize::from(path.is_file())
+            }
+        })
+        .sum()
+}
+
+/// Every injected failure must resume the authoritative source and remove all
+/// partially written RAM, disk-upper, and integrity artifacts. This is a real
+/// KVM gate rather than a mocked state-machine assertion.
+#[cfg(feature = "test-failpoints")]
+#[test]
+#[ignore = "needs Linux+KVM + reflink storage and an OCI guest fixture"]
+fn live_snapshot_phase_failures_resume_source_and_remove_artifacts() {
+    const PHASES: &[&str] = &[
+        "dirty_logging",
+        "bulk",
+        "dirty_round",
+        "final_pause",
+        "state_capture",
+        "precopy_complete",
+        "snapshot_written",
+        "snapshot_published",
+        "integrity_written",
+        "integrity_published",
+    ];
+
+    let runtime_dir = std::env::temp_dir()
+        .join(".vmm-runtime")
+        .join(format!("vmm-{}", std::process::id()));
+    let overlay_dir = std::env::var_os("VMM_TEST_OVERLAY_DIR")
+        .map(PathBuf::from)
+        .expect("VMM_TEST_OVERLAY_DIR must select reflink storage")
+        .join(std::process::id().to_string());
+
+    for phase in PHASES {
+        let controller = VmmController::new();
+        controller
+            .create_live(agent_vm_config(256))
+            .unwrap_or_else(|error| panic!("create source for {phase}: {error}"));
+        assert_guest_exec(&controller, "printf before-failure", "before-failure");
+        let runtime_before = regular_file_count(&runtime_dir);
+        let overlay_before = regular_file_count(&overlay_dir);
+
+        let failpoint = LiveSnapshotFailpointGuard::arm(phase);
+        let error = controller
+            .live_snapshot(LiveSnapshotConfig::default())
+            .expect_err("phase injection must fail the snapshot");
+        drop(failpoint);
+        assert!(
+            error.to_string().contains(phase),
+            "wrong error for {phase}: {error}"
+        );
+        assert_guest_exec(
+            &controller,
+            &format!("printf source-alive-{phase}"),
+            &format!("source-alive-{phase}"),
+        );
+        assert_eq!(
+            regular_file_count(&runtime_dir),
+            runtime_before,
+            "runtime artifact leaked after {phase}"
+        );
+        assert_eq!(
+            regular_file_count(&overlay_dir),
+            overlay_before,
+            "disk-upper artifact leaked after {phase}"
+        );
+        controller
+            .stop()
+            .unwrap_or_else(|error| panic!("stop source after {phase}: {error}"));
+        eprintln!("live snapshot injected phase {phase}: PASS");
+    }
+}
+
+/// A deliberately non-convergent live snapshot on a guest larger than the
+/// ordinary 256/512 MiB correctness fixtures. The source must resume after a
+/// bounded final stop, and the restored guest must retain data outside the
+/// continuously dirtied working set.
+#[test]
+#[ignore = "needs Linux+KVM + reflink storage and a large OCI guest fixture"]
+fn live_snapshot_large_memory_high_dirty() {
+    let memory_mib = std::env::var("VMM_TEST_LARGE_MEMORY_MIB")
+        .ok()
+        .map(|value| value.parse::<u64>().expect("VMM_TEST_LARGE_MEMORY_MIB"))
+        .unwrap_or(1024);
+    assert!(
+        (1024..=vmm_core::config::MAX_MEMORY_MIB).contains(&memory_mib),
+        "large-memory gate must exercise a supported guest of at least 1 GiB"
+    );
+    let churn_mib = (memory_mib / 2).min(1024);
+
+    let controller = VmmController::new();
+    controller
+        .create_live(agent_vm_config(memory_mib))
+        .expect("create large live VM");
+    assert_guest_exec(
+        &controller,
+        "printf large-source-ready",
+        "large-source-ready",
+    );
+    guest_stdout(
+        &controller,
+        &format!(
+            "mkdir -p {GUEST_RAM_DIR}; mount -t tmpfs -o size={}m tmpfs {GUEST_RAM_DIR}; \
+             dd if=/dev/urandom of={GUEST_RAM_DIR}/immutable bs=1M count=16 status=none; \
+             dd if=/dev/zero of={GUEST_RAM_DIR}/churn bs=1M count={churn_mib} status=none; sync",
+            churn_mib + 64
+        ),
+    );
+    let source_digest = guest_stdout(
+        &controller,
+        &format!("sha256sum {GUEST_RAM_DIR}/immutable | cut -d' ' -f1"),
+    )
+    .trim()
+    .to_owned();
+    assert_eq!(source_digest.len(), 64, "unexpected source digest");
+
+    guest_stdout(
+        &controller,
+        &format!(
+            "nohup sh -c 'while [ ! -f {GUEST_RAM_DIR}/stop-churn ]; do \
+             dd if=/dev/zero of={GUEST_RAM_DIR}/churn bs=1M count={churn_mib} \
+             conv=notrunc status=none; done' </dev/null >/dev/null 2>&1 & \
+             echo $! >{GUEST_RAM_DIR}/churn.pid; printf churn-started"
+        ),
+    );
+
+    let config = LiveSnapshotConfig {
+        target_downtime_us: 500,
+        max_rounds: 8,
+        timeout_secs: 30,
+    };
+    let result = controller
+        .live_snapshot(config.clone())
+        .expect("bounded high-dirty live snapshot");
+    eprintln!(
+        "large high-dirty snapshot: memory={}MiB rounds={} pages={} residual={} decision={:?} termination={:?} downtime={:?} elapsed={:?}",
+        memory_mib,
+        result.rounds,
+        result.pages_copied,
+        result.final_dirty_pages,
+        result.final_decision,
+        result.termination,
+        result.downtime,
+        result.elapsed
+    );
+    assert_eq!(result.mem_bytes, memory_mib << 20);
+    assert!(result.rounds >= 2, "pre-copy did not sample dirtying");
+    assert!(
+        matches!(
+            result.termination,
+            vmm_core::LiveSnapshotTermination::Diverging
+                | vmm_core::LiveSnapshotTermination::Timeout
+                | vmm_core::LiveSnapshotTermination::MaxRounds
+        ),
+        "the sustained tmpfs rewrite unexpectedly converged: {:?}",
+        result.termination
+    );
+    assert!(
+        result.final_dirty_pages >= 256,
+        "high-dirty final stop copied less than 1 MiB; workload was ineffective"
+    );
+    assert!(
+        result.elapsed <= std::time::Duration::from_secs(config.timeout_secs + 5),
+        "high-dirty snapshot exceeded its hard bound: {:?}",
+        result.elapsed
+    );
+    assert!(
+        result.downtime < std::time::Duration::from_secs(2),
+        "bounded final stop took {:?}",
+        result.downtime
+    );
+
+    let source_after = guest_stdout(
+        &controller,
+        &format!(
+            "touch {GUEST_RAM_DIR}/stop-churn; sha256sum {GUEST_RAM_DIR}/immutable | cut -d' ' -f1"
+        ),
+    );
+    assert_eq!(
+        source_after.trim(),
+        source_digest,
+        "source changed or stalled"
+    );
+
+    let restore_controller = VmmController::new();
+    restore_controller
+        .restore(
+            &result.snapshot_path,
+            Some(
+                private_overlay_path("large-high-dirty-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("restore large high-dirty snapshot");
+    let restored_digest = guest_stdout(
+        &restore_controller,
+        &format!(
+            "touch {GUEST_RAM_DIR}/stop-churn; sha256sum {GUEST_RAM_DIR}/immutable | cut -d' ' -f1"
+        ),
+    );
+    assert_eq!(
+        restored_digest.trim(),
+        source_digest,
+        "large high-dirty restore corrupted immutable guest memory"
+    );
+    restore_controller.stop().expect("stop restored VM");
+    controller.stop().expect("stop source VM");
+    eprintln!("large high-dirty live snapshot: PASS");
+}
+
+/// Prove that configured RAM beyond the x86 MMIO aperture is present in a
+/// second KVM slot, remains packed in the VMSN artifact, and survives lazy
+/// restore. This is separate from the high-dirty latency gate so storage speed
+/// cannot obscure the address-layout invariant.
+#[test]
+#[ignore = "needs Linux+KVM + reflink storage and a 4 GiB OCI guest fixture"]
+fn split_memory_above_mmio_gap_live_snapshot_restore() {
+    let memory_mib = std::env::var("VMM_TEST_SPLIT_MEMORY_MIB")
+        .ok()
+        .map(|value| value.parse::<u64>().expect("VMM_TEST_SPLIT_MEMORY_MIB"))
+        .unwrap_or(4096);
+    assert!(
+        memory_mib > 3328 && memory_mib <= vmm_core::config::MAX_MEMORY_MIB,
+        "split-memory gate must cross the 3.25 GiB aperture"
+    );
+
+    let controller = VmmController::new();
+    controller
+        .create_live(agent_vm_config(memory_mib))
+        .expect("boot split-memory VM");
+    let mem_total_kib = guest_stdout(
+        &controller,
+        "awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo",
+    )
+    .trim()
+    .parse::<u64>()
+    .expect("numeric guest MemTotal");
+    assert!(
+        mem_total_kib > 3_500_000,
+        "guest lost high memory: MemTotal={mem_total_kib} KiB"
+    );
+    assert_guest_exec(
+        &controller,
+        "awk '$1 ~ /^100000000-/ && /System RAM/ { found=1 } END { if (found) print \"high-ram-ok\"; else exit 1 }' /proc/iomem",
+        "high-ram-ok",
+    );
+    assert_guest_exec(
+        &controller,
+        "mkdir -p /run/split-memory; mount -t tmpfs -o size=64m tmpfs /run/split-memory; dd if=/dev/urandom of=/run/split-memory/proof bs=1M count=32 status=none; sha256sum /run/split-memory/proof > /run/split-memory/proof.sha256; echo split-proof-ready",
+        "split-proof-ready",
+    );
+
+    let result = controller
+        .live_snapshot(LiveSnapshotConfig {
+            target_downtime_us: 2_000,
+            max_rounds: 8,
+            timeout_secs: 60,
+        })
+        .expect("live snapshot split-memory VM");
+    assert_eq!(result.mem_bytes, memory_mib << 20);
+    assert_guest_exec(
+        &controller,
+        "printf split-source-alive",
+        "split-source-alive",
+    );
+
+    let restored = VmmController::new();
+    restored
+        .restore(
+            &result.snapshot_path,
+            Some(
+                private_overlay_path("split-memory-restore")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect("lazy restore split-memory snapshot");
+    assert_guest_exec(
+        &restored,
+        "sha256sum -c /run/split-memory/proof.sha256 && awk '$1 ~ /^100000000-/ && /System RAM/ { found=1 } END { if (found) print \"split-restore-ok\"; else exit 1 }' /proc/iomem",
+        "split-restore-ok",
+    );
+    restored.stop().expect("stop split-memory restore");
+    controller.stop().expect("stop split-memory source");
+    eprintln!(
+        "split memory live snapshot/restore: PASS ({} MiB, {:?} downtime)",
+        memory_mib, result.downtime
+    );
 }
 
 /// Performance gates.
 /// Cold boot latency (p50/p99), restore latency, snapshot latency.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn perf_gates_comprehensive() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let mut boot_times = Vec::new();
     let mut snapshot_times = Vec::new();
     let mut restore_times = Vec::new();
@@ -204,7 +762,14 @@ fn perf_gates_comprehensive() {
         let controller = VmmController::new();
         flushed_eprintln!("iter {i}: pre-create");
         let t0 = Instant::now();
-        controller.create(vm_config()).expect("boot");
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo perf-create-ok'",
+            "perf-create-ok",
+        );
         let boot_ms = t0.elapsed().as_millis();
         boot_times.push(boot_ms);
         flushed_eprintln!("iter {i}: boot done — {boot_ms}ms");
@@ -217,7 +782,21 @@ fn perf_gates_comprehensive() {
         flushed_eprintln!("iter {i}: snapshot done — {snap_ms}ms ({snap_path})");
 
         let t2 = Instant::now();
-        controller.restore(&snap_path, None).expect("restore");
+        controller
+            .restore(
+                &snap_path,
+                Some(
+                    private_overlay_path("perf-restore")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            )
+            .expect("restore");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo perf-restore-ok'",
+            "perf-restore-ok",
+        );
         let restore_ms = t2.elapsed().as_millis();
         restore_times.push(restore_ms);
         flushed_eprintln!("iter {i}: restore done — {restore_ms}ms");
@@ -238,21 +817,17 @@ fn perf_gates_comprehensive() {
     let snap_p50 = snapshot_times[snapshot_times.len() / 2];
     let restore_p50 = restore_times[restore_times.len() / 2];
 
-    // Thresholds are nested-virt gates, not bare-metal targets. The design
-    // targets are <125ms boot, <30ms snapshot, <10ms restore on bare metal; on
-    // c8i nested KVM (L0 hides ioeventfd, no kvm-clock vDSO) the same
-    // operations run 2-5× slower because every guest exit traps to L0.
-    // We assert against the nested ceiling so the gate fails loud on
-    // any real regression while still ratcheting toward bare-metal numbers.
-    const BOOT_GATE_MS: u128 = 125; // bare-metal target — c8i ~30-100ms.
+    // Boot and restore include a successful guest command. Snapshot measures
+    // only the state capture itself.
+    const BOOT_GATE_MS: u128 = 5_000;
     const SNAP_GATE_MS: u128 = 200; // bare-metal <30ms; nested ~73ms.
-    const RESTORE_GATE_MS: u128 = 200; // bare-metal <10ms (UFFD); nested eager copy.
+    const RESTORE_GATE_MS: u128 = 5_000;
 
     eprintln!("=== PERF GATES ===");
     eprintln!("Cold boot p50: {boot_p50}ms (gate <{BOOT_GATE_MS}ms)");
     eprintln!("Cold boot p99: {boot_p99}ms");
-    eprintln!("Snapshot p50: {snap_p50}ms (gate <{SNAP_GATE_MS}ms; bare-metal target <30ms)");
-    eprintln!("Restore p50: {restore_p50}ms (gate <{RESTORE_GATE_MS}ms; bare-metal target <10ms)");
+    eprintln!("Snapshot p50: {snap_p50}ms (gate <{SNAP_GATE_MS}ms)");
+    eprintln!("Restore-to-exec p50: {restore_p50}ms (gate <{RESTORE_GATE_MS}ms)");
 
     assert!(
         snap_p50 < SNAP_GATE_MS,
@@ -271,7 +846,7 @@ fn perf_gates_comprehensive() {
         eprintln!(
             "boot p50 {boot_p50}ms — informational only (boot latency is dominated by \
              host virt nesting; set VMM_PERF_STRICT=1 to enforce the {BOOT_GATE_MS}ms \
-             bare-metal gate)"
+             create-to-command-ready gate)"
         );
     }
     eprintln!("perf gates: PASS");
@@ -279,29 +854,29 @@ fn perf_gates_comprehensive() {
 
 /// VM creation rate (VMs/sec/host).
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn perf_creation_rate() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let n = 10;
     let controller = VmmController::new();
     let t0 = Instant::now();
     for _ in 0..n {
-        controller.create(vm_config()).expect("boot");
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo creation-rate-ok'",
+            "creation-rate-ok",
+        );
         controller.stop().ok();
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let rate = n as f64 / elapsed;
-    // Gate: 3 VMs/sec on nested virt (bare-metal target is >100/s).
-    // c8i nested virt is ~5-15 VMs/sec for the minimal kernel.
-    const RATE_GATE: f64 = 3.0;
+    // This is create-to-command-ready throughput, not kernel-load throughput.
+    const RATE_GATE: f64 = 0.2;
     eprintln!("=== CREATION RATE ===");
     eprintln!(
-        "Created {n} VMs in {elapsed:.2}s = {rate:.1} VMs/sec (gate >{RATE_GATE:.0}/s; bare-metal target >100/s)"
+        "Created and executed in {n} VMs in {elapsed:.2}s = {rate:.1} VMs/sec (gate >{RATE_GATE:.1}/s)"
     );
     if perf_strict() {
         assert!(
@@ -319,14 +894,8 @@ fn perf_creation_rate() {
 
 /// Per-VM memory overhead.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn perf_memory_overhead() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     // Incremental overhead — boot one VM, measure RSS; boot a second,
     // measure RSS again; the delta isolates per-VM cost from VMM-binary
     // cost (the classic microVM design point is ~5 MiB on bare metal).
@@ -342,16 +911,30 @@ fn perf_memory_overhead() {
     }
 
     let controller1 = VmmController::new();
-    controller1.create(vm_config()).expect("boot 1");
+    controller1
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest 1");
+    assert_guest_exec(
+        &controller1,
+        "bash -c 'echo memory-vm-1-ok'",
+        "memory-vm-1-ok",
+    );
     let rss1 = rss_mib();
     let controller2 = VmmController::new();
-    controller2.create(vm_config()).expect("boot 2");
+    controller2
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest 2");
+    assert_guest_exec(
+        &controller2,
+        "bash -c 'echo memory-vm-2-ok'",
+        "memory-vm-2-ok",
+    );
     let rss2 = rss_mib();
     let delta_mib = rss2.saturating_sub(rss1);
 
     eprintln!("=== MEMORY OVERHEAD ===");
     eprintln!("RSS after VM1: {rss1} MiB, after VM2: {rss2} MiB, delta: {delta_mib} MiB");
-    eprintln!("Target: <5 MiB per-VM (bare metal); gate <20 MiB allows demand-paged guest pages");
+    eprintln!("Gate: <256 MiB incremental RSS per live 256 MiB guest");
 
     // Gate: <256 MiB per VM on nested virt (guest RAM is 256 MiB; on nested
     // virt the L0 may eagerly map pages). On bare metal, this would be <20 MiB.
@@ -368,16 +951,17 @@ fn perf_memory_overhead() {
 
 /// Snapshot tampering — corrupt state file → restore must refuse.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn snapshot_tampering_rejected() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let controller = VmmController::new();
-    controller.create(vm_config()).expect("boot");
+    controller
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest");
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo tamper-source-ok'",
+        "tamper-source-ok",
+    );
     let snap_path = controller.snapshot(false).expect("snapshot");
     retain_snapshot(&controller, &snap_path);
 
@@ -529,6 +1113,7 @@ fn jailer_escape_attempts() {
         rlimit_nofile: 1024,
         rlimit_as: 0,
         netns: "".into(),
+        isolate_network: false,
         cgroup_limits: None,
     };
     let result = vmm_jailer::jail(&bad_cfg);
@@ -542,6 +1127,7 @@ fn jailer_escape_attempts() {
         rlimit_nofile: 1024,
         rlimit_as: 0,
         netns: "".into(),
+        isolate_network: false,
         cgroup_limits: None,
     };
     let result = vmm_jailer::jail(&root_cfg);
@@ -550,25 +1136,14 @@ fn jailer_escape_attempts() {
     eprintln!("jailer escape attempts: PASS");
 }
 
-/// Cold-boot benchmark — 100 iterations of (create → snapshot → drop), measuring
-/// the wall-clock from `create()` entry to return. The synchronous boot path
-/// runs to first HLT (kernel init runs, then KVM_RUN returns Ok(()) via the
-/// watchdog or HLT exit). This is the standard microVM "cold boot to
-/// userspace" metric — though it stops at kernel-to-init handoff because
-/// the c8i nested-virt stack blocks virtio-blk DRIVER_OK from firing, so we
-/// can't reach a real `/bin/echo` without bare metal.
+/// Cold-boot benchmark — 100 iterations from live create through a successful
+/// command executed by the guest agent.
 ///
 /// Reports p50/p95/p99 + p999 to expose tail jitter. Writes
 /// `target/cold-boot-bench.md` so the numbers stick around across runs.
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage; ~10 minutes"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS; ~10 minutes"]
 fn cold_boot_benchmark_100() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     const N: usize = 100;
     let mut samples_ms: Vec<u128> = Vec::with_capacity(N);
 
@@ -577,7 +1152,14 @@ fn cold_boot_benchmark_100() {
     for i in 0..N {
         let controller = VmmController::new();
         let t0 = Instant::now();
-        controller.create(vm_config()).expect("boot");
+        controller
+            .create_live(agent_vm_config(256))
+            .expect("boot live guest");
+        assert_guest_exec(
+            &controller,
+            "bash -c 'echo cold-boot-benchmark-ok'",
+            "cold-boot-benchmark-ok",
+        );
         let elapsed_us = t0.elapsed().as_micros();
         samples_ms.push(elapsed_us);
         controller.stop().ok();
@@ -605,11 +1187,9 @@ fn cold_boot_benchmark_100() {
     let report = format!(
         "# Cold-boot benchmark — {N} iterations\n\
          \n\
-         Boots a 128 MiB VM with the in-tree minimal bzImage to first HLT (kernel\n\
-         init runs, returns to the controller). c8i nested-virt; no userspace\n\
-         echo because virtio-blk DRIVER_OK doesn't fire on L1 (a known\n\
-         nested-virt limitation). Bare-metal numbers would skip the L0 trap penalty\n\
-         and run 2-5× faster.\n\
+         Boots a 256 MiB VM with the configured candidate kernel and rootfs, then\n\
+         executes a bash marker through the guest agent. Each sample is a real\n\
+         create-to-command-ready measurement.\n\
          \n\
          | metric | value |\n\
          |---|---|\n\
@@ -678,23 +1258,18 @@ fn cold_boot_benchmark_100() {
 fn oci_cold_boot_pull_pipeline() {
     use vmm_core::oci::{pull_and_convert, OciImageRef};
 
-    // Pick alpine:3 — ~5 MB, single layer, fastest to validate the pipeline.
-    // (Debian:slim is ~30 MB; we don't need apt-get for this gate, only that
-    // pull+convert produces a bootable ext4 image.)
+    // Exercise the production-default distro rather than a tiny synthetic
+    // image. CI may override the immutable reference for a pinned mirror.
+    let reference = std::env::var("VMM_TEST_OCI_IMAGE")
+        .unwrap_or_else(|_| "docker://docker.io/library/ubuntu:24.04".into());
     let image = OciImageRef {
-        reference: "docker://docker.io/library/alpine:3".into(),
+        reference,
         auth_file: None,
     };
-    let out = std::env::temp_dir().join("vmm-oci-bench-alpine.ext4");
+    let out = std::env::temp_dir().join("vmm-oci-pipeline.ext4");
 
     let t0 = Instant::now();
-    let result = match pull_and_convert(&image, &out, 256) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("oci pipeline skipped — {e}");
-            return; // tool missing or offline; the gate is the binary, not the network
-        }
-    };
+    let result = pull_and_convert(&image, &out, 512).expect("OCI pull and conversion must succeed");
     let pull_ms = t0.elapsed().as_millis();
 
     eprintln!(

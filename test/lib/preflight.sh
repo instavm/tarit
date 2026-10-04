@@ -80,10 +80,18 @@ require_tools(){
 
 # build_binaries — build taritd (release) + vmm (debug) if missing.
 build_binaries(){
-  local vmm="$REPO_ROOT/vmm/target/debug/vmm"
-  local taritd="$REPO_ROOT/orch/target/release/taritd"
-  if [ ! -x "$vmm" ]; then info "building vmm (debug)…"; ( cd "$REPO_ROOT/vmm" && cargo build -p vmm --features boot ) || die "vmm build failed"; fi
-  if [ ! -x "$taritd" ]; then info "building taritd (release)…"; ( cd "$REPO_ROOT/orch" && cargo build --release -p taritd ) || die "taritd build failed"; fi
+  local vmm="${TARIT_VMM_BIN:-$REPO_ROOT/vmm/target/debug/vmm}"
+  local taritd="${TARITD_BIN:-$REPO_ROOT/orch/target/release/taritd}"
+  if [ ! -x "$vmm" ]; then
+    [ -z "${TARIT_VMM_BIN:-}" ] || die "configured TARIT_VMM_BIN is not executable: $vmm"
+    info "building vmm (debug)…"
+    ( cd "$REPO_ROOT/vmm" && cargo build -p vmm --features boot ) || die "vmm build failed"
+  fi
+  if [ ! -x "$taritd" ]; then
+    [ -z "${TARITD_BIN:-}" ] || die "configured TARITD_BIN is not executable: $taritd"
+    info "building taritd (release)…"
+    ( cd "$REPO_ROOT/orch" && cargo build --release -p taritd ) || die "taritd build failed"
+  fi
   export TARIT_VMM_BIN="$vmm" TARITD_BIN="$taritd"
 }
 

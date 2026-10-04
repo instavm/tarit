@@ -1,17 +1,24 @@
 //! Declarative VM configuration (kernel path, memory size, vcpu count, volumes, net).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// One mebibyte in bytes.
 pub const MIB: u64 = 1024 * 1024;
 /// Minimum guest RAM accepted by config validation.
 pub const MIN_MEMORY_MIB: u64 = 1;
-/// Maximum guest RAM accepted by config validation (1 TiB).
-pub const MAX_MEMORY_MIB: u64 = 1024 * 1024;
+/// Maximum guest RAM accepted by config validation. The memory backend packs
+/// this RAM contiguously for snapshots and maps bytes beyond 3.25 GiB into a
+/// second KVM slot above the x86 MMIO aperture.
+pub const MAX_MEMORY_MIB: u64 = 65_536;
 /// Maximum guest RAM accepted by config validation, in bytes.
 pub const MAX_MEMORY_BYTES: u64 = MAX_MEMORY_MIB * MIB;
 /// Maximum number of vCPUs accepted by config validation.
 pub const MAX_VCPU_COUNT: u16 = 256;
+/// Maximum number of network devices supported by the deterministic MMIO map.
+pub const MAX_NET_DEVICES: usize = 8;
+/// Maximum number of virtio block devices supported by the deterministic MMIO map.
+pub const MAX_BLOCK_DEVICES: usize = 16;
 
 /// Error returned when a VM config fails resource-sizing validation.
 #[derive(Debug)]
@@ -76,6 +83,11 @@ pub struct VolumeConfig {
     /// Private sparse CoW overlay path. When set, `path` is the read-only base.
     #[serde(default)]
     pub overlay: Option<String>,
+    /// Private descriptor inherited from the orchestrator. When present the VMM
+    /// duplicates this already-open object instead of resolving `path`; `path`
+    /// is then only a non-sensitive diagnostic label.
+    #[serde(default)]
+    pub inherited_fd: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,8 +125,152 @@ impl VmConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.memory.validate()?;
         self.vcpus.validate()?;
+        validate_volumes(&self.volumes)?;
+        validate_networks(&self.net)?;
         Ok(())
     }
+}
+
+fn validate_volumes(volumes: &[VolumeConfig]) -> Result<(), ConfigError> {
+    if volumes.len() > MAX_BLOCK_DEVICES {
+        return Err(ConfigError::Invalid(format!(
+            "volumes supports at most {MAX_BLOCK_DEVICES} devices, got {}",
+            volumes.len()
+        )));
+    }
+    let mut inherited = HashSet::new();
+    for (index, volume) in volumes.iter().enumerate() {
+        if volume.path.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "volumes[{index}].path label must not be empty"
+            )));
+        }
+        if let Some(fd) = volume.inherited_fd {
+            if fd < 3 {
+                return Err(ConfigError::Invalid(format!(
+                    "volumes[{index}].inherited_fd must be at least 3"
+                )));
+            }
+            if volume.overlay.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "volumes[{index}] cannot combine inherited_fd with overlay"
+                )));
+            }
+            if !inherited.insert(fd) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate inherited volume descriptor {fd}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_networks(networks: &[NetConfig]) -> Result<(), ConfigError> {
+    if networks.len() > MAX_NET_DEVICES {
+        return Err(ConfigError::Invalid(format!(
+            "net supports at most {MAX_NET_DEVICES} devices, got {}",
+            networks.len()
+        )));
+    }
+
+    let mut taps = HashSet::new();
+    let mut macs = HashSet::new();
+    let mut ips = HashSet::new();
+    let mut host_ports = HashSet::new();
+    for (index, net) in networks.iter().enumerate() {
+        if net.tap.is_empty()
+            || net.tap.len() >= libc_if_name_size()
+            || !net
+                .tap
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "net[{index}].tap must be 1..={} ASCII [A-Za-z0-9_.-] bytes",
+                libc_if_name_size() - 1
+            )));
+        }
+        if !taps.insert(net.tap.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "duplicate tap interface {:?}",
+                net.tap
+            )));
+        }
+
+        if let Some(mac) = &net.guest_mac {
+            let parsed = parse_mac(mac).ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "net[{index}].guest_mac must be six colon-separated hex bytes"
+                ))
+            })?;
+            if parsed == [0; 6] || parsed[0] & 1 != 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "net[{index}].guest_mac must be a non-zero unicast address"
+                )));
+            }
+            if !macs.insert(parsed) {
+                return Err(ConfigError::Invalid(format!("duplicate guest MAC {mac:?}")));
+            }
+        }
+
+        if let Some(ip) = &net.guest_ip {
+            let parsed = ip.parse::<std::net::IpAddr>().map_err(|error| {
+                ConfigError::Invalid(format!("net[{index}].guest_ip {ip:?}: {error}"))
+            })?;
+            if parsed.is_unspecified() || parsed.is_multicast() {
+                return Err(ConfigError::Invalid(format!(
+                    "net[{index}].guest_ip must be a unicast address"
+                )));
+            }
+            if !ips.insert(parsed) {
+                return Err(ConfigError::Invalid(format!("duplicate guest IP {ip:?}")));
+            }
+        } else if !net.port_forwards.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "net[{index}] needs guest_ip when port_forwards are configured"
+            )));
+        }
+
+        for (forward_index, forward) in net.port_forwards.iter().enumerate() {
+            if forward.host_port == 0 || forward.guest_port == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "net[{index}].port_forwards[{forward_index}] ports must be non-zero"
+                )));
+            }
+            if !matches!(forward.proto.as_str(), "tcp" | "udp") {
+                return Err(ConfigError::Invalid(format!(
+                    "net[{index}].port_forwards[{forward_index}].proto must be tcp or udp"
+                )));
+            }
+            if !host_ports.insert((forward.proto.as_str(), forward.host_port)) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate host port {}/{}",
+                    forward.host_port, forward.proto
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn libc_if_name_size() -> usize {
+    // Linux IFNAMSIZ. This protocol is consumed by the Linux VMM; keeping the
+    // bound here also makes invalid names fail before any host networking call.
+    16
+}
+
+fn parse_mac(value: &str) -> Option<[u8; 6]> {
+    let mut result = [0u8; 6];
+    let mut parts = value.split(':');
+    for byte in &mut result {
+        let part = parts.next()?;
+        if part.len() != 2 {
+            return None;
+        }
+        *byte = u8::from_str_radix(part, 16).ok()?;
+    }
+    parts.next().is_none().then_some(result)
 }
 
 impl MemoryConfig {
@@ -170,5 +326,124 @@ mod tests {
         assert!(serde_json::from_str::<VmConfig>(top).is_err());
         let nested = r#"{"kernel":{"path":"/k","cmdline":"","initramfs":null,"x":1},"memory":{"size_mib":64},"vcpus":{"count":1}}"#;
         assert!(serde_json::from_str::<VmConfig>(nested).is_err());
+    }
+
+    #[test]
+    fn memory_validation_accepts_the_split_memory_ceiling() {
+        assert!(MemoryConfig {
+            size_mib: MAX_MEMORY_MIB
+        }
+        .validate()
+        .is_ok());
+        assert!(MemoryConfig {
+            size_mib: MAX_MEMORY_MIB + 1
+        }
+        .validate()
+        .is_err());
+    }
+
+    fn config_with_net(net: Vec<NetConfig>) -> VmConfig {
+        VmConfig {
+            kernel: KernelConfig {
+                path: "/kernel".into(),
+                cmdline: String::new(),
+                initramfs: None,
+            },
+            memory: MemoryConfig { size_mib: 64 },
+            vcpus: VcpuConfig { count: 1 },
+            volumes: Vec::new(),
+            net,
+        }
+    }
+
+    fn volume(label: &str, inherited_fd: Option<i32>) -> VolumeConfig {
+        VolumeConfig {
+            path: label.into(),
+            read_only: false,
+            overlay: None,
+            inherited_fd,
+        }
+    }
+
+    #[test]
+    fn config_validates_inherited_volume_descriptors() {
+        let mut config = config_with_net(Vec::new());
+        config.volumes = vec![volume("data", Some(3)), volume("cache", Some(4))];
+        config.validate().unwrap();
+
+        config.volumes = vec![volume("data", Some(2))];
+        assert!(config.validate().is_err());
+        config.volumes = vec![volume("data", Some(3)), volume("cache", Some(3))];
+        assert!(config.validate().is_err());
+        config.volumes = vec![VolumeConfig {
+            overlay: Some("/tmp/unsafe.cow".into()),
+            ..volume("data", Some(3))
+        }];
+        assert!(config.validate().is_err());
+        config.volumes = vec![volume("", Some(3))];
+        assert!(config.validate().is_err());
+        config.volumes = (0..=MAX_BLOCK_DEVICES)
+            .map(|index| volume(&format!("disk-{index}"), None))
+            .collect();
+        assert!(config.validate().is_err());
+    }
+
+    fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {
+        NetConfig {
+            tap: tap.into(),
+            guest_mac: Some(mac.into()),
+            guest_ip: Some(ip.into()),
+            port_forwards: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_validates_network_identity_and_uniqueness() {
+        config_with_net(vec![
+            net("tap-a", "02:00:00:00:00:01", "10.0.0.2"),
+            net("tap-b", "02:00:00:00:00:02", "10.0.0.3"),
+        ])
+        .validate()
+        .unwrap();
+
+        assert!(
+            config_with_net(vec![net("bad/tap", "02:00:00:00:00:01", "10.0.0.2")])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            config_with_net(vec![net("tap-a", "03:00:00:00:00:01", "10.0.0.2")])
+                .validate()
+                .is_err()
+        );
+        assert!(config_with_net(vec![
+            net("tap-a", "02:00:00:00:00:01", "10.0.0.2"),
+            net("tap-a", "02:00:00:00:00:02", "10.0.0.3"),
+        ])
+        .validate()
+        .is_err());
+        assert!(config_with_net(vec![
+            net("tap-a", "02:00:00:00:00:01", "10.0.0.2"),
+            net("tap-b", "02:00:00:00:00:01", "10.0.0.3"),
+        ])
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn config_validates_port_forward_identity() {
+        let mut first = net("tap-a", "02:00:00:00:00:01", "10.0.0.2");
+        first.port_forwards.push(PortForwardConfig {
+            host_port: 8080,
+            guest_port: 80,
+            proto: "tcp".into(),
+        });
+        let mut second = net("tap-b", "02:00:00:00:00:02", "10.0.0.3");
+        second.port_forwards.push(PortForwardConfig {
+            host_port: 8080,
+            guest_port: 8080,
+            proto: "tcp".into(),
+        });
+        assert!(config_with_net(vec![first, second]).validate().is_err());
     }
 }

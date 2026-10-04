@@ -7,8 +7,9 @@ This guide covers building, running, clustering, load balancing, deployment help
 - Linux host with KVM for actually running microVMs.
 - Rust stable toolchain.
 - The rust-vmm based `vmm` binary from the sibling VMM repository.
-- Guest kernel and optional rootfs image readable by `taritd`.
-- `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`.
+- The release ELF `vmlinux` and optional rootfs image readable by `taritd`.
+- `umoci`, `skopeo`, and `e2fsck` on hosts that run `taritd image build`;
+  `cosign` is additionally required when provenance verification is configured.
 - PostgreSQL for distributed cluster mode.
 - `CAP_NET_ADMIN` or root only if `TARIT_ENABLE_NET=true`.
 
@@ -30,6 +31,18 @@ cargo build --release --features "vmm-core/kvm vmm-core/boot vmm-memory-backend/
 
 The deploy script uses the command above when the `vmm` binary is not found on `PATH`.
 
+Prepare and install the kernel and rootfs:
+
+```sh
+cd /path/to/tarit
+sudo make guest
+sudo install -d -m 0755 /var/lib/taritd
+sudo install -m 0644 guest-assets/vmlinux guest-assets/rootfs.ext4 /var/lib/taritd/
+```
+
+`make guest` verifies the pinned release kernel checksum and falls back to the
+same checksum-pinned source build if the artifact is unavailable.
+
 ## Run one node
 
 ```sh
@@ -40,7 +53,7 @@ export TARIT_LISTEN='0.0.0.0:8080'
 export TARIT_HOST_ID="$(hostname)"
 export TARIT_RPC_ADDR='http://127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"
@@ -63,7 +76,7 @@ Build immutable rootfs images from OCI refs on the host that has the VMM binary
 and OCI tooling:
 
 ```sh
-taritd image build --oci node:20-slim --name node20
+taritd image build --oci node:20-slim --name node20 --size 2048
 taritd image ls
 ```
 
@@ -92,6 +105,14 @@ taritd image gc --older-than-days 7 --dry-run
 taritd image gc --older-than-days 30 --pattern 'node:*'
 ```
 
+`--size` defaults to 1024 MiB and also bounds OCI preprocessing. Tarit verifies
+manifest, config, and layer descriptor size and SHA-256, then streams each
+supported layer before extraction. It rejects excessive layers, compressed or
+expanded bytes, entries, file size, or path length before running the unpacker.
+The command exits non-zero and removes its unpublished output and private
+workspace. The public VM-create API continues to accept only a successfully
+registered `image` name; no partial image becomes API-visible.
+
 ## Run a three-node cluster
 
 All nodes share:
@@ -101,7 +122,7 @@ export TARIT_API_KEY='replace-with-a-long-random-token'
 export TARIT_PEER_SECRET='replace-with-a-long-random-peer-secret'
 export TARIT_DATABASE_URL='postgres://taritd:password@postgres.example:5432/taritd?sslmode=require'
 export TARIT_VMM_BIN='/opt/taritd/bin/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
 export TARIT_MAX_VMS='32'
 export TARIT_MAX_MEMORY_MIB='65536'
@@ -110,11 +131,21 @@ export RUST_LOG='taritd=info,tower_http=info'
 
 Each node must differ:
 
+The `:8443` origins below assume a private TLS proxy that denies every route
+except `/internal/v1/*` and forwards those requests to the node's HTTP listener
+on `:8080`. The proxy must support WebSocket upgrades and preserve method, path,
+query, body, and `X-Tarit-*` headers exactly because `taritd` validates them as
+part of the request HMAC. Its certificate SAN must match the advertised
+hostname and chain to the WebPKI roots built into the Rustls clients; a custom
+peer CA cannot currently be configured. For an isolated development cluster
+without a compatible proxy, use the private `http://...:8080` origin and set
+`TARIT_ALLOW_INSECURE_PEER_HTTP=1` explicitly.
+
 | Node | Required differences |
 | --- | --- |
-| A | `TARIT_HOST_ID=node-a`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=http://10.0.1.10:8080`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-a/sockets`, `TARIT_DB=$HOME/.taritd/node-a/fleet.db` |
-| B | `TARIT_HOST_ID=node-b`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=http://10.0.1.11:8080`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-b/sockets`, `TARIT_DB=$HOME/.taritd/node-b/fleet.db` |
-| C | `TARIT_HOST_ID=node-c`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=http://10.0.1.12:8080`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-c/sockets`, `TARIT_DB=$HOME/.taritd/node-c/fleet.db` |
+| A | `TARIT_HOST_ID=node-a`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-a.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-a/sockets`, `TARIT_DB=$HOME/.taritd/node-a/fleet.db` |
+| B | `TARIT_HOST_ID=node-b`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-b.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-b/sockets`, `TARIT_DB=$HOME/.taritd/node-b/fleet.db` |
+| C | `TARIT_HOST_ID=node-c`, `TARIT_LISTEN=0.0.0.0:8080`, `TARIT_RPC_ADDR=https://node-c.peer.example.com:8443`, `TARIT_SOCKET_DIR=$HOME/.taritd/node-c/sockets`, `TARIT_DB=$HOME/.taritd/node-c/fleet.db` |
 
 Start `./target/release/taritd` on each node. Within one heartbeat interval, every node should show in:
 
@@ -145,7 +176,36 @@ Recommended public routing:
 
 The current binary mounts public and internal routes on the same listener. In production, isolate internal access with network policy, security groups, firewall rules, or a sidecar/proxy that blocks `/internal/v1/*` from public networks.
 
-Execution polling caveat: `POST /v1/execute_async` creates the execution record on whichever API node accepted the request. `GET /v1/executions/{id}` is not forwarded through the fleet. If clients use an external load balancer, enable stickiness for execution polling or have the client poll the same node.
+In fleet mode, asynchronous execution records are stored in PostgreSQL, so
+`GET /v1/executions/{id}` can be polled through any healthy API node.
+
+## Resource isolation and disk pressure
+
+Set `TARIT_VM_CGROUP_PARENT` to a delegated cgroup v2 subtree to enforce
+per-VM CPU, memory, and PID limits. Optional `TARIT_VM_IO_*` limits add
+`io.max` entries for each block device backing the rootfs and overlay.
+Optional `TARIT_VM_NET_*` limits shape guest ingress and police guest egress on
+the VM TAP. taritd reapplies these limits when it adopts a live VMM after
+restart.
+
+Configure byte and/or inode high and low watermarks with
+`TARIT_DISK_*_WATERMARK`. Above a high watermark, create, restore, snapshot,
+and warm refill are blocked. Admission resumes only after usage falls below the
+corresponding low watermark. `/v1/warm-pool`, `/v1/cluster`, and `/metrics`
+expose the current pressure state and reservations.
+
+Use a dedicated cgroup parent and enable its controllers before starting
+taritd:
+
+```sh
+mkdir -p /sys/fs/cgroup/tarit
+echo '+cpu +memory +pids +io' > /sys/fs/cgroup/cgroup.subtree_control
+export TARIT_VM_CGROUP_PARENT=/sys/fs/cgroup/tarit
+export TARIT_VM_CGROUP_PIDS_MAX=256
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md) for the full limit and watermark
+reference.
 
 ## Warm pool operations
 
@@ -222,13 +282,18 @@ When enabled, `taritd`:
    VM pool; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
+Snapshot restore assigns a new host TAP allocation. Before publishing the VM,
+taritd sends a typed IPv4 repair request to the guest agent and verifies
+host-to-guest reachability. The agent applies and checks the configuration
+through the kernel, so minimal OCI images do not need `iproute2` for restore.
+
 Before loading configuration, opening a database, resolving images, or looking
 up VMs, `taritd` enumerates strict `insta<N>` names with structured `ip -j
 link` output and lowers them. A containment, VM-list, or recovery error is
 fatal: no supervisor or HTTP listener is published. Network-disabled startup
-is allowed only when that preflight found no Tarit TAP and there are no local
-live VM records requiring recovery. It then reconciles the persisted map with
-live local VM records, validates the
+is allowed only when that preflight found no Tarit TAP. Networkless live VMs
+can still be adopted from local durable state. It then reconciles the persisted
+map with live local VM records, validates the
 required nft base-chain hooks, and atomically inserts top-of-chain forward and
 input drop quarantines for every recovered TAP. It removes Tarit-owned stale
 policy for all their slots and programs and verifies every netdev IPv4/ARP,
@@ -278,7 +343,7 @@ Requirements:
 
 ## Rootfs mode
 
-`TARIT_ROOTFS_READONLY=true` makes `taritd` attach the rootfs as read-only and rewrites the common `root=/dev/vda rw` fragment to `root=/dev/vda ro`. Use this when many VMs share one immutable base image. If false, a rootfs should be single-owner or otherwise safely cloned, because writable sharing can corrupt filesystems.
+Every rootfs base is opened immutably and attached through a private per-VM CoW overlay, so guests never share writable filesystem state. `TARIT_ROOTFS_READONLY=true` additionally requests read-only guest mount semantics by rewriting the common `root=/dev/vda rw` fragment to `root=/dev/vda ro`.
 
 ## PostgreSQL and RDS
 
@@ -293,13 +358,98 @@ export TARIT_RDS_CA_FILE="$HOME/.taritd/rds-global-bundle.pem"
 
 ## Deploy scripts
 
+For the strict jailed launch path, enable both
+`TARIT_VM_JAIL_PID_NAMESPACE=1` and
+`TARIT_VM_JAIL_NETWORK_NAMESPACE=1`. The supervised host PID is a minimal
+privilege-dropped launcher; its child is PID 1 inside the VM's PID namespace.
+The VMM process network namespace is empty. taritd keeps the TAP and host
+routing policy in the host namespace and transfers an already-open TAP queue
+descriptor to the VMM before it enters confinement.
+
 | Script | Purpose | Important inputs |
 | --- | --- | --- |
-| `deploy/c8i-deploy.sh` | Rsync this repo to an EC2 c8i host, build `taritd`, build or reuse `vmm`, start `taritd`, and run `tests/e2e_c8i.sh`. | `C8I_HOST`, `C8I_USER`, `C8I_KEY`, `REMOTE_DIR`, `VMM_DIR`, `TARIT_API_KEY`. |
+| `deploy/c8i-deploy.sh` | Rsync this repo to an EC2 c8i host, build `taritd`, build or reuse `vmm`, start network-enabled `taritd` as root, and run `tests/e2e_c8i.sh`. | `C8I_HOST`, a 32-character `TARIT_API_KEY`, `TARIT_KERNEL`, and `TARIT_ROOTFS` are required. The host must be in `C8I_KNOWN_HOSTS`. It binds to `127.0.0.1:8080` unless `TARIT_LISTEN` is set. |
 | `deploy/provision-rds.sh` | Create a new RDS PostgreSQL fleet store and credentials env file. | `AWS_REGION`, `TARIT_CP_VPC_ID`, `TARIT_CP_C8I_SG`, `TARIT_CP_DB_PASSWORD`. |
 | `deploy/open-api-port.sh` | Open TCP API port on the configured EC2 security group. | `C8I_SG`, `TARIT_PORT`, `TARIT_PUBLIC_CIDR`, `AWS_REGION`. |
 
-The deploy script uses `pkill -f 'target/release/taritd'` on the remote host. Use caution on shared hosts.
+The c8i rootfs must contain `curl`; `make guest` includes it. The deploy script
+records the remote daemon PID in `~/.taritd/taritd.pid` and verifies the process
+identity before stopping a prior run.
+
+## Continuous lifecycle qualification
+
+`tests/continuous_mixed_oci_soak.sh` runs one bounded epoch at a time while
+keeping three guest workloads active. It rotates entries from a case file with
+the format `name|kernel|rootfs`, writes per-operation JSONL logs, and checks a
+configurable free-space floor. Each guest keeps a background writer active
+while the driver performs live forks, snapshot/restore, hibernate and ingress
+wake, pause/resume, balloon changes, mutations, and concurrent work across all
+anchors. It also issues four concurrent execute requests to one VM immediately
+after pause/resume. Each request verifies a distinct guest-side token before the
+driver rechecks the long-lived workload, detecting cross-transport command
+interleaving, duplicate execution, stale completion, and response loss. The
+status and terminal records include per-action counts and p50, p95, p99, and
+maximum latency. Fork records additionally retain phase distributions, live
+pre-copy rounds, copied and residual dirty pages, downtime, convergence reason,
+and local versus cross-node path counts. Retained snapshots are bounded per
+epoch; live fork artifacts are deleted with their transient children.
+
+For focused reproduction, pass `--actions` through
+`TARIT_LIFECYCLE_DRIVER_ARGS`. Supported comma-separated actions are `assert`,
+`mutate`, `fork`, `hibernate`, `pause`, `balloon`, `guest-work`,
+`contended-exec`, and `snapshot`. The required baseline fork, snapshot, and
+concurrency checks still run before the selected loop. For example,
+`--actions hibernate` repeatedly exercises scale-to-zero and execute-triggered
+resume without removing the baseline lifecycle checks.
+
+Without `--duration-seconds`, the lifecycle driver runs exactly `--steps`
+randomized actions for every value in `--seeds`. Duration mode is intended for
+continuous qualification and requires one explicit seed so a failure remains
+reproducible.
+
+When `TARIT_CONTINUOUS_EPOCH_HIBERNATE_MIN_SECONDS` is nonzero, each epoch also
+creates a fourth logical VM, arms monotonic and realtime timers, and hibernates
+it while the three resident anchors continue working. At epoch completion,
+concurrent execute requests must single-flight its restore. The driver verifies
+the minimum zero-VMM hold, host-relative realtime repair, paused monotonic time,
+timer delivery, clone identity and session rotation, database state, artifact
+ownership, and capacity cleanup. The installed c8i unit requires at least a
+one-hour hold; its six-hour workload epoch normally yields a hold longer than
+six hours.
+`tests/tarit-continuous-soak.service` is the c8i systemd unit. It archives a
+failed epoch and restarts after 30 seconds so an isolated failure does not stop
+subsequent qualification. Repeated failures remain visible in
+`failures/index.jsonl`; they are not treated as passing epochs.
+
+After each configured number of epochs, the supervisor runs independent
+qualification gates against the same OCI and kernel case. The runtime-crash
+gate kills and re-adopts active VMMs. The ingress gate verifies live fork,
+true scale-to-zero, and single-flight wake through execute, PTY, SSH, and HTTP
+share traffic. The volume gate alternates local block and NFS 4.1-backed block
+storage, writes and flushes a filesystem in the guest, hibernates to zero VMM
+processes, wakes through HTTP, and verifies the durable attachment. Set
+`TARIT_CONTINUOUS_CHAOS_EVERY_EPOCHS`,
+`TARIT_CONTINUOUS_INGRESS_EVERY_EPOCHS`, or
+`TARIT_CONTINUOUS_VOLUME_EVERY_EPOCHS` to `0` to disable a gate or to a larger
+integer to reduce its frequency. Successful auxiliary runs are recorded in
+`qualification.jsonl`; their complete logs use the same 14-day bounded
+retention as epoch logs.
+
+Required environment entries are `TARIT_CONTINUOUS_CASES_FILE`,
+`TARITD_BIN`, `TARIT_VMM_BIN`, and `TARIT_TEST_GUEST_AGENT_BIN`. The case file
+and environment file belong under `/etc/tarit` with mode `0600`. The
+`current.jsonl` symlink follows the active or most recently failed epoch;
+`epochs.jsonl` records completed epochs. Failure bundles and their index are
+stored under `/t/tarit-continuous-soak/failures`.
+
+```sh
+sudo systemctl status tarit-continuous-soak
+sudo journalctl -u tarit-continuous-soak -n 100 --no-pager
+sudo systemctl stop tarit-continuous-soak
+```
+
+Manual KVM gates use the same global lock. Stop the service before running a
+manual gate rather than bypassing the lock.
 
 ## Benchmarks
 
@@ -326,12 +476,13 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 - Use a long random `TARIT_PEER_SECRET` for peers and rotate it with a coordinated restart.
 - Do not expose `/internal/v1/*` publicly.
 - Use TLS for public clients, usually at the load balancer.
-- Prefer mTLS for peer traffic in production. Peer auth uses a shared header secret; add mTLS at the network or proxy layer when required.
+- Peer requests use a replay-protected HMAC; the shared key is never transmitted.
+- A separate internal listener with mandatory mTLS and host-session fencing is still required before hostile multi-tenant production use.
 - Keep `TARIT_RPC_ADDR` values private and stable.
 - Use PostgreSQL TLS and CA validation where available.
 - Restrict VMM, kernel, rootfs, socket, and SQLite paths to trusted local directories.
 - If `TARIT_ENABLE_NET=true`, audit nftables and host forwarding policy.
-- Avoid writable rootfs sharing. Use `TARIT_ROOTFS_READONLY=true` for shared base images.
+- Keep base images immutable; taritd always places guest writes in a private per-VM CoW overlay.
 
 ## Troubleshooting
 
@@ -351,3 +502,22 @@ Modes are `sequential`, `staggered`, `burst`, or `all`.
 | `spawn vmm` fails | Wrong `TARIT_VMM_BIN` or missing execute bit. | Verify path and permissions. |
 | `wait for socket` times out | VMM child failed to create UDS. | Check VMM logs, kernel/rootfs paths, and KVM availability. |
 | Network provisioning fails | Missing privileges or `ip`/`nft`. | Run with required capabilities and verify host networking tools. |
+## OCI image admission and provenance
+
+`taritd image build` resolves a registry tag once with `skopeo inspect`, verifies
+the resulting digest reference with `cosign verify` when a trusted key is
+configured, and passes only that immutable digest reference to the OCI pull.
+The image row records the registry manifest, generated ext4, injected agent,
+and provenance-key SHA-256 digests. VM admission rehashes the rootfs and rejects
+legacy, truncated, substituted, tag-only, or policy-mismatched records before
+the VMM starts.
+
+Production nodes must set both `TARIT_IMAGE_REQUIRE_SIGNATURE=1` and
+`TARIT_IMAGE_COSIGN_KEY=/absolute/path/to/cosign.pub`. Rotate policy by admitting
+the desired images with the new key before removing the old policy. Restoring
+the prior trusted key permits rollback to a previously admitted digest; Tarit
+never resolves its old mutable tag again.
+
+Use `taritd image verify NAME[:TAG]` during rollout and rollback to rehash the
+published ext4 and confirm that the record was admitted by the currently
+trusted provenance key before directing tenant traffic to it.

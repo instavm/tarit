@@ -22,12 +22,13 @@ PROVIDER_CMD="printf '%s\n' \"\$1\" >> $DECISIONS"
 : > "$DECISIONS"
 
 for p in $(pgrep -f 'target/release/taritd' 2>/dev/null); do kill "$p" 2>/dev/null; done; sleep 2
-( export TARIT_API_KEY=askey TARIT_PEER_SECRET=as-peer-secret-long-enough-000 \
+( export TARIT_API_KEY=askey TARIT_PEER_SECRET=autoscale-peer-secret-long-enough-000 \
     TARIT_DATABASE_URL="$TARIT_DATABASE_URL" TARIT_RDS_CA_FILE="$CA" \
     TARIT_LISTEN=127.0.0.1:19050 TARIT_RPC_ADDR=http://127.0.0.1:19050 TARIT_HOST_ID=$RID-n1 \
+    TARIT_ALLOW_INSECURE_PEER_HTTP=1 \
     TARIT_SOCKET_DIR="$DIR/sockets" TARIT_DB="$DIR/i.sqlite" TARIT_CONFIG="$DIR/none.toml" \
-    TARIT_VMM_BIN="$VMM_BIN" TARIT_KERNEL=/tmp/vmlinux.microvm \
-    TARIT_ROOTFS=/tmp/vsock-rootfs.ext4 TARIT_WARM_POOL=0 TARIT_MAX_VMS=2 \
+    TARIT_VMM_BIN="$VMM_BIN" TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}" \
+    TARIT_ROOTFS="${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}" TARIT_WARM_POOL=0 TARIT_MAX_VMS=2 \
     TARIT_AUTOSCALE=1 TARIT_AUTOSCALE_MIN=1 TARIT_AUTOSCALE_MAX=10 \
     TARIT_AUTOSCALE_OUT_FREE_VCPUS=1000000 TARIT_AUTOSCALE_PROVIDER_CMD="$PROVIDER_CMD" \
     RUST_LOG=taritd=info

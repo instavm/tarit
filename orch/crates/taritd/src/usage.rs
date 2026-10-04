@@ -53,7 +53,10 @@ fn meter_runtime_once(state: &AppState) {
             .values()
             .filter(|v| {
                 v.host_id == state.config.host_id
-                    && matches!(v.status, VmStatus::Running | VmStatus::Paused)
+                    && matches!(
+                        v.status,
+                        VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                    )
             })
             .map(|v| {
                 (
@@ -149,7 +152,17 @@ pub fn meter_exec(
         window_end: now,
         created_at: now,
     };
-    let _ = state.store_tx.send(StoreWrite::Usage(event));
+    if let Err(error) = state.store_tx.try_send(StoreWrite::Usage(event.clone())) {
+        state.metrics.inc_store_enqueue_failure();
+        let persisted = state
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.enqueue_usage(&event).ok());
+        if persisted.is_none() {
+            tracing::error!(%error, "usage outbox queue and synchronous fallback unavailable");
+        }
+    }
 }
 
 fn runtime_event(

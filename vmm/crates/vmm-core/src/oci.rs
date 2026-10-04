@@ -16,9 +16,21 @@
 //! The VMM binary itself stays lean — the OCI pipeline is an orchestrator
 //! concern. The VMM just boots the resulting ext4 image.
 
+use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -31,6 +43,14 @@ pub enum OciError {
     Mke2fsNotFound,
     #[error("command failed: {cmd}: {stderr}")]
     CommandFailed { cmd: String, stderr: String },
+    #[error("invalid output path: {0}")]
+    InvalidOutput(String),
+    #[error("unsafe OCI rootfs path: {0}")]
+    UnsafePath(String),
+    #[error("invalid OCI layout: {0}")]
+    InvalidLayout(String),
+    #[error("OCI resource limit exceeded: {0}")]
+    ResourceLimit(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -59,6 +79,78 @@ pub struct OciPullResult {
     pub agent_init: bool,
 }
 
+const MAX_OCI_LAYERS: usize = 128;
+const MAX_OCI_JSON_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_OCI_PATH_BYTES: usize = 4096;
+const OCI_EXPANSION_MULTIPLIER: u64 = 2;
+const OCI_ENTRIES_PER_DISK_MIB: u64 = 256;
+const MIN_OCI_ENTRIES: u64 = 16_384;
+
+#[derive(Debug, Clone, Copy)]
+struct OciResourceLimits {
+    max_layers: usize,
+    max_compressed_bytes: u64,
+    max_expanded_bytes: u64,
+    max_entries: u64,
+    max_single_file_bytes: u64,
+    max_path_bytes: usize,
+}
+
+impl OciResourceLimits {
+    fn for_disk_size(size_mb: u64) -> Result<Self, OciError> {
+        let disk_bytes = size_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| OciError::ResourceLimit("disk size overflows bytes".into()))?;
+        if disk_bytes == 0 {
+            return Err(OciError::ResourceLimit(
+                "disk size must be greater than zero".into(),
+            ));
+        }
+        let stream_budget = disk_bytes
+            .checked_mul(OCI_EXPANSION_MULTIPLIER)
+            .ok_or_else(|| OciError::ResourceLimit("OCI byte budget overflows".into()))?;
+        Ok(Self {
+            max_layers: MAX_OCI_LAYERS,
+            max_compressed_bytes: stream_budget,
+            max_expanded_bytes: stream_budget,
+            max_entries: size_mb
+                .saturating_mul(OCI_ENTRIES_PER_DISK_MIB)
+                .max(MIN_OCI_ENTRIES),
+            max_single_file_bytes: disk_bytes,
+            max_path_bytes: MAX_OCI_PATH_BYTES,
+        })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct OciPreflightStats {
+    layers: usize,
+    compressed_bytes: u64,
+    expanded_bytes: u64,
+    entries: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OciDescriptor {
+    media_type: String,
+    digest: String,
+    size: u64,
+    #[serde(default)]
+    annotations: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OciIndex {
+    manifests: Vec<OciDescriptor>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OciManifest {
+    config: OciDescriptor,
+    layers: Vec<OciDescriptor>,
+}
+
 /// Pull an OCI image and convert it to a bootable ext4 disk image.
 ///
 /// Steps:
@@ -75,12 +167,13 @@ pub fn pull_and_convert(
 
 /// Like [`pull_and_convert`], but also injects the guest exec agent as the
 /// image's init when `agent_path` is given. OCI/Docker images ship only a root
-/// filesystem — no kernel, no init system (the container runtime runs the
-/// entrypoint as PID 1). To boot one as a microVM we supply the kernel and drop
-/// in the agent as `/usr/sbin/vmm-agent`, pointing `/sbin/init` at it (unless
-/// the image already has an init). Booted with the agent as PID 1 it mounts the
-/// pseudo-filesystems and serves the exec channel, so `node:20`, `python:3` and
-/// friends become directly runnable sandboxes.
+/// filesystem — no kernel, and their configured entrypoint is normally started
+/// by a container runtime. To boot one as a microVM we supply the kernel, install
+/// the agent at `/usr/sbin/vmm-agent`, and atomically point `/sbin/init` at it.
+/// This deliberately replaces an image-provided init: otherwise images such as
+/// Alpine try to start an incomplete OpenRC userspace and never expose the exec
+/// channel. Booted with the agent as PID 1, app images become directly runnable
+/// sandboxes.
 pub fn pull_and_convert_with_agent(
     image: &OciImageRef,
     output_path: &Path,
@@ -89,18 +182,25 @@ pub fn pull_and_convert_with_agent(
 ) -> Result<OciPullResult, OciError> {
     let start = std::time::Instant::now();
 
+    // Reject invalid or overflowing budgets before invoking network tools or
+    // creating a build workspace.
+    let limits = OciResourceLimits::for_disk_size(size_mb)?;
+
     // Check for required tools.
     check_tool("skopeo")?;
     check_tool("umoci")?;
     check_tool("mke2fs")?;
 
-    let work_dir = output_path.parent().unwrap_or(Path::new("."));
-    let oci_dir = work_dir.join("oci-image");
-    let rootfs_dir = work_dir.join("rootfs");
-
-    // Clean up any previous attempt.
-    let _ = std::fs::remove_dir_all(&oci_dir);
-    let _ = std::fs::remove_dir_all(&rootfs_dir);
+    let final_output = resolved_output_path(output_path)?;
+    let output_dir = final_output
+        .parent()
+        .expect("resolved output always has a parent");
+    // Every build receives an atomic, mode-0700 workspace. Fixed sibling
+    // directories allowed concurrent builds to delete or corrupt each other.
+    let workspace = create_oci_workspace(output_dir)?;
+    let oci_dir = workspace.path().join("oci-image");
+    let rootfs_dir = workspace.path().join("bundle");
+    let staged_output = workspace.path().join("disk.ext4");
 
     // Step 1: Pull the image via skopeo.
     log::info!("oci: pulling {} via skopeo", image.reference);
@@ -113,6 +213,18 @@ pub fn pull_and_convert_with_agent(
         skopeo_cmd.arg("--authfile").arg(auth);
     }
     run_command(skopeo_cmd, "skopeo copy")?;
+
+    // Descriptor sizes only bound the compressed blobs. Stream every layer
+    // before extraction so a high-ratio archive or inode flood cannot consume
+    // the worker's filesystem while the unpacker is running.
+    let preflight = preflight_oci_layout(&oci_dir, "default", limits)?;
+    log::info!(
+        "oci: admitted {} layers, {} compressed bytes, {} expanded bytes, {} entries",
+        preflight.layers,
+        preflight.compressed_bytes,
+        preflight.expanded_bytes,
+        preflight.entries
+    );
 
     // Step 2: Unpack layers via umoci.
     log::info!("oci: unpacking layers via umoci");
@@ -146,15 +258,12 @@ pub fn pull_and_convert_with_agent(
         .arg("-L")
         .arg("rootfs")
         .arg("-F")
-        .arg(output_path)
+        .arg(&staged_output)
         .arg(format!("{}M", size_mb));
     run_command(mke2fs, "mke2fs")?;
+    publish_disk_image(&staged_output, &final_output)?;
 
-    // Clean up intermediate dirs.
-    let _ = std::fs::remove_dir_all(&oci_dir);
-    let _ = std::fs::remove_dir_all(&rootfs_dir);
-
-    let size_bytes = std::fs::metadata(output_path)?.len();
+    let size_bytes = std::fs::metadata(&final_output)?.len();
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     log::info!(
@@ -172,28 +281,407 @@ pub fn pull_and_convert_with_agent(
     })
 }
 
-/// Copy the exec agent into an unpacked rootfs and make it the init: install to
-/// `/usr/sbin/vmm-agent` and point `/sbin/init` at it when the image has no init
-/// of its own. The image can then be booted with the default cmdline (the agent
-/// runs as PID 1) or with an explicit `init=/usr/sbin/vmm-agent`.
-fn inject_agent_init(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let sbin = rootfs.join("usr/sbin");
-    std::fs::create_dir_all(&sbin)?;
-    let dst = sbin.join("vmm-agent");
-    std::fs::copy(agent, &dst)?;
-    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
-
-    // Point /sbin/init at the agent unless the image already provides one, so
-    // the default `root=/dev/vda rw` cmdline (no init=) boots straight to it.
-    let sbin_dir = rootfs.join("sbin");
-    std::fs::create_dir_all(&sbin_dir)?;
-    let init = sbin_dir.join("init");
-    if !init.exists() {
-        let _ = std::os::unix::fs::symlink("/usr/sbin/vmm-agent", &init);
+fn resolved_output_path(output_path: &Path) -> Result<PathBuf, OciError> {
+    let file_name = output_path.file_name().ok_or_else(|| {
+        OciError::InvalidOutput(format!("{} has no file name", output_path.display()))
+    })?;
+    if file_name.as_bytes().contains(&0) {
+        return Err(OciError::InvalidOutput("file name contains NUL".into()));
     }
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|error| {
+        OciError::InvalidOutput(format!(
+            "resolve output directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let metadata = std::fs::symlink_metadata(&parent)?;
+    if !metadata.is_dir() {
+        return Err(OciError::InvalidOutput(format!(
+            "{} is not a directory",
+            parent.display()
+        )));
+    }
+    Ok(parent.join(file_name))
+}
+
+fn create_oci_workspace(parent: &Path) -> Result<tempfile::TempDir, OciError> {
+    let workspace = tempfile::Builder::new()
+        .prefix(".tarit-oci-")
+        .tempdir_in(parent)
+        .map_err(OciError::Io)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(workspace)
+}
+
+fn publish_disk_image(staged: &Path, destination: &Path) -> Result<(), OciError> {
+    let metadata = std::fs::symlink_metadata(staged)?;
+    if !metadata.file_type().is_file() {
+        return Err(OciError::UnsafePath(format!(
+            "staged disk is not a regular file: {}",
+            staged.display()
+        )));
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(staged, std::fs::Permissions::from_mode(0o600))?;
+
+    // Open without following links and flush the completed filesystem before
+    // atomically publishing it. The private workspace makes this setup-only;
+    // it does not add anything to VM boot or restore latency.
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let staged_file = options.open(staged)?;
+    if !staged_file.metadata()?.file_type().is_file() {
+        return Err(OciError::UnsafePath(format!(
+            "staged disk changed type: {}",
+            staged.display()
+        )));
+    }
+    staged_file.sync_all()?;
+
+    if let Ok(existing) = std::fs::symlink_metadata(destination) {
+        if existing.file_type().is_dir() {
+            return Err(OciError::InvalidOutput(format!(
+                "refusing to replace output directory {}",
+                destination.display()
+            )));
+        }
+    }
+    std::fs::rename(staged, destination)?;
+    #[cfg(target_os = "linux")]
+    File::open(
+        destination
+            .parent()
+            .expect("resolved destination has a parent"),
+    )?
+    .sync_all()?;
+    Ok(())
+}
+
+/// Copy the exec agent into an unpacked rootfs and make it the init. Every
+/// path component is traversed relative to an already-open directory fd with
+/// `O_NOFOLLOW`; image-controlled symlinks cannot redirect writes onto the
+/// host. The final executable is written under a unique name and renamed over
+/// any untrusted leaf atomically.
+fn inject_agent_init(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
+    #[cfg(unix)]
+    {
+        inject_agent_init_unix(rootfs, agent)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (rootfs, agent);
+        Err(OciError::UnsafePath(
+            "agent injection requires Unix openat confinement".into(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn inject_agent_init_unix(rootfs: &Path, agent: &Path) -> Result<(), OciError> {
+    let mut root_options = OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let root = root_options.open(rootfs).map_err(|error| {
+        OciError::UnsafePath(format!("open rootfs {}: {error}", rootfs.display()))
+    })?;
+    if !root.metadata()?.is_dir() {
+        return Err(OciError::UnsafePath(format!(
+            "rootfs is not a directory: {}",
+            rootfs.display()
+        )));
+    }
+
+    let usr = open_or_create_directory_at(&root, "usr")?;
+    let usr_sbin = match entry_kind_at(&usr, "sbin")? {
+        None => open_or_create_directory_at(&usr, "sbin")?,
+        Some(EntryKind::Directory) => open_directory_at(&usr, "sbin")?,
+        Some(EntryKind::Symlink) => {
+            let target = read_link_at(&usr, "sbin")?;
+            if target.as_bytes() != b"bin" && target.as_bytes() != b"/usr/bin" {
+                return Err(OciError::UnsafePath(format!(
+                    "unsupported /usr/sbin symlink target {:?}; expected bin",
+                    target
+                )));
+            }
+            open_directory_at(&usr, "bin")?
+        }
+        Some(EntryKind::Other) => {
+            return Err(OciError::UnsafePath(
+                "/usr/sbin exists but is neither a directory nor a safe symlink".into(),
+            ))
+        }
+    };
+    install_agent_at(&usr_sbin, agent)?;
+
+    let init_dir = match entry_kind_at(&root, "sbin")? {
+        None => open_or_create_directory_at(&root, "sbin")?,
+        Some(EntryKind::Directory) => open_directory_at(&root, "sbin")?,
+        Some(EntryKind::Symlink) => {
+            let target = read_link_at(&root, "sbin")?;
+            if target.as_bytes() != b"usr/sbin" && target.as_bytes() != b"/usr/sbin" {
+                return Err(OciError::UnsafePath(format!(
+                    "unsupported /sbin symlink target {:?}; expected usr/sbin",
+                    target
+                )));
+            }
+            usr_sbin.try_clone()?
+        }
+        Some(EntryKind::Other) => {
+            return Err(OciError::UnsafePath(
+                "/sbin exists but is neither a directory nor a safe symlink".into(),
+            ))
+        }
+    };
+    ensure_init_link_at(&init_dir)?;
     log::info!("oci: injected exec agent as init (/usr/sbin/vmm-agent)");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[cfg(unix)]
+fn c_name(name: &str) -> Result<std::ffi::CString, OciError> {
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| OciError::UnsafePath(format!("path component contains NUL: {name:?}")))
+}
+
+#[cfg(unix)]
+fn entry_kind_at(parent: &File, name: &str) -> Result<Option<EntryKind>, OciError> {
+    let name = c_name(name)?;
+    // SAFETY: stat is immediately initialized by fstatat before being read.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: parent and name are valid for the duration of fstatat, and stat
+    // is valid writable storage.
+    let rc = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    let file_type = stat.st_mode & libc::S_IFMT;
+    Ok(Some(if file_type == libc::S_IFDIR {
+        EntryKind::Directory
+    } else if file_type == libc::S_IFLNK {
+        EntryKind::Symlink
+    } else {
+        EntryKind::Other
+    }))
+}
+
+#[cfg(unix)]
+fn open_or_create_directory_at(parent: &File, name: &str) -> Result<File, OciError> {
+    match entry_kind_at(parent, name)? {
+        None => {
+            let c_name = c_name(name)?;
+            // SAFETY: parent fd and component name are valid; mkdirat retains
+            // no pointer after returning.
+            let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o755) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+            }
+        }
+        Some(EntryKind::Directory) => {}
+        Some(kind) => {
+            return Err(OciError::UnsafePath(format!(
+                "component {name:?} is {kind:?}, not a directory"
+            )))
+        }
+    }
+    open_directory_at(parent, name)
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &File, name: &str) -> Result<File, OciError> {
+    let name = c_name(name)?;
+    // SAFETY: parent fd and name are valid for openat; the returned fd is
+    // checked and uniquely transferred to File.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(OciError::UnsafePath(format!(
+            "open directory component {:?}: {}",
+            name,
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: fd is a fresh successful openat result and is uniquely owned.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn read_link_at(parent: &File, name: &str) -> Result<std::ffi::OsString, OciError> {
+    let name = c_name(name)?;
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: parent/name are valid and buffer is writable for its full length.
+    let len = unsafe {
+        libc::readlinkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if len < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let len =
+        usize::try_from(len).map_err(|_| OciError::UnsafePath("negative symlink length".into()))?;
+    if len == buffer.len() {
+        return Err(OciError::UnsafePath("/sbin symlink target too long".into()));
+    }
+    buffer.truncate(len);
+    Ok(std::ffi::OsString::from_vec(buffer))
+}
+
+#[cfg(unix)]
+fn install_agent_at(destination_dir: &File, agent: &Path) -> Result<(), OciError> {
+    const MAX_AGENT_BYTES: u64 = 64 * 1024 * 1024;
+    static AGENT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let mut source_options = OpenOptions::new();
+    source_options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut source = source_options.open(agent).map_err(|error| {
+        OciError::UnsafePath(format!("open agent {}: {error}", agent.display()))
+    })?;
+    let source_metadata = source.metadata()?;
+    if !source_metadata.file_type().is_file()
+        || source_metadata.len() == 0
+        || source_metadata.len() > MAX_AGENT_BYTES
+    {
+        return Err(OciError::UnsafePath(format!(
+            "agent must be a non-empty regular file no larger than {MAX_AGENT_BYTES} bytes"
+        )));
+    }
+
+    let sequence = AGENT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary_name = format!(".vmm-agent-{}-{sequence}.tmp", std::process::id());
+    let temporary = c_name(&temporary_name)?;
+    let destination = c_name("vmm-agent")?;
+    // SAFETY: directory fd and name are valid, mode is supplied with O_CREAT.
+    let fd = unsafe {
+        libc::openat(
+            destination_dir.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o700,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fd is a fresh successful openat result and is uniquely owned.
+    let mut staged = unsafe { File::from_raw_fd(fd) };
+    let result = (|| -> Result<(), OciError> {
+        let copied = std::io::copy(&mut source, &mut staged)?;
+        if copied != source_metadata.len() {
+            return Err(OciError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "agent changed size while being copied",
+            )));
+        }
+        staged.flush()?;
+        staged.sync_all()?;
+        // SAFETY: staged is a valid file descriptor and 0755 is a valid mode.
+        if unsafe { libc::fchmod(staged.as_raw_fd(), 0o755) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: both names are valid components relative to the same held
+        // directory descriptor. renameat replaces a leaf symlink, never follows it.
+        if unsafe {
+            libc::renameat(
+                destination_dir.as_raw_fd(),
+                temporary.as_ptr(),
+                destination_dir.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        #[cfg(target_os = "linux")]
+        destination_dir.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // SAFETY: temporary is a valid leaf name relative to destination_dir;
+        // unlinkat cannot traverse outside that held directory.
+        unsafe {
+            libc::unlinkat(destination_dir.as_raw_fd(), temporary.as_ptr(), 0);
+        }
+    }
+    result
+}
+
+#[cfg(unix)]
+fn ensure_init_link_at(sbin_dir: &File) -> Result<(), OciError> {
+    static INIT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let target = c_name("/usr/sbin/vmm-agent")?;
+    let init = c_name("init")?;
+    let sequence = INIT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temporary_name = format!(".tarit-init-{}-{sequence}.tmp", std::process::id());
+    let temporary = c_name(&temporary_name)?;
+    // SAFETY: target and leaf name are valid for symlinkat and the held fd
+    // confines creation to the image's /sbin directory. O_EXCL-like behavior
+    // from symlinkat prevents an image-controlled temporary leaf from being
+    // followed or overwritten.
+    if unsafe { libc::symlinkat(target.as_ptr(), sbin_dir.as_raw_fd(), temporary.as_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: both names are leaf components relative to the held /sbin fd.
+    // renameat atomically replaces a regular file or symlink without following
+    // it. A hostile directory at /sbin/init is rejected by the kernel.
+    if unsafe {
+        libc::renameat(
+            sbin_dir.as_raw_fd(),
+            temporary.as_ptr(),
+            sbin_dir.as_raw_fd(),
+            init.as_ptr(),
+        )
+    } < 0
+    {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: this is the exact private leaf just created above.
+        unsafe {
+            libc::unlinkat(sbin_dir.as_raw_fd(), temporary.as_ptr(), 0);
+        }
+        return Err(error.into());
+    }
+    #[cfg(target_os = "linux")]
+    sbin_dir.sync_all()?;
     Ok(())
 }
 
@@ -204,6 +692,276 @@ fn check_tool(name: &str) -> Result<(), OciError> {
         "umoci" if which("umoci").is_none() => Err(OciError::UmociNotFound),
         "mke2fs" if which("mke2fs").is_none() => Err(OciError::Mke2fsNotFound),
         _ => Ok(()),
+    }
+}
+
+fn preflight_oci_layout(
+    oci_dir: &Path,
+    tag: &str,
+    limits: OciResourceLimits,
+) -> Result<OciPreflightStats, OciError> {
+    let index_path = oci_dir.join("index.json");
+    let index: OciIndex = read_bounded_json(&index_path, MAX_OCI_JSON_BYTES)?;
+    let manifest_descriptor = index
+        .manifests
+        .iter()
+        .find(|descriptor| {
+            descriptor
+                .annotations
+                .get("org.opencontainers.image.ref.name")
+                .is_some_and(|name| name == tag)
+        })
+        .or_else(|| (index.manifests.len() == 1).then(|| &index.manifests[0]))
+        .ok_or_else(|| {
+            OciError::InvalidLayout(format!(
+                "index does not contain an unambiguous {tag:?} manifest"
+            ))
+        })?;
+    if manifest_descriptor.media_type != "application/vnd.oci.image.manifest.v1+json"
+        && manifest_descriptor.media_type != "application/vnd.docker.distribution.manifest.v2+json"
+    {
+        return Err(OciError::InvalidLayout(format!(
+            "unsupported manifest media type {}",
+            manifest_descriptor.media_type
+        )));
+    }
+    if manifest_descriptor.size > MAX_OCI_JSON_BYTES {
+        return Err(OciError::ResourceLimit(format!(
+            "image manifest is {} bytes; limit is {}",
+            manifest_descriptor.size, MAX_OCI_JSON_BYTES
+        )));
+    }
+    let manifest_path = verify_descriptor_blob(oci_dir, manifest_descriptor)?;
+    let manifest: OciManifest = read_bounded_json(&manifest_path, MAX_OCI_JSON_BYTES)?;
+    if manifest.config.media_type != "application/vnd.oci.image.config.v1+json"
+        && manifest.config.media_type != "application/vnd.docker.container.image.v1+json"
+    {
+        return Err(OciError::InvalidLayout(format!(
+            "unsupported image config media type {}",
+            manifest.config.media_type
+        )));
+    }
+    if manifest.config.size > MAX_OCI_JSON_BYTES {
+        return Err(OciError::ResourceLimit(format!(
+            "image config is {} bytes; limit is {}",
+            manifest.config.size, MAX_OCI_JSON_BYTES
+        )));
+    }
+    let config_path = verify_descriptor_blob(oci_dir, &manifest.config)?;
+    let _: serde_json::Value = read_bounded_json(&config_path, MAX_OCI_JSON_BYTES)?;
+    if manifest.layers.len() > limits.max_layers {
+        return Err(OciError::ResourceLimit(format!(
+            "{} layers exceeds limit {}",
+            manifest.layers.len(),
+            limits.max_layers
+        )));
+    }
+
+    let mut stats = OciPreflightStats {
+        layers: manifest.layers.len(),
+        ..OciPreflightStats::default()
+    };
+    for descriptor in &manifest.layers {
+        stats.compressed_bytes = stats
+            .compressed_bytes
+            .checked_add(descriptor.size)
+            .ok_or_else(|| OciError::ResourceLimit("compressed byte count overflows".into()))?;
+        if stats.compressed_bytes > limits.max_compressed_bytes {
+            return Err(OciError::ResourceLimit(format!(
+                "compressed layers require {} bytes; limit is {}",
+                stats.compressed_bytes, limits.max_compressed_bytes
+            )));
+        }
+        let blob = verify_descriptor_blob(oci_dir, descriptor)?;
+        scan_oci_layer(&blob, descriptor, limits, &mut stats)?;
+    }
+    Ok(stats)
+}
+
+fn read_bounded_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<T, OciError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(OciError::InvalidLayout(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(OciError::ResourceLimit(format!(
+            "JSON document {} is {} bytes; limit is {max_bytes}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| OciError::InvalidLayout(format!("parse {}: {error}", path.display())))
+}
+
+fn verify_descriptor_blob(oci_dir: &Path, descriptor: &OciDescriptor) -> Result<PathBuf, OciError> {
+    let encoded = descriptor
+        .digest
+        .strip_prefix("sha256:")
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or_else(|| {
+            OciError::InvalidLayout(format!("unsupported digest {}", descriptor.digest))
+        })?;
+    let path = oci_dir.join("blobs").join("sha256").join(encoded);
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(OciError::InvalidLayout(format!(
+            "blob {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() != descriptor.size {
+        return Err(OciError::InvalidLayout(format!(
+            "blob {} has size {}; descriptor requires {}",
+            path.display(),
+            metadata.len(),
+            descriptor.size
+        )));
+    }
+    let mut file = File::open(&path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != encoded {
+        return Err(OciError::InvalidLayout(format!(
+            "blob {} digest mismatch",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn scan_oci_layer(
+    path: &Path,
+    descriptor: &OciDescriptor,
+    limits: OciResourceLimits,
+    stats: &mut OciPreflightStats,
+) -> Result<(), OciError> {
+    let file = File::open(path)?;
+    let reader: Box<dyn Read> = match descriptor.media_type.as_str() {
+        "application/vnd.oci.image.layer.v1.tar"
+        | "application/vnd.oci.image.layer.nondistributable.v1.tar"
+        | "application/vnd.docker.image.rootfs.diff.tar" => Box::new(file),
+        "application/vnd.oci.image.layer.v1.tar+gzip"
+        | "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip"
+        | "application/vnd.docker.image.rootfs.diff.tar.gzip" => Box::new(GzDecoder::new(file)),
+        "application/vnd.oci.image.layer.v1.tar+zstd"
+        | "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd" => {
+            Box::new(zstd::stream::read::Decoder::new(file)?)
+        }
+        other => {
+            return Err(OciError::InvalidLayout(format!(
+                "unsupported layer media type {other}"
+            )))
+        }
+    };
+    let remaining = limits
+        .max_expanded_bytes
+        .checked_sub(stats.expanded_bytes)
+        .ok_or_else(|| OciError::ResourceLimit("expanded byte budget exhausted".into()))?;
+    let mut limited = ExpandedLimitReader::new(reader, remaining);
+    let scan_result = {
+        let mut archive = tar::Archive::new(&mut limited);
+        (|| -> Result<(), OciError> {
+            for entry in archive.entries()? {
+                let entry = entry?;
+                stats.entries = stats
+                    .entries
+                    .checked_add(1)
+                    .ok_or_else(|| OciError::ResourceLimit("OCI entry count overflows".into()))?;
+                if stats.entries > limits.max_entries {
+                    return Err(OciError::ResourceLimit(format!(
+                        "layer entries exceed limit {}",
+                        limits.max_entries
+                    )));
+                }
+                let size = entry.size();
+                if size > limits.max_single_file_bytes {
+                    return Err(OciError::ResourceLimit(format!(
+                        "layer entry is {size} bytes; per-file limit is {}",
+                        limits.max_single_file_bytes
+                    )));
+                }
+                let path_bytes = entry.path_bytes();
+                if path_bytes.len() > limits.max_path_bytes {
+                    return Err(OciError::ResourceLimit(format!(
+                        "layer path is {} bytes; limit is {}",
+                        path_bytes.len(),
+                        limits.max_path_bytes
+                    )));
+                }
+            }
+            Ok(())
+        })()
+    };
+    if limited.exceeded {
+        return Err(OciError::ResourceLimit(format!(
+            "expanded layers exceed limit {}",
+            limits.max_expanded_bytes
+        )));
+    }
+    scan_result?;
+    stats.expanded_bytes = stats
+        .expanded_bytes
+        .checked_add(limited.consumed)
+        .ok_or_else(|| OciError::ResourceLimit("expanded byte count overflows".into()))?;
+    Ok(())
+}
+
+struct ExpandedLimitReader<R> {
+    inner: R,
+    limit: u64,
+    consumed: u64,
+    exceeded: bool,
+}
+
+impl<R> ExpandedLimitReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            consumed: 0,
+            exceeded: false,
+        }
+    }
+}
+
+impl<R: Read> Read for ExpandedLimitReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.consumed);
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? == 0 {
+                return Ok(0);
+            }
+            self.exceeded = true;
+            return Err(std::io::Error::other("expanded OCI byte limit exceeded"));
+        }
+        let allowed = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.consumed = self.consumed.saturating_add(read as u64);
+        Ok(read)
     }
 }
 
@@ -236,6 +994,88 @@ fn run_command(mut cmd: Command, name: &str) -> Result<(), OciError> {
 mod tests {
     use super::*;
 
+    fn test_limits(max_expanded_bytes: u64, max_entries: u64) -> OciResourceLimits {
+        OciResourceLimits {
+            max_layers: 4,
+            max_compressed_bytes: 1024 * 1024,
+            max_expanded_bytes,
+            max_entries,
+            max_single_file_bytes: 1024 * 1024,
+            max_path_bytes: 256,
+        }
+    }
+
+    fn tar_layer(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, contents) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *contents).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn write_blob(root: &Path, media_type: &str, bytes: &[u8]) -> OciDescriptor {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let blob_dir = root.join("blobs/sha256");
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(blob_dir.join(&digest), bytes).unwrap();
+        OciDescriptor {
+            media_type: media_type.into(),
+            digest: format!("sha256:{digest}"),
+            size: bytes.len() as u64,
+            annotations: HashMap::new(),
+        }
+    }
+
+    fn write_layout(root: &Path, layers: Vec<(&str, Vec<u8>)>) {
+        let layer_descriptors = layers
+            .iter()
+            .map(|(media_type, bytes)| write_blob(root, media_type, bytes))
+            .collect();
+        let config = write_blob(
+            root,
+            "application/vnd.oci.image.config.v1+json",
+            br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#,
+        );
+        let manifest = serde_json::to_vec(&OciManifest {
+            config,
+            layers: layer_descriptors,
+        })
+        .unwrap();
+        let mut descriptor = write_blob(
+            root,
+            "application/vnd.oci.image.manifest.v1+json",
+            &manifest,
+        );
+        descriptor
+            .annotations
+            .insert("org.opencontainers.image.ref.name".into(), "default".into());
+        std::fs::write(
+            root.join("index.json"),
+            serde_json::to_vec(&OciIndex {
+                manifests: vec![descriptor],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn test_agent(dir: &Path) -> PathBuf {
+        let path = dir.join("vmm-agent");
+        std::fs::write(&path, b"test-agent").unwrap();
+        path
+    }
+
     #[test]
     fn oci_image_ref_serializes() {
         let r = OciImageRef {
@@ -247,9 +1087,263 @@ mod tests {
     }
 
     #[test]
+    fn oci_preflight_accepts_digest_verified_gzip_and_zstd_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = tar_layer(&[("etc/one", b"one"), ("etc/two", b"two")]);
+        let second = tar_layer(&[("usr/bin/tool", b"tool")]);
+        write_layout(
+            temp.path(),
+            vec![
+                ("application/vnd.oci.image.layer.v1.tar+gzip", gzip(&first)),
+                (
+                    "application/vnd.oci.image.layer.v1.tar+zstd",
+                    zstd::stream::encode_all(second.as_slice(), 1).unwrap(),
+                ),
+            ],
+        );
+
+        let stats =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10)).unwrap();
+
+        assert_eq!(stats.layers, 2);
+        assert_eq!(stats.entries, 3);
+        assert!(stats.compressed_bytes > 0);
+        assert!(stats.expanded_bytes > 0);
+    }
+
+    #[test]
+    fn oci_resource_limits_reject_zero_and_overflowing_disk_sizes() {
+        assert!(matches!(
+            OciResourceLimits::for_disk_size(0),
+            Err(OciError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            OciResourceLimits::for_disk_size(u64::MAX),
+            Err(OciError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn oci_preflight_rejects_inode_exhaustion_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = tar_layer(&[("a", b""), ("b", b""), ("c", b"")]);
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar+gzip", gzip(&layer))],
+        );
+
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 2)).unwrap_err();
+
+        assert!(matches!(error, OciError::ResourceLimit(_)));
+        assert!(error.to_string().contains("entries exceed limit"));
+    }
+
+    #[test]
+    fn oci_preflight_rejects_expansion_bomb_before_unpack() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = vec![0u8; 16 * 1024];
+        let layer = tar_layer(&[("large-zero-file", &payload)]);
+        let compressed = gzip(&layer);
+        assert!(compressed.len() < 1024);
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar+gzip", compressed)],
+        );
+
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(4096, 10)).unwrap_err();
+
+        assert!(matches!(error, OciError::ResourceLimit(_)));
+        assert!(error.to_string().contains("expanded layers exceed limit"));
+    }
+
+    #[test]
+    fn oci_preflight_rejects_blob_changed_after_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = tar_layer(&[("proof", b"original")]);
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar", layer)],
+        );
+        let index: OciIndex =
+            read_bounded_json(&temp.path().join("index.json"), MAX_OCI_JSON_BYTES).unwrap();
+        let manifest_path = verify_descriptor_blob(temp.path(), &index.manifests[0]).unwrap();
+        let manifest: OciManifest = read_bounded_json(&manifest_path, MAX_OCI_JSON_BYTES).unwrap();
+        let layer_path = verify_descriptor_blob(temp.path(), &manifest.layers[0]).unwrap();
+        let mut bytes = std::fs::read(&layer_path).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&layer_path, bytes).unwrap();
+
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10)).unwrap_err();
+
+        assert!(matches!(error, OciError::InvalidLayout(_)));
+        assert!(error.to_string().contains("digest mismatch"));
+    }
+
+    #[test]
     fn which_finds_known_commands() {
         // `ls` should always be available.
         assert!(which("ls").is_some());
         assert!(which("nonexistent_tool_12345").is_none());
+    }
+
+    #[test]
+    fn oci_workspaces_are_private_and_unique() {
+        let parent = tempfile::tempdir().unwrap();
+        let first = create_oci_workspace(parent.path()).unwrap();
+        let second = create_oci_workspace(parent.path()).unwrap();
+        assert_ne!(first.path(), second.path());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(first.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_uses_fd_relative_paths_and_supports_usrmerge() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::os::unix::fs::symlink("bin", rootfs.join("usr/sbin")).unwrap();
+        std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
+        let agent = test_agent(temp.path());
+
+        inject_agent_init(&rootfs, &agent).unwrap();
+
+        assert_eq!(
+            std::fs::read(rootfs.join("usr/sbin/vmm-agent")).unwrap(),
+            b"test-agent"
+        );
+        let mode = std::fs::metadata(rootfs.join("usr/sbin/vmm-agent"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(
+            std::fs::read_link(rootfs.join("usr/sbin/init")).unwrap(),
+            Path::new("/usr/sbin/vmm-agent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_rejects_image_controlled_parent_symlink_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&rootfs).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("usr")).unwrap();
+        let agent = test_agent(temp.path());
+
+        let error = inject_agent_init(&rootfs, &agent).unwrap_err();
+        assert!(matches!(error, OciError::UnsafePath(_)));
+        assert!(!outside.join("sbin/vmm-agent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_replaces_leaf_symlink_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let destination = rootfs.join("usr/sbin");
+        std::fs::create_dir_all(&destination).unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, destination.join("vmm-agent")).unwrap();
+        let agent = test_agent(temp.path());
+
+        inject_agent_init(&rootfs, &agent).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(destination.join("vmm-agent"))
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(
+            std::fs::read(destination.join("vmm-agent")).unwrap(),
+            b"test-agent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_replaces_existing_image_init_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let sbin = rootfs.join("sbin");
+        std::fs::create_dir_all(&sbin).unwrap();
+        let victim = temp.path().join("image-init");
+        std::fs::write(&victim, b"original-init").unwrap();
+        std::os::unix::fs::symlink(&victim, sbin.join("init")).unwrap();
+        let agent = test_agent(temp.path());
+
+        inject_agent_init(&rootfs, &agent).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original-init");
+        assert_eq!(
+            std::fs::read_link(sbin.join("init")).unwrap(),
+            Path::new("/usr/sbin/vmm-agent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_rejects_unsafe_sbin_symlink_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        std::os::unix::fs::symlink("../../outside", rootfs.join("sbin")).unwrap();
+        let agent = test_agent(temp.path());
+
+        let error = inject_agent_init(&rootfs, &agent).unwrap_err();
+        assert!(matches!(error, OciError::UnsafePath(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_injection_rejects_unsafe_usr_sbin_symlink_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(rootfs.join("usr")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("usr/sbin")).unwrap();
+        std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
+        let agent = test_agent(temp.path());
+
+        let error = inject_agent_init(&rootfs, &agent).unwrap_err();
+        assert!(matches!(error, OciError::UnsafePath(_)));
+        assert!(!outside.join("vmm-agent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_replaces_output_symlink_without_touching_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged.ext4");
+        let output = temp.path().join("output.ext4");
+        let victim = temp.path().join("victim");
+        std::fs::write(&staged, b"disk").unwrap();
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &output).unwrap();
+
+        publish_disk_image(&staged, &output).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(std::fs::read(&output).unwrap(), b"disk");
+        assert!(std::fs::symlink_metadata(output)
+            .unwrap()
+            .file_type()
+            .is_file());
     }
 }

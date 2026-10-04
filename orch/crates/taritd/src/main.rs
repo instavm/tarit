@@ -4,6 +4,7 @@ mod autoscale;
 mod cli;
 mod cluster;
 mod config;
+mod disk;
 mod gateway;
 mod image;
 mod internal;
@@ -12,6 +13,7 @@ mod net;
 mod openapi;
 mod ops;
 mod peer;
+mod peer_tls;
 mod pty;
 mod scheduler;
 mod share_gateway;
@@ -19,15 +21,16 @@ mod shares;
 mod ssh_keys;
 mod supervisor;
 mod usage;
+mod volume_provider;
 mod warmpool;
 
 use anyhow::Context;
 use api::{router, AppState};
 use clap::Parser;
-use config::Config;
+use config::{Config, PtyConnectionLimits};
 use peer::PeerClient;
 use scheduler::Scheduler;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -43,6 +46,7 @@ use tarit_fleet::PostgresFleet;
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const STORE_QUEUE_CAPACITY: usize = 8_192;
 
 #[derive(Clone)]
 struct ShutdownCoordinator {
@@ -87,7 +91,8 @@ async fn main() -> anyhow::Result<()> {
             "contain pre-existing Tarit TAPs before configuration, database, image, or VM discovery",
         )?;
         let config = Config::from_env().context("load config")?;
-        run_server(config, preflight_taps).await
+        let pty_limits = PtyConnectionLimits::from_env().context("load PTY connection limits")?;
+        run_server(config, preflight_taps, pty_limits).await
     } else {
         cli::run_client(cli).await
     }
@@ -103,7 +108,104 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::Result<()> {
+fn persist_startup_vm_observation(
+    store: &Store,
+    vm: &tarit_types::VmRecord,
+    context: &str,
+) -> anyhow::Result<()> {
+    store
+        .insert_vm(vm)
+        .with_context(|| format!("{context}: {}", vm.id))
+}
+
+fn is_identityless_legacy_creating(config: &Config, record: &tarit_types::VmRecord) -> bool {
+    record.host_id == config.host_id
+        && record.status == VmStatus::Creating
+        && record.runtime_layout.is_none()
+        && record.socket_path.as_deref().is_none_or(str::is_empty)
+        && record.pid.is_none_or(|pid| pid == 0)
+}
+
+fn reconcile_legacy_creating_records(
+    config: &Config,
+    store: &Store,
+    supervisor: &VmmSupervisor,
+    records: &mut [tarit_types::VmRecord],
+) -> anyhow::Result<()> {
+    for record in records
+        .iter_mut()
+        .filter(|record| is_identityless_legacy_creating(config, record))
+    {
+        let fenced_revision = record.revision.checked_add(2).ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy Creating VM {} revision is exhausted; cleanup cannot be fenced",
+                record.id
+            )
+        })?;
+        let terminated = supervisor
+            .reconcile_legacy_creating_runtime(record.id)
+            .with_context(|| {
+                format!(
+                    "contain legacy Creating runtime and clean owned artifacts for VM {}",
+                    record.id
+                )
+            })?;
+        record.status = VmStatus::Error;
+        record.revision = fenced_revision;
+        record.updated_at = chrono::Utc::now();
+        persist_startup_vm_observation(
+            store,
+            record,
+            "persist terminal legacy Creating VM before runtime-layout backfill",
+        )?;
+        tracing::warn!(
+            vm = %record.id,
+            revision = record.revision,
+            terminated,
+            "reconciled identity-less legacy Creating VM before runtime-layout backfill"
+        );
+    }
+    Ok(())
+}
+
+fn backfill_legacy_runtime_layouts(
+    config: &Config,
+    store: &Store,
+    records: &mut [tarit_types::VmRecord],
+) -> anyhow::Result<()> {
+    for record in records {
+        let Some(layout) = supervisor::infer_legacy_nonjailed_runtime_layout(config, record)
+            .with_context(|| format!("infer legacy runtime layout for VM {}", record.id))?
+        else {
+            continue;
+        };
+        record.runtime_layout = Some(layout);
+        record.revision = record.revision.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "legacy active VM {} revision is exhausted; drain required before upgrade",
+                record.id
+            )
+        })?;
+        record.updated_at = chrono::Utc::now();
+        persist_startup_vm_observation(
+            store,
+            record,
+            "persist inferred legacy runtime layout before adoption",
+        )?;
+        tracing::warn!(
+            vm = %record.id,
+            revision = record.revision,
+            "persisted inferred legacy non-jailed runtime layout before adoption"
+        );
+    }
+    Ok(())
+}
+
+async fn run_server(
+    mut config: Config,
+    preflight_taps: Vec<String>,
+    pty_limits: PtyConnectionLimits,
+) -> anyhow::Result<()> {
     tracing::info!(
         listen = %config.listen,
         host_id = %config.host_id,
@@ -115,6 +217,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     // releases all sockets if any subsequent setup step fails.
     let ServerListeners {
         control,
+        peer: peer_listener,
         share,
         ssh,
     } = bind_server_listeners(&config).await?;
@@ -127,14 +230,39 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
 
     let store = Store::open(&config.db_path).context("open store")?;
     image::resolve_warm_pool_images(&mut config, &store).context("resolve warm-pool images")?;
-    let persisted_vms = store
+    warmpool::validate_exact_classes(&config).context("validate warm-pool classes")?;
+    let mut persisted_vms = store
         .list_vms()
         .context("load persisted VMs during startup")?;
+    let persisted_hibernations = store
+        .list_hibernations()
+        .context("load pending hibernations during startup")?;
+    let mut aborted_fleet_hibernations = Vec::new();
+    let owned_vm_ids = persisted_vms
+        .iter()
+        .filter(|vm| {
+            vm.host_id == config.host_id
+                && !is_identityless_legacy_creating(&config, vm)
+                && matches!(
+                    vm.status,
+                    VmStatus::Creating
+                        | VmStatus::Running
+                        | VmStatus::Paused
+                        | VmStatus::Suspended
+                        | VmStatus::Hibernated
+                )
+        })
+        .map(|vm| vm.id)
+        .collect::<Vec<_>>();
     let live_vm_ids = persisted_vms
         .iter()
         .filter(|vm| {
             vm.host_id == config.host_id
-                && matches!(vm.status, VmStatus::Running | VmStatus::Paused)
+                && !is_identityless_legacy_creating(&config, vm)
+                && matches!(
+                    vm.status,
+                    VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                )
         })
         .map(|vm| vm.id)
         .collect::<Vec<_>>();
@@ -142,13 +270,16 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     let supervisor = Arc::new(
         VmmSupervisor::new_with_live_vms(
             config.clone(),
-            live_vm_ids,
+            live_vm_ids.iter().copied(),
             &preflight_taps,
             Arc::clone(&scheduler),
         )
         .context("initialize fail-closed network recovery")?,
     );
-
+    reconcile_legacy_creating_records(&config, &store, &supervisor, &mut persisted_vms)
+        .context("reconcile legacy Creating VMs before runtime-layout backfill")?;
+    backfill_legacy_runtime_layouts(&config, &store, &mut persisted_vms)
+        .context("backfill legacy active VM runtime layouts")?;
     // Re-adopt VMs that survived this restart so the control plane can manage
     // them again. Their network policy was reconciled during supervisor
     // construction; this restores the exec/pause/snapshot/delete path. VMs that
@@ -156,18 +287,128 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     // missing network allocation) are marked terminal so the API never reports
     // an uncontrollable VM as running. Persisting that terminal state is
     // mandatory: if it fails, startup aborts rather than serve stale durable
-    // Running/Paused records for VMs that no longer exist.
-    let unadoptable: std::collections::HashSet<Uuid> = {
-        let ids = supervisor.readopt_running_vms(&persisted_vms).await;
-        for id in &ids {
-            store
-                .update_vm_status(*id, VmStatus::Error)
-                .map_err(|error| {
-                    anyhow::anyhow!("persist terminal status for unadoptable VM {id}: {error}")
-                })?;
+    // Running/Paused/Suspended records for VMs that no longer exist.
+    {
+        let failures = supervisor
+            .readopt_running_vms(&mut persisted_vms)
+            .await
+            .context("re-adopt locally owned VMMs")?;
+        let failed_ids = failures
+            .iter()
+            .map(|failure| failure.id)
+            .collect::<Vec<_>>();
+        for failure in &failures {
+            let vm = match persisted_vms.iter_mut().find(|vm| vm.id == failure.id) {
+                Some(vm) => vm,
+                None => {
+                    anyhow::bail!(
+                        "startup reconciliation lost persisted VM {} while fencing: {}",
+                        failure.id,
+                        failure.reason
+                    );
+                }
+            };
+            let recoverable_hibernation = persisted_hibernations
+                .iter()
+                .find(|hibernation| hibernation.vm_id == vm.id);
+            vm.status = if recoverable_hibernation.is_some() {
+                VmStatus::Hibernated
+            } else {
+                VmStatus::Error
+            };
+            // N+1 may have reached the fleet before the previous process
+            // crashed with SQLite still at N. Fence the terminal observation
+            // at N+2 and publish this exact record to every store.
+            vm.revision = match vm.revision.checked_add(2) {
+                Some(revision) => revision,
+                None => {
+                    anyhow::bail!(
+                        "startup reconciliation exhausted VM {} revision while fencing: {}",
+                        failure.id,
+                        failure.reason
+                    );
+                }
+            };
+            vm.updated_at = chrono::Utc::now();
+            if recoverable_hibernation.is_some() {
+                vm.runtime_layout = None;
+                vm.socket_path = None;
+                vm.pid = None;
+                tracing::warn!(vm = %failure.id, reason = %failure.reason,
+                    "startup reconciliation recovered an interrupted hibernation");
+            } else {
+                tracing::warn!(vm = %failure.id, reason = %failure.reason,
+                    "startup reconciliation fenced an unrecoverable VM record");
+            }
+            persist_startup_vm_observation(
+                &store,
+                vm,
+                if recoverable_hibernation.is_some() {
+                    "persist recovered interrupted hibernation"
+                } else {
+                    "persist terminal status for startup-reconciled VM"
+                },
+            )?;
         }
-        ids.into_iter().collect()
-    };
+        for vm in &persisted_vms {
+            if vm.host_id == config.host_id
+                && matches!(
+                    vm.status,
+                    VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                )
+                && !failed_ids.contains(&vm.id)
+            {
+                persist_startup_vm_observation(
+                    &store,
+                    vm,
+                    "persist observed status for re-adopted VM",
+                )?;
+            }
+        }
+        // If the old VMM was successfully re-adopted, the process crashed
+        // before hibernation teardown took effect. Abort that prepared intent;
+        // the still-running VM remains authoritative and can be hibernated
+        // again. Failed readoption above intentionally retains the row as the
+        // durable resume source.
+        for hibernation in &persisted_hibernations {
+            let re_adopted = persisted_vms.iter().any(|vm| {
+                vm.id == hibernation.vm_id
+                    && matches!(
+                        vm.status,
+                        VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+                    )
+                    && !failed_ids.contains(&vm.id)
+            });
+            if re_adopted {
+                store
+                    .delete_hibernation(&hibernation.owner_key, hibernation.vm_id)
+                    .with_context(|| {
+                        format!(
+                            "clear aborted hibernation for re-adopted VM {}",
+                            hibernation.vm_id
+                        )
+                    })?;
+                aborted_fleet_hibernations.push((hibernation.owner_key.clone(), hibernation.vm_id));
+            }
+        }
+    }
+    // Only sweep after every durable Creating/live record and every owned
+    // unpersisted jail/cgroup runtime has been adopted or confirmed dead.
+    // Otherwise GC could remove a live jail or free its UID/GID lease.
+    let startup_references = artifact_references(
+        &persisted_vms,
+        &store
+            .list_snapshots()
+            .context("load durable snapshot references for startup GC")?,
+    );
+    let startup_gc = supervisor
+        .sweep_owned_artifacts(startup_references)
+        .context("sweep owned artifacts during startup")?;
+    tracing::info!(
+        removed_files = startup_gc.removed_files,
+        removed_jails = startup_gc.removed_jails,
+        "startup owned-artifact sweep completed"
+    );
     // Build the peer HTTP client off the async runtime. `reqwest::blocking`
     // spins up its own current-thread runtime; constructing it inside a tokio
     // context panics on current tokio ("Cannot drop a runtime ... from within
@@ -176,16 +417,31 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     // spawn_blocking, so this only moves the one-time construction off-thread.
     let peer = {
         let secret = config.peer_secret.clone();
-        std::thread::spawn(move || PeerClient::new(secret))
-            .join()
-            .map_err(|_| anyhow::anyhow!("peer client init thread panicked"))?
+        let allow_insecure = config.allow_insecure_peer_http;
+        let host_id = config.host_id.clone();
+        let session_id = config.host_session_id;
+        let tls = config.peer_tls.clone();
+        std::thread::spawn(move || {
+            PeerClient::new_for_host(secret, allow_insecure, host_id, session_id, tls.as_ref())
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("peer client init thread panicked"))??
     };
+
+    let peer_certificate_sha256 = config
+        .peer_tls
+        .as_ref()
+        .map(peer_tls::leaf_certificate_sha256)
+        .transpose()
+        .context("fingerprint peer TLS leaf certificate")?;
 
     // Register self in local roster for single-host / scheduler.
     {
         let cap = scheduler.local_capacity(1, 256);
         let host = tarit_store::HostRecord {
             host_id: config.host_id.clone(),
+            boot_session_id: Some(config.host_session_id),
+            peer_certificate_sha256: peer_certificate_sha256.clone(),
             rpc_addr: Some(config.rpc_addr.clone()),
             sandbox_count: cap.sandbox_count,
             free_vcpus: cap.free_vcpus,
@@ -205,14 +461,12 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         Arc::new(RwLock::new(HashMap::new()));
     {
         let mut c = vm_cache.write().unwrap();
-        for mut vm in persisted_vms {
-            if unadoptable.contains(&vm.id) {
-                vm.status = VmStatus::Error;
-            }
-            c.insert(vm.id, vm);
+        for vm in &persisted_vms {
+            c.insert(vm.id, vm.clone());
         }
     }
-    let (store_tx, mut store_rx) = tokio::sync::mpsc::unbounded_channel::<api::StoreWrite>();
+    let (store_tx, mut store_rx) =
+        tokio::sync::mpsc::channel::<api::StoreWrite>(STORE_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(None::<&'static str>);
     let shutdown = ShutdownCoordinator::new(shutdown_tx.clone(), Arc::clone(&supervisor));
 
@@ -225,10 +479,66 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
                 .await
                 .context("postgres fleet")?,
         );
+        let initial_capacity = scheduler.local_capacity(1, 256);
+        let initial_host = tarit_fleet::host_record_from_capacity(
+            &config.host_id,
+            config.host_session_id,
+            peer_certificate_sha256.clone(),
+            Some(config.rpc_addr.clone()),
+            initial_capacity.sandbox_count,
+            initial_capacity.free_vcpus,
+            initial_capacity.free_memory_mib,
+        );
+        // Publish this process incarnation before serving or routing any peer
+        // request. A previous process with the same host_id is fenced as soon
+        // as this transaction commits.
+        fleet
+            .upsert_host(&initial_host)
+            .await
+            .context("publish initial host boot session")?;
+        // SQLite and the local read cache already contain the restart-fenced
+        // VMM observation. Publish that same record to the fleet before any
+        // listener can serve or route traffic.
+        for vm in persisted_vms
+            .iter()
+            .filter(|vm| owned_vm_ids.contains(&vm.id))
+        {
+            fleet
+                .upsert_vm(vm)
+                .await
+                .with_context(|| format!("publish restart-reconciled VM {} to fleet", vm.id))?;
+        }
+        // A successfully re-adopted VMM is authoritative over an interrupted
+        // hibernation prepared by the previous process. SQLite was cleared
+        // before connecting to Postgres; now that the Running observation is
+        // durably published, remove the matching fleet intent as well so its
+        // artifact reference cannot leak. NotFound is already converged (for
+        // example, if the previous process crashed after the fleet deletion).
+        for (owner_key, vm_id) in &aborted_fleet_hibernations {
+            match fleet.delete_hibernation(owner_key, *vm_id).await {
+                Ok(()) | Err(tarit_fleet::FleetError::NotFound) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("clear aborted fleet hibernation for re-adopted VM {vm_id}")
+                    });
+                }
+            }
+        }
+        let interrupted = fleet
+            .fail_incomplete_executions_for_host(
+                &config.host_id,
+                "accepting taritd restarted before execution reached a terminal state",
+            )
+            .await
+            .context("reconcile incomplete fleet executions")?;
+        if interrupted > 0 {
+            tracing::warn!(interrupted, "marked interrupted global executions failed");
+        }
         let fleet_sync = spawn_fleet_sync(
             Arc::clone(&fleet),
             Arc::clone(&store),
             config.clone(),
+            peer_certificate_sha256.clone(),
             Arc::clone(&scheduler),
             shutdown_rx.clone(),
         );
@@ -257,12 +567,13 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
         vm_cache,
         store_tx,
         lifecycle: Arc::new(Mutex::new(HashMap::new())),
+        activation_gates: Arc::new(Mutex::new(HashMap::new())),
         #[cfg(test)]
         lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
         #[cfg(test)]
         lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
         terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),
-        pty_registry: Arc::new(pty::PtyRegistry::default()),
+        pty_registry: Arc::new(pty::PtyRegistry::new(pty_limits)),
         supervisor: Arc::clone(&supervisor),
         scheduler: scheduler.clone(),
         peer: Arc::new(peer),
@@ -275,6 +586,7 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     // Start every background worker only after all listener binds succeeded.
     let store_writer = {
         let store = Arc::clone(&state.store);
+        let metrics = Arc::clone(&state.metrics);
         let shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             loop {
@@ -288,24 +600,36 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
                 };
                 match store.lock() {
                     Ok(s) => match op {
-                        api::StoreWrite::Vm(rec) => {
-                            let _ = s.insert_vm(&rec);
-                        }
                         api::StoreWrite::VmDurable(rec, completion) => {
                             let result = s.insert_vm(&rec).map_err(api::store_err);
+                            if let Err(error) = &result {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(vm = %rec.id, %error, "persist durable VM record");
+                            }
                             let _ = completion.send(result);
                         }
                         api::StoreWrite::Exec(rec) => {
-                            let _ = s.insert_execution(&rec);
+                            if let Err(error) = s.insert_execution(&rec) {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(execution = %rec.id, %error, "persist execution record");
+                            }
                         }
                         api::StoreWrite::Usage(ev) => {
-                            let _ = s.enqueue_usage(&ev);
+                            if let Err(error) = s.enqueue_usage(&ev) {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(event = %ev.id, %error, "persist usage outbox event");
+                            }
                         }
                         api::StoreWrite::Audit(ev) => {
-                            let _ = s.enqueue_audit(&ev);
+                            if let Err(error) = s.enqueue_audit(&ev) {
+                                metrics.inc_store_write_failure();
+                                tracing::error!(event = %ev.id, %error, "persist audit outbox event");
+                            }
                         }
                     },
                     Err(_) => {
+                        metrics.inc_store_write_failure();
+                        tracing::error!("store lock poisoned in persistence worker");
                         if let api::StoreWrite::VmDurable(_, completion) = op {
                             let _ = completion.send(Err(tarit_types::OrchError::Internal(
                                 "store lock poisoned during shutdown persistence".into(),
@@ -337,6 +661,9 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     let usage_meter = usage::spawn_usage_meter(state.clone(), meter_secs, shutdown_rx.clone());
     let outbox_flusher =
         usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
+    let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());
+    let artifact_gc = spawn_artifact_gc(state.clone(), shutdown_rx.clone());
+    let artifact_repair = spawn_artifact_repair(state.clone(), shutdown_rx.clone());
 
     let shutdown_signal_task = spawn_shutdown_signal(shutdown.clone(), shutdown_rx.clone());
     let worker_tasks = BackgroundTasks::new(
@@ -346,23 +673,46 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
             fleet_sync,
             Some(usage_meter),
             outbox_flusher,
+            Some(vm_exit_reconciler),
+            Some(artifact_gc),
+            Some(artifact_repair),
             Some(shutdown_signal_task),
         ],
         warm_pool,
         autoscaler,
     );
 
-    let (app, share_app) = server_routers(state.clone());
+    let (app, peer_app, share_app) = server_routers(state.clone());
     tracing::info!("control listener listening on http://{}", config.listen);
+    if let Some(peer_addr) = config.peer_listen {
+        tracing::info!(
+            transport = if config.peer_tls.is_some() {
+                "mTLS"
+            } else {
+                "plaintext-development"
+            },
+            "peer listener listening on {peer_addr}"
+        );
+    }
     if let Some(share_addr) = config.share_listen {
         tracing::info!("share listener listening on http://{}", share_addr);
     }
     let control_server = spawn_http_server(control, app, shutdown_rx.clone());
+    let peer_server = match peer_listener {
+        Some(listener) => Some(spawn_peer_server(
+            listener,
+            peer_app,
+            config.peer_tls.as_ref(),
+            shutdown_rx.clone(),
+        )?),
+        None => None,
+    };
     let share_server =
         share.map(|listener| spawn_http_server(listener, share_app, shutdown_rx.clone()));
     let ssh_server = ssh.map(|listener| spawn_ssh_server(listener, state.clone()));
     let outcome = supervise_servers(
         control_server,
+        peer_server,
         share_server,
         ssh_server,
         shutdown,
@@ -386,8 +736,295 @@ async fn run_server(mut config: Config, preflight_taps: Vec<String>) -> anyhow::
     .await
 }
 
+fn artifact_references(
+    vms: &[tarit_types::VmRecord],
+    snapshots: &[tarit_store::SnapshotRecord],
+) -> disk::ArtifactReferences {
+    let active_vms = vms.iter().filter(|vm| {
+        matches!(
+            vm.status,
+            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+        )
+    });
+    let active_vm_ids = active_vms.clone().map(|vm| vm.id).collect::<HashSet<_>>();
+    let mut runtime_paths = HashSet::new();
+    for vm in active_vms {
+        if let Some(layout) = &vm.runtime_layout {
+            runtime_paths.extend(layout.artifact_paths.iter().map(std::path::PathBuf::from));
+            if let Some(path) = &layout.overlay_path {
+                runtime_paths.insert(std::path::PathBuf::from(path));
+            }
+            if let Some(path) = &layout.jail_path {
+                runtime_paths.insert(std::path::PathBuf::from(path));
+            }
+        }
+    }
+    let mut snapshot_paths = HashSet::new();
+    for snapshot in snapshots {
+        snapshot_paths.insert(std::path::PathBuf::from(&snapshot.path));
+        snapshot_paths.insert(std::path::PathBuf::from(format!(
+            "{}.integrity",
+            snapshot.path
+        )));
+        if let Some(path) = &snapshot.overlay_path {
+            snapshot_paths.insert(std::path::PathBuf::from(path));
+        }
+    }
+    disk::ArtifactReferences {
+        active_vm_ids,
+        snapshot_paths,
+        runtime_paths,
+    }
+}
+
+fn spawn_artifact_gc(
+    state: AppState,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(state.supervisor.disk_sweep_interval());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
+            let vms = state
+                .vm_cache
+                .read()
+                .map(|cache| cache.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let mut snapshots = match state.store.lock() {
+                Ok(store) => match store.list_snapshots() {
+                    Ok(snapshots) => snapshots,
+                    Err(error) => {
+                        tracing::error!(%error, "load snapshot references for artifact GC failed");
+                        continue;
+                    }
+                },
+                Err(_) => {
+                    tracing::error!("store lock poisoned during artifact GC");
+                    continue;
+                }
+            };
+            if let Some(fleet) = state.fleet.as_ref() {
+                let mut removed_ids = HashSet::new();
+                let minimum_age = chrono::Duration::seconds(
+                    i64::try_from(state.config.disk_pressure.artifact_min_age_secs)
+                        .unwrap_or(i64::MAX),
+                );
+                for snapshot in &snapshots {
+                    if snapshot.host_id != state.config.host_id
+                        || chrono::Utc::now() - snapshot.created_at < minimum_age
+                    {
+                        continue;
+                    }
+                    let Some(owner_key) = snapshot.owner_key.as_deref() else {
+                        continue;
+                    };
+                    let local_artifact = match state.store.lock() {
+                        Ok(store) => store.get_artifact(owner_key, snapshot.snapshot_id),
+                        Err(_) => {
+                            tracing::error!("store lock poisoned during replica GC");
+                            break;
+                        }
+                    };
+                    let Ok(local_artifact) = local_artifact else {
+                        continue;
+                    };
+                    if local_artifact.reference_count != 0
+                        || local_artifact.storage_locator != snapshot.path
+                    {
+                        continue;
+                    }
+                    match fleet.get_artifact(owner_key, snapshot.snapshot_id).await {
+                        Ok(_) => continue,
+                        Err(tarit_fleet::FleetError::NotFound) => {}
+                        Err(error) => {
+                            tracing::warn!(artifact = %snapshot.snapshot_id, %error,
+                                "fleet lookup for physical replica GC failed");
+                            continue;
+                        }
+                    }
+                    let removed_files = match disk::delete_owned_snapshot_components(
+                        &state.config.socket_dir,
+                        snapshot,
+                    ) {
+                        Ok(removed) => removed,
+                        Err(error) => {
+                            tracing::error!(artifact = %snapshot.snapshot_id, %error,
+                                "physical replica deletion failed");
+                            continue;
+                        }
+                    };
+                    let metadata_deleted = match state.store.lock() {
+                        Ok(store) => store.delete_local_replica_metadata_if_unreferenced(
+                            owner_key,
+                            snapshot.snapshot_id,
+                            &snapshot.path,
+                        ),
+                        Err(_) => {
+                            tracing::error!("store lock poisoned during replica metadata GC");
+                            continue;
+                        }
+                    };
+                    match metadata_deleted {
+                        Ok(_) => {
+                            removed_ids.insert(snapshot.snapshot_id);
+                            tracing::info!(artifact = %snapshot.snapshot_id, removed_files,
+                                "unreferenced physical replica removed");
+                        }
+                        Err(error) => tracing::error!(artifact = %snapshot.snapshot_id, %error,
+                            "physical replica bytes removed but metadata cleanup will retry"),
+                    }
+                }
+                snapshots.retain(|snapshot| !removed_ids.contains(&snapshot.snapshot_id));
+            }
+            match state
+                .supervisor
+                .sweep_owned_artifacts(artifact_references(&vms, &snapshots))
+            {
+                Ok(report) if report.removed_files > 0 || report.removed_jails > 0 => {
+                    tracing::info!(
+                        removed_files = report.removed_files,
+                        removed_jails = report.removed_jails,
+                        "periodic owned-artifact sweep completed"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "periodic owned-artifact sweep failed"),
+            }
+        }
+    })
+}
+
+fn spawn_artifact_repair(
+    state: AppState,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(fleet) = state.fleet.clone() else {
+            return;
+        };
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
+            if state.supervisor.disk_pressure_snapshot().pressured {
+                continue;
+            }
+            let artifacts = match fleet.list_degraded_artifacts(8).await {
+                Ok(artifacts) => artifacts,
+                Err(error) => {
+                    tracing::warn!(%error, "list degraded artifacts for repair failed");
+                    continue;
+                }
+            };
+            for artifact in artifacts {
+                let lease_token = match fleet
+                    .try_acquire_artifact_repair_lease(
+                        artifact.artifact_id,
+                        &state.config.host_id,
+                        state.config.host_session_id,
+                        &state.config.zone,
+                        chrono::Utc::now() + chrono::Duration::seconds(30),
+                    )
+                    .await
+                {
+                    Ok(Some(token)) => token,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(artifact = %artifact.artifact_id, %error,
+                            "artifact repair lease acquisition failed");
+                        continue;
+                    }
+                };
+                let renew_fleet = Arc::clone(&fleet);
+                let renew_host = state.config.host_id.clone();
+                let renew_session = state.config.host_session_id;
+                let renew_artifact = artifact.artifact_id;
+                let renewal = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(10));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        match renew_fleet
+                            .renew_artifact_repair_lease(
+                                renew_artifact,
+                                &renew_host,
+                                renew_session,
+                                lease_token,
+                                chrono::Utc::now() + chrono::Duration::seconds(30),
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) | Err(_) => break,
+                        }
+                    }
+                });
+                let identity = config::ApiIdentity {
+                    tenant: artifact.owner_key.clone(),
+                    role: config::ApiRole::User,
+                    max_vms: None,
+                    api_key_id: format!("artifact-repair:{}", state.config.host_id),
+                };
+                let result =
+                    ops::localize_branch_artifact(&state, &artifact, &identity, false).await;
+                renewal.abort();
+                let _ = renewal.await;
+                if let Err(error) = fleet
+                    .release_artifact_repair_lease(
+                        artifact.artifact_id,
+                        &state.config.host_id,
+                        state.config.host_session_id,
+                        lease_token,
+                    )
+                    .await
+                {
+                    tracing::warn!(artifact = %artifact.artifact_id, %error,
+                        "artifact repair lease release failed");
+                }
+                match result {
+                    Ok(_) => tracing::info!(artifact = %artifact.artifact_id,
+                        "artifact replica repair published"),
+                    Err(error) => tracing::warn!(artifact = %artifact.artifact_id, %error,
+                        "artifact replica repair attempt failed"),
+                }
+                break;
+            }
+        }
+    })
+}
+
+fn spawn_vm_exit_reconciler(
+    state: AppState,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                _ = interval.tick() => {}
+            }
+            for failure in ops::reconcile_unexpected_vmm_exits(&state).await {
+                tracing::error!(%failure, "unexpected VMM exit reconciliation failed");
+            }
+        }
+    })
+}
+
 struct ServerListeners {
     control: tokio::net::TcpListener,
+    peer: Option<tokio::net::TcpListener>,
     share: Option<tokio::net::TcpListener>,
     ssh: Option<tokio::net::TcpListener>,
 }
@@ -402,8 +1039,17 @@ async fn bind_server_listeners(config: &Config) -> anyhow::Result<ServerListener
         ),
         false => None,
     };
+    let peer = match config.peer_listen {
+        Some(address) => Some(
+            tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("bind peer listener {address}"))?,
+        ),
+        None => None,
+    };
     Ok(ServerListeners {
         control,
+        peer,
         share,
         ssh,
     })
@@ -499,9 +1145,10 @@ fn spawn_shutdown_signal(
 
 type ServerHandle = tokio::task::JoinHandle<anyhow::Result<()>>;
 
-fn server_routers(state: AppState) -> (axum::Router, axum::Router) {
+fn server_routers(state: AppState) -> (axum::Router, axum::Router, axum::Router) {
     (
-        router(state.clone()).merge(internal::internal_router(state.clone())),
+        router(state.clone()),
+        internal::internal_router(state.clone()),
         share_gateway::router(state),
     )
 }
@@ -537,6 +1184,85 @@ fn spawn_http_server(
             .await
             .context("HTTP server serve")
     })
+}
+
+fn spawn_peer_server(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    tls: Option<&config::PeerTlsConfig>,
+    shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> anyhow::Result<ServerHandle> {
+    let Some(tls) = tls else {
+        return Ok(spawn_http_server(listener, app, shutdown_rx));
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(peer_tls::server_config(tls)?);
+    Ok(tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let accepted = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, address) = accepted.context("accept peer TLS connection")?;
+            let acceptor = acceptor.clone();
+            let app = app.clone();
+            let connection_shutdown = shutdown_rx.clone();
+            connections.spawn(async move {
+                let stream = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => {
+                        tracing::warn!(peer = %address, %error, "rejected peer TLS handshake");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!(peer = %address, "peer TLS handshake timed out");
+                        return;
+                    }
+                };
+                let peer_certificate_sha256 = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certificates| certificates.first())
+                    .map(peer_tls::certificate_sha256);
+                let Some(peer_certificate_sha256) = peer_certificate_sha256 else {
+                    tracing::warn!(peer = %address, "peer TLS connection has no authenticated leaf certificate");
+                    return;
+                };
+                let app = app.layer(axum::Extension(
+                    internal::VerifiedPeerCertificate(peer_certificate_sha256),
+                ));
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let service = hyper_util::service::TowerToHyperService::new(app);
+                let builder = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                );
+                let connection = builder.serve_connection_with_upgrades(io, service);
+                tokio::pin!(connection);
+                tokio::select! {
+                    result = &mut connection => {
+                        if let Err(error) = result {
+                            tracing::debug!(peer = %address, %error, "peer TLS connection closed");
+                        }
+                    }
+                    _ = wait_for_shutdown(connection_shutdown) => {
+                        connection.as_mut().graceful_shutdown();
+                        if let Err(error) = connection.await {
+                            tracing::debug!(peer = %address, %error, "peer TLS connection drain failed");
+                        }
+                    }
+                }
+            });
+        }
+        while connections.join_next().await.is_some() {}
+        Ok(())
+    }))
 }
 
 fn spawn_ssh_server(listener: tokio::net::TcpListener, state: AppState) -> ServerHandle {
@@ -597,20 +1323,58 @@ where
 enum ServerEvent {
     Shutdown(&'static str),
     Control(Result<anyhow::Result<()>, tokio::task::JoinError>),
+    Peer(Result<anyhow::Result<()>, tokio::task::JoinError>),
     Share(Result<anyhow::Result<()>, tokio::task::JoinError>),
     Ssh(Result<anyhow::Result<()>, tokio::task::JoinError>),
 }
 
 async fn supervise_servers(
     mut control: ServerHandle,
+    mut peer: Option<ServerHandle>,
     mut share: Option<ServerHandle>,
     mut ssh: Option<ServerHandle>,
     shutdown: ShutdownCoordinator,
     shutdown_rx: watch::Receiver<Option<&'static str>>,
     drain_timeout: Duration,
 ) -> LifecycleOutcome {
-    let event = match (share.as_mut(), ssh.as_mut()) {
-        (Some(share), Some(ssh)) => {
+    let event = match (peer.as_mut(), share.as_mut(), ssh.as_mut()) {
+        (Some(peer), Some(share), Some(ssh)) => {
+            tokio::select! {
+                biased;
+                reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
+                result = &mut control => ServerEvent::Control(result),
+                result = &mut *peer => ServerEvent::Peer(result),
+                result = &mut *share => ServerEvent::Share(result),
+                result = &mut *ssh => ServerEvent::Ssh(result),
+            }
+        }
+        (Some(peer), Some(share), None) => {
+            tokio::select! {
+                biased;
+                reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
+                result = &mut control => ServerEvent::Control(result),
+                result = &mut *peer => ServerEvent::Peer(result),
+                result = &mut *share => ServerEvent::Share(result),
+            }
+        }
+        (Some(peer), None, Some(ssh)) => {
+            tokio::select! {
+                biased;
+                reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
+                result = &mut control => ServerEvent::Control(result),
+                result = &mut *peer => ServerEvent::Peer(result),
+                result = &mut *ssh => ServerEvent::Ssh(result),
+            }
+        }
+        (Some(peer), None, None) => {
+            tokio::select! {
+                biased;
+                reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
+                result = &mut control => ServerEvent::Control(result),
+                result = &mut *peer => ServerEvent::Peer(result),
+            }
+        }
+        (None, Some(share), Some(ssh)) => {
             tokio::select! {
                 biased;
                 reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
@@ -619,7 +1383,7 @@ async fn supervise_servers(
                 result = &mut *ssh => ServerEvent::Ssh(result),
             }
         }
-        (Some(share), None) => {
+        (None, Some(share), None) => {
             tokio::select! {
                 biased;
                 reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
@@ -627,7 +1391,7 @@ async fn supervise_servers(
                 result = &mut *share => ServerEvent::Share(result),
             }
         }
-        (None, Some(ssh)) => {
+        (None, None, Some(ssh)) => {
             tokio::select! {
                 biased;
                 reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
@@ -635,7 +1399,7 @@ async fn supervise_servers(
                 result = &mut *ssh => ServerEvent::Ssh(result),
             }
         }
-        (None, None) => {
+        (None, None, None) => {
             tokio::select! {
                 biased;
                 reason = wait_for_shutdown(shutdown_rx.clone()) => ServerEvent::Shutdown(reason),
@@ -649,6 +1413,7 @@ async fn supervise_servers(
     shutdown.close_admission();
 
     let mut control_exited = false;
+    let mut peer_exited = false;
     let mut share_exited = false;
     let mut ssh_exited = false;
     let mut first_error = None;
@@ -658,6 +1423,16 @@ async fn supervise_servers(
             control_exited = true;
             classify_server_exit(
                 "control",
+                result,
+                shutdown_rx.borrow().is_some(),
+                &mut first_error,
+            );
+            shutdown_after_server_exit(&shutdown, &shutdown_rx, &first_error)
+        }
+        ServerEvent::Peer(result) => {
+            peer_exited = true;
+            classify_server_exit(
+                "peer",
                 result,
                 shutdown_rx.borrow().is_some(),
                 &mut first_error,
@@ -697,6 +1472,11 @@ async fn supervise_servers(
             &mut first_error,
             drain_server("control", &mut control, deadline).await,
         );
+    }
+    if !peer_exited {
+        if let Some(peer) = peer.as_mut() {
+            record_first_error(&mut first_error, drain_server("peer", peer, deadline).await);
+        }
     }
     if !share_exited {
         if let Some(share) = share.as_mut() {
@@ -851,6 +1631,7 @@ fn spawn_fleet_sync(
     fleet: Arc<PostgresFleet>,
     store: Arc<Mutex<Store>>,
     config: Config,
+    peer_certificate_sha256: Option<String>,
     scheduler: Arc<Scheduler>,
     shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> JoinHandle<()> {
@@ -865,6 +1646,8 @@ fn spawn_fleet_sync(
             let cap = scheduler.local_capacity(1, 256);
             let host = tarit_fleet::host_record_from_capacity(
                 &config.host_id,
+                config.host_session_id,
+                peer_certificate_sha256.clone(),
                 Some(config.rpc_addr.clone()),
                 cap.sandbox_count,
                 cap.free_vcpus,
@@ -873,6 +1656,14 @@ fn spawn_fleet_sync(
             if fleet.upsert_host(&host).await.is_err() {
                 tracing::warn!("fleet heartbeat failed");
                 continue;
+            }
+            if let Err(error) = fleet
+                .refresh_artifact_replication_health(
+                    chrono::Utc::now() - chrono::Duration::seconds(15),
+                )
+                .await
+            {
+                tracing::warn!(%error, "fleet artifact health reconciliation failed");
             }
             match fleet.list_hosts().await {
                 Ok(hosts) => {
@@ -895,12 +1686,377 @@ mod tests {
         body::Body,
         http::{header::HOST, Request, StatusCode},
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "linux")]
+    use std::{
+        io::{Read, Write},
+        os::unix::ffi::OsStrExt,
+        process::{Command, Stdio},
+        thread,
+    };
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn peer_tls_listener_serves_trusted_client_and_rejects_missing_certificate() {
+        let pki = peer_tls::tests::test_pki();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        let app = axum::Router::new().route(
+            "/probe",
+            axum::routing::get(|| async { StatusCode::NO_CONTENT }),
+        );
+        let server = spawn_peer_server(listener, app, Some(&pki.server), shutdown_rx).unwrap();
+
+        let mut authenticated_builder = reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_root_certs(false)
+            .identity(peer_tls::reqwest_identity(&pki.client).unwrap());
+        let mut unauthenticated_builder = reqwest::Client::builder()
+            .no_proxy()
+            .tls_built_in_root_certs(false);
+        for root in peer_tls::reqwest_roots(&pki.client).unwrap() {
+            authenticated_builder = authenticated_builder.add_root_certificate(root.clone());
+            unauthenticated_builder = unauthenticated_builder.add_root_certificate(root);
+        }
+        let authenticated = authenticated_builder.build().unwrap();
+        let unauthenticated = unauthenticated_builder.build().unwrap();
+        let url = format!("https://localhost:{port}/probe");
+
+        assert_eq!(
+            authenticated.get(&url).send().await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(unauthenticated.get(&url).send().await.is_err());
+
+        shutdown_tx.send(Some("test")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("peer TLS listener drains")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn short_test_root(prefix: &str) -> PathBuf {
+        let suffix = Uuid::new_v4().simple().to_string();
+        PathBuf::from("target/t").join(format!("{prefix}-{suffix}"))
+    }
+
     fn test_shutdown(tx: watch::Sender<Option<&'static str>>) -> ShutdownCoordinator {
         ShutdownCoordinator::new(tx, Arc::new(VmmSupervisor::new(test_config())))
+    }
+
+    #[test]
+    fn artifact_gc_uses_persisted_runtime_layout_paths() {
+        let now = chrono::Utc::now();
+        let persisted_overlay = PathBuf::from("/old-layout/overlays/vm.cow");
+        let persisted_jail = PathBuf::from("/old-layout/jails/vm");
+        let vm = tarit_types::VmRecord {
+            id: Uuid::new_v4(),
+            host_id: "host-a".into(),
+            owner_key: None,
+            api_key_id: None,
+            status: VmStatus::Running,
+            revision: 1,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: Some("rootfs".into()),
+            rootfs_read_only: true,
+            cmdline: "console=ttyS0".into(),
+            runtime_layout: Some(tarit_types::VmRuntimeLayout {
+                overlay_path: Some(persisted_overlay.display().to_string()),
+                jail_path: Some(persisted_jail.display().to_string()),
+                artifact_paths: vec!["/old-layout/control.sock".into()],
+            }),
+            socket_path: Some("/old-layout/control.sock".into()),
+            pid: Some(42),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let references = artifact_references(&[vm], &[]);
+        assert!(references.runtime_paths.contains(&persisted_overlay));
+        assert!(references.runtime_paths.contains(&persisted_jail));
+        assert!(references
+            .runtime_paths
+            .contains(Path::new("/old-layout/control.sock")));
+    }
+
+    fn legacy_active_record(
+        config: &Config,
+        id: Uuid,
+        socket_path: PathBuf,
+        pid: Option<u32>,
+    ) -> tarit_types::VmRecord {
+        let now = chrono::Utc::now();
+        tarit_types::VmRecord {
+            id,
+            host_id: config.host_id.clone(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: Some("test-key".into()),
+            status: VmStatus::Running,
+            revision: 7,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: config.kernel.display().to_string(),
+            rootfs_path: Some(config.rootfs.display().to_string()),
+            rootfs_read_only: true,
+            cmdline: supervisor::DEFAULT_CMDLINE.into(),
+            runtime_layout: None,
+            socket_path: Some(socket_path.display().to_string()),
+            pid,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn ambiguous_legacy_runtime_layout_requires_drain() {
+        let config = test_config();
+        let id = Uuid::new_v4();
+        let mut records = vec![legacy_active_record(
+            &config,
+            id,
+            config.socket_dir.join("not-the-vm-id.sock"),
+            None,
+        )];
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&records[0]).unwrap();
+
+        let error = backfill_legacy_runtime_layouts(&config, &store, &mut records)
+            .expect_err("ambiguous legacy layout must block startup");
+        let error = format!("{error:#}");
+        assert!(error.contains("drain required before upgrade"));
+        assert!(error.contains("legacy UUID-scoped socket"));
+        assert_eq!(store.get_vm(id).unwrap().runtime_layout, None);
+    }
+
+    #[test]
+    fn identity_less_legacy_creating_is_fenced_before_layout_backfill() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/legacy-creating-upgrade-{}", Uuid::new_v4()));
+        let mut config = test_config();
+        config.vmm_bin = std::env::current_exe().unwrap();
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        let supervisor = VmmSupervisor::new(config.clone());
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let overlay_path = config.socket_dir.join("overlays").join(format!("{id}.cow"));
+        std::fs::write(&socket_path, b"stale socket artifact").unwrap();
+        std::fs::write(&overlay_path, b"stale overlay artifact").unwrap();
+        let mut record = legacy_active_record(&config, id, socket_path.clone(), None);
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&record).unwrap();
+        let mut records = vec![record];
+
+        reconcile_legacy_creating_records(&config, &store, &supervisor, &mut records).unwrap();
+        backfill_legacy_runtime_layouts(&config, &store, &mut records).unwrap();
+
+        let durable = store.get_vm(id).unwrap();
+        assert_eq!(durable.status, VmStatus::Error);
+        assert_eq!(durable.revision, 9);
+        assert_eq!(durable.runtime_layout, None);
+        assert!(!socket_path.exists());
+        assert!(!overlay_path.exists());
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identity_less_legacy_creating_is_excluded_from_live_recovery() {
+        let config = test_config();
+        let id = Uuid::new_v4();
+        let mut record = legacy_active_record(
+            &config,
+            id,
+            config.socket_dir.join(format!("{id}.sock")),
+            None,
+        );
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+
+        assert!(is_identityless_legacy_creating(&config, &record));
+        record.host_id = "other-host".into();
+        assert!(!is_identityless_legacy_creating(&config, &record));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn identity_less_legacy_creating_terminates_discovered_owned_runtime() {
+        let root = short_test_root("lcr");
+        let mut config = test_config();
+        config.vmm_bin = PathBuf::from("sh");
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        let supervisor = VmmSupervisor::new(config.clone());
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut published = false;
+        for _ in 0..200 {
+            published =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).is_ok_and(|cmdline| {
+                    cmdline
+                        .windows(socket_path.as_os_str().as_bytes().len())
+                        .any(|window| window == socket_path.as_os_str().as_bytes())
+                });
+            if published {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "legacy VMM stand-in did not publish its argv");
+        let mut record = legacy_active_record(&config, id, socket_path.clone(), None);
+        record.status = VmStatus::Creating;
+        record.socket_path = None;
+        let store = Store::open(":memory:").unwrap();
+        store.insert_vm(&record).unwrap();
+        let mut records = vec![record];
+
+        reconcile_legacy_creating_records(&config, &store, &supervisor, &mut records).unwrap();
+
+        child.wait().unwrap();
+        assert_eq!(store.get_vm(id).unwrap().status, VmStatus::Error);
+        assert!(!socket_path.exists());
+        drop(listener);
+        drop(supervisor);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_active_runtime_is_persisted_before_adoption() {
+        let root = short_test_root("lla");
+        let mut config = test_config();
+        config.vmm_bin = PathBuf::from("sh");
+        config.socket_dir = root.join("sockets");
+        config.db_path = root.join("fleet.db");
+        config.net_state_path = root.join("net-state.json");
+        config.images_dir = root.join("images");
+        config.kernel = root.join("kernel");
+        config.rootfs = root.join("rootfs");
+        std::fs::create_dir_all(config.socket_dir.join("overlays")).unwrap();
+
+        let id = Uuid::new_v4();
+        let socket_path = config.socket_dir.join(format!("{id}.sock"));
+        let overlay_path = config.socket_dir.join("overlays").join(format!("{id}.cow"));
+        std::fs::write(&overlay_path, b"legacy overlay").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(request, tarit_vmm_client::ApiRequest::Status));
+            let response = tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                state: tarit_vmm_client::VmState::Paused,
+                uptime_ms: 1,
+                vcpus: 1,
+                mem_mib: 256,
+                volumes: 0,
+                nets: 0,
+                kernel: "kernel".into(),
+                vcpu_alive: true,
+            });
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+        });
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("read _line")
+            .arg("tarit-vmm")
+            .arg("serve")
+            .arg("--socket")
+            .arg(&socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut published = false;
+        for _ in 0..200 {
+            published =
+                std::fs::read(format!("/proc/{}/cmdline", child.id())).is_ok_and(|cmdline| {
+                    cmdline
+                        .windows(socket_path.as_os_str().as_bytes().len())
+                        .any(|window| window == socket_path.as_os_str().as_bytes())
+                });
+            if published {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(published, "legacy VMM stand-in did not publish its argv");
+
+        let store = Store::open(":memory:").unwrap();
+        let mut records = vec![legacy_active_record(
+            &config,
+            id,
+            socket_path.clone(),
+            Some(child.id()),
+        )];
+        store.insert_vm(&records[0]).unwrap();
+        backfill_legacy_runtime_layouts(&config, &store, &mut records).unwrap();
+
+        let durable = store.get_vm(id).unwrap();
+        assert_eq!(durable.revision, 8);
+        assert_eq!(
+            durable.runtime_layout,
+            Some(tarit_types::VmRuntimeLayout {
+                overlay_path: Some(overlay_path.display().to_string()),
+                jail_path: None,
+                artifact_paths: vec![
+                    socket_path.display().to_string(),
+                    overlay_path.display().to_string(),
+                ],
+            })
+        );
+
+        let supervisor = Arc::new(VmmSupervisor::new(config));
+        let warnings = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(supervisor.readopt_running_vms(&mut records))
+            .unwrap();
+        server.join().unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(records[0].status, VmStatus::Paused);
+        assert_eq!(records[0].revision, 10);
+        supervisor.stop_vm(id).unwrap();
+        child.wait().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -943,7 +2099,9 @@ mod tests {
         config.net_state_path = root.join("net-state.json");
         config.ssh_gateway_host_key_path = root.join("ssh-host");
 
-        let error = run_server(config, Vec::new()).await.unwrap_err();
+        let error = run_server(config, Vec::new(), PtyConnectionLimits::default())
+            .await
+            .unwrap_err();
 
         assert!(error
             .to_string()
@@ -987,18 +2145,20 @@ mod tests {
     }
 
     #[test]
-    fn server_routers_keep_control_and_share_routes_separate() {
-        let (control, share) = server_routers(test_state());
+    fn server_routers_keep_control_peer_and_share_routes_separate() {
+        let (control, peer, share) = server_routers(test_state());
         let share_host = "calm-red-fox.shares.example.com";
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let control_test = control.clone();
+        let peer_test = peer.clone();
         let share_test = share.clone();
 
         runtime.block_on(async move {
             let control_response = control_test
+                .clone()
                 .oneshot(
                     Request::builder()
                         .uri("/")
@@ -1011,6 +2171,31 @@ mod tests {
             // A share-style request pointed at the control listener hits the
             // control router's not-found fallback, not a share handler.
             assert_eq!(control_response.status(), StatusCode::NOT_FOUND);
+
+            let public_internal_response = control_test
+                .oneshot(
+                    Request::builder()
+                        .uri("/internal/v1/vms")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(public_internal_response.status(), StatusCode::NOT_FOUND);
+
+            let peer_public_response = peer_test
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Peer authentication is applied before routing, so an unsigned
+            // public-looking request is rejected without revealing whether a
+            // path exists on the internal listener.
+            assert_eq!(peer_public_response.status(), StatusCode::UNAUTHORIZED);
 
             let share_response = share_test
                 .oneshot(
@@ -1025,6 +2210,7 @@ mod tests {
             assert_eq!(share_response.status(), StatusCode::NOT_FOUND);
         });
         drop(control);
+        drop(peer);
         drop(share);
         drop(runtime);
     }
@@ -1068,6 +2254,7 @@ mod tests {
         shutdown_tx.send(Some("test")).unwrap();
         let outcome = supervise_servers(
             control,
+            None,
             Some(share),
             None,
             shutdown,
@@ -1097,6 +2284,7 @@ mod tests {
 
         let outcome = supervise_servers(
             control,
+            None,
             Some(share),
             None,
             shutdown,
@@ -1138,6 +2326,7 @@ mod tests {
 
         let outcome = supervise_servers(
             control,
+            None,
             Some(share),
             None,
             test_shutdown(shutdown_tx),
@@ -1174,6 +2363,7 @@ mod tests {
 
         let outcome = supervise_servers(
             control,
+            None,
             Some(share),
             None,
             test_shutdown(shutdown_tx),
@@ -1207,6 +2397,7 @@ mod tests {
 
         let outcome = supervise_servers(
             control,
+            None,
             Some(share),
             None,
             test_shutdown(shutdown_tx),
@@ -1231,6 +2422,7 @@ mod tests {
 
         let outcome = supervise_servers(
             control,
+            None,
             Some(share),
             None,
             test_shutdown(shutdown_tx),
@@ -1260,6 +2452,7 @@ mod tests {
 
         let outcome = supervise_servers(
             control,
+            None,
             Some(share),
             None,
             test_shutdown(shutdown_tx),
@@ -1418,6 +2611,7 @@ mod tests {
             )])
             .unwrap(),
             host_id: "test-host".into(),
+            host_session_id: Uuid::nil(),
             vmm_bin: PathBuf::from("target/taritd-main-test/vmm"),
             kernel: PathBuf::from("target/taritd-main-test/kernel"),
             rootfs: PathBuf::from("target/taritd-main-test/rootfs"),
@@ -1425,17 +2619,30 @@ mod tests {
             db_path: PathBuf::from("target/taritd-main-test/fleet.db"),
             net_state_path: PathBuf::from("target/taritd-main-test/net-state.json"),
             images_dir: PathBuf::from("target/taritd-main-test/images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: config::WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,
@@ -1459,7 +2666,7 @@ mod tests {
         let config = test_config();
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = shares::ShareRepository::new(Arc::clone(&store), None);
-        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, _store_rx) = tokio::sync::mpsc::channel(128);
         AppState {
             config: config.clone(),
             audit_outbox: Arc::new(audit::LocalAuditOutbox::new(Arc::clone(&store))),
@@ -1468,6 +2675,7 @@ mod tests {
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            activation_gates: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
             lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),

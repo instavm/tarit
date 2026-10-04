@@ -1,6 +1,6 @@
 //! vmm-jailer: host-side confinement of the VMM process.
 //!
-//! Jailer wrapper: chroot, PID/mount/network/user namespaces,
+//! Jailer wrapper: chroot, mount/UTS/IPC/network namespaces,
 //! cgroups (CPU/mem/IO/PID limits), drop to unprivileged uid/gid,
 //! `--resource-limit` style fd/file caps.
 //!
@@ -19,7 +19,7 @@ pub mod profile;
 pub mod seccomp;
 
 #[cfg(target_os = "linux")]
-pub use executor::jail;
+pub use executor::{jail, launch_pid_namespace, PidNamespaceRole};
 pub use jailer::Jailer;
 pub use profile::{audit_profile, VmmSeccompProfiles};
 pub use seccomp::{SeccompProfile, ThreadKind};

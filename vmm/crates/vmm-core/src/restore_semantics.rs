@@ -6,8 +6,10 @@
 //! **Clocks (kvmclock):**
 //! - The guest uses kvmclock (KVM's paravirtualized clock) for time.
 //! - On restore, the guest's clock reads the old TSC value → time jump.
-//! - KVM handles this automatically: `KVM_SET_CLOCK` resets the guest's
-//!   clock base on restore. The kernel detects the jump and resyncs.
+//! - Tarit restores the saved KVM clock with `KVM_CLOCK_REALTIME` cleared,
+//!   notifies restored vCPUs with `KVM_KVMCLOCK_CTRL`, and repairs realtime in
+//!   the guest during the mandatory pre-admission clone-repair exchange. This
+//!   advances wall time without incorrectly advancing monotonic timers.
 //! - For clones: each clone gets its own kvmclock offset (KVM creates a
 //!   fresh VM, so the clock starts from the host's current time).
 //!
@@ -15,21 +17,23 @@
 //! - The guest's CRNG state is in the memory snapshot.
 //! - If 100 clones share the same CRNG state → they produce the same
 //!   random numbers → security vulnerability.
-//! - Fix: virtio-rng feeds fresh entropy from /dev/urandom. On restore/
-//!   clone, the guest's kernel detects the "fresh boot" (via kvmclock
-//!   jump) and re-seeds the CRNG from virtio-rng.
-//! - Our `VirtioRng` device serves entropy on demand — each clone gets
-//!   independent randomness.
+//! - Virtio-rng can feed fresh host entropy, but its presence and a clock jump
+//!   do not prove that the cloned kernel CRNG has consumed it before returning
+//!   bytes. Userspace PRNGs and cached tokens are outside the kernel CRNG.
+//! - Secure multi-resume therefore requires a VM generation device and the
+//!   mandatory pre-admission userspace repair exchange. The exchange supplies
+//!   fresh host entropy, forces a kernel reseed, rotates clone identity, and
+//!   completes the optional post-fork hook before restore is acknowledged.
 //!
 //! **What we need to do on restore:**
 //! 1. Create a fresh KvmVm (new VM = new kvmclock base)
 //! 2. Load the memory snapshot (guest CRNG state is in there)
 //! 3. Load the device state (but DON'T restore rng bytes_served)
-//! 4. The guest kernel detects the clock jump → re-seeds CRNG from virtio-rng
-//! 5. Each clone now has independent randomness
+//! 4. Change the guest-visible VM generation before vCPUs resume
+//! 5. Wait for kernel reseed and userspace repair before admitting traffic
 //!
 //! **What we DON'T need to do:**
-//! - Manually patch the guest's CRNG state (the kernel handles it)
+//! - Assume an available entropy device has already reseeded cloned state
 //! - Set a specific TSC value (KVM handles it via kvmclock)
 //! - Worry about timer interrupts (the PIT/HPET is recreated by KvmVm::new)
 
@@ -43,9 +47,8 @@ pub struct ClockRestoreConfig {
     /// and resyncs.
     pub reset_clock: bool,
     /// Whether to force CRNG re-seed on restore (default: true).
-    /// The guest kernel does this automatically when it detects a clock
-    /// jump; this flag is for safety (forces virtio-rng to serve fresh
-    /// entropy immediately).
+    /// This is a required action. It is not satisfied merely by wiring a fresh
+    /// virtio-rng device.
     pub force_crng_reseed: bool,
 }
 
@@ -66,15 +69,15 @@ impl ClockRestoreConfig {
 pub struct PostRestoreActions {
     /// The clock was reset (kvmclock jumped).
     pub clock_reset: bool,
-    /// The CRNG will be re-seeded from virtio-rng on next guest request.
+    /// The CRNG must be re-seeded before the clone is admitted.
     pub crng_reseed_pending: bool,
 }
 
 /// Compute the post-restore actions for a VM.
 ///
-/// On restore, we always reset the clock (KVM does this automatically
-/// when creating a new VM). The guest kernel detects the jump and
-/// schedules a CRNG re-seed from virtio-rng.
+/// Compute the required post-restore policy. Applying these requirements is a
+/// separate operation; this pure value must never be treated as proof that the
+/// guest observed a generation change or completed a reseed.
 pub fn compute_post_restore(config: &ClockRestoreConfig) -> PostRestoreActions {
     PostRestoreActions {
         clock_reset: config.reset_clock,

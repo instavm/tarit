@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use vmm_devices::bus::MmioBus;
 
+const SNAPSHOT_VCPU_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Commands the control thread sends to the vCPU thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VcpuCommand {
@@ -107,8 +109,7 @@ impl VcpuThread {
             // are unrestricted, makes glibc cache the result so the steady-state
             // run loop never needs openat.
             {
-                let mut warm: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024);
-                warm.resize(8 * 1024 * 1024, 0);
+                let mut warm = vec![0; 8 * 1024 * 1024];
                 warm[0] = 1;
                 warm[8 * 1024 * 1024 - 1] = 1;
                 std::hint::black_box(&warm);
@@ -149,6 +150,14 @@ impl VcpuThread {
                     }
                     // Check control channel.
                     if ctrl.load(Ordering::Relaxed) {
+                        // Tell KVM that userspace deliberately paused this
+                        // vCPU. A kvm-clock guest consumes the flag to avoid a
+                        // false watchdog soft-lockup after a long pause. The
+                        // ioctl is optional for guests using another clock
+                        // source, so rejection is diagnostic rather than fatal.
+                        if let Err(error) = vcpu.kvmclock_ctrl() {
+                            log::debug!("KVM_KVMCLOCK_CTRL on pause unavailable: {error}");
+                        }
                         // Guest is stopped here — capture the full vCPU state
                         // for a faithful snapshot. All the ioctls (KVM_GET_*),
                         // the futex (Mutex), and the allocation (mmap/brk) used
@@ -167,11 +176,24 @@ impl VcpuThread {
                         }
                         paus.store(true, Ordering::Relaxed);
                         log::info!("vCPU thread pausing");
-                        // Spin-wait for control to clear (resume) or for stop.
+                        // Wait for control to clear (resume) or for stop.
+                        // Adaptive backoff: a live-snapshot final stop resumes
+                        // within microseconds, so spin briefly and poll at µs
+                        // granularity first — a coarse sleep here would become
+                        // guest downtime. Long pauses (suspend, full snapshot)
+                        // back off to 10ms ticks after the first 5ms.
+                        let park_start = std::time::Instant::now();
                         while ctrl.load(Ordering::Relaxed)
                             && !stop_for_thread.load(Ordering::Relaxed)
                         {
-                            thread::sleep(std::time::Duration::from_millis(10));
+                            let parked = park_start.elapsed();
+                            if parked < std::time::Duration::from_micros(200) {
+                                std::hint::spin_loop();
+                            } else if parked < std::time::Duration::from_millis(5) {
+                                thread::sleep(std::time::Duration::from_micros(10));
+                            } else {
+                                thread::sleep(std::time::Duration::from_millis(10));
+                            }
                         }
                         if stop_for_thread.load(Ordering::Relaxed) {
                             log::info!("vCPU thread stopping (from pause)");
@@ -287,32 +309,174 @@ impl VcpuThread {
 
     /// Request the vCPU to pause. Blocks until the vCPU is actually paused
     /// — or returns immediately if the run loop has already exited.
+    ///
+    /// The wait is µs-granular: live snapshots measure their guest blackout
+    /// across this handshake, so a coarse poll here would put a floor under
+    /// the achievable downtime. Spin first, then sleep in 10µs steps, and
+    /// re-kick/liveness-probe the vCPU only every ~200µs.
     pub fn pause(&self) {
         if self.exited.load(Ordering::Relaxed) {
             return;
         }
         self.control.store(true, Ordering::Relaxed);
-        // Poke the vCPU thread until it pauses. The kick is re-sent every
-        // tick because KVM may re-enter the guest before we observe `paused`.
+        self.signal_vcpu();
+        let start = std::time::Instant::now();
+        let mut next_kick = std::time::Duration::from_micros(200);
         while !self.paused.load(Ordering::Relaxed) && !self.exited.load(Ordering::Relaxed) {
-            // If the vCPU thread died abruptly (a seccomp SIGSYS terminates it
-            // without running the exit guard), it can never set paused/exited.
-            // A zero-signal liveness probe lets pause() — and therefore
-            // snapshot()/stop() — abort instead of spinning forever.
-            if !self.vcpu_alive() {
-                log::warn!("vCPU thread is gone; aborting pause (guest already dead)");
-                self.exited.store(true, Ordering::Relaxed);
-                self.paused.store(true, Ordering::Relaxed);
-                return;
+            let elapsed = start.elapsed();
+            if elapsed >= next_kick {
+                // If the vCPU thread died abruptly (a seccomp SIGSYS terminates
+                // it without running the exit guard), it can never set
+                // paused/exited. A zero-signal liveness probe lets pause() —
+                // and therefore snapshot()/stop() — abort instead of spinning
+                // forever. The kick is re-sent because KVM may re-enter the
+                // guest before we observe `paused`.
+                if !self.vcpu_alive() {
+                    log::warn!("vCPU thread is gone; aborting pause (guest already dead)");
+                    self.exited.store(true, Ordering::Relaxed);
+                    self.paused.store(true, Ordering::Relaxed);
+                    return;
+                }
+                self.signal_vcpu();
+                next_kick += std::time::Duration::from_micros(200);
             }
-            self.signal_vcpu();
-            thread::sleep(std::time::Duration::from_millis(1));
+            if elapsed < std::time::Duration::from_micros(100) {
+                std::hint::spin_loop();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(10));
+            }
         }
+    }
+
+    /// Arm this vCPU for a coherent multi-vCPU snapshot pause without waiting.
+    ///
+    /// Call this for every vCPU before waiting on any one of them. That keeps
+    /// the inter-vCPU stop skew to the KVM exit/acknowledgement interval instead
+    /// of allowing later vCPUs to run while the controller waits on the first.
+    pub(crate) fn request_snapshot_pause(&self) -> Result<()> {
+        if self.exited.load(Ordering::Relaxed) || !self.vcpu_alive() {
+            return Err(VmmError::Snapshot(
+                "vCPU exited before snapshot pause".into(),
+            ));
+        }
+        *self
+            .captured_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.control.store(true, Ordering::Release);
+        self.signal_vcpu();
+        Ok(())
+    }
+
+    /// Wait for a previously armed snapshot pause and require newly captured
+    /// state. A timeout or dead thread fails the snapshot instead of allowing a
+    /// stale capture from an earlier pause to be published.
+    pub(crate) fn wait_snapshot_paused(&self) -> Result<()> {
+        let start = std::time::Instant::now();
+        let mut next_kick = std::time::Duration::from_micros(200);
+        while !self.paused.load(Ordering::Acquire) {
+            if self.exited.load(Ordering::Relaxed) || !self.vcpu_alive() {
+                self.exited.store(true, Ordering::Relaxed);
+                return Err(VmmError::Snapshot(
+                    "vCPU exited during snapshot pause".into(),
+                ));
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= SNAPSHOT_VCPU_TRANSITION_TIMEOUT {
+                return Err(VmmError::Snapshot(format!(
+                    "vCPU snapshot pause timed out after {:?}",
+                    SNAPSHOT_VCPU_TRANSITION_TIMEOUT
+                )));
+            }
+            if elapsed >= next_kick {
+                self.signal_vcpu();
+                next_kick += std::time::Duration::from_micros(200);
+            }
+            if elapsed < std::time::Duration::from_micros(100) {
+                std::hint::spin_loop();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(10));
+            }
+        }
+        if self.exited.load(Ordering::Relaxed) {
+            return Err(VmmError::Snapshot(
+                "vCPU exited while acknowledging snapshot pause".into(),
+            ));
+        }
+        if self
+            .captured_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return Err(VmmError::Snapshot(
+                "vCPU snapshot pause did not capture state".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resume the vCPU from a pause.
     pub fn resume(&self) {
         self.control.store(false, Ordering::Relaxed);
+    }
+
+    /// Block until the vCPU thread has left its pause park (or exited). Used
+    /// by callers that measure guest blackout: `resume()` only requests the
+    /// resume, this observes the vCPU actually committing to re-enter the
+    /// guest.
+    pub fn wait_resumed(&self) {
+        let start = std::time::Instant::now();
+        let mut next_probe = std::time::Duration::from_micros(200);
+        while self.paused.load(Ordering::Relaxed) && !self.exited.load(Ordering::Relaxed) {
+            let elapsed = start.elapsed();
+            if elapsed >= next_probe {
+                // Same failure mode as pause(): a signal-terminated vCPU
+                // thread never clears `paused` (VcpuExitGuard doesn't run on
+                // SIGSYS), so probe liveness instead of spinning forever.
+                if !self.vcpu_alive() {
+                    log::warn!("vCPU thread is gone; aborting wait_resumed");
+                    self.exited.store(true, Ordering::Relaxed);
+                    return;
+                }
+                next_probe += std::time::Duration::from_micros(200);
+            }
+            if elapsed < std::time::Duration::from_micros(100) {
+                std::hint::spin_loop();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(10));
+            }
+        }
+    }
+
+    /// Bounded counterpart to [`Self::wait_resumed`] for snapshot publication.
+    pub(crate) fn wait_snapshot_resumed(&self) -> Result<()> {
+        let start = std::time::Instant::now();
+        while self.paused.load(Ordering::Acquire) {
+            if self.exited.load(Ordering::Relaxed) || !self.vcpu_alive() {
+                self.exited.store(true, Ordering::Relaxed);
+                return Err(VmmError::Snapshot(
+                    "vCPU exited while resuming from snapshot pause".into(),
+                ));
+            }
+            if start.elapsed() >= SNAPSHOT_VCPU_TRANSITION_TIMEOUT {
+                return Err(VmmError::Snapshot(format!(
+                    "vCPU snapshot resume timed out after {:?}",
+                    SNAPSHOT_VCPU_TRANSITION_TIMEOUT
+                )));
+            }
+            if start.elapsed() < std::time::Duration::from_micros(100) {
+                std::hint::spin_loop();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(10));
+            }
+        }
+        if self.exited.load(Ordering::Relaxed) {
+            return Err(VmmError::Snapshot(
+                "vCPU exited after snapshot pause".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Stop the vCPU permanently (joins the thread).

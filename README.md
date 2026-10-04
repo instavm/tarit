@@ -1,11 +1,15 @@
 # Tarit
 
-**The fastest hypervisor and sandbox cloud for AI agents and RL environments.**
+**A KVM microVM platform for AI agents and isolated execution.**
 
 Tarit is a microVM platform for secure, fast, ephemeral
 sandboxes, built for AI agent workloads. It boots a real hardware-virtualized VM
-in milliseconds, runs a task inside it, and tears it down, giving each sandbox
-kernel-level isolation instead of a shared-kernel container boundary.
+in milliseconds, runs a task inside it, and tears it down. Each sandbox has a
+guest kernel rather than sharing the host kernel; production containment also
+depends on the host-side controls described in [SECURITY.md](SECURITY.md).
+Jailed orchestrated VMMs support dedicated PID and process network namespaces;
+the host-owned TAP queue is passed by descriptor so host routing and traffic
+policy remain outside the VMM namespace.
 
 It has two parts, developed together in this monorepo:
 
@@ -23,9 +27,9 @@ without hand-copying types.
 
 ## Why microVMs
 
-- **Real isolation.** Each sandbox is a KVM guest with its own kernel, not a
-  namespaced process. A compromised or runaway workload cannot see the host or
-  its neighbors.
+- **Hardware virtualization.** Each sandbox is a KVM guest with its own kernel,
+  not a shared-kernel container. Host confinement, resource limits, networking,
+  and the VMM device boundary remain part of the security model.
 - **Fast and cheap.** Minimal device model (MMIO virtio only, no PCI, no BIOS),
   demand-paged guest RAM, and snapshot/restore for sub-second starts.
 - **Ephemeral by design.** Create, run, discard. Snapshots and copy-on-write
@@ -33,23 +37,14 @@ without hand-copying types.
 - **Built for agents.** vsock-based exec and interactive PTY, per-key usage
   metering and audit, and an orchestrator tuned for bursty create/exec/destroy.
 
-## The VMM vs Firecracker
+## Performance evidence
 
-Tarit column from bare-metal validation; Firecracker column from its published
-docs.
-
-| | Tarit, bare metal (p50) | Firecracker |
-|---|---|---|
-| Ready to exec from snapshot | 83 ms (`node -v` result) | no published number |
-| Snapshot restore to running VM | 2.9 ms | no published number |
-| Warm-pool VM handout | 12.3 ms | n/a |
-| Exec round trip in a running VM | 0.6 ms | n/a, no exec agent |
-| Full snapshot, 256 MiB | 60 ms, guest keeps running | pause required |
-| Live snapshot of a running guest | yes | no |
-| Suspend that releases guest RAM | yes | no |
-| PTY over the API | yes | serial console only |
-| OCI image boot | built in | no |
-| Egress filtering | per-VM allowlist + rate limits | rate limits only |
+Latency depends on the host kernel, CPU, storage, guest image, workload, and
+commit. Run `vmm/ci/perf-gates.sh` for the VMM lifecycle gates and
+`test/bench.sh` for end-to-end time-to-interactive measurements. A published
+result should include the commit, host and guest configuration, artifact
+identities, iteration count, percentile method, and raw report; unversioned
+headline numbers are not treated as release evidence.
 
 ## Architecture at a glance
 
@@ -83,12 +78,15 @@ microVMs needs root (or membership in the `kvm` group), so the commands use
 ```sh
 git clone https://github.com/instavm/tarit && cd tarit
 sudo make install      # build + install vmm, taritd, and the guest agent
-sudo make guest        # one-time: build a guest kernel + pull an Ubuntu rootfs
+sudo make guest        # one-time: fetch a verified guest kernel + pull an Ubuntu rootfs
 ```
 
-`make guest` does the slow work once (kernel build + OCI pull) and writes
-`guest-assets/vmlinux` and `guest-assets/rootfs.ext4`, so starting a VM afterwards
-is instant. Boot one, run a command in it, tear it down:
+`make guest` downloads the pinned, checksum-verified guest kernel and pulls the
+OCI rootfs once. If the release artifact is unavailable, it builds the same
+kernel from checksum-pinned source. It writes `guest-assets/vmlinux` and
+`guest-assets/rootfs.ext4`, so later starts do not repeat image conversion.
+The [guest kernel documentation](vmm/guest/README.md) lists the pins, build,
+and release checks. Boot one, run a command in it, tear it down:
 
 ```sh
 sudo vmm serve --socket /tmp/vm.sock &
@@ -98,6 +96,11 @@ sudo vmm --socket /tmp/vm.sock exec "uname -a"
 sudo vmm --socket /tmp/vm.sock stop
 ```
 
+For a kernel-only install, run `sudo vmm kernel install`. Interactive
+`vmm run` and `vmm create` commands offer to install that pinned kernel when
+`--kernel` is omitted. Non-interactive commands require `--kernel` or a prior
+install.
+
 Only want the hypervisor? `sudo make install-vmm` installs just `vmm`.
 
 ### Layer 2: snapshot, suspend, restore
@@ -105,17 +108,36 @@ Only want the hypervisor? `sudo make install-vmm` installs just `vmm`.
 Drive the same socket to capture and move VM state. A full snapshot writes memory
 plus device state; `--diff` writes only dirty pages. Suspend releases resident
 guest RAM; resume brings it back. Restore boots a fresh VMM from a snapshot.
+Snapshots include the architectural and host-advertised KVM paravirtual MSR
+state used by the guest. Restore validates that state against the destination
+before changing a vCPU and rejects incompatible hosts without a partial
+restore. Suspend parks the block, network, and vsock workers after stopping the
+vCPUs; resume waits for those workers to leave the parked state before vCPUs
+run again.
 
 ```sh
 sudo vmm --socket /tmp/vm.sock snapshot              # full snapshot, prints the .snap path
 sudo vmm --socket /tmp/vm.sock snapshot --diff       # incremental (dirty pages only)
+sudo vmm --socket /tmp/vm.sock snapshot --live       # live: guest keeps running
 sudo vmm --socket /tmp/vm.sock suspend               # release resident guest RAM
 sudo vmm --socket /tmp/vm.sock resume
 sudo vmm restore --snapshot /path/to.snap            # restore into a new VMM process
 ```
 
-Tarit also does **live snapshots**: a memory-consistent snapshot of a running
-guest with no downtime, so a busy VM can be checkpointed or forked. See
+Tarit also does **live snapshots** (`snapshot --live`): pre-copy rounds run
+while the guest executes, then a final stop copies only the residual dirty
+pages and captures vCPU + device state. The final stop targets sub-millisecond
+downtime (500µs by default); dirty pages are tracked from both KVM's dirty log
+(vCPU writes) and a software tracker covering virtio DMA, and device I/O
+threads are quiesced for the final stop so the image stays coherent. One
+caveat: a guest that dirties memory faster than it can be copied never
+converges, so after a bounded number of rounds (or timeout) the snapshot
+forces the final stop and downtime grows with the residual — the reported
+`downtime` in the result is always the real measured blackout. Orchestrated
+full snapshots similarly use a disk-consistency pause. They use
+FICLONE/reflink when available; the correctness-preserving sparse-copy
+fallback is not a low-latency path, so production latency gates require
+reflink-capable storage. See
 [vmm/docs/STANDALONE.md](vmm/docs/STANDALONE.md) for the full device, egress,
 jailer, and PTY surface.
 

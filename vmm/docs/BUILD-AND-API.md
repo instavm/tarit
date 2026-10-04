@@ -8,6 +8,12 @@
 - **Linux x86_64 host with KVM** (`/dev/kvm`) for running VMs
 - For OCI image pulling: `skopeo`, `umoci`, `e2fsprogs` (`sudo apt install skopeo umoci e2fsprogs`)
 
+From the repository root, `sudo make guest` downloads Tarit's pinned,
+checksum-verified ELF `vmlinux` and creates an agent-enabled rootfs under
+`guest-assets/`. If the release artifact is unavailable, it builds the same
+kernel from checksum-pinned source. The loader also supports user-supplied
+`bzImage` kernels, but the release artifact is `vmlinux`.
+
 ### Build Commands
 
 ```sh
@@ -39,11 +45,15 @@ cargo test --workspace
 # KVM smoke tests (Linux+KVM only)
 sudo cargo test -p vmm-memory-backend --features kvm -- --include-ignored
 
-# E2E integration tests (Linux+KVM + guest/bzImage)
-sudo cargo test -p vmm-integration --features kvm -- --include-ignored
+# E2E integration tests (Linux+KVM, run from vmm/)
+sudo VMM_TEST_KERNEL=../guest-assets/vmlinux \
+  VMM_TEST_ROOTFS=../guest-assets/rootfs.ext4 \
+  cargo test -p vmm-integration --features kvm -- --include-ignored
 
 # Comprehensive test (44 feature checks)
-sudo cargo test -p vmm-integration --features kvm --test comprehensive_e2e -- --include-ignored --nocapture
+sudo VMM_TEST_KERNEL=../guest-assets/vmlinux \
+  VMM_TEST_ROOTFS=../guest-assets/rootfs.ext4 \
+  cargo test -p vmm-integration --features kvm --test comprehensive_e2e -- --include-ignored --nocapture
 
 # Virtio-blk E2E (5 tests: read/write/flush/RO/OOB)
 sudo cargo test -p vmm-integration --test virtio_blk_e2e -- --include-ignored
@@ -60,12 +70,12 @@ cargo fmt --all -- --check
 ### `vmm run` (`start`): Boot a fresh VM
 
 ```sh
-vmm run --kernel <PATH> [OPTIONS]
+vmm run [--kernel <PATH>] [OPTIONS]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernel <PATH>` | (required) | Path to bzImage or vmlinux |
+| `--kernel <PATH>` | installed pinned kernel | Path to a user-supplied bzImage or vmlinux |
 | `--cmdline <CMDLINE>` | loader default | Kernel command line |
 | `--initramfs <PATH>` | none | Path to initramfs image |
 | `--mem <MIB>` | 256 | Guest memory size in MiB |
@@ -81,28 +91,29 @@ vmm run --kernel <PATH> [OPTIONS]
 
 **Examples:**
 ```sh
-# Fast boot (kernel HLTs: for benchmarks)
-vmm run --kernel guest/bzImage --mem 256
+# Fast boot for a purpose-built HLT benchmark kernel
+vmm run --kernel /path/to/hlt-test-kernel --mem 256
 
 # Full boot with rootfs
-vmm run --kernel guest/bzImage --rootfs rootfs.ext4 --full-boot \
+vmm run --kernel ../guest-assets/vmlinux --rootfs ../guest-assets/rootfs.ext4 --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 
 # With initramfs
-vmm run --kernel guest/bzImage --initramfs guest/initramfs.cpio.gz --mem 512
+vmm run --kernel ../guest-assets/vmlinux --initramfs guest/initramfs.cpio.gz \
+  --mem 512 --full-boot
 ```
 
 ### `vmm create`: Boot a VM inside `vmm serve` (via API)
 
 ```sh
-vmm create --kernel <PATH> [OPTIONS] [--socket <PATH>]
+vmm create [--kernel <PATH>] [OPTIONS] [--socket <PATH>]
 ```
 
 This sends an API `create` request to an existing `vmm serve` socket.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernel <PATH>` | (required) | Path to bzImage or vmlinux |
+| `--kernel <PATH>` | installed pinned kernel | Path to a user-supplied bzImage or vmlinux |
 | `--cmdline <CMDLINE>` | loader default, with `root=/dev/vda rw` prepended when `--rootfs` is set | Kernel command line |
 | `--initramfs <PATH>` | none | Path to initramfs image |
 | `--mem <MIB>` | 256 | Guest memory size in MiB |
@@ -110,6 +121,21 @@ This sends an API `create` request to an existing `vmm serve` socket.
 | `--rootfs <PATH>` | none | Attach a boot rootfs as `/dev/vda` read-write |
 | `--volume <PATH[:ro\|rw]>` | none | Attach a storage volume (repeatable) |
 | `--overlay <PATH>` | none | Attach a private CoW overlay for each `--volume` |
+
+When `--kernel` is omitted, interactive `run` and `create` commands verify the
+installed pinned kernel and offer a `[y/N]` download if it is missing.
+Non-interactive commands fail with an install command instead of prompting.
+
+### `vmm kernel install`: Install the pinned kernel
+
+```sh
+vmm kernel install [--output <PATH>] [--force]
+```
+
+The command downloads the version and URL embedded at build time, requires
+HTTPS, verifies the embedded SHA-256, and installs with an atomic rename.
+`TARIT_KERNEL` overrides the default path. `--force` replaces a regular file
+whose checksum is wrong; symlinks and non-regular files are rejected.
 
 ### `vmm serve` (`server`): Start the API server
 
@@ -124,6 +150,9 @@ vmm serve [OPTIONS] [--socket <PATH>]
 | `--uid <UID>` | 1000 | UID to drop to when jailed |
 | `--gid <GID>` | 1000 | GID to drop to when jailed |
 | `--netns <PATH>` | none | Enter a network namespace when jailed |
+| `--isolate-network` | off | Create an empty VMM process network namespace while using inherited TAP descriptors |
+| `--pid-namespace` | off | Run the VMM child as PID 1 in a dedicated PID namespace |
+| `--seccomp` | automatic with `--jail` | Compatibility flag for the mandatory built-in profile; jail mode cannot disable seccomp |
 | `--cgroup <PATH>` | none | Apply cgroup v2 limits under this cgroup path |
 | `--cgroup-memory-max <BYTES>` | none | Set `memory.max` |
 | `--cgroup-cpu-max <QUOTA/PERIOD\|MILLICPU>` | none | Set `cpu.max` |
@@ -255,15 +284,26 @@ vmm pull ghcr.io/owner/repo:tag --output app.ext4 --auth ~/.docker/auth.json \
 ```
 
 With `--agent`, the pull path installs the guest exec agent at
-`/usr/sbin/vmm-agent` and points `/sbin/init` at it when the image has no init.
+`/usr/sbin/vmm-agent` and atomically points `/sbin/init` at it. This intentionally
+replaces an OCI image's init because Tarit boots the injected agent as PID 1;
+the image's container entrypoint and init system are not started automatically.
 
 | Flag | Default | Description |
 |---|---|---|
 | `<IMAGE_REF>` | (required) | OCI image reference |
 | `--output <PATH>` | (required) | Output disk image path |
-| `--size <MIB>` | 1024 | Disk image size in MiB |
+| `--size <MIB>` | 1024 | Disk image size in MiB and basis for OCI unpack limits |
 | `--auth <PATH>` | none | Auth file path for private registries |
 | `--agent <PATH>` | none | Compiled guest exec agent to inject |
+
+Before unpack, Tarit verifies every manifest, config, and layer descriptor
+against the referenced regular file and SHA-256 digest. It rejects manifests or
+configs over 8 MiB, more than 128 layers, compressed or expanded layer streams
+over twice the requested disk size, a single file larger than the requested
+disk, paths over 4096 bytes, or more than `max(16384, 256 * MIB)` layer entries.
+Rejection exits non-zero, publishes no output image, and removes the private
+build workspace. Increase `--size` only when the intended filesystem genuinely
+requires a larger image and corresponding unpack budget.
 
 ### Global Flags
 
@@ -303,7 +343,7 @@ All requests are JSON objects with an `op` field (snake_case):
   "op": "create",
   "config": {
     "kernel": {
-      "path": "guest/vmlinux.minimal",
+      "path": "../guest-assets/vmlinux",
       "cmdline": "console=ttyS0 quiet loglevel=0 reboot=k panic=-1 nomodule pci=off root=/dev/vda rw init=/usr/sbin/vmm-agent",
       "initramfs": null
     },
@@ -383,6 +423,23 @@ Set `diff` to `true` to request a diff snapshot.
 `timeout_ms` defaults to `0` in the wire type. The controller treats `0` as
 the built-in 30 second timeout.
 
+#### `repair_guest_network`: Reapply guest IPv4 configuration
+```json
+{
+  "op": "repair_guest_network",
+  "network": {
+    "addr": "172.16.0.2",
+    "prefix": 30,
+    "gateway": "172.16.0.1",
+    "dns_servers": []
+  }
+}
+```
+The address and gateway must be IPv4 addresses, the prefix must be `0..=32`,
+and each DNS entry must be an IP address. The guest agent applies and verifies
+the address, netmask, link state, and single default route directly through the
+Linux network API. Restore does not require `iproute2` in the guest image.
+
 #### `attach_pty`: Attach an interactive PTY stream
 ```json
 { "op": "attach_pty", "cols": 120, "rows": 40, "shell": "/bin/sh" }
@@ -418,6 +475,7 @@ All responses are JSON objects with a `status` field:
 | `snapshot` | `path` | `snapshot` |
 | `restored` | none | `restore` |
 | `exec` | `exit_code`, `stdout`, `stderr`, `duration_ms` | `exec` |
+| `guest_network_repaired` | none | `repair_guest_network` |
 | `egress_updated` | `rules_applied` | `update_egress` |
 | `vm_status` | `state`, `uptime_ms`, `vcpus`, `mem_mib`, `volumes`, `nets`, `kernel`, `vcpu_alive` | `status` |
 | `err` | `msg` | Any non-PTY request |
@@ -428,7 +486,7 @@ All responses are JSON objects with a `status` field:
 { "status": "restored" }
 { "status": "exec", "exit_code": 0, "stdout": "hello\n", "stderr": "", "duration_ms": 15 }
 { "status": "egress_updated", "rules_applied": 2 }
-{ "status": "vm_status", "state": "running", "uptime_ms": 1234, "vcpus": 1, "mem_mib": 256, "volumes": 1, "nets": 1, "kernel": "guest/bzImage", "vcpu_alive": true }
+{ "status": "vm_status", "state": "running", "uptime_ms": 1234, "vcpus": 1, "mem_mib": 256, "volumes": 1, "nets": 1, "kernel": "../guest-assets/vmlinux", "vcpu_alive": true }
 { "status": "err", "msg": "VM not found" }
 ```
 
@@ -473,7 +531,7 @@ print(vmm_request("build/run/vmm.sock", {
     "op": "create",
     "config": {
         "kernel": {
-            "path": "guest/vmlinux.minimal",
+            "path": "../guest-assets/vmlinux",
             "cmdline": "console=ttyS0 quiet loglevel=0 reboot=k panic=-1 nomodule pci=off root=/dev/vda rw init=/usr/sbin/vmm-agent",
             "initramfs": None,
         },
@@ -515,8 +573,8 @@ crates/
   vmm-memory-backend/ Guest memory (mmap), dirty bitmap, KVM registration,
                       dirty-log ioctl, UFFD lazy restore
   vmm-loader/         Kernel load (bzImage/ELF), E820 map, zero page, cmdline
-  vmm-devices/        MMIO bus, virtio-mmio transport, virtio-blk (backend +
-                      transport + vqueue walker), virtio-net, virtio-rng, serial
+  vmm-devices/        MMIO bus, virtio-mmio transport, isolated virtio-blk
+                      queue workers, virtio-net, virtio-rng, serial
   vmm-snapshot/       CRC state file, diff snapshots, clone plans, live
                       snapshot convergence, snapshot format
   vmm-net/            TAP creation, nftables egress compiler, DNS-aware
@@ -530,12 +588,14 @@ crates/
 src/                  The vmm binary (CLI + wiring)
 docs/                 Build and API reference, design choices, integration, benchmarks
 ci/                   CI scripts (check.sh, kvm-runner-bootstrap.sh, perf-gates.sh)
-guest/                Guest kernel configs + bzImage (gitignored)
+guest/                Guest kernel configs, release tooling, and agent
 ```
 
 ## Security Model
 
-- **Seccomp confinement**: the jailer seccomp profile blocks process network syscalls (socket, connect, bind, sendto, recvfrom)
+- **Seccomp confinement**: each queue worker has a purpose-specific syscall
+  profile. Block workers can poll and use pre-opened storage descriptors but
+  cannot open paths, create sockets, use network syscalls, or issue ioctls.
 - **VM-to-VM isolation**: each VM gets its own netns, no bridge between VMs
 - **Host-enforced egress**: nftables default-deny + allowlist, guest cannot alter
 - **Jailer**: chroot + mount namespace + privilege drop + seccomp + cgroup v2 limits

@@ -4,8 +4,10 @@
 //! block (file-backed) and net (tap-backed). vhost-user backends are a later
 //! option.
 
+pub mod balloon;
 pub mod blk;
 pub mod blk_backend;
+pub mod blk_io_loop;
 pub mod blk_transport;
 pub mod net;
 pub mod net_io_loop;
@@ -19,6 +21,7 @@ pub mod vqueue;
 pub mod vsock;
 pub mod vsock_io_loop;
 
+pub use balloon::VirtioBalloonMmio;
 pub use blk::VirtioBlk;
 pub use blk_transport::VirtioBlkMmio;
 pub use net::VirtioNet;

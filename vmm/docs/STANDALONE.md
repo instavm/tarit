@@ -8,7 +8,8 @@ See [BUILD-AND-API.md](BUILD-AND-API.md) for the full CLI reference.
 
 - x86_64 Linux with KVM available at `/dev/kvm`.
 - Rust 1.95 or newer to build the VMM.
-- A guest Linux kernel image, usually `bzImage` or `vmlinux`.
+- The release ELF `vmlinux`, prepared with `sudo make guest` from the
+  repository root. The loader also accepts user-supplied bzImage kernels.
 - An ext4 rootfs image for userspace boot.
 - Root or the needed capabilities for KVM, TAP devices, network namespaces, cgroups, and jailing.
 - For OCI image conversion: `skopeo`, `umoci`, and `e2fsprogs`.
@@ -18,7 +19,12 @@ Build the binary on the Linux host:
 ```sh
 cd vmm
 cargo build --release -p vmm --features boot
+sudo target/release/vmm kernel install
 ```
+
+The install command downloads the kernel version pinned in the binary and
+verifies its SHA-256. Interactive `run` and `create` commands offer the same
+install when `--kernel` is omitted. Automation never prompts.
 
 ## One-shot boot with `vmm run`
 
@@ -27,14 +33,14 @@ cargo build --release -p vmm --features boot
 Fast boot mode is the default. It is useful for kernel-load and HLT-loop checks:
 
 ```sh
-sudo target/release/vmm run --kernel guest/bzImage --mem 256
+sudo target/release/vmm run --kernel /path/to/hlt-test-kernel --mem 256
 ```
 
 For a normal Linux userspace boot from an ext4 rootfs, use `--full-boot`:
 
 ```sh
-sudo target/release/vmm run --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --mem 512 \
   --vcpus 1 \
   --full-boot \
@@ -45,8 +51,8 @@ Attach a data volume with a private CoW overlay. `--overlay` applies to `--volum
 
 ```sh
 mkdir -p run
-sudo target/release/vmm run --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --volume disks/data-base.ext4:ro \
   --overlay run/vm0-data.cow \
   --full-boot \
@@ -59,8 +65,8 @@ Attach virtio-net to a host TAP. The orchestrator or operator is responsible for
 sudo ip tuntap add dev tap0 mode tap
 sudo ip addr add 172.16.0.1/24 dev tap0
 sudo ip link set tap0 up
-sudo target/release/vmm run --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --net tap=tap0,mac=02:00:00:00:00:02 \
   --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
@@ -70,7 +76,7 @@ sudo target/release/vmm run --kernel guest/bzImage \
 
 | Flag | Default | Meaning |
 |---|---:|---|
-| `--kernel <PATH>` | required | Kernel image, bzImage or vmlinux. |
+| `--kernel <PATH>` | installed pinned kernel | User-supplied bzImage or vmlinux. |
 | `--cmdline <CMDLINE>` | loader default | Kernel command line. |
 | `--initramfs <PATH>` | none | Optional initramfs image. |
 | `--mem <MIB>` | `256` | Guest memory in MiB. |
@@ -98,8 +104,8 @@ socket.
 
 ```sh
 target/release/vmm --socket /tmp/vmm.sock create \
-  --kernel guest/bzImage \
-  --rootfs guest/rootfs.ext4 \
+  --kernel ../guest-assets/vmlinux \
+  --rootfs ../guest-assets/rootfs.ext4 \
   --mem 512 \
   --vcpus 1 \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
@@ -124,13 +130,13 @@ req = {
     "op": "create",
     "config": {
         "kernel": {
-            "path": "guest/bzImage",
+            "path": "../guest-assets/vmlinux",
             "cmdline": "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr",
             "initramfs": None,
         },
         "memory": {"size_mib": 512},
         "vcpus": {"count": 1},
-        "volumes": [{"path": "guest/rootfs.ext4", "read_only": False, "overlay": None}],
+        "volumes": [{"path": "../guest-assets/rootfs.ext4", "read_only": False, "overlay": None}],
         "net": [],
     },
 }
@@ -155,6 +161,7 @@ target/release/vmm --socket /tmp/vmm.sock suspend
 target/release/vmm --socket /tmp/vmm.sock resume
 target/release/vmm --socket /tmp/vmm.sock snapshot
 target/release/vmm --socket /tmp/vmm.sock snapshot --diff
+target/release/vmm --socket /tmp/vmm.sock snapshot --live
 target/release/vmm --socket /tmp/vmm.sock update-egress \
   --allow 10.0.0.0/8:443/tcp \
   --allow 8.8.8.8/32:53/udp \
@@ -207,6 +214,9 @@ sudo target/release/vmm restore --snapshot /path/to/snapshot.snap
 | `--uid <UID>` | `1000` | UID to drop to when jailed. |
 | `--gid <GID>` | `1000` | GID to drop to when jailed. |
 | `--netns <PATH>` | none | Network namespace path to enter when jailed. |
+| `--isolate-network` | off | Create an empty VMM process network namespace. Host networking must be supplied through inherited TAP descriptors. |
+| `--pid-namespace` | off | Fork the VMM child as PID 1 in a new PID namespace while a privilege-dropped launcher remains visible to the host supervisor. |
+| `--seccomp` | automatic with `--jail` | Compatibility flag for the mandatory built-in profile; jail mode cannot disable seccomp. |
 | `--cgroup <PATH>` | none | cgroup v2 path for the served VMM process. |
 | `--cgroup-memory-max <BYTES>` | none | Set `memory.max`. Accepts bytes or K/M/G/T suffixes. Requires `--cgroup`. |
 | `--cgroup-cpu-max <QUOTA/PERIOD|MILLICPU>` | none | Set `cpu.max`. Accepts `1000m`, `max`, `QUOTA/PERIOD`, or `QUOTA PERIOD`. Requires `--cgroup`. |
@@ -224,7 +234,7 @@ target/release/vmm pull docker://alpine:3.20 \
   --size 1024 \
   --agent guest/agent/vmm-agent
 
-sudo target/release/vmm run --kernel guest/bzImage \
+sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --rootfs images/alpine.ext4 \
   --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
@@ -246,9 +256,16 @@ target/release/vmm pull docker://ghcr.io/owner/image:tag \
 |---|---:|---|
 | `<IMAGE_REF>` | required | OCI reference, for example `docker://ubuntu:22.04`. |
 | `--output <PATH>` | required | Output ext4 disk image path. |
-| `--size <MIB>` | `1024` | Disk image size in MiB. |
+| `--size <MIB>` | `1024` | Disk image size in MiB and basis for OCI unpack limits. |
 | `--auth <PATH>` | none | Auth file for private registries. |
 | `--agent <PATH>` | none | Compiled guest exec agent to inject into the image. |
+
+OCI descriptor size and SHA-256 are verified before extraction. The pull fails
+without publishing an output if the image exceeds 128 layers, an 8 MiB
+manifest/config limit, twice the requested disk size in compressed or expanded
+layer data, the requested disk size for one file, 4096 bytes for one path, or
+`max(16384, 256 * MIB)` layer entries. Private build workspaces are removed on
+failure.
 
 ## Jailer and cgroup confinement
 

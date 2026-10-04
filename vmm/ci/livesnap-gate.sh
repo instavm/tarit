@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ci/livesnap-gate.sh — live-snapshot / restore / suspend memory-consistency CI
-# gate. Runs deterministic, SHA256-verified consistency checks for full-snapshot
-# restore, diff-chain (incremental) restore, and suspend/resume. Exits non-zero
-# if any regresses. Run as root on a Linux+KVM host (c8i):
+# gate. Runs deterministic, SHA256-verified consistency checks for live
+# snapshot, full-snapshot restore, diff-chain (incremental) restore, and
+# suspend/resume. Exits non-zero if any regresses. Run as root on a Linux+KVM
+# host (c8i):
 #
 #   sudo bash ci/livesnap-gate.sh
 #
@@ -12,10 +13,17 @@
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 FAIL=0
+
+# The per-check scripts drive the daemon over its UDS, so they need the binary.
+if ! (cd "$DIR/.." && cargo build --features boot --bin vmm); then
+  echo "LIVESNAP_GATE_FAIL: cannot build the vmm binary"; exit 1
+fi
+
 run() {
   echo ""; echo "########## $1 ##########"
   if bash "$DIR/$2"; then echo ">>> $1: OK"; else echo ">>> $1: FAILED"; FAIL=1; fi
 }
+run "live-snapshot consistency"          livesnap-check.sh
 run "full-snapshot restore consistency" full-restore-check.sh
 run "diff-chain restore consistency"    diff-restore-check.sh
 run "suspend/resume RAM consistency"    suspend-validate.sh

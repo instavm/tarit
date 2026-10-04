@@ -1,5 +1,5 @@
 use crate::api::AppState;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -76,6 +76,8 @@ pub struct Metrics {
     vm_create_total: AtomicU64,
     vm_create_errors_total: AtomicU64,
     exec_total: AtomicU64,
+    store_enqueue_failures_total: AtomicU64,
+    store_write_failures_total: AtomicU64,
     share_requests: [AtomicU64; SHARE_VISIBILITY_COUNT * SHARE_STATUS_CLASS_COUNT],
     share_auth_failures_total: AtomicU64,
     share_owner_failures_total: AtomicU64,
@@ -92,6 +94,8 @@ impl Default for Metrics {
             vm_create_total: AtomicU64::new(0),
             vm_create_errors_total: AtomicU64::new(0),
             exec_total: AtomicU64::new(0),
+            store_enqueue_failures_total: AtomicU64::new(0),
+            store_write_failures_total: AtomicU64::new(0),
             share_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             share_auth_failures_total: AtomicU64::new(0),
             share_owner_failures_total: AtomicU64::new(0),
@@ -164,6 +168,14 @@ impl Metrics {
 
     pub fn inc_exec_total(&self) {
         increment_counter(&self.exec_total, 1);
+    }
+
+    pub(crate) fn inc_store_enqueue_failure(&self) {
+        increment_counter(&self.store_enqueue_failures_total, 1);
+    }
+
+    pub(crate) fn inc_store_write_failure(&self) {
+        increment_counter(&self.store_write_failures_total, 1);
     }
 
     pub(crate) fn track_share_http(self: &Arc<Self>) -> ActiveShareHttp {
@@ -417,6 +429,44 @@ pub fn render_metrics(state: &AppState) -> String {
         "taritd_scheduler_free_memory_mib {}",
         capacity.free_memory_mib
     );
+    let disk = state.supervisor.disk_pressure_snapshot();
+    metric_header(
+        &mut out,
+        "taritd_disk_pressure",
+        "gauge",
+        "Whether node disk pressure is blocking VM admission and warm refill.",
+    );
+    let _ = writeln!(out, "taritd_disk_pressure {}", u8::from(disk.pressured));
+    metric_header(
+        &mut out,
+        "taritd_disk_used_bytes",
+        "gauge",
+        "Filesystem bytes currently used on the Tarit artifact filesystem.",
+    );
+    let _ = writeln!(out, "taritd_disk_used_bytes {}", disk.used_bytes);
+    metric_header(
+        &mut out,
+        "taritd_disk_used_inodes",
+        "gauge",
+        "Filesystem inodes currently used on the Tarit artifact filesystem.",
+    );
+    let _ = writeln!(out, "taritd_disk_used_inodes {}", disk.used_inodes);
+    metric_header(
+        &mut out,
+        "taritd_artifact_gc_removed",
+        "gauge",
+        "Tarit-owned artifacts removed by the most recent sweep.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_artifact_gc_removed{{kind=\"file\"}} {}",
+        disk.last_removed_files
+    );
+    let _ = writeln!(
+        out,
+        "taritd_artifact_gc_removed{{kind=\"jail\"}} {}",
+        disk.last_removed_jails
+    );
 
     metric_header(
         &mut out,
@@ -447,6 +497,86 @@ pub fn render_metrics(state: &AppState) -> String {
         "Public exec requests accepted by this taritd.",
     );
     let _ = writeln!(out, "taritd_exec_total {}", state.metrics.exec_total());
+    metric_header(
+        &mut out,
+        "taritd_store_enqueue_failures_total",
+        "counter",
+        "Writes that encountered a full or closed bounded persistence queue.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_enqueue_failures_total {}",
+        state
+            .metrics
+            .store_enqueue_failures_total
+            .load(Ordering::Relaxed)
+    );
+    metric_header(
+        &mut out,
+        "taritd_store_write_failures_total",
+        "counter",
+        "SQLite persistence operations that failed in the background writer.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_write_failures_total {}",
+        state
+            .metrics
+            .store_write_failures_total
+            .load(Ordering::Relaxed)
+    );
+    metric_header(
+        &mut out,
+        "taritd_store_queue_available",
+        "gauge",
+        "Currently available slots in the bounded persistence queue.",
+    );
+    let _ = writeln!(
+        out,
+        "taritd_store_queue_available {}",
+        state.store_tx.capacity()
+    );
+
+    let pty = state.pty_registry.connection_stats();
+    metric_header(
+        &mut out,
+        "taritd_pty_active_connections",
+        "gauge",
+        "Active guest PTY WebSocket connections.",
+    );
+    let _ = writeln!(out, "taritd_pty_active_connections {}", pty.active);
+    metric_header(
+        &mut out,
+        "taritd_pty_connection_limit",
+        "gauge",
+        "Configured active PTY connection limit by bounded admission scope.",
+    );
+    for (scope, limit) in [
+        ("global", pty.limit_global),
+        ("tenant", pty.limit_per_tenant),
+        ("vm", pty.limit_per_vm),
+    ] {
+        let _ = writeln!(
+            out,
+            "taritd_pty_connection_limit{{scope=\"{scope}\"}} {limit}"
+        );
+    }
+    metric_header(
+        &mut out,
+        "taritd_pty_admission_rejections_total",
+        "counter",
+        "PTY WebSocket admissions rejected by bounded capacity scope.",
+    );
+    for (scope, rejected) in [
+        ("global", pty.rejected_global),
+        ("tenant", pty.rejected_tenant),
+        ("vm", pty.rejected_vm),
+    ] {
+        let _ = writeln!(
+            out,
+            "taritd_pty_admission_rejections_total{{scope=\"{scope}\"}} {rejected}"
+        );
+    }
 
     metric_header(
         &mut out,
@@ -499,6 +629,8 @@ fn vm_status_counts(state: &AppState) -> Vec<(&'static str, usize)> {
         VmStatus::Creating,
         VmStatus::Running,
         VmStatus::Paused,
+        VmStatus::Suspended,
+        VmStatus::Hibernated,
         VmStatus::Stopped,
         VmStatus::Error,
     ];
@@ -538,7 +670,11 @@ fn tenant_vm_counts(state: &AppState) -> Vec<(String, usize)> {
         for vm in cache.values() {
             if matches!(
                 vm.status,
-                VmStatus::Creating | VmStatus::Running | VmStatus::Paused
+                VmStatus::Creating
+                    | VmStatus::Running
+                    | VmStatus::Paused
+                    | VmStatus::Suspended
+                    | VmStatus::Hibernated
             ) {
                 let tenant = vm.owner_key.as_deref().unwrap_or("unknown");
                 *counts.entry(tenant.to_string()).or_default() += 1;
@@ -549,29 +685,43 @@ fn tenant_vm_counts(state: &AppState) -> Vec<(String, usize)> {
 }
 
 fn warm_pool_depths(state: &AppState) -> Vec<(String, usize)> {
-    let mut classes = BTreeSet::new();
+    let mut classes = BTreeMap::new();
     for class in &state.config.warm_pool.classes {
-        classes.insert((class.vcpus, class.memory_mib));
+        let spawn = crate::supervisor::VmSpawnConfig::from_warm_class(&state.config, class);
+        classes.insert(warm_pool_class_label(&spawn), spawn);
     }
     classes
         .into_iter()
-        .map(|(vcpus, memory_mib)| {
-            (
-                warm_pool_class_label(vcpus, memory_mib),
-                state.supervisor.warm_count(vcpus, memory_mib),
-            )
-        })
+        .map(|(label, spawn)| (label, state.supervisor.warm_count(&spawn)))
         .collect()
 }
 
-fn warm_pool_class_label(vcpus: u8, memory_mib: u64) -> String {
-    format!("{vcpus}vcpu_{memory_mib}mib")
+fn warm_pool_class_label(spawn: &crate::supervisor::VmSpawnConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{}\0{}\0{}\0{}",
+        spawn.kernel_path.display(),
+        spawn
+            .rootfs_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        spawn.cmdline,
+        spawn.read_only
+    );
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut short = String::with_capacity(12);
+    for byte in &digest[..6] {
+        let _ = write!(&mut short, "{byte:02x}");
+    }
+    format!("{}vcpu_{}mib_{}", spawn.vcpus, spawn.memory_mib, short)
 }
 
 fn warm_pool_watermarks(state: &AppState) -> Vec<(String, &'static str, usize)> {
     let mut out = Vec::new();
     for class in &state.config.warm_pool.classes {
-        let label = warm_pool_class_label(class.vcpus, class.memory_mib);
+        let spawn = crate::supervisor::VmSpawnConfig::from_warm_class(&state.config, class);
+        let label = warm_pool_class_label(&spawn);
         out.push((label.clone(), "hard_floor", class.hard_floor));
         out.push((label.clone(), "low_watermark", class.low_watermark));
         out.push((label.clone(), "target", class.target));
@@ -682,11 +832,15 @@ mod tests {
                 owner_key: Some("tenant-a".into()),
                 api_key_id: None,
                 status: VmStatus::Running,
+                revision: 1,
+                startup_path: None,
                 memory_mib: 256,
                 vcpus: 1,
                 kernel_path: "kernel".into(),
                 rootfs_path: None,
+                rootfs_read_only: false,
                 cmdline: "console=ttyS0".into(),
+                runtime_layout: None,
                 socket_path: Some("socket".into()),
                 pid: Some(std::process::id()),
                 created_at: now,
@@ -707,6 +861,9 @@ mod tests {
             "taritd_vm_create_total",
             "taritd_vm_create_errors_total",
             "taritd_exec_total",
+            "taritd_pty_active_connections",
+            "taritd_pty_connection_limit",
+            "taritd_pty_admission_rejections_total",
             "taritd_vm_memory_rss_bytes",
             "taritd_vm_cpu_seconds_total",
             "taritd_share_requests_total",
@@ -724,8 +881,8 @@ mod tests {
 
         assert!(body.contains("taritd_up 1\n"));
         assert!(body.contains("taritd_vms{status=\"running\"} 1\n"));
-        // Tenant labels are hashed by default so the unauthenticated /metrics
-        // endpoint does not leak raw tenant names (R-012).
+        // Tenant labels are hashed by default so metrics do not expose raw
+        // tenant names to any scraper granted metrics access (R-012).
         assert!(
             !body.contains("tenant=\"tenant-a\""),
             "raw tenant name must not appear when labels are not exposed"
@@ -734,13 +891,16 @@ mod tests {
             body.contains("taritd_tenant_vms{tenant=\"h:"),
             "tenant label should be a hash by default"
         );
-        assert!(body.contains("taritd_warm_pool_depth{class=\"1vcpu_256mib\"} 0\n"));
-        assert!(body.contains(
-            "taritd_warm_pool_watermark{class=\"1vcpu_256mib\",watermark=\"target\"} 8\n"
-        ));
+        assert!(body.contains("taritd_warm_pool_depth{class=\"1vcpu_256mib_"));
+        assert!(body.contains("taritd_warm_pool_watermark{class=\"1vcpu_256mib_"));
         assert!(body.contains("taritd_vm_create_total 1\n"));
         assert!(body.contains("taritd_vm_create_errors_total 1\n"));
         assert!(body.contains("taritd_exec_total 1\n"));
+        assert!(body.contains("taritd_pty_active_connections 0\n"));
+        assert!(body.contains("taritd_pty_connection_limit{scope=\"global\"} 1024\n"));
+        assert!(body.contains("taritd_pty_connection_limit{scope=\"tenant\"} 128\n"));
+        assert!(body.contains("taritd_pty_connection_limit{scope=\"vm\"} 16\n"));
+        assert!(body.contains("taritd_pty_admission_rejections_total{scope=\"tenant\"} 0\n"));
 
         for line in body.lines().filter(|line| !line.starts_with('#')) {
             let (sample, value) = line.rsplit_once(' ').expect("sample has value");
@@ -853,6 +1013,7 @@ mod tests {
             )])
             .unwrap(),
             host_id: "test-host".into(),
+            host_session_id: Uuid::nil(),
             vmm_bin: PathBuf::from("target/taritd-metrics-test/vmm"),
             kernel: PathBuf::from("target/taritd-metrics-test/kernel"),
             rootfs: PathBuf::from("target/taritd-metrics-test/rootfs"),
@@ -860,17 +1021,30 @@ mod tests {
             db_path: PathBuf::from("target/taritd-metrics-test/fleet.db"),
             net_state_path: PathBuf::from("target/taritd-metrics-test/net-state.json"),
             images_dir: PathBuf::from("target/taritd-metrics-test/images"),
+            shared_block: None,
+            image_admission_policy: crate::image::ImageAdmissionPolicy::default(),
             max_vms: 4,
             max_vcpus: 4,
             max_memory_mib: 1024,
             peer_secret: "peer-secret".into(),
+            peer_listen: None,
+            peer_tls: None,
             database_url: None,
             rpc_addr: "http://127.0.0.1:0".into(),
+            allow_insecure_peer_http: true,
             enable_net: false,
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
+            api_max_in_flight: 128,
+            api_requests_per_second: 10_000,
+            api_request_timeout_ms: 5_000,
+            api_max_body_bytes: 1024 * 1024,
             vm_cgroup_parent: None,
+            vm_jail: None,
             vm_cgroup_pids_max: 1024,
+            vm_io_quota: crate::config::VmIoQuotaConfig::default(),
+            vm_net_quota: crate::config::VmNetQuotaConfig::default(),
+            disk_pressure: crate::config::DiskPressureConfig::default(),
             warm_pool: WarmPoolConfig::default(),
             admission_timeout_ms: 1,
             reap_on_shutdown: true,
@@ -890,7 +1064,7 @@ mod tests {
         };
         let store = Arc::new(Mutex::new(Store::open(":memory:").unwrap()));
         let shares = crate::shares::ShareRepository::new(Arc::clone(&store), None);
-        let (store_tx, _store_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (store_tx, _store_rx) = tokio::sync::mpsc::channel(128);
         AppState {
             config: config.clone(),
             audit_outbox: Arc::new(crate::audit::LocalAuditOutbox::new(Arc::clone(&store))),
@@ -899,6 +1073,7 @@ mod tests {
             vm_cache: Arc::new(RwLock::new(HashMap::new())),
             store_tx,
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
+            activation_gates: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_faults: Arc::new(Mutex::new(Vec::new())),
             lifecycle_pauses: Arc::new(Mutex::new(HashMap::new())),
             terminal_transition_gate: Arc::new(tokio::sync::Mutex::new(())),

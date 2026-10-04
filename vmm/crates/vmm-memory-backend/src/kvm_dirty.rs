@@ -14,7 +14,7 @@
 use crate::backend::GuestMemory;
 use crate::dirty::DirtyBitmap;
 use kvm_ioctls::VmFd;
-use vm_memory::{Address, GuestMemoryBackend as _, GuestMemoryRegion};
+use vm_memory::{Address as _, GuestMemoryBackend as _, GuestMemoryRegion};
 
 /// Errors from KVM dirty-log operations.
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +23,8 @@ pub enum KvmDirtyError {
     GetDirtyLog { slot: u32, e: kvm_ioctls::Error },
     #[error("KVM_CAP_DIRTY_LOG_RING unavailable: {0}")]
     NoDirtyRing(kvm_ioctls::Error),
+    #[error("guest memory region at GPA {gpa:#x} has no packed backing offset")]
+    InvalidRegionMapping { gpa: u64 },
 }
 
 /// Read the dirty bitmap for every registered slot and merge into one
@@ -40,8 +42,12 @@ pub fn read_dirty_log(
     let mut bitmap = DirtyBitmap::new();
     for (slot_idx, region) in mem.inner.iter().enumerate() {
         let slot = slots.get(slot_idx).copied().unwrap_or(slot_idx as u32);
-        let region_start = region.start_addr().raw_value();
         let region_len = region.len();
+        let region_gpa = region.start_addr().raw_value();
+        let packed_region_start = mem
+            .gpa_to_offset(region_gpa)
+            .ok_or(KvmDirtyError::InvalidRegionMapping { gpa: region_gpa })?;
+        debug_assert_eq!(mem.offset_to_gpa(packed_region_start), Some(region_gpa));
 
         // KVM_GET_DIRTY_LOG returns a bitmap with one bit per page (4 KiB).
         // kvm-ioctls's `get_dirty_log` returns `Vec<u64>` — each word holds 64
@@ -61,8 +67,8 @@ pub fn read_dirty_log(
             for bit in 0..64 {
                 if w & (1u64 << bit) != 0 {
                     let pfn_offset = (word_idx * 64 + bit) as u64;
-                    let gpa = region_start + pfn_offset * 4096;
-                    bitmap.mark(gpa);
+                    let offset = packed_region_start + pfn_offset * 4096;
+                    bitmap.mark(offset);
                 }
             }
         }

@@ -8,7 +8,7 @@
 //! The VMM just opens it and wires it to the virtio-net device.
 
 use std::ffi::CString;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
@@ -30,6 +30,8 @@ const IFF_NO_PI: u16 = 0x1000;
 
 /// TUNSETIFF ioctl request.
 const TUNSETIFF: libc::c_ulong = 0x400454ca;
+/// TUNGETIFF ioctl request.
+const TUNGETIFF: libc::c_ulong = 0x800454d2;
 /// TUNSETPERSIST ioctl request.
 const TUNSETPERSIST: libc::c_ulong = 0x400454cb;
 
@@ -50,6 +52,63 @@ struct Ifreq {
 }
 
 impl Tap {
+    /// Take ownership of a TAP descriptor inherited from the orchestrator.
+    ///
+    /// The descriptor is validated against the requested interface name so a
+    /// stale or incorrectly mapped inherited fd cannot attach the wrong host
+    /// network device to a guest.
+    pub fn from_inherited_fd(fd: RawFd, expected_name: &str) -> Result<Self, TapError> {
+        if fd < 0 {
+            return Err(TapError::Open(format!("invalid inherited fd {fd}")));
+        }
+        // SAFETY: the caller transfers ownership of a valid inherited
+        // descriptor. OwnedFd closes it on every validation error.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let mut ifr = Ifreq {
+            name: [0u8; 16],
+            flags: 0,
+            _pad: [0u8; 22],
+        };
+        // SAFETY: `fd` is expected to reference a TUN/TAP queue and `ifr`
+        // remains valid for the duration of the ioctl.
+        let rc = unsafe { libc::ioctl(owned.as_raw_fd(), TUNGETIFF as _, &mut ifr) };
+        if rc < 0 {
+            return Err(TapError::Ioctl(format!(
+                "validate inherited fd {fd}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let end = ifr.name.iter().position(|&b| b == 0).unwrap_or(16);
+        let actual_name = String::from_utf8_lossy(&ifr.name[..end]).to_string();
+        if actual_name != expected_name {
+            return Err(TapError::Ioctl(format!(
+                "inherited fd {fd} is TAP {actual_name}, expected {expected_name}"
+            )));
+        }
+        if ifr.flags & IFF_TAP == 0 || ifr.flags & IFF_NO_PI == 0 {
+            return Err(TapError::Ioctl(format!(
+                "inherited fd {fd} for {actual_name} lacks IFF_TAP|IFF_NO_PI"
+            )));
+        }
+        // SAFETY: `fd` is open and F_GETFL/F_SETFL operate on scalar flags.
+        let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                < 0
+        {
+            return Err(TapError::Nonblock(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        let fd = owned.into_raw_fd();
+        log::info!("using inherited TAP: {actual_name} (fd={fd})");
+        Ok(Self {
+            fd,
+            name: actual_name,
+            closed: AtomicBool::new(false),
+        })
+    }
+
     /// Create a new TAP device with the given name.
     /// If `name` is empty, the kernel assigns a name (tap0, tap1, ...).
     pub fn create(name: &str) -> Result<Self, TapError> {

@@ -65,10 +65,54 @@ impl OwnedScratchFile {
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let file = options.open(&path)?;
-        Self::from_created_file(path, file)
+        Self::from_owned_file(path, file)
     }
 
-    fn from_created_file(path: PathBuf, file: File) -> io::Result<Self> {
+    /// Adopt an existing private file supplied by the orchestrator. The open
+    /// descriptor and a second path identity check make this an exact-inode
+    /// claim; symlinks, hard links, foreign owners, and broad modes are refused.
+    #[cfg(unix)]
+    pub fn adopt_private(path: impl Into<PathBuf>) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = path.into();
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options.open(&path)?;
+        let metadata = file.metadata()?;
+        let effective_uid = unsafe { libc::geteuid() };
+        let mode = metadata.mode() & 0o777;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != effective_uid
+            || metadata.nlink() != 1
+            || mode & 0o077 != 0
+            || mode & 0o600 != 0o600
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be a private regular file owned by uid {effective_uid}",
+                    path.display()
+                ),
+            ));
+        }
+        let path_metadata = fs::symlink_metadata(&path)?;
+        if !path_metadata.file_type().is_file()
+            || file_identity(path_metadata) != file_identity(metadata)
+        {
+            return Err(io::Error::other(format!(
+                "{} changed while ownership was claimed",
+                path.display()
+            )));
+        }
+        file.sync_all()?;
+        Self::from_owned_file(path, file)
+    }
+
+    fn from_owned_file(path: PathBuf, file: File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         Ok(Self {
             #[cfg(unix)]
@@ -119,6 +163,60 @@ impl OwnedScratchFile {
 
     pub fn file(&self) -> &File {
         &self._file
+    }
+
+    /// Atomically publish this owned file at an unused `target`, updating the
+    /// tracked path while retaining ownership of the same inode.
+    pub fn rename_to(&mut self, target: impl Into<PathBuf>) -> io::Result<()> {
+        let target = target.into();
+        if self.path == target {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            sync_directory(parent)?;
+        }
+        rename_noreplace(&self.path, &target)?;
+        self.path = target;
+        if let Some(parent) = self.path.parent() {
+            sync_directory(parent)?;
+        }
+
+        #[cfg(target_os = "linux")]
+        fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+
+            let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL")
+            })?;
+            let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "target path contains NUL")
+            })?;
+            // SAFETY: both paths are valid NUL-terminated strings and the kernel
+            // does not retain their pointers after renameat2 returns.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    source.as_ptr(),
+                    libc::AT_FDCWD,
+                    target.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn rename_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+            fs::hard_link(source, target)?;
+            fs::remove_file(source)
+        }
+        Ok(())
     }
 
     /// Remove the file if it still points at the inode this VM created.
@@ -328,6 +426,11 @@ fn file_identity(metadata: fs::Metadata) -> ScratchIdentity {
     }
 }
 
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let dir = File::open(path)?;
+    dir.sync_all()
+}
+
 #[cfg(target_os = "linux")]
 fn has_open_owner(path: &Path) -> bool {
     let Ok(target) = fs::metadata(path) else {
@@ -424,6 +527,16 @@ mod tests {
             should_collect_entry(OsStr::new("vmm-ov-user.cow"), Some(old()), now(), max_age),
             None
         );
+        assert_eq!(
+            should_collect_entry(
+                OsStr::new("bundle-123e4567-e89b-12d3-a456-426614174000.ram"),
+                Some(old()),
+                now(),
+                max_age
+            ),
+            None,
+            "taritd-owned snapshot bundle names must never be VMM GC candidates"
+        );
     }
 
     #[test]
@@ -507,6 +620,39 @@ mod tests {
 
         assert!(owned.remove().unwrap());
         assert!(!path.exists(), "partial owned snapshots must be removed");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopting_private_scratch_rejects_links_and_broad_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-work/gc-adopt-private")
+            .join(format!("{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let broad = dir.join("broad.cow");
+        fs::write(&broad, b"data").unwrap();
+        fs::set_permissions(&broad, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(OwnedScratchFile::adopt_private(&broad).is_err());
+
+        let linked = dir.join("linked.cow");
+        let second_link = dir.join("linked-again.cow");
+        fs::write(&linked, b"data").unwrap();
+        fs::set_permissions(&linked, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&linked, &second_link).unwrap();
+        assert!(OwnedScratchFile::adopt_private(&linked).is_err());
+
+        let target = dir.join("target.cow");
+        let symlink = dir.join("symlink.cow");
+        fs::write(&target, b"data").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        assert!(OwnedScratchFile::adopt_private(&symlink).is_err());
 
         fs::remove_dir_all(dir).unwrap();
     }

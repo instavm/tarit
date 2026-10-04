@@ -21,10 +21,8 @@
 
 #![cfg(all(target_os = "linux", target_arch = "x86_64", feature = "kvm"))]
 
-use std::path::PathBuf;
 use std::time::Instant;
 use vmm_core::clone::build_clone_specs;
-use vmm_core::config::{KernelConfig, MemoryConfig, VcpuConfig, VmConfig};
 use vmm_core::controller::VmmController;
 use vmm_core::oci::OciImageRef;
 use vmm_core::restore_semantics::{compute_post_restore, ClockRestoreConfig};
@@ -38,28 +36,8 @@ use vmm_net::rate_limit::TokenBucket;
 use vmm_snapshot::diff::apply_diffs;
 use vmm_snapshot::live::{decide, PrecopyParams, RoundDecision};
 
-fn kernel_path() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    PathBuf::from(manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("guest/bzImage"))
-        .unwrap_or_else(|| PathBuf::from("guest/bzImage"))
-}
-
-fn vm_config() -> VmConfig {
-    VmConfig {
-        kernel: KernelConfig {
-            path: kernel_path().to_string_lossy().to_string(),
-            cmdline: "console=ttyS0 reboot=k panic=1 nokaslr".into(),
-            initramfs: None,
-        },
-        memory: MemoryConfig { size_mib: 256 },
-        vcpus: VcpuConfig { count: 1 },
-        volumes: vec![],
-        net: vec![],
-    }
-}
+mod test_support;
+use test_support::{agent_vm_config, assert_guest_exec, private_overlay_path};
 
 fn retain_snapshot(controller: &VmmController, path: &str) {
     let identity = vmm_core::gc::OwnedScratchFile::identity_for(std::path::Path::new(path))
@@ -70,14 +48,8 @@ fn retain_snapshot(controller: &VmmController, path: &str) {
 }
 
 #[test]
-#[ignore = "needs Linux+KVM + guest/bzImage"]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn comprehensive_all_features_and_edge_cases() {
-    let kpath = kernel_path();
-    if !kpath.exists() {
-        eprintln!("kernel not found — skip");
-        return;
-    }
-
     let controller = VmmController::new();
     let mut passed = 0;
     let mut failed = 0;
@@ -99,8 +71,14 @@ fn comprehensive_all_features_and_edge_cases() {
     let t = Instant::now();
     check!(
         "boot via controller",
-        controller.create(vm_config()).is_ok()
+        controller.create_live(agent_vm_config(256)).is_ok()
     );
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo comprehensive-create-ok'",
+        "comprehensive-create-ok",
+    );
+    check!("guest command after boot", true);
     eprintln!("    boot: {}ms", t.elapsed().as_millis());
 
     // === 2. Snapshot ===
@@ -116,8 +94,21 @@ fn comprehensive_all_features_and_edge_cases() {
 
     // === 3. Restore ===
     eprintln!("=== 3. Restore ===");
-    let restore_result = controller.restore(&snap_path, None);
+    let restore_result = controller.restore(
+        &snap_path,
+        Some(
+            private_overlay_path("comprehensive-restore")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
     check!("restore succeeded", restore_result.is_ok());
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo comprehensive-restore-ok'",
+        "comprehensive-restore-ok",
+    );
+    check!("guest command after restore", true);
 
     // === 4. Clone Fan-Out ===
     eprintln!("=== 4. Clone Fan-Out ===");
@@ -278,6 +269,7 @@ fn comprehensive_all_features_and_edge_cases() {
         rlimit_nofile: 1024,
         rlimit_as: 1 << 30,
         netns: "".into(),
+        isolate_network: false,
         cgroup_limits: None,
     };
     check!(
@@ -307,7 +299,7 @@ fn comprehensive_all_features_and_edge_cases() {
         "large dirty set continues",
         matches!(decision, RoundDecision::Continue { .. })
     );
-    let decision = decide(&params, 1, 1 * 1024 * 1024);
+    let decision = decide(&params, 1, 1024 * 1024);
     check!(
         "small dirty set stops",
         matches!(decision, RoundDecision::FinalStop { .. })
@@ -344,12 +336,8 @@ fn comprehensive_all_features_and_edge_cases() {
 
     // Build the "full" image (what the memory looks like after writes)
     let mut full = base.clone();
-    for i in 0x1000..0x2000 {
-        full[i] = 0xBB;
-    }
-    for i in 0x5000..0x6000 {
-        full[i] = 0xCC;
-    }
+    full[0x1000..0x2000].fill(0xBB);
+    full[0x5000..0x6000].fill(0xCC);
 
     // Build diffs
     let diff1 = vmm_snapshot::diff::PageDelta {

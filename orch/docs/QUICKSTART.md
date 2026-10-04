@@ -10,7 +10,7 @@ can exec into and SSH into. For the full option list see
 - A Linux host with KVM (`/dev/kvm` present). macOS can build and cross-check but
   cannot run microVMs.
 - Rust stable toolchain.
-- A guest kernel (`vmlinux`/`bzImage`) and an ext4 rootfs readable by `taritd`.
+- The release ELF `vmlinux` and an ext4 rootfs readable by `taritd`.
 - For cluster mode only: PostgreSQL reachable from every node.
 - For host networking only: root or `CAP_NET_ADMIN`, plus `ip` and `nft`.
 
@@ -24,7 +24,15 @@ cargo build --release -p taritd
 
 cd /path/to/tarit/vmm
 cargo build --release --features "vmm-core/kvm vmm-core/boot vmm-memory-backend/kvm"
+
+cd /path/to/tarit
+sudo make guest
+sudo install -d -m 0755 /var/lib/taritd
+sudo install -m 0644 guest-assets/vmlinux guest-assets/rootfs.ext4 /var/lib/taritd/
 ```
+
+`make guest` verifies the pinned release kernel checksum and falls back to the
+same checksum-pinned source build if the artifact is unavailable.
 
 ## 2. Run one node
 
@@ -34,9 +42,9 @@ cd /path/to/tarit/orch
 export TARIT_API_KEY="$(openssl rand -hex 24)"
 export TARIT_LISTEN='127.0.0.1:8080'
 export TARIT_VMM_BIN='/path/to/tarit/vmm/target/release/vmm'
-export TARIT_KERNEL='/var/lib/taritd/vmlinux.microvm'
+export TARIT_KERNEL='/var/lib/taritd/vmlinux'
 export TARIT_ROOTFS='/var/lib/taritd/rootfs.ext4'
-export TARIT_ROOTFS_READONLY=1        # required when many VMs share one base image
+export TARIT_ROOTFS_READONLY=1        # optional read-only guest mount; base isolation is always CoW
 export TARIT_SOCKET_DIR="$HOME/.taritd/sockets"
 export TARIT_DB="$HOME/.taritd/fleet.db"
 
@@ -94,9 +102,10 @@ ssh -p 2222 "$vm"@<taritd-host>
 
 The same PTY stream is available over WebSocket at
 `WS /v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` (binary frames are
-raw bytes, text frames are JSON `resize`/`exit`). The one-time `connect_token`
-comes from the `POST /v1/vms/{id}/pty/sessions` response and expires after 5
-minutes.
+raw bytes, text frames are JSON `resize`/`exit`). The session `connect_token`
+comes from the `POST /v1/vms/{id}/pty/sessions` response. One connection may be
+active at a time, and the session remains reconnectable for five minutes after
+disconnect.
 
 ## 5. Cluster mode (optional)
 

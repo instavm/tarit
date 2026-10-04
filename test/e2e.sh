@@ -11,7 +11,7 @@
 # Env: TARIT_KERNEL, TARIT_ROOTFS (default /tmp/vmlinux.microvm, /tmp/vsock-rootfs.ext4;
 # build them with `sudo make guest`), PER_TEST_TIMEOUT (default 360s).
 set -uo pipefail
-HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 . "$HERE/lib/preflight.sh"
 
 require_kvm
@@ -31,9 +31,11 @@ declare -A SUITE=(
   [multitenant]=e2e_multitenant.sh
   [net]=e2e_net_scale.sh
   [lifecycle]=e2e_lifecycle.sh
+  [suspend]=e2e_suspend_resume.sh
+  [snapshot-disk]=e2e_snapshot_disk.sh
   [cpu-refill]=e2e_cpu_refill.sh
 )
-ORDER=(smoke cli ssh-pty image warmpool multitenant net lifecycle cpu-refill)
+ORDER=(smoke cli ssh-pty image warmpool multitenant net lifecycle suspend snapshot-disk cpu-refill)
 [ "$#" -gt 0 ] && ORDER=("$@")
 
 declare -A RESULT; PASS=0; FAIL=0
@@ -43,13 +45,18 @@ for name in "${ORDER[@]}"; do
   path="$REPO_ROOT/orch/tests/$script"
   [ -f "$path" ] || { RESULT[$name]=MISSING; FAIL=$((FAIL+1)); continue; }
   echo; info "── $name ($script) ──"
-  reap_taritd_vmm
+  # Each suite owns and tears down the process group it launches. Never sweep
+  # unrelated taritd or VMM processes from a shared KVM host.
   if timeout "${PER_TEST_TIMEOUT:-360}" bash "$path"; then RESULT[$name]=PASS; PASS=$((PASS+1)); else RESULT[$name]=FAIL; FAIL=$((FAIL+1)); fi
 done
-reap_taritd_vmm
 
 echo; echo "================ test/e2e summary ================"
 for name in "${ORDER[@]}"; do printf "  %-14s %s\n" "$name" "${RESULT[$name]:-SKIP}"; done
 echo "  ------------------------------------------"
 echo "  PASS=$PASS FAIL=$FAIL"
-[ "$FAIL" -eq 0 ] && { echo "  RESULT: E2E_PASS"; exit 0; } || { echo "  RESULT: E2E_FAIL"; exit 1; }
+if [ "$FAIL" -eq 0 ]; then
+  echo "  RESULT: E2E_PASS"
+  exit 0
+fi
+echo "  RESULT: E2E_FAIL"
+exit 1

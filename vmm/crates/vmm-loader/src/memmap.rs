@@ -11,9 +11,9 @@
 //! |---|---|---|
 //! | `0x0`..`0xA_0000` | RAM | low memory (640 KiB) |
 //! | `0xA_0000`..`0x10_0000` | reserved | legacy VGA + BIOS data (384 KiB) |
-//! | `0x10_0000`..`0x_1000_0000` | RAM | high memory before the MMIO gap |
-//! | `0x_1000_0000`..`0x_8000_0000` | reserved | the MMIO gap (virtio-mmio devices) |
-//! | `0x_8000_0000`..`mem_end` | RAM | high memory after the gap |
+//! | `0x10_0000`..`0xd000_0000` | RAM | high memory before the MMIO gap |
+//! | `0xd000_0000`..`0x1_0000_0000` | reserved | virtio MMIO, PCI config, and KVM TSS space |
+//! | `0x1_0000_0000`..`mem_end` | RAM | future split-region high memory |
 
 // --- x86_64 boot / E820 constants (from kernel Documentation/x86/boot.txt) --
 
@@ -42,9 +42,9 @@ pub const ZERO_PAGE_ADDR: u64 = 0x0001_0000;
 /// High-memory start — the kernel is loaded just above this.
 pub const HIMEM_START: u64 = 0x0010_0000; // 1 MiB
 /// Start of the MMIO gap.
-pub const MMIO_GAP_START: u64 = 0x_1000_0000; // 256 MiB
+pub const MMIO_GAP_START: u64 = 0xd000_0000; // 3.25 GiB
 /// End of the MMIO gap.
-pub const MMIO_GAP_END: u64 = 0x_8000_0000; // 2 GiB
+pub const MMIO_GAP_END: u64 = 0x1_0000_0000; // 4 GiB
 
 // --- E820 map construction -------------------------------------------------
 
@@ -56,7 +56,7 @@ pub struct E820Entry {
     pub mem_type: u32,
 }
 
-/// Build the E820 map for a guest with `mem_size_bytes` of RAM.
+/// Build the E820 map for a guest with `mem_size_bytes` of packed RAM.
 ///
 /// See the module docs for the layout. For small VMs whose RAM ends before
 /// the MMIO gap, only the first three entries are emitted.
@@ -87,26 +87,18 @@ pub fn build_e820_map(mem_size_bytes: u64) -> Vec<E820Entry> {
         });
     }
 
-    // 4. The MMIO gap (reserved). Emitted when RAM extends into the gap.
-    // The gap entry spans only up to min(mem_size, MMIO_GAP_END) so the
-    // E820 map stays contiguous and totals exactly to mem_size. When RAM
-    // ends inside the gap, the gap "eats" the upper part of RAM (the kernel
-    // sees less usable RAM than mem_size — that's the MMIO-hole model).
+    // 4. The complete MMIO gap. RAM that does not fit below it is relocated
+    // above 4 GiB rather than being silently consumed by the aperture.
     if mem_size_bytes > MMIO_GAP_START {
-        let gap_end_in_ram = mem_size_bytes.min(MMIO_GAP_END);
         entries.push(E820Entry {
             addr: MMIO_GAP_START,
-            size: gap_end_in_ram - MMIO_GAP_START,
+            size: MMIO_GAP_END - MMIO_GAP_START,
             mem_type: E820_RESERVED,
         });
-    }
-
-    // 5. High memory after the gap, up to the end of RAM. Only when RAM
-    // extends past the gap.
-    if mem_size_bytes > MMIO_GAP_END {
+        // 5. The packed bytes after the low slot are exposed above 4 GiB.
         entries.push(E820Entry {
             addr: MMIO_GAP_END,
-            size: mem_size_bytes - MMIO_GAP_END,
+            size: mem_size_bytes - MMIO_GAP_START,
             mem_type: E820_RAM,
         });
     }
@@ -142,34 +134,32 @@ mod tests {
 
     #[test]
     fn e820_map_layout_large_4gib() {
-        // 4 GiB RAM: all 5 entries, including the post-gap high memory.
+        // A configured 4 GiB of packed RAM has 768 MiB relocated above 4 GiB.
         let m = build_e820_map(4 * 1024 * 1024 * 1024);
         assert_eq!(m.len(), 5);
-        let last = m[4];
-        assert_eq!(last.addr, MMIO_GAP_END);
-        assert_eq!(last.size, 4 * 1024 * 1024 * 1024 - MMIO_GAP_END);
-        assert_eq!(last.mem_type, E820_RAM);
-    }
-
-    #[test]
-    fn e820_map_layout_1gib_ram_ends_inside_gap() {
-        // 1 GiB RAM is below MMIO_GAP_END (2 GiB), so there's no post-gap
-        // entry — the gap itself is the last entry, and it spans from
-        // MMIO_GAP_START up to the end of RAM (not the full gap).
-        let m = build_e820_map(1024 * 1024 * 1024);
-        assert_eq!(m.len(), 4);
         assert_eq!(m[3].addr, MMIO_GAP_START);
+        assert_eq!(m[3].size, MMIO_GAP_END - MMIO_GAP_START);
         assert_eq!(m[3].mem_type, E820_RESERVED);
-        assert_eq!(
-            m[3].size,
-            1024 * 1024 * 1024 - MMIO_GAP_START,
-            "gap should span only up to end of RAM"
-        );
+        assert_eq!(m[4].addr, MMIO_GAP_END);
+        assert_eq!(m[4].size, 768 * 1024 * 1024);
+        assert_eq!(m[4].mem_type, E820_RAM);
     }
 
     #[test]
-    fn e820_ram_and_reserved_sum_to_mem_size() {
-        // The total of all E820 entries (RAM + reserved) must equal mem_size.
+    fn e820_map_layout_1gib_is_all_usable_outside_legacy_hole() {
+        // Virtio MMIO starts at 3.25 GiB, so a 1 GiB guest must not silently
+        // lose three quarters of its configured RAM to a fictitious hole.
+        let m = build_e820_map(1024 * 1024 * 1024);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[2].addr, HIMEM_START);
+        assert_eq!(m[2].size, 1024 * 1024 * 1024 - HIMEM_START);
+        assert_eq!(m[2].mem_type, E820_RAM);
+    }
+
+    #[test]
+    fn e820_ram_and_reserved_cover_the_physical_layout() {
+        // Above the aperture, the physical span includes the inserted MMIO
+        // gap while configured RAM remains packed.
         // We require mem_size >= HIMEM_START (1 MiB) — a real VMM never boots
         // with sub-megabyte RAM. Sizes at and above the gap are the
         // interesting boundary cases.
@@ -177,15 +167,20 @@ mod tests {
             HIMEM_START,             // exactly 1 MiB (low + reserved, no high)
             16 * 1024 * 1024,        // before gap
             MMIO_GAP_START,          // exactly at gap start
-            MMIO_GAP_START + 0x1000, // just into gap
-            MMIO_GAP_END,            // exactly at gap end
-            256 * 1024 * 1024,       // after gap
-            1024 * 1024 * 1024,      // 1 GiB (ends inside gap)
-            4 * 1024 * 1024 * 1024,  // 4 GiB (past gap)
+            MMIO_GAP_START + 0x1000, // first high-memory page
+            MMIO_GAP_END,
+            256 * 1024 * 1024,      // ordinary small guest
+            1024 * 1024 * 1024,     // 1 GiB, below the gap
+            4 * 1024 * 1024 * 1024, // 4 GiB, exactly through the gap
         ] {
             let m = build_e820_map(sz);
             let total: u64 = m.iter().map(|e| e.size).sum();
-            assert_eq!(total, sz, "size 0x{sz:x}");
+            let expected = if sz > MMIO_GAP_START {
+                sz + (MMIO_GAP_END - MMIO_GAP_START)
+            } else {
+                sz
+            };
+            assert_eq!(total, expected, "size 0x{sz:x}");
         }
     }
 

@@ -3,9 +3,13 @@
 
 use std::cmp;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::path::Path;
 use thiserror::Error;
 
 use crate::virtio::blk::{req_type, status, validate_req, BlkReqHeader};
@@ -272,50 +276,269 @@ enum BackendStorage {
     Cow(CowOverlay),
 }
 
+#[cfg(unix)]
+fn open_private_overlay(path: &Path) -> Result<File, BlkBackendError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        BlkBackendError::Validation(format!("overlay path has no file name: {}", path.display()))
+    })?;
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut parent_options = OpenOptions::new();
+    parent_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let parent = parent_options.open(parent_path).map_err(|error| {
+        BlkBackendError::Validation(format!(
+            "open overlay directory {}: {error}",
+            parent_path.display()
+        ))
+    })?;
+    let parent_metadata = parent.metadata()?;
+    // SAFETY: geteuid has no preconditions and returns a scalar ID.
+    let effective_uid = unsafe { libc::geteuid() };
+    if parent_metadata.uid() != effective_uid && parent_metadata.uid() != 0 {
+        return Err(BlkBackendError::Validation(format!(
+            "overlay directory {} is owned by uid {}, expected {} or root",
+            parent_path.display(),
+            parent_metadata.uid(),
+            effective_uid
+        )));
+    }
+    if parent_metadata.mode() & 0o022 != 0 {
+        return Err(BlkBackendError::Validation(format!(
+            "overlay directory {} is group/world writable (mode {:04o})",
+            parent_path.display(),
+            parent_metadata.mode() & 0o7777
+        )));
+    }
+
+    let name = std::ffi::CString::new(file_name.as_bytes()).map_err(|_| {
+        BlkBackendError::Validation(format!(
+            "overlay file name contains NUL: {}",
+            path.display()
+        ))
+    })?;
+    // First open an existing overlay. O_NOFOLLOW prevents a predictable leaf
+    // name from redirecting the VMM onto another host file.
+    // SAFETY: parent fd/name remain valid for openat; a successful descriptor
+    // is transferred exactly once into File below.
+    let existing_fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    let fd = if existing_fd >= 0 {
+        existing_fd
+    } else {
+        let open_error = std::io::Error::last_os_error();
+        if open_error.kind() != std::io::ErrorKind::NotFound {
+            return Err(BlkBackendError::Validation(format!(
+                "open overlay {} without following links: {open_error}",
+                path.display()
+            )));
+        }
+        // Missing overlays are created atomically. If another actor wins the
+        // race, O_EXCL fails and we refuse to adopt the replacement.
+        // SAFETY: parent fd/name remain valid, and mode is present with O_CREAT.
+        let created_fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if created_fd < 0 {
+            return Err(BlkBackendError::Validation(format!(
+                "create private overlay {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        created_fd
+    };
+    // SAFETY: fd is a fresh successful openat result and is uniquely owned.
+    let overlay = unsafe { File::from_raw_fd(fd) };
+    let metadata = overlay.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BlkBackendError::Validation(format!(
+            "overlay is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.uid() != effective_uid {
+        return Err(BlkBackendError::Validation(format!(
+            "overlay {} is owned by uid {}, expected {}",
+            path.display(),
+            metadata.uid(),
+            effective_uid
+        )));
+    }
+    if metadata.nlink() != 1 {
+        return Err(BlkBackendError::Validation(format!(
+            "overlay {} has {} hard links; expected exactly one",
+            path.display(),
+            metadata.nlink()
+        )));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 || mode & 0o600 != 0o600 {
+        return Err(BlkBackendError::Validation(format!(
+            "overlay {} must be owner read/write only, got mode {mode:04o}",
+            path.display()
+        )));
+    }
+    Ok(overlay)
+}
+
+#[cfg(not(unix))]
+fn open_private_overlay(path: &Path) -> Result<File, BlkBackendError> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?)
+}
+
 /// A file-backed virtio-blk backend. Services read/write/flush requests
 /// against a host file or a copy-on-write overlay over a read-only base.
 pub struct BlkBackend {
     storage: BackendStorage,
     pub read_only: bool,
     pub sectors: u64,
+    #[cfg(feature = "test-failpoints")]
+    service_delay: std::time::Duration,
+    #[cfg(feature = "test-failpoints")]
+    delayed_services: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "test-failpoints")]
+struct DelayedServiceGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(feature = "test-failpoints")]
+impl Drop for DelayedServiceGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+fn validate_file_access(file: &File, read_only: bool) -> Result<(), BlkBackendError> {
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let access = flags & libc::O_ACCMODE;
+    if access == libc::O_WRONLY || (!read_only && access != libc::O_RDWR) {
+        return Err(BlkBackendError::Validation(
+            "backing descriptor has incompatible access mode".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_file_access(_file: &File, _read_only: bool) -> Result<(), BlkBackendError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn backing_size_bytes(file: &File) -> Result<u64, BlkBackendError> {
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_file() {
+        return Ok(metadata.len());
+    }
+    #[cfg(target_os = "linux")]
+    if metadata.file_type().is_block_device() {
+        const BLKGETSIZE64: libc::Ioctl = 0x8008_1272_u32 as libc::Ioctl;
+        let mut bytes = 0_u64;
+        if unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut bytes) } < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        return Ok(bytes);
+    }
+    Err(BlkBackendError::Validation(
+        "backing descriptor is not a regular file or block device".into(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn backing_size_bytes(file: &File) -> Result<u64, BlkBackendError> {
+    Ok(file.metadata()?.len())
 }
 
 impl BlkBackend {
     /// Open a backing file for the block device.
-    pub fn open(path: &PathBuf, read_only: bool) -> Result<Self, BlkBackendError> {
-        let file = if read_only {
-            File::open(path)?
-        } else {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)?
-        };
-        let metadata = file.metadata()?;
-        let sectors = metadata.len() / 512;
+    pub fn open(path: &Path, read_only: bool) -> Result<Self, BlkBackendError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(!read_only);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let file = options.open(path)?;
+        Self::from_file(file, read_only, &path.display().to_string())
+    }
+
+    /// Adopt an already-open regular file or block device. This is used for
+    /// orchestrator-inherited descriptors so a jailed VMM never re-resolves a
+    /// provider path after admission.
+    pub fn from_file(
+        file: File,
+        read_only: bool,
+        diagnostic_label: &str,
+    ) -> Result<Self, BlkBackendError> {
+        validate_file_access(&file, read_only)?;
+        let bytes = backing_size_bytes(&file)?;
+        if bytes == 0 || bytes % SECTOR_SIZE != 0 {
+            return Err(BlkBackendError::Validation(format!(
+                "backing size {bytes} is not a positive multiple of {SECTOR_SIZE}"
+            )));
+        }
+        let sectors = bytes / SECTOR_SIZE;
         log::info!(
             "blk backend: {} ({} sectors, read_only={read_only})",
-            path.display(),
+            diagnostic_label,
             sectors
         );
         Ok(Self {
             storage: BackendStorage::Raw(file),
             read_only,
             sectors,
+            #[cfg(feature = "test-failpoints")]
+            service_delay: std::time::Duration::ZERO,
+            #[cfg(feature = "test-failpoints")]
+            delayed_services: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
     /// Open a read-only base image with a private sparse copy-on-write overlay.
-    pub fn open_cow(base_path: &PathBuf, overlay_path: &PathBuf) -> Result<Self, BlkBackendError> {
-        let base = File::open(base_path)?;
+    pub fn open_cow(base_path: &Path, overlay_path: &Path) -> Result<Self, BlkBackendError> {
+        let mut base_options = OpenOptions::new();
+        base_options.read(true);
+        #[cfg(unix)]
+        base_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let base = base_options.open(base_path)?;
         let metadata = base.metadata()?;
-        let sectors = metadata.len() / SECTOR_SIZE;
-        let overlay = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(overlay_path)?;
+        #[cfg(unix)]
+        if !metadata.file_type().is_file() && !metadata.file_type().is_block_device() {
+            return Err(BlkBackendError::Validation(format!(
+                "CoW base is not a regular file or block device: {}",
+                base_path.display()
+            )));
+        }
+        let bytes = backing_size_bytes(&base)?;
+        if bytes == 0 || bytes % SECTOR_SIZE != 0 {
+            return Err(BlkBackendError::Validation(format!(
+                "CoW base size {bytes} is not a positive multiple of {SECTOR_SIZE}"
+            )));
+        }
+        let sectors = bytes / SECTOR_SIZE;
+        let overlay = open_private_overlay(overlay_path)?;
         let cow = CowOverlay::open(base, overlay, sectors)?;
         log::info!(
             "blk backend cow: base={} overlay={} ({} sectors)",
@@ -327,7 +550,23 @@ impl BlkBackend {
             storage: BackendStorage::Cow(cow),
             read_only: false,
             sectors,
+            #[cfg(feature = "test-failpoints")]
+            service_delay: std::time::Duration::ZERO,
+            #[cfg(feature = "test-failpoints")]
+            delayed_services: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub fn set_test_service_delay(&mut self, delay: std::time::Duration) {
+        self.service_delay = delay;
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    pub(crate) fn test_delayed_services_counter(
+        &self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.delayed_services)
     }
 
     /// Service a single block request.
@@ -337,6 +576,17 @@ impl BlkBackend {
     ///
     /// Returns the status byte to write back to the guest's status descriptor.
     pub fn service(&mut self, header: &BlkReqHeader, data: &mut [u8]) -> u8 {
+        #[cfg(feature = "test-failpoints")]
+        let _delay_guard = if self.service_delay.is_zero() {
+            None
+        } else {
+            self.delayed_services
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = DelayedServiceGuard(std::sync::Arc::clone(&self.delayed_services));
+            std::thread::sleep(self.service_delay);
+            Some(guard)
+        };
+
         // Validate the request.
         let (op, offset, force_unit_access) = match self.validate_service_req(header, data.len()) {
             Ok(validated) => validated,
@@ -598,6 +848,9 @@ fn read_u64(buf: &[u8], offset: usize) -> Result<u64, BlkBackendError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
 
     fn hdr(req_type: u32, sector: u64) -> BlkReqHeader {
         BlkReqHeader {
@@ -624,6 +877,20 @@ mod tests {
             .join("../../target/test-work")
             .join(format!("{name}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        dir
+    }
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         dir
     }
 
@@ -646,7 +913,7 @@ mod tests {
         tmp.write_all(&[0xAA; 512]).unwrap();
         tmp.flush().unwrap();
 
-        let mut backend = BlkBackend::open(&tmp.path().to_path_buf(), false).unwrap();
+        let mut backend = BlkBackend::open(tmp.path(), false).unwrap();
 
         let header = BlkReqHeader {
             req_type: req_type::IN,
@@ -657,6 +924,29 @@ mod tests {
         let status = backend.service(&header, &mut data);
         assert_eq!(status, status::OK);
         assert!(data.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn from_file_enforces_access_size_and_object_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.blk");
+        std::fs::write(&path, [0u8; 512]).unwrap();
+
+        let read_only = OpenOptions::new().read(true).open(&path).unwrap();
+        assert!(BlkBackend::from_file(read_only, false, "data").is_err());
+
+        let odd_path = dir.path().join("odd.blk");
+        std::fs::write(&odd_path, [0u8; 513]).unwrap();
+        let odd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&odd_path)
+            .unwrap();
+        assert!(BlkBackend::from_file(odd, false, "odd").is_err());
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let socket_fd: OwnedFd = socket.into();
+        assert!(BlkBackend::from_file(File::from(socket_fd), true, "socket").is_err());
     }
 
     #[test]
@@ -725,7 +1015,7 @@ mod tests {
 
     #[test]
     fn cow_write_goes_to_overlay_and_leaves_base_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x11, 0x22]);
@@ -751,7 +1041,7 @@ mod tests {
 
     #[test]
     fn cow_reads_unwritten_blocks_from_base_and_written_blocks_from_overlay() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20, 0x30]);
@@ -775,7 +1065,7 @@ mod tests {
 
     #[test]
     fn cow_overlay_dirty_bitmap_persists_after_reopen() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20]);
@@ -802,7 +1092,7 @@ mod tests {
 
     #[test]
     fn cow_two_overlays_share_base_but_keep_private_writes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay_a = dir.path().join("a.overlay");
         let overlay_b = dir.path().join("b.overlay");
@@ -867,7 +1157,7 @@ mod tests {
 
     #[test]
     fn cow_flush_and_fua_sync_overlay_without_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x55]);
@@ -891,7 +1181,7 @@ mod tests {
 
     #[test]
     fn cow_partial_write_preserves_base_bytes_and_handles_last_block() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20, 0x30]);
@@ -909,7 +1199,7 @@ mod tests {
 
     #[test]
     fn cow_rejects_request_that_crosses_device_end() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let base = dir.path().join("base.img");
         let overlay = dir.path().join("vm.overlay");
         write_block_pattern(&base, &[0x10, 0x20]);
@@ -918,5 +1208,77 @@ mod tests {
         let mut data = vec![0x77; SECTOR_SIZE_USIZE + 1];
         let status = backend.service(&hdr(req_type::OUT, 1), &mut data);
         assert_eq!(status, status::IO_ERR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cow_rejects_overlay_symlink_without_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.img");
+        let overlay = dir.path().join("vm.overlay");
+        let victim = dir.path().join("victim");
+        write_block_pattern(&base, &[0x10]);
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &overlay).unwrap();
+
+        assert!(BlkBackend::open_cow(&base, &overlay).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cow_rejects_world_writable_overlay_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let unsafe_dir = dir.path().join("unsafe");
+        let base = dir.path().join("base.img");
+        let overlay = unsafe_dir.join("vm.overlay");
+        std::fs::create_dir(&unsafe_dir).unwrap();
+        std::fs::set_permissions(&unsafe_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        write_block_pattern(&base, &[0x10]);
+
+        let error = BlkBackend::open_cow(&base, &overlay)
+            .err()
+            .expect("unsafe overlay directory must fail");
+        assert!(error.to_string().contains("group/world writable"));
+        assert!(!overlay.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cow_rejects_non_private_or_hardlinked_existing_overlay() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = private_tempdir();
+        let base = dir.path().join("base.img");
+        let overlay = dir.path().join("vm.overlay");
+        let alias = dir.path().join("alias.overlay");
+        write_block_pattern(&base, &[0x10]);
+        drop(BlkBackend::open_cow(&base, &overlay).unwrap());
+
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(BlkBackend::open_cow(&base, &overlay).is_err());
+
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&overlay, &alias).unwrap();
+        let error = BlkBackend::open_cow(&base, &overlay)
+            .err()
+            .expect("hardlinked overlay must fail");
+        assert!(error.to_string().contains("hard links"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cow_rejects_symlink_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_base = dir.path().join("base.img");
+        let base_link = dir.path().join("base-link.img");
+        let overlay = dir.path().join("vm.overlay");
+        write_block_pattern(&real_base, &[0x10]);
+        std::os::unix::fs::symlink(&real_base, &base_link).unwrap();
+
+        assert!(BlkBackend::open_cow(&base_link, &overlay).is_err());
+        assert!(!overlay.exists());
     }
 }

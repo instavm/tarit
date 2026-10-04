@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub enum ThreadKind {
     Vcpu,
     Device,
+    Block,
+    Vsock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,16 +46,16 @@ impl SeccompProfile {
                 // glibc lazy-loads thread-local storage and may madvise
                 // the stack on the first `thread::sleep` call.
                 "madvise".into(),
-                // virtio-blk MMIO exits are handled in the vCPU thread.
-                // The backend does pread64/pwrite64/lseek for file I/O.
-                "pread64".into(),
-                "pwrite64".into(),
-                "lseek".into(),
-                "fdatasync".into(),
-                // CoW-overlay and plain-blk FLUSH call File::sync_all() = fsync
-                // for durability; without it the first FLUSH on a write-heavy
-                // guest rootfs kills the vCPU thread with SIGSYS (seccomp).
-                "fsync".into(),
+                // A restored guest's virtio-balloon MMIO notification is
+                // processed on this thread. Lazy-page discard checks
+                // residency before MADV_DONTNEED so it never waits on an
+                // unresolved UFFD fault.
+                "mincore".into(),
+                // Rust's owned-fd drop path checks that the KVM vCPU fd is
+                // still valid with fcntl(F_GETFD) immediately before close.
+                // Permit only that read-only query; general fcntl operations
+                // (duplication, flag mutation, and locking) stay denied.
+                "fcntl".into(),
                 // Rust runtime + glibc need these during normal operation and
                 // especially during a panic unwind: the stack-overflow guard
                 // (sigaltstack), TLS/guard pages (mprotect/mremap), signal setup
@@ -95,7 +97,6 @@ impl SeccompProfile {
                 "recvmsg".into(),
                 "sendmsg".into(),
                 "eventfd2".into(),
-                "ioctl".into(),
                 "futex".into(),
                 "close".into(),
                 "dup".into(),
@@ -119,16 +120,71 @@ impl SeccompProfile {
                 "gettid".into(),
                 "getpid".into(),
                 "clock_gettime".into(),
-                // The vsock transport can lazily connect a configured Unix
-                // socket listener in response to a guest REQUEST. Keep the
-                // profile conservative but complete for that current code path.
-                "socket".into(),
-                "connect".into(),
-                "fcntl".into(),
-                "getsockopt".into(),
-                "setsockopt".into(),
             ],
         }
+    }
+
+    /// Block queue worker. It can poll eventfds and perform positional I/O or
+    /// durable flushes on descriptors opened before confinement, but cannot
+    /// create sockets, open paths, issue ioctls, or use network syscalls.
+    pub fn block() -> Self {
+        Self {
+            kind: ThreadKind::Block,
+            allow: vec![
+                "poll".into(),
+                "ppoll".into(),
+                "read".into(),
+                "write".into(),
+                "pread64".into(),
+                "pwrite64".into(),
+                "lseek".into(),
+                "fdatasync".into(),
+                "fsync".into(),
+                "futex".into(),
+                "close".into(),
+                "mmap".into(),
+                "munmap".into(),
+                "mprotect".into(),
+                "mremap".into(),
+                "rt_sigreturn".into(),
+                "rt_sigaction".into(),
+                "rt_sigprocmask".into(),
+                "sigaltstack".into(),
+                "exit".into(),
+                "exit_group".into(),
+                "nanosleep".into(),
+                "clock_nanosleep".into(),
+                "sched_yield".into(),
+                "restart_syscall".into(),
+                "getrandom".into(),
+                "madvise".into(),
+                "brk".into(),
+                "gettid".into(),
+                "getpid".into(),
+                "clock_gettime".into(),
+            ],
+        }
+    }
+
+    /// Device profile for the virtio-vsock pump. Unlike the network data
+    /// plane, this thread must lazily create host Unix streams. Its `socket`
+    /// syscall is argument-filtered to AF_UNIX/SOCK_STREAM at compile time.
+    pub fn vsock() -> Self {
+        let mut profile = Self::device();
+        profile.kind = ThreadKind::Vsock;
+        profile.allow.extend(
+            [
+                "socket",
+                "connect",
+                "fcntl",
+                "getsockopt",
+                "setsockopt",
+                "ioctl",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        profile
     }
 }
 
@@ -145,7 +201,7 @@ impl SeccompProfile {
 
         for name in &self.allow {
             let nr = self.syscall_nr(name)?;
-            rules.insert(nr, vec![]);
+            rules.insert(nr, self.rules_for_syscall(name)?);
         }
 
         let filter: BpfProgram = SeccompFilter::new(
@@ -167,10 +223,76 @@ impl SeccompProfile {
             match self.kind {
                 ThreadKind::Vcpu => "vCPU",
                 ThreadKind::Device => "device",
+                ThreadKind::Block => "block",
+                ThreadKind::Vsock => "vsock",
             },
             self.allow.len()
         );
         Ok(())
+    }
+
+    fn rules_for_syscall(&self, name: &str) -> Result<Vec<seccompiler::SeccompRule>, String> {
+        use seccompiler::{SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompRule};
+
+        let conditions = match (self.kind, name) {
+            // Linux ioctl request numbers encode the subsystem in bits 8..15.
+            // The vCPU owns only its VcpuFd, so allowing KVM-family requests is
+            // sufficient for KVM_RUN and the KVM_GET/SET state used by pause,
+            // snapshot, and restore, while rejecting arbitrary host ioctls.
+            (ThreadKind::Vcpu, "ioctl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(0xff00),
+                0xae00,
+            )
+            .map_err(|e| format!("ioctl condition: {e}"))?],
+            (ThreadKind::Vcpu, "fcntl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::F_GETFD as u64,
+            )
+            .map_err(|e| format!("fcntl condition: {e}"))?],
+            // Rust may OR CLOEXEC/NONBLOCK into the socket type, so mask only
+            // the low socket-type nibble and separately require AF_UNIX and
+            // protocol 0. This prevents the guest-facing pump from creating
+            // Internet sockets even if it is compromised.
+            (ThreadKind::Vsock, "socket") => vec![
+                SeccompCondition::new(
+                    0,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::Eq,
+                    libc::AF_UNIX as u64,
+                )
+                .map_err(|e| format!("socket domain condition: {e}"))?,
+                SeccompCondition::new(
+                    1,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(0xf),
+                    libc::SOCK_STREAM as u64,
+                )
+                .map_err(|e| format!("socket type condition: {e}"))?,
+                SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0)
+                    .map_err(|e| format!("socket protocol condition: {e}"))?,
+            ],
+            // std's UnixStream::set_nonblocking issues ioctl(FIONBIO) on Linux;
+            // the pump calls it for every lazily connected host stream. Allow
+            // exactly that request and nothing else. The cast is kept because
+            // libc types FIONBIO differently across gnu (c_ulong) and musl
+            // (c_int) targets.
+            #[allow(clippy::unnecessary_cast)]
+            (ThreadKind::Vsock, "ioctl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::FIONBIO as u64,
+            )
+            .map_err(|e| format!("ioctl condition: {e}"))?],
+            _ => return Ok(Vec::new()),
+        };
+        Ok(vec![
+            SeccompRule::new(conditions).map_err(|e| format!("seccomp rule: {e}"))?
+        ])
     }
 
     fn syscall_nr(&self, name: &str) -> Result<i64, String> {
@@ -207,6 +329,7 @@ impl SeccompProfile {
             "nanosleep" => Ok(libc::SYS_nanosleep),
             "clock_nanosleep" => Ok(libc::SYS_clock_nanosleep),
             "madvise" => Ok(libc::SYS_madvise),
+            "mincore" => Ok(libc::SYS_mincore),
             "lseek" => Ok(libc::SYS_lseek),
             "fdatasync" => Ok(libc::SYS_fdatasync),
             "fsync" => Ok(libc::SYS_fsync),
@@ -258,6 +381,80 @@ mod tests {
     }
 
     #[test]
+    fn block_profile_has_no_path_network_or_ioctl_authority() {
+        let profile = SeccompProfile::block();
+        assert_eq!(profile.kind, ThreadKind::Block);
+        for denied in [
+            "open", "openat", "socket", "connect", "ioctl", "recvfrom", "sendto",
+        ] {
+            assert!(!profile.allow.contains(&denied.to_string()), "{denied}");
+        }
+        for required in [
+            "poll",
+            "read",
+            "write",
+            "pread64",
+            "pwrite64",
+            "lseek",
+            "fdatasync",
+            "fsync",
+        ] {
+            assert!(profile.allow.contains(&required.to_string()), "{required}");
+        }
+    }
+
+    #[test]
+    fn vsock_profile_is_the_only_device_profile_with_socket_creation() {
+        let device = SeccompProfile::device();
+        let vsock = SeccompProfile::vsock();
+        assert_eq!(vsock.kind, ThreadKind::Vsock);
+        assert!(!device.allow.contains(&"socket".to_string()));
+        assert!(!device.allow.contains(&"connect".to_string()));
+        assert!(!device.allow.contains(&"ioctl".to_string()));
+        assert!(vsock.allow.contains(&"socket".to_string()));
+        assert!(vsock.allow.contains(&"connect".to_string()));
+        // set_nonblocking on lazily connected host streams needs ioctl(FIONBIO).
+        assert!(vsock.allow.contains(&"ioctl".to_string()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sensitive_syscalls_compile_to_argument_filtered_rules() {
+        assert_eq!(
+            SeccompProfile::vcpu()
+                .rules_for_syscall("ioctl")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SeccompProfile::vcpu()
+                .rules_for_syscall("fcntl")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SeccompProfile::vsock()
+                .rules_for_syscall("socket")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            SeccompProfile::vsock()
+                .rules_for_syscall("ioctl")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(SeccompProfile::device()
+            .rules_for_syscall("read")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn thread_kind_eq() {
         assert_eq!(ThreadKind::Vcpu, ThreadKind::Vcpu);
         assert_ne!(ThreadKind::Vcpu, ThreadKind::Device);
@@ -273,9 +470,13 @@ mod tests {
     }
 
     #[test]
-    fn vcpu_profile_allows_ioctl() {
+    #[cfg(target_os = "linux")]
+    fn vcpu_profile_covers_kvm_and_lazy_balloon_syscalls() {
         let p = SeccompProfile::vcpu();
-        assert!(p.allow.contains(&"ioctl".to_string()));
+        for syscall in ["ioctl", "fcntl", "madvise", "mincore"] {
+            assert!(p.allow.contains(&syscall.to_string()), "{syscall}");
+            assert!(p.syscall_nr(syscall).is_ok(), "{syscall}");
+        }
     }
 
     #[test]
@@ -303,7 +504,6 @@ mod tests {
             "recvmsg",
             "sendmsg",
             "eventfd2",
-            "ioctl",
             "futex",
             "close",
             "dup",

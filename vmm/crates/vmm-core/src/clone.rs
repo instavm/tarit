@@ -5,7 +5,8 @@
 //! - Independent memory (UFFD lazy fault from the shared snapshot mmap)
 //! - Independent disk (sparse CoW overlay)
 //! - Independent network (unique MAC + netns + tap)
-//! - Independent PRNG (virtio-rng re-seeds from /dev/urandom)
+//! - Fresh entropy device (cryptographic clone uniqueness additionally needs a
+//!   generation notification and userspace repair barrier)
 //! - Independent clock (fresh kvmclock base)
 //!
 //! Target: <10ms per clone for the hand-off (UFFD returns immediately;
@@ -80,7 +81,8 @@ pub fn build_clone_specs(
 /// Clone fan-out: restore N instances from a base snapshot.
 ///
 /// This is the PaaS "burst of 100" path. Each clone:
-/// 1. Creates a fresh KvmVm (new kvmclock → clock reset → CRNG re-seed)
+/// 1. Creates a fresh KvmVm (fresh clock/device instances; this alone does not
+///    reseed cloned kernel or userspace PRNG state)
 /// 2. UFFD-registers the memory with the snapshot file (lazy fault-in)
 /// 3. Creates a sparse CoW overlay for the disk
 /// 4. Sets up a unique tap + netns
@@ -102,9 +104,9 @@ pub fn clone_fanout(
         // sparse CoW overlay when `overlay_path` is set, so the clone never
         // reuses the golden snapshot's saved upper layer.
         //
-        // Each restore also creates a fresh
-        // KvmVm with its own kvmclock → the guest detects the clock jump
-        // and re-seeds its CRNG from virtio-rng.
+        // Each restore also creates fresh KVM clock and device instances. Do
+        // not infer cryptographic uniqueness from that: clone admission still
+        // needs a generation notification and userspace repair barrier.
         match controller.restore(&spec.snapshot_path, spec.overlay_path.clone()) {
             Ok(()) => {
                 log::info!(
@@ -141,44 +143,96 @@ pub fn clone_fanout(
 pub fn create_cow_overlay(base_path: &str, overlay_path: &str) -> Result<(), String> {
     use std::fs;
     use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
 
     let src = fs::File::open(base_path).map_err(|e| format!("open base: {e}"))?;
-    let dst = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(overlay_path)
-        .map_err(|e| format!("create overlay: {e}"))?;
+    let overlay_path = PathBuf::from(overlay_path);
+    let parent = overlay_path
+        .parent()
+        .ok_or_else(|| format!("overlay path has no parent: {}", overlay_path.display()))?;
+    let file_name = overlay_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid overlay path: {}", overlay_path.display()))?;
+    let stage_path = parent.join(format!(
+        ".{file_name}.stage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let dst = options
+        .open(&stage_path)
+        .map_err(|e| format!("create staged overlay {}: {e}", stage_path.display()))?;
 
-    let src_size = src.metadata().map_err(|e| format!("metadata: {e}"))?.len();
+    let result = (|| {
+        let src_size = src.metadata().map_err(|e| format!("metadata: {e}"))?.len();
 
-    // Use copy_file_range for efficient CoW on supported filesystems.
-    // SAFETY: `src` and `dst` are valid file descriptors, offsets are null so
-    // the kernel uses and updates each fd's current offset, and `src_size` comes
-    // from the source file metadata.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_copy_file_range,
-            src.as_raw_fd(),
-            std::ptr::null::<i64>(),
-            dst.as_raw_fd(),
-            std::ptr::null::<i64>(),
-            src_size as usize,
-            0u32,
-        )
+        // Use copy_file_range for efficient CoW on supported filesystems.
+        // SAFETY: `src` and `dst` are valid file descriptors, offsets are null so
+        // the kernel uses and updates each fd's current offset, and `src_size` comes
+        // from the source file metadata.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_copy_file_range,
+                src.as_raw_fd(),
+                std::ptr::null::<i64>(),
+                dst.as_raw_fd(),
+                std::ptr::null::<i64>(),
+                src_size as usize,
+                0u32,
+            )
+        };
+
+        if ret < 0 {
+            // Fallback: regular copy.
+            let mut src = fs::File::open(base_path).map_err(|e| format!("reopen: {e}"))?;
+            std::io::copy(
+                &mut src,
+                &mut dst
+                    .try_clone()
+                    .map_err(|e| format!("clone staged overlay: {e}"))?,
+            )
+            .map_err(|e| format!("copy: {e}"))?;
+        }
+        dst.sync_all()
+            .map_err(|e| format!("sync staged overlay {}: {e}", stage_path.display()))?;
+        fs::rename(&stage_path, &overlay_path).map_err(|e| {
+            format!(
+                "publish staged overlay {} -> {}: {e}",
+                stage_path.display(),
+                overlay_path.display()
+            )
+        })?;
+        Ok::<u64, String>(src_size)
+    })();
+    let src_size = match result {
+        Ok(src_size) => src_size,
+        Err(error) => {
+            if let Err(cleanup_error) = fs::remove_file(&stage_path) {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "{error}; cleanup staged overlay {}: {cleanup_error}",
+                        stage_path.display()
+                    ));
+                }
+            }
+            return Err(error);
+        }
     };
 
-    if ret < 0 {
-        // Fallback: regular copy.
-        let mut src = fs::File::open(base_path).map_err(|e| format!("reopen: {e}"))?;
-        std::io::copy(
-            &mut src,
-            &mut fs::File::create(overlay_path).map_err(|e| format!("recreate: {e}"))?,
-        )
-        .map_err(|e| format!("copy: {e}"))?;
-    }
-
-    log::info!("CoW overlay: {base_path} → {overlay_path} ({src_size} bytes)");
+    log::info!(
+        "CoW overlay: {base_path} → {} ({src_size} bytes)",
+        overlay_path.display()
+    );
     Ok(())
 }
 

@@ -39,6 +39,7 @@ start_node(){
   ( export TARIT_API_KEY="$API_KEY" TARIT_PEER_SECRET="$PEER_SECRET" \
       TARIT_DATABASE_URL="$TARIT_DATABASE_URL" TARIT_RDS_CA_FILE="${TARIT_RDS_CA_FILE:-}" \
       TARIT_LISTEN="127.0.0.1:${PORTS[$i]}" TARIT_RPC_ADDR="http://127.0.0.1:${PORTS[$i]}" \
+      TARIT_ALLOW_INSECURE_PEER_HTTP=1 \
       TARIT_HOST_ID="${HOSTS[$i]}" TARIT_SOCKET_DIR="$nd/sockets" TARIT_DB="$nd/taritd.sqlite" \
       TARIT_VMM_BIN="${TARIT_VMM_BIN:-$ROOT/../vmm/target/debug/vmm}" \
       TARIT_KERNEL="${TARIT_KERNEL:-/tmp/vmlinux.microvm}" TARIT_ROOTFS="${TARIT_ROOTFS:-/tmp/vsock-rootfs.ext4}" \

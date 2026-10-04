@@ -470,11 +470,145 @@ impl WarmPoolDraft {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmJailConfig {
+    /// Parent directory for per-VM jail roots.
+    pub base_dir: PathBuf,
+    /// First non-root uid reserved for per-VM jail identities.
+    pub uid_base: u32,
+    /// First non-root gid reserved for per-VM jail identities.
+    pub gid_base: u32,
+    /// Number of unique uid/gid pairs available.
+    pub id_count: u32,
+    /// Versioned jail profile whose supported namespace set is explicit.
+    pub profile: String,
+    /// Per-thread seccomp is mandatory for jailed production VMMs.
+    pub seccomp: bool,
+    /// Run the VMM child as PID 1 in a dedicated PID namespace.
+    pub pid_namespace: bool,
+    /// Run the VMM process in a dedicated empty network namespace.
+    pub network_namespace: bool,
+}
+
+pub const SUPPORTED_VM_JAIL_PROFILE: &str = "chroot-mount-uts-ipc-v1";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmIoQuotaConfig {
+    pub read_bps_max: Option<u64>,
+    pub write_bps_max: Option<u64>,
+    pub read_iops_max: Option<u64>,
+    pub write_iops_max: Option<u64>,
+}
+
+impl VmIoQuotaConfig {
+    pub fn is_configured(&self) -> bool {
+        self.read_bps_max.is_some()
+            || self.write_bps_max.is_some()
+            || self.read_iops_max.is_some()
+            || self.write_iops_max.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VmNetQuotaConfig {
+    pub ingress_bps_max: Option<u64>,
+    pub egress_bps_max: Option<u64>,
+}
+
+impl VmNetQuotaConfig {
+    pub fn is_configured(&self) -> bool {
+        self.ingress_bps_max.is_some() || self.egress_bps_max.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskPressureConfig {
+    /// Filesystem-used byte watermark that enters pressure.
+    pub bytes_high: Option<u64>,
+    /// Filesystem-used byte watermark below which pressure clears.
+    pub bytes_low: Option<u64>,
+    /// Filesystem-used inode watermark that enters pressure.
+    pub inodes_high: Option<u64>,
+    /// Filesystem-used inode watermark below which pressure clears.
+    pub inodes_low: Option<u64>,
+    pub sweep_interval_secs: u64,
+    pub artifact_min_age_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerTlsConfig {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
+    /// PEM bundle of trusted peer certificate authorities. Multiple active CA
+    /// certificates permit a bounded overlap window during rotation.
+    pub client_ca_bundle: PathBuf,
+}
+
+impl Default for DiskPressureConfig {
+    fn default() -> Self {
+        Self {
+            bytes_high: None,
+            bytes_low: None,
+            inodes_high: None,
+            inodes_low: None,
+            sweep_interval_secs: 30,
+            artifact_min_age_secs: 300,
+        }
+    }
+}
+
+impl DiskPressureConfig {
+    pub fn is_configured(&self) -> bool {
+        self.bytes_high.is_some() || self.inodes_high.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedBlockProviderKind {
+    NfsV4_1,
+}
+
+impl SharedBlockProviderKind {
+    pub fn provider_name(self) -> &'static str {
+        match self {
+            Self::NfsV4_1 => "nfs_v4_1_block",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedBlockConfig {
+    pub kind: SharedBlockProviderKind,
+    pub security: tarit_volume::NfsSecurityFlavor,
+    pub endpoint: String,
+    pub export: String,
+    pub mount_root: PathBuf,
+    pub max_size_bytes: u64,
+    pub operation_timeout_ms: u64,
+}
+
+impl fmt::Debug for SharedBlockConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedBlockConfig")
+            .field("kind", &self.kind)
+            .field("security", &self.security)
+            .field("endpoint", &"[REDACTED]")
+            .field("export", &"[REDACTED]")
+            .field("mount_root", &self.mount_root)
+            .field("max_size_bytes", &self.max_size_bytes)
+            .field("operation_timeout_ms", &self.operation_timeout_ms)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
     pub api_keys: ApiKeyRegistry,
     pub host_id: String,
+    /// Random per-process boot identity used to fence stale peer requests.
+    pub host_session_id: Uuid,
     pub vmm_bin: PathBuf,
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
@@ -484,37 +618,65 @@ pub struct Config {
     /// to TARIT_DB so restarts recover tap/IP ownership before allocating.
     pub net_state_path: PathBuf,
     pub images_dir: PathBuf,
+    /// Optional shared NFS-backed raw block provider. Endpoint and export are
+    /// private host configuration and never enter public volume records.
+    pub shared_block: Option<SharedBlockConfig>,
+    /// Immutable OCI admission and signature policy captured at startup.
+    pub image_admission_policy: crate::image::ImageAdmissionPolicy,
     /// Max concurrent sandboxes on this host (placement guard).
     pub max_vms: usize,
     pub max_vcpus: u64,
     pub max_memory_mib: u64,
     pub peer_secret: String,
+    /// Dedicated internal RPC listener. Internal routes are never installed on
+    /// the public control listener.
+    pub peer_listen: Option<SocketAddr>,
+    pub peer_tls: Option<PeerTlsConfig>,
     /// Optional Postgres URL for global fleet sync (`tokio-postgres`, MIT/Apache-2.0).
     pub database_url: Option<String>,
-    /// Address advertised to peers for HTTP RPC (e.g. http://10.0.0.1:8080).
+    /// HTTPS origin advertised to fleet peers. Plain HTTP is available only
+    /// through the explicit development escape hatch below.
     pub rpc_addr: String,
+    /// Explicit development escape hatch for plaintext peer RPC. Fleet mode is
+    /// HTTPS-only by default because signed caller identity and request metadata
+    /// otherwise cross the network in cleartext. The shared key itself is never
+    /// transmitted.
+    pub allow_insecure_peer_http: bool,
     /// Provision per-VM host networking (tap + /30 + NAT). Requires
     /// CAP_NET_ADMIN (run taritd as root). Off by default.
     pub enable_net: bool,
-    /// Treat the rootfs as an immutable, shared read-only base (virtio-blk
-    /// read-only + `ro` cmdline). Lets many VMs safely share one image without
-    /// journal-recovery corruption; writes go to the agent's tmpfs mounts.
-    /// Env TARIT_ROOTFS_READONLY. Off by default (rw, single-owner rootfs).
+    /// Request read-only guest mount semantics (`ro` kernel cmdline). The host
+    /// always opens the base image immutably and gives each VM a private CoW
+    /// overlay, regardless of this setting. Env TARIT_ROOTFS_READONLY.
     pub rootfs_read_only: bool,
-    /// Expose raw tenant names and VM ids as labels on the unauthenticated
+    /// Expose raw tenant names and VM ids as labels on the authenticated
     /// `/metrics` endpoint. Off by default: tenant and vm_id labels are replaced
     /// with a stable short hash so scraping cannot enumerate tenant or VM
     /// identities. Only enable this when `/metrics` is bound to a trusted
     /// private network. Env TARIT_METRICS_EXPOSE_TENANT_LABELS.
     pub metrics_expose_tenant_labels: bool,
+    /// Public API load-shedding and request envelope limits.
+    pub api_max_in_flight: usize,
+    pub api_requests_per_second: u64,
+    pub api_request_timeout_ms: u64,
+    pub api_max_body_bytes: usize,
     /// Parent cgroup v2 path under which taritd places a per-VM cgroup for each
     /// `vmm serve` child (memory + PID limits), e.g. `/sys/fs/cgroup/tarit`.
     /// When unset, no per-VM cgroup is applied (host must be cgroup v2 and
     /// taritd must run as root for this to work). Env TARIT_VM_CGROUP_PARENT.
     pub vm_cgroup_parent: Option<String>,
+    /// Optional per-VM jail root + uid/gid pool. When set, every VMM is staged
+    /// in a private chroot with rewritten in-jail asset and socket paths.
+    pub vm_jail: Option<VmJailConfig>,
     /// pids.max for each per-VM cgroup (fork-bomb ceiling). Env
     /// TARIT_VM_CGROUP_PIDS_MAX. Only used when `vm_cgroup_parent` is set.
     pub vm_cgroup_pids_max: u64,
+    /// Optional per-VM cgroup v2 block-I/O throttles.
+    pub vm_io_quota: VmIoQuotaConfig,
+    /// Optional per-VM host TAP shaping limits.
+    pub vm_net_quota: VmNetQuotaConfig,
+    /// Filesystem pressure admission and owned-artifact GC policy.
+    pub disk_pressure: DiskPressureConfig,
     /// Warm-pool policy (loaded from the optional config file + env).
     pub warm_pool: WarmPoolConfig,
     /// How long a create() waits for a VM slot (warm backfill or a freed cold
@@ -546,6 +708,58 @@ pub struct Config {
     pub share_idle_timeout_secs: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PtyConnectionLimits {
+    pub(crate) global: usize,
+    pub(crate) per_tenant: usize,
+    pub(crate) per_vm: usize,
+}
+
+impl Default for PtyConnectionLimits {
+    fn default() -> Self {
+        Self {
+            global: 1_024,
+            per_tenant: 128,
+            per_vm: 16,
+        }
+    }
+}
+
+impl PtyConnectionLimits {
+    pub(crate) fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        Self::new(
+            env_positive_usize("TARIT_PTY_MAX_ACTIVE_CONNECTIONS", defaults.global)?,
+            env_positive_usize(
+                "TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT",
+                defaults.per_tenant,
+            )?,
+            env_positive_usize("TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM", defaults.per_vm)?,
+        )
+    }
+
+    fn new(global: usize, per_tenant: usize, per_vm: usize) -> Result<Self> {
+        if global > tokio::sync::Semaphore::MAX_PERMITS {
+            bail!("TARIT_PTY_MAX_ACTIVE_CONNECTIONS exceeds the runtime semaphore capacity");
+        }
+        if per_tenant >= global {
+            bail!(
+                "TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT must be less than TARIT_PTY_MAX_ACTIVE_CONNECTIONS"
+            );
+        }
+        if per_vm > per_tenant {
+            bail!(
+                "TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM must not exceed TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT"
+            );
+        }
+        Ok(Self {
+            global,
+            per_tenant,
+            per_vm,
+        })
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let listen = env::var("TARIT_LISTEN")
@@ -557,6 +771,7 @@ impl Config {
         let api_keys = load_api_keys(file_config.as_ref())?;
 
         let host_id = env::var("TARIT_HOST_ID").unwrap_or_else(|_| default_hostname());
+        let host_session_id = Uuid::new_v4();
 
         let vmm_bin = expand_path(&env::var("TARIT_VMM_BIN").unwrap_or_else(|_| "vmm".into()));
         let kernel = expand_path(
@@ -576,18 +791,12 @@ impl Config {
         let images_dir = expand_path(
             &env::var("TARIT_IMAGES_DIR").unwrap_or_else(|_| "~/.taritd/images".into()),
         );
+        let shared_block = parse_shared_block_config()?;
+        let image_admission_policy = crate::image::ImageAdmissionPolicy::from_env()?;
 
-        let max_vms = env::var("TARIT_MAX_VMS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(32);
-        let max_vcpus_env = env::var("TARIT_MAX_VCPUS")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let max_memory_mib = env::var("TARIT_MAX_MEMORY_MIB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(65_536);
+        let max_vms = env_positive_usize("TARIT_MAX_VMS", 32)?;
+        let max_vcpus_env = env_optional_positive_u64("TARIT_MAX_VCPUS")?;
+        let max_memory_mib = env_positive_u64("TARIT_MAX_MEMORY_MIB", 65_536)?;
         let database_url = env::var("TARIT_DATABASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
@@ -595,29 +804,75 @@ impl Config {
             load_peer_secret_for_mode(env::var("TARIT_PEER_SECRET").ok(), database_url.is_some())?;
         let rpc_addr = env::var("TARIT_RPC_ADDR")
             .unwrap_or_else(|_| format!("http://{}:{}", listen.ip(), listen.port()));
+        let allow_insecure_peer_http = env_bool_checked("TARIT_ALLOW_INSECURE_PEER_HTTP", false)?;
+        let production_mode = env_bool_checked("TARIT_PRODUCTION", false)?;
+        let peer_listen = env::var("TARIT_PEER_LISTEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<SocketAddr>()
+                    .context("TARIT_PEER_LISTEN must be a valid socket address")
+            })
+            .transpose()?;
+        let peer_tls = parse_peer_tls_config(
+            env::var("TARIT_PEER_TLS_CERT").ok(),
+            env::var("TARIT_PEER_TLS_KEY").ok(),
+            env::var("TARIT_PEER_TLS_CLIENT_CA").ok(),
+        )?;
+        validate_peer_listener_config(
+            database_url.is_some(),
+            production_mode,
+            allow_insecure_peer_http,
+            peer_listen,
+            peer_tls.as_ref(),
+        )?;
+        validate_rpc_addr(
+            &rpc_addr,
+            database_url.is_some(),
+            allow_insecure_peer_http,
+            production_mode,
+        )?;
 
-        let enable_net = env_bool("TARIT_ENABLE_NET", false);
+        let enable_net = env_bool_checked("TARIT_ENABLE_NET", false)?;
 
-        let rootfs_read_only = env_bool("TARIT_ROOTFS_READONLY", false);
+        let rootfs_read_only = env_bool_checked("TARIT_ROOTFS_READONLY", false)?;
 
-        let metrics_expose_tenant_labels = env_bool("TARIT_METRICS_EXPOSE_TENANT_LABELS", false);
+        let metrics_expose_tenant_labels =
+            env_bool_checked("TARIT_METRICS_EXPOSE_TENANT_LABELS", false)?;
+        let api_max_in_flight = env_positive_usize("TARIT_API_MAX_IN_FLIGHT", 1_024)?;
+        let api_requests_per_second = env_positive_u64("TARIT_API_REQUESTS_PER_SECOND", 5_000)?;
+        let api_request_timeout_ms = env_positive_u64("TARIT_API_REQUEST_TIMEOUT_MS", 180_000)?;
+        let api_max_body_bytes = env_positive_usize("TARIT_API_MAX_BODY_BYTES", 1024 * 1024)?;
 
         let vm_cgroup_parent = env::var("TARIT_VM_CGROUP_PARENT")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let vm_cgroup_pids_max = env::var("TARIT_VM_CGROUP_PIDS_MAX")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024);
+        let vm_jail = parse_vm_jail_config(max_vms)?;
+        let vm_cgroup_pids_max = env_positive_u64("TARIT_VM_CGROUP_PIDS_MAX", 1024)?;
+        let vm_io_quota = VmIoQuotaConfig {
+            read_bps_max: env_optional_positive_u64("TARIT_VM_IO_READ_BPS_MAX")?,
+            write_bps_max: env_optional_positive_u64("TARIT_VM_IO_WRITE_BPS_MAX")?,
+            read_iops_max: env_optional_positive_u64("TARIT_VM_IO_READ_IOPS_MAX")?,
+            write_iops_max: env_optional_positive_u64("TARIT_VM_IO_WRITE_IOPS_MAX")?,
+        };
+        let vm_net_quota = VmNetQuotaConfig {
+            ingress_bps_max: env_optional_positive_u64("TARIT_VM_NET_INGRESS_BPS_MAX")?,
+            egress_bps_max: env_optional_positive_u64("TARIT_VM_NET_EGRESS_BPS_MAX")?,
+        };
+        if vm_io_quota.is_configured() && vm_cgroup_parent.is_none() {
+            bail!("TARIT_VM_IO_* limits require TARIT_VM_CGROUP_PARENT");
+        }
+        if vm_net_quota.is_configured() && !enable_net {
+            bail!("TARIT_VM_NET_* limits require TARIT_ENABLE_NET=1");
+        }
+        let disk_pressure = parse_disk_pressure_config()?;
 
         let warm_pool = load_warm_pool(file_config.as_ref())?;
 
-        let admission_timeout_ms = env::var("TARIT_ADMISSION_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60_000);
-        let reap_on_shutdown = env_bool("TARIT_REAP_ON_SHUTDOWN", true);
+        let admission_timeout_ms = env_positive_u64("TARIT_ADMISSION_TIMEOUT_MS", 60_000)?;
+        let reap_on_shutdown = env_bool_checked("TARIT_REAP_ON_SHUTDOWN", true)?;
 
         // CPU overcommit: when the warm pool is on and TARIT_MAX_VCPUS is not
         // pinned, derive the vCPU ceiling from physical cores * overcommit so
@@ -641,7 +896,7 @@ impl Config {
         let env_usize =
             |k: &str, d: usize| env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
         let autoscale = AutoscaleConfig {
-            enabled: env_bool("TARIT_AUTOSCALE", false),
+            enabled: env_bool_checked("TARIT_AUTOSCALE", false)?,
             min_nodes: env_usize("TARIT_AUTOSCALE_MIN", 1),
             max_nodes: env_usize("TARIT_AUTOSCALE_MAX", 10),
             scale_out_free_vcpus: env_u64("TARIT_AUTOSCALE_OUT_FREE_VCPUS", 2),
@@ -651,7 +906,7 @@ impl Config {
                 .filter(|s| !s.is_empty()),
         };
 
-        let ssh_gateway_enabled = env_bool("TARIT_SSH_GATEWAY", false);
+        let ssh_gateway_enabled = env_bool_checked("TARIT_SSH_GATEWAY", false)?;
         let ssh_gateway_addr = env::var("TARIT_SSH_GATEWAY_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:2222".into())
             .parse::<SocketAddr>()
@@ -682,10 +937,31 @@ impl Config {
             share_idle_timeout_secs_raw.as_deref(),
         )?;
 
+        if production_mode {
+            if !image_admission_policy.require_signature {
+                bail!("TARIT_PRODUCTION requires TARIT_IMAGE_REQUIRE_SIGNATURE=1");
+            }
+            validate_production_requirements(
+                database_url.as_deref(),
+                &vmm_bin,
+                &kernel,
+                &rootfs,
+                enable_net,
+                vm_cgroup_parent.as_deref(),
+                vm_jail.as_ref(),
+                &vm_io_quota,
+                &vm_net_quota,
+                &disk_pressure,
+                shared_block.as_ref(),
+                allow_insecure_peer_http,
+            )?;
+        }
+
         Ok(Self {
             listen,
             api_keys,
             host_id,
+            host_session_id,
             vmm_bin,
             kernel,
             rootfs,
@@ -693,17 +969,30 @@ impl Config {
             db_path,
             net_state_path,
             images_dir,
+            shared_block,
+            image_admission_policy,
             max_vms,
             max_vcpus,
             max_memory_mib,
             peer_secret,
+            peer_listen,
+            peer_tls,
             database_url,
             rpc_addr,
+            allow_insecure_peer_http,
             enable_net,
             rootfs_read_only,
             metrics_expose_tenant_labels,
+            api_max_in_flight,
+            api_requests_per_second,
+            api_request_timeout_ms,
+            api_max_body_bytes,
             vm_cgroup_parent,
+            vm_jail,
             vm_cgroup_pids_max,
+            vm_io_quota,
+            vm_net_quota,
+            disk_pressure,
             warm_pool,
             admission_timeout_ms,
             reap_on_shutdown,
@@ -730,6 +1019,7 @@ impl fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("api_keys", &self.api_keys)
             .field("host_id", &self.host_id)
+            .field("host_session_id", &self.host_session_id)
             .field("vmm_bin", &self.vmm_bin)
             .field("kernel", &self.kernel)
             .field("rootfs", &self.rootfs)
@@ -737,23 +1027,36 @@ impl fmt::Debug for Config {
             .field("db_path", &self.db_path)
             .field("net_state_path", &self.net_state_path)
             .field("images_dir", &self.images_dir)
+            .field("shared_block", &self.shared_block)
+            .field("image_admission_policy", &self.image_admission_policy)
             .field("max_vms", &self.max_vms)
             .field("max_vcpus", &self.max_vcpus)
             .field("max_memory_mib", &self.max_memory_mib)
             .field("peer_secret", &"[REDACTED]")
+            .field("peer_listen", &self.peer_listen)
+            .field("peer_tls", &self.peer_tls)
             .field(
                 "database_url",
                 &self.database_url.as_ref().map(|_| "[REDACTED]"),
             )
             .field("rpc_addr", &self.rpc_addr)
+            .field("allow_insecure_peer_http", &self.allow_insecure_peer_http)
             .field("enable_net", &self.enable_net)
             .field("rootfs_read_only", &self.rootfs_read_only)
             .field(
                 "metrics_expose_tenant_labels",
                 &self.metrics_expose_tenant_labels,
             )
+            .field("api_max_in_flight", &self.api_max_in_flight)
+            .field("api_requests_per_second", &self.api_requests_per_second)
+            .field("api_request_timeout_ms", &self.api_request_timeout_ms)
+            .field("api_max_body_bytes", &self.api_max_body_bytes)
             .field("vm_cgroup_parent", &self.vm_cgroup_parent)
+            .field("vm_jail", &self.vm_jail)
             .field("vm_cgroup_pids_max", &self.vm_cgroup_pids_max)
+            .field("vm_io_quota", &self.vm_io_quota)
+            .field("vm_net_quota", &self.vm_net_quota)
+            .field("disk_pressure", &self.disk_pressure)
             .field("warm_pool", &self.warm_pool)
             .field("admission_timeout_ms", &self.admission_timeout_ms)
             .field("reap_on_shutdown", &self.reap_on_shutdown)
@@ -904,6 +1207,194 @@ fn load_peer_secret_for_mode(raw: Option<String>, cluster_mode: bool) -> Result<
     }
 }
 
+fn parse_peer_tls_config(
+    certificate_chain: Option<String>,
+    private_key: Option<String>,
+    client_ca_bundle: Option<String>,
+) -> Result<Option<PeerTlsConfig>> {
+    match (certificate_chain, private_key, client_ca_bundle) {
+        (None, None, None) => Ok(None),
+        (Some(certificate_chain), Some(private_key), Some(client_ca_bundle)) => {
+            let config = PeerTlsConfig {
+                certificate_chain: expand_path(certificate_chain.trim()),
+                private_key: expand_path(private_key.trim()),
+                client_ca_bundle: expand_path(client_ca_bundle.trim()),
+            };
+            for (name, path) in [
+                ("TARIT_PEER_TLS_CERT", &config.certificate_chain),
+                ("TARIT_PEER_TLS_KEY", &config.private_key),
+                ("TARIT_PEER_TLS_CLIENT_CA", &config.client_ca_bundle),
+            ] {
+                if path.as_os_str().is_empty() {
+                    bail!("{name} must not be empty");
+                }
+            }
+            Ok(Some(config))
+        }
+        _ => bail!(
+            "TARIT_PEER_TLS_CERT, TARIT_PEER_TLS_KEY, and TARIT_PEER_TLS_CLIENT_CA must be configured together"
+        ),
+    }
+}
+
+fn validate_peer_listener_config(
+    cluster_mode: bool,
+    production_mode: bool,
+    allow_insecure_http: bool,
+    peer_listen: Option<SocketAddr>,
+    peer_tls: Option<&PeerTlsConfig>,
+) -> Result<()> {
+    if cluster_mode && peer_listen.is_none() {
+        bail!("fleet mode requires a dedicated TARIT_PEER_LISTEN");
+    }
+    if peer_tls.is_some() && peer_listen.is_none() {
+        bail!("peer TLS requires TARIT_PEER_LISTEN");
+    }
+    if cluster_mode && !allow_insecure_http && peer_tls.is_none() {
+        bail!("fleet peer RPC requires mutual TLS certificate, key, and client CA configuration");
+    }
+    if production_mode && peer_tls.is_none() {
+        bail!("TARIT_PRODUCTION requires mutual TLS on the dedicated peer listener");
+    }
+    if peer_tls.is_some() && allow_insecure_http {
+        bail!("TARIT_ALLOW_INSECURE_PEER_HTTP cannot be combined with peer TLS");
+    }
+    Ok(())
+}
+
+fn validate_rpc_addr(
+    raw: &str,
+    cluster_mode: bool,
+    allow_insecure_http: bool,
+    production_mode: bool,
+) -> Result<()> {
+    let url = reqwest::Url::parse(raw).context("TARIT_RPC_ADDR must be an absolute HTTP URL")?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.port_or_known_default().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        bail!(
+            "TARIT_RPC_ADDR must be a normalized http(s) origin without credentials, path, query, or fragment"
+        );
+    }
+    if cluster_mode && url.scheme() != "https" && !allow_insecure_http {
+        bail!(
+            "fleet peer RPC must use https; set TARIT_ALLOW_INSECURE_PEER_HTTP=1 only for an isolated development network"
+        );
+    }
+    if production_mode && (url.scheme() != "https" || allow_insecure_http) {
+        bail!("TARIT_PRODUCTION requires HTTPS peer RPC and forbids insecure peer HTTP");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_production_requirements(
+    database_url: Option<&str>,
+    vmm_bin: &Path,
+    kernel: &Path,
+    rootfs: &Path,
+    enable_net: bool,
+    vm_cgroup_parent: Option<&str>,
+    vm_jail: Option<&VmJailConfig>,
+    vm_io_quota: &VmIoQuotaConfig,
+    vm_net_quota: &VmNetQuotaConfig,
+    disk_pressure: &DiskPressureConfig,
+    shared_block: Option<&SharedBlockConfig>,
+    allow_insecure_peer_http: bool,
+) -> Result<()> {
+    if !cfg!(target_os = "linux") {
+        bail!("TARIT_PRODUCTION is supported only on Linux");
+    }
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("TARIT_PRODUCTION jail, TAP, cgroup, and device staging require root privileges");
+    }
+    if database_url.is_none() {
+        bail!(
+            "TARIT_PRODUCTION requires TARIT_DATABASE_URL for durable global control-plane state"
+        );
+    }
+    if !enable_net {
+        bail!("TARIT_PRODUCTION requires TARIT_ENABLE_NET=1");
+    }
+    let vm_jail = vm_jail.ok_or_else(|| {
+        anyhow::anyhow!(
+            "TARIT_PRODUCTION requires TARIT_VM_JAIL_BASE plus TARIT_VM_JAIL_UID_BASE/TARIT_VM_JAIL_GID_BASE"
+        )
+    })?;
+    if !vm_jail.base_dir.is_absolute() {
+        bail!("TARIT_VM_JAIL_BASE must be an absolute path");
+    }
+    if vm_jail.profile != SUPPORTED_VM_JAIL_PROFILE {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_PROFILE={SUPPORTED_VM_JAIL_PROFILE}");
+    }
+    if !vm_jail.seccomp {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_SECCOMP=1");
+    }
+    validate_production_jail_network_isolation(vm_jail)?;
+    // Rootfs isolation is enforced by the supervisor: every immutable base is
+    // attached through a private per-VM CoW overlay. `TARIT_ROOTFS_READONLY`
+    // controls guest mount semantics and is intentionally not a production gate.
+    let cgroup = vm_cgroup_parent
+        .map(Path::new)
+        .filter(|path| path.is_absolute() && path.starts_with("/sys/fs/cgroup/"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("TARIT_PRODUCTION requires TARIT_VM_CGROUP_PARENT below /sys/fs/cgroup")
+        })?;
+    if cgroup == Path::new("/sys/fs/cgroup") {
+        bail!("TARIT_VM_CGROUP_PARENT must be a dedicated child cgroup");
+    }
+    if vm_io_quota.is_configured() && vm_cgroup_parent.is_none() {
+        bail!("TARIT_VM_IO_* limits require TARIT_VM_CGROUP_PARENT");
+    }
+    if vm_net_quota.is_configured() && !enable_net {
+        bail!("TARIT_VM_NET_* limits require TARIT_ENABLE_NET=1");
+    }
+    if !disk_pressure.is_configured() {
+        bail!("TARIT_PRODUCTION requires byte or inode disk-pressure high/low watermarks");
+    }
+    if let Some(shared_block) = shared_block {
+        validate_production_shared_block(shared_block)?;
+    }
+    for (name, path) in [
+        ("TARIT_VMM_BIN", vmm_bin),
+        ("TARIT_KERNEL", kernel),
+        ("TARIT_ROOTFS", rootfs),
+    ] {
+        if !path.is_absolute() || !path.is_file() {
+            bail!("{name} must be an existing absolute regular file in TARIT_PRODUCTION");
+        }
+    }
+    if allow_insecure_peer_http {
+        bail!("TARIT_PRODUCTION forbids TARIT_ALLOW_INSECURE_PEER_HTTP");
+    }
+    Ok(())
+}
+
+fn validate_production_shared_block(shared_block: &SharedBlockConfig) -> Result<()> {
+    if shared_block.kind == SharedBlockProviderKind::NfsV4_1
+        && shared_block.security != tarit_volume::NfsSecurityFlavor::Krb5Privacy
+    {
+        bail!("TARIT_PRODUCTION generic NFS volumes require TARIT_SHARED_BLOCK_SECURITY=krb5p");
+    }
+    Ok(())
+}
+
+fn validate_production_jail_network_isolation(vm_jail: &VmJailConfig) -> Result<()> {
+    if !vm_jail.pid_namespace {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_PID_NAMESPACE=1");
+    }
+    if !vm_jail.network_namespace {
+        bail!("TARIT_PRODUCTION requires TARIT_VM_JAIL_NETWORK_NAMESPACE=1");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod security_tests {
     use super::*;
@@ -983,6 +1474,55 @@ mod security_tests {
         assert_ne!(a, b);
         assert!(a.len() >= 32);
         assert!(b.len() >= 32);
+    }
+
+    #[test]
+    fn peer_rpc_origin_requires_https_unless_development_escape_is_explicit() {
+        assert!(validate_rpc_addr("http://node-a:8080", true, false, false).is_err());
+        assert!(validate_rpc_addr("http://node-a:8080", true, true, false).is_ok());
+        assert!(validate_rpc_addr("https://node-a.example:8443", true, false, false).is_ok());
+        assert!(validate_rpc_addr("https://node-a.example/path", true, false, false).is_err());
+        assert!(validate_rpc_addr("https://node-a.example:8443", true, true, true).is_err());
+    }
+
+    #[test]
+    fn fleet_peer_listener_requires_complete_mutual_tls_configuration() {
+        let address = Some("127.0.0.1:8443".parse().unwrap());
+        assert!(validate_peer_listener_config(true, false, false, None, None).is_err());
+        assert!(validate_peer_listener_config(true, false, false, address, None).is_err());
+
+        let tls = PeerTlsConfig {
+            certificate_chain: "node.pem".into(),
+            private_key: "node-key.pem".into(),
+            client_ca_bundle: "peer-ca.pem".into(),
+        };
+        assert!(validate_peer_listener_config(true, false, false, address, Some(&tls)).is_ok());
+        assert!(validate_peer_listener_config(true, false, true, address, Some(&tls)).is_err());
+        assert!(validate_peer_listener_config(false, false, true, address, None).is_ok());
+    }
+
+    #[test]
+    fn peer_tls_paths_are_all_or_nothing() {
+        assert!(parse_peer_tls_config(Some("node.pem".into()), None, None).is_err());
+        assert!(parse_peer_tls_config(
+            Some("node.pem".into()),
+            Some("node-key.pem".into()),
+            Some("peer-ca.pem".into()),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn pty_active_connection_limits_preserve_noisy_neighbor_headroom() {
+        assert_eq!(
+            PtyConnectionLimits::new(1_024, 128, 16).unwrap(),
+            PtyConnectionLimits::default()
+        );
+        assert!(PtyConnectionLimits::new(8, 8, 1).is_err());
+        assert!(PtyConnectionLimits::new(8, 4, 5).is_err());
+        assert!(PtyConnectionLimits::new(8, 4, 4).is_ok());
+        assert!(PtyConnectionLimits::new(tokio::sync::Semaphore::MAX_PERMITS + 1, 4, 1).is_err());
     }
 }
 
@@ -1224,12 +1764,222 @@ fn default_hostname() -> String {
         .unwrap_or_else(|| "localhost".into())
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
+fn env_bool_checked(key: &str, default: bool) -> Result<bool> {
+    match env::var(key) {
+        Ok(raw) => parse_bool(&raw).ok_or_else(|| {
+            anyhow::anyhow!("{key} must be a boolean (1/0, true/false, yes/no, on/off)")
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_positive_u64(key: &str, default: u64) -> Result<u64> {
+    let Some(raw) = env::var(key).ok() else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<u64>()
+        .with_context(|| format!("{key} must be a positive integer"))?;
+    if value == 0 {
+        bail!("{key} must be a positive integer");
+    }
+    Ok(value)
+}
+
+fn env_optional_positive_u64(key: &str) -> Result<Option<u64>> {
     env::var(key)
         .ok()
-        .as_deref()
-        .and_then(parse_bool)
-        .unwrap_or(default)
+        .map(|raw| {
+            let value = raw
+                .parse::<u64>()
+                .with_context(|| format!("{key} must be a positive integer"))?;
+            if value == 0 {
+                bail!("{key} must be a positive integer");
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+fn env_optional_positive_u32(key: &str) -> Result<Option<u32>> {
+    env_optional_positive_u64(key)?
+        .map(|value| u32::try_from(value).with_context(|| format!("{key} exceeds u32")))
+        .transpose()
+}
+
+fn parse_shared_block_config() -> Result<Option<SharedBlockConfig>> {
+    const RELATED: &[&str] = &[
+        "TARIT_SHARED_BLOCK_ENDPOINT",
+        "TARIT_SHARED_BLOCK_EXPORT",
+        "TARIT_SHARED_BLOCK_MOUNT_ROOT",
+        "TARIT_SHARED_BLOCK_MAX_BYTES",
+        "TARIT_SHARED_BLOCK_TIMEOUT_MS",
+        "TARIT_SHARED_BLOCK_SECURITY",
+    ];
+    let provider = env::var("TARIT_SHARED_BLOCK_PROVIDER")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(provider) = provider else {
+        if RELATED.iter().any(|key| env::var(key).is_ok()) {
+            bail!("TARIT_SHARED_BLOCK_PROVIDER is required when shared-block settings are present");
+        }
+        return Ok(None);
+    };
+    let kind = match provider.as_str() {
+        "nfs_v4_1_block" => SharedBlockProviderKind::NfsV4_1,
+        _ => bail!(
+            "unsupported TARIT_SHARED_BLOCK_PROVIDER={provider:?}; supported provider is nfs_v4_1_block"
+        ),
+    };
+    let security = match env::var("TARIT_SHARED_BLOCK_SECURITY")
+        .unwrap_or_else(|_| "sys".into())
+        .as_str()
+    {
+        "sys" => tarit_volume::NfsSecurityFlavor::Sys,
+        "krb5" => tarit_volume::NfsSecurityFlavor::Krb5,
+        "krb5i" => tarit_volume::NfsSecurityFlavor::Krb5Integrity,
+        "krb5p" => tarit_volume::NfsSecurityFlavor::Krb5Privacy,
+        value => bail!(
+            "unsupported TARIT_SHARED_BLOCK_SECURITY={value:?}; supported values are sys, krb5, krb5i, and krb5p"
+        ),
+    };
+    let endpoint = env::var("TARIT_SHARED_BLOCK_ENDPOINT")
+        .context("TARIT_SHARED_BLOCK_ENDPOINT must be set")?;
+    let export =
+        env::var("TARIT_SHARED_BLOCK_EXPORT").context("TARIT_SHARED_BLOCK_EXPORT must be set")?;
+    tarit_volume::NfsProvider::new(
+        tarit_volume::NfsDialect::GenericV4_1,
+        endpoint.clone(),
+        export.clone(),
+        None,
+        None,
+    )
+    .and_then(|provider| provider.with_security(security))
+    .map_err(|error| anyhow::anyhow!("invalid shared-block NFS configuration: {error}"))?;
+    let mount_root = expand_path(
+        &env::var("TARIT_SHARED_BLOCK_MOUNT_ROOT")
+            .context("TARIT_SHARED_BLOCK_MOUNT_ROOT must be set")?,
+    );
+    if !mount_root.is_absolute() {
+        bail!("TARIT_SHARED_BLOCK_MOUNT_ROOT must be an absolute path");
+    }
+    let max_size_bytes =
+        env_positive_u64("TARIT_SHARED_BLOCK_MAX_BYTES", 1024 * 1024 * 1024 * 1024)?;
+    if max_size_bytes < tarit_volume::MIN_BLOCK_VOLUME_BYTES {
+        bail!(
+            "TARIT_SHARED_BLOCK_MAX_BYTES must be at least {}",
+            tarit_volume::MIN_BLOCK_VOLUME_BYTES
+        );
+    }
+    Ok(Some(SharedBlockConfig {
+        kind,
+        security,
+        endpoint,
+        export,
+        mount_root,
+        max_size_bytes,
+        operation_timeout_ms: env_positive_u64("TARIT_SHARED_BLOCK_TIMEOUT_MS", 20_000)?,
+    }))
+}
+
+fn parse_vm_jail_config(max_vms: usize) -> Result<Option<VmJailConfig>> {
+    let base_dir = env::var("TARIT_VM_JAIL_BASE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from);
+    let uid_base = env_optional_positive_u32("TARIT_VM_JAIL_UID_BASE")?;
+    let gid_base = env_optional_positive_u32("TARIT_VM_JAIL_GID_BASE")?;
+    let id_count = env_optional_positive_u32("TARIT_VM_JAIL_ID_COUNT")?;
+    let profile =
+        env::var("TARIT_VM_JAIL_PROFILE").unwrap_or_else(|_| SUPPORTED_VM_JAIL_PROFILE.to_string());
+    let seccomp = env_bool_checked("TARIT_VM_JAIL_SECCOMP", true)?;
+    let pid_namespace = env_bool_checked("TARIT_VM_JAIL_PID_NAMESPACE", false)?;
+    let network_namespace = env_bool_checked("TARIT_VM_JAIL_NETWORK_NAMESPACE", false)?;
+
+    if base_dir.is_none()
+        && uid_base.is_none()
+        && gid_base.is_none()
+        && id_count.is_none()
+        && env::var("TARIT_VM_JAIL_PROFILE").is_err()
+        && env::var("TARIT_VM_JAIL_SECCOMP").is_err()
+        && env::var("TARIT_VM_JAIL_PID_NAMESPACE").is_err()
+        && env::var("TARIT_VM_JAIL_NETWORK_NAMESPACE").is_err()
+    {
+        return Ok(None);
+    }
+
+    let base_dir = base_dir.ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_BASE must be set"))?;
+    if !base_dir.is_absolute() {
+        bail!("TARIT_VM_JAIL_BASE must be an absolute path");
+    }
+    let uid_base = uid_base.ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_UID_BASE must be set"))?;
+    let gid_base = gid_base.ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_GID_BASE must be set"))?;
+    let id_count = id_count.unwrap_or_else(|| u32::try_from(max_vms.max(1)).unwrap_or(u32::MAX));
+    let required_ids = u32::try_from(max_vms.max(1))
+        .context("TARIT_MAX_VMS exceeds the supported jail uid/gid pool size")?;
+    if id_count < required_ids {
+        bail!("TARIT_VM_JAIL_ID_COUNT must be at least TARIT_MAX_VMS");
+    }
+    uid_base
+        .checked_add(id_count - 1)
+        .ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_UID_BASE + ID_COUNT overflows u32"))?;
+    gid_base
+        .checked_add(id_count - 1)
+        .ok_or_else(|| anyhow::anyhow!("TARIT_VM_JAIL_GID_BASE + ID_COUNT overflows u32"))?;
+    if profile != SUPPORTED_VM_JAIL_PROFILE {
+        bail!(
+            "unsupported TARIT_VM_JAIL_PROFILE={profile:?}; supported profile is {SUPPORTED_VM_JAIL_PROFILE}"
+        );
+    }
+    if !seccomp {
+        bail!("TARIT_VM_JAIL_SECCOMP=0 is unsupported for the safe jail profile");
+    }
+
+    Ok(Some(VmJailConfig {
+        base_dir,
+        uid_base,
+        gid_base,
+        id_count,
+        profile,
+        seccomp,
+        pid_namespace,
+        network_namespace,
+    }))
+}
+
+fn parse_disk_pressure_config() -> Result<DiskPressureConfig> {
+    let bytes_high = env_optional_positive_u64("TARIT_DISK_BYTES_HIGH_WATERMARK")?;
+    let bytes_low = env_optional_positive_u64("TARIT_DISK_BYTES_LOW_WATERMARK")?;
+    let inodes_high = env_optional_positive_u64("TARIT_DISK_INODES_HIGH_WATERMARK")?;
+    let inodes_low = env_optional_positive_u64("TARIT_DISK_INODES_LOW_WATERMARK")?;
+    validate_watermark_pair("TARIT_DISK_BYTES", bytes_high, bytes_low)?;
+    validate_watermark_pair("TARIT_DISK_INODES", inodes_high, inodes_low)?;
+    Ok(DiskPressureConfig {
+        bytes_high,
+        bytes_low,
+        inodes_high,
+        inodes_low,
+        sweep_interval_secs: env_positive_u64("TARIT_ARTIFACT_GC_INTERVAL_SECS", 30)?,
+        artifact_min_age_secs: env_positive_u64("TARIT_ARTIFACT_GC_MIN_AGE_SECS", 300)?,
+    })
+}
+
+fn validate_watermark_pair(prefix: &str, high: Option<u64>, low: Option<u64>) -> Result<()> {
+    match (high, low) {
+        (None, None) => Ok(()),
+        (Some(high), Some(low)) if low < high => Ok(()),
+        (Some(_), Some(_)) => {
+            bail!("{prefix}_LOW_WATERMARK must be less than {prefix}_HIGH_WATERMARK")
+        }
+        _ => bail!("{prefix}_HIGH_WATERMARK and {prefix}_LOW_WATERMARK must be set together"),
+    }
+}
+
+fn env_positive_usize(key: &str, default: usize) -> Result<usize> {
+    let value = env_positive_u64(key, default as u64)?;
+    usize::try_from(value).with_context(|| format!("{key} exceeds this platform's size limit"))
 }
 
 fn env_usize(key: &str) -> Option<usize> {
@@ -1277,9 +2027,124 @@ pub fn expand_path(raw: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn parse_reap(raw: Option<&str>) -> bool {
         raw.and_then(parse_bool).unwrap_or(true)
+    }
+
+    const SHARED_BLOCK_ENV: &[&str] = &[
+        "TARIT_SHARED_BLOCK_PROVIDER",
+        "TARIT_SHARED_BLOCK_ENDPOINT",
+        "TARIT_SHARED_BLOCK_EXPORT",
+        "TARIT_SHARED_BLOCK_MOUNT_ROOT",
+        "TARIT_SHARED_BLOCK_MAX_BYTES",
+        "TARIT_SHARED_BLOCK_TIMEOUT_MS",
+        "TARIT_SHARED_BLOCK_SECURITY",
+    ];
+
+    fn clear_shared_block_env() {
+        for key in SHARED_BLOCK_ENV {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn shared_block_config_is_all_or_none() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        assert!(parse_shared_block_config().unwrap().is_none());
+
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "127.0.0.1");
+        let error = parse_shared_block_config().expect_err("partial config must fail closed");
+        assert!(error.to_string().contains("TARIT_SHARED_BLOCK_PROVIDER"));
+        clear_shared_block_env();
+    }
+
+    #[test]
+    fn shared_block_config_parses_validated_nfs_profile() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        std::env::set_var("TARIT_SHARED_BLOCK_PROVIDER", "nfs_v4_1_block");
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "127.0.0.1");
+        std::env::set_var("TARIT_SHARED_BLOCK_EXPORT", "/srv/tarit");
+        std::env::set_var("TARIT_SHARED_BLOCK_MOUNT_ROOT", "/run/tarit/shared-block");
+        std::env::set_var("TARIT_SHARED_BLOCK_MAX_BYTES", "8388608");
+        std::env::set_var("TARIT_SHARED_BLOCK_TIMEOUT_MS", "30000");
+
+        let config = parse_shared_block_config().unwrap().unwrap();
+        assert_eq!(config.kind, SharedBlockProviderKind::NfsV4_1);
+        assert_eq!(config.security, tarit_volume::NfsSecurityFlavor::Sys);
+        assert_eq!(config.endpoint, "127.0.0.1");
+        assert_eq!(config.export, "/srv/tarit");
+        assert_eq!(config.mount_root, PathBuf::from("/run/tarit/shared-block"));
+        assert_eq!(config.max_size_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.operation_timeout_ms, 30_000);
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("127.0.0.1"));
+        assert!(!debug.contains("/srv/tarit"));
+        clear_shared_block_env();
+    }
+
+    #[test]
+    fn production_shared_nfs_requires_privacy_protection() {
+        let base = SharedBlockConfig {
+            kind: SharedBlockProviderKind::NfsV4_1,
+            security: tarit_volume::NfsSecurityFlavor::Sys,
+            endpoint: "server.internal".into(),
+            export: "/srv/tarit".into(),
+            mount_root: PathBuf::from("/run/tarit/shared-block"),
+            max_size_bytes: 8 * 1024 * 1024,
+            operation_timeout_ms: 30_000,
+        };
+        let error = validate_production_shared_block(&base)
+            .expect_err("AUTH_SYS must not be admitted in production");
+        assert!(error.to_string().contains("krb5p"));
+        let protected = SharedBlockConfig {
+            security: tarit_volume::NfsSecurityFlavor::Krb5Privacy,
+            ..base
+        };
+        validate_production_shared_block(&protected).unwrap();
+    }
+
+    #[test]
+    fn shared_block_security_flavor_is_validated() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        std::env::set_var("TARIT_SHARED_BLOCK_PROVIDER", "nfs_v4_1_block");
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "server.internal");
+        std::env::set_var("TARIT_SHARED_BLOCK_EXPORT", "/srv/tarit");
+        std::env::set_var("TARIT_SHARED_BLOCK_MOUNT_ROOT", "/run/tarit/shared-block");
+        std::env::set_var("TARIT_SHARED_BLOCK_SECURITY", "krb5p");
+        let config = parse_shared_block_config().unwrap().unwrap();
+        assert_eq!(
+            config.security,
+            tarit_volume::NfsSecurityFlavor::Krb5Privacy
+        );
+
+        std::env::set_var("TARIT_SHARED_BLOCK_SECURITY", "soft");
+        let error = parse_shared_block_config().expect_err("unknown flavor must fail closed");
+        assert!(error.to_string().contains("supported values"));
+        clear_shared_block_env();
+    }
+
+    #[test]
+    fn shared_block_config_rejects_too_small_volume_ceiling() {
+        let _guard = env_lock();
+        clear_shared_block_env();
+        std::env::set_var("TARIT_SHARED_BLOCK_PROVIDER", "nfs_v4_1_block");
+        std::env::set_var("TARIT_SHARED_BLOCK_ENDPOINT", "127.0.0.1");
+        std::env::set_var("TARIT_SHARED_BLOCK_EXPORT", "/srv/tarit");
+        std::env::set_var("TARIT_SHARED_BLOCK_MOUNT_ROOT", "/run/tarit/shared-block");
+        std::env::set_var("TARIT_SHARED_BLOCK_MAX_BYTES", "1024");
+        let error = parse_shared_block_config().expect_err("undersized ceiling must fail");
+        assert!(error.to_string().contains("must be at least"));
+        clear_shared_block_env();
     }
 
     #[test]
@@ -1426,5 +2291,77 @@ mod tests {
         .unwrap();
 
         assert!(warm_pool_draft_from_file(Some(&file)).finish().is_err());
+    }
+
+    #[test]
+    fn vm_jail_config_requires_base_uid_and_gid_together() {
+        let _guard = env_lock();
+        std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
+        std::env::remove_var("TARIT_VM_JAIL_UID_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_GID_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_ID_COUNT");
+        let error = parse_vm_jail_config(4).expect_err("partial jail config must fail");
+        assert!(error.to_string().contains("TARIT_VM_JAIL_UID_BASE"));
+        std::env::remove_var("TARIT_VM_JAIL_BASE");
+    }
+
+    #[test]
+    fn vm_jail_config_defaults_id_count_to_max_vms() {
+        let _guard = env_lock();
+        std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
+        std::env::set_var("TARIT_VM_JAIL_UID_BASE", "200000");
+        std::env::set_var("TARIT_VM_JAIL_GID_BASE", "300000");
+        std::env::remove_var("TARIT_VM_JAIL_ID_COUNT");
+        let jail = parse_vm_jail_config(8).unwrap().expect("jail config");
+        assert_eq!(jail.base_dir, PathBuf::from("/srv/tarit/jails"));
+        assert_eq!(jail.uid_base, 200_000);
+        assert_eq!(jail.gid_base, 300_000);
+        assert_eq!(jail.id_count, 8);
+        assert_eq!(jail.profile, SUPPORTED_VM_JAIL_PROFILE);
+        assert!(jail.seccomp);
+        std::env::remove_var("TARIT_VM_JAIL_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_UID_BASE");
+        std::env::remove_var("TARIT_VM_JAIL_GID_BASE");
+    }
+
+    #[test]
+    fn vm_jail_parses_pid_and_network_namespaces() {
+        let _guard = env_lock();
+        std::env::set_var("TARIT_VM_JAIL_BASE", "/srv/tarit/jails");
+        std::env::set_var("TARIT_VM_JAIL_UID_BASE", "200000");
+        std::env::set_var("TARIT_VM_JAIL_GID_BASE", "300000");
+        std::env::set_var("TARIT_VM_JAIL_PID_NAMESPACE", "1");
+        std::env::set_var("TARIT_VM_JAIL_NETWORK_NAMESPACE", "1");
+        let jail = parse_vm_jail_config(8).unwrap().unwrap();
+        assert!(jail.pid_namespace);
+        assert!(jail.network_namespace);
+        for key in [
+            "TARIT_VM_JAIL_BASE",
+            "TARIT_VM_JAIL_UID_BASE",
+            "TARIT_VM_JAIL_GID_BASE",
+            "TARIT_VM_JAIL_PID_NAMESPACE",
+            "TARIT_VM_JAIL_NETWORK_NAMESPACE",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn production_jail_fails_closed_without_network_namespace() {
+        let jail = VmJailConfig {
+            base_dir: PathBuf::from("/srv/tarit/jails"),
+            uid_base: 200_000,
+            gid_base: 300_000,
+            id_count: 8,
+            profile: SUPPORTED_VM_JAIL_PROFILE.into(),
+            seccomp: true,
+            pid_namespace: true,
+            network_namespace: false,
+        };
+        let error = validate_production_jail_network_isolation(&jail)
+            .expect_err("host-network jail must not pass the production gate");
+        assert!(error
+            .to_string()
+            .contains("TARIT_VM_JAIL_NETWORK_NAMESPACE=1"));
     }
 }

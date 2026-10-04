@@ -72,6 +72,7 @@ exceptions = [
     { name = "tarit-fleet", allow = ["AGPL-3.0-or-later"] },
     { name = "tarit-store", allow = ["AGPL-3.0-or-later"] },
     { name = "tarit-types", allow = ["AGPL-3.0-or-later"] },
+    { name = "tarit-volume", allow = ["AGPL-3.0-or-later"] },
     { name = "tarit-vmm-client", allow = ["AGPL-3.0-or-later"] },
     { name = "taritd", allow = ["AGPL-3.0-or-later"] },
 ]

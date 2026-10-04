@@ -146,6 +146,7 @@ struct CreateVmRequest {
 pub struct CreateVmResponse {
     pub id: Uuid,
     pub status: String,
+    pub startup_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

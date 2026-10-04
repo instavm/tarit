@@ -8,6 +8,7 @@
 # Install location (override e.g. `make install PREFIX=$HOME/.local`):
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
+LIBEXECDIR ?= $(PREFIX)/libexec/tarit
 DESTDIR ?=
 
 CARGO ?= cargo
@@ -32,17 +33,20 @@ taritd:
 agent:
 	$(MAKE) -C vmm/guest/agent
 
-# One-time quickstart assets: build a vsock-capable guest kernel and pre-pull an
-# Ubuntu rootfs (into guest-assets/), so starting a microVM later is instant.
+# One-time quickstart assets: fetch the verified guest kernel (or build it from
+# pinned source) and pre-pull an Ubuntu rootfs into guest-assets/.
 guest:
 	./scripts/setup-guest.sh
 
-# Install both binaries to $(BINDIR) (needs write access; use sudo for /usr/local).
+# Install host binaries plus the guest-only agent (use sudo for /usr/local).
 install: build
 	install -d "$(DESTDIR)$(BINDIR)"
+	install -d "$(DESTDIR)$(LIBEXECDIR)"
 	install -m755 vmm/target/release/vmm     "$(DESTDIR)$(BINDIR)/vmm"
 	install -m755 orch/target/release/taritd "$(DESTDIR)$(BINDIR)/taritd"
+	install -m755 vmm/guest/agent/vmm-agent  "$(DESTDIR)$(LIBEXECDIR)/vmm-agent"
 	@echo "installed vmm + taritd to $(DESTDIR)$(BINDIR)"
+	@echo "installed guest agent to $(DESTDIR)$(LIBEXECDIR)/vmm-agent"
 
 # Install only the VMM.
 install-vmm: vmm
