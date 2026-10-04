@@ -322,7 +322,9 @@ fn connect_nonblocking(path: &Path, deadline: Instant) -> Result<UnixStream, Vmm
         }
     }
     request_phase_timeout(Some(deadline), Instant::now(), Duration::MAX)?;
-    stream.set_nonblocking(false)?;
+    // Readiness only promises that some bytes can be transferred. Keep the
+    // socket nonblocking so a write larger than the available send buffer
+    // returns control to the deadline-aware polling loop.
     Ok(stream)
 }
 
@@ -898,6 +900,74 @@ mod tests {
         ));
         release_tx.send(()).expect("release server");
         server.join().expect("join server");
+    }
+
+    #[test]
+    fn request_timeout_covers_a_peer_that_stops_reading() {
+        let socket = socket_path();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket.0).expect("bind test VMM socket");
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept client");
+            // Keep the connection open without consuming the request. A large
+            // command must fill the socket send buffer and exercise backpressure.
+            release_rx.recv().expect("release server");
+        });
+        let (result_tx, result_rx) = mpsc::channel();
+        let path = socket.0.clone();
+        let client = std::thread::spawn(move || {
+            let result = VmmClient::new(path)
+                .with_request_timeout(Duration::from_millis(100))
+                .exec(&"x".repeat(8 * 1024 * 1024), 1000);
+            result_tx.send(result).expect("send request result");
+        });
+
+        let result = result_rx.recv_timeout(Duration::from_secs(2));
+        // Always release and join the peer, including when the regression
+        // leaves the client stuck in a blocking write past its deadline.
+        release_tx.send(()).expect("release server");
+        server.join().expect("join server");
+        client.join().expect("join client");
+
+        let error = result
+            .expect("the request must time out without the peer closing")
+            .expect_err("a peer that does not read must time out");
+        assert!(matches!(
+            error,
+            VmmError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn large_request_survives_write_backpressure_within_deadline() {
+        let socket = socket_path();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket.0).expect("bind test VMM socket");
+        let command = "x".repeat(8 * 1024 * 1024);
+        let expected_command = command.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            std::thread::sleep(Duration::from_millis(100));
+            let request: ApiRequest =
+                serde_json::from_slice(&read_api_frame(&mut stream).expect("read request"))
+                    .expect("decode request");
+            assert!(matches!(
+                request,
+                ApiRequest::Exec { command, .. } if command == expected_command
+            ));
+            let body = serde_json::to_vec(&ApiResponse::Ok).expect("encode response");
+            write_api_frame(&mut stream, &body).expect("write response");
+        });
+
+        let result = VmmClient::new(&socket.0)
+            .with_request_timeout(Duration::from_secs(5))
+            .request_ok(&ApiRequest::Exec {
+                command,
+                timeout_ms: 1000,
+            });
+        server.join().expect("join server");
+        assert!(matches!(result.expect("complete request"), ApiResponse::Ok));
     }
 
     #[test]
