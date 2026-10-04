@@ -26,3 +26,6 @@ budget to polling an existing execution. Deadlines must be finite and positive;
 poll intervals must be finite and nonnegative. Expiry raises
 `TaritDeadlineExceeded` and stops waiting; an already submitted guest command
 may continue running.
+
+`pollIntervalMs` is the minimum wait after a pending response before another
+poll. If the deadline expires before that interval ends, no further poll is sent.

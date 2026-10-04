@@ -24,6 +24,7 @@ export interface ExecuteOptions {
   timeoutMs?: number;
   /** Total wait budget, including submission and HTTP polling in execute(). */
   deadlineMs?: number;
+  /** Minimum delay after a pending response before the next execution poll. */
   pollIntervalMs?: number;
 }
 
@@ -105,6 +106,13 @@ export class TaritPtyConnectionError extends Error {
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function sleepUntil(wakeAt: number): Promise<void> {
+  do {
+    const remaining = Math.max(0, wakeAt - performance.now());
+    await sleep(Math.min(Math.ceil(remaining), 2_147_483_647));
+  } while (performance.now() < wakeAt);
 }
 
 function validatePollInterval(milliseconds: number): void {
@@ -586,7 +594,7 @@ export class TaritClient {
       if (TERMINAL_EXECUTION_STATUS.has(result.data.status)) return result.data;
       const remaining = deadline - performance.now();
       if (remaining <= 0) throw new TaritDeadlineExceeded(`execution ${executionId} exceeded its deadline`);
-      await sleep(Math.min(Math.ceil(Math.min(pollInterval, remaining)), 2_147_483_647));
+      await sleepUntil(Math.min(performance.now() + pollInterval, deadline));
     }
   }
 }

@@ -62,6 +62,49 @@ test("waitExecution does not poll again after sleeping to the deadline", async (
   assert.equal(requests, 1);
 });
 
+for (const boundary of [
+  { name: "deadline", deadlineMs: 10, pollIntervalMs: 100, expires: true },
+  { name: "poll interval", deadlineMs: 100, pollIntervalMs: 10, expires: false },
+]) {
+  test(`waitExecution rechecks its ${boundary.name} after an early wake`, async (context) => {
+    let elapsed = 0;
+    context.mock.method(performance, "now", () => elapsed);
+    context.mock.timers.enable({ apis: ["setTimeout"] });
+    const polls: number[] = [];
+    const fetch: typeof globalThis.fetch = async () => {
+      polls.push(elapsed);
+      return executionResponse(polls.length === 1 ? "pending" : "completed");
+    };
+    const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
+    const outcome = client.waitExecution(executionId, {
+      deadlineMs: boundary.deadlineMs,
+      pollIntervalMs: boundary.pollIntervalMs,
+    }).then(
+      (record) => ({ record, error: undefined }),
+      (error: unknown) => ({ record: undefined, error }),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(polls, [0]);
+
+    // Timer callbacks can run before the requested monotonic time is reached.
+    elapsed = 9.5;
+    context.mock.timers.tick(10);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(polls, [0]);
+
+    elapsed = 10;
+    context.mock.timers.tick(1);
+    const result = await outcome;
+    if (boundary.expires) {
+      assert.ok(result.error instanceof TaritDeadlineExceeded);
+      assert.deepEqual(polls, [0]);
+    } else {
+      assert.equal(result.record?.status, "completed");
+      assert.deepEqual(polls, [0, 10]);
+    }
+  });
+}
+
 test("execute uses one budget across submission and polling", async (context) => {
   let elapsed = 0;
   context.mock.method(performance, "now", () => elapsed);
