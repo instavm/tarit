@@ -251,13 +251,21 @@ export class PtyConnection {
           this.socket.close(1002, "protocol error");
         });
     });
-    this.socket.addEventListener("error", () => this.fail(new TaritPtyConnectionError("PTY WebSocket failed")));
+    this.socket.addEventListener("error", () => {
+      this.messageChain = this.messageChain.then(() => this.fail(new TaritPtyConnectionError("PTY WebSocket failed")));
+    });
     this.socket.addEventListener("close", (event) => {
-      if (!this.sawExit && !this.closedByClient) {
-        this.fail(new TaritPtyClosed(`PTY session ${this.ptyId} closed before an exit frame (code ${event.code})`));
-      } else if (this.closedByClient) {
-        this.fail(new TaritPtyClosed(`PTY session ${this.ptyId} was closed by the client`));
-      }
+      // WebSocket events can arrive while an earlier Blob is still decoding.
+      // Deliver those frames before completing or rejecting pending reads.
+      this.messageChain = this.messageChain.then(() => {
+        if (this.closedByClient) {
+          this.fail(new TaritPtyClosed(`PTY session ${this.ptyId} was closed by the client`));
+        } else if (this.sawExit) {
+          this.fail(new TaritPtyClosed(`PTY session ${this.ptyId} has exited`));
+        } else {
+          this.fail(new TaritPtyClosed(`PTY session ${this.ptyId} closed before an exit frame (code ${event.code})`));
+        }
+      });
     });
   }
 
@@ -310,6 +318,7 @@ export class PtyConnection {
   }
 
   private async acceptMessage(data: unknown): Promise<void> {
+    if (this.terminalError !== undefined) return;
     let message: PtyMessage;
     if (typeof data === "string") {
       let control: unknown;
@@ -336,6 +345,8 @@ export class PtyConnection {
     } else {
       throw new TaritPtyProtocolError("PTY server sent an unsupported binary message");
     }
+    // An explicit client close can interrupt asynchronous Blob conversion.
+    if (this.terminalError !== undefined) return;
     const waiter = this.waiters.shift();
     if (waiter === undefined) this.queued.push(message);
     else {
