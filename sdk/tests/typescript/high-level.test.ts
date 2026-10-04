@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  PtyConnection,
   TaritApiError,
   TaritClient,
   TaritDeadlineExceeded,
+  TaritPtyClosed,
+  TaritPtyConnectionError,
   TaritPtyProtocolError,
   type PtyWebSocket,
 } from "../../typescript/src/index.js";
@@ -66,6 +69,79 @@ class FakeWebSocket extends EventTarget {
     return this as unknown as PtyWebSocket;
   }
 }
+
+test("PTY drains buffered output and exit before a following close", async () => {
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key" });
+  const socket = new FakeWebSocket();
+  socket.open();
+  const pty = new PtyConnection(client, vmId, ptyId, socket.asPtySocket());
+  const output = pty.read();
+  // Blob conversion is asynchronous. The transport may report close before
+  // the SDK has decoded messages that arrived earlier on the wire.
+  socket.message(new Blob(["last output"]));
+  socket.message('{"type":"exit","exit_code":7}');
+  socket.close();
+  assert.deepEqual(await output, { type: "data", data: new TextEncoder().encode("last output") });
+  assert.deepEqual(await pty.read(), { type: "exit", exitCode: 7 });
+  await assert.rejects(() => pty.read({ deadlineMs: 50 }), TaritPtyClosed);
+});
+
+test("PTY preserves output before reporting a close without an exit", async () => {
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key" });
+  const socket = new FakeWebSocket();
+  socket.open();
+  const pty = new PtyConnection(client, vmId, ptyId, socket.asPtySocket());
+  const output = pty.read();
+  socket.message(new Uint8Array([42]));
+  socket.close();
+  assert.deepEqual(await output, { type: "data", data: new Uint8Array([42]) });
+  await assert.rejects(() => pty.read(), /closed before an exit frame/);
+});
+
+test("PTY reports a malformed frame before a following close", async () => {
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key" });
+  const socket = new FakeWebSocket();
+  socket.open();
+  const pty = new PtyConnection(client, vmId, ptyId, socket.asPtySocket());
+  const result = pty.read();
+  socket.message("not JSON");
+  socket.close();
+  await assert.rejects(result, TaritPtyProtocolError);
+});
+
+test("PTY preserves output before a following transport error", async () => {
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key" });
+  const socket = new FakeWebSocket();
+  socket.open();
+  const pty = new PtyConnection(client, vmId, ptyId, socket.asPtySocket());
+  const output = pty.read();
+  socket.message(new Uint8Array([42]));
+  socket.dispatchEvent(new Event("error"));
+  socket.close();
+  assert.deepEqual(await output, { type: "data", data: new Uint8Array([42]) });
+  await assert.rejects(() => pty.read(), TaritPtyConnectionError);
+});
+
+test("explicit PTY close discards a frame still being decoded", async () => {
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key" });
+  const socket = new FakeWebSocket();
+  socket.open();
+  const pty = new PtyConnection(client, vmId, ptyId, socket.asPtySocket());
+  let release: (data: ArrayBuffer) => void = () => assert.fail("decoding has not started");
+  let started: () => void = () => undefined;
+  const decoding = new Promise<void>((resolve) => { started = resolve; });
+  const blob = new Blob();
+  blob.arrayBuffer = () => new Promise<ArrayBuffer>((resolve) => {
+    release = resolve;
+    started();
+  });
+  socket.message(blob);
+  await decoding;
+  await pty.close({ deleteSession: false });
+  release(new ArrayBuffer(1));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await assert.rejects(() => pty.read(), TaritPtyClosed);
+});
 
 test("execute polls to terminal and sends the API key", async () => {
   let polls = 0;
