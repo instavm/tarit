@@ -866,6 +866,8 @@ export interface components {
         CreateVmRequest: {
             /** Format: uuid */
             id?: string;
+            /** @description Fixed boot RAM for new virtio-mem templates. memory_mib is the fully reserved maximum and must be larger and 128-MiB aligned. */
+            boot_memory_mib?: number;
             /** @default 256 */
             memory_mib: number;
             /** @default 1 */
@@ -930,6 +932,8 @@ export interface components {
             provider: "local_block";
         };
         RestoreRequest: {
+            /** @description Grow guest-visible RAM to this total within the snapshot reserved maximum. Requires a live hotplug-ready snapshot; shrinking is rejected. */
+            target_memory_mib?: number;
             /**
              * Format: uuid
              * @description Opaque snapshot handle. Physical storage paths and host placement are never public.

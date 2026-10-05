@@ -61,6 +61,7 @@ pub fn agent_vm_config(memory_mib: u64) -> VmConfig {
         },
         memory: MemoryConfig {
             size_mib: memory_mib,
+            boot_size_mib: None,
         },
         vcpus: VcpuConfig { count: 1 },
         volumes: vec![VolumeConfig {

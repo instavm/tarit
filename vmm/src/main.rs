@@ -362,6 +362,10 @@ enum Cmd {
         #[arg(long, default_value = "256", value_name = "MIB")]
         mem: u64,
 
+        /// Fixed boot RAM for virtio-mem; --mem reserves the maximum.
+        #[arg(long, value_name = "MIB")]
+        boot_memory_mib: Option<u64>,
+
         /// Number of vCPUs.
         #[arg(long, default_value = "1", value_name = "N")]
         vcpus: u8,
@@ -385,6 +389,10 @@ enum Cmd {
         /// Path to the snapshot file.
         #[arg(long, value_name = "PATH")]
         snapshot: String,
+
+        /// Grow a hotplug-ready snapshot to this total RAM in MiB.
+        #[arg(long, value_name = "MIB")]
+        target_memory_mib: Option<u64>,
 
         /// Restore memory backend policy.
         #[arg(long, default_value = "auto", value_enum)]
@@ -613,11 +621,20 @@ fn main() -> Result<()> {
         ),
         Cmd::Restore {
             snapshot,
+            target_memory_mib,
             memory_policy,
             jail,
             uid,
             gid,
-        } => restore(&cli.socket, snapshot, memory_policy, jail, uid, gid),
+        } => restore(
+            &cli.socket,
+            snapshot,
+            memory_policy,
+            target_memory_mib,
+            jail,
+            uid,
+            gid,
+        ),
         Cmd::Serve {
             jail,
             uid,
@@ -646,6 +663,7 @@ fn main() -> Result<()> {
             cmdline,
             initramfs,
             mem,
+            boot_memory_mib,
             vcpus,
             rootfs,
             volume,
@@ -656,6 +674,7 @@ fn main() -> Result<()> {
             cmdline,
             initramfs,
             mem,
+            boot_memory_mib,
             vcpus,
             rootfs,
             volume,
@@ -833,6 +852,7 @@ fn cmd_create(
     cmdline: Option<String>,
     initramfs: Option<String>,
     mem_mib: u64,
+    boot_memory_mib: Option<u64>,
     vcpus: u8,
     rootfs: Option<String>,
     volume: Vec<String>,
@@ -850,7 +870,10 @@ fn cmd_create(
             cmdline,
             initramfs,
         },
-        memory: vmm_core::config::MemoryConfig { size_mib: mem_mib },
+        memory: vmm_core::config::MemoryConfig {
+            size_mib: mem_mib,
+            boot_size_mib: boot_memory_mib,
+        },
         vcpus: vmm_core::config::VcpuConfig { count: vcpus },
         volumes,
         net: Vec::new(),
@@ -1129,6 +1152,7 @@ fn restore(
     socket: &str,
     snapshot: String,
     memory_policy: RestoreMemoryPolicyArg,
+    target_memory_mib: Option<u64>,
     jail_dir: Option<String>,
     uid: u32,
     gid: u32,
@@ -1141,6 +1165,7 @@ fn restore(
         return api_request(
             socket,
             &vmm_api::types::ApiRequest::Restore {
+                target_memory_mib,
                 snapshot_path: snapshot,
                 memory_integrity: None,
                 overlay: None,
@@ -1175,7 +1200,15 @@ fn restore(
     log::info!("restore: snapshot={snapshot}");
     let controller = vmm_core::VmmController::new();
     controller
-        .restore_with_overrides(&snapshot, None, None, memory_policy.into())
+        .restore_with_memory_target(
+            &snapshot,
+            None,
+            None,
+            None,
+            memory_policy.into(),
+            None,
+            target_memory_mib,
+        )
         .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
     println!("Restored VM from {snapshot}");
     Ok(())
