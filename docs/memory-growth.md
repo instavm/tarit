@@ -65,7 +65,10 @@ Build the kernel with `vmm/guest/build-minimal-kernel.sh` from this branch. Both
 its base config and override list enable `CONFIG_VIRTIO_MEM=y`; the build checks
 that memory hotplug/hotremove and virtio-mem survived `olddefconfig`. Rebuild the
 agent and image provenance/boot digest using the normal image pipeline. The
-existing downloadable kernel release is not updated by this patch.
+existing published kernel release is unchanged. The manifest pins the new CI-built
+binary under the candidate tag `guest-kernel-v6.12.96-mem1`; that tag must pass the
+normal hardware promotion and explicit release workflow before the download
+helper can fetch it. Until then, build locally or use the matching CI candidate.
 
 Upgrade the VMM, taritd, guest kernel and agent together on a canary host before
 creating new templates. New device state has a framed snapshot trailer; older
