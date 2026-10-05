@@ -54,6 +54,23 @@ json_field() {
   python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
 }
 
+snapshot_artifact_path() {
+  # Resolve the public handle through this test's local store for file checks.
+  python3 - "$DIR/fleet.db" "$1" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as db:
+    row = db.execute(
+        "SELECT path FROM snapshots WHERE snapshot_id = ?", (sys.argv[2],)
+    ).fetchone()
+if row is None:
+    raise SystemExit("FAIL: snapshot is missing from the local test database")
+print(row[0])
+PY
+}
+
 exec_json() {
   local vm_id=$1 command=$2
   api -H 'Content-Type: application/json' \
@@ -118,11 +135,13 @@ SNAPSHOT_JSON=$(api -H 'Content-Type: application/json' -d '{"diff":false}' \
   "$BASE_URL/v1/vms/$SOURCE_ID/snapshot")
 SNAPSHOT_END_MS=$(python3 -c 'import time; print(time.monotonic_ns() // 1000000)')
 SNAPSHOT_CAPTURE_MS=$((SNAPSHOT_END_MS - SNAPSHOT_START_MS))
-SNAPSHOT_PATH=$(printf '%s' "$SNAPSHOT_JSON" | json_field path)
+SNAPSHOT_ID=$(printf '%s' "$SNAPSHOT_JSON" | json_field snapshot_id)
+SNAPSHOT_PATH=$(snapshot_artifact_path "$SNAPSHOT_ID")
 [ -f "$SNAPSHOT_PATH" ]
 exec_json "$SOURCE_ID" "sh -c 'echo post-snapshot-mutation > /root/tarit-snapshot-state; sync'" |
   grep -q '"exit_code":0'
 api -X DELETE "$BASE_URL/v1/vms/$SOURCE_ID" >/dev/null
+[ -f "$SNAPSHOT_PATH" ]
 [ ! -e "$DIR/sockets/overlays/$SOURCE_ID.cow" ] || {
   echo "FAIL: source VM overlay survived deletion"
   exit 1
@@ -130,10 +149,10 @@ api -X DELETE "$BASE_URL/v1/vms/$SOURCE_ID" >/dev/null
 
 echo "== restore twice from the snapshot-owned disk artifact =="
 RESTORE_A=$(api -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json,sys; print(json.dumps({"snapshot_path":sys.argv[1]}))' "$SNAPSHOT_PATH")" \
+  -d "$(python3 -c 'import json,sys; print(json.dumps({"snapshot_id":sys.argv[1]}))' "$SNAPSHOT_ID")" \
   "$BASE_URL/v1/restore")
 RESTORE_B=$(api -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json,sys; print(json.dumps({"snapshot_path":sys.argv[1]}))' "$SNAPSHOT_PATH")" \
+  -d "$(python3 -c 'import json,sys; print(json.dumps({"snapshot_id":sys.argv[1]}))' "$SNAPSHOT_ID")" \
   "$BASE_URL/v1/restore")
 A_ID=$(printf '%s' "$RESTORE_A" | json_field id)
 B_ID=$(printf '%s' "$RESTORE_B" | json_field id)

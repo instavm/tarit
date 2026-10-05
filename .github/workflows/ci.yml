@@ -107,6 +107,12 @@ jobs:
         with:
           workspaces: ${{ matrix.workspace }}
 
+      - name: Test snapshot-disk harness contract
+        if: matrix.workspace == 'orch'
+        run: |
+          python3 -m unittest orch/tests/test_e2e_snapshot_disk.py -v
+          bash -n orch/tests/e2e_snapshot_disk.sh
+
       - name: Format
         working-directory: ${{ matrix.workspace }}
         run: cargo fmt --all -- --check
