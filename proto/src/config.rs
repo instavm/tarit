@@ -292,8 +292,7 @@ impl MemoryConfig {
             )));
         }
         if let Some(boot) = self.boot_size_mib {
-            if boot < 128
-                || boot > 3328
+            if !(128..=3328).contains(&boot)
                 || boot >= self.size_mib
                 || !boot.is_multiple_of(128)
                 || !self.size_mib.is_multiple_of(128)

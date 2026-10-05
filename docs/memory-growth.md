@@ -116,8 +116,9 @@ Local validation at draft creation: 152 device/backend tests, 31 protocol tests,
 461 orchestrator tests plus the new reservation test, 123 Linux core tests in a
 container without KVM, and 24 TypeScript / 12 Python SDK tests pass. The complete
 Linux VMM and orchestrator test targets compile; guest agent and witness compile
-with strict C warnings. The normal Linux Clippy invocation is blocked by existing
-duplicate `cfg` attributes in loader, UFFD and jailer modules, outside this change.
+with strict C warnings. Rust 1.99 VMM Clippy without the boot feature and protocol Clippy pass. The
+Rust 1.88 Linux boot-feature Clippy invocation is blocked by existing duplicate
+`cfg` attributes in loader, UFFD and jailer modules, outside this change.
 
 Still required before readiness claims: run that hardware gate; qualify the
 same flow with production jail/cgroup/seccomp, signed lazy snapshots, SMP,

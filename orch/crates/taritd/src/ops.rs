@@ -1615,6 +1615,7 @@ pub async fn restore_local_from_surviving_artifact(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Existing lifecycle context plus an optional growth target.
 async fn restore_local_with_policy(
     state: &AppState,
     snapshot_path: &str,

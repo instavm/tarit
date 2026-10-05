@@ -1617,6 +1617,7 @@ impl VmmController {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[allow(clippy::too_many_arguments)] // Preserve the existing restore resource-override API.
     pub fn restore_with_memory_target(
         &self,
         snapshot_path: &str,
@@ -1833,6 +1834,7 @@ impl VmmController {
     }
 
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    #[allow(clippy::too_many_arguments)] // Preserve the existing restore resource-override API.
     pub fn restore_with_memory_target(
         &self,
         _snapshot_path: &str,

@@ -731,6 +731,7 @@ impl VmmClient {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Preserve the existing restore resource-override API.
     pub fn restore_with_memory_target(
         &self,
         snapshot_path: &str,
