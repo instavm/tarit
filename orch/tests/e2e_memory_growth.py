@@ -85,7 +85,8 @@ def main():
             result = api('POST', '/v1/restore', body, allow_error=bool(fail))
             if fail:
                 assert isinstance(result, tuple) and result[0] >= 400, result
-                assert fail in result[1], result
+                assert result[0] == 500 and json.loads(result[1]) == {'error': 'VM operation failed'}, result
+                assert fail in (path / 'taritd.log').read_text(), fail
                 visible = api('GET', f'/v1/vms/{vm}', allow_error=True)
                 assert isinstance(visible, tuple) or visible['status'] != 'running', visible
                 api('DELETE', f'/v1/vms/{vm}', allow_error=True)
@@ -120,6 +121,7 @@ def main():
                 except AssertionError:
                     time.sleep(0.1)
             else:
+                print('WITNESS_DIAGNOSTIC', api('POST', '/v1/execute', {'vm_id': source, 'command': 'cat /tmp/memory-workload.log; ls -l /tarit-memory-workload /tmp/tarit-memory-growth.sock; cat /proc/sys/vm/overcommit_memory; cat /proc/meminfo', 'timeout_ms': 30000}), flush=True)
                 raise RuntimeError('memory witness did not start')
             snap = snapshot(source)
             if serial:

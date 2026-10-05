@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
         close(fd);
         return n < 0 ? 1 : 0;
     }
-    unsigned char *ram = mmap(NULL, GROWN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char *ram = mmap(NULL, GROWN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (ram == MAP_FAILED) fail("mmap");
     size_t resident = INITIAL;
     for (size_t p = 0; p < resident / 4096; p++) ram[p * 4096] = marker(p);
