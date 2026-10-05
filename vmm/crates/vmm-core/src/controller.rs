@@ -5771,7 +5771,7 @@ fn build_running_vm(
             if let Some(target) = restored.target_memory_mib {
                 wired
                     .device
-                    .set_target_total_mib(target)
+                    .prepare_restore_target_total_mib(target)
                     .map_err(VmmError::InvalidConfig)?;
             }
         }
@@ -6013,6 +6013,13 @@ fn build_running_vm(
             kvm_vm.mmio_bus.clone(),
             serial.clone(),
         ));
+    }
+
+    // The target was staged before vCPUs started. Signal only after every saved
+    // LAPIC is installed, so restore cannot overwrite an injected config IRQ.
+    // Replay saved pending causes even when there was no target override.
+    if let Some(device) = memory_device.as_ref() {
+        device.reassert_pending_interrupt();
     }
 
     // Notify only after the restored vCPUs are live. Injecting a GED edge into

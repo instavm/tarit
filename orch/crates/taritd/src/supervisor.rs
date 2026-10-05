@@ -838,6 +838,15 @@ pub struct VmSpawnConfig {
 }
 
 impl VmSpawnConfig {
+    /// Rewrite asset paths without changing the requested VM resource shape.
+    fn with_jail_paths(&self, rootfs_path: Option<PathBuf>) -> Self {
+        Self {
+            kernel_path: PathBuf::from(JAIL_KERNEL_PATH),
+            rootfs_path,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn resource_shape(&self) -> ResourceShape {
         ResourceShape::new(self.vcpus, self.memory_mib)
     }
@@ -3461,13 +3470,7 @@ impl VmmSupervisor {
         Ok(PreparedRuntime {
             host_socket: lease.root.join(JAIL_SOCKET_PATH.trim_start_matches('/')),
             socket_argument: PathBuf::from(JAIL_SOCKET_PATH),
-            vm_config: VmSpawnConfig {
-                boot_memory_mib: None,
-                target_memory_mib: None,
-                kernel_path: PathBuf::from(JAIL_KERNEL_PATH),
-                rootfs_path,
-                ..vm_config.clone()
-            },
+            vm_config: vm_config.with_jail_paths(rootfs_path),
             host_rootfs: vm_config
                 .rootfs_path
                 .as_ref()
@@ -9230,6 +9233,24 @@ mod tests {
         assert_ne!(same_max_ordinary, hotplug);
         hotplug.target_memory_mib = Some(4096);
         assert_eq!(hotplug.resource_shape(), ResourceShape::new(1, 4096));
+    }
+
+    #[test]
+    fn jailed_hotplug_config_preserves_boot_target_and_maximum() {
+        let mut requested = spawn_config(false, Some(PathBuf::from("/host/rootfs")));
+        requested.kernel_path = PathBuf::from("/host/kernel");
+        requested.memory_mib = 4096;
+        requested.boot_memory_mib = Some(2048);
+        requested.target_memory_mib = Some(4096);
+        let jailed = requested.with_jail_paths(Some(PathBuf::from(JAIL_ROOTFS_PATH)));
+        let vmm = build_vmm_config(&jailed, None, None, &[]);
+        assert_eq!(vmm.memory.boot_size_mib, Some(2048));
+        assert_eq!(vmm.memory.size_mib, 4096);
+        assert_eq!(jailed.target_memory_mib, Some(4096));
+        assert_eq!(jailed.resource_shape(), requested.resource_shape());
+        assert_eq!(vmm.kernel.path, JAIL_KERNEL_PATH);
+        assert_eq!(jailed.rootfs_path, Some(PathBuf::from(JAIL_ROOTFS_PATH)));
+        assert_eq!(requested.kernel_path, PathBuf::from("/host/kernel"));
     }
 
     #[test]

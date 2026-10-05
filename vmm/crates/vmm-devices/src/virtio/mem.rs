@@ -166,6 +166,15 @@ impl VirtioMemMmio {
     /// User-visible requests only grow. Device unplug requests are still
     /// supported for driver reset/recovery; they do not reduce the reservation.
     pub fn set_target_total_mib(&self, total_mib: u64) -> Result<(), String> {
+        self.prepare_restore_target_total_mib(total_mib)?;
+        self.reassert_pending_interrupt();
+        Ok(())
+    }
+
+    /// Stage a restore target before vCPUs start, without injecting an IRQ into
+    /// an IRQCHIP/LAPIC whose saved state has not yet been restored. The caller
+    /// must call `reassert_pending_interrupt` after all restored vCPUs are live.
+    pub fn prepare_restore_target_total_mib(&self, total_mib: u64) -> Result<(), String> {
         let total = total_mib
             .checked_mul(1024 * 1024)
             .ok_or("memory target overflow")?;
@@ -181,8 +190,23 @@ impl VirtioMemMmio {
         }
         self.target_pages.store(pages, Ordering::Release);
         self.config_generation.fetch_add(1, Ordering::AcqRel);
-        self.trigger_interrupt(INT_CONFIG);
+        self.interrupt_status.fetch_or(INT_CONFIG, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Reassert saved ring/config causes, including when no target override was
+    /// supplied. Snapshot state preserves causes, not the host eventfd counter.
+    pub fn reassert_pending_interrupt(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(event) = self
+            .irq_evt
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|_| self.has_pending_interrupt())
+        {
+            let _ = event.write(1);
+        }
     }
 
     pub fn target_total_mib(&self) -> u64 {
@@ -204,15 +228,7 @@ impl VirtioMemMmio {
 
     fn trigger_interrupt(&self, kind: u32) {
         self.interrupt_status.fetch_or(kind, Ordering::SeqCst);
-        #[cfg(target_os = "linux")]
-        if let Some(event) = self
-            .irq_evt
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            let _ = event.write(1);
-        }
+        self.reassert_pending_interrupt();
     }
 
     fn selected_queue(&self) -> Option<QueueState> {
@@ -641,6 +657,43 @@ impl VirtioMemMmioState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_defers_irq_and_replays_saved_pending_causes() {
+        use vmm_sys_util::eventfd::EventFd;
+        let d = dev();
+        let irq = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        d.set_irq_evt(irq.try_clone().unwrap());
+        d.prepare_restore_target_total_mib(512).unwrap();
+        assert_eq!(d.target_total_mib(), 512);
+        assert!(d.has_pending_interrupt());
+        assert_eq!(
+            irq.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let saved = d.save();
+        d.reassert_pending_interrupt();
+        assert_eq!(irq.read().unwrap(), 1);
+        d.mmio_write(reg::INTERRUPT_ACK, u64::from(INT_CONFIG), 4)
+            .unwrap();
+        d.reassert_pending_interrupt();
+        assert_eq!(
+            irq.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        // Restoring a pending notification must replay it even without a new
+        // target: the fresh host eventfd starts empty.
+        let restored = dev();
+        restored.set_irq_evt(irq.try_clone().unwrap());
+        restored.restore_checked(saved).unwrap();
+        assert_eq!(
+            irq.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        restored.reassert_pending_interrupt();
+        assert_eq!(irq.read().unwrap(), 1);
+    }
     fn dev() -> VirtioMemMmio {
         VirtioMemMmio::new(
             10,
