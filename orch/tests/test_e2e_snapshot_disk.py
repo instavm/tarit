@@ -49,11 +49,23 @@ class FakeApi(BaseHTTPRequestHandler):
                 + "\n"
             )
 
-    def create_vm(self, state):
+    def create_vm(self, state, *, restored=False):
         vm_id = str(uuid.UUID(int=self.server.next_vm))
         self.server.next_vm += 1
         self.server.vms[vm_id] = state
-        (self.server.overlays / f"{vm_id}.cow").touch()
+        # Runtime metadata owns the filename; restored uppers need not use the
+        # cold-start VM filename or any naming convention known to the harness.
+        filename = f"restored-private-{vm_id}.cow" if restored else f"{vm_id}.cow"
+        overlay = self.server.overlays / filename
+        self.server.overlay_paths[vm_id] = overlay
+        if not (restored and self.server.mode == "missing-restore-overlay"):
+            overlay.touch()
+        if not (restored and self.server.mode == "missing-runtime-record"):
+            self.server.db.execute(
+                "INSERT INTO vms(id, runtime_overlay_path) VALUES (?, ?)",
+                (vm_id, str(overlay)),
+            )
+            self.server.db.commit()
         self.reply({"id": vm_id}, 201)
 
     def do_POST(self):
@@ -84,7 +96,7 @@ class FakeApi(BaseHTTPRequestHandler):
             state = self.server.snapshot
             if self.server.mode != "shared-restores":
                 state = state.copy()
-            self.create_vm(state)
+            self.create_vm(state, restored=True)
         elif self.path == "/v1/execute":
             state = self.server.vms[body["vm_id"]]
             marker = re.search(r"echo ([a-z-]+) >", body["command"])
@@ -104,7 +116,9 @@ class FakeApi(BaseHTTPRequestHandler):
         self.record()
         vm_id = self.path.split("/")[-1]
         del self.server.vms[vm_id]
-        (self.server.overlays / f"{vm_id}.cow").unlink()
+        self.server.overlay_paths.pop(vm_id).unlink(missing_ok=True)
+        self.server.db.execute("DELETE FROM vms WHERE id = ?", (vm_id,))
+        self.server.db.commit()
         self.reply({})
 
 
@@ -120,8 +134,12 @@ def fake_taritd():
         server.db.execute(
             "CREATE TABLE snapshots(path TEXT PRIMARY KEY, snapshot_id TEXT UNIQUE)"
         )
+        server.db.execute(
+            "CREATE TABLE vms(id TEXT PRIMARY KEY, runtime_overlay_path TEXT)"
+        )
         server.db.commit()
         server.vms = {}
+        server.overlay_paths = {}
         server.next_vm = 1
         server.serve_forever()
 
@@ -209,7 +227,20 @@ class SnapshotDiskContractTests(unittest.TestCase):
     def test_shared_restore_state_is_rejected(self):
         result, calls = self.run_harness("shared-restores")
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("restored VMs shared writable disk state", result.stdout)
         self.assertEqual(sum(call["path"] == "/v1/restore" for call in calls), 2)
+        self.assertNotIn("RESULT: SNAPSHOT_DISK_PASS", result.stdout)
+
+    def test_missing_runtime_record_is_rejected(self):
+        result, _ = self.run_harness("missing-runtime-record")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("VM has no recorded runtime overlay", result.stdout)
+        self.assertNotIn("RESULT: SNAPSHOT_DISK_PASS", result.stdout)
+
+    def test_missing_restore_overlay_is_rejected(self):
+        result, _ = self.run_harness("missing-restore-overlay")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("restored VM overlay is missing", result.stdout)
         self.assertNotIn("RESULT: SNAPSHOT_DISK_PASS", result.stdout)
 
 

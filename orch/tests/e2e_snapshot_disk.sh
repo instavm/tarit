@@ -71,6 +71,23 @@ print(row[0])
 PY
 }
 
+vm_overlay_path() {
+  # Restore uppers use snapshot-specific names; the runtime record is canonical.
+  python3 - "$DIR/fleet.db" "$1" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as db:
+    row = db.execute(
+        "SELECT runtime_overlay_path FROM vms WHERE id = ?", (sys.argv[2],)
+    ).fetchone()
+if row is None or not row[0]:
+    raise SystemExit("FAIL: VM has no recorded runtime overlay")
+print(row[0])
+PY
+}
+
 exec_json() {
   local vm_id=$1 command=$2
   api -H 'Content-Type: application/json' \
@@ -126,6 +143,8 @@ echo "== create source and checkpoint disk =="
 SOURCE_JSON=$(api -H 'Content-Type: application/json' \
   -d '{"vcpus":1,"memory_mib":256}' "$BASE_URL/v1/vms")
 SOURCE_ID=$(printf '%s' "$SOURCE_JSON" | json_field id)
+SOURCE_OVERLAY=$(vm_overlay_path "$SOURCE_ID")
+[ -f "$SOURCE_OVERLAY" ]
 exec_json "$SOURCE_ID" "sh -c 'echo snapshot-checkpoint > /root/tarit-snapshot-state; sync'" |
   grep -q '"exit_code":0'
 
@@ -142,7 +161,7 @@ exec_json "$SOURCE_ID" "sh -c 'echo post-snapshot-mutation > /root/tarit-snapsho
   grep -q '"exit_code":0'
 api -X DELETE "$BASE_URL/v1/vms/$SOURCE_ID" >/dev/null
 [ -f "$SNAPSHOT_PATH" ]
-[ ! -e "$DIR/sockets/overlays/$SOURCE_ID.cow" ] || {
+[ ! -e "$SOURCE_OVERLAY" ] || {
   echo "FAIL: source VM overlay survived deletion"
   exit 1
 }
@@ -157,8 +176,18 @@ RESTORE_B=$(api -H 'Content-Type: application/json' \
 A_ID=$(printf '%s' "$RESTORE_A" | json_field id)
 B_ID=$(printf '%s' "$RESTORE_B" | json_field id)
 [ "$A_ID" != "$B_ID" ]
-[ -f "$DIR/sockets/overlays/$A_ID.cow" ]
-[ -f "$DIR/sockets/overlays/$B_ID.cow" ]
+A_OVERLAY=$(vm_overlay_path "$A_ID")
+B_OVERLAY=$(vm_overlay_path "$B_ID")
+for overlay in "$A_OVERLAY" "$B_OVERLAY"; do
+  [ -f "$overlay" ] || {
+    echo "FAIL: restored VM overlay is missing"
+    exit 1
+  }
+done
+[ "$A_OVERLAY" != "$B_OVERLAY" ] || {
+  echo "FAIL: restored VMs shared a writable overlay"
+  exit 1
+}
 
 exec_json "$A_ID" 'cat /root/tarit-snapshot-state' | grep -q 'snapshot-checkpoint'
 exec_json "$B_ID" 'cat /root/tarit-snapshot-state' | grep -q 'snapshot-checkpoint'
@@ -166,11 +195,11 @@ exec_json "$A_ID" "sh -c 'echo restore-a-private > /root/tarit-snapshot-state; s
   grep -q '"exit_code":0'
 exec_json "$A_ID" 'cat /root/tarit-snapshot-state' | grep -q 'restore-a-private'
 B_STATE=$(exec_json "$B_ID" 'cat /root/tarit-snapshot-state')
-printf '%s' "$B_STATE" | grep -q 'snapshot-checkpoint'
 if printf '%s' "$B_STATE" | grep -q 'restore-a-private'; then
   echo "FAIL: restored VMs shared writable disk state"
   exit 1
 fi
+printf '%s' "$B_STATE" | grep -q 'snapshot-checkpoint'
 
 api -X DELETE "$BASE_URL/v1/vms/$A_ID" >/dev/null
 api -X DELETE "$BASE_URL/v1/vms/$B_ID" >/dev/null
