@@ -26,19 +26,19 @@ description = "A minimal rust-vmm-based microVM manager for x86_64 Linux."
 
 [workspace.dependencies]
 # Curated rust-vmm crate versions (pin to a single compatible set)
-kvm-bindings = { version = "0.10", features = ["fam-wrappers", "serde"] }
-kvm-ioctls = "0.19"
+kvm-bindings = { version = "0.14", features = ["fam-wrappers", "serde"] }
+kvm-ioctls = "0.25"
 vm-memory = { version = "0.18", features = ["backend-mmap", "backend-atomic"] }
 linux-loader = "0.14"
-virtio-queue = "0.17"
+virtio-queue = "0.18"
 virtio-devices = "0.1"
 virtio-bindings = "0.2"
 vm-device = "0.1"
 vm-allocator = "0.1"
 vm-superio = "0.8"
 event-manager = "0.4"
-seccompiler = "0.4"
-vmm-sys-util = "0.12"
+seccompiler = "0.5"
+vmm-sys-util = "0.15"
 # supporting libs
 log = "0.4"
 env_logger = "0.11"
