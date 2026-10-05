@@ -821,6 +821,8 @@ pub struct VmDataVolumeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VmSpawnConfig {
+    pub boot_memory_mib: Option<u64>,
+    pub target_memory_mib: Option<u64>,
     pub memory_mib: u64,
     pub vcpus: u8,
     pub kernel_path: PathBuf,
@@ -854,6 +856,8 @@ impl VmSpawnConfig {
             }
         });
         Self {
+            boot_memory_mib: req.boot_memory_mib,
+            target_memory_mib: None,
             memory_mib: req.memory_mib,
             vcpus: req.vcpus,
             kernel_path: req
@@ -881,6 +885,8 @@ impl VmSpawnConfig {
                 .unwrap_or_else(|| config.rootfs.clone()),
         );
         Self {
+            boot_memory_mib: None,
+            target_memory_mib: None,
             memory_mib: class.memory_mib,
             vcpus: class.vcpus,
             kernel_path: config.kernel.clone(),
@@ -3258,6 +3264,8 @@ impl VmmSupervisor {
 
     fn expected_runtime_layout(&self, record: &VmRecord) -> VmRuntimeLayout {
         let config = VmSpawnConfig {
+            boot_memory_mib: None,
+            target_memory_mib: None,
             memory_mib: record.memory_mib,
             vcpus: record.vcpus,
             kernel_path: PathBuf::from(&record.kernel_path),
@@ -3454,6 +3462,8 @@ impl VmmSupervisor {
             host_socket: lease.root.join(JAIL_SOCKET_PATH.trim_start_matches('/')),
             socket_argument: PathBuf::from(JAIL_SOCKET_PATH),
             vm_config: VmSpawnConfig {
+                boot_memory_mib: None,
+                target_memory_mib: None,
                 kernel_path: PathBuf::from(JAIL_KERNEL_PATH),
                 rootfs_path,
                 ..vm_config.clone()
@@ -5476,13 +5486,14 @@ impl VmmSupervisor {
         let client = VmmClient::new(&vm.socket_path).with_request_timeout(LIFECYCLE_OP_TIMEOUT);
         let restore_path = runtime.guest_snapshot.as_deref().unwrap_or(snapshot_path);
         let volume_override = runtime_volume_configs(&runtime.data_volumes);
-        if let Err(e) = client.restore_with_resource_overrides(
+        if let Err(e) = client.restore_with_memory_target(
             restore_path,
             overlay.clone(),
             Some(net_override),
             Some(volume_override),
             tarit_vmm_client::RestoreMemoryPolicy::Auto,
             memory_integrity,
+            vm_config.target_memory_mib,
         ) {
             return Err(self.cleanup_boot_failure(
                 id,
@@ -8848,6 +8859,7 @@ fn build_vmm_config(
         },
         memory: MemoryConfig {
             size_mib: cfg.memory_mib,
+            boot_size_mib: cfg.boot_memory_mib,
         },
         vcpus: VcpuConfig { count: cfg.vcpus },
         volumes,
@@ -9192,6 +9204,8 @@ mod tests {
 
     fn spawn_config(read_only: bool, rootfs_path: Option<PathBuf>) -> VmSpawnConfig {
         VmSpawnConfig {
+            boot_memory_mib: None,
+            target_memory_mib: None,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: PathBuf::from("/kernel"),
@@ -9202,6 +9216,20 @@ mod tests {
             egress_allow_existing: false,
             data_volumes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn hotplug_reserves_maximum_and_cannot_claim_an_ordinary_warm_vm() {
+        let ordinary = spawn_config(true, None);
+        let mut hotplug = ordinary.clone();
+        hotplug.memory_mib = 4096;
+        hotplug.boot_memory_mib = Some(2048);
+        assert_eq!(hotplug.resource_shape(), ResourceShape::new(1, 4096));
+        let mut same_max_ordinary = hotplug.clone();
+        same_max_ordinary.boot_memory_mib = None;
+        assert_ne!(same_max_ordinary, hotplug);
+        hotplug.target_memory_mib = Some(4096);
+        assert_eq!(hotplug.resource_shape(), ResourceShape::new(1, 4096));
     }
 
     #[test]

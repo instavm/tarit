@@ -1903,7 +1903,14 @@ async fn restore_vm(
         Err(error) => return Err(error.into()),
     }
     let reserved = reserve_vm_quota(&state, &identity, id).await?;
-    let result = restore_vm_after_quota(&state, &identity, req.snapshot_id, id).await;
+    let result = restore_vm_after_quota(
+        &state,
+        &identity,
+        req.snapshot_id,
+        id,
+        req.target_memory_mib,
+    )
+    .await;
     if reserved {
         if let Err(error) = release_vm_quota(&state, &identity, id).await {
             tracing::warn!(vm = %id, tenant = %identity.tenant, %error,
@@ -1918,6 +1925,7 @@ async fn restore_vm_after_quota(
     identity: &ApiIdentity,
     snapshot_id: Uuid,
     id: Uuid,
+    target_memory_mib: Option<u64>,
 ) -> Result<(StatusCode, Json<PublicVmRecord>), ApiError> {
     let (host_id, snapshot_path) = resolve_snapshot_locator(state, identity, snapshot_id).await?;
     let on_peer = if host_id != state.config.host_id {
@@ -1930,19 +1938,20 @@ async fn restore_vm_after_quota(
             let peer = Arc::clone(&state.peer);
             let identity = identity.clone();
             tokio::task::spawn_blocking(move || {
-                peer.restore_remote(&rpc, &snapshot_path, id, &identity)
+                peer.restore_remote(&rpc, &snapshot_path, id, &identity, target_memory_mib)
             })
             .await
             .map_err(|e| OrchError::Internal(format!("join: {e}")))??
         }
         None => {
-            ops::restore_local(
+            ops::restore_local_with_target(
                 state,
                 &snapshot_path,
                 Some(id),
                 Some(identity.tenant.clone()),
                 Some(identity.api_key_id.clone()),
                 identity.is_admin(),
+                target_memory_mib,
             )
             .await?
         }
@@ -5055,6 +5064,7 @@ mod tests {
         };
 
         let mut req = CreateVmRequest {
+            boot_memory_mib: None,
             id: None,
             owner_key: None,
             api_key_id: None,

@@ -831,6 +831,9 @@ fn default_local_block_provider() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateVmRequest {
+    /// Fixed boot RAM; memory_mib reserves the maximum for grow-on-restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_memory_mib: Option<u64>,
     pub id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_key: Option<String>,
@@ -1042,6 +1045,9 @@ pub struct SnapshotRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreRequest {
+    /// Total guest RAM after restore, within the saved maximum; grow-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_memory_mib: Option<u64>,
     pub snapshot_id: Uuid,
     #[serde(default)]
     pub id: Option<Uuid>,

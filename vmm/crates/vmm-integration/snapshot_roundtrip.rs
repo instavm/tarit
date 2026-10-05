@@ -83,7 +83,10 @@ fn restored_clones_get_private_rootfs_overlays() {
                 .into(),
             initramfs: None,
         },
-        memory: MemoryConfig { size_mib: 256 },
+        memory: MemoryConfig {
+            size_mib: 256,
+            boot_size_mib: None,
+        },
         vcpus: VcpuConfig { count: 1 },
         volumes: vec![VolumeConfig {
             path: base_rootfs.to_string_lossy().into_owned(),

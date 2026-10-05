@@ -111,6 +111,7 @@ impl DirtyBitmap {
 #[derive(Debug, Clone, Default)]
 pub struct SoftwareDirtyBitmap {
     dirty: Arc<Mutex<DirtyBitmap>>,
+    guest_layout: Option<(u64, u64)>,
 }
 
 impl SoftwareDirtyBitmap {
@@ -118,15 +119,39 @@ impl SoftwareDirtyBitmap {
         Self::default()
     }
 
+    pub fn with_guest_layout(&self, low: u64, total: u64) -> Self {
+        Self {
+            dirty: self.dirty.clone(),
+            guest_layout: Some((low, total)),
+        }
+    }
+
     pub fn mark(&self, gpa: u64) {
-        self.dirty.lock().unwrap().mark(gpa);
+        self.mark_range(gpa, 1);
     }
 
     pub fn mark_range(&self, gpa: u64, len: u64) {
         if len == 0 {
             return;
         }
-        self.dirty.lock().unwrap().mark_range(gpa, len);
+        let offset = match self.guest_layout {
+            Some((low, total)) => {
+                const HIGH: u64 = 0x1_0000_0000;
+                if gpa < low && gpa.checked_add(len).is_some_and(|end| end <= low) {
+                    gpa
+                } else if gpa >= HIGH
+                    && (gpa - HIGH)
+                        .checked_add(len)
+                        .is_some_and(|end| end <= total - low)
+                {
+                    low + (gpa - HIGH)
+                } else {
+                    return;
+                }
+            }
+            None => gpa,
+        };
+        self.dirty.lock().unwrap().mark_range(offset, len);
     }
 
     pub fn snapshot(&self) -> DirtyBitmap {

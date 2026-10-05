@@ -651,6 +651,38 @@ static int wait_for_child(pid_t pid) {
     }
 }
 
+#ifdef __linux__
+#define MEMORY_ONLINE_PREFIX "VMM_MEMORY_ONLINE_V1:"
+#define MEMORY_ONLINE_OK "TARIT_MEMORY_ONLINE_V1_OK"
+/* Read-only acknowledgement: the VMM decides the aperture and target. Never
+ * probe or write arbitrary guest physical addresses from the agent. */
+static int memory_online(const char *command) {
+    unsigned long long region, requested;
+    char extra;
+    if (sscanf(command + sizeof(MEMORY_ONLINE_PREFIX) - 1, "%llu:%llu%c",
+               &region, &requested, &extra) != 2 || region == 0 ||
+        region > (64ULL << 30) || requested > region ||
+        region % (128ULL << 20) || requested % (128ULL << 20)) return -1;
+    FILE *f = fopen("/sys/devices/system/memory/block_size_bytes", "r");
+    unsigned long long block = 0;
+    if (!f) return -1;
+    int parsed = fscanf(f, "%llx", &block);
+    fclose(f);
+    if (parsed != 1 || block == 0 || block > (128ULL << 20) ||
+        (1ULL << 32) % block || region % block) return -1;
+    unsigned long long online = 0;
+    for (unsigned long long addr = (1ULL << 32); addr < (1ULL << 32) + region; addr += block) {
+        char path[128], state[32];
+        snprintf(path, sizeof(path), "/sys/devices/system/memory/memory%llu/state", addr / block);
+        f = fopen(path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%31s", state) == 1 && strcmp(state, "online") == 0) online += block;
+        fclose(f);
+    }
+    return online >= requested ? 0 : -1;
+}
+#endif
+
 static void run_command(int serial_fd, const char *command) {
     int pipefd[2];
     bool wrote_output = false;
@@ -666,6 +698,12 @@ static void run_command(int serial_fd, const char *command) {
         return;
     }
 #ifdef __linux__
+    if (strncmp(command, MEMORY_ONLINE_PREFIX, sizeof(MEMORY_ONLINE_PREFIX) - 1) == 0) {
+        int ready = memory_online(command) == 0;
+        if (ready) serial_printf(serial_fd, "%s\n", MEMORY_ONLINE_OK);
+        serial_printf(serial_fd, "VMM_EXEC_EXIT=%d\n", ready ? 0 : 1);
+        return;
+    }
     if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0 ||
         strncmp(command, CLONE_REPAIR_PREFIX_V3, CLONE_REPAIR_PREFIX_V3_LEN) == 0) {
         char clone_id[33];
@@ -869,6 +907,13 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     /* Keep readiness independent of guest shell/userspace availability. */
     if (command[0] == '\0') {
         (void)send_exec_exit(fd, request_id, 0);
+        return;
+    }
+    if (strncmp(command, MEMORY_ONLINE_PREFIX, sizeof(MEMORY_ONLINE_PREFIX) - 1) == 0) {
+        int ready = memory_online(command) == 0;
+        if (ready) (void)send_exec_chunk(fd, EXEC_FRAME_STDOUT, request_id,
+                                       MEMORY_ONLINE_OK, sizeof(MEMORY_ONLINE_OK) - 1);
+        (void)send_exec_exit(fd, request_id, ready ? 0 : 1);
         return;
     }
     if (strncmp(command, CLONE_REPAIR_PREFIX_V2, CLONE_REPAIR_PREFIX_V2_LEN) == 0 ||

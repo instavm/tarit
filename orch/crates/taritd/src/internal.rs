@@ -122,6 +122,8 @@ pub struct InternalSnapshotBody {
 
 #[derive(Deserialize)]
 struct InternalRestoreRequest {
+    #[serde(default)]
+    target_memory_mib: Option<u64>,
     snapshot_path: String,
     id: Uuid,
     owner_key: String,
@@ -134,6 +136,7 @@ pub fn internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/v1/vms", post(internal_create))
         .route("/internal/v1/restore", post(internal_restore))
+        .route("/internal/v1/restore-memory-target", post(internal_restore))
         .route(
             "/internal/v1/vms/{id}",
             get(internal_get).delete(internal_stop),
@@ -936,13 +939,14 @@ async fn internal_restore(
     Json(req): Json<InternalRestoreRequest>,
 ) -> Result<(StatusCode, Json<InternalVmRecord>), ApiError> {
     let identity = require_peer_identity(identity.as_ref().map(|i| &i.0))?;
-    let rec = ops::restore_local(
+    let rec = ops::restore_local_with_target(
         &state,
         &req.snapshot_path,
         Some(req.id),
         Some(req.owner_key),
         Some(req.api_key_id),
         identity.is_admin(),
+        req.target_memory_mib,
     )
     .await?;
     Ok((StatusCode::CREATED, Json(rec.into())))

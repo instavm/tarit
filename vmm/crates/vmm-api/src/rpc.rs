@@ -271,19 +271,21 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             }
         }
         ApiRequest::Restore {
+            target_memory_mib,
             snapshot_path,
             memory_integrity,
             overlay,
             net,
             volumes,
             memory_policy,
-        } => match controller.restore_with_resource_overrides(
+        } => match controller.restore_with_memory_target(
             &snapshot_path,
             overlay,
             net,
             volumes,
             memory_policy,
             memory_integrity,
+            target_memory_mib,
         ) {
             Ok(()) => ApiResponse::Restored,
             Err(e) => ApiResponse::Err {
@@ -853,7 +855,10 @@ mod tests {
                 cmdline: "console=ttyS0".into(),
                 initramfs: None,
             },
-            memory: MemoryConfig { size_mib: 64 },
+            memory: MemoryConfig {
+                size_mib: 64,
+                boot_size_mib: None,
+            },
             vcpus: VcpuConfig { count: 1 },
             volumes: vec![],
             net: vec![],
