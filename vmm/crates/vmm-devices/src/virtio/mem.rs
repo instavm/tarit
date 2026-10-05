@@ -577,9 +577,7 @@ impl MmioDevice for VirtioMemMmio {
             reg::HOST_FEATURES_SEL => self.host_features_sel.store(value, Ordering::Relaxed),
             reg::GUEST_FEATURES_SEL => self.guest_features_sel.store(value, Ordering::Relaxed),
             reg::GUEST_FEATURES => match self.guest_features_sel.load(Ordering::Relaxed) {
-                0 => self
-                    .guest_features_low
-                    .store(value & FEATURES_LOW, Ordering::Relaxed),
+                0 => self.guest_features_low.store(0, Ordering::Relaxed),
                 1 => self
                     .guest_features_high
                     .store(value & FEATURES_HIGH, Ordering::Relaxed),
