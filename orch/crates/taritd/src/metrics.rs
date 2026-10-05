@@ -317,15 +317,28 @@ impl Metrics {
 }
 
 fn increment_counter(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(amount))
-    });
+    // try_update requires Rust 1.95; retain the orchestrator's Rust 1.88 build.
+    let mut current = counter.load(Ordering::Relaxed);
+    while let Err(observed) = counter.compare_exchange_weak(
+        current,
+        current.saturating_add(amount),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        current = observed;
+    }
 }
 
 fn decrement_gauge(gauge: &AtomicU64) {
-    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(1))
-    });
+    let mut current = gauge.load(Ordering::Relaxed);
+    while let Err(observed) = gauge.compare_exchange_weak(
+        current,
+        current.saturating_sub(1),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        current = observed;
+    }
 }
 
 pub fn render_metrics(state: &AppState) -> String {
@@ -814,6 +827,41 @@ mod tests {
     use tarit_store::Store;
     use tarit_types::VmRecord;
     use uuid::Uuid;
+
+    #[test]
+    fn atomic_metrics_updates_saturate_at_bounds() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        increment_counter(&counter, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX - 1);
+        increment_counter(&counter, 8);
+        increment_counter(&counter, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        let gauge = AtomicU64::new(1);
+        decrement_gauge(&gauge);
+        decrement_gauge(&gauge);
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn atomic_metrics_updates_are_not_lost_under_contention() {
+        let counter = AtomicU64::new(0);
+        let gauge = AtomicU64::new(40_000);
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..10_000 {
+                        increment_counter(&counter, 3);
+                        decrement_gauge(&gauge);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 120_000);
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn render_metrics_has_prometheus_shape() {

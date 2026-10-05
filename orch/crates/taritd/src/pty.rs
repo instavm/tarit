@@ -116,9 +116,16 @@ where
 }
 
 fn increment_rejection(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(1))
-    });
+    // try_update requires Rust 1.95; retain the orchestrator's Rust 1.88 build.
+    let mut current = counter.load(Ordering::Relaxed);
+    while let Err(observed) = counter.compare_exchange_weak(
+        current,
+        current.saturating_add(1),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        current = observed;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -925,6 +932,28 @@ enum BridgeError {
 mod tests {
     use super::*;
     use crate::config::ApiRole;
+
+    #[test]
+    fn rejection_counter_preserves_concurrent_increments_and_saturates() {
+        let counter = AtomicU64::new(0);
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..10_000 {
+                        increment_rejection(&counter);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.load(Ordering::Relaxed), 40_000);
+
+        counter.store(u64::MAX - 1, Ordering::Relaxed);
+        increment_rejection(&counter);
+        increment_rejection(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 
     fn test_identity() -> ApiIdentity {
         test_identity_for("tenant-a")
