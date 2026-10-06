@@ -104,6 +104,8 @@ struct RemoteSnapshotRequest {
 
 #[derive(Serialize)]
 struct RemoteRestoreRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_memory_mib: Option<u64>,
     snapshot_path: &'a str,
     id: Uuid,
     owner_key: &'a str,
@@ -854,11 +856,19 @@ impl PeerClient {
         snapshot_path: &str,
         id: Uuid,
         identity: &ApiIdentity,
+        target_memory_mib: Option<u64>,
     ) -> Result<VmRecord, OrchError> {
         self.post_json(
             target,
-            "/internal/v1/restore",
+            // Older peers may ignore an unknown optional JSON field. A new
+            // endpoint makes an explicit growth request fail closed on them.
+            if target_memory_mib.is_some() {
+                "/internal/v1/restore-memory-target"
+            } else {
+                "/internal/v1/restore"
+            },
             &RemoteRestoreRequest {
+                target_memory_mib,
                 snapshot_path,
                 id,
                 owner_key: &identity.tenant,

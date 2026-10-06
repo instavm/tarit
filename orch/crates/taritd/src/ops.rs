@@ -1129,6 +1129,12 @@ async fn create_local_owned(
     task: &OwnedTaskControl,
 ) -> Result<VmRecord, OrchError> {
     let now = Utc::now();
+    tarit_proto::MemoryConfig {
+        size_mib: req.memory_mib,
+        boot_size_mib: req.boot_memory_mib,
+    }
+    .size_bytes()
+    .map_err(|e| OrchError::BadRequest(e.to_string()))?;
     let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
     let warm_enabled = state.config.warm_pool.enabled
         && req.id.is_none()
@@ -1554,6 +1560,27 @@ pub async fn restore_local(
     api_key_id: Option<String>,
     caller_is_admin: bool,
 ) -> Result<VmRecord, OrchError> {
+    restore_local_with_target(
+        state,
+        snapshot_path,
+        id,
+        owner_key,
+        api_key_id,
+        caller_is_admin,
+        None,
+    )
+    .await
+}
+
+pub async fn restore_local_with_target(
+    state: &AppState,
+    snapshot_path: &str,
+    id: Option<Uuid>,
+    owner_key: Option<String>,
+    api_key_id: Option<String>,
+    caller_is_admin: bool,
+    target_memory_mib: Option<u64>,
+) -> Result<VmRecord, OrchError> {
     restore_local_with_policy(
         state,
         snapshot_path,
@@ -1562,6 +1589,7 @@ pub async fn restore_local(
         api_key_id,
         caller_is_admin,
         false,
+        target_memory_mib,
     )
     .await
 }
@@ -1582,10 +1610,12 @@ pub async fn restore_local_from_surviving_artifact(
         api_key_id,
         caller_is_admin,
         true,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Existing lifecycle context plus an optional growth target.
 async fn restore_local_with_policy(
     state: &AppState,
     snapshot_path: &str,
@@ -1594,6 +1624,7 @@ async fn restore_local_with_policy(
     api_key_id: Option<String>,
     caller_is_admin: bool,
     allow_degraded_fleet: bool,
+    target_memory_mib: Option<u64>,
 ) -> Result<VmRecord, OrchError> {
     let id = id.unwrap_or_else(Uuid::new_v4);
     let state = state.clone();
@@ -1604,6 +1635,7 @@ async fn restore_local_with_policy(
         api_key_id,
         caller_is_admin,
         allow_degraded_fleet,
+        target_memory_mib,
     };
     run_supervised_lifecycle(&state, id, move |task| async move {
         restore_local_owned(&worker_state, &snapshot_path, id, access, &task).await
@@ -1616,6 +1648,7 @@ struct RestoreAccess {
     api_key_id: Option<String>,
     caller_is_admin: bool,
     allow_degraded_fleet: bool,
+    target_memory_mib: Option<u64>,
 }
 
 async fn restore_local_owned(
@@ -1669,6 +1702,8 @@ async fn restore_local_owned(
         }
     };
     let restore_config = VmSpawnConfig {
+        boot_memory_mib: None,
+        target_memory_mib: access.target_memory_mib,
         memory_mib,
         vcpus,
         kernel_path: kernel_path.clone().into(),
@@ -2480,6 +2515,8 @@ async fn resume_hibernated_local(
     };
     let data_volumes = attached_volume_spawn_config(state, &owner_key, id).await?;
     let restore_config = VmSpawnConfig {
+        boot_memory_mib: None,
+        target_memory_mib: None,
         memory_mib,
         vcpus,
         kernel_path: kernel_path.clone().into(),
@@ -2558,6 +2595,8 @@ async fn resume_hibernated_local(
         state.supervisor.runtime_layout_for_snapshot_restore(
             id,
             &VmSpawnConfig {
+                boot_memory_mib: None,
+                target_memory_mib: None,
                 memory_mib,
                 vcpus,
                 kernel_path: publication_record.kernel_path.clone().into(),
@@ -5213,6 +5252,8 @@ mod tests {
         let (state, writes) = test_state_with_durable_writer();
         let writes = Arc::new(tokio::sync::Mutex::new(writes));
         let warm_cfg = VmSpawnConfig {
+            boot_memory_mib: None,
+            target_memory_mib: None,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: PathBuf::from("kernel"),
@@ -5325,6 +5366,7 @@ mod tests {
         let warm_cfg = VmSpawnConfig::from_defaults(
             &state.config,
             &CreateVmRequest {
+                boot_memory_mib: None,
                 id: None,
                 owner_key: Some("test".into()),
                 api_key_id: None,
@@ -5358,6 +5400,7 @@ mod tests {
                 create_local(
                     &request_state,
                     &CreateVmRequest {
+                        boot_memory_mib: None,
                         id: None,
                         owner_key: Some("test".into()),
                         api_key_id: None,
@@ -5409,6 +5452,8 @@ mod tests {
     fn stop_all_converges_an_abandoned_warm_publication_without_releasing_early() {
         let (state, mut writes) = test_state_with_durable_writer();
         let warm_cfg = VmSpawnConfig {
+            boot_memory_mib: None,
+            target_memory_mib: None,
             memory_mib: 256,
             vcpus: 1,
             kernel_path: PathBuf::from("kernel"),

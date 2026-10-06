@@ -64,8 +64,12 @@ pub struct KernelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
-    /// Guest RAM in MiB.
+    /// Guest RAM in MiB, or the fully reserved maximum when boot_size_mib is set.
     pub size_mib: u64,
+    /// Opt in to virtio-mem. `size_mib` is the maximum reserved RAM;
+    /// this is the fixed RAM visible at boot. The remainder starts unplugged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_size_mib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,7 +291,24 @@ impl MemoryConfig {
                 self.size_mib
             )));
         }
+        if let Some(boot) = self.boot_size_mib {
+            if !(128..=3328).contains(&boot)
+                || boot >= self.size_mib
+                || !boot.is_multiple_of(128)
+                || !self.size_mib.is_multiple_of(128)
+            {
+                return Err(ConfigError::Invalid(
+                    "virtio-mem requires 128-MiB aligned boot RAM in 128..=3328, below maximum RAM"
+                        .into(),
+                ));
+            }
+        }
         Ok(bytes)
+    }
+
+    pub fn boot_bytes(&self) -> Result<u64, ConfigError> {
+        self.validate()?;
+        Ok(self.boot_size_mib.unwrap_or(self.size_mib) * MIB)
     }
 
     /// Validate guest RAM sizing without returning the converted byte count.
@@ -319,6 +340,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hotplug_sizing_separates_boot_ram_from_maximum_reservation() {
+        let valid = MemoryConfig {
+            size_mib: 4096,
+            boot_size_mib: Some(2048),
+        };
+        assert_eq!(valid.size_bytes().unwrap(), 4096 * MIB);
+        assert_eq!(valid.boot_bytes().unwrap(), 2048 * MIB);
+        for (max, boot) in [
+            (4096, 4096),
+            (4096, 3456),
+            (4096, 2049),
+            (4095, 2048),
+            (4096, 0),
+        ] {
+            assert!(MemoryConfig {
+                size_mib: max,
+                boot_size_mib: Some(boot)
+            }
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[test]
     fn config_rejects_unknown_fields() {
         // Hardening: an unexpected/injected field is rejected
         // (deny_unknown_fields) rather than silently ignored.
@@ -331,12 +376,14 @@ mod tests {
     #[test]
     fn memory_validation_accepts_the_split_memory_ceiling() {
         assert!(MemoryConfig {
-            size_mib: MAX_MEMORY_MIB
+            size_mib: MAX_MEMORY_MIB,
+            boot_size_mib: None
         }
         .validate()
         .is_ok());
         assert!(MemoryConfig {
-            size_mib: MAX_MEMORY_MIB + 1
+            size_mib: MAX_MEMORY_MIB + 1,
+            boot_size_mib: None
         }
         .validate()
         .is_err());
@@ -349,7 +396,10 @@ mod tests {
                 cmdline: String::new(),
                 initramfs: None,
             },
-            memory: MemoryConfig { size_mib: 64 },
+            memory: MemoryConfig {
+                size_mib: 64,
+                boot_size_mib: None,
+            },
             vcpus: VcpuConfig { count: 1 },
             volumes: Vec::new(),
             net,

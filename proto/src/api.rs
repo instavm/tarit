@@ -82,6 +82,9 @@ pub enum ApiRequest {
         identity: ScratchIdentity,
     },
     Restore {
+        /// Grow guest-visible RAM to this total MiB within its reserved maximum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_memory_mib: Option<u64>,
         snapshot_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         memory_integrity: Option<MemoryIntegrity>,
@@ -217,7 +220,10 @@ mod tests {
                 cmdline: "console=ttyS0".into(),
                 initramfs: None,
             },
-            memory: MemoryConfig { size_mib: 256 },
+            memory: MemoryConfig {
+                size_mib: 256,
+                boot_size_mib: None,
+            },
             vcpus: VcpuConfig { count: 1 },
             volumes: vec![],
             net: vec![],
@@ -394,6 +400,7 @@ mod tests {
         let back: ApiRequest = serde_json::from_str(json).unwrap();
         match back {
             ApiRequest::Restore {
+                target_memory_mib: None,
                 snapshot_path,
                 memory_integrity,
                 overlay,
@@ -415,6 +422,7 @@ mod tests {
     #[test]
     fn request_restore_round_trips_with_overlay() {
         let r = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/golden.snap".into(),
             memory_integrity: None,
             overlay: Some("/clones/a.cow".into()),
@@ -431,6 +439,7 @@ mod tests {
         assert!(matches!(
             back,
             ApiRequest::Restore {
+            target_memory_mib: None,
                 snapshot_path,
                 memory_integrity: None,
                 overlay: Some(overlay),
@@ -444,6 +453,7 @@ mod tests {
     #[test]
     fn request_restore_round_trips_with_explicit_network_rebind() {
         let r = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/golden.snap".into(),
             memory_integrity: None,
             overlay: None,
@@ -472,6 +482,7 @@ mod tests {
     #[test]
     fn request_restore_round_trips_non_default_memory_policy() {
         let r = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/golden.snap".into(),
             memory_integrity: None,
             overlay: None,

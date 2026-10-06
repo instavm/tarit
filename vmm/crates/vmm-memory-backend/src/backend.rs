@@ -33,6 +33,7 @@ pub enum MemoryError {
 pub struct GuestMemory {
     pub inner: Arc<GuestMemoryMmap>,
     pub size_bytes: u64,
+    pub low_size_bytes: u64,
     backing: Arc<MmapRegion>,
     host_dirty: SoftwareDirtyBitmap,
     #[cfg(target_os = "linux")]
@@ -42,17 +43,37 @@ pub struct GuestMemory {
 impl GuestMemory {
     /// Build guest memory containing `size_bytes` of packed RAM.
     pub fn new(size_bytes: u64) -> Result<Self, MemoryError> {
-        Self::new_with_flags(size_bytes, false)
+        Self::new_with_layout(size_bytes, false, None)
     }
 
     /// Build guest memory with huge pages (2 MiB). Reduces TLB misses during
     /// the page-fault storm of UFFD lazy restore (E2B reports 5x faster
     /// first read). Requires `vm.nr_hugepages > 0` on the host.
     pub fn new_hugepages(size_bytes: u64) -> Result<Self, MemoryError> {
-        Self::new_with_flags(size_bytes, true)
+        Self::new_with_layout(size_bytes, true, None)
     }
 
-    fn new_with_flags(size_bytes: u64, huge_pages: bool) -> Result<Self, MemoryError> {
+    /// Fixed boot RAM below the MMIO aperture, with a virtio-mem region at 4GiB.
+    /// The maximum backing is reserved up front; it is not all boot-time RAM.
+    pub fn new_hotplug(size_bytes: u64, boot_bytes: u64) -> Result<Self, MemoryError> {
+        if boot_bytes == 0
+            || boot_bytes > MMIO_GAP_START
+            || boot_bytes >= size_bytes
+            || !boot_bytes.is_multiple_of(128 * 1024 * 1024)
+            || !size_bytes.is_multiple_of(128 * 1024 * 1024)
+        {
+            return Err(MemoryError::Region(
+                "invalid virtio-mem memory layout".into(),
+            ));
+        }
+        Self::new_with_layout(size_bytes, false, Some(boot_bytes))
+    }
+
+    fn new_with_layout(
+        size_bytes: u64,
+        huge_pages: bool,
+        boot_bytes: Option<u64>,
+    ) -> Result<Self, MemoryError> {
         if size_bytes == 0 || !size_bytes.is_multiple_of(4096) {
             return Err(MemoryError::Region(format!(
                 "size must be a non-zero multiple of 4096, got {size_bytes}"
@@ -76,7 +97,7 @@ impl GuestMemory {
             MmapRegion::new(actual_size_usize)
                 .map_err(|e| MemoryError::Assembly(format!("guest memory backing: {e}")))?,
         );
-        let low_size = actual_size.min(MMIO_GAP_START);
+        let low_size = boot_bytes.unwrap_or_else(|| actual_size.min(MMIO_GAP_START));
         let high_size = actual_size - low_size;
         let mut regions = Vec::with_capacity(if high_size == 0 { 1 } else { 2 });
         regions.push(Self::raw_region(
@@ -102,6 +123,7 @@ impl GuestMemory {
         Ok(Self {
             inner: Arc::new(inner),
             size_bytes: actual_size,
+            low_size_bytes: low_size,
             backing,
             host_dirty: SoftwareDirtyBitmap::new(),
             #[cfg(target_os = "linux")]
@@ -142,7 +164,7 @@ impl GuestMemory {
 
     /// Translate a guest physical address into its packed snapshot/host offset.
     pub fn gpa_to_offset(&self, gpa: u64) -> Option<u64> {
-        let low_size = self.size_bytes.min(MMIO_GAP_START);
+        let low_size = self.low_size_bytes;
         if gpa < low_size {
             return Some(gpa);
         }
@@ -158,7 +180,7 @@ impl GuestMemory {
         if offset >= self.size_bytes {
             return None;
         }
-        let low_size = self.size_bytes.min(MMIO_GAP_START);
+        let low_size = self.low_size_bytes;
         if offset < low_size {
             Some(offset)
         } else {
@@ -195,8 +217,14 @@ impl GuestMemory {
         Ok(())
     }
 
-    pub fn host_dirty_tracker(&self) -> SoftwareDirtyBitmap {
+    /// Tracker for packed backing offsets (UFFD), not guest DMA addresses.
+    pub fn packed_dirty_tracker(&self) -> SoftwareDirtyBitmap {
         self.host_dirty.clone()
+    }
+
+    pub fn host_dirty_tracker(&self) -> SoftwareDirtyBitmap {
+        self.host_dirty
+            .with_guest_layout(self.low_size_bytes, self.size_bytes)
     }
 
     /// Mark a range in the packed snapshot address space dirty.
@@ -289,6 +317,42 @@ impl GuestMemory {
 mod tests {
     use super::*;
     use vm_memory::{GuestMemoryBackend as _, GuestMemoryRegion as _};
+
+    #[test]
+    fn hotplug_layout_and_dma_dirty_tracking_preserve_packed_offsets() {
+        let boot = 256 * 1024 * 1024;
+        let m = GuestMemory::new_hotplug(2 * boot, boot).unwrap();
+        assert_eq!(m.gpa_to_offset(boot), None);
+        assert_eq!(m.gpa_to_offset(MMIO_GAP_START), None);
+        assert_eq!(m.gpa_to_offset(MMIO_GAP_END + 4096), Some(boot + 4096));
+        m.host_dirty_tracker().mark_range(MMIO_GAP_END + 4095, 2);
+        let dirty = m.drain_host_dirty();
+        assert_eq!(dirty.len(), 2);
+        assert!(dirty.contains(boot));
+        assert!(dirty.contains(boot + 4096));
+        // UFFD uses packed offsets while DMA uses GPAs. Both must hit the same
+        // backing bitmap, including below the conventional 3.25GiB split.
+        m.packed_dirty_tracker().mark_range(boot + 8192, 1);
+        assert!(m.drain_host_dirty().contains(boot + 8192));
+        m.host_dirty_tracker().mark_range(boot, 4096);
+        assert!(m.drain_host_dirty().is_empty());
+        m.write_phys(MMIO_GAP_END, &[0xa5; 16]).unwrap();
+        let mut bytes = [0; 16];
+        m.read_phys(MMIO_GAP_END, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xa5; 16]);
+    }
+
+    #[test]
+    fn invalid_hotplug_apertures_are_rejected_before_mapping() {
+        for (max, boot) in [
+            (0, 0),
+            (256 << 20, 256 << 20),
+            (512 << 20, 129 << 20),
+            (5 << 30, 4 << 30),
+        ] {
+            assert!(GuestMemory::new_hotplug(max, boot).is_err());
+        }
+    }
 
     #[test]
     fn builds_small_guest_memory() {
