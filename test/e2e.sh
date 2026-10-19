@@ -41,7 +41,7 @@ ORDER=(smoke cli ssh-pty image warmpool multitenant net lifecycle suspend snapsh
 declare -A RESULT; PASS=0; FAIL=0
 for name in "${ORDER[@]}"; do
   script="${SUITE[$name]:-}"
-  [ -n "$script" ] || { warn "unknown suite '$name' (known: ${!SUITE[*]})"; continue; }
+  [ -n "$script" ] || { warn "unknown suite '$name' (known: ${!SUITE[*]})"; RESULT[$name]=UNKNOWN; FAIL=$((FAIL+1)); continue; }
   path="$REPO_ROOT/orch/tests/$script"
   [ -f "$path" ] || { RESULT[$name]=MISSING; FAIL=$((FAIL+1)); continue; }
   echo; info "── $name ($script) ──"
@@ -54,7 +54,7 @@ echo; echo "================ test/e2e summary ================"
 for name in "${ORDER[@]}"; do printf "  %-14s %s\n" "$name" "${RESULT[$name]:-SKIP}"; done
 echo "  ------------------------------------------"
 echo "  PASS=$PASS FAIL=$FAIL"
-if [ "$FAIL" -eq 0 ]; then
+if [ "$FAIL" -eq 0 ] && [ "$PASS" -gt 0 ]; then
   echo "  RESULT: E2E_PASS"
   exit 0
 fi
