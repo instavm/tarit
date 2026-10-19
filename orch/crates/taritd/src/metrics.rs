@@ -316,15 +316,15 @@ impl Metrics {
     }
 }
 
-fn increment_counter(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(amount))
+pub(crate) fn increment_counter(counter: &AtomicU64, amount: u64) {
+    counter.update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.saturating_add(amount)
     });
 }
 
 fn decrement_gauge(gauge: &AtomicU64) {
-    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(1))
+    gauge.update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        current.saturating_sub(1)
     });
 }
 
@@ -814,6 +814,18 @@ mod tests {
     use tarit_store::Store;
     use tarit_types::VmRecord;
     use uuid::Uuid;
+
+    #[test]
+    fn counters_and_gauges_saturate_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        increment_counter(&counter, 8);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+
+        let gauge = AtomicU64::new(1);
+        decrement_gauge(&gauge);
+        decrement_gauge(&gauge);
+        assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn render_metrics_has_prometheus_shape() {

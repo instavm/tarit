@@ -116,9 +116,7 @@ where
 }
 
 fn increment_rejection(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(1))
-    });
+    crate::metrics::increment_counter(counter, 1);
 }
 
 #[derive(Debug, Clone)]
