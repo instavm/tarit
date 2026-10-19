@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, RwLock, RwLockReadGuard,
 };
 use std::time::{Duration, Instant};
 use tarit_types::{OrchError, VmRecord, VmRuntimeLayout, VmStatus};
@@ -2862,7 +2862,9 @@ pub(crate) enum WarmClaimOutcome<T> {
 #[derive(Default)]
 pub(crate) struct VmAdmissionGate {
     closed: AtomicBool,
-    operation: Mutex<()>,
+    /// Admitted operations share this lock so they never serialize behind one
+    /// another; `close` takes it exclusively to wait for every one in flight.
+    operation: RwLock<()>,
 }
 
 impl VmAdmissionGate {
@@ -2874,14 +2876,19 @@ impl VmAdmissionGate {
         self.closed.store(true, Ordering::Release);
         let _operation = self
             .operation
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
 
-    pub(crate) fn enter(&self) -> Result<std::sync::MutexGuard<'_, ()>, OrchError> {
+    pub(crate) fn enter(&self) -> Result<RwLockReadGuard<'_, ()>, OrchError> {
+        // Reject before queueing behind a pending `close`, which waits for
+        // every in-flight operation to drain.
+        if self.is_closed() {
+            return Err(shutdown_error());
+        }
         let operation = self
             .operation
-            .lock()
+            .read()
             .map_err(|_| OrchError::Internal("supervisor admission lock poisoned".into()))?;
         if self.is_closed() {
             return Err(shutdown_error());
@@ -10101,6 +10108,49 @@ mod tests {
             !created.load(Ordering::Acquire),
             "a refill planned before shutdown must not create a VMM after admission closes"
         );
+    }
+
+    #[test]
+    fn admission_gate_admits_concurrent_operations_and_close_drains_them() {
+        let gate = Arc::new(VmAdmissionGate::default());
+        let slow_resume = gate.enter().unwrap();
+
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let worker_gate = Arc::clone(&gate);
+        let concurrent = thread::spawn(move || {
+            let _create = worker_gate.enter().unwrap();
+            admitted_tx.send(()).unwrap();
+        });
+        admitted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an in-flight operation must not serialize other admissions");
+        concurrent.join().unwrap();
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let closer_gate = Arc::clone(&gate);
+        let closer_closed = Arc::clone(&closed);
+        let closer = thread::spawn(move || {
+            closer_gate.close();
+            closer_closed.store(true, Ordering::Release);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gate.is_closed() {
+            assert!(
+                Instant::now() < deadline,
+                "close must mark admission closed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(gate.enter(), Err(OrchError::Overloaded { .. })));
+        assert!(
+            !closed.load(Ordering::Acquire),
+            "close must wait for the in-flight operation"
+        );
+
+        drop(slow_resume);
+        closer.join().unwrap();
+        assert!(closed.load(Ordering::Acquire));
+        assert!(matches!(gate.enter(), Err(OrchError::Overloaded { .. })));
     }
 
     #[test]

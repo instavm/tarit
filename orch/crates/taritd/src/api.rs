@@ -636,10 +636,10 @@ async fn readyz(State(state): State<AppState>) -> Response {
     let admission = state.supervisor.admission_gate();
     checks.insert(
         "admission",
-        if admission.enter().is_ok() {
-            "ok"
-        } else {
+        if admission.is_closed() {
             "closed"
+        } else {
+            "ok"
         },
     );
     checks.insert(
