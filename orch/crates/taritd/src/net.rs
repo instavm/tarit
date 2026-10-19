@@ -38,6 +38,10 @@ const NFT_INPUT_CHAIN: &str = "vm_input";
 /// ingress base chain without touching another VM's filter.
 const NFT_INGRESS_TABLE_PREFIX: &str = "taritd_ingress_";
 const NFT_INGRESS_CHAIN: &str = "ingress";
+/// IPv4 link-local, which hosts cloud instance metadata services
+/// (169.254.169.254) and other host-adjacent endpoints. Every TAP drops it in
+/// the forward chain ahead of tenant allow rules, so no allowlist can open it.
+const LINK_LOCAL_CIDR: &str = "169.254.0.0/16";
 const TAP_PREFIX: &str = "insta";
 const NET_POOL_SLOTS: u32 = 1 << 14;
 const NET_STATE_VERSION: u32 = 2;
@@ -932,7 +936,7 @@ impl NetProvisioner {
         }
         for (chain, kind, minimum_rules) in [
             (NFT_CHAIN, TaritdNftRuleKind::Nat, 1),
-            (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard, 3),
+            (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard, 4),
             (NFT_INPUT_CHAIN, TaritdNftRuleKind::Input, 3),
         ] {
             let listing = command_stdout("nft", &["-a", "list", "chain", "ip", NFT_TABLE, chain])?;
@@ -1841,6 +1845,25 @@ fn tap_provision_argv(
             "ip".into(),
             "daddr".into(),
             "172.16.0.0/16".into(),
+            "drop".into(),
+            "comment".into(),
+            guard_comment.clone(),
+        ],
+        vec![
+            "nft".into(),
+            "add".into(),
+            "rule".into(),
+            "ip".into(),
+            NFT_TABLE.into(),
+            NFT_FWD_CHAIN.into(),
+            "iifname".into(),
+            interface.clone(),
+            "ip".into(),
+            "saddr".into(),
+            alloc.guest_ip.clone(),
+            "ip".into(),
+            "daddr".into(),
+            LINK_LOCAL_CIDR.into(),
             "drop".into(),
             "comment".into(),
             guard_comment.clone(),
@@ -2856,6 +2879,29 @@ pub(crate) fn normalize_egress_allowlist(entries: &[String]) -> Result<Vec<Strin
     Ok(normalized)
 }
 
+/// Tenant-facing policy validation. An entry entirely inside the mandatory
+/// link-local guard could never match, so reject it rather than persist a rule
+/// the host always drops. Durable policies are still loaded with
+/// [`normalize_egress_allowlist`], so an entry stored before the guard existed
+/// stays inert instead of blocking boot or resume.
+pub(crate) fn normalize_tenant_egress_allowlist(
+    entries: &[String],
+) -> Result<Vec<String>, OrchError> {
+    let normalized = normalize_egress_allowlist(entries)?;
+    let link_local = LINK_LOCAL_CIDR
+        .parse::<Ipv4Net>()
+        .expect("link-local guard CIDR is valid");
+    for entry in &normalized {
+        let (cidr, _, _) = parse_egress_entry(entry)?;
+        if link_local.contains(&parse_ipv4_egress_cidr(&cidr, entry)?) {
+            return Err(OrchError::BadRequest(format!(
+                "bad egress rule {entry:?}: link-local {LINK_LOCAL_CIDR} is always denied"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
 fn parse_ipv4_egress_cidr(cidr: &str, entry: &str) -> Result<Ipv4Net, OrchError> {
     match cidr.parse::<IpAddr>() {
         Ok(IpAddr::V4(addr)) => Ok(Ipv4Net::from(addr)),
@@ -3264,6 +3310,7 @@ fn validate_security_rule_order(
             let guards = [
                 SecurityRuleRole::ForwardSourceGuard,
                 SecurityRuleRole::ForwardLateralGuard,
+                SecurityRuleRole::ForwardLinkLocalGuard,
                 SecurityRuleRole::ForwardUplinkGuard,
             ];
             let first_accept = first(&[
@@ -3449,6 +3496,13 @@ fn validate_complete_forward_policy(
             ),
         ),
         (
+            SecurityRuleRole::ForwardLinkLocalGuard,
+            format!(
+                "iifname {tap} ip saddr {} ip daddr {LINK_LOCAL_CIDR} drop",
+                alloc.guest_ip
+            ),
+        ),
+        (
             SecurityRuleRole::ForwardUplinkGuard,
             format!("iifname {tap} ip saddr {} oifname != ", alloc.guest_ip),
         ),
@@ -3527,6 +3581,7 @@ fn validate_complete_forward_policy(
                 role,
                 SecurityRuleRole::ForwardSourceGuard
                     | SecurityRuleRole::ForwardLateralGuard
+                    | SecurityRuleRole::ForwardLinkLocalGuard
                     | SecurityRuleRole::ForwardUplinkGuard
                     | SecurityRuleRole::EgressStateful
                     | SecurityRuleRole::EgressAllow
@@ -3655,6 +3710,7 @@ fn validate_complete_input_policy(alloc: &NetAlloc, listing: &str) -> Result<(),
 enum SecurityRuleRole {
     ForwardSourceGuard,
     ForwardLateralGuard,
+    ForwardLinkLocalGuard,
     ForwardUplinkGuard,
     InputSourceGuard,
     InputStateful,
@@ -3694,6 +3750,15 @@ fn valid_taritd_security_rule(
                 ) =>
         {
             Some(SecurityRuleRole::ForwardLateralGuard)
+        }
+        (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard)
+            if rule
+                == format!(
+                    "iifname {tap} ip saddr {} ip daddr {LINK_LOCAL_CIDR} drop",
+                    alloc.guest_ip
+                ) =>
+        {
+            Some(SecurityRuleRole::ForwardLinkLocalGuard)
         }
         (NFT_FWD_CHAIN, TaritdNftRuleKind::Guard)
             if valid_any_uplink_guard_rule(rule, &tap, &alloc.guest_ip) =>
@@ -4002,7 +4067,12 @@ mod tests {
                 nft_quote(&guard_comment(alloc))
             ),
             format!(
-                "iifname {tap} ip saddr {} oifname != \"eth0\" drop comment {} # handle 3",
+                "iifname {tap} ip saddr {} ip daddr 169.254.0.0/16 drop comment {} # handle 3",
+                alloc.guest_ip,
+                nft_quote(&guard_comment(alloc))
+            ),
+            format!(
+                "iifname {tap} ip saddr {} oifname != \"eth0\" drop comment {} # handle 4",
                 alloc.guest_ip,
                 nft_quote(&guard_comment(alloc))
             ),
@@ -4013,7 +4083,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .enumerate()
-                .map(|(index, rule)| format!("{} # handle {}", rule[6..].join(" "), index + 4)),
+                .map(|(index, rule)| format!("{} # handle {}", rule[6..].join(" "), index + 5)),
         )
         .collect::<Vec<_>>()
         .join("\n");
@@ -4316,6 +4386,25 @@ esac
                     "ip",
                     "saddr",
                     "172.16.0.2",
+                    "ip",
+                    "daddr",
+                    "169.254.0.0/16",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
                     "oifname",
                     "!=",
                     "\"eth0\"",
@@ -4522,6 +4611,25 @@ esac
                     "ip",
                     "daddr",
                     "172.16.0.0/16",
+                    "drop",
+                    "comment",
+                    "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
+                ]),
+                argv(&[
+                    "nft",
+                    "add",
+                    "rule",
+                    "ip",
+                    "taritd_nat",
+                    "vm_egress",
+                    "iifname",
+                    "\"insta0\"",
+                    "ip",
+                    "saddr",
+                    "172.16.0.2",
+                    "ip",
+                    "daddr",
+                    "169.254.0.0/16",
                     "drop",
                     "comment",
                     "\"taritd-guard slot=0 vm=00000000-0000-0000-0000-000000000000 tap=insta0\"",
@@ -4958,6 +5066,87 @@ esac
     }
 
     #[test]
+    fn tenant_egress_policy_rejects_destinations_inside_the_link_local_guard() {
+        for entry in [
+            "169.254.169.254",
+            "169.254.169.254:80",
+            "169.254.0.0/16",
+            "169.254.170.0/24:53/udp",
+        ] {
+            assert!(
+                matches!(
+                    normalize_tenant_egress_allowlist(&[entry.into()]),
+                    Err(OrchError::BadRequest(_))
+                ),
+                "tenant policy accepted link-local entry {entry:?}"
+            );
+        }
+        // Broader ranges stay valid; the forward guard drops their link-local
+        // portion before any tenant accept.
+        assert_eq!(
+            normalize_tenant_egress_allowlist(&[
+                "0.0.0.0/0".into(),
+                "169.0.0.0/8:443".into(),
+                "169.255.0.1".into(),
+            ])
+            .unwrap(),
+            vec!["0.0.0.0/0", "169.0.0.0/8:443/tcp", "169.255.0.1"]
+        );
+        // Durable policies persisted before the guard existed still load, so a
+        // stored link-local entry cannot block boot, resume, or recovery.
+        assert_eq!(
+            normalize_egress_allowlist(&["169.254.169.254:80".into()]).unwrap(),
+            vec!["169.254.169.254:80/tcp"]
+        );
+    }
+
+    #[test]
+    fn recovery_rebuilds_forward_guards_programmed_without_the_link_local_drop() {
+        let alloc = NetAlloc::for_idx(7);
+        let policy = EgressPolicy {
+            allowlist: vec!["0.0.0.0/0".into()],
+            allow_existing: true,
+        };
+        let (nat, forward, input) = complete_policy_listings(&alloc, &policy);
+        let legacy_forward = forward
+            .lines()
+            .filter(|line| !line.contains(LINK_LOCAL_CIDR))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(legacy_forward.lines().count() + 1, forward.lines().count());
+
+        // A guard set from an earlier release is still a recognized managed
+        // shape, so recovery purges and reprograms it instead of refusing it.
+        validate_taritd_security_chain(NFT_FWD_CHAIN, &legacy_forward).unwrap();
+        assert!(legacy_forward.lines().all(|line| {
+            is_recognized_taritd_rule(NFT_FWD_CHAIN, line)
+                && is_stale_recovery_rule_for_alloc(line, &alloc)
+        }));
+        assert!(recovered_tap_reconcile_argv(&alloc, "eth0")
+            .iter()
+            .any(|argv| argv.join(" ").contains(&format!(
+                "vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr {LINK_LOCAL_CIDR} drop comment"
+            ))));
+        // It is never accepted as a complete policy before quarantine release.
+        assert!(validate_complete_effective_security_policies(
+            &[(alloc.clone(), policy.clone())],
+            "eth0",
+            &nat,
+            &legacy_forward,
+            &input,
+        )
+        .is_err());
+        validate_complete_effective_security_policies(
+            &[(alloc, policy)],
+            "eth0",
+            &nat,
+            &forward,
+            &input,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn egress_entry_rejects_injected_and_malformed_ipv4_cidrs() {
         for entry in [
             "192.0.2.0/24 accept; list chain ip taritd_nat vm_egress; #",
@@ -5325,6 +5514,7 @@ case "${0##*/}:$*" in
     elif [ -e "$TARIT_TEST_FAKE_STATE.policy" ]; then
       echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 12"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 13"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 169.254.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 18"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 14"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 15"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10 tcp dport 443 accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 16"
@@ -5446,6 +5636,7 @@ esac
             "nft delete rule ip taritd_nat vm_egress handle 12",
             "nft delete rule ip taritd_nat vm_egress handle 13",
             "nft delete rule ip taritd_nat vm_egress handle 14",
+            "nft delete rule ip taritd_nat vm_egress handle 18",
             "nft delete rule ip taritd_nat vm_input handle 15",
             "nft delete rule ip taritd_nat vm_input handle 16",
             "nft delete rule ip taritd_nat vm_input handle 17",
@@ -5465,6 +5656,7 @@ esac
             "nft add rule netdev taritd_ingress_7 ingress ether type ip accept",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr != 172.16.0.30 counter drop",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop",
+            "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 169.254.0.0/16 drop",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept",
             "nft add rule ip taritd_nat vm_egress iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 198.51.100.10 tcp dport 443 accept",
@@ -5872,6 +6064,7 @@ case "${0##*/}:$*" in
     [ ! -e "$TARIT_TEST_FAKE_STATE.policy7" ] || {
       echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 12"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 15"
+      echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 169.254.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 24"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 16"
       echo "iifname \"insta7\" ip saddr 172.16.0.30 drop comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_7 tap=insta7\" # handle 19"
     }
@@ -5888,7 +6081,7 @@ case "${0##*/}:$*" in
     ;;
   "nft:delete rule ip taritd_nat post handle 11") touch "$TARIT_TEST_FAKE_STATE.policy7-nat-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_egress handle 12") touch "$TARIT_TEST_FAKE_STATE.policy7-guard-cleaned" ;;
-  "nft:delete rule ip taritd_nat vm_egress handle 15"|"nft:delete rule ip taritd_nat vm_egress handle 16") touch "$TARIT_TEST_FAKE_STATE.policy7-guard-cleaned" ;;
+  "nft:delete rule ip taritd_nat vm_egress handle 15"|"nft:delete rule ip taritd_nat vm_egress handle 16"|"nft:delete rule ip taritd_nat vm_egress handle 24") touch "$TARIT_TEST_FAKE_STATE.policy7-guard-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_egress handle 19") touch "$TARIT_TEST_FAKE_STATE.policy7-egress-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_egress handle 13") touch "$TARIT_TEST_FAKE_STATE.policy8-guard-cleaned" ;;
   "nft:delete rule ip taritd_nat vm_input handle 14") touch "$TARIT_TEST_FAKE_STATE.policy7-input-cleaned" ;;
@@ -6461,6 +6654,7 @@ forward_rules() {
     echo "iifname \"insta7\" drop comment \"taritd-egress-update-quarantine slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 99"
   echo "iifname \"insta7\" ip saddr != 172.16.0.30 counter drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 11"
   echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 172.16.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 12"
+  echo "iifname \"insta7\" ip saddr 172.16.0.30 ip daddr 169.254.0.0/16 drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 14"
   echo "iifname \"insta7\" ip saddr 172.16.0.30 oifname != \"eth0\" drop comment \"taritd-guard slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 13"
   if [ -e "$TARIT_TEST_STATE.replaced" ]; then
     echo "iifname \"insta7\" ip saddr 172.16.0.30 ct state established,related accept comment \"taritd-egress slot=7 vm=$TARIT_TEST_VM_ID tap=insta7\" # handle 21"
@@ -6754,6 +6948,7 @@ esac
         for (chain, marker) in [
             ("forward", "ip saddr != 172.16.0.30 counter drop"),
             ("forward", "ip daddr 172.16.0.0/16 drop"),
+            ("forward", "ip daddr 169.254.0.0/16 drop"),
             ("forward", "oifname != \"eth0\" drop"),
             ("forward", "ct state established,related accept"),
             ("forward", "ip daddr 198.51.100.10 tcp dport 443 accept"),
@@ -6797,6 +6992,7 @@ esac
         for (chain, marker) in [
             ("forward", "ip saddr != 172.16.0.30 counter drop"),
             ("forward", "ip daddr 172.16.0.0/16 drop"),
+            ("forward", "ip daddr 169.254.0.0/16 drop"),
             ("forward", "oifname != \"eth0\" drop"),
             ("forward", "ct state established,related accept"),
             ("forward", "ip daddr 198.51.100.10 tcp dport 443 accept"),
@@ -6836,6 +7032,7 @@ esac
         for (chain, marker, move_to_end) in [
             ("forward", "ip saddr != 172.16.0.30 counter drop", true),
             ("forward", "ip daddr 172.16.0.0/16 drop", true),
+            ("forward", "ip daddr 169.254.0.0/16 drop", true),
             ("forward", "oifname != \"eth0\" drop", true),
             ("forward", "ct state established,related accept", false),
             (

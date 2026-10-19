@@ -3781,7 +3781,7 @@ pub async fn put_egress_policy_local(
     } else {
         Some(state.supervisor.operation_gate(id)?.lock_owned().await)
     };
-    let allowlist = crate::net::normalize_egress_allowlist(&allowlist)?;
+    let allowlist = crate::net::normalize_tenant_egress_allowlist(&allowlist)?;
     let now = Utc::now();
     if vm.status == VmStatus::Hibernated {
         if let Some(fleet) = state.fleet.as_ref() {
@@ -5742,6 +5742,17 @@ mod tests {
                 false,
             )),
             Err(OrchError::Conflict(_))
+        ));
+        assert!(matches!(
+            runtime.block_on(put_egress_policy_local(
+                &state,
+                id,
+                "test",
+                2,
+                vec!["169.254.169.254:80".into()],
+                false,
+            )),
+            Err(OrchError::BadRequest(_))
         ));
         assert!(matches!(
             get_egress_policy_local(&state, id, "other-tenant"),

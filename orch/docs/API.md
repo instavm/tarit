@@ -597,7 +597,7 @@ Request:
 }
 ```
 
-`allow_existing` defaults to `false`.
+`allow_existing` defaults to `false`. Entries entirely inside IPv4 link-local `169.254.0.0/16` are rejected with `400`: the host always drops that range.
 
 Response `200`:
 
