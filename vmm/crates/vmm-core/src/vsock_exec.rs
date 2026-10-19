@@ -828,6 +828,13 @@ fn read_text_line(stream: &mut UnixStream, timeout: Duration) -> std::io::Result
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
+        // The deadline bounds the whole line. A peer that trickles bytes
+        // faster than any per-read timeout must not hold the accept thread.
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        stream.set_read_timeout(Some(deadline.saturating_duration_since(now)))?;
         match stream.read(&mut byte) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -854,9 +861,7 @@ fn read_text_line(stream: &mut UnixStream, timeout: Duration) -> std::io::Result
             Err(error)
                 if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
             {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
+                continue
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -1183,6 +1188,29 @@ mod tests {
         let start = Instant::now();
         assert!(!channel.wait_for_initial_connection(Duration::from_secs(1)));
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn connection_banner_deadline_bounds_a_trickling_peer() {
+        let (mut guest, host) = UnixStream::pair().unwrap();
+        let trickler = std::thread::spawn(move || {
+            // Every byte arrives well inside the per-read timeout, but the
+            // banner line never ends.
+            for _ in 0..50 {
+                if guest.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(CONNECT_READY_TIMEOUT / 5);
+            }
+        });
+
+        let start = Instant::now();
+        let Err(error) = prepare_connection(host, 1) else {
+            panic!("a trickled banner must time out");
+        };
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        assert!(start.elapsed() < CONNECT_READY_TIMEOUT * 3);
+        trickler.join().unwrap();
     }
 
     #[test]
