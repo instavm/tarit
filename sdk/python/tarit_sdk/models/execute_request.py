@@ -18,7 +18,9 @@ class ExecuteRequest:
     Attributes:
         vm_id (UUID):
         command (str):
-        timeout_ms (int | Unset):  Default: 30000.
+        timeout_ms (int | Unset): Command budget in milliseconds. `POST /v1/execute` also rejects values above the
+            server's API request deadline (`TARIT_API_REQUEST_TIMEOUT_MS`, default 180000); use `POST /v1/execute_async` for
+            longer commands. Default: 30000.
     """
 
     vm_id: UUID

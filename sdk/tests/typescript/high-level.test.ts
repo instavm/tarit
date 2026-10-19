@@ -38,6 +38,21 @@ function execution(status: "pending" | "running" | "completed" | "failed", field
   };
 }
 
+function forkResult() {
+  return {
+    source_vm_id: vmId,
+    vm: {
+      id: childId,
+      status: "running",
+      revision: 1,
+      memory_mib: 256,
+      vcpus: 1,
+      created_at: now,
+      updated_at: now,
+    },
+  };
+}
+
 class FakeWebSocket extends EventTarget {
   binaryType: BinaryType = "blob";
   readyState = 0;
@@ -169,18 +184,21 @@ test("fork overload retry reuses one child id", async () => {
     const incoming = request instanceof Request ? request : new Request(request, init);
     bodies.push(await incoming.json());
     if (bodies.length === 1) return json(503, { error: "target temporarily unavailable" });
-    return json(201, {
-      source_vm_id: vmId,
-      vm: {
-        id: childId,
-        status: "running",
-        revision: 1,
-        memory_mib: 256,
-        vcpus: 1,
-        created_at: now,
-        updated_at: now,
-      },
-    });
+    return json(201, forkResult());
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
+  const result = await client.fork(vmId, { childId, deadlineMs: 1_000 });
+  assert.equal(result.vm.id, childId);
+  assert.deepEqual(bodies, [{ id: childId }, { id: childId }]);
+});
+
+test("fork accepts the idempotent replay after a lost response", async () => {
+  const bodies: unknown[] = [];
+  const fetch: typeof globalThis.fetch = async (request, init) => {
+    const incoming = request instanceof Request ? request : new Request(request, init);
+    bodies.push(await incoming.json());
+    if (bodies.length === 1) throw new TypeError("fetch failed");
+    return json(200, forkResult());
   };
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "tenant-key", fetch });
   const result = await client.fork(vmId, { childId, deadlineMs: 1_000 });
