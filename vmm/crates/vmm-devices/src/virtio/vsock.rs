@@ -1359,7 +1359,7 @@ fn write_desc_chain(
             return false;
         }
         if let Some(dirty) = dirty {
-            dirty.mark_range(addr, take as u64);
+            dirty.mark_guest_range(addr, take as u64);
         }
         cursor = next_cursor;
     }

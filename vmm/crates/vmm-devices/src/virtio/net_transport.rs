@@ -513,7 +513,7 @@ impl VirtioNetMmio {
                         return Some(0);
                     }
                     if let Some(dirty) = dirty.as_ref() {
-                        dirty.mark_range(addr, take as u64);
+                        dirty.mark_guest_range(addr, take as u64);
                     }
                     cursor = next_cursor;
                 }

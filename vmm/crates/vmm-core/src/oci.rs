@@ -16,7 +16,7 @@
 //! The VMM binary itself stays lean — the OCI pipeline is an orchestrator
 //! concern. The VMM just boots the resulting ext4 image.
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -863,7 +863,10 @@ fn scan_oci_layer(
         | "application/vnd.docker.image.rootfs.diff.tar" => Box::new(file),
         "application/vnd.oci.image.layer.v1.tar+gzip"
         | "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip"
-        | "application/vnd.docker.image.rootfs.diff.tar.gzip" => Box::new(GzDecoder::new(file)),
+        | "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
+            // umoci decodes every gzip member, so the scan must too.
+            Box::new(MultiGzDecoder::new(file))
+        }
         "application/vnd.oci.image.layer.v1.tar+zstd"
         | "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd" => {
             Box::new(zstd::stream::read::Decoder::new(file)?)
@@ -883,7 +886,7 @@ fn scan_oci_layer(
         let mut archive = tar::Archive::new(&mut limited);
         (|| -> Result<(), OciError> {
             for entry in archive.entries()? {
-                let entry = entry?;
+                let mut entry = entry?;
                 stats.entries = stats
                     .entries
                     .checked_add(1)
@@ -893,6 +896,11 @@ fn scan_oci_layer(
                         "layer entries exceed limit {}",
                         limits.max_entries
                     )));
+                }
+                if is_sparse_entry(&mut entry)? {
+                    return Err(OciError::InvalidLayout(
+                        "sparse layer entries are not supported".into(),
+                    ));
                 }
                 let size = entry.size();
                 if size > limits.max_single_file_bytes {
@@ -913,6 +921,7 @@ fn scan_oci_layer(
             Ok(())
         })()
     };
+    let scan_result = scan_result.and_then(|()| drain_tar_padding(&mut limited));
     if limited.exceeded {
         return Err(OciError::ResourceLimit(format!(
             "expanded layers exceed limit {}",
@@ -925,6 +934,41 @@ fn scan_oci_layer(
         .checked_add(limited.consumed)
         .ok_or_else(|| OciError::ResourceLimit("expanded byte count overflows".into()))?;
     Ok(())
+}
+
+/// GNU sparse entries, in the old header form or the PAX form, unpack to a
+/// logical size far larger than the stream bytes the expanded budget counts.
+fn is_sparse_entry<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<bool, OciError> {
+    if entry.header().entry_type().is_gnu_sparse() {
+        return Ok(true);
+    }
+    let Some(extensions) = entry.pax_extensions()? else {
+        return Ok(false);
+    };
+    for extension in extensions {
+        if extension?.key_bytes().starts_with(b"GNU.sparse.") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Read the rest of the decompressed layer after the tar end-of-archive block.
+/// The bytes still count toward the expanded budget and may only be the zero
+/// padding archivers append.
+fn drain_tar_padding(reader: &mut impl Read) -> Result<(), OciError> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        if buffer[..read].iter().any(|byte| *byte != 0) {
+            return Err(OciError::InvalidLayout(
+                "layer has data after the tar end-of-archive marker".into(),
+            ));
+        }
+    }
 }
 
 struct ExpandedLimitReader<R> {
@@ -1156,6 +1200,102 @@ mod tests {
 
         assert!(matches!(error, OciError::ResourceLimit(_)));
         assert!(error.to_string().contains("expanded layers exceed limit"));
+    }
+
+    #[test]
+    fn oci_preflight_scans_every_gzip_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = vec![0x41u8; 16 * 1024];
+        let layer = tar_layer(&[("etc/one", b"one"), ("large-file", &payload)]);
+        // The first member ends exactly after the first entry, so a decoder
+        // that stops after one member sees a small, well-formed archive.
+        let mut blob = gzip(&layer[..1024]);
+        blob.extend_from_slice(&gzip(&layer[1024..]));
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar+gzip", blob)],
+        );
+
+        let stats =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10)).unwrap();
+        assert_eq!(stats.entries, 2);
+        assert!(stats.expanded_bytes >= layer.len() as u64);
+
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(4096, 10)).unwrap_err();
+        assert!(matches!(error, OciError::ResourceLimit(_)));
+        assert!(error.to_string().contains("expanded layers exceed limit"));
+    }
+
+    #[test]
+    fn oci_preflight_allows_zero_padding_but_rejects_data_after_tar_end() {
+        let mut padded = tar_layer(&[("etc/one", b"one")]);
+        padded.resize(10 * 1024, 0);
+        let temp = tempfile::tempdir().unwrap();
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar+gzip", gzip(&padded))],
+        );
+        let stats =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10)).unwrap();
+        assert_eq!(stats.entries, 1);
+
+        let mut smuggled = gzip(&padded);
+        smuggled.extend_from_slice(&gzip(&tar_layer(&[("etc/two", b"two")])));
+        let temp = tempfile::tempdir().unwrap();
+        write_layout(
+            temp.path(),
+            vec![("application/vnd.oci.image.layer.v1.tar+gzip", smuggled)],
+        );
+        let error =
+            preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10)).unwrap_err();
+        assert!(matches!(error, OciError::InvalidLayout(_)));
+        assert!(error.to_string().contains("after the tar end-of-archive"));
+    }
+
+    #[test]
+    fn oci_preflight_rejects_sparse_entries() {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_mode(0o644);
+        header.set_size(512);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(512 * 1024);
+        gnu.sparse[0].set_offset(512 * 1024 - 512);
+        gnu.sparse[0].set_length(512);
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_data(&mut header, "var/gnu-sparse", &[0x5a; 512][..])
+            .unwrap();
+        let gnu_sparse = builder.into_inner().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([
+                ("GNU.sparse.major", &b"1"[..]),
+                ("GNU.sparse.minor", &b"0"[..]),
+                ("GNU.sparse.realsize", &b"524288"[..]),
+            ])
+            .unwrap();
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(0o644);
+        header.set_size(512);
+        builder
+            .append_data(&mut header, "var/pax-sparse", &[0u8; 512][..])
+            .unwrap();
+        let pax_sparse = builder.into_inner().unwrap();
+
+        for layer in [gnu_sparse, pax_sparse] {
+            let temp = tempfile::tempdir().unwrap();
+            write_layout(
+                temp.path(),
+                vec![("application/vnd.oci.image.layer.v1.tar", layer)],
+            );
+            let error = preflight_oci_layout(temp.path(), "default", test_limits(64 * 1024, 10))
+                .unwrap_err();
+            assert!(matches!(error, OciError::InvalidLayout(_)));
+            assert!(error.to_string().contains("sparse"));
+        }
     }
 
     #[test]

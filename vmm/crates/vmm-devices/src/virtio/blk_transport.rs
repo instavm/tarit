@@ -476,7 +476,7 @@ impl VirtioBlkMmio {
                 break;
             }
             if let Some(dirty) = dirty {
-                dirty.mark_range(addr, take as u64);
+                dirty.mark_guest_range(addr, take as u64);
             }
             cursor = next_cursor;
         }
@@ -492,7 +492,7 @@ impl VirtioBlkMmio {
         match writable.last() {
             Some((addr, len)) if *len > 0 && mem.write_obj(st, GuestAddress(*addr)).is_ok() => {
                 if let Some(dirty) = dirty {
-                    dirty.mark_range(*addr, 1);
+                    dirty.mark_guest_range(*addr, 1);
                 }
                 1
             }

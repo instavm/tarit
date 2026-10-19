@@ -39,7 +39,7 @@ fn write_obj_mem<T: ByteValued>(
 ) -> bool {
     if mem.write_obj(val, addr).is_ok() {
         if let Some(dirty) = dirty {
-            dirty.mark_range(addr.raw_value(), std::mem::size_of::<T>() as u64);
+            dirty.mark_guest_range(addr.raw_value(), std::mem::size_of::<T>() as u64);
         }
         true
     } else {
@@ -61,7 +61,7 @@ fn write_slice_mem(
 ) -> bool {
     if mem.write_slice(buf, addr).is_ok() {
         if let Some(dirty) = dirty {
-            dirty.mark_range(addr.raw_value(), buf.len() as u64);
+            dirty.mark_guest_range(addr.raw_value(), buf.len() as u64);
         }
         true
     } else {
@@ -848,6 +848,50 @@ mod tests {
         assert!(dirty.contains(status_addr));
         assert!(dirty.contains(used + 4));
         assert!(dirty.contains(used + 2));
+    }
+
+    #[test]
+    fn process_queue_dirty_records_high_ram_by_packed_offset() {
+        use vmm_memory_backend::backend::{GuestMemory, MMIO_GAP_END, MMIO_GAP_START};
+
+        let guest = GuestMemory::new(MMIO_GAP_START + 2 * 4096).unwrap();
+        let mem = &*guest.inner;
+        let (desc_table, avail, used) = (0x10000, 0x20000, 0x30000);
+        let _ = mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(avail));
+        let _ = mem.write_obj(0u16, GuestAddress(avail + 4));
+        let desc0 = Descriptor {
+            addr: MMIO_GAP_END,
+            len: 32,
+            flags: desc_flags::WRITE | desc_flags::NEXT,
+            next: 1,
+        };
+        let desc1 = Descriptor {
+            addr: 0x4000,
+            len: 1,
+            flags: desc_flags::WRITE,
+            next: 0,
+        };
+        let _ = mem.write_obj(desc0, GuestAddress(desc_table));
+        let _ = mem.write_obj(desc1, GuestAddress(desc_table + 16));
+
+        let dirty = guest.host_dirty_tracker();
+        let mut p = VirtQueueProcessor::new(QueueConfig {
+            size: 8,
+            desc_table_addr: desc_table,
+            avail_ring_addr: avail,
+            used_ring_addr: used,
+            ready: true,
+        });
+        let count = p.process_queue_dirty(mem, Some(&dirty), |_readable, writable| {
+            writable.fill(0x5a);
+            0
+        });
+
+        assert_eq!(count, 1);
+        let dirty = guest.drain_host_dirty();
+        assert!(dirty.contains(MMIO_GAP_START));
+        assert!(!dirty.contains(MMIO_GAP_END));
+        assert!(dirty.contains(0x4000));
     }
 
     #[test]

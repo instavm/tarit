@@ -389,7 +389,7 @@ class TaritClient:
                     client=self.raw,
                     body=ForkVmRequest(id=child_id),
                 )
-            except (httpx.TimeoutException, httpx.NetworkError):
+            except httpx.TransportError:
                 response = None
             if response is not None and int(response.status_code) not in RETRYABLE_STATUS:
                 return _parsed(response, ForkVmResponse, "fork VM")
@@ -540,7 +540,7 @@ class AsyncTaritClient:
         while True:
             try:
                 response = await call()
-            except (httpx.TimeoutException, httpx.NetworkError):
+            except httpx.TransportError:
                 response = None
             if response is not None and int(response.status_code) not in RETRYABLE_STATUS:
                 return response

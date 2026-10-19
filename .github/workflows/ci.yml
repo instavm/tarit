@@ -119,15 +119,15 @@ jobs:
 
       - name: Clippy
         working-directory: ${{ matrix.workspace }}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Check
         working-directory: ${{ matrix.workspace }}
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: Test (non-KVM unit tests)
         working-directory: ${{ matrix.workspace }}
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Test lifecycle soak supervisor
         if: matrix.workspace == 'orch'
@@ -139,7 +139,7 @@ jobs:
         if: matrix.workspace == 'vmm'
         working-directory: ${{ matrix.workspace }}
         run: >-
-          cargo check --workspace --all-targets
+          cargo check --locked --workspace --all-targets
           --features vmm-core/kvm
           --features vmm-core/boot
           --features vmm-memory-backend/kvm
@@ -149,7 +149,7 @@ jobs:
         if: matrix.workspace == 'vmm'
         working-directory: ${{ matrix.workspace }}
         run: >-
-          cargo clippy --workspace --all-targets
+          cargo clippy --locked --workspace --all-targets
           --features vmm-core/kvm
           --features vmm-core/boot
           --features vmm-memory-backend/kvm

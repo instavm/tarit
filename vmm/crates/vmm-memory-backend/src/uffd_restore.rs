@@ -158,8 +158,8 @@ pub struct ChunkIntegrity {
 }
 
 // SAFETY: `LazyRestore` owns the UFFD fd and mmap lifetime, and the raw mmap
-// pointer is read-only after construction. Drop synchronizes shutdown by closing
-// the fd and joining the handler thread before unmapping the snapshot.
+// pointer is read-only after construction. Drop synchronizes shutdown by joining
+// the handler thread, then closing the fd, before unmapping the snapshot.
 unsafe impl Send for LazyRestore {}
 // SAFETY: Shared access only observes atomics/fd ownership; mutable teardown is
 // guarded by `Drop`'s unique `&mut self`, so concurrent readers cannot mutate
@@ -171,14 +171,16 @@ impl Drop for LazyRestore {
         // Signal the handler thread to shut down.
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        // Close the uffd fd first — this unblocks the handler thread's
-        // blocking read(uffd_fd) (returns EBADF or 0).
-        if let Some(uffd_fd) = self.uffd_fd.take() {
-            drop(uffd_fd);
-        }
-        // Join the handler thread (should exit within 1s via poll timeout).
+        // Join the handler thread before closing the uffd. The handler only
+        // holds the raw fd number, so closing first would let another thread
+        // reuse that number while the handler can still read or ioctl it. The
+        // fd is nonblocking and the handler polls with a timeout, so it
+        // observes the shutdown flag within one poll interval.
         if let Some(handle) = self.handler_thread.take() {
             let _ = handle.join();
+        }
+        if let Some(uffd_fd) = self.uffd_fd.take() {
+            drop(uffd_fd);
         }
         // Unmap the snapshot.
         if !self.snapshot_mmap.is_null() && self.snapshot_mmap_len > 0 {

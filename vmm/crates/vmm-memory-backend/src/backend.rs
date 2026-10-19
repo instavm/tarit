@@ -195,6 +195,9 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Tracker shared with devices that write guest RAM directly. They hold
+    /// only guest physical addresses and must mark through
+    /// [`SoftwareDirtyBitmap::mark_guest_range`].
     pub fn host_dirty_tracker(&self) -> SoftwareDirtyBitmap {
         self.host_dirty.clone()
     }
@@ -330,6 +333,20 @@ mod tests {
             &[0x5a; 16]
         );
         assert!(m.drain_host_dirty().contains(MMIO_GAP_START));
+    }
+
+    #[test]
+    fn device_dirty_tracker_records_high_ram_by_packed_offset() {
+        let m = GuestMemory::new(MMIO_GAP_START + 2 * 4096).expect("split guest memory");
+        let tracker = m.host_dirty_tracker();
+        tracker.mark_guest_range(MMIO_GAP_END, 16);
+        tracker.mark_guest_range(MMIO_GAP_START - 4096, 1);
+
+        let dirty = m.drain_host_dirty();
+        assert!(dirty.contains(MMIO_GAP_START));
+        assert!(dirty.contains(MMIO_GAP_START - 4096));
+        assert!(!dirty.contains(MMIO_GAP_END));
+        assert_eq!(dirty.len(), 2);
     }
 
     #[test]

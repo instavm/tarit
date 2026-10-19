@@ -8,8 +8,8 @@ use std::io::{BufReader, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tarit_store::{ImageRecord, Store, StoreError};
-use tarit_types::{CreateVmRequest, OrchError, VmStatus};
+use tarit_store::{ImageRecord, SnapshotRecord, Store, StoreError};
+use tarit_types::{CreateVmRequest, OrchError, VmRecord, VmStatus};
 
 use crate::config::{expand_path, load_warm_pool_config, Config, WarmPoolConfig};
 
@@ -515,7 +515,7 @@ pub fn remove_image(config: &LocalImageConfig, image_ref: &ImageRef) -> Result<I
     let protected = protected_paths(&store)?;
     if protected.contains(&image.rootfs_path) {
         bail!(
-            "image {} is referenced by a warm-pool class or active VM",
+            "image {} is referenced by a warm-pool class, VM, or snapshot",
             image_ref.label()
         );
     }
@@ -596,18 +596,36 @@ pub fn select_gc_candidates(
         .collect()
 }
 
+/// Base rootfs paths that durable records still boot from: every VM that can
+/// run again (a Hibernated VM restores over its original base) and every
+/// snapshot, whose restore boots from the base recorded at capture time.
+fn record_rootfs_paths(vms: &[VmRecord], snapshots: &[SnapshotRecord]) -> HashSet<String> {
+    let vm_paths = vms
+        .iter()
+        .filter(|vm| {
+            matches!(
+                vm.status,
+                VmStatus::Creating
+                    | VmStatus::Running
+                    | VmStatus::Paused
+                    | VmStatus::Suspended
+                    | VmStatus::Hibernated
+            )
+        })
+        .filter_map(|vm| vm.rootfs_path.clone());
+    let snapshot_paths = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.rootfs_path.clone());
+    vm_paths.chain(snapshot_paths).collect()
+}
+
 fn protected_paths(store: &Store) -> Result<HashSet<String>> {
-    let mut protected = HashSet::new();
-    for vm in store.list_vms().context("list VMs for image GC")? {
-        if matches!(
-            vm.status,
-            VmStatus::Creating | VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
-        ) {
-            if let Some(rootfs) = vm.rootfs_path {
-                protected.insert(rootfs);
-            }
-        }
-    }
+    let mut protected = record_rootfs_paths(
+        &store.list_vms().context("list VMs for image GC")?,
+        &store
+            .list_snapshots()
+            .context("list snapshots for image GC")?,
+    );
 
     let mut warm_pool = load_warm_pool_config()?;
     for class in &warm_pool.classes {
@@ -912,6 +930,71 @@ mod tests {
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].label(), "node:18");
+    }
+
+    #[test]
+    fn hibernated_vms_and_snapshots_protect_their_base_rootfs() {
+        let now = Utc::now();
+        let vm = |status: VmStatus, rootfs: &str| VmRecord {
+            id: uuid::Uuid::new_v4(),
+            host_id: "host-a".into(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: None,
+            status,
+            revision: 1,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: Some(rootfs.into()),
+            rootfs_read_only: true,
+            cmdline: "console=ttyS0".into(),
+            runtime_layout: None,
+            socket_path: None,
+            pid: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let vms = vec![
+            vm(VmStatus::Running, "/images/running.ext4"),
+            vm(VmStatus::Hibernated, "/images/hibernated.ext4"),
+            vm(VmStatus::Stopped, "/images/stopped.ext4"),
+            vm(VmStatus::Error, "/images/error.ext4"),
+        ];
+        let snapshot = SnapshotRecord {
+            snapshot_id: uuid::Uuid::new_v4(),
+            path: "/snapshots/vm.snap".into(),
+            overlay_path: Some("/snapshots/vm.overlay".into()),
+            host_id: "host-a".into(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: None,
+            vm_id: vms[2].id,
+            ephemeral_owner_vm_id: None,
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: Some("kernel".into()),
+            rootfs_path: Some("/images/snapshotted.ext4".into()),
+            rootfs_read_only: Some(true),
+            cmdline: Some("console=ttyS0".into()),
+            content_digest: None,
+            size_bytes: None,
+            created_at: now,
+        };
+        let rootless_snapshot = SnapshotRecord {
+            rootfs_path: None,
+            ..snapshot.clone()
+        };
+
+        let protected = record_rootfs_paths(&vms, &[snapshot, rootless_snapshot]);
+
+        assert_eq!(
+            protected,
+            HashSet::from([
+                "/images/running.ext4".to_string(),
+                "/images/hibernated.ext4".to_string(),
+                "/images/snapshotted.ext4".to_string(),
+            ])
+        );
     }
 
     trait ImageRecordExt {

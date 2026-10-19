@@ -3588,6 +3588,23 @@ fn fleet_error_from_postgres(error: tokio_postgres::Error) -> FleetError {
     }
 }
 
+/// Whether every connection the fleet pool opens for `database_url` uses TLS
+/// or stays on a local Unix socket. tokio-postgres defaults to
+/// `sslmode=prefer`, which silently falls back to plaintext TCP.
+pub fn database_url_requires_tls(database_url: &str) -> Result<bool, FleetError> {
+    let mut cfg = PoolConfig::new();
+    cfg.url = Some(database_url.to_string());
+    let pg = cfg
+        .get_pg_config()
+        .map_err(|e| FleetError::Config(e.to_string()))?;
+    let unix_sockets_only = pg.get_hostaddrs().is_empty()
+        && pg
+            .get_hosts()
+            .iter()
+            .all(|host| matches!(host, tokio_postgres::config::Host::Unix(_)));
+    Ok(pg.get_ssl_mode() == tokio_postgres::config::SslMode::Require || unix_sockets_only)
+}
+
 fn make_rustls_connector() -> Result<MakeRustlsConnect, FleetError> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -3791,6 +3808,31 @@ mod tests {
                 .await?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn database_url_tls_requirement_rejects_plaintext_fallback() {
+        for url in [
+            "postgres://u:p@db.example:5432/tarit?sslmode=require",
+            "host=db.example dbname=tarit sslmode=require",
+            "postgres://u@%2Frun%2Fpostgresql/tarit",
+            "host=/run/postgresql dbname=tarit sslmode=disable",
+            "dbname=tarit",
+        ] {
+            assert!(database_url_requires_tls(url).unwrap(), "{url}");
+        }
+        for url in [
+            "postgres://u:p@db.example:5432/tarit",
+            "postgres://u:p@db.example:5432/tarit?sslmode=prefer",
+            "postgres://u:p@db.example:5432/tarit?sslmode=disable",
+            "host=/run/postgresql,db.example dbname=tarit",
+            "host=/run/postgresql hostaddr=10.0.0.5 dbname=tarit",
+        ] {
+            assert!(!database_url_requires_tls(url).unwrap(), "{url}");
+        }
+        assert!(
+            database_url_requires_tls("postgres://db.example/tarit?sslmode=verify-full").is_err()
+        );
     }
 
     #[test]
