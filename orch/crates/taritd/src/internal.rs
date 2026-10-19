@@ -955,8 +955,16 @@ async fn internal_exec(
     Json(body): Json<InternalExecBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
-    let (code, stdout, stderr, duration_ms) =
-        ops::exec_local(&state, id, body.command, body.timeout_ms).await?;
+    // The peer waits on this request, so it is bound by the same deadline.
+    let gate_deadline = ops::exec_gate_deadline(&state.config, body.timeout_ms);
+    let (code, stdout, stderr, duration_ms) = ops::exec_local(
+        &state,
+        id,
+        body.command,
+        body.timeout_ms,
+        Some(gate_deadline),
+    )
+    .await?;
     Ok(Json(serde_json::json!({
         "exit_code": code,
         "stdout": stdout,

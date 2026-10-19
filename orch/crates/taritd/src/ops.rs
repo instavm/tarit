@@ -1853,20 +1853,47 @@ fn restored_rootfs_read_only(value: Option<bool>) -> bool {
     value.unwrap_or(true)
 }
 
+/// Latest instant a request-bound exec may wait for its VM's operation gate
+/// and still run its full `timeout_ms` inside the API request deadline.
+pub(crate) fn exec_gate_deadline(
+    config: &crate::config::Config,
+    timeout_ms: u64,
+) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + std::time::Duration::from_millis(config.api_request_timeout_ms.saturating_sub(timeout_ms))
+}
+
+/// `gate_deadline` bounds the wait behind other operations on the VM for
+/// callers holding an API request (and its in-flight permit); background
+/// execs pass `None` and queue.
 pub async fn exec_local(
     state: &AppState,
     vm_id: Uuid,
     command: String,
     timeout_ms: u64,
+    gate_deadline: Option<tokio::time::Instant>,
 ) -> Result<(i32, String, String, u64), OrchError> {
     ensure_active_local(state, vm_id).await?;
     let gate = state.supervisor.operation_gate(vm_id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = lock_operation_gate(gate, vm_id, gate_deadline).await?;
     ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
     let sup = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+}
+
+async fn lock_operation_gate(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    vm_id: Uuid,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, OrchError> {
+    let Some(deadline) = deadline else {
+        return Ok(gate.lock_owned().await);
+    };
+    tokio::time::timeout_at(deadline, gate.lock_owned())
+        .await
+        .map_err(|_| OrchError::Conflict(format!("VM {vm_id} is busy with another operation")))
 }
 
 pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
@@ -4448,6 +4475,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_bound_exec_stops_waiting_for_a_busy_vm_at_its_deadline() {
+        let id = Uuid::new_v4();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        test_runtime().block_on(async {
+            let held = Arc::clone(&gate).lock_owned().await;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+            let error = lock_operation_gate(Arc::clone(&gate), id, Some(deadline))
+                .await
+                .expect_err("a busy gate must not be awaited past the deadline");
+            assert!(matches!(error, OrchError::Conflict(_)));
+            assert!(error.to_string().contains("busy"));
+            drop(held);
+            // A free gate is still taken once its deadline has passed.
+            let expired = tokio::time::Instant::now();
+            drop(
+                lock_operation_gate(Arc::clone(&gate), id, Some(expired))
+                    .await
+                    .unwrap(),
+            );
+            drop(lock_operation_gate(gate, id, None).await.unwrap());
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn exec_against_suspended_vm_is_a_conflict() {
@@ -4459,7 +4510,7 @@ mod tests {
             .install_test_control_runtime(id, PathBuf::from("unused.sock"));
 
         let error = test_runtime()
-            .block_on(exec_local(&state, id, "true".into(), 100))
+            .block_on(exec_local(&state, id, "true".into(), 100, None))
             .expect_err("exec against a suspended VM must be rejected");
 
         assert!(matches!(error, OrchError::Conflict(_)));
@@ -4808,7 +4859,7 @@ mod tests {
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
-            runtime.block_on(exec_local(&state, id, "true".into(), 100)),
+            runtime.block_on(exec_local(&state, id, "true".into(), 100, None)),
             Err(OrchError::Unavailable(_))
         ));
         assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
