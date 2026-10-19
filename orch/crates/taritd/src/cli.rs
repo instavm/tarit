@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::{
     env, io::Write as _, net::SocketAddr, path::PathBuf, process::Command as ProcessCommand,
 };
-use tarit_types::{ExecutionRecord, PublicVmRecord};
+use tarit_types::{ExecutionRecord, PublicVmRecord, SnapshotResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
@@ -610,10 +610,8 @@ async fn vm_snapshot(client: &ClientConfig, args: VmSnapshotArgs) -> Result<()> 
         .await?;
     if client.json {
         print_json(&raw);
-    } else if let Some(host_id) = snapshot.host_id {
-        println!("{} {}", snapshot.path, host_id);
     } else {
-        println!("{}", snapshot.path);
+        println!("{}", snapshot.snapshot_id);
     }
     Ok(())
 }
@@ -943,12 +941,6 @@ impl Drop for RawMode {
 }
 
 #[derive(Debug, Deserialize)]
-struct SnapshotResponse {
-    path: String,
-    host_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct SshKeySummary {
     id: Uuid,
     fingerprint: String,
@@ -999,6 +991,15 @@ mod tests {
             }) => assert_eq!(args.vcpus, Some(2)),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn vm_snapshot_decodes_the_server_snapshot_handle() {
+        // `POST /v1/vms/{id}/snapshot` returns only the opaque handle.
+        let snapshot_id = Uuid::new_v4();
+        let decoded: SnapshotResponse =
+            serde_json::from_value(json!({ "snapshot_id": snapshot_id })).unwrap();
+        assert_eq!(decoded.snapshot_id, snapshot_id);
     }
 
     #[test]

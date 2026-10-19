@@ -173,8 +173,8 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `taritd vm get <id>` | Show one VM record. |
 | `taritd vm delete <id>` | Stop and remove a VM. |
 | `taritd vm pause <id>`, `taritd vm resume <id>` | Pause or resume a VM. |
-| `taritd vm snapshot <id> [--diff]` | Snapshot a VM; prints `path` and `host_id`. |
-| `taritd restore <snapshot_path>` | Restore a VM from a snapshot file. |
+| `taritd vm snapshot <id> [--diff]` | Snapshot a VM; prints the opaque `snapshot_id`. |
+| `taritd restore <snapshot_id>` | Restore a VM from a snapshot handle. |
 | `taritd exec <id> <command...>` | Run a command in the VM over `POST /v1/execute`; exits with the command's exit code. |
 | `taritd image build --oci <OCI_REF> --name <NAME[:TAG]> [--size <MIB>]` | Build and register a rootfs image; size defaults to 1024 MiB and bounds OCI unpack work. |
 | `taritd image ls` | List registered images. |
