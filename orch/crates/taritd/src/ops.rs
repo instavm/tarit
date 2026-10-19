@@ -2528,7 +2528,7 @@ async fn resume_hibernated_local(
     let path = hibernation.snapshot_path.clone();
     let shape = restore_config.resource_shape();
     let supervisor = Arc::clone(&state.supervisor);
-    let booted = tokio::task::spawn_blocking(move || {
+    let booted = match tokio::task::spawn_blocking(move || {
         supervisor.restore_vm(
             ticket,
             path,
@@ -2539,11 +2539,17 @@ async fn resume_hibernated_local(
         )
     })
     .await
-    .map_err(|join| {
-        state
-            .supervisor
-            .cleanup_boot_join_failure(id, "hibernation restore task", join)
-    })??;
+    {
+        Ok(Ok(booted)) => booted,
+        Ok(Err(error)) => return Err(release_failed_activation_reservation(state, id, error)),
+        Err(join) => {
+            let error =
+                state
+                    .supervisor
+                    .cleanup_boot_join_failure(id, "hibernation restore task", join);
+            return Err(release_failed_activation_reservation(state, id, error));
+        }
+    };
 
     let publication_state = state.clone();
     let mut publication_record = current;
@@ -2589,7 +2595,8 @@ async fn resume_hibernated_local(
                 Ok(record)
             }
         })
-        .await?;
+        .await
+        .map_err(|error| release_failed_activation_reservation(state, id, error))?;
     mark_running(state, record.clone())?;
 
     if let Some(fleet) = state.fleet.as_ref() {
@@ -2609,6 +2616,25 @@ async fn resume_hibernated_local(
         .map_err(crate::api::store_err)?;
     cleanup_hibernation_snapshots_for_vm(state, id).await?;
     Ok(record)
+}
+
+/// A failed wake leaves the VM durably Hibernated, so no terminal transition
+/// will release the live boot reservation it took. Release it here unless the
+/// supervisor still retains the boot for cleanup or the runtime was published.
+fn release_failed_activation_reservation(
+    state: &AppState,
+    id: Uuid,
+    error: OrchError,
+) -> OrchError {
+    if state.supervisor.has_retained_boot(id) || state.supervisor.is_running(id) {
+        return error;
+    }
+    match state.supervisor.release_reservation_after_terminal(id) {
+        Ok(()) => error,
+        Err(release) => OrchError::Internal(format!(
+            "{error}; activation retained its scheduler reservation: {release}"
+        )),
+    }
 }
 
 pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<String, OrchError> {
@@ -5721,6 +5747,131 @@ mod tests {
             get_egress_policy_local(&state, id, "other-tenant"),
             Err(OrchError::Forbidden(_))
         ));
+    }
+
+    #[test]
+    fn failed_hibernated_wake_releases_its_boot_reservation() {
+        use sha2::Digest as _;
+
+        let (state, _writes) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let record = {
+            let mut cache = state.vm_cache.write().unwrap();
+            let record = cache.get_mut(&id).unwrap();
+            record.status = VmStatus::Hibernated;
+            record.clone()
+        };
+        let now = Utc::now();
+        let root = PathBuf::from(format!("target/hibernated-wake-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot_path = root.join("vm.snap");
+        let header = [0_u8; 32];
+        let memory = b"hibernated RAM image";
+        std::fs::write(&snapshot_path, [&header[..], &memory[..]].concat()).unwrap();
+        let manifest = tarit_proto::IntegrityManifest {
+            chunk_size: tarit_proto::INTEGRITY_CHUNK_SIZE,
+            artifacts: vec![
+                tarit_proto::ArtifactIntegrity {
+                    kind: tarit_proto::ArtifactKind::SnapshotMetadata,
+                    len: header.len() as u64,
+                    chunk_hashes: vec![sha2::Sha256::digest(header).into()],
+                },
+                tarit_proto::ArtifactIntegrity {
+                    kind: tarit_proto::ArtifactKind::Ram,
+                    len: memory.len() as u64,
+                    chunk_hashes: vec![sha2::Sha256::digest(memory).into()],
+                },
+            ],
+        };
+        let manifest_path = PathBuf::from(format!("{}.integrity", snapshot_path.display()));
+        std::fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
+        let volume = tarit_types::VolumeRecord {
+            id: Uuid::new_v4(),
+            owner_key: "test".into(),
+            name: "data".into(),
+            provider: "local_block".into(),
+            storage_class: tarit_types::VolumeStorageClass::Block,
+            size_bytes: 4 * 1024 * 1024,
+            status: tarit_types::VolumeStatus::Available,
+            capabilities: tarit_types::VolumeCapabilities {
+                read_only_many: true,
+                read_write_once: true,
+                read_write_many: false,
+                snapshots: false,
+                clones: false,
+            },
+            host_id: Some(state.config.host_id.clone()),
+            region: None,
+            zone: None,
+            generation: 1,
+            revision: 1,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_vm(&record).unwrap();
+            store
+                .insert_snapshot(&tarit_store::SnapshotRecord {
+                    snapshot_id: Uuid::new_v4(),
+                    path: snapshot_path.display().to_string(),
+                    overlay_path: None,
+                    host_id: state.config.host_id.clone(),
+                    owner_key: Some("test".into()),
+                    api_key_id: None,
+                    vm_id: id,
+                    ephemeral_owner_vm_id: None,
+                    memory_mib: Some(record.memory_mib),
+                    vcpus: Some(record.vcpus),
+                    kernel_path: Some(record.kernel_path.clone()),
+                    rootfs_path: None,
+                    rootfs_read_only: None,
+                    cmdline: Some(record.cmdline.clone()),
+                    content_digest: Some(image::sha256_regular_file(&manifest_path).unwrap()),
+                    size_bytes: Some((header.len() + memory.len()) as u64),
+                    created_at: now,
+                })
+                .unwrap();
+            store
+                .upsert_hibernation(&tarit_store::HibernationRecord {
+                    vm_id: id,
+                    owner_key: "test".into(),
+                    snapshot_path: snapshot_path.display().to_string(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            store.insert_volume(&volume).unwrap();
+            // The attached volume has no backing device, so runtime preparation
+            // fails after the wake has reserved scheduler capacity.
+            store
+                .bind_vm_volumes(&[VmVolumeAttachmentRecord {
+                    vm_id: id,
+                    volume_id: volume.id,
+                    device_index: 0,
+                    owner_key: "test".into(),
+                    mode: VolumeAttachmentMode::ReadWrite,
+                    volume_generation: volume.generation,
+                    created_at: now,
+                }])
+                .unwrap();
+        }
+
+        let runtime = test_runtime();
+        for attempt in 0..2 {
+            let error = runtime
+                .block_on(resume_local(&state, id))
+                .expect_err("a wake with an unprepared volume must fail");
+            assert!(
+                matches!(error, OrchError::Internal(_)),
+                "wake attempt {attempt} must fail in runtime preparation, not on a leaked reservation: {error}"
+            );
+            assert!(!state.scheduler.is_reserved(id));
+            assert!(!state.supervisor.has_retained_boot(id));
+        }
+        assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Hibernated);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn test_runtime() -> tokio::runtime::Runtime {
