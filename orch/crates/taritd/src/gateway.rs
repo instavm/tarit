@@ -17,10 +17,11 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::api::{store_err, AppState};
+use crate::api::{public_operation_error, store_err, AppState};
 use crate::cluster::Owner;
 use crate::config::{ApiIdentity, ApiRole};
 use crate::ops;
+use crate::pty::{validate_shell, PtyConnectionPermit, PtyRegistry};
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -143,28 +144,27 @@ impl GatewayHandler {
             .map(|state| (state.cols, state.rows))
             .unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
 
-        let stream = match attach_authorized_pty(&self.state, &auth, cols, rows, shell).await {
-            Ok(stream) => stream,
-            Err(msg) => {
-                tracing::warn!(?channel, vm_id = %auth.vm_id, "gateway: attach failed: {msg}");
-                fail_channel_request(session, channel, &msg)?;
-                return Ok(());
-            }
-        };
+        let (stream, permit) =
+            match attach_authorized_pty(&self.state, &auth, cols, rows, shell).await {
+                Ok(attached) => attached,
+                Err(error) => {
+                    tracing::warn!(?channel, vm_id = %auth.vm_id, %error, "gateway: attach failed");
+                    fail_channel_request(session, channel, &public_gateway_error(&error))?;
+                    return Ok(());
+                }
+            };
         tracing::debug!(?channel, vm_id = %auth.vm_id, "gateway: attach ok");
 
         if let Err(e) = stream.set_nonblocking(true) {
-            fail_channel_request(
-                session,
-                channel,
-                &format!("set PTY stream nonblocking: {e}"),
-            )?;
+            tracing::warn!(?channel, vm_id = %auth.vm_id, "gateway: set PTY stream nonblocking: {e}");
+            fail_channel_request(session, channel, "PTY attach failed")?;
             return Ok(());
         }
         let stream = match tokio::net::UnixStream::from_std(stream) {
             Ok(stream) => stream,
             Err(e) => {
-                fail_channel_request(session, channel, &format!("wrap PTY stream: {e}"))?;
+                tracing::warn!(?channel, vm_id = %auth.vm_id, "gateway: wrap PTY stream: {e}");
+                fail_channel_request(session, channel, "PTY attach failed")?;
                 return Ok(());
             }
         };
@@ -184,6 +184,7 @@ impl GatewayHandler {
         entry.started = true;
         entry.writer = Some(writer);
         entry.vmm_task = Some(task);
+        entry.connection_permit = Some(permit);
         Ok(())
     }
 
@@ -202,12 +203,8 @@ impl GatewayHandler {
         };
 
         if let Err(e) = write_vmm_stream_frame_locked(&writer, &frame).await {
-            send_gateway_error(
-                session,
-                channel,
-                &format!("PTY stream write failed: {e}"),
-                1,
-            )?;
+            tracing::debug!(?channel, "gateway: PTY stream write failed: {e}");
+            send_gateway_error(session, channel, "PTY stream write failed", 1)?;
             self.remove_channel(channel);
         }
         Ok(())
@@ -411,6 +408,8 @@ struct ChannelState {
     started: bool,
     writer: Option<Arc<AsyncMutex<OwnedWriteHalf>>>,
     vmm_task: Option<tokio::task::JoinHandle<()>>,
+    /// Shared PTY connection capacity held until the channel state drops.
+    connection_permit: Option<PtyConnectionPermit>,
 }
 
 impl Default for ChannelState {
@@ -421,6 +420,7 @@ impl Default for ChannelState {
             started: false,
             writer: None,
             vmm_task: None,
+            connection_permit: None,
         }
     }
 }
@@ -464,44 +464,92 @@ async fn attach_authorized_pty(
     cols: u16,
     rows: u16,
     shell: Option<String>,
-) -> Result<std::os::unix::net::UnixStream, String> {
+) -> Result<(std::os::unix::net::UnixStream, PtyConnectionPermit), OrchError> {
+    // Authorize before cluster routing or activation: a foreign VM must look
+    // exactly like a missing one and never reveal or wake its owner node.
+    authorize_vm_owner(state, auth).await?;
+    let permit = admit_ssh_pty(&state.pty_registry, auth, shell.as_deref())?;
     let identity = ApiIdentity {
         tenant: auth.owner_key.clone(),
         role: ApiRole::User,
         max_vms: None,
         api_key_id: format!("ssh:{}", auth.fingerprint),
     };
-    match ops::resolve_owner_for_activation(state, auth.vm_id, &identity).await {
-        Ok(Owner::Local) => {}
-        Ok(Owner::Remote(rpc)) => {
-            return Err(format!(
-                "VM {} is owned by remote peer {rpc}; SSH peer forwarding is not implemented yet, connect to the owning node",
-                auth.vm_id
+    match ops::resolve_owner_for_activation(state, auth.vm_id, &identity).await? {
+        Owner::Local => {}
+        Owner::Remote(_) => {
+            return Err(OrchError::Conflict(
+                "SSH peer forwarding is not implemented yet; connect to the owning node".into(),
             ));
         }
-        Err(e) => return Err(e.to_string()),
     }
+    // Stale-owner recovery may have just created the local record; bind the
+    // PTY to that record's owner too.
+    authorize_vm_owner(state, auth).await?;
 
-    let record = local_vm_record(state, auth.vm_id).map_err(|e| e.to_string())?;
-    if record.owner_key.as_deref() != Some(auth.owner_key.as_str()) {
+    crate::ops::ensure_active_local(state, auth.vm_id).await?;
+
+    let supervisor = Arc::clone(&state.supervisor);
+    let vm_id = auth.vm_id;
+    let stream =
+        tokio::task::spawn_blocking(move || supervisor.attach_pty(vm_id, cols, rows, shell))
+            .await
+            .map_err(|e| OrchError::Internal(format!("attach PTY join: {e}")))??;
+    Ok((stream, permit))
+}
+
+/// Check the key's tenant against the VM's recorded owner without routing or
+/// activating it. Missing and foreign VMs return the same error.
+async fn authorize_vm_owner(state: &AppState, auth: &Authenticated) -> Result<(), OrchError> {
+    let not_found = || OrchError::NotFound(format!("vm {} not found", auth.vm_id));
+    let owner_key = match local_vm_record(state, auth.vm_id) {
+        Ok(record) => record.owner_key,
+        Err(OrchError::NotFound(_)) => {
+            let Some(fleet) = state.fleet.as_ref() else {
+                return Err(not_found());
+            };
+            fleet
+                .get_vm(auth.vm_id)
+                .await
+                .map_err(|error| match error {
+                    tarit_fleet::FleetError::NotFound => not_found(),
+                    other => OrchError::Internal(format!("read fleet VM owner: {other}")),
+                })?
+                .owner_key
+        }
+        Err(error) => return Err(error),
+    };
+    if owner_key.as_deref() != Some(auth.owner_key.as_str()) {
         tracing::warn!(
             vm_id = %auth.vm_id,
             fingerprint = %auth.fingerprint,
             "SSH gateway ownership check failed"
         );
-        return Err("authenticated SSH key does not own the requested VM".into());
+        return Err(not_found());
     }
+    Ok(())
+}
 
-    crate::ops::ensure_active_local(state, auth.vm_id)
-        .await
-        .map_err(|error| format!("activate VM for SSH: {error}"))?;
+/// Validate an SSH channel's command and reserve the same global, tenant, and
+/// VM PTY connection capacity that WebSocket PTYs use.
+fn admit_ssh_pty(
+    registry: &PtyRegistry,
+    auth: &Authenticated,
+    shell: Option<&str>,
+) -> Result<PtyConnectionPermit, OrchError> {
+    validate_shell(shell)?;
+    registry.try_acquire_connection(&auth.owner_key, auth.vm_id)
+}
 
-    let supervisor = Arc::clone(&state.supervisor);
-    let vm_id = auth.vm_id;
-    tokio::task::spawn_blocking(move || supervisor.attach_pty(vm_id, cols, rows, shell))
-        .await
-        .map_err(|e| format!("attach PTY join: {e}"))?
-        .map_err(|e| e.to_string())
+/// Fixed client-facing text for gateway failures. Missing and foreign VMs read
+/// the same; internal, VMM, and owner-node detail stays in server logs.
+fn public_gateway_error(error: &OrchError) -> String {
+    match error {
+        OrchError::NotFound(_) | OrchError::Forbidden(_) | OrchError::Unauthorized => {
+            "VM not found".into()
+        }
+        _ => public_operation_error(error),
+    }
 }
 
 fn local_vm_record(state: &AppState, vm_id: Uuid) -> Result<VmRecord, OrchError> {
@@ -546,8 +594,11 @@ async fn vmm_to_ssh(
             }
             TYPE_ERROR => {
                 let msg = decode_error_message(frame.payload)?;
+                // VMM/guest error text can carry implementation detail; keep it
+                // in server logs and send a stable message.
+                tracing::warn!(?channel, error = %msg, "guest PTY stream reported an error");
                 let _ = handle
-                    .data(channel, format!("taritd ssh gateway: {msg}\r\n"))
+                    .data(channel, "taritd ssh gateway: PTY stream failed\r\n")
                     .await;
                 let _ = handle.exit_status_request(channel, 1).await;
                 let _ = handle.eof(channel).await;
@@ -676,7 +727,9 @@ enum BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, WarmPoolConfig};
+    use crate::config::{
+        ApiKeyRegistry, ApiRole, AutoscaleConfig, Config, PtyConnectionLimits, WarmPoolConfig,
+    };
     use crate::metrics::Metrics;
     use crate::peer::PeerClient;
     use crate::pty::PtyRegistry;
@@ -757,6 +810,180 @@ mod tests {
 
         assert!(matches!(auth, server::Auth::Accept));
         assert_eq!(handler.auth.as_ref().unwrap().owner_key, "test-owner");
+    }
+
+    fn authenticated(tenant: &str, vm_id: Uuid) -> Authenticated {
+        Authenticated {
+            owner_key: tenant.into(),
+            vm_id,
+            fingerprint: ED25519_FINGERPRINT.into(),
+        }
+    }
+
+    fn insert_vm_record(state: &AppState, id: Uuid, tenant: &str) {
+        let now = Utc::now();
+        let record = VmRecord {
+            id,
+            host_id: state.config.host_id.clone(),
+            owner_key: Some(tenant.into()),
+            api_key_id: None,
+            status: tarit_types::VmStatus::Running,
+            revision: 1,
+            startup_path: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: "kernel".into(),
+            rootfs_path: None,
+            rootfs_read_only: false,
+            cmdline: "console=ttyS0".into(),
+            runtime_layout: None,
+            socket_path: None,
+            pid: None,
+            created_at: now,
+            updated_at: now,
+        };
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state.vm_cache.write().unwrap().insert(id, record);
+    }
+
+    #[test]
+    fn ssh_pty_admission_shares_the_pty_connection_limits() {
+        let registry = PtyRegistry::new(PtyConnectionLimits {
+            global: 3,
+            per_tenant: 2,
+            per_vm: 1,
+        });
+        let vm_a = Uuid::new_v4();
+        let first = admit_ssh_pty(&registry, &authenticated("tenant-a", vm_a), None).unwrap();
+        assert!(matches!(
+            admit_ssh_pty(&registry, &authenticated("tenant-a", vm_a), Some("ls")),
+            Err(OrchError::Overloaded { .. })
+        ));
+        let second = admit_ssh_pty(
+            &registry,
+            &authenticated("tenant-a", Uuid::new_v4()),
+            Some("ls"),
+        )
+        .unwrap();
+        assert!(matches!(
+            admit_ssh_pty(&registry, &authenticated("tenant-a", Uuid::new_v4()), None),
+            Err(OrchError::Overloaded { .. })
+        ));
+        let third =
+            admit_ssh_pty(&registry, &authenticated("tenant-b", Uuid::new_v4()), None).unwrap();
+        assert!(matches!(
+            admit_ssh_pty(&registry, &authenticated("tenant-c", Uuid::new_v4()), None),
+            Err(OrchError::Overloaded { .. })
+        ));
+        let stats = registry.connection_stats();
+        assert_eq!(stats.active, 3);
+        assert_eq!(
+            (
+                stats.rejected_vm,
+                stats.rejected_tenant,
+                stats.rejected_global
+            ),
+            (1, 1, 1)
+        );
+
+        drop(third);
+        for command in ["x".repeat(4097), "ls\0-la".to_string()] {
+            assert!(matches!(
+                admit_ssh_pty(
+                    &registry,
+                    &authenticated("tenant-c", Uuid::new_v4()),
+                    Some(&command),
+                ),
+                Err(OrchError::BadRequest(_))
+            ));
+        }
+        assert_eq!(registry.connection_stats().active, 2);
+        drop(first);
+        drop(second);
+        assert_eq!(registry.connection_stats().active, 0);
+        admit_ssh_pty(&registry, &authenticated("tenant-a", vm_a), None)
+            .expect("dropped permits must release every scope");
+    }
+
+    #[test]
+    fn gateway_errors_use_fixed_public_messages() {
+        for error in [
+            OrchError::NotFound("vm 4a1f not found in cluster".into()),
+            OrchError::Forbidden("VM belongs to another tenant".into()),
+            OrchError::Unauthorized,
+        ] {
+            assert_eq!(public_gateway_error(&error), "VM not found");
+        }
+        assert_eq!(
+            public_gateway_error(&OrchError::Internal(
+                "peer https://node.internal /srv/tarit/vm.sock".into()
+            )),
+            "internal error"
+        );
+        assert_eq!(
+            public_gateway_error(&OrchError::Vmm(
+                "connect /run/tarit/vm.sock: connection refused".into()
+            )),
+            "VM operation failed"
+        );
+        assert_eq!(
+            public_gateway_error(&OrchError::Unavailable(
+                "owner host node-private is stale".into()
+            )),
+            "service unavailable"
+        );
+        assert!(public_gateway_error(&OrchError::Overloaded {
+            message: "too many active PTY connections for VM".into(),
+            retry_after_secs: 1,
+        })
+        .contains("too many active PTY connections for VM"));
+    }
+
+    #[test]
+    fn foreign_vms_look_missing_and_no_vm_reveals_its_owner_node() {
+        let state = test_state();
+        let missing = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+        let remote = Uuid::new_v4();
+        insert_vm_record(&state, foreign, "tenant-b");
+        insert_vm_record(&state, remote, "tenant-a");
+        for vm_id in [foreign, remote] {
+            crate::cluster::set_test_authoritative_owner(
+                &state.config.host_id,
+                vm_id,
+                "peer-node-7",
+                "https://10.9.8.7:7443".into(),
+            );
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let attach_error = |vm_id| {
+            let auth = authenticated("tenant-a", vm_id);
+            match runtime.block_on(attach_authorized_pty(&state, &auth, 80, 24, None)) {
+                Ok(_) => panic!("attach to {vm_id} must fail"),
+                Err(error) => public_gateway_error(&error),
+            }
+        };
+
+        let missing_message = attach_error(missing);
+        let foreign_message = attach_error(foreign);
+        let remote_message = attach_error(remote);
+
+        assert_eq!(missing_message, "VM not found");
+        assert_eq!(foreign_message, missing_message);
+        assert!(
+            remote_message.contains("connect to the owning node"),
+            "{remote_message}"
+        );
+        for message in [&foreign_message, &remote_message] {
+            assert!(
+                !message.contains("peer-node-7") && !message.contains("10.9.8.7"),
+                "{message}"
+            );
+        }
+        assert_eq!(state.pty_registry.connection_stats().active, 0);
     }
 
     #[test]

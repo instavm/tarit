@@ -406,7 +406,7 @@ fn public_vm_runtime_status(status: serde_json::Value) -> Result<PublicVmRuntime
         .map_err(|_| OrchError::Internal("invalid VMM status response".into()))
 }
 
-fn public_operation_error(error: &OrchError) -> String {
+pub(crate) fn public_operation_error(error: &OrchError) -> String {
     match error {
         OrchError::Unavailable(_) => "service unavailable".into(),
         OrchError::Internal(_) => "internal error".into(),

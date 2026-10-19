@@ -52,7 +52,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_MAX_MEMORY_MIB` | u64 | `65536` | Local memory placement ceiling in MiB. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | u64 | `60000` | Time a create operation may wait for capacity before admission gives up. |
 | `TARIT_CPU_OVERCOMMIT` | f64 | `4.0` | Warm-pool CPU overcommit ratio. Also affects derived `TARIT_MAX_VCPUS` when the warm pool is enabled and `TARIT_MAX_VCPUS` is unset. |
-| `TARIT_PTY_MAX_ACTIVE_CONNECTIONS` | positive usize | `1024` | Node-wide active guest PTY WebSocket limit. |
+| `TARIT_PTY_MAX_ACTIVE_CONNECTIONS` | positive usize | `1024` | Node-wide active guest PTY limit, shared by WebSocket PTYs and SSH gateway channels. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT` | positive usize | `128` | Active guest PTY limit for one authenticated tenant. Must be less than the node-wide limit so one tenant cannot consume every slot. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM` | positive usize | `16` | Active guest PTY limit for one VM. Must not exceed the per-tenant limit. |
 

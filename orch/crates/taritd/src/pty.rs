@@ -370,7 +370,7 @@ impl PtyRegistry {
         sessions.retain(|_, session| session.vm_id != vm_id);
     }
 
-    fn try_acquire_connection(
+    pub(crate) fn try_acquire_connection(
         &self,
         tenant: &str,
         vm_id: Uuid,
@@ -793,7 +793,7 @@ fn validate_dimensions(cols: u16, rows: u16) -> Result<(), OrchError> {
     Ok(())
 }
 
-fn validate_shell(shell: Option<&str>) -> Result<(), OrchError> {
+pub(crate) fn validate_shell(shell: Option<&str>) -> Result<(), OrchError> {
     if shell.is_some_and(|shell| shell.len() > MAX_SHELL_BYTES || shell.contains('\0')) {
         return Err(OrchError::BadRequest(
             "PTY shell must be at most 4096 bytes and contain no NUL".into(),
