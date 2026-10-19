@@ -30,7 +30,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
-| `TARIT_DATABASE_URL` | string | unset | PostgreSQL fleet registry URL. Empty string is treated as unset. Setting this enables distributed fleet behavior. |
+| `TARIT_DATABASE_URL` | string | unset | PostgreSQL fleet registry URL. Empty string is treated as unset. Setting this enables distributed fleet behavior. `TARIT_PRODUCTION=1` requires `sslmode=require` unless every host is a Unix socket, because the default `sslmode=prefer` silently falls back to plaintext. |
 | `TARIT_PEER_SECRET` | string | random local-only value | Key for short-lived, source/target-bound peer request HMACs. It is never sent on the wire. Explicit values must be at least 32 characters and cannot be `dev-peer-secret`; cluster mode requires this variable. |
 | `TARIT_ALLOW_INSECURE_PEER_HTTP` | bool | `false` | Permit `http://` peer origins in cluster mode. Use only on an isolated development network; production mode forbids it. |
 | `TARIT_PRODUCTION` | bool | `false` | Enforce the strict production configuration gates, including per-VM PID and network namespaces. This does not by itself satisfy every release gate in `PRODUCTION_READINESS.md`. |
