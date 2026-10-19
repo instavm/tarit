@@ -790,7 +790,7 @@ async fn update_share(
     request: Request,
 ) -> Result<Json<ShareRecord>, ShareApiError> {
     let id = parse_lifecycle_share_id(&state, &identity, audit_action::UPDATE_SHARE, id)?;
-    let pre_mutation = share_audit_fields(&state, id).await;
+    let pre_mutation = share_audit_fields(&state, &identity, id).await;
     let request = parse_share_json::<UpdateShareRequest>(request).await;
     let attempted = match &request {
         Ok(request) => pre_mutation.merge(ShareAuditFields::from_update_request(request)),
@@ -846,7 +846,7 @@ async fn revoke_share(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ShareApiError> {
     let id = parse_lifecycle_share_id(&state, &identity, audit_action::REVOKE_SHARE, id)?;
-    let pre_mutation = share_audit_fields(&state, id).await;
+    let pre_mutation = share_audit_fields(&state, &identity, id).await;
     record_share_audit(
         &state,
         &identity,
@@ -884,7 +884,7 @@ async fn issue_share_token(
     Path(id): Path<String>,
 ) -> Result<Json<ShareTokenResponse>, ShareApiError> {
     let id = parse_lifecycle_share_id(&state, &identity, audit_action::ISSUE_SHARE_TOKEN, id)?;
-    let pre_mutation = share_audit_fields(&state, id).await;
+    let pre_mutation = share_audit_fields(&state, &identity, id).await;
     record_share_audit(
         &state,
         &identity,
@@ -1066,10 +1066,18 @@ fn parse_lifecycle_share_id(
     }
 }
 
-async fn share_audit_fields(state: &AppState, id: Uuid) -> ShareAuditFields {
+async fn share_audit_fields(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> ShareAuditFields {
     match state.shares.get(id).await {
-        Ok(Some(share)) => ShareAuditFields::from(&share),
-        Ok(None) | Err(_) => ShareAuditFields {
+        // The caller can read its audit trail back, so it must only carry
+        // metadata of shares the caller is allowed to see.
+        Ok(Some(share)) if identity.is_admin() || share.owner_key == identity.tenant => {
+            ShareAuditFields::from(&share)
+        }
+        Ok(_) | Err(_) => ShareAuditFields {
             share_id: Some(id),
             ..Default::default()
         },
@@ -5609,8 +5617,14 @@ mod tests {
         assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
         assert_eq!(audits[1].action, audit_action::UPDATE_SHARE);
         assert_eq!(audits[1].outcome, audit_outcome::DENIED);
-        assert_share_audit_detail(&audits[1], &share_id.to_string(), 9090, "private");
-        assert_eq!(audits[0].vm_id, audits[1].vm_id);
+        // Only the caller's own request fields; nothing about the share.
+        for audit in &audits {
+            assert_eq!(audit.vm_id, None);
+            assert_eq!(
+                audit.detail.as_deref(),
+                Some(format!("share_id={share_id}; guest_port=9090").as_str())
+            );
+        }
         drop(rt);
     }
 
@@ -5635,8 +5649,20 @@ mod tests {
         assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
         assert_eq!(audits[1].action, audit_action::REVOKE_SHARE);
         assert_eq!(audits[1].outcome, audit_outcome::DENIED);
-        assert_share_audit_detail(&audits[1], &share_id.to_string(), 8080, "private");
-        assert_eq!(audits[0].vm_id, audits[1].vm_id);
+        assert_foreign_share_audits(&audits, share_id);
+
+        let admin = rt.block_on(request_json(
+            router(state.clone()),
+            "DELETE",
+            &format!("/v1/shares/{share_id}"),
+            "admin-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(admin.status(), StatusCode::NO_CONTENT);
+        let admin_attempt = &durable_audits(&state)[2];
+        assert_eq!(admin_attempt.outcome, audit_outcome::ATTEMPT);
+        assert!(admin_attempt.vm_id.is_some());
+        assert_share_audit_detail(admin_attempt, &share_id.to_string(), 8080, "private");
         drop(rt);
     }
 
@@ -5662,8 +5688,7 @@ mod tests {
         assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
         assert_eq!(audits[1].action, audit_action::ISSUE_SHARE_TOKEN);
         assert_eq!(audits[1].outcome, audit_outcome::DENIED);
-        assert_share_audit_detail(&audits[1], &share_id.to_string(), 8080, "private");
-        assert_eq!(audits[0].vm_id, audits[1].vm_id);
+        assert_foreign_share_audits(&audits, share_id);
         drop(rt);
     }
 
@@ -6287,6 +6312,18 @@ mod tests {
 
     fn durable_audits(state: &AppState) -> Vec<AuditEvent> {
         state.store.lock().unwrap().list_unsent_audit(100).unwrap()
+    }
+
+    /// A denied caller can read its audit trail back, so it must not learn the
+    /// share's VM, port, or visibility from it.
+    fn assert_foreign_share_audits(audits: &[AuditEvent], share_id: Uuid) {
+        for audit in audits {
+            assert_eq!(audit.vm_id, None);
+            assert_eq!(
+                audit.detail.as_deref(),
+                Some(format!("share_id={share_id}").as_str())
+            );
+        }
     }
 
     fn assert_share_audit_detail(
