@@ -1008,7 +1008,10 @@ export interface components {
             /** Format: uuid */
             vm_id: string;
             command: string;
-            /** @default 30000 */
+            /**
+             * @description Command budget in milliseconds. `POST /v1/execute` also rejects values above the server's API request deadline (`TARIT_API_REQUEST_TIMEOUT_MS`, default 180000); use `POST /v1/execute_async` for longer commands.
+             * @default 30000
+             */
             timeout_ms: number;
         };
         ExecutionRecord: {
@@ -1066,7 +1069,7 @@ export interface components {
             /** Format: uuid */
             vm_id?: string | null;
             /** @enum {string} */
-            action: "create" | "delete" | "pause" | "suspend" | "resume" | "snapshot" | "restore" | "exec" | "attach_pty" | "ssh_attempt" | "update_egress" | "create_share" | "update_share" | "revoke_share" | "issue_share_token" | "create_volume" | "delete_volume";
+            action: "create" | "delete" | "pause" | "suspend" | "resume" | "snapshot" | "fork" | "hibernate" | "create_branch" | "update_branch" | "delete_branch" | "restore" | "exec" | "attach_pty" | "ssh_attempt" | "update_egress" | "create_share" | "update_share" | "revoke_share" | "issue_share_token" | "create_volume" | "delete_volume" | "set_balloon";
             /** @enum {string} */
             outcome: "attempt" | "ok" | "denied" | "error";
             detail?: string | null;
@@ -2399,6 +2402,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description Idempotent replay of a fork that already produced this child id */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForkVmResponse"];
+                };
+            };
             /** @description Ready isolated child VM */
             201: {
                 headers: {
@@ -2542,6 +2554,13 @@ export interface operations {
                     "application/json": components["schemas"]["ExecutionRecord"];
                 };
             };
+            /** @description `timeout_ms` exceeds 3600000 or the API request deadline */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Missing or invalid API key */
             401: {
                 headers: {
@@ -2558,6 +2577,13 @@ export interface operations {
             };
             /** @description VM not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description VM is not running, or stayed busy with another operation too long to finish within the API request deadline */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2586,6 +2612,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ExecutionRecord"];
                 };
+            };
+            /** @description `timeout_ms` exceeds 3600000 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Missing or invalid API key */
             401: {

@@ -1853,20 +1853,47 @@ fn restored_rootfs_read_only(value: Option<bool>) -> bool {
     value.unwrap_or(true)
 }
 
+/// Latest instant a request-bound exec may wait for its VM's operation gate
+/// and still run its full `timeout_ms` inside the API request deadline.
+pub(crate) fn exec_gate_deadline(
+    config: &crate::config::Config,
+    timeout_ms: u64,
+) -> tokio::time::Instant {
+    tokio::time::Instant::now()
+        + std::time::Duration::from_millis(config.api_request_timeout_ms.saturating_sub(timeout_ms))
+}
+
+/// `gate_deadline` bounds the wait behind other operations on the VM for
+/// callers holding an API request (and its in-flight permit); background
+/// execs pass `None` and queue.
 pub async fn exec_local(
     state: &AppState,
     vm_id: Uuid,
     command: String,
     timeout_ms: u64,
+    gate_deadline: Option<tokio::time::Instant>,
 ) -> Result<(i32, String, String, u64), OrchError> {
     ensure_active_local(state, vm_id).await?;
     let gate = state.supervisor.operation_gate(vm_id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = lock_operation_gate(gate, vm_id, gate_deadline).await?;
     ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
     let sup = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+}
+
+async fn lock_operation_gate(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    vm_id: Uuid,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, OrchError> {
+    let Some(deadline) = deadline else {
+        return Ok(gate.lock_owned().await);
+    };
+    tokio::time::timeout_at(deadline, gate.lock_owned())
+        .await
+        .map_err(|_| OrchError::Conflict(format!("VM {vm_id} is busy with another operation")))
 }
 
 pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
@@ -2528,7 +2555,7 @@ async fn resume_hibernated_local(
     let path = hibernation.snapshot_path.clone();
     let shape = restore_config.resource_shape();
     let supervisor = Arc::clone(&state.supervisor);
-    let booted = tokio::task::spawn_blocking(move || {
+    let booted = match tokio::task::spawn_blocking(move || {
         supervisor.restore_vm(
             ticket,
             path,
@@ -2539,11 +2566,17 @@ async fn resume_hibernated_local(
         )
     })
     .await
-    .map_err(|join| {
-        state
-            .supervisor
-            .cleanup_boot_join_failure(id, "hibernation restore task", join)
-    })??;
+    {
+        Ok(Ok(booted)) => booted,
+        Ok(Err(error)) => return Err(release_failed_activation_reservation(state, id, error)),
+        Err(join) => {
+            let error =
+                state
+                    .supervisor
+                    .cleanup_boot_join_failure(id, "hibernation restore task", join);
+            return Err(release_failed_activation_reservation(state, id, error));
+        }
+    };
 
     let publication_state = state.clone();
     let mut publication_record = current;
@@ -2589,7 +2622,8 @@ async fn resume_hibernated_local(
                 Ok(record)
             }
         })
-        .await?;
+        .await
+        .map_err(|error| release_failed_activation_reservation(state, id, error))?;
     mark_running(state, record.clone())?;
 
     if let Some(fleet) = state.fleet.as_ref() {
@@ -2609,6 +2643,25 @@ async fn resume_hibernated_local(
         .map_err(crate::api::store_err)?;
     cleanup_hibernation_snapshots_for_vm(state, id).await?;
     Ok(record)
+}
+
+/// A failed wake leaves the VM durably Hibernated, so no terminal transition
+/// will release the live boot reservation it took. Release it here unless the
+/// supervisor still retains the boot for cleanup or the runtime was published.
+fn release_failed_activation_reservation(
+    state: &AppState,
+    id: Uuid,
+    error: OrchError,
+) -> OrchError {
+    if state.supervisor.has_retained_boot(id) || state.supervisor.is_running(id) {
+        return error;
+    }
+    match state.supervisor.release_reservation_after_terminal(id) {
+        Ok(()) => error,
+        Err(release) => OrchError::Internal(format!(
+            "{error}; activation retained its scheduler reservation: {release}"
+        )),
+    }
 }
 
 pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<String, OrchError> {
@@ -3755,7 +3808,7 @@ pub async fn put_egress_policy_local(
     } else {
         Some(state.supervisor.operation_gate(id)?.lock_owned().await)
     };
-    let allowlist = crate::net::normalize_egress_allowlist(&allowlist)?;
+    let allowlist = crate::net::normalize_tenant_egress_allowlist(&allowlist)?;
     let now = Utc::now();
     if vm.status == VmStatus::Hibernated {
         if let Some(fleet) = state.fleet.as_ref() {
@@ -4422,6 +4475,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_bound_exec_stops_waiting_for_a_busy_vm_at_its_deadline() {
+        let id = Uuid::new_v4();
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        test_runtime().block_on(async {
+            let held = Arc::clone(&gate).lock_owned().await;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+            let error = lock_operation_gate(Arc::clone(&gate), id, Some(deadline))
+                .await
+                .expect_err("a busy gate must not be awaited past the deadline");
+            assert!(matches!(error, OrchError::Conflict(_)));
+            assert!(error.to_string().contains("busy"));
+            drop(held);
+            // A free gate is still taken once its deadline has passed.
+            let expired = tokio::time::Instant::now();
+            drop(
+                lock_operation_gate(Arc::clone(&gate), id, Some(expired))
+                    .await
+                    .unwrap(),
+            );
+            drop(lock_operation_gate(gate, id, None).await.unwrap());
+        });
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn exec_against_suspended_vm_is_a_conflict() {
@@ -4433,7 +4510,7 @@ mod tests {
             .install_test_control_runtime(id, PathBuf::from("unused.sock"));
 
         let error = test_runtime()
-            .block_on(exec_local(&state, id, "true".into(), 100))
+            .block_on(exec_local(&state, id, "true".into(), 100, None))
             .expect_err("exec against a suspended VM must be rejected");
 
         assert!(matches!(error, OrchError::Conflict(_)));
@@ -4782,7 +4859,7 @@ mod tests {
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
-            runtime.block_on(exec_local(&state, id, "true".into(), 100)),
+            runtime.block_on(exec_local(&state, id, "true".into(), 100, None)),
             Err(OrchError::Unavailable(_))
         ));
         assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
@@ -5718,9 +5795,145 @@ mod tests {
             Err(OrchError::Conflict(_))
         ));
         assert!(matches!(
+            runtime.block_on(put_egress_policy_local(
+                &state,
+                id,
+                "test",
+                2,
+                vec!["169.254.169.254:80".into()],
+                false,
+            )),
+            Err(OrchError::BadRequest(_))
+        ));
+        assert!(matches!(
             get_egress_policy_local(&state, id, "other-tenant"),
             Err(OrchError::Forbidden(_))
         ));
+    }
+
+    #[test]
+    fn failed_hibernated_wake_releases_its_boot_reservation() {
+        use sha2::Digest as _;
+
+        let (state, _writes) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let record = {
+            let mut cache = state.vm_cache.write().unwrap();
+            let record = cache.get_mut(&id).unwrap();
+            record.status = VmStatus::Hibernated;
+            record.clone()
+        };
+        let now = Utc::now();
+        let root = PathBuf::from(format!("target/hibernated-wake-failure-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot_path = root.join("vm.snap");
+        let header = [0_u8; 32];
+        let memory = b"hibernated RAM image";
+        std::fs::write(&snapshot_path, [&header[..], &memory[..]].concat()).unwrap();
+        let manifest = tarit_proto::IntegrityManifest {
+            chunk_size: tarit_proto::INTEGRITY_CHUNK_SIZE,
+            artifacts: vec![
+                tarit_proto::ArtifactIntegrity {
+                    kind: tarit_proto::ArtifactKind::SnapshotMetadata,
+                    len: header.len() as u64,
+                    chunk_hashes: vec![sha2::Sha256::digest(header).into()],
+                },
+                tarit_proto::ArtifactIntegrity {
+                    kind: tarit_proto::ArtifactKind::Ram,
+                    len: memory.len() as u64,
+                    chunk_hashes: vec![sha2::Sha256::digest(memory).into()],
+                },
+            ],
+        };
+        let manifest_path = PathBuf::from(format!("{}.integrity", snapshot_path.display()));
+        std::fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
+        let volume = tarit_types::VolumeRecord {
+            id: Uuid::new_v4(),
+            owner_key: "test".into(),
+            name: "data".into(),
+            provider: "local_block".into(),
+            storage_class: tarit_types::VolumeStorageClass::Block,
+            size_bytes: 4 * 1024 * 1024,
+            status: tarit_types::VolumeStatus::Available,
+            capabilities: tarit_types::VolumeCapabilities {
+                read_only_many: true,
+                read_write_once: true,
+                read_write_many: false,
+                snapshots: false,
+                clones: false,
+            },
+            host_id: Some(state.config.host_id.clone()),
+            region: None,
+            zone: None,
+            generation: 1,
+            revision: 1,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_vm(&record).unwrap();
+            store
+                .insert_snapshot(&tarit_store::SnapshotRecord {
+                    snapshot_id: Uuid::new_v4(),
+                    path: snapshot_path.display().to_string(),
+                    overlay_path: None,
+                    host_id: state.config.host_id.clone(),
+                    owner_key: Some("test".into()),
+                    api_key_id: None,
+                    vm_id: id,
+                    ephemeral_owner_vm_id: None,
+                    memory_mib: Some(record.memory_mib),
+                    vcpus: Some(record.vcpus),
+                    kernel_path: Some(record.kernel_path.clone()),
+                    rootfs_path: None,
+                    rootfs_read_only: None,
+                    cmdline: Some(record.cmdline.clone()),
+                    content_digest: Some(image::sha256_regular_file(&manifest_path).unwrap()),
+                    size_bytes: Some((header.len() + memory.len()) as u64),
+                    created_at: now,
+                })
+                .unwrap();
+            store
+                .upsert_hibernation(&tarit_store::HibernationRecord {
+                    vm_id: id,
+                    owner_key: "test".into(),
+                    snapshot_path: snapshot_path.display().to_string(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            store.insert_volume(&volume).unwrap();
+            // The attached volume has no backing device, so runtime preparation
+            // fails after the wake has reserved scheduler capacity.
+            store
+                .bind_vm_volumes(&[VmVolumeAttachmentRecord {
+                    vm_id: id,
+                    volume_id: volume.id,
+                    device_index: 0,
+                    owner_key: "test".into(),
+                    mode: VolumeAttachmentMode::ReadWrite,
+                    volume_generation: volume.generation,
+                    created_at: now,
+                }])
+                .unwrap();
+        }
+
+        let runtime = test_runtime();
+        for attempt in 0..2 {
+            let error = runtime
+                .block_on(resume_local(&state, id))
+                .expect_err("a wake with an unprepared volume must fail");
+            assert!(
+                matches!(error, OrchError::Internal(_)),
+                "wake attempt {attempt} must fail in runtime preparation, not on a leaked reservation: {error}"
+            );
+            assert!(!state.scheduler.is_reserved(id));
+            assert!(!state.supervisor.has_retained_boot(id));
+        }
+        assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Hibernated);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn test_runtime() -> tokio::runtime::Runtime {

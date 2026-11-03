@@ -9,6 +9,7 @@
 //! Off-KVM, we expose a pure-Rust bitmap used by the snapshot diff logic so
 //! the bookkeeping is unit-testable without a kernel.
 
+use crate::backend::{MMIO_GAP_END, MMIO_GAP_START};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -108,6 +109,9 @@ impl DirtyBitmap {
 /// KVM dirty logging only records writes performed by guest vCPUs. Virtio
 /// devices, guest-control channels, and UFFD restore copy bytes directly into
 /// the guest mmap, so they must mark this bitmap explicitly for diff snapshots.
+///
+/// Entries are packed snapshot offsets, not guest physical addresses. Callers
+/// that only know a GPA must use [`Self::mark_guest_range`].
 #[derive(Debug, Clone, Default)]
 pub struct SoftwareDirtyBitmap {
     dirty: Arc<Mutex<DirtyBitmap>>,
@@ -127,6 +131,26 @@ impl SoftwareDirtyBitmap {
             return;
         }
         self.dirty.lock().unwrap().mark_range(gpa, len);
+    }
+
+    /// Mark a guest physical byte range dirty. RAM above the MMIO aperture is
+    /// packed directly after low RAM, so the range is split at the aperture;
+    /// for every RAM-backed GPA this matches `GuestMemory::gpa_to_offset`.
+    pub fn mark_guest_range(&self, gpa: u64, len: u64) {
+        let Some(end) = gpa.checked_add(len) else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        let mut dirty = self.dirty.lock().unwrap();
+        if gpa < MMIO_GAP_START {
+            dirty.mark_range(gpa, end.min(MMIO_GAP_START) - gpa);
+        }
+        if end > MMIO_GAP_END {
+            let start = gpa.max(MMIO_GAP_END);
+            dirty.mark_range(MMIO_GAP_START + (start - MMIO_GAP_END), end - start);
+        }
     }
 
     pub fn snapshot(&self) -> DirtyBitmap {
@@ -237,5 +261,18 @@ mod tests {
         let drained = tracker.drain();
         assert_eq!(drained.len(), 2);
         assert!(tracker.is_empty());
+    }
+
+    #[test]
+    fn software_dirty_bitmap_packs_guest_ranges_around_mmio_gap() {
+        let tracker = SoftwareDirtyBitmap::new();
+        tracker.mark_guest_range(0x1000, 1);
+        tracker.mark_guest_range(MMIO_GAP_START, 4096);
+        tracker.mark_guest_range(MMIO_GAP_END + 0x1000, 4096);
+
+        let drained = tracker.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.contains(0x1000));
+        assert!(drained.contains(MMIO_GAP_START + 0x1000));
     }
 }

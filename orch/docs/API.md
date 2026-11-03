@@ -532,7 +532,7 @@ Request:
 }
 ```
 
-`timeout_ms` defaults to `30000`.
+`timeout_ms` defaults to `30000` and must not exceed `3600000` or the server's API request deadline (`TARIT_API_REQUEST_TIMEOUT_MS`, default `180000`); use `POST /v1/execute_async` for longer commands. A request that cannot start its command in time because another operation holds the VM returns `409` instead of outliving that deadline.
 
 Response `200`: final `ExecutionRecord` with `status: "completed"` (result fields `exit_code`, `stdout`, `stderr`, `duration_ms` set) or `status: "failed"` (`error` set). A command that runs but exits non-zero is still `completed`; check `exit_code`. An exec that could not run at all (for example, guest agent unavailable) returns `200` with `status: "failed"`, not an HTTP error.
 
@@ -541,9 +541,11 @@ Status codes:
 | Status | Meaning |
 | --- | --- |
 | `200` | Execution finished; the record carries the outcome (completed or failed). |
+| `400` | `timeout_ms` is above `3600000` or the API request deadline. |
 | `401` | Missing or wrong `X-API-Key`. |
 | `403` | VM belongs to a different tenant. |
 | `404` | VM not found. |
+| `409` | VM is not running, or stayed busy with another operation for too long. |
 | `500` | Owner resolution, peer, or internal failure. |
 
 ### `POST /v1/execute_async`
@@ -560,7 +562,7 @@ Request:
 }
 ```
 
-`timeout_ms` defaults to `30000`.
+`timeout_ms` defaults to `30000` and must not exceed `3600000`.
 
 Response `202`: initial `ExecutionRecord` with `status: "pending"`.
 
@@ -569,6 +571,7 @@ Status codes:
 | Status | Meaning |
 | --- | --- |
 | `202` | Execution accepted. |
+| `400` | `timeout_ms` is above `3600000`. |
 | `401` | Missing or wrong `X-API-Key`. |
 | `403` | VM belongs to a different tenant. |
 | `404` | VM not found. |
@@ -597,7 +600,7 @@ Request:
 }
 ```
 
-`allow_existing` defaults to `false`.
+`allow_existing` defaults to `false`. Entries entirely inside IPv4 link-local `169.254.0.0/16` are rejected with `400`: the host always drops that range.
 
 Response `200`:
 

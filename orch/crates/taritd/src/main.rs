@@ -46,6 +46,7 @@ use tarit_fleet::PostgresFleet;
 
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const STORE_QUEUE_CAPACITY: usize = 8_192;
 
 #[derive(Clone)]
@@ -1186,6 +1187,19 @@ fn spawn_http_server(
     })
 }
 
+/// Delay before the peer listener accepts again after `error`. Failures of a
+/// single pending connection retry at once; anything else, such as EMFILE or
+/// ENFILE, pauses briefly so finishing connections can release descriptors.
+fn peer_accept_backoff(error: &std::io::Error) -> Duration {
+    match error.kind() {
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::Interrupted => Duration::ZERO,
+        _ => PEER_ACCEPT_ERROR_BACKOFF,
+    }
+}
+
 fn spawn_peer_server(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -1202,9 +1216,35 @@ fn spawn_peer_server(
             let accepted = tokio::select! {
                 biased;
                 _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = joined {
+                        tracing::warn!(%error, "peer TLS connection task failed");
+                    }
+                    continue;
+                }
                 accepted = listener.accept() => accepted,
             };
-            let (stream, address) = accepted.context("accept peer TLS connection")?;
+            let (stream, address) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // An accept failure belongs to one connection or to a
+                    // transient resource limit; it must never stop the node.
+                    let backoff = peer_accept_backoff(&error);
+                    tracing::warn!(
+                        %error,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "peer TLS accept failed"
+                    );
+                    if !backoff.is_zero() {
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(shutdown_rx.clone()) => break,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                    }
+                    continue;
+                }
+            };
             let acceptor = acceptor.clone();
             let app = app.clone();
             let connection_shutdown = shutdown_rx.clone();
@@ -1736,6 +1776,22 @@ mod tests {
             .expect("peer TLS listener drains")
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn peer_accept_errors_back_off_only_for_resource_exhaustion() {
+        for errno in [libc::ECONNABORTED, libc::ECONNRESET, libc::EINTR] {
+            assert_eq!(
+                peer_accept_backoff(&std::io::Error::from_raw_os_error(errno)),
+                Duration::ZERO
+            );
+        }
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(
+                peer_accept_backoff(&std::io::Error::from_raw_os_error(errno)),
+                PEER_ACCEPT_ERROR_BACKOFF
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

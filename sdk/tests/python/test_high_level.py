@@ -124,6 +124,22 @@ class SyncClientTests(unittest.TestCase):
         self.assertEqual(result.vm.id, CHILD_ID)
         self.assertEqual(bodies, [{"id": str(CHILD_ID)}, {"id": str(CHILD_ID)}])
 
+    def test_fork_accepts_idempotent_replay_after_server_disconnect(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            self.assertEqual(json.loads(request.content), {"id": str(CHILD_ID)})
+            if attempts == 1:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+            return httpx.Response(200, json=fork_result())
+
+        with TaritClient("https://tarit.test", "tenant-key", transport=httpx.MockTransport(handler)) as client:
+            result = client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=1)
+        self.assertEqual(result.vm.id, CHILD_ID)
+        self.assertEqual(attempts, 2)
+
     def test_tenant_denial_is_typed(self) -> None:
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(403, json={"error": "VM belongs to another tenant"})
@@ -242,6 +258,23 @@ class AsyncClientTests(unittest.IsolatedAsyncioTestCase):
             result = await client.execute(VM_ID, "echo sdk-ok", poll_interval=0)
         self.assertEqual(result.status, "completed")
         self.assertEqual(polls, 1)
+
+    async def test_fork_accepts_idempotent_replay_after_server_disconnect(self) -> None:
+        attempts = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            self.assertEqual(json.loads(request.content), {"id": str(CHILD_ID)})
+            if attempts == 1:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+            return httpx.Response(200, json=fork_result())
+
+        transport = httpx.MockTransport(handler)
+        async with AsyncTaritClient("https://tarit.test", "tenant-key", transport=transport) as client:
+            result = await client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=1)
+        self.assertEqual(result.vm.id, CHILD_ID)
+        self.assertEqual(attempts, 2)
 
     async def test_open_pty_async_bridges_frames_and_cleans_up(self) -> None:
         methods: list[str] = []

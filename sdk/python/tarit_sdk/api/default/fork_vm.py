@@ -35,6 +35,11 @@ def _get_kwargs(
 
 
 def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | ForkVmResponse | None:
+    if response.status_code == 200:
+        response_200 = ForkVmResponse.from_dict(response.json())
+
+        return response_200
+
     if response.status_code == 201:
         response_201 = ForkVmResponse.from_dict(response.json())
 

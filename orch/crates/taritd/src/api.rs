@@ -74,6 +74,7 @@ use tarit_types::{
     RestoreBranchRequest, ShareRecord, ShareTokenResponse, ShareVisibility, SnapshotRequest,
     SnapshotResponse, UpdateBranchHeadRequest, UpdateShareRequest, UsageEvent, UsageSummary,
     VmRecord, VmStatus, VolumeCapabilities, VolumeRecord, VolumeStatus, VolumeStorageClass,
+    MAX_EXEC_TIMEOUT_MS,
 };
 use tarit_volume::{VolumeError, MIN_BLOCK_VOLUME_BYTES};
 use tower_http::trace::TraceLayer;
@@ -406,7 +407,7 @@ fn public_vm_runtime_status(status: serde_json::Value) -> Result<PublicVmRuntime
         .map_err(|_| OrchError::Internal("invalid VMM status response".into()))
 }
 
-fn public_operation_error(error: &OrchError) -> String {
+pub(crate) fn public_operation_error(error: &OrchError) -> String {
     match error {
         OrchError::Unavailable(_) => "service unavailable".into(),
         OrchError::Internal(_) => "internal error".into(),
@@ -636,10 +637,10 @@ async fn readyz(State(state): State<AppState>) -> Response {
     let admission = state.supervisor.admission_gate();
     checks.insert(
         "admission",
-        if admission.enter().is_ok() {
-            "ok"
-        } else {
+        if admission.is_closed() {
             "closed"
+        } else {
+            "ok"
         },
     );
     checks.insert(
@@ -789,7 +790,7 @@ async fn update_share(
     request: Request,
 ) -> Result<Json<ShareRecord>, ShareApiError> {
     let id = parse_lifecycle_share_id(&state, &identity, audit_action::UPDATE_SHARE, id)?;
-    let pre_mutation = share_audit_fields(&state, id).await;
+    let pre_mutation = share_audit_fields(&state, &identity, id).await;
     let request = parse_share_json::<UpdateShareRequest>(request).await;
     let attempted = match &request {
         Ok(request) => pre_mutation.merge(ShareAuditFields::from_update_request(request)),
@@ -845,7 +846,7 @@ async fn revoke_share(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ShareApiError> {
     let id = parse_lifecycle_share_id(&state, &identity, audit_action::REVOKE_SHARE, id)?;
-    let pre_mutation = share_audit_fields(&state, id).await;
+    let pre_mutation = share_audit_fields(&state, &identity, id).await;
     record_share_audit(
         &state,
         &identity,
@@ -883,7 +884,7 @@ async fn issue_share_token(
     Path(id): Path<String>,
 ) -> Result<Json<ShareTokenResponse>, ShareApiError> {
     let id = parse_lifecycle_share_id(&state, &identity, audit_action::ISSUE_SHARE_TOKEN, id)?;
-    let pre_mutation = share_audit_fields(&state, id).await;
+    let pre_mutation = share_audit_fields(&state, &identity, id).await;
     record_share_audit(
         &state,
         &identity,
@@ -1065,10 +1066,18 @@ fn parse_lifecycle_share_id(
     }
 }
 
-async fn share_audit_fields(state: &AppState, id: Uuid) -> ShareAuditFields {
+async fn share_audit_fields(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> ShareAuditFields {
     match state.shares.get(id).await {
-        Ok(Some(share)) => ShareAuditFields::from(&share),
-        Ok(None) | Err(_) => ShareAuditFields {
+        // The caller can read its audit trail back, so it must only carry
+        // metadata of shares the caller is allowed to see.
+        Ok(Some(share)) if identity.is_admin() || share.owner_key == identity.tenant => {
+            ShareAuditFields::from(&share)
+        }
+        Ok(_) | Err(_) => ShareAuditFields {
             share_id: Some(id),
             ..Default::default()
         },
@@ -3099,6 +3108,26 @@ async fn authorize_vm_action(
     Ok(())
 }
 
+/// Bound an exec budget. A synchronous exec must also fit inside the API
+/// request deadline: past it the client receives a 504, but the handler and
+/// its in-flight permit would otherwise keep running.
+fn validate_exec_timeout(
+    timeout_ms: u64,
+    request_timeout_ms: Option<u64>,
+) -> Result<(), OrchError> {
+    if timeout_ms > MAX_EXEC_TIMEOUT_MS {
+        return Err(OrchError::BadRequest(format!(
+            "timeout_ms must not exceed {MAX_EXEC_TIMEOUT_MS}"
+        )));
+    }
+    if let Some(limit) = request_timeout_ms.filter(|limit| timeout_ms > *limit) {
+        return Err(OrchError::BadRequest(format!(
+            "timeout_ms must not exceed the {limit} ms API request deadline; use /v1/execute_async for longer commands"
+        )));
+    }
+    Ok(())
+}
+
 async fn execute_async(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
@@ -3116,6 +3145,7 @@ async fn execute_async_impl(
     identity: ApiIdentity,
     req: ExecuteRequest,
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
+    validate_exec_timeout(req.timeout_ms, None)?;
     // Locate the VM anywhere in the cluster; the exec runs on its owning node.
     // (Resolving here also validates existence for a clean 404.)
     let owner = ops::resolve_owner_for_activation(&state, req.vm_id, &identity).await?;
@@ -3155,7 +3185,9 @@ async fn execute_async_impl(
         }
 
         let result = match owner {
-            Owner::Local => ops::exec_local(&state2, vm_id, command.clone(), timeout_ms).await,
+            Owner::Local => {
+                ops::exec_local(&state2, vm_id, command.clone(), timeout_ms, None).await
+            }
             Owner::Remote(rpc) => {
                 let peer = Arc::clone(&state2.peer);
                 let cmd = command.clone();
@@ -3255,6 +3287,8 @@ async fn execute_impl(
     identity: &ApiIdentity,
     req: ExecuteRequest,
 ) -> Result<Json<ExecutionRecord>, ApiError> {
+    validate_exec_timeout(req.timeout_ms, Some(state.config.api_request_timeout_ms))?;
+    let gate_deadline = ops::exec_gate_deadline(&state.config, req.timeout_ms);
     let owner = ops::resolve_owner_for_activation(state, req.vm_id, identity).await?;
     authorize_vm_action(state, &owner, req.vm_id, identity).await?;
     let now = Utc::now();
@@ -3264,7 +3298,16 @@ async fn execute_impl(
     let timeout_ms = req.timeout_ms;
 
     let result = match owner {
-        Owner::Local => ops::exec_local(state, vm_id, command.clone(), timeout_ms).await,
+        Owner::Local => {
+            ops::exec_local(
+                state,
+                vm_id,
+                command.clone(),
+                timeout_ms,
+                Some(gate_deadline),
+            )
+            .await
+        }
         Owner::Remote(rpc) => {
             let peer = Arc::clone(&state.peer);
             let cmd = command.clone();
@@ -5139,6 +5182,66 @@ mod tests {
     }
 
     #[test]
+    fn exec_timeout_is_bounded_and_sync_exec_fits_the_request_deadline() {
+        validate_exec_timeout(MAX_EXEC_TIMEOUT_MS, None).unwrap();
+        for timeout_ms in [MAX_EXEC_TIMEOUT_MS + 1, u64::MAX] {
+            assert!(matches!(
+                validate_exec_timeout(timeout_ms, None),
+                Err(OrchError::BadRequest(_))
+            ));
+            assert!(matches!(
+                validate_exec_timeout(timeout_ms, Some(u64::MAX)),
+                Err(OrchError::BadRequest(_))
+            ));
+        }
+        validate_exec_timeout(180_000, Some(180_000)).unwrap();
+        let error = validate_exec_timeout(180_001, Some(180_000)).unwrap_err();
+        assert!(matches!(error, OrchError::BadRequest(_)));
+        assert!(error.to_string().contains("/v1/execute_async"));
+
+        // Validation precedes owner resolution, so no VM is needed.
+        let (state, _audits) = test_state_with_audit();
+        let rt = test_runtime();
+        let sync = rt.block_on(request_json(
+            router(state.clone()),
+            "POST",
+            "/v1/execute",
+            "tenant-a-key",
+            serde_json::json!({
+                "vm_id": Uuid::new_v4(),
+                "command": "true",
+                "timeout_ms": state.config.api_request_timeout_ms + 1,
+            }),
+        ));
+        assert_eq!(sync.status(), StatusCode::BAD_REQUEST);
+        let not_found = rt.block_on(request_json(
+            router(state.clone()),
+            "POST",
+            "/v1/execute",
+            "tenant-a-key",
+            serde_json::json!({
+                "vm_id": Uuid::new_v4(),
+                "command": "true",
+                "timeout_ms": state.config.api_request_timeout_ms,
+            }),
+        ));
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        let background = rt.block_on(request_json(
+            router(state.clone()),
+            "POST",
+            "/v1/execute_async",
+            "tenant-a-key",
+            serde_json::json!({
+                "vm_id": Uuid::new_v4(),
+                "command": "true",
+                "timeout_ms": u64::MAX,
+            }),
+        ));
+        assert_eq!(background.status(), StatusCode::BAD_REQUEST);
+        drop(rt);
+    }
+
+    #[test]
     fn share_routes_enforce_lifecycle_statuses_and_keep_tokens_out_of_audits() {
         let (mut state, _audits) = test_state_with_audit();
         state.config.share_token_key = Some([7; 32]);
@@ -5514,8 +5617,14 @@ mod tests {
         assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
         assert_eq!(audits[1].action, audit_action::UPDATE_SHARE);
         assert_eq!(audits[1].outcome, audit_outcome::DENIED);
-        assert_share_audit_detail(&audits[1], &share_id.to_string(), 9090, "private");
-        assert_eq!(audits[0].vm_id, audits[1].vm_id);
+        // Only the caller's own request fields; nothing about the share.
+        for audit in &audits {
+            assert_eq!(audit.vm_id, None);
+            assert_eq!(
+                audit.detail.as_deref(),
+                Some(format!("share_id={share_id}; guest_port=9090").as_str())
+            );
+        }
         drop(rt);
     }
 
@@ -5540,8 +5649,20 @@ mod tests {
         assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
         assert_eq!(audits[1].action, audit_action::REVOKE_SHARE);
         assert_eq!(audits[1].outcome, audit_outcome::DENIED);
-        assert_share_audit_detail(&audits[1], &share_id.to_string(), 8080, "private");
-        assert_eq!(audits[0].vm_id, audits[1].vm_id);
+        assert_foreign_share_audits(&audits, share_id);
+
+        let admin = rt.block_on(request_json(
+            router(state.clone()),
+            "DELETE",
+            &format!("/v1/shares/{share_id}"),
+            "admin-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(admin.status(), StatusCode::NO_CONTENT);
+        let admin_attempt = &durable_audits(&state)[2];
+        assert_eq!(admin_attempt.outcome, audit_outcome::ATTEMPT);
+        assert!(admin_attempt.vm_id.is_some());
+        assert_share_audit_detail(admin_attempt, &share_id.to_string(), 8080, "private");
         drop(rt);
     }
 
@@ -5567,8 +5688,7 @@ mod tests {
         assert_eq!(audits[0].outcome, audit_outcome::ATTEMPT);
         assert_eq!(audits[1].action, audit_action::ISSUE_SHARE_TOKEN);
         assert_eq!(audits[1].outcome, audit_outcome::DENIED);
-        assert_share_audit_detail(&audits[1], &share_id.to_string(), 8080, "private");
-        assert_eq!(audits[0].vm_id, audits[1].vm_id);
+        assert_foreign_share_audits(&audits, share_id);
         drop(rt);
     }
 
@@ -6192,6 +6312,18 @@ mod tests {
 
     fn durable_audits(state: &AppState) -> Vec<AuditEvent> {
         state.store.lock().unwrap().list_unsent_audit(100).unwrap()
+    }
+
+    /// A denied caller can read its audit trail back, so it must not learn the
+    /// share's VM, port, or visibility from it.
+    fn assert_foreign_share_audits(audits: &[AuditEvent], share_id: Uuid) {
+        for audit in audits {
+            assert_eq!(audit.vm_id, None);
+            assert_eq!(
+                audit.detail.as_deref(),
+                Some(format!("share_id={share_id}").as_str())
+            );
+        }
     }
 
     fn assert_share_audit_detail(

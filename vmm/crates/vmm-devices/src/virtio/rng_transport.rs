@@ -217,7 +217,7 @@ impl VirtioRngMmio {
                         return Some(used_len);
                     }
                     if let Some(dirty) = dirty.as_ref() {
-                        dirty.mark_range(addr, len as u64);
+                        dirty.mark_guest_range(addr, len as u64);
                     }
                     let Some(next_used_len) = used_len.checked_add(len) else {
                         return Some(used_len);

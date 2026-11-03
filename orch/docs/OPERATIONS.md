@@ -279,7 +279,8 @@ When enabled, `taritd`:
 8. Adds a per-slot nftables masquerade rule tagged with an `taritd` comment.
 9. Installs per-tap forward guards before bringing the tap up: guest traffic may
    leave only through the detected uplink and cannot target the `172.16.0.0/16`
-   VM pool; established and related return traffic remains allowed.
+   VM pool or IPv4 link-local `169.254.0.0/16` (cloud instance metadata), whatever
+   the allowlist; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
 Snapshot restore assigns a new host TAP allocation. Before publishing the VM,
@@ -297,8 +298,8 @@ map with live local VM records, validates the
 required nft base-chain hooks, and atomically inserts top-of-chain forward and
 input drop quarantines for every recovered TAP. It removes Tarit-owned stale
 policy for all their slots and programs and verifies every netdev IPv4/ARP,
-source, VM-pool lateral, uplink, host-input, masquerade, and persisted egress
-policy while all TAPs remain contained.
+source, VM-pool lateral, link-local, uplink, host-input, masquerade, and
+persisted egress policy while all TAPs remain contained.
 
 `taritd_nat` forward and input chains are closed Tarit ownership domains:
 every rule relevant to a recovered TAP must have a recognized Tarit comment and

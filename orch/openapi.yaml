@@ -361,6 +361,8 @@ components:
         timeout_ms:
           type: integer
           default: 30000
+          maximum: 3600000
+          description: Command budget in milliseconds. `POST /v1/execute` also rejects values above the server's API request deadline (`TARIT_API_REQUEST_TIMEOUT_MS`, default 180000); use `POST /v1/execute_async` for longer commands.
     ExecutionRecord:
       type: object
       required: [id, vm_id, command, timeout_ms, status, created_at, updated_at]
@@ -460,7 +462,7 @@ components:
           format: uuid
         action:
           type: string
-          enum: [create, delete, pause, suspend, resume, snapshot, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token, create_volume, delete_volume]
+          enum: [create, delete, pause, suspend, resume, snapshot, fork, hibernate, create_branch, update_branch, delete_branch, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token, create_volume, delete_volume, set_balloon]
         outcome:
           type: string
           enum: [attempt, ok, denied, error]
@@ -1316,6 +1318,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ForkVmResponse"
+        "200":
+          description: Idempotent replay of a fork that already produced this child id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ForkVmResponse"
         "401":
           description: Missing or invalid API key
         "403":
@@ -1382,12 +1390,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExecutionRecord"
+        "400":
+          description: "`timeout_ms` exceeds 3600000 or the API request deadline"
         "401":
           description: Missing or invalid API key
         "403":
           description: VM belongs to a different tenant
         "404":
           description: VM not found
+        "409":
+          description: VM is not running, or stayed busy with another operation too long to finish within the API request deadline
   /v1/execute_async:
     post:
       operationId: executeAsync
@@ -1406,6 +1418,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ExecutionRecord"
+        "400":
+          description: "`timeout_ms` exceeds 3600000"
         "401":
           description: Missing or invalid API key
         "403":

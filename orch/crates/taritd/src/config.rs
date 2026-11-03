@@ -1314,11 +1314,12 @@ fn validate_production_requirements(
     if unsafe { libc::geteuid() } != 0 {
         bail!("TARIT_PRODUCTION jail, TAP, cgroup, and device staging require root privileges");
     }
-    if database_url.is_none() {
+    let Some(database_url) = database_url else {
         bail!(
             "TARIT_PRODUCTION requires TARIT_DATABASE_URL for durable global control-plane state"
         );
-    }
+    };
+    validate_production_database_url(database_url)?;
     if !enable_net {
         bail!("TARIT_PRODUCTION requires TARIT_ENABLE_NET=1");
     }
@@ -1374,6 +1375,16 @@ fn validate_production_requirements(
         bail!("TARIT_PRODUCTION forbids TARIT_ALLOW_INSECURE_PEER_HTTP");
     }
     Ok(())
+}
+
+fn validate_production_database_url(database_url: &str) -> Result<()> {
+    match tarit_fleet::database_url_requires_tls(database_url) {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!(
+            "TARIT_PRODUCTION requires TARIT_DATABASE_URL to set sslmode=require unless every host is a Unix socket"
+        ),
+        Err(error) => bail!("TARIT_DATABASE_URL is not a valid PostgreSQL URL: {error}"),
+    }
 }
 
 fn validate_production_shared_block(shared_block: &SharedBlockConfig) -> Result<()> {
@@ -2089,6 +2100,22 @@ mod tests {
         assert!(!debug.contains("127.0.0.1"));
         assert!(!debug.contains("/srv/tarit"));
         clear_shared_block_env();
+    }
+
+    #[test]
+    fn production_database_url_must_not_fall_back_to_plaintext() {
+        let error = validate_production_database_url("postgres://u:secret@db.example:5432/tarit")
+            .expect_err("the default sslmode=prefer must not pass the production gate");
+        assert!(error.to_string().contains("sslmode=require"));
+        validate_production_database_url(
+            "postgres://u:secret@db.example:5432/tarit?sslmode=require",
+        )
+        .unwrap();
+        validate_production_database_url("postgres://u@%2Frun%2Fpostgresql/tarit").unwrap();
+        let error =
+            validate_production_database_url("postgres://u:secret@db.example/tarit?sslmode=bogus")
+                .expect_err("unknown sslmode must be rejected");
+        assert!(!error.to_string().contains("secret"));
     }
 
     #[test]

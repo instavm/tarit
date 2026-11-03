@@ -872,6 +872,10 @@ fn default_exec_timeout_ms() -> u64 {
     30_000
 }
 
+/// Largest accepted `ExecuteRequest::timeout_ms` (one hour). A command holds
+/// its VM's operation gate for its whole budget, so the budget must be bounded.
+pub const MAX_EXEC_TIMEOUT_MS: u64 = 3_600_000;
+
 /// Status of an async execution job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
