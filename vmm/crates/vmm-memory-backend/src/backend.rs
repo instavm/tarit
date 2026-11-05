@@ -128,25 +128,47 @@ impl GuestMemory {
     /// devices.
     #[cfg(target_os = "linux")]
     pub fn map_file_private(&self, file: &std::fs::File, offset: u64) -> Result<(), MemoryError> {
+        self.map_file_range_private(file, offset, 0, self.size_bytes)
+    }
+
+    /// Like [`Self::map_file_private`], but replaces only the packed RAM range
+    /// `ram_offset..ram_offset + len` with `file` from `file_offset`. Used to
+    /// layer page runs of incremental snapshots over a mapped base image.
+    #[cfg(target_os = "linux")]
+    pub fn map_file_range_private(
+        &self,
+        file: &std::fs::File,
+        file_offset: u64,
+        ram_offset: u64,
+        len: u64,
+    ) -> Result<(), MemoryError> {
         use std::os::fd::AsRawFd;
 
-        if !offset.is_multiple_of(4096) {
+        if !file_offset.is_multiple_of(4096)
+            || !ram_offset.is_multiple_of(4096)
+            || !len.is_multiple_of(4096)
+            || len == 0
+        {
             return Err(MemoryError::Region(format!(
-                "snapshot RAM offset {offset} is not page aligned"
+                "snapshot RAM range is not page aligned: file {file_offset}, ram {ram_offset}, len {len}"
             )));
         }
-        let len = usize::try_from(self.size_bytes)
-            .map_err(|_| MemoryError::Region("memory size does not fit usize".into()))?;
-        let offset = libc::off_t::try_from(offset)
+        ram_offset
+            .checked_add(len)
+            .filter(|end| *end <= self.size_bytes)
+            .ok_or(MemoryError::OutOfBounds(ram_offset, len))?;
+        let len = usize::try_from(len).map_err(|_| MemoryError::OutOfBounds(ram_offset, len))?;
+        let ram_offset = usize::try_from(ram_offset)
+            .map_err(|_| MemoryError::OutOfBounds(ram_offset, len as u64))?;
+        let offset = libc::off_t::try_from(file_offset)
             .map_err(|_| MemoryError::Region("snapshot RAM offset overflows off_t".into()))?;
-        let base = self.backing.as_ptr();
-        // SAFETY: `base..base+len` is the live anonymous reservation owned by
-        // `self.backing`; MAP_FIXED atomically replaces it with the file
-        // mapping at the same address, so every pointer derived from the
+        // SAFETY: the range was checked to lie inside the live reservation
+        // owned by `self.backing`; MAP_FIXED atomically replaces it with the
+        // file mapping at the same address, so every pointer derived from the
         // backing stays valid. The mapping is unmapped by `backing`'s Drop.
         let mapped = unsafe {
             libc::mmap(
-                base.cast(),
+                self.backing.as_ptr().add(ram_offset).cast(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,

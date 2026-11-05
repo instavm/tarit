@@ -4207,6 +4207,110 @@ fn write_diff_snapshot_to_file(
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
 ) -> Result<usize> {
     use std::io::Write;
+
+    let runs = dirty_page_runs(dirty, mem.len());
+    let mut index = Vec::with_capacity(runs.len() * DIFF_RUN_ENTRY_BYTES);
+    for &(offset, pages) in &runs {
+        index.extend_from_slice(&offset.to_le_bytes());
+        index.extend_from_slice(&pages.to_le_bytes());
+    }
+    let mut data_crc = crc32fast::Hasher::new();
+    let mut data_len = 0usize;
+    for &(offset, pages) in &runs {
+        let start = offset as usize;
+        let end = (start + pages as usize * DIFF_PAGE_BYTES).min(mem.len());
+        data_crc.update(&mem[start..end]);
+        data_len += end - start;
+    }
+
+    let pbytes = parent.as_bytes();
+    let parent_len = u32::try_from(pbytes.len())
+        .map_err(|_| VmmError::Snapshot("parent path too long".into()))?;
+    let state_len = u64::try_from(state_blob.len())
+        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+    let run_count =
+        u32::try_from(runs.len()).map_err(|_| VmmError::Snapshot("too many diff runs".into()))?;
+
+    let mut header = Vec::with_capacity(64 + pbytes.len() + state_blob.len() + index.len());
+    header.extend_from_slice(ALIGNED_DIFF_MAGIC);
+    header.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    header.extend_from_slice(&parent_len.to_le_bytes());
+    header.extend_from_slice(pbytes);
+    header.extend_from_slice(&state_len.to_le_bytes());
+    header.extend_from_slice(&crc32fast::hash(state_blob).to_le_bytes());
+    header.extend_from_slice(state_blob);
+    header.extend_from_slice(&run_count.to_le_bytes());
+    header.extend_from_slice(&crc32fast::hash(&index).to_le_bytes());
+    header.extend_from_slice(&index);
+    header.extend_from_slice(&data_crc.finalize().to_le_bytes());
+    header.resize(header.len().next_multiple_of(DIFF_PAGE_BYTES), 0);
+
+    let mut wr = |b: &[u8]| -> Result<()> {
+        file.write_all(b)
+            .map_err(|e| VmmError::Snapshot(e.to_string()))
+    };
+    wr(&header)?;
+    for &(offset, pages) in &runs {
+        let start = offset as usize;
+        let end = start + pages as usize * DIFF_PAGE_BYTES;
+        if end <= mem.len() {
+            wr(&mem[start..end])?;
+        } else {
+            // A partial final page is zero-filled so the data stays aligned.
+            wr(&mem[start..])?;
+            wr(&vec![0u8; end - mem.len()])?;
+        }
+    }
+    file.flush()
+        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    Ok(data_len)
+}
+
+/// Coalesce dirty pages into sorted `(packed offset, page count)` runs.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn dirty_page_runs(
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+    mem_len: usize,
+) -> Vec<(u64, u32)> {
+    let mut pfns: Vec<u64> = dirty
+        .dirty_pfns()
+        .iter()
+        .copied()
+        .filter(|pfn| {
+            usize::try_from(*pfn)
+                .ok()
+                .and_then(|pfn| pfn.checked_mul(DIFF_PAGE_BYTES))
+                .is_some_and(|start| start < mem_len)
+        })
+        .collect();
+    pfns.sort_unstable();
+    pfns.dedup();
+    let mut runs: Vec<(u64, u32)> = Vec::new();
+    for pfn in pfns {
+        match runs.last_mut() {
+            Some((start, pages))
+                if *start / DIFF_PAGE_BYTES as u64 + u64::from(*pages) == pfn
+                    && *pages < MAX_DIFF_RUN_PAGES =>
+            {
+                *pages += 1;
+            }
+            _ => runs.push((pfn * DIFF_PAGE_BYTES as u64, 1)),
+        }
+    }
+    runs
+}
+
+/// The interleaved `VMSD` layout written before page-aligned diffs; kept so
+/// tests can prove such files still restore.
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_legacy_diff_snapshot_to_file(
+    mut file: &std::fs::File,
+    parent: &str,
+    state_blob: &[u8],
+    mem: &[u8],
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+) -> Result<usize> {
+    use std::io::Write;
     use vmm_snapshot::diff::build_diff;
     const MAGIC: &[u8; 4] = b"VMSD";
 
@@ -4274,6 +4378,21 @@ const MAX_DIFF_PAGE_BYTES: u64 = 1024 * 1024;
 const MAX_DIFF_PAGES: usize = 1 << 20;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const MAX_DIFF_CHAIN_DEPTH: usize = 1024;
+/// Magic of a page-aligned incremental snapshot: an index of coalesced dirty
+/// page runs followed by their pages on 4 KiB boundaries, so restore can map
+/// long runs straight from the file instead of copying them.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const ALIGNED_DIFF_MAGIC: &[u8; 4] = b"VMSA";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const DIFF_PAGE_BYTES: usize = 4096;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const DIFF_RUN_ENTRY_BYTES: usize = 12;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const MAX_DIFF_RUN_PAGES: u32 = 1 << 18;
+/// Runs at least this long are mapped from the diff file on restore; shorter
+/// runs are read into guest RAM, which is cheaper than a mapping per run.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const MAP_MIN_RUN_PAGES: usize = 16;
 #[cfg(any(
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
@@ -4849,6 +4968,16 @@ enum SnapshotContent {
         version: u16,
         pages: Vec<(u64, Vec<u8>)>,
     },
+    /// Page-aligned diff: pages stay in `file` and are mapped or read on
+    /// restore. `runs` are `(packed offset, page count)` in data order.
+    AlignedDiff {
+        parent: PathBuf,
+        state: Vec<u8>,
+        version: u16,
+        file: std::fs::File,
+        data_offset: u64,
+        runs: Vec<(u64, u32)>,
+    },
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5264,9 +5393,157 @@ fn read_snapshot_with(
             version,
             pages,
         })
+    } else if &magic == ALIGNED_DIFF_MAGIC {
+        read_aligned_diff(file, file_len, &path_display, snapshot_root)
     } else {
         Err(VmmError::Snapshot(format!("bad magic in {path_display}")))
     }
+}
+
+/// Parse a page-aligned diff after its magic. The run index is CRC-checked
+/// and validated here; page data is CRC-checked once per file version.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn read_aligned_diff(
+    mut file: std::fs::File,
+    file_len: u64,
+    path_display: &str,
+    snapshot_root: &Path,
+) -> Result<SnapshotContent> {
+    use std::io::{Read, Seek};
+
+    let rd = |f: &mut std::fs::File, buf: &mut [u8], what: &str| -> Result<()> {
+        f.read_exact(buf)
+            .map_err(|e| VmmError::Snapshot(format!("{what} in {path_display}: {e}")))
+    };
+    let mut u16b = [0u8; 2];
+    let mut u32b = [0u8; 4];
+    let mut u64b = [0u8; 8];
+    rd(&mut file, &mut u16b, "read version")?;
+    let version = u16::from_le_bytes(u16b);
+    if !matches!(version, LEGACY_SNAPSHOT_VERSION | SNAPSHOT_VERSION) {
+        return Err(VmmError::Snapshot(format!(
+            "unsupported VMSA version {version} in {path_display}"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read parent_len")?;
+    let parent_len = u64::from(u32::from_le_bytes(u32b));
+    if parent_len > MAX_DIFF_PARENT_PATH_BYTES {
+        return Err(VmmError::Snapshot("parent path too long".into()));
+    }
+    let position = |f: &mut std::fs::File| f.stream_position().unwrap_or(file_len);
+    ensure_file_has_bytes(
+        file_len,
+        position(&mut file),
+        parent_len,
+        "parent path",
+        path_display,
+    )?;
+    let mut pbuf = vec![0u8; parent_len as usize];
+    rd(&mut file, &mut pbuf, "read parent")?;
+    let parent = std::str::from_utf8(&pbuf).map_err(|e| {
+        VmmError::Snapshot(format!("parent path is not UTF-8 in {path_display}: {e}"))
+    })?;
+    let parent = resolve_snapshot_parent(parent, snapshot_root)?;
+
+    rd(&mut file, &mut u64b, "read state_len")?;
+    let state_len = u64::from_le_bytes(u64b);
+    if state_len > MAX_SNAPSHOT_STATE_BYTES {
+        return Err(VmmError::Snapshot(format!(
+            "state blob too large in {path_display}: {state_len} bytes"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read state_crc")?;
+    let state_crc = u32::from_le_bytes(u32b);
+    ensure_file_has_bytes(
+        file_len,
+        position(&mut file),
+        state_len,
+        "state blob",
+        path_display,
+    )?;
+    let mut state = vec![0u8; state_len as usize];
+    rd(&mut file, &mut state, "read state")?;
+    let actual_state_crc = crc32fast::hash(&state);
+    if actual_state_crc != state_crc {
+        return Err(VmmError::Snapshot(format!(
+            "state CRC mismatch in {path_display}: got {actual_state_crc:#010x}, expected {state_crc:#010x}"
+        )));
+    }
+
+    rd(&mut file, &mut u32b, "read run count")?;
+    let run_count = u32::from_le_bytes(u32b) as usize;
+    if run_count > MAX_DIFF_PAGES {
+        return Err(VmmError::Snapshot(format!(
+            "too many diff runs in {path_display}: {run_count}"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read index_crc")?;
+    let index_crc = u32::from_le_bytes(u32b);
+    let index_len = (run_count * DIFF_RUN_ENTRY_BYTES) as u64;
+    ensure_file_has_bytes(
+        file_len,
+        position(&mut file),
+        index_len,
+        "run index",
+        path_display,
+    )?;
+    let mut index = vec![0u8; index_len as usize];
+    rd(&mut file, &mut index, "read run index")?;
+    if crc32fast::hash(&index) != index_crc {
+        return Err(VmmError::Snapshot(format!(
+            "run index CRC mismatch in {path_display}"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read data_crc")?;
+    let data_crc = u32::from_le_bytes(u32b);
+
+    let mut runs = Vec::with_capacity(run_count);
+    let mut data_pages = 0u64;
+    let mut previous_end = 0u64;
+    for entry in index.as_chunks::<DIFF_RUN_ENTRY_BYTES>().0 {
+        let offset = u64::from_le_bytes(entry[..8].try_into().expect("8-byte offset"));
+        let pages = u32::from_le_bytes(entry[8..].try_into().expect("4-byte count"));
+        let end = u64::from(pages)
+            .checked_mul(DIFF_PAGE_BYTES as u64)
+            .and_then(|len| offset.checked_add(len))
+            .ok_or_else(|| VmmError::Snapshot("diff run overflow".into()))?;
+        if pages == 0
+            || pages > MAX_DIFF_RUN_PAGES
+            || !offset.is_multiple_of(DIFF_PAGE_BYTES as u64)
+            || offset < previous_end
+            || end > crate::config::MAX_MEMORY_BYTES
+        {
+            return Err(VmmError::Snapshot(format!(
+                "invalid diff run 0x{offset:x}+{pages} pages in {path_display}"
+            )));
+        }
+        previous_end = end;
+        data_pages += u64::from(pages);
+        runs.push((offset, pages));
+    }
+
+    let data_offset = position(&mut file).next_multiple_of(DIFF_PAGE_BYTES as u64);
+    let data_len = data_pages * DIFF_PAGE_BYTES as u64;
+    if data_offset.checked_add(data_len) != Some(file_len) {
+        return Err(VmmError::Snapshot(format!(
+            "diff data length mismatch in {path_display}: {data_pages} pages at {data_offset}, file is {file_len} bytes"
+        )));
+    }
+    let data_layout = FullSnapshotLayout {
+        state_offset: 0,
+        state_len: 0,
+        mem_offset: data_offset,
+        mem_len: data_len,
+    };
+    verify_ram_crc_once(&file, path_display, &data_layout, data_crc)?;
+    Ok(SnapshotContent::AlignedDiff {
+        parent,
+        state,
+        version,
+        file,
+        data_offset,
+        runs,
+    })
 }
 
 /// Reconstruct the guest memory + tip state for a snapshot that may be the tip
@@ -5284,11 +5561,19 @@ fn load_snapshot_chain_with(
     path: &str,
     ram_load: RamLoad,
 ) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>, u16)> {
-    // Follow the chain tip→base, collecting each diff's (state, pages).
-    type DiffPages = Vec<(u64, Vec<u8>)>;
-    type DiffChain = Vec<(u16, Vec<u8>, DiffPages)>;
+    use std::os::unix::fs::FileExt as _;
 
-    let mut diffs: DiffChain = Vec::new();
+    enum ChainDiff {
+        Pages(Vec<(u64, Vec<u8>)>),
+        Aligned {
+            file: std::fs::File,
+            data_offset: u64,
+            runs: Vec<(u64, u32)>,
+        },
+    }
+
+    // Follow the chain tip→base, collecting each diff's state and pages.
+    let mut diffs: Vec<(u16, Vec<u8>, ChainDiff)> = Vec::new();
     let mut chain_page_bytes = 0u64;
     let (mut cur, snapshot_root) = canonical_snapshot_tip(path)?;
     let mut seen = std::collections::HashSet::new();
@@ -5314,7 +5599,26 @@ fn load_snapshot_chain_with(
                 for (_, bytes) in &pages {
                     chain_page_bytes = validate_diff_payload_budget(chain_page_bytes, bytes.len())?;
                 }
-                diffs.push((version, state, pages));
+                diffs.push((version, state, ChainDiff::Pages(pages)));
+                cur = parent;
+            }
+            SnapshotContent::AlignedDiff {
+                parent,
+                state,
+                version,
+                file,
+                data_offset,
+                runs,
+            } => {
+                diffs.push((
+                    version,
+                    state,
+                    ChainDiff::Aligned {
+                        file,
+                        data_offset,
+                        runs,
+                    },
+                ));
                 cur = parent;
             }
         }
@@ -5324,20 +5628,78 @@ fn load_snapshot_chain_with(
         .first()
         .map(|(version, state, _)| (*version, state.clone()))
         .unwrap_or((base_version, base_state));
-    // Apply diffs base→tip = reverse of the tip→base collection order.
+
+    // Resolve every page to its newest version: walk tip→base and skip pages
+    // a newer diff already supplied, so overwritten pages are never touched.
     let mem_bytes = usize::try_from(mem.size_bytes)
         .map_err(|_| VmmError::Memory("restored memory too large".into()))?;
     let mem_slice: &mut [u8] = {
-        // SAFETY: `mem` is owned here and sized `mem_bytes`; we only write in-range.
+        // SAFETY: `mem` is owned here and sized `mem_bytes`; we only write
+        // in-range. Mapping file ranges over it keeps the same addresses.
         unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_bytes) }
     };
-    for (_, _, pages) in diffs.iter().rev() {
-        for (gpa, bytes) in pages {
-            validate_diff_page_range(*gpa, bytes.len(), mem_bytes)?;
-            let start = usize::try_from(*gpa)
-                .map_err(|_| VmmError::Snapshot("diff page GPA too large".into()))?;
-            let end = start + bytes.len();
-            mem_slice[start..end].copy_from_slice(bytes);
+    let page_count = mem_bytes.div_ceil(DIFF_PAGE_BYTES);
+    let mut covered = vec![0u64; page_count.div_ceil(64)];
+    let is_covered = |covered: &[u64], page: usize| covered[page / 64] & (1 << (page % 64)) != 0;
+    let cover = |covered: &mut [u64], page: usize| covered[page / 64] |= 1 << (page % 64);
+
+    for (_, _, diff) in &diffs {
+        match diff {
+            ChainDiff::Pages(pages) => {
+                for (gpa, bytes) in pages {
+                    validate_diff_page_range(*gpa, bytes.len(), mem_bytes)?;
+                    let start = usize::try_from(*gpa)
+                        .map_err(|_| VmmError::Snapshot("diff page GPA too large".into()))?;
+                    for (index, chunk) in bytes.chunks(DIFF_PAGE_BYTES).enumerate() {
+                        let at = start + index * DIFF_PAGE_BYTES;
+                        let page = at / DIFF_PAGE_BYTES;
+                        if at.is_multiple_of(DIFF_PAGE_BYTES) && is_covered(&covered, page) {
+                            continue;
+                        }
+                        mem_slice[at..at + chunk.len()].copy_from_slice(chunk);
+                        if at.is_multiple_of(DIFF_PAGE_BYTES) && chunk.len() == DIFF_PAGE_BYTES {
+                            cover(&mut covered, page);
+                        }
+                    }
+                }
+            }
+            ChainDiff::Aligned {
+                file,
+                data_offset,
+                runs,
+            } => {
+                let mut data_page = 0u64;
+                for &(offset, pages) in runs {
+                    let run_len = pages as usize * DIFF_PAGE_BYTES;
+                    validate_diff_page_range(offset, run_len, mem_bytes)?;
+                    let first = offset as usize / DIFF_PAGE_BYTES;
+                    let mut k = 0usize;
+                    while k < pages as usize {
+                        if is_covered(&covered, first + k) {
+                            k += 1;
+                            continue;
+                        }
+                        let begin = k;
+                        while k < pages as usize && !is_covered(&covered, first + k) {
+                            cover(&mut covered, first + k);
+                            k += 1;
+                        }
+                        let ram_offset = ((first + begin) * DIFF_PAGE_BYTES) as u64;
+                        let file_offset =
+                            data_offset + (data_page + begin as u64) * DIFF_PAGE_BYTES as u64;
+                        let len = (k - begin) * DIFF_PAGE_BYTES;
+                        if ram_load == RamLoad::Map && k - begin >= MAP_MIN_RUN_PAGES {
+                            mem.map_file_range_private(file, file_offset, ram_offset, len as u64)
+                                .map_err(|e| VmmError::Memory(e.to_string()))?;
+                        } else {
+                            let at = ram_offset as usize;
+                            file.read_exact_at(&mut mem_slice[at..at + len], file_offset)
+                                .map_err(|e| VmmError::Snapshot(format!("read diff pages: {e}")))?;
+                        }
+                    }
+                    data_page += u64::from(pages);
+                }
+            }
         }
     }
     Ok((mem, tip_state, tip_version))
@@ -7456,6 +7818,59 @@ mod tests {
         assert!(error.contains("memory CRC mismatch"), "{error}");
 
         for path in [&base, &d1, &bad] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // A chain mixing a legacy interleaved diff with page-aligned diffs must
+    // resolve every page to its newest version in both load modes, with long
+    // runs mapped from the diff file and short ones read.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn mixed_legacy_and_aligned_diff_chain_resolves_newest_pages() {
+        use vmm_memory_backend::dirty::DirtyBitmap;
+        let dir = private_runtime_dir().unwrap();
+        let pid = std::process::id();
+        let name = |tag: &str| dir.join(format!("t-mix-{tag}-{pid}.snap"));
+        let (base, d1, d2) = (name("base"), name("d1"), name("d2"));
+        let s = |p: &std::path::PathBuf| p.to_str().unwrap().to_string();
+
+        let mib = usize::try_from(crate::config::MIB).expect("MiB fits usize");
+        let page = DIFF_PAGE_BYTES;
+        let mem = vec![0x10u8; mib];
+        write_snapshot_file(&s(&base), b"base", &mem, false).unwrap();
+
+        // Legacy diff: pages 1..=3 -> 0x21.
+        let mut m1 = mem.clone();
+        m1[page..4 * page].fill(0x21);
+        let mut dirty1 = DirtyBitmap::new();
+        for pfn in 1..=3 {
+            dirty1.mark(pfn * page as u64);
+        }
+        let file = open_snapshot_output(&s(&d1), SnapshotCreateMode::CreateNew).unwrap();
+        write_legacy_diff_snapshot_to_file(&file, &s(&base), b"one", &m1, &dirty1).unwrap();
+        drop(file);
+
+        // Aligned diff: page 2 (short run, read) and pages 32..64 (long run,
+        // mapped) -> 0x32; page 3 keeps the legacy diff's 0x21.
+        let mut m2 = m1.clone();
+        m2[2 * page..3 * page].fill(0x32);
+        m2[32 * page..64 * page].fill(0x32);
+        let mut dirty2 = DirtyBitmap::new();
+        dirty2.mark(2 * page as u64);
+        for pfn in 32..64 {
+            dirty2.mark(pfn * page as u64);
+        }
+        write_diff_snapshot_file(&s(&d2), &s(&d1), b"two", &m2, &dirty2).unwrap();
+
+        for mode in [RamLoad::Copy, RamLoad::Map] {
+            let (gm, state, _) = load_snapshot_chain_with(&s(&d2), mode).unwrap();
+            assert_eq!(state, b"two");
+            // SAFETY: `gm` owns `mib` bytes for the duration of the check.
+            let got = unsafe { std::slice::from_raw_parts(gm.as_ptr(), mib) };
+            assert!(got == &m2[..], "chain resolved wrong pages");
+        }
+        for path in [&base, &d1, &d2] {
             let _ = std::fs::remove_file(path);
         }
     }
