@@ -37,6 +37,11 @@ pub struct GuestMemory {
     host_dirty: SoftwareDirtyBitmap,
     #[cfg(target_os = "linux")]
     lazy_page_discard: Arc<RwLock<Option<crate::uffd_restore::LazyPageDiscard>>>,
+    /// Set once the backing is a private mapping of a snapshot file. Discards
+    /// must then replace pages with anonymous memory, because MADV_DONTNEED on
+    /// a private file mapping would refault the snapshot's bytes, not zeros.
+    #[cfg(target_os = "linux")]
+    file_backed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GuestMemory {
@@ -106,7 +111,64 @@ impl GuestMemory {
             host_dirty: SoftwareDirtyBitmap::new(),
             #[cfg(target_os = "linux")]
             lazy_page_discard: Arc::new(RwLock::new(None)),
+            #[cfg(target_os = "linux")]
+            file_backed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Replace the whole RAM backing with a private copy-on-write mapping of
+    /// `file` starting at `offset`, the packed RAM image of a full snapshot.
+    ///
+    /// Pages are faulted in by the kernel from the page cache on first touch,
+    /// so restore cost does not depend on RAM size, and every VM restored from
+    /// the same file shares the untouched pages. Guest writes stay private.
+    /// The file must not be modified while any mapping of it is live.
+    ///
+    /// Must be called before the memory is registered with KVM or handed to
+    /// devices.
+    #[cfg(target_os = "linux")]
+    pub fn map_file_private(&self, file: &std::fs::File, offset: u64) -> Result<(), MemoryError> {
+        use std::os::fd::AsRawFd;
+
+        if !offset.is_multiple_of(4096) {
+            return Err(MemoryError::Region(format!(
+                "snapshot RAM offset {offset} is not page aligned"
+            )));
+        }
+        let len = usize::try_from(self.size_bytes)
+            .map_err(|_| MemoryError::Region("memory size does not fit usize".into()))?;
+        let offset = libc::off_t::try_from(offset)
+            .map_err(|_| MemoryError::Region("snapshot RAM offset overflows off_t".into()))?;
+        let base = self.backing.as_ptr();
+        // SAFETY: `base..base+len` is the live anonymous reservation owned by
+        // `self.backing`; MAP_FIXED atomically replaces it with the file
+        // mapping at the same address, so every pointer derived from the
+        // backing stays valid. The mapping is unmapped by `backing`'s Drop.
+        let mapped = unsafe {
+            libc::mmap(
+                base.cast(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                file.as_raw_fd(),
+                offset,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(MemoryError::Region(format!(
+                "map snapshot RAM: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        self.file_backed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether RAM is a private mapping of a snapshot file.
+    #[cfg(target_os = "linux")]
+    pub fn is_file_backed(&self) -> bool {
+        self.file_backed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn raw_region(
@@ -219,6 +281,15 @@ impl GuestMemory {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(discard);
     }
 
+    /// Forget a UFFD lazy-restore discard hook once RAM no longer depends on it.
+    #[cfg(target_os = "linux")]
+    pub fn clear_lazy_page_discard(&self) {
+        *self
+            .lazy_page_discard
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
     /// Return the exclusion fence used by host-side readers of lazily restored
     /// RAM. Holding its write side prevents balloon MADV_DONTNEED calls while
     /// the caller walks pages; the UFFD handler remains unfenced and can serve
@@ -258,6 +329,31 @@ impl GuestMemory {
         let base = self.as_ptr() as *mut u8;
         let offset = usize::try_from(offset).map_err(|_| MemoryError::OutOfBounds(gpa, len))?;
         let length = usize::try_from(len).map_err(|_| MemoryError::OutOfBounds(gpa, len))?;
+        if self.is_file_backed() {
+            // SAFETY: range validation above proves this page-aligned subrange
+            // is within the live guest mapping owned by `self`. MAP_FIXED
+            // swaps it for fresh anonymous memory in place, so it refaults as
+            // zeros instead of the snapshot's bytes; KVM's MMU notifier drops
+            // any stale translations.
+            let mapped = unsafe {
+                libc::mmap(
+                    base.add(offset).cast(),
+                    length,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(MemoryError::Region(format!(
+                    "discard file-backed RAM: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            self.host_dirty.mark_range(offset as u64, len);
+            return Ok(());
+        }
         // SAFETY: range validation above proves this subrange is within the
         // live, page-aligned guest mmap owned by `self`.
         crate::uffd_restore::madvise_dontneed(unsafe { base.add(offset) }, length)
@@ -347,6 +443,41 @@ mod tests {
         assert!(dirty.contains(MMIO_GAP_START - 4096));
         assert!(!dirty.contains(MMIO_GAP_END));
         assert_eq!(dirty.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_backed_ram_is_private_shared_until_written_and_discards_to_zero() {
+        use std::io::Write as _;
+
+        let mut image = vec![0u8; 8192 + 3 * 4096];
+        image[8192..8192 + 4096].fill(0x11);
+        image[8192 + 4096..8192 + 8192].fill(0x22);
+        image[8192 + 8192..].fill(0x33);
+        let mut file = tempfile::tempfile().expect("snapshot file");
+        file.write_all(&image).unwrap();
+
+        let m = GuestMemory::new(3 * 4096).expect("guest memory");
+        assert!(m.map_file_private(&file, 4097).is_err(), "unaligned offset");
+        m.map_file_private(&file, 8192).expect("map snapshot RAM");
+        assert!(m.is_file_backed());
+
+        let mut page = [0u8; 4096];
+        m.read_phys(0, &mut page).unwrap();
+        assert!(page.iter().all(|&b| b == 0x11));
+
+        // Guest writes are private copy-on-write and never reach the file.
+        m.write_phys(4096, &[0xee; 8]).unwrap();
+        let mut on_disk = vec![0u8; 8];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut on_disk, 8192 + 4096).unwrap();
+        assert_eq!(on_disk, [0x22; 8]);
+
+        // A balloon discard refaults zeros, never the snapshot's bytes.
+        m.discard_range(2 * 4096, 4096).unwrap();
+        m.read_phys(2 * 4096, &mut page).unwrap();
+        assert!(page.iter().all(|&b| b == 0));
+        m.read_phys(0, &mut page).unwrap();
+        assert!(page.iter().all(|&b| b == 0x11), "neighbours untouched");
     }
 
     #[test]

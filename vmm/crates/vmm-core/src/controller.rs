@@ -2931,7 +2931,9 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         let host_dirty = guest_mem.host_dirty_tracker();
         let state_blob = vm.state_blob.clone().unwrap_or_default();
         let state_len = u64::try_from(state_blob.len())
-            .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+            .ok()
+            .and_then(page_aligned_state_len)
+            .ok_or_else(|| VmmError::Snapshot("state blob too large".into()))?;
         let mem_len_u64 = u64::try_from(mem_len)
             .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
         let layout = full_snapshot_layout_for_lengths(state_len, mem_len_u64)
@@ -2972,6 +2974,26 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         // active until the full memory image has been copied above. Drop it only now
         // so the same range can be registered on the suspend image.
         vm.lazy_restore = None;
+
+        // Swap guest RAM for a private mapping of the image just written. That
+        // releases every resident page at once, and resume faults pages back
+        // from the page cache in the kernel with no userspace fault handler.
+        match guest_mem.map_file_private(&file, layout.mem_offset) {
+            Ok(()) => {
+                guest_mem.clear_lazy_page_discard();
+                drop_file_cache(&file, layout.mem_offset, layout.mem_len);
+                vm.transient_files.set_suspend_snapshot(owned_snapshot);
+                vm.state = VmState::Suspended;
+                log::info!(
+                    "VM: suspend image mapped at {path} ({} bytes guest RAM released)",
+                    layout.mem_len
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                log::warn!("suspend: mapping the image failed ({error}); using UFFD");
+            }
+        }
 
         let lazy_restore = match vmm_memory_backend::start_lazy_restore_in_place(
             mem_ptr,
@@ -3328,6 +3350,16 @@ fn unique_suspend_snapshot_path() -> Result<String> {
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
+/// Stored state length, including zero padding, that starts the RAM image of a
+/// full snapshot on a page boundary. Page-aligned RAM can be mapped straight
+/// into a restored guest and reflinked; readers already accept the padding.
+fn page_aligned_state_len(state_len: u64) -> Option<u64> {
+    const RAM_ALIGNMENT: u64 = 4096;
+    let unaligned = FULL_SNAPSHOT_HEADER_LEN.checked_add(state_len)?;
+    let aligned = unaligned.checked_add(RAM_ALIGNMENT - 1)? / RAM_ALIGNMENT * RAM_ALIGNMENT;
+    Some(aligned - FULL_SNAPSHOT_HEADER_LEN)
+}
+
 fn full_snapshot_layout_for_lengths(state_len: u64, mem_len: u64) -> Option<FullSnapshotLayout> {
     let mem_offset = FULL_SNAPSHOT_HEADER_LEN.checked_add(state_len)?;
     mem_offset.checked_add(mem_len)?;
@@ -4064,11 +4096,17 @@ fn write_snapshot_to_file(
     use std::io::Write;
     const MAGIC: &[u8; 4] = b"VMSN";
 
-    let state_crc = crc32fast::hash(state_blob);
+    let unpadded_state_len = u64::try_from(state_blob.len())
+        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+    let state_len = page_aligned_state_len(unpadded_state_len)
+        .ok_or_else(|| VmmError::Snapshot("snapshot memory offset overflow".into()))?;
+    let padding = vec![0u8; (state_len - unpadded_state_len) as usize];
+    let mut state_hasher = crc32fast::Hasher::new();
+    state_hasher.update(state_blob);
+    state_hasher.update(&padding);
+    let state_crc = state_hasher.finalize();
     let mem_crc = crc32fast::hash(mem_dump);
     let flags: u16 = if diff { 1 } else { 0 };
-    let state_len = u64::try_from(state_blob.len())
-        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
     let mem_len = u64::try_from(mem_dump.len())
         .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
 
@@ -4087,6 +4125,8 @@ fn write_snapshot_to_file(
     file.write_all(&mem_crc.to_le_bytes())
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.write_all(state_blob)
+        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    file.write_all(&padding)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.write_all(mem_dump)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
@@ -4612,6 +4652,20 @@ fn eager_restore_snapshot(path: &str) -> Result<RestoredSnapshot> {
     })
 }
 
+/// Restore by mapping the chain's base RAM image privately and applying any
+/// diff pages on top. Cost is proportional to the diff pages, not guest RAM,
+/// and VMs restored from the same base share its untouched pages.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn mapped_restore_snapshot(path: &str) -> Result<RestoredSnapshot> {
+    let (mem, state_blob, snapshot_version) = load_snapshot_chain_with(path, RamLoad::Map)?;
+    Ok(RestoredSnapshot {
+        mem,
+        state_blob,
+        snapshot_version,
+        lazy_restore: None,
+    })
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn restore_snapshot_with_policy(
     path: &str,
@@ -4620,6 +4674,14 @@ fn restore_snapshot_with_policy(
 ) -> Result<RestoredSnapshot> {
     match memory_policy {
         tarit_proto::RestoreMemoryPolicy::Auto => {
+            if memory_integrity.is_none() {
+                match mapped_restore_snapshot(path) {
+                    Ok(restored) => return Ok(restored),
+                    Err(error) => {
+                        log::info!("restore: mapped restore unavailable ({error}); trying UFFD");
+                    }
+                }
+            }
             match try_lazy_restore_full_snapshot(path, memory_integrity) {
                 Ok(Some(restored)) => Ok(restored),
                 Ok(None) if memory_integrity.is_none() => {
@@ -4847,7 +4909,145 @@ fn resolve_snapshot_parent(parent: &str, snapshot_root: &Path) -> Result<PathBuf
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
+/// How a full snapshot's RAM image becomes guest memory.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RamLoad {
+    /// Read every byte into fresh anonymous memory.
+    Copy,
+    /// Map the page-aligned image privately; fails for unaligned images.
+    Map,
+}
+
+/// xattr recording that a full snapshot's RAM image already matched its CRC.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const RAM_VERIFIED_XATTR: &std::ffi::CStr = c"user.tarit.ram-verified";
+
+/// Check a full snapshot's RAM CRC once per file version.
+///
+/// The first restore of a snapshot verifies the image (through a read-only
+/// mapping, which also warms the page cache for the restore) and records the
+/// file identity, layout and CRC in an xattr. Later restores of the same,
+/// unmodified file skip the scan, which is what keeps restore and fan-out cost
+/// independent of guest RAM size. Changing the file changes its mtime or
+/// inode, and copies to other hosts usually drop the xattr, so both are
+/// re-verified. This is corruption detection; authenticated snapshots use the
+/// chunk manifest path instead.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn verify_ram_crc_once(
+    file: &std::fs::File,
+    path_display: &str,
+    layout: &FullSnapshotLayout,
+    expected_crc: u32,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|e| VmmError::Snapshot(format!("stat {path_display}: {e}")))?;
+    let key = format!(
+        "v1:{}:{}:{}:{}.{}:{}:{}:{expected_crc:08x}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        layout.mem_offset,
+        layout.mem_len,
+    );
+    let mut recorded = [0u8; 160];
+    // SAFETY: valid fd, NUL-terminated name, and a writable buffer of the
+    // stated length; fgetxattr writes at most that many bytes.
+    let n = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            RAM_VERIFIED_XATTR.as_ptr(),
+            recorded.as_mut_ptr().cast(),
+            recorded.len(),
+        )
+    };
+    if n > 0 && &recorded[..n as usize] == key.as_bytes() {
+        return Ok(());
+    }
+
+    let actual = crc32_mapped_range(file, path_display, layout.mem_offset, layout.mem_len)?;
+    if actual != expected_crc {
+        return Err(VmmError::Snapshot(format!(
+            "memory CRC mismatch in {path_display}: got {actual:#010x}, expected {expected_crc:#010x}"
+        )));
+    }
+    // SAFETY: valid fd, NUL-terminated name, and a readable value buffer of
+    // the stated length. Failure (read-only file, no xattr support) only
+    // means the next restore verifies again.
+    unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            RAM_VERIFIED_XATTR.as_ptr(),
+            key.as_ptr().cast(),
+            key.len(),
+            0,
+        )
+    };
+    Ok(())
+}
+
+/// CRC32 of a file range through a read-only mapping, without copying it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn crc32_mapped_range(
+    file: &std::fs::File,
+    path_display: &str,
+    offset: u64,
+    len: u64,
+) -> Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    if len == 0 {
+        return Ok(crc32fast::hash(&[]));
+    }
+    let map_offset = offset / 4096 * 4096;
+    let delta = usize::try_from(offset - map_offset)
+        .map_err(|_| VmmError::Snapshot("snapshot offset too large".into()))?;
+    let len = usize::try_from(len)
+        .map_err(|_| VmmError::Snapshot(format!("memory image too large in {path_display}")))?;
+    let map_len = len + delta;
+    let map_offset = libc::off_t::try_from(map_offset)
+        .map_err(|_| VmmError::Snapshot("snapshot offset too large".into()))?;
+    // SAFETY: read-only private mapping of a valid fd with a page-aligned
+    // offset; it is only read below and unmapped before returning.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            map_offset,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(VmmError::Snapshot(format!(
+            "map {path_display} for CRC: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `ptr..ptr+map_len` is the live read-only mapping created above.
+    unsafe { libc::madvise(ptr, map_len, libc::MADV_SEQUENTIAL) };
+    // SAFETY: as above; the file length was validated against the layout by
+    // parse_full_snapshot_header, so every byte is backed by the file.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(delta), len) };
+    let crc = crc32fast::hash(bytes);
+    // SAFETY: unmapping exactly the mapping created above.
+    unsafe { libc::munmap(ptr, map_len) };
+    Ok(crc)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn read_snapshot_with(
+    path: &Path,
+    snapshot_root: &Path,
+    ram_load: RamLoad,
+) -> Result<SnapshotContent> {
     use std::io::{Read, Seek, SeekFrom};
 
     let path_display = path.display().to_string();
@@ -4882,6 +5082,23 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
                 "state CRC mismatch in {path_display}: got {actual_state_crc:#010x}, expected {:#010x}",
                 header.state_crc
             )));
+        }
+        if ram_load == RamLoad::Map {
+            if !layout.mem_offset.is_multiple_of(4096) {
+                return Err(VmmError::Snapshot(format!(
+                    "RAM image in {path_display} is not page aligned"
+                )));
+            }
+            verify_ram_crc_once(&file, &path_display, &layout, header.mem_crc)?;
+            let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
+                .map_err(|e| VmmError::Memory(e.to_string()))?;
+            mem.map_file_private(&file, layout.mem_offset)
+                .map_err(|e| VmmError::Memory(e.to_string()))?;
+            return Ok(SnapshotContent::Full {
+                mem,
+                state,
+                version: header.version,
+            });
         }
         let actual_mem_crc = crc32_file_range(
             &mut file,
@@ -5044,6 +5261,14 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
 /// Iterative (not recursive) so a chain of hundreds of diffs can't overflow.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>, u16)> {
+    load_snapshot_chain_with(path, RamLoad::Copy)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn load_snapshot_chain_with(
+    path: &str,
+    ram_load: RamLoad,
+) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>, u16)> {
     // Follow the chain tip→base, collecting each diff's (state, pages).
     type DiffPages = Vec<(u64, Vec<u8>)>;
     type DiffChain = Vec<(u16, Vec<u8>, DiffPages)>;
@@ -5059,7 +5284,7 @@ fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, V
         if !seen.insert(cur.clone()) {
             return Err(VmmError::Snapshot("snapshot chain cycle".into()));
         }
-        match read_snapshot(&cur, &snapshot_root)? {
+        match read_snapshot_with(&cur, &snapshot_root, ram_load)? {
             SnapshotContent::Full {
                 mem,
                 state,
@@ -7144,6 +7369,69 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("count mismatch"));
+    }
+
+    // Mapped restore must reconstruct exactly what the copying loader does,
+    // keep the snapshot file untouched, and still reject a corrupted base.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn mapped_snapshot_chain_matches_copy_and_detects_corruption() {
+        use std::os::unix::fs::FileExt as _;
+        use vmm_memory_backend::dirty::DirtyBitmap;
+        let dir = private_runtime_dir().unwrap();
+        let pid = std::process::id();
+        let base = dir.join(format!("t-map-base-{pid}.snap"));
+        let d1 = dir.join(format!("t-map-d1-{pid}.snap"));
+        let (base_s, d1_s) = (base.to_str().unwrap(), d1.to_str().unwrap());
+
+        let mib = usize::try_from(crate::config::MIB).expect("MiB fits usize");
+        let mem: Vec<u8> = (0..mib).map(|i| (i / 4096) as u8).collect();
+        write_snapshot_file(base_s, b"basestate", &mem, false).unwrap();
+        let mut m1 = mem.clone();
+        m1[4096..8192].fill(0xBB);
+        let mut dirty1 = DirtyBitmap::new();
+        dirty1.mark(0x1000);
+        write_diff_snapshot_file(d1_s, base_s, b"state1", &m1, &dirty1).unwrap();
+
+        let (copied, copied_state, _) = load_snapshot_chain_with(d1_s, RamLoad::Copy).unwrap();
+        let (mapped, mapped_state, _) = load_snapshot_chain_with(d1_s, RamLoad::Map).unwrap();
+        assert!(mapped.is_file_backed());
+        assert_eq!(mapped_state, copied_state);
+        // SAFETY: both memories own `mib` bytes for the duration of the test.
+        let (a, b) = unsafe {
+            (
+                std::slice::from_raw_parts(copied.as_ptr(), mib),
+                std::slice::from_raw_parts(mapped.as_ptr(), mib),
+            )
+        };
+        assert_eq!(a, b, "mapped chain must match the copied chain");
+        assert_eq!(&b[4096..8192], &[0xBB; 4096][..]);
+
+        // Guest writes stay private; the base image on disk is unchanged.
+        mapped.write_phys(0, &[0xEE; 16]).unwrap();
+        drop(mapped);
+        let (again, _, _) = load_snapshot_chain_with(base_s, RamLoad::Map).unwrap();
+        // SAFETY: `again` owns `mib` bytes.
+        let again = unsafe { std::slice::from_raw_parts(again.as_ptr(), mib) };
+        assert_eq!(&again[..16], &mem[..16]);
+
+        // A corrupted copy of the base (new inode, no verification record)
+        // must fail its RAM CRC instead of being mapped.
+        let bad = dir.join(format!("t-map-bad-{pid}.snap"));
+        std::fs::copy(&base, &bad).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&bad).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.write_all_at(&[0x5A], len - 1).unwrap();
+        drop(file);
+        let error = match load_snapshot_chain_with(bad.to_str().unwrap(), RamLoad::Map) {
+            Ok(_) => panic!("corrupted base must not map"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("memory CRC mismatch"), "{error}");
+
+        for path in [&base, &d1, &bad] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     // Incremental diff-chain round trip. Boot-gated because it uses the
