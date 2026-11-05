@@ -247,8 +247,8 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 }
             } else {
                 controller
-                    .snapshot(diff)
-                    .map(|path| (path, None, None, None))
+                    .snapshot_with_overlay(diff)
+                    .map(|(path, overlay_path)| (path, overlay_path, None, None))
             };
             match result {
                 Ok((path, overlay_path, integrity_path, live_stats)) => ApiResponse::Snapshot {
@@ -995,9 +995,7 @@ mod tests {
         }
         assert!(controller.status().is_ok());
 
-        let sock = std::env::current_dir()
-            .unwrap()
-            .join(format!(".vmm-teardown-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!(".vmm-teardown-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         assert!(sock.exists());
@@ -1043,9 +1041,7 @@ mod tests {
 
     #[test]
     fn harden_socket_permissions_sets_socket_mode_0600() {
-        let sock = std::env::current_dir()
-            .unwrap()
-            .join(format!(".vmm-api-perms-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!(".vmm-api-perms-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
 
