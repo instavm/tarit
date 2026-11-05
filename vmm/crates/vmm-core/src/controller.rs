@@ -56,6 +56,9 @@ pub struct RunningVm {
     /// they are closed when the VM stops — create/stop cycles must not leak fds
     /// (a PaaS churns through many thousands of VMs per host).
     pub keep_alive_fds: Vec<vmm_sys_util::eventfd::EventFd>,
+    /// KVM dirty logging was enabled before any vCPU ran, so every guest
+    /// write since this VM started is tracked.
+    pub dirty_logging_from_start: bool,
 }
 
 /// A VM instance with its memory available for snapshot.
@@ -1124,6 +1127,7 @@ impl VmmController {
                 vsock_pty,
                 // Own the irqfd EventFds so they're closed on stop (no fd leak).
                 keep_alive_fds: irq_evts,
+                dirty_logging_from_start: false,
             }),
         });
 
@@ -1706,15 +1710,26 @@ impl VmmController {
             None => (None, VmState::Paused),
         };
         let resumed = running.is_some();
+        // With every guest write tracked since restore, the snapshot restored
+        // here is the parent of the next diff snapshot: restore, run, and
+        // checkpoint again writes only the pages the run touched.
+        let dirty_logging = running
+            .as_ref()
+            .is_some_and(|running| running.dirty_logging_from_start);
+        let last_snapshot = dirty_logging.then(|| {
+            std::fs::canonicalize(snapshot_path)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| snapshot_path.to_string())
+        });
 
         let mut slot = self.lock();
         *slot = Some(VmInstance {
             generation: next_vm_generation(),
             state,
             created_at: std::time::Instant::now(),
-            last_snapshot: None,
+            last_snapshot,
             transient_files: VmTransientFiles::from_owned_overlays(overlay_guard.disarm()),
-            dirty_logging: false,
+            dirty_logging,
             config,
             guest_mem: Some(mem),
             state_blob: Some(state_blob),
@@ -5831,6 +5846,16 @@ fn build_running_vm(
     let template = crate::cpu_template::CpuTemplate::bare();
     let kvm_vm = crate::kvm::KvmVm::new_with_options(mem, devices, template, full_boot)?;
 
+    // Track guest writes from the first restored instruction, so the next diff
+    // snapshot contains only what changed since the snapshot restored here.
+    let dirty_logging_from_start = match kvm_vm.enable_dirty_logging() {
+        Ok(()) => kvm_vm.read_dirty().is_ok(),
+        Err(error) => {
+            log::warn!("restore: dirty logging unavailable ({error}); next diff will be full");
+            false
+        }
+    };
+
     // Replace the snapshot's generation value before any restored vCPU can
     // execute. Old snapshots without the ACPI device were rejected above.
     let vmgenid = crate::vmgenid::VmGenId::new(&kvm_vm.mem)?;
@@ -6072,6 +6097,7 @@ fn build_running_vm(
         vsock_exec,
         vsock_pty,
         keep_alive_fds: irq_evts,
+        dirty_logging_from_start,
     })
 }
 
