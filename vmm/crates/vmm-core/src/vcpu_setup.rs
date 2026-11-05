@@ -76,6 +76,11 @@ const RSDP_ADDR: u64 = 0xe0000;
 const CPUID_1_ECX_VMX: u32 = 1 << 5;
 const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
 const CPUID_1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+// KVM_GET_SUPPORTED_CPUID does not set the hypervisor-present bit. Without it
+// Linux never probes the 0x4000_0000 KVM leaves, so it gets no kvmclock and
+// must calibrate the TSC itself. Intel hosts can fall back to CPUID 0x15;
+// AMD hosts cannot and the guest stalls in early boot.
+const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
 const CPUID_1_EDX_APIC: u32 = 1 << 9;
 const CPUID_8000_0001_ECX_SVM: u32 = 1 << 2;
 
@@ -125,7 +130,7 @@ fn normalize_boot_cpuid(cpuid: &mut kvm_bindings::CpuId, apic_id: u8) {
             (1, 0) => {
                 entry.ebx = (entry.ebx & 0x00FF_FFFF) | ((apic_id as u32) << 24);
                 entry.edx |= CPUID_1_EDX_APIC;
-                entry.ecx |= CPUID_1_ECX_TSC_DEADLINE;
+                entry.ecx |= CPUID_1_ECX_TSC_DEADLINE | CPUID_1_ECX_HYPERVISOR;
                 entry.ecx &= !(CPUID_1_ECX_X2APIC | CPUID_1_ECX_VMX);
             }
             (0x8000_0001, 0) => entry.ecx &= !CPUID_8000_0001_ECX_SVM,
@@ -948,6 +953,7 @@ mod tests {
         assert_eq!(leaf1.ebx >> 24, 3, "APIC id must remain normalized");
         assert_ne!(leaf1.edx & CPUID_1_EDX_APIC, 0);
         assert_ne!(leaf1.ecx & CPUID_1_ECX_TSC_DEADLINE, 0);
+        assert_ne!(leaf1.ecx & CPUID_1_ECX_HYPERVISOR, 0);
         assert_eq!(leaf1.ecx & CPUID_1_ECX_X2APIC, 0);
         assert_eq!(leaf1.ecx & CPUID_1_ECX_VMX, 0);
 
