@@ -2566,7 +2566,12 @@ fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
         if Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Wake the moment the restored agent reconnects instead of polling;
+        // the bound only lets the loop re-check that the VM still exists.
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        channel.wait_until_connected(wait);
     }
 
     Err(VmmError::Device(
@@ -6528,6 +6533,8 @@ struct WiredBalloon {
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 pub struct BalloonIrqResample {
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the thread so teardown does not wait out its poll timeout.
+    wake: vmm_sys_util::eventfd::EventFd,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -6543,19 +6550,31 @@ impl BalloonIrqResample {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
+        let wake = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|error| VmmError::Kvm(format!("balloon IRQ resample wake: {error}")))?;
+        let wake_thread = wake
+            .try_clone()
+            .map_err(|error| VmmError::Kvm(format!("balloon IRQ resample wake: {error}")))?;
         let handle = std::thread::Builder::new()
             .name("balloon-irq-resample".into())
             .spawn(move || {
                 while !stop_thread.load(Ordering::Acquire) {
-                    let mut pollfd = libc::pollfd {
-                        fd: resample_evt.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // SAFETY: pollfd points to one initialized entry and the
-                    // thread owns the eventfd for its entire lifetime.
-                    let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
-                    if ready <= 0 {
+                    let mut pollfds = [
+                        libc::pollfd {
+                            fd: resample_evt.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: wake_thread.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: pollfds holds two initialized entries and the
+                    // thread owns both eventfds for its entire lifetime.
+                    let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 100) };
+                    if ready <= 0 || pollfds[0].revents == 0 {
                         continue;
                     }
                     let _ = resample_evt.read();
@@ -6567,6 +6586,7 @@ impl BalloonIrqResample {
             .map_err(|error| VmmError::Kvm(format!("spawn balloon IRQ resample: {error}")))?;
         Ok(Self {
             stop,
+            wake,
             handle: Some(handle),
         })
     }
@@ -6577,6 +6597,7 @@ impl Drop for BalloonIrqResample {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.stop.store(true, Ordering::Release);
+        let _ = self.wake.write(1);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
