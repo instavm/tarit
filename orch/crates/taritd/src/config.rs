@@ -796,7 +796,10 @@ impl Config {
 
         let max_vms = env_positive_usize("TARIT_MAX_VMS", 32)?;
         let max_vcpus_env = env_optional_positive_u64("TARIT_MAX_VCPUS")?;
-        let max_memory_mib = env_positive_u64("TARIT_MAX_MEMORY_MIB", 65_536)?;
+        // Without an explicit ceiling, place no more guest memory than the
+        // host has: a fixed default admitted 64 GiB on small hosts.
+        let max_memory_mib =
+            env_positive_u64("TARIT_MAX_MEMORY_MIB", host_memory_mib().unwrap_or(65_536))?;
         let database_url = env::var("TARIT_DATABASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
@@ -874,18 +877,14 @@ impl Config {
         let admission_timeout_ms = env_positive_u64("TARIT_ADMISSION_TIMEOUT_MS", 60_000)?;
         let reap_on_shutdown = env_bool_checked("TARIT_REAP_ON_SHUTDOWN", true)?;
 
-        // CPU overcommit: when the warm pool is on and TARIT_MAX_VCPUS is not
-        // pinned, derive the vCPU ceiling from physical cores * overcommit so
-        // "400% overcommit" actually raises how many VMs we will place.
+        // CPU overcommit: unless TARIT_MAX_VCPUS is pinned, derive the vCPU
+        // ceiling from this host's cores * overcommit, so the default tracks
+        // the machine and "400% overcommit" raises how many VMs we place.
         let max_vcpus = max_vcpus_env.unwrap_or_else(|| {
-            if warm_pool.enabled {
-                let cores = std::thread::available_parallelism()
-                    .map(|n| n.get() as f64)
-                    .unwrap_or(1.0);
-                (cores * warm_pool.cpu_overcommit).ceil() as u64
-            } else {
-                64
-            }
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get() as f64)
+                .unwrap_or(1.0);
+            ((cores * warm_pool.cpu_overcommit).ceil() as u64).max(1)
         });
 
         let region = env::var("TARIT_REGION").unwrap_or_else(|_| "local".into());
@@ -1782,6 +1781,19 @@ fn env_bool_checked(key: &str, default: bool) -> Result<bool> {
         }),
         Err(_) => Ok(default),
     }
+}
+
+/// Total host memory in MiB from /proc/meminfo, if readable.
+fn host_memory_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    (kib >= 1024).then_some(kib / 1024)
 }
 
 fn env_positive_u64(key: &str, default: u64) -> Result<u64> {

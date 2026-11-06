@@ -48,10 +48,10 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `TARIT_MAX_VMS` | usize | `32` | Maximum concurrent local VM slots, including warm VMs. |
-| `TARIT_MAX_VCPUS` | u64 | `64` when warm pool is disabled; otherwise `ceil(available_parallelism * cpu_overcommit)` | Local vCPU placement ceiling. If set, it overrides the derived warm-pool ceiling. |
-| `TARIT_MAX_MEMORY_MIB` | u64 | `65536` | Local memory placement ceiling in MiB. |
+| `TARIT_MAX_VCPUS` | u64 | `ceil(available_parallelism * TARIT_CPU_OVERCOMMIT)` | Local vCPU placement ceiling. If set, it overrides the derived ceiling. |
+| `TARIT_MAX_MEMORY_MIB` | u64 | host `MemTotal` in MiB (`65536` if `/proc/meminfo` is unreadable) | Local memory placement ceiling in MiB. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | u64 | `60000` | Time a create operation may wait for capacity before admission gives up. |
-| `TARIT_CPU_OVERCOMMIT` | f64 | `4.0` | Warm-pool CPU overcommit ratio. Also affects derived `TARIT_MAX_VCPUS` when the warm pool is enabled and `TARIT_MAX_VCPUS` is unset. |
+| `TARIT_CPU_OVERCOMMIT` | f64 | `4.0` | CPU overcommit ratio for the warm pool and for the derived `TARIT_MAX_VCPUS` when it is unset. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS` | positive usize | `1024` | Node-wide active guest PTY limit, shared by WebSocket PTYs and SSH gateway channels. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT` | positive usize | `128` | Active guest PTY limit for one authenticated tenant. Must be less than the node-wide limit so one tenant cannot consume every slot. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM` | positive usize | `16` | Active guest PTY limit for one VM. Must not exceed the per-tenant limit. |
