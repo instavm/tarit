@@ -12,6 +12,9 @@ pub enum ThreadKind {
     Block,
     Vsock,
 }
+/// `TUNSETOFFLOAD` (`_IOW('T', 208, unsigned int)`): the one TAP ioctl the
+/// network worker may issue, to apply the offloads its guest negotiated.
+pub const TUNSETOFFLOAD: u64 = 0x4004_54d0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeccompProfile {
@@ -120,6 +123,8 @@ impl SeccompProfile {
                 "gettid".into(),
                 "getpid".into(),
                 "clock_gettime".into(),
+                // Only TUNSETOFFLOAD; see rules_for_syscall.
+                "ioctl".into(),
             ],
         }
     }
@@ -304,6 +309,16 @@ impl SeccompProfile {
                 SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0)
                     .map_err(|e| format!("socket protocol condition: {e}"))?,
             ],
+            // The network worker applies the offloads a guest negotiated to
+            // its TAP. Allow exactly TUNSETOFFLOAD, which only changes the
+            // offload flags of a TAP fd (and fails on any other fd).
+            (ThreadKind::Device, "ioctl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                TUNSETOFFLOAD,
+            )
+            .map_err(|e| format!("ioctl condition: {e}"))?],
             // std's UnixStream::set_nonblocking issues ioctl(FIONBIO) on Linux;
             // the pump calls it for every lazily connected host stream. Allow
             // exactly that request and nothing else. The cast is kept because
@@ -439,7 +454,8 @@ mod tests {
         assert_eq!(vsock.kind, ThreadKind::Vsock);
         assert!(!device.allow.contains(&"socket".to_string()));
         assert!(!device.allow.contains(&"connect".to_string()));
-        assert!(!device.allow.contains(&"ioctl".to_string()));
+        // The network worker may issue one ioctl, TUNSETOFFLOAD (below).
+        assert!(device.allow.contains(&"ioctl".to_string()));
         assert!(vsock.allow.contains(&"socket".to_string()));
         assert!(vsock.allow.contains(&"connect".to_string()));
         // set_nonblocking on lazily connected host streams needs ioctl(FIONBIO).
@@ -477,10 +493,42 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            SeccompProfile::device()
+                .rules_for_syscall("ioctl")
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(SeccompProfile::device()
             .rules_for_syscall("read")
             .unwrap()
             .is_empty());
+    }
+
+    /// Under the network worker's profile TUNSETOFFLOAD reaches the kernel:
+    /// on a non-TAP fd it fails with ENOTTY and the thread keeps running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_profile_allows_tunsetoffload() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe2 returns.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let errno = std::thread::spawn(move || {
+            SeccompProfile::device().install().expect("install profile");
+            // SAFETY: TUNSETOFFLOAD takes its flags by value; on a pipe the
+            // kernel rejects it without side effects.
+            let rc = unsafe { libc::ioctl(fds[0], TUNSETOFFLOAD as _, 0 as libc::c_ulong) };
+            assert_eq!(rc, -1);
+            std::io::Error::last_os_error().raw_os_error()
+        })
+        .join()
+        .expect("network worker profile must allow TUNSETOFFLOAD");
+        assert_eq!(errno, Some(libc::ENOTTY));
+        for fd in fds {
+            // SAFETY: both descriptors came from pipe2 above.
+            unsafe { libc::close(fd) };
+        }
     }
 
     /// A confined thread that opens a path (as glibc does lazily inside

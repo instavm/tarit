@@ -43,11 +43,52 @@ const VIRTIO_NET_HDR_NUM_BUFFERS_OFF: usize = 10;
 /// Max Ethernet frame we accept end-to-end (header + 1500 MTU + slack).
 const MAX_FRAME_BYTES: usize = 1600;
 
-/// virtio-net feature bits the device advertises.
+/// Max frame with offloads: the 65550-byte packet virtio-net allows with TSO,
+/// plus the header.
+pub const MAX_GSO_FRAME_BYTES: usize = VIRTIO_NET_HDR_LEN + 65550;
+
+/// virtio-net feature bits (virtio 1.x §5.1.3).
 pub mod net_features {
     pub const CSUM: u32 = 1 << 0;
-    pub const GUEST_CSUM: u32 = 1 << 2;
+    pub const GUEST_CSUM: u32 = 1 << 1;
     pub const MAC: u32 = 1 << 5;
+    pub const GUEST_TSO4: u32 = 1 << 7;
+    pub const GUEST_TSO6: u32 = 1 << 8;
+    pub const HOST_TSO4: u32 = 1 << 11;
+    pub const HOST_TSO6: u32 = 1 << 12;
+    /// VIRTIO_RING_F_EVENT_IDX: interrupts and kicks only when the other
+    /// side asks for them.
+    pub const RING_EVENT_IDX: u32 = 1 << 29;
+    /// Offered only on a TAP whose frames carry a virtio-net header, which
+    /// is what carries checksum and segmentation state between the guest and
+    /// the host stack.
+    pub const OFFLOADS: u32 = CSUM | GUEST_CSUM | GUEST_TSO4 | GUEST_TSO6 | HOST_TSO4 | HOST_TSO6;
+}
+
+/// `virtio_net_hdr` flags and GSO types the receive path checks.
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+const VIRTIO_NET_HDR_GSO_ECN: u8 = 0x80;
+
+/// TAP offload flags (`TUN_F_*`) for the receive offloads a guest accepted.
+pub fn tap_offloads_for(guest_features: u32) -> u32 {
+    const TUN_F_CSUM: u32 = 0x01;
+    const TUN_F_TSO4: u32 = 0x02;
+    const TUN_F_TSO6: u32 = 0x04;
+    if guest_features & net_features::GUEST_CSUM == 0 {
+        // Segmentation offloads require checksum offload.
+        return 0;
+    }
+    let mut flags = TUN_F_CSUM;
+    if guest_features & net_features::GUEST_TSO4 != 0 {
+        flags |= TUN_F_TSO4;
+    }
+    if guest_features & net_features::GUEST_TSO6 != 0 {
+        flags |= TUN_F_TSO6;
+    }
+    flags
 }
 
 const QUEUE_RX: usize = 0;
@@ -103,6 +144,60 @@ impl QueueState {
     }
 }
 
+/// Read `out.len()` bytes at byte offset `at` of a descriptor chain.
+#[cfg(target_os = "linux")]
+fn read_chain(
+    mem: &GuestMemoryMmap,
+    chain: &[(u64, u32)],
+    mut at: usize,
+    out: &mut [u8],
+) -> Result<(), ()> {
+    let mut done = 0;
+    for &(addr, len) in chain {
+        let len = len as usize;
+        if at >= len {
+            at -= len;
+            continue;
+        }
+        let take = (len - at).min(out.len() - done);
+        mem.read_slice(&mut out[done..done + take], GuestAddress(addr + at as u64))
+            .map_err(|_| ())?;
+        done += take;
+        at = 0;
+        if done == out.len() {
+            return Ok(());
+        }
+    }
+    Err(())
+}
+
+/// Write `data` at byte offset `at` of a descriptor chain.
+#[cfg(target_os = "linux")]
+fn write_chain(
+    mem: &GuestMemoryMmap,
+    chain: &[(u64, u32)],
+    mut at: usize,
+    data: &[u8],
+) -> Result<(), ()> {
+    let mut done = 0;
+    for &(addr, len) in chain {
+        let len = len as usize;
+        if at >= len {
+            at -= len;
+            continue;
+        }
+        let take = (len - at).min(data.len() - done);
+        mem.write_slice(&data[done..done + take], GuestAddress(addr + at as u64))
+            .map_err(|_| ())?;
+        done += take;
+        at = 0;
+        if done == data.len() {
+            return Ok(());
+        }
+    }
+    Err(())
+}
+
 /// Snapshot state for virtio-net MMIO negotiation and queue configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct VirtioNetMmioState {
@@ -149,6 +244,16 @@ pub struct VirtioNetMmio {
     /// Raw tap fd. Set by the VMM after creating the tap. The transport
     /// borrows it for `write(2)` on TX; ownership stays with the caller.
     tap_fd: Mutex<Option<RawFd>>,
+    /// The tap's frames carry a virtio-net header (`IFF_VNET_HDR`), so the
+    /// device offers offloads and passes the header through unchanged.
+    vnet_hdr: AtomicBool,
+    /// TAP offloads (`TUN_F_*`) to apply, set when the guest negotiates and
+    /// applied by the network worker, the only thread allowed that ioctl.
+    /// `u32::MAX` means nothing is pending.
+    pending_offloads: AtomicU32,
+    /// RX entries were added that the driver asked to be interrupted for;
+    /// raised by the next `signal_rx`.
+    rx_irq_pending: AtomicBool,
     /// IRQ EventFd — written when we need to interrupt the guest.
     #[cfg(target_os = "linux")]
     irq_evt: Mutex<Option<vmm_sys_util::eventfd::EventFd>>,
@@ -249,6 +354,9 @@ impl VirtioNetMmio {
             rate_limiter: Mutex::new(None),
             interrupt_status: AtomicU32::new(0),
             tap_fd: Mutex::new(None),
+            vnet_hdr: AtomicBool::new(false),
+            pending_offloads: AtomicU32::new(u32::MAX),
+            rx_irq_pending: AtomicBool::new(false),
             #[cfg(target_os = "linux")]
             irq_evt: Mutex::new(None),
             status_writes: AtomicU64::new(0),
@@ -296,6 +404,50 @@ impl VirtioNetMmio {
     /// transport only uses it for `write(2)` on TX.
     pub fn set_tap_fd(&self, fd: RawFd) {
         *self.lock_state(&self.tap_fd, "tap_fd") = Some(fd);
+    }
+
+    /// Record that the tap's frames carry a virtio-net header. Must be set
+    /// before the guest reads the device features.
+    pub fn set_vnet_hdr(&self, vnet_hdr: bool) {
+        self.vnet_hdr.store(vnet_hdr, Ordering::Relaxed);
+    }
+
+    pub fn vnet_hdr(&self) -> bool {
+        self.vnet_hdr.load(Ordering::Relaxed)
+    }
+
+    /// Low feature word offered to the guest.
+    pub fn host_features(&self) -> u32 {
+        let features = self.features | net_features::RING_EVENT_IDX;
+        if self.vnet_hdr() {
+            features | net_features::OFFLOADS
+        } else {
+            features
+        }
+    }
+
+    fn event_idx(&self) -> bool {
+        self.guest_features.load(Ordering::Relaxed) & net_features::RING_EVENT_IDX != 0
+    }
+
+    /// Offload features the guest negotiated.
+    pub fn negotiated_offloads(&self) -> u32 {
+        self.guest_features.load(Ordering::Relaxed) & net_features::OFFLOADS
+    }
+
+    fn request_tap_offloads(&self, guest_features: u32) {
+        if self.vnet_hdr() {
+            self.pending_offloads
+                .store(tap_offloads_for(guest_features), Ordering::Release);
+        }
+    }
+
+    /// TAP offloads the network worker should apply, if any are pending.
+    pub fn take_offload_request(&self) -> Option<u32> {
+        match self.pending_offloads.swap(u32::MAX, Ordering::AcqRel) {
+            u32::MAX => None,
+            flags => Some(flags),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -373,6 +525,14 @@ impl VirtioNetMmio {
             None => return Ok(0),
         };
         let tap_fd = *self.try_lock_state(&self.tap_fd, "tap_fd")?;
+        // With a virtio-net header on the tap, frames (up to 64 KiB with TSO)
+        // go out with the guest's header; otherwise the header is dropped.
+        let vnet_hdr = self.vnet_hdr();
+        let max_frame = if vnet_hdr {
+            MAX_GSO_FRAME_BYTES
+        } else {
+            MAX_FRAME_BYTES
+        };
 
         let mut proc_guard = self.try_lock_state(&self.tx_processor, "tx_processor")?;
         if proc_guard.is_none() {
@@ -380,6 +540,8 @@ impl VirtioNetMmio {
         } else {
             proc_guard.as_mut().unwrap().update_config(cfg);
         }
+        proc_guard.as_mut().unwrap().set_event_idx(self.event_idx());
+        let old_used = proc_guard.as_ref().unwrap().last_used_idx();
 
         let mut total_pkts = 0usize;
         let mut processing_failed = false;
@@ -398,7 +560,7 @@ impl VirtioNetMmio {
                     let Some(new_len) = buf.len().checked_add(len as usize) else {
                         return Some(0);
                     };
-                    if new_len > MAX_FRAME_BYTES {
+                    if new_len > max_frame {
                         return Some(0);
                     }
                     let off = buf.len();
@@ -414,6 +576,7 @@ impl VirtioNetMmio {
                     return Some(0);
                 }
                 let packet = &buf[VIRTIO_NET_HDR_LEN..];
+                let wire: &[u8] = if vnet_hdr { &buf } else { packet };
 
                 match self.rate_limit_allows(packet.len() as u64) {
                     Ok(true) => {}
@@ -427,7 +590,7 @@ impl VirtioNetMmio {
                 if let Some(fd) = tap_fd {
                     // SAFETY: write to a valid open fd. Short writes count as a packet sent.
                     let rc = unsafe {
-                        libc::write(fd, packet.as_ptr() as *const libc::c_void, packet.len())
+                        libc::write(fd, wire.as_ptr() as *const libc::c_void, wire.len())
                     };
                     if rc > 0 {
                         total_pkts += 1;
@@ -438,7 +601,12 @@ impl VirtioNetMmio {
                 Some(0) // device wrote nothing back into the chain
             });
 
-        if processed > 0 {
+        if processed > 0
+            && proc_guard
+                .as_ref()
+                .unwrap()
+                .needs_notification(&mem, old_used)
+        {
             self.trigger_interrupt()?;
         }
         if processing_failed || self.is_failed() {
@@ -453,11 +621,198 @@ impl VirtioNetMmio {
     /// packet bytes. Returns true iff a chain was consumed. If no avail
     /// descriptor is ready the packet is dropped (caller should retry later).
     pub fn inject_rx_packet(&self, packet: &[u8]) -> Result<bool, MmioError> {
+        self.inject_rx(None, packet, true)
+    }
+
+    /// [`Self::inject_rx_packet`] without interrupting the guest; the
+    /// caller batches frames and calls [`Self::signal_rx`] once.
+    pub fn inject_rx_packet_quiet(&self, packet: &[u8]) -> Result<bool, MmioError> {
+        self.inject_rx(None, packet, false)
+    }
+
+    /// Interrupt the guest for frames delivered by the `_quiet` and
+    /// `inject_rx_vnet_frame` calls.
+    pub fn signal_rx(&self) -> Result<(), MmioError> {
+        if self.rx_irq_pending.swap(false, Ordering::AcqRel) {
+            self.trigger_interrupt()?;
+        }
+        Ok(())
+    }
+
+    /// Deliver a frame read from a tap with a virtio-net header (`frame` is
+    /// header + packet). The header passes through, so offloads the guest
+    /// negotiated (partial checksums, TSO) reach it intact. A frame using an
+    /// offload the guest did not accept (possible only while the tap still
+    /// has the previous driver's offloads) is dropped. Does not interrupt
+    /// the guest; call [`Self::signal_rx`] after a batch.
+    pub fn inject_rx_vnet_frame(&self, frame: &[u8]) -> Result<bool, MmioError> {
+        if frame.len() <= VIRTIO_NET_HDR_LEN {
+            return Ok(false);
+        }
+        let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+        header.copy_from_slice(&frame[..VIRTIO_NET_HDR_LEN]);
+        let accepted = self.guest_features.load(Ordering::Relaxed);
+        let needs_csum = header[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM != 0;
+        let gso_allowed = match header[1] & !VIRTIO_NET_HDR_GSO_ECN {
+            VIRTIO_NET_HDR_GSO_NONE => true,
+            VIRTIO_NET_HDR_GSO_TCPV4 => accepted & net_features::GUEST_TSO4 != 0,
+            VIRTIO_NET_HDR_GSO_TCPV6 => accepted & net_features::GUEST_TSO6 != 0,
+            _ => false,
+        };
+        if (needs_csum && accepted & net_features::GUEST_CSUM == 0)
+            || !gso_allowed
+            || header[1] & VIRTIO_NET_HDR_GSO_ECN != 0
+        {
+            log::debug!("virtio-net: dropping a frame with offloads the guest did not accept");
+            return Ok(false);
+        }
+        header[VIRTIO_NET_HDR_NUM_BUFFERS_OFF..].copy_from_slice(&1u16.to_le_bytes());
+        self.inject_rx(Some(header), &frame[VIRTIO_NET_HDR_LEN..], false)
+    }
+
+    /// Read frames from a tap carrying a virtio-net header straight into the
+    /// guest's receive buffers (one copy, as the kernel writes them there),
+    /// up to `max_frames`, without interrupting the guest. Returns how many
+    /// were delivered and whether the tap ran dry; `None` when this path does
+    /// not apply (no vnet header, a rate limiter, or no guest memory yet).
+    #[cfg(target_os = "linux")]
+    pub fn rx_from_vnet_tap(
+        &self,
+        tap_fd: RawFd,
+        max_frames: usize,
+    ) -> Result<Option<(usize, bool)>, MmioError> {
+        use vm_memory::GuestMemoryBackend;
+
+        self.ensure_operational()?;
+        if !self.vnet_hdr()
+            || self
+                .try_lock_state(&self.rate_limiter, "rate_limiter")?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let Some(mem) = self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() else {
+            return Ok(None);
+        };
+        let dirty = self.try_lock_state(&self.host_dirty, "host_dirty")?.clone();
+        let Some(cfg) = self.queue_config(QUEUE_RX)? else {
+            return Ok(Some((0, false)));
+        };
+        let accepted = self.guest_features.load(Ordering::Relaxed);
+        let mut proc_guard = self.try_lock_state(&self.rx_processor, "rx_processor")?;
+        let processor = match proc_guard.as_mut() {
+            Some(processor) => {
+                processor.update_config(cfg);
+                processor
+            }
+            None => proc_guard.insert(VirtQueueProcessor::new(cfg)),
+        };
+        processor.set_event_idx(self.event_idx());
+        let old_used = processor.last_used_idx();
+
+        let mut delivered = 0usize;
+        let mut tap_empty = false;
+        processor.process_queue_descriptors_dirty(&mem, dirty.as_ref(), |_readable, writable| {
+            if delivered == max_frames {
+                return None;
+            }
+            // Host addresses of the chain's buffers; each descriptor lies in
+            // one guest memory region or the chain is unusable.
+            let mut guards = Vec::with_capacity(writable.len());
+            let mut iovecs = Vec::with_capacity(writable.len());
+            for &(addr, len) in writable {
+                let Ok(slice) = mem.get_slice(GuestAddress(addr), len as usize) else {
+                    return Some(0);
+                };
+                let guard = slice.ptr_guard_mut();
+                iovecs.push(libc::iovec {
+                    iov_base: guard.as_ptr() as *mut libc::c_void,
+                    iov_len: len as usize,
+                });
+                guards.push(guard);
+            }
+            // SAFETY: every iovec points into guest memory kept mapped by its
+            // guard for the duration of the call.
+            let rc = unsafe { libc::readv(tap_fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
+            drop(guards);
+            if rc < 0 {
+                // Nothing ready (or a transient error): keep the chain.
+                tap_empty = true;
+                return None;
+            }
+            let len = rc as usize;
+            if len <= VIRTIO_NET_HDR_LEN {
+                return Some(0);
+            }
+            if let Some(dirty) = dirty.as_ref() {
+                let mut left = len;
+                for &(addr, size) in writable {
+                    let take = left.min(size as usize);
+                    dirty.mark_guest_range(addr, take as u64);
+                    left -= take;
+                    if left == 0 {
+                        break;
+                    }
+                }
+            }
+            let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+            if read_chain(&mem, writable, 0, &mut header).is_err() {
+                return Some(0);
+            }
+            let needs_csum = header[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM != 0;
+            let gso_ok = match header[1] {
+                VIRTIO_NET_HDR_GSO_NONE => true,
+                VIRTIO_NET_HDR_GSO_TCPV4 => accepted & net_features::GUEST_TSO4 != 0,
+                VIRTIO_NET_HDR_GSO_TCPV6 => accepted & net_features::GUEST_TSO6 != 0,
+                _ => false,
+            };
+            if (needs_csum && accepted & net_features::GUEST_CSUM == 0) || !gso_ok {
+                // Only while the tap still has a previous driver's offloads.
+                log::debug!("virtio-net: dropping a frame with offloads the guest did not accept");
+                return Some(0);
+            }
+            if write_chain(
+                &mem,
+                writable,
+                VIRTIO_NET_HDR_NUM_BUFFERS_OFF,
+                &1u16.to_le_bytes(),
+            )
+            .is_err()
+            {
+                return Some(0);
+            }
+            delivered += 1;
+            self.rx_packets.fetch_add(1, Ordering::Relaxed);
+            self.rx_bytes
+                .fetch_add((len - VIRTIO_NET_HDR_LEN) as u64, Ordering::Relaxed);
+            Some(len as u32)
+        });
+        if delivered > 0 && processor.needs_notification(&mem, old_used) {
+            self.rx_irq_pending.store(true, Ordering::Release);
+        }
+        drop(proc_guard);
+        if self.is_failed() {
+            return Err(MmioError::Device);
+        }
+        Ok(Some((delivered, tap_empty)))
+    }
+
+    fn inject_rx(
+        &self,
+        header: Option<[u8; VIRTIO_NET_HDR_LEN]>,
+        packet: &[u8],
+        notify: bool,
+    ) -> Result<bool, MmioError> {
         self.ensure_operational()?;
         let Some(need) = packet.len().checked_add(VIRTIO_NET_HDR_LEN) else {
             return Ok(false);
         };
-        if need > MAX_FRAME_BYTES {
+        let max_frame = if header.is_some() {
+            MAX_GSO_FRAME_BYTES
+        } else {
+            MAX_FRAME_BYTES
+        };
+        if need > max_frame {
             return Ok(false);
         }
         let mem = match self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() {
@@ -476,6 +831,8 @@ impl VirtioNetMmio {
         } else {
             proc_guard.as_mut().unwrap().update_config(cfg);
         }
+        proc_guard.as_mut().unwrap().set_event_idx(self.event_idx());
+        let old_used = proc_guard.as_ref().unwrap().last_used_idx();
 
         let mut delivered = false;
         let mut processing_failed = false;
@@ -505,34 +862,41 @@ impl VirtioNetMmio {
                         return None;
                     }
                 }
-                // Lay down the 12-byte virtio_net_hdr_v1 (zeroed, with
-                // num_buffers = 1 for this single-descriptor packet), then
+                // Lay down the 12-byte virtio_net_hdr_v1 (the tap's, or zeroed,
+                // with num_buffers = 1 for this single-chain packet), then
                 // the packet bytes, spanning whatever descriptors are needed.
-                let mut header = [0u8; VIRTIO_NET_HDR_LEN];
-                header[VIRTIO_NET_HDR_NUM_BUFFERS_OFF..].copy_from_slice(&1u16.to_le_bytes());
-                let mut to_write: Vec<u8> = Vec::with_capacity(need);
-                to_write.extend_from_slice(&header);
-                to_write.extend_from_slice(packet);
-                let mut cursor = 0usize;
+                let header = header.unwrap_or_else(|| {
+                    let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+                    header[VIRTIO_NET_HDR_NUM_BUFFERS_OFF..].copy_from_slice(&1u16.to_le_bytes());
+                    header
+                });
+                // Copy header then packet straight into the chain.
+                let mut sources = [&header[..], packet].into_iter();
+                let mut source: &[u8] = sources.next().unwrap_or_default();
                 for &(addr, len) in writable {
-                    if cursor >= to_write.len() {
-                        break;
+                    let mut at = addr;
+                    let mut room = len as usize;
+                    while room > 0 {
+                        while source.is_empty() {
+                            match sources.next() {
+                                Some(next) => source = next,
+                                None => break,
+                            }
+                        }
+                        if source.is_empty() {
+                            break;
+                        }
+                        let take = room.min(source.len());
+                        if mem.write_slice(&source[..take], GuestAddress(at)).is_err() {
+                            return Some(0);
+                        }
+                        if let Some(dirty) = dirty.as_ref() {
+                            dirty.mark_guest_range(at, take as u64);
+                        }
+                        source = &source[take..];
+                        room -= take;
+                        at += take as u64;
                     }
-                    let remaining = to_write.len() - cursor;
-                    let take = remaining.min(len as usize);
-                    let Some(next_cursor) = cursor.checked_add(take) else {
-                        return Some(0);
-                    };
-                    if mem
-                        .write_slice(&to_write[cursor..next_cursor], GuestAddress(addr))
-                        .is_err()
-                    {
-                        return Some(0);
-                    }
-                    if let Some(dirty) = dirty.as_ref() {
-                        dirty.mark_guest_range(addr, take as u64);
-                    }
-                    cursor = next_cursor;
                 }
                 delivered = true;
                 self.rx_packets.fetch_add(1, Ordering::Relaxed);
@@ -541,8 +905,17 @@ impl VirtioNetMmio {
                 Some(need as u32)
             });
 
-        if delivered {
-            self.trigger_interrupt()?;
+        if delivered
+            && proc_guard
+                .as_ref()
+                .unwrap()
+                .needs_notification(&mem, old_used)
+        {
+            if notify {
+                self.trigger_interrupt()?;
+            } else {
+                self.rx_irq_pending.store(true, Ordering::Release);
+            }
         }
         if processing_failed || self.is_failed() {
             Err(MmioError::Device)
@@ -605,6 +978,8 @@ impl VirtioNetMmio {
         self.irq_evt.clear_poison();
         self.status.store(0, Ordering::SeqCst);
         self.activated.store(false, Ordering::SeqCst);
+        // The driver went away; stop the tap sending offloaded frames.
+        self.request_tap_offloads(0);
         self.host_features_sel.store(0, Ordering::SeqCst);
         self.guest_features_sel.store(0, Ordering::SeqCst);
         self.guest_features.store(0, Ordering::SeqCst);
@@ -641,6 +1016,10 @@ impl Persist for VirtioNetMmio {
             .store(state.guest_features, Ordering::Relaxed);
         *self.lock_state(&self.queues, "queues") = state.queues;
         self.activated.store(state.activated, Ordering::Relaxed);
+        if state.activated {
+            // The new tap starts with no offloads; give it the guest's.
+            self.request_tap_offloads(state.guest_features);
+        }
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
         let queues = self.lock_state(&self.queues, "queues");
@@ -684,6 +1063,10 @@ impl Persist for Arc<VirtioNetMmio> {
             .store(state.guest_features, Ordering::Relaxed);
         *self.lock_state(&self.queues, "queues") = state.queues;
         self.activated.store(state.activated, Ordering::Relaxed);
+        if state.activated {
+            // The new tap starts with no offloads; give it the guest's.
+            self.request_tap_offloads(state.guest_features);
+        }
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
         let queues = self.lock_state(&self.queues, "queues");
@@ -718,7 +1101,7 @@ impl MmioDevice for VirtioNetMmio {
             reg::VENDOR_ID => self.vendor_id,
             reg::HOST_FEATURES => {
                 if self.host_features_sel.load(Ordering::Relaxed) == 0 {
-                    self.features
+                    self.host_features()
                 } else {
                     // virtio 1.x bit (32): VERSION_1. Bit 32 is in the high word.
                     1 << 0
@@ -764,8 +1147,10 @@ impl MmioDevice for VirtioNetMmio {
                     return Ok(());
                 }
                 self.status.store(val, Ordering::Relaxed);
-                if val & status_bits::DRIVER_OK != 0 {
-                    self.activated.store(true, Ordering::Relaxed);
+                if val & status_bits::DRIVER_OK != 0
+                    && !self.activated.swap(true, Ordering::Relaxed)
+                {
+                    self.request_tap_offloads(self.guest_features.load(Ordering::Relaxed));
                 }
             }
             reg::HOST_FEATURES_SEL => {
@@ -775,7 +1160,9 @@ impl MmioDevice for VirtioNetMmio {
                 self.guest_features_sel.store(val, Ordering::Relaxed);
             }
             reg::GUEST_FEATURES if self.guest_features_sel.load(Ordering::Relaxed) == 0 => {
-                self.guest_features.store(val, Ordering::Relaxed);
+                // A driver may only accept features the device offered.
+                self.guest_features
+                    .store(val & self.host_features(), Ordering::Relaxed);
             }
             reg::QUEUE_SEL => {
                 self.queue_sel.store(val, Ordering::Relaxed);
@@ -845,6 +1232,331 @@ mod tests {
 
     fn new_mem() -> Arc<GuestMemoryMmap> {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap())
+    }
+
+    /// A non-blocking datagram socketpair stands in for a TAP with a
+    /// virtio-net header: each read returns one whole frame, and an empty
+    /// one returns EAGAIN.
+    #[cfg(target_os = "linux")]
+    fn frame_pipe() -> (RawFd, RawFd) {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors socketpair returns.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        (fds[0], fds[1])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn close_fds(fds: &[RawFd]) {
+        for fd in fds {
+            // SAFETY: each descriptor came from frame_pipe and is closed once.
+            unsafe { libc::close(*fd) };
+        }
+    }
+
+    /// Activate `dev` with the guest accepting `accepted` (masked to what
+    /// the device offers).
+    fn negotiate(dev: &VirtioNetMmio, accepted: u32) {
+        dev.mmio_write(reg::GUEST_FEATURES_SEL, 0, 4).unwrap();
+        dev.mmio_write(reg::GUEST_FEATURES, accepted as u64, 4)
+            .unwrap();
+        dev.mmio_write(reg::STATUS, status_bits::DRIVER_OK as u64, 4)
+            .unwrap();
+    }
+
+    #[test]
+    fn offloads_are_offered_only_with_a_vnet_header() {
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        assert_eq!(dev.host_features() & net_features::OFFLOADS, 0);
+        assert_ne!(dev.host_features() & net_features::RING_EVENT_IDX, 0);
+        dev.set_vnet_hdr(true);
+        assert_eq!(
+            dev.host_features() & net_features::OFFLOADS,
+            net_features::OFFLOADS
+        );
+        // A driver cannot accept what was not offered.
+        let plain = VirtioNetMmio::new(6, [0; 6]);
+        negotiate(&plain, u32::MAX);
+        assert_eq!(plain.negotiated_offloads(), 0);
+        assert_eq!(
+            plain.guest_features.load(Ordering::Relaxed),
+            plain.host_features()
+        );
+    }
+
+    #[test]
+    fn tap_offloads_follow_the_features_the_guest_accepted() {
+        assert_eq!(tap_offloads_for(0), 0);
+        assert_eq!(
+            tap_offloads_for(net_features::GUEST_TSO4),
+            0,
+            "TSO needs csum"
+        );
+        assert_eq!(tap_offloads_for(net_features::GUEST_CSUM), 0x01);
+        assert_eq!(
+            tap_offloads_for(net_features::GUEST_CSUM | net_features::GUEST_TSO4),
+            0x03
+        );
+        assert_eq!(tap_offloads_for(net_features::OFFLOADS), 0x07);
+
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_vnet_hdr(true);
+        assert_eq!(dev.take_offload_request(), None);
+        negotiate(&dev, net_features::GUEST_CSUM | net_features::GUEST_TSO4);
+        assert_eq!(dev.take_offload_request(), Some(0x03));
+        assert_eq!(dev.take_offload_request(), None, "taken once");
+        // A reset stops the tap sending offloaded frames.
+        dev.mmio_write(reg::STATUS, 0, 4).unwrap();
+        assert_eq!(dev.take_offload_request(), Some(0));
+
+        // Without a vnet header nothing is ever requested.
+        let plain = VirtioNetMmio::new(6, [0; 6]);
+        negotiate(&plain, u32::MAX);
+        assert_eq!(plain.take_offload_request(), None);
+    }
+
+    #[test]
+    fn restore_asks_the_new_tap_for_the_guests_offloads() {
+        let source = VirtioNetMmio::new(6, [0; 6]);
+        source.set_vnet_hdr(true);
+        negotiate(&source, net_features::OFFLOADS);
+        let state = source.save();
+
+        let mut restored = VirtioNetMmio::new(6, [0; 6]);
+        restored.set_vnet_hdr(true);
+        restored.restore(state);
+        assert_eq!(restored.negotiated_offloads(), net_features::OFFLOADS);
+        assert_eq!(restored.take_offload_request(), Some(0x07));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tx_with_a_vnet_header_sends_the_guest_header_with_the_frame() {
+        use crate::virtio::vqueue::desc_flags;
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        dev.set_vnet_hdr(true);
+        let (tap, peer) = frame_pipe();
+        dev.set_tap_fd(tap);
+        negotiate(&dev, net_features::OFFLOADS);
+        const DESC: u64 = 0x10_0000;
+        const AVAIL: u64 = 0x10_1000;
+        const USED: u64 = 0x10_2000;
+        const BUF: u64 = 0x10_3000;
+        // A TSO frame: header with NEEDS_CSUM and GSO_TCPV4, then payload.
+        let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+        header[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+        header[1] = VIRTIO_NET_HDR_GSO_TCPV4;
+        header[4] = 0xb4; // gso_size 1460 (little endian)
+        header[5] = 0x05;
+        let payload = vec![0x5au8; 3000];
+        mem.write_slice(&header, GuestAddress(BUF)).unwrap();
+        mem.write_slice(&payload, GuestAddress(BUF + 0x100))
+            .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: BUF,
+                len: VIRTIO_NET_HDR_LEN as u32,
+                flags: desc_flags::NEXT,
+                next: 1,
+            },
+            GuestAddress(DESC),
+        )
+        .unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: BUF + 0x100,
+                len: payload.len() as u32,
+                flags: 0,
+                next: 0,
+            },
+            GuestAddress(DESC + 16),
+        )
+        .unwrap();
+        mem.write_obj(0u16, GuestAddress(AVAIL + 4)).unwrap();
+        mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(AVAIL))
+            .unwrap();
+        configure_net_queue(&dev, 1, DESC, AVAIL, USED);
+
+        assert_eq!(dev.process_tx_queue().unwrap(), 1);
+        let mut wire = vec![0u8; 8192];
+        // SAFETY: `wire` is writable for its length.
+        let n = unsafe { libc::read(peer, wire.as_mut_ptr() as *mut libc::c_void, wire.len()) };
+        assert_eq!(n as usize, VIRTIO_NET_HDR_LEN + payload.len());
+        assert_eq!(&wire[..VIRTIO_NET_HDR_LEN], &header);
+        assert_eq!(&wire[VIRTIO_NET_HDR_LEN..n as usize], &payload[..]);
+        close_fds(&[tap, peer]);
+    }
+
+    /// RX queue of two-descriptor chains (12-byte header buffer, then a
+    /// data buffer), the layout Linux uses for large receive buffers.
+    #[cfg(target_os = "linux")]
+    fn post_rx_chains(
+        dev: &VirtioNetMmio,
+        mem: &GuestMemoryMmap,
+        chains: u16,
+        data_len: u32,
+    ) -> (u64, u64) {
+        use crate::virtio::vqueue::desc_flags;
+        const DESC: u64 = 0x20_0000;
+        const AVAIL: u64 = 0x20_1000;
+        const USED: u64 = 0x20_2000;
+        const BUF: u64 = 0x21_0000;
+        for chain in 0..chains as u64 {
+            let head = (chain * 2) as u16;
+            let buf = BUF + chain * 0x2_0000;
+            mem.write_obj(
+                Descriptor {
+                    addr: buf,
+                    len: VIRTIO_NET_HDR_LEN as u32,
+                    flags: desc_flags::WRITE | desc_flags::NEXT,
+                    next: head + 1,
+                },
+                GuestAddress(DESC + head as u64 * 16),
+            )
+            .unwrap();
+            mem.write_obj(
+                Descriptor {
+                    addr: buf + 0x100,
+                    len: data_len,
+                    flags: desc_flags::WRITE,
+                    next: 0,
+                },
+                GuestAddress(DESC + (head as u64 + 1) * 16),
+            )
+            .unwrap();
+            mem.write_obj(head, GuestAddress(AVAIL + 4 + chain * 2))
+                .unwrap();
+        }
+        mem.write_obj(
+            AvailRing {
+                flags: 0,
+                idx: chains,
+            },
+            GuestAddress(AVAIL),
+        )
+        .unwrap();
+        configure_net_queue(dev, 0, DESC, AVAIL, USED);
+        (BUF, USED)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rx_from_a_vnet_tap_lands_in_guest_buffers_with_its_header() {
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        dev.set_vnet_hdr(true);
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        dev.set_irq_evt(evt.try_clone().unwrap());
+        negotiate(&dev, net_features::OFFLOADS);
+        let (buf, used) = post_rx_chains(&dev, &mem, 2, 4096);
+        let (tap, peer) = frame_pipe();
+
+        // DATA_VALID (the host already checked the checksum) passes through.
+        let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+        frame[0] = 2;
+        frame.extend_from_slice(&[0xc3u8; 1000]);
+        // SAFETY: `frame` is readable for its length.
+        assert_eq!(
+            unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) },
+            frame.len() as isize
+        );
+
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((1, true)));
+        assert_eq!(net_used_idx(&mem, used), 1);
+        let entry: UsedElem = mem.read_obj(GuestAddress(used + 4)).unwrap();
+        assert_eq!(entry.len as usize, frame.len());
+        let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+        mem.read_slice(&mut header, GuestAddress(buf)).unwrap();
+        assert_eq!(header[0], 2);
+        assert_eq!(
+            u16::from_le_bytes([header[10], header[11]]),
+            1,
+            "num_buffers"
+        );
+        let mut data = vec![0u8; 1000];
+        mem.read_slice(&mut data, GuestAddress(buf + 0x100))
+            .unwrap();
+        assert!(data.iter().all(|b| *b == 0xc3));
+        // One interrupt for the batch, raised by signal_rx.
+        assert!(evt.read().is_err());
+        dev.signal_rx().unwrap();
+        assert_eq!(evt.read().unwrap(), 1);
+        close_fds(&[tap, peer]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rx_drops_offloads_the_guest_did_not_accept() {
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        dev.set_vnet_hdr(true);
+        // Checksum offload only: no TSO.
+        negotiate(&dev, net_features::GUEST_CSUM);
+        let (_, used) = post_rx_chains(&dev, &mem, 2, 4096);
+        let (tap, peer) = frame_pipe();
+        let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+        frame[1] = VIRTIO_NET_HDR_GSO_TCPV4;
+        frame.extend_from_slice(&[1u8; 100]);
+        // SAFETY: `frame` is readable for its length.
+        unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) };
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((0, true)));
+        let entry: UsedElem = mem.read_obj(GuestAddress(used + 4)).unwrap();
+        assert_eq!(entry.len, 0, "the buffer returns empty");
+        assert_eq!(dev.rx_packets.load(Ordering::Relaxed), 0);
+        // The copying path refuses the same frame.
+        assert!(!dev.inject_rx_vnet_frame(&frame).unwrap());
+        close_fds(&[tap, peer]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn event_idx_interrupts_only_when_the_driver_asks() {
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        dev.set_vnet_hdr(true);
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        dev.set_irq_evt(evt.try_clone().unwrap());
+        negotiate(&dev, net_features::OFFLOADS | net_features::RING_EVENT_IDX);
+        let (_, used) = post_rx_chains(&dev, &mem, 4, 4096);
+        const AVAIL: u64 = 0x20_1000;
+        // used_event = 2: interrupt once the third used entry is added.
+        mem.write_obj(2u16, GuestAddress(AVAIL + 4 + 2 * 16))
+            .unwrap();
+        let (tap, peer) = frame_pipe();
+        let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+        frame.extend_from_slice(&[7u8; 64]);
+        let send = || {
+            // SAFETY: `frame` is readable for its length.
+            unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) };
+        };
+        send();
+        send();
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((2, true)));
+        dev.signal_rx().unwrap();
+        assert!(
+            evt.read().is_err(),
+            "used index 2 has not passed used_event 2"
+        );
+        send();
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((1, true)));
+        dev.signal_rx().unwrap();
+        assert_eq!(evt.read().unwrap(), 1, "used index 3 passed used_event");
+        // The device asks to be kicked when the driver passes what it used.
+        let avail_event: u16 = mem.read_obj(GuestAddress(used + 4 + 8 * 16)).unwrap();
+        assert_eq!(avail_event, 3);
+        close_fds(&[tap, peer]);
     }
 
     #[test]

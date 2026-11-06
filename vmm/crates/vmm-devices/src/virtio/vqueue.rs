@@ -205,6 +205,10 @@ pub struct VirtQueueProcessor {
     config: QueueConfig,
     last_avail_idx: u16,
     last_used_idx: u16,
+    /// VIRTIO_RING_F_EVENT_IDX negotiated: the driver says (`used_event`)
+    /// when it needs an interrupt and the device says (`avail_event`) when
+    /// it needs a kick, instead of one of each per buffer.
+    event_idx: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +227,7 @@ impl VirtQueueProcessor {
             config,
             last_avail_idx,
             last_used_idx,
+            event_idx: false,
         }
     }
 
@@ -231,6 +236,7 @@ impl VirtQueueProcessor {
             config,
             last_avail_idx: state.last_avail_idx,
             last_used_idx: state.last_used_idx,
+            event_idx: false,
         }
     }
 
@@ -246,6 +252,53 @@ impl VirtQueueProcessor {
     /// tracks its position across calls.
     pub fn update_config(&mut self, config: QueueConfig) {
         self.config = config;
+    }
+
+    /// Use the driver's and device's event indexes (VIRTIO_RING_F_EVENT_IDX).
+    pub fn set_event_idx(&mut self, on: bool) {
+        self.event_idx = on;
+    }
+
+    pub fn last_used_idx(&self) -> u16 {
+        self.last_used_idx
+    }
+
+    /// Whether the driver wants an interrupt for the used entries added since
+    /// the used index was `old_used` (always, without EVENT_IDX). Call after
+    /// the used index is published.
+    pub fn needs_notification(&self, mem: &GuestMemoryMmap, old_used: u16) -> bool {
+        if !self.event_idx {
+            return true;
+        }
+        // Order the used-index store before reading the driver's used_event.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        let Some(used_event) = self
+            .used_event_addr()
+            .and_then(|addr| read_obj_mem::<u16>(mem, addr))
+        else {
+            return true;
+        };
+        let new = self.last_used_idx;
+        // vring_need_event(): did `used_event` fall in (old_used, new]?
+        new.wrapping_sub(used_event).wrapping_sub(1) < new.wrapping_sub(old_used)
+    }
+
+    /// `used_event`, after the avail ring's entries.
+    fn used_event_addr(&self) -> Option<GuestAddress> {
+        let ring = checked_mul_u64(self.config.size as u64, 2, "used_event offset")?;
+        let off = checked_add_u64(4, ring, "used_event offset")?;
+        checked_guest_addr(self.config.avail_ring_addr, off, "used_event address")
+    }
+
+    /// `avail_event`, after the used ring's entries.
+    fn avail_event_addr(&self) -> Option<GuestAddress> {
+        let ring = checked_mul_u64(
+            self.config.size as u64,
+            std::mem::size_of::<UsedElem>() as u64,
+            "avail_event offset",
+        )?;
+        let off = checked_add_u64(4, ring, "avail_event offset")?;
+        checked_guest_addr(self.config.used_ring_addr, off, "avail_event address")
     }
 
     fn queue_is_usable(&self, mem: &GuestMemoryMmap, caller: &str) -> bool {
@@ -666,54 +719,87 @@ impl VirtQueueProcessor {
         }
 
         let avail_addr = GuestAddress(self.config.avail_ring_addr);
-        let avail: AvailRing = match read_obj_mem::<AvailRing>(mem, avail_addr) {
-            Some(a) => a,
-            None => return 0,
-        };
-
         let mut processed = 0;
-        while self.last_avail_idx != avail.idx {
-            let avail_entry_addr = match self.avail_entry_addr() {
-                Some(addr) => addr,
-                None => break,
+        loop {
+            let avail: AvailRing = match read_obj_mem::<AvailRing>(mem, avail_addr) {
+                Some(a) => a,
+                None => return processed,
             };
-            let head_desc_idx: u16 = match read_obj_mem::<u16>(mem, avail_entry_addr) {
-                Some(v) => v,
-                None => break,
-            };
+            let mut stopped = false;
+            while self.last_avail_idx != avail.idx {
+                let avail_entry_addr = match self.avail_entry_addr() {
+                    Some(addr) => addr,
+                    None => {
+                        stopped = true;
+                        break;
+                    }
+                };
+                let head_desc_idx: u16 = match read_obj_mem::<u16>(mem, avail_entry_addr) {
+                    Some(v) => v,
+                    None => {
+                        stopped = true;
+                        break;
+                    }
+                };
 
-            let chain = match self.walk_descriptor_chain(mem, head_desc_idx) {
-                Some(chain) => chain,
-                None => {
-                    self.reject_available_chain();
-                    continue;
-                }
-            };
+                let chain = match self.walk_descriptor_chain(mem, head_desc_idx) {
+                    Some(chain) => chain,
+                    None => {
+                        self.reject_available_chain();
+                        continue;
+                    }
+                };
 
-            let used_len = match handler(&chain.readable, &chain.writable) {
-                Some(n) => n,
-                None => break, // leave chain in-flight, try again next call
-            };
+                let used_len = match handler(&chain.readable, &chain.writable) {
+                    Some(n) => n,
+                    None => {
+                        // Leave the chain in flight; try again next call.
+                        stopped = true;
+                        break;
+                    }
+                };
 
-            let used_elem = UsedElem {
-                id: head_desc_idx as u32,
-                len: used_len,
-            };
-            let used_entry_addr = match self.used_entry_addr() {
-                Some(addr) => addr,
-                None => break,
-            };
-            let _ = write_obj_mem(mem, dirty, used_elem, used_entry_addr);
-            self.last_used_idx = self.last_used_idx.wrapping_add(1);
-            self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
-            processed += 1;
+                let used_elem = UsedElem {
+                    id: head_desc_idx as u32,
+                    len: used_len,
+                };
+                let used_entry_addr = match self.used_entry_addr() {
+                    Some(addr) => addr,
+                    None => {
+                        stopped = true;
+                        break;
+                    }
+                };
+                let _ = write_obj_mem(mem, dirty, used_elem, used_entry_addr);
+                self.last_used_idx = self.last_used_idx.wrapping_add(1);
+                self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+                processed += 1;
+            }
+
+            // Publish the used ring index at +2 (after the flags field).
+            if let Some(used_idx_addr) = self.used_idx_addr() {
+                let _ = write_obj_mem(mem, dirty, self.last_used_idx, used_idx_addr);
+            }
+            if !self.event_idx {
+                return processed;
+            }
+            // Ask for a kick when the driver publishes past what we consumed.
+            if let Some(addr) = self.avail_event_addr() {
+                let _ = write_obj_mem(mem, dirty, self.last_avail_idx, addr);
+            }
+            if stopped {
+                return processed;
+            }
+            // A buffer published between reading the avail index and writing
+            // avail_event did not kick us; look again after a full barrier.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let avail_idx = checked_guest_addr(self.config.avail_ring_addr, 2, "avail idx address")
+                .and_then(|addr| read_obj_mem::<u16>(mem, addr));
+            match avail_idx {
+                Some(idx) if idx != self.last_avail_idx => continue,
+                _ => return processed,
+            }
         }
-
-        // Publish the used ring index at +2 (after the flags field).
-        if let Some(used_idx_addr) = self.used_idx_addr() {
-            let _ = write_obj_mem(mem, dirty, self.last_used_idx, used_idx_addr);
-        }
-        processed
     }
 }
 

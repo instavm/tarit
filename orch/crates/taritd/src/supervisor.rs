@@ -68,6 +68,10 @@ const TUNSETIFF: libc::c_ulong = 0x400454ca;
 const IFF_TAP: u16 = 0x0002;
 #[cfg(target_os = "linux")]
 const IFF_NO_PI: u16 = 0x1000;
+/// Frames carry a virtio-net header, so the VMM can offer the guest
+/// checksum and segmentation offloads (it checks for this flag).
+#[cfg(target_os = "linux")]
+const IFF_VNET_HDR: u16 = 0x4000;
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -99,7 +103,7 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let mut ifreq = TapIfreq {
         name: [0; 16],
-        flags: IFF_TAP | IFF_NO_PI,
+        flags: IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
         _pad: [0; 22],
     };
     ifreq.name[..tap_name.len()].copy_from_slice(tap_name.as_bytes());

@@ -307,7 +307,15 @@ fn run(
     }
 
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
-    let mut buf = [0u8; MAX_FRAME];
+    // A tap with a virtio-net header delivers header + up to 64 KiB (TSO).
+    let mut buf = vec![
+        0u8;
+        if device.vnet_hdr() {
+            super::net_transport::MAX_GSO_FRAME_BYTES
+        } else {
+            MAX_FRAME
+        }
+    ];
 
     'run: while !stop.load(Ordering::Relaxed) {
         // Pause request: acknowledge and park. While parked this thread
@@ -341,6 +349,7 @@ fn run(
             log::error!("net_io_loop: epoll_wait: {err}");
             break;
         }
+        apply_offloads(tap_fd, &device);
         for ev in &events[..n as usize] {
             match ev.u64 {
                 1 if !drain_tap(tap_fd, &device, &mut buf) => break 'run,
@@ -358,39 +367,118 @@ fn run(
 /// Pull all available frames from the tap (it's non-blocking) and push them
 /// to the guest RX queue. Stops at EAGAIN.
 fn drain_tap(tap_fd: RawFd, device: &Arc<VirtioNetMmio>, buf: &mut [u8]) -> bool {
+    apply_offloads(tap_fd, device);
+    // Deliver ready frames and interrupt the guest once per batch (at most
+    // RX_BATCH frames, so a steady stream still interrupts promptly).
+    const RX_BATCH: usize = 64;
+    // With a virtio-net header the kernel writes frames straight into the
+    // guest's buffers.
     loop {
-        // SAFETY: `buf` is a valid writable slice for `buf.len()` bytes; invalid
-        // or non-ready fds are reported by read and handled below.
-        let rc = unsafe { libc::read(tap_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if rc < 0 {
-            let err = io::Error::last_os_error();
-            if matches!(
-                err.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
-                return true;
+        match device.rx_from_vnet_tap(tap_fd, RX_BATCH) {
+            Ok(Some((delivered, tap_empty))) => {
+                if delivered > 0 {
+                    if let Err(error) = device.signal_rx() {
+                        log::error!("net_io_loop: RX interrupt failed: {error}");
+                        return false;
+                    }
+                }
+                if tap_empty {
+                    return true;
+                }
+                if delivered == RX_BATCH {
+                    continue;
+                }
+                // The guest has no free buffer. Fall through to the copying
+                // path, which drops the frame instead of leaving the tap
+                // readable (level-triggered epoll would spin on it).
+                break;
             }
-            log::warn!("net_io_loop: tap read: {err}");
-            return true;
-        }
-        if rc == 0 {
-            return true;
-        }
-        let frame = &buf[..rc as usize];
-        match device.inject_rx_packet(frame) {
-            Ok(true) => {}
-            Ok(false) => {
-                log::debug!(
-                    "net_io_loop: RX queue full — dropping {}-byte frame",
-                    frame.len()
-                );
-                return true;
-            }
+            Ok(None) => break,
             Err(error) => {
                 log::error!("net_io_loop: device failed during RX: {error}");
                 return false;
             }
         }
+    }
+    let mut pending = 0usize;
+    let keep_running = loop {
+        // SAFETY: `buf` is a valid writable slice for `buf.len()` bytes; invalid
+        // or non-ready fds are reported by read and handled below.
+        let rc = unsafe { libc::read(tap_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if !matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                log::warn!("net_io_loop: tap read: {err}");
+            }
+            break true;
+        }
+        if rc == 0 {
+            break true;
+        }
+        let frame = &buf[..rc as usize];
+        let delivered = if device.vnet_hdr() {
+            device.inject_rx_vnet_frame(frame)
+        } else {
+            device.inject_rx_packet_quiet(frame)
+        };
+        match delivered {
+            Ok(true) => {
+                pending += 1;
+                if pending == RX_BATCH {
+                    pending = 0;
+                    if let Err(error) = device.signal_rx() {
+                        log::error!("net_io_loop: RX interrupt failed: {error}");
+                        return false;
+                    }
+                }
+            }
+            Ok(false) => {
+                log::debug!(
+                    "net_io_loop: RX queue full — dropping {}-byte frame",
+                    frame.len()
+                );
+                break true;
+            }
+            Err(error) => {
+                log::error!("net_io_loop: device failed during RX: {error}");
+                break false;
+            }
+        }
+    };
+    if pending > 0 {
+        if let Err(error) = device.signal_rx() {
+            log::error!("net_io_loop: RX interrupt failed: {error}");
+            return false;
+        }
+    }
+    keep_running
+}
+
+/// Give the tap the offloads the guest negotiated (or none after a reset).
+/// Until then the tap sends plain frames, which every guest accepts.
+fn apply_offloads(tap_fd: RawFd, device: &Arc<VirtioNetMmio>) {
+    let Some(flags) = device.take_offload_request() else {
+        return;
+    };
+    // SAFETY: TUNSETOFFLOAD takes its flags by value and only changes the
+    // offloads of the tap behind `tap_fd`; seccomp allows exactly this ioctl.
+    let rc = unsafe {
+        libc::ioctl(
+            tap_fd,
+            vmm_jailer::seccomp::TUNSETOFFLOAD as _,
+            flags as libc::c_ulong,
+        )
+    };
+    if rc < 0 {
+        log::warn!(
+            "net_io_loop: TUNSETOFFLOAD {flags:#x}: {}",
+            io::Error::last_os_error()
+        );
+    } else {
+        log::debug!("net_io_loop: tap offloads set to {flags:#x}");
     }
 }
 

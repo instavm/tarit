@@ -7406,7 +7406,18 @@ fn restore_virtio_net_states(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    for (dev, state) in devs.iter_mut().zip(decoded) {
+    for (index, (dev, state)) in devs.iter_mut().zip(decoded).enumerate() {
+        // A guest that negotiated offloads sends and expects frames with
+        // partial checksums and TSO; only a tap carrying a virtio-net header
+        // can pass them, so do not resume it on one that cannot.
+        let offloads =
+            state.guest_features & vmm_devices::virtio::net_transport::net_features::OFFLOADS;
+        if offloads != 0 && !dev.vnet_hdr() {
+            return Err(VmmError::Snapshot(format!(
+                "snapshot virtio-net {index} negotiated offloads {offloads:#x}, but its TAP was \
+                 opened without IFF_VNET_HDR"
+            )));
+        }
         vmm_devices::persist::Persist::restore(dev, state);
     }
     Ok(())
@@ -8052,6 +8063,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         dev.set_guest_memory(gm.clone());
         dev.set_guest_dirty_tracker(host_dirty.clone());
         dev.set_tap_fd(tap.fd);
+        dev.set_vnet_hdr(tap.vnet_hdr);
         let irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
             .map_err(|e| VmmError::Kvm(format!("EventFd: {e}")))?;
         let io_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
@@ -8698,6 +8710,34 @@ mod tests {
         std::os::unix::fs::FileExt::read_exact_at(out.as_file(), &mut header, 0).unwrap();
         let mem_crc = u32::from_le_bytes(header[28..32].try_into().unwrap());
         assert_eq!(mem_crc, crc32fast::hash(&expected));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn restore_refuses_offloads_on_a_tap_without_a_vnet_header() {
+        use vmm_devices::bus::MmioDevice as _;
+        use vmm_devices::virtio::net_transport::{net_features, VirtioNetMmio};
+        let source = VirtioNetMmio::new(6, [0; 6]);
+        source.set_vnet_hdr(true);
+        source
+            .mmio_write(
+                vmm_devices::virtio::regs::reg::GUEST_FEATURES,
+                net_features::OFFLOADS as u64,
+                4,
+            )
+            .unwrap();
+        let state = postcard::to_allocvec(&vmm_devices::persist::Persist::save(&source)).unwrap();
+
+        let mut plain = vec![Arc::new(VirtioNetMmio::new(6, [0; 6]))];
+        let error =
+            restore_virtio_net_states(&mut plain, std::slice::from_ref(&state)).unwrap_err();
+        assert!(error.to_string().contains("IFF_VNET_HDR"), "{error}");
+
+        let with_header = Arc::new(VirtioNetMmio::new(6, [0; 6]));
+        with_header.set_vnet_hdr(true);
+        let mut devs = vec![with_header];
+        restore_virtio_net_states(&mut devs, &[state]).unwrap();
+        assert_eq!(devs[0].negotiated_offloads(), net_features::OFFLOADS);
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
