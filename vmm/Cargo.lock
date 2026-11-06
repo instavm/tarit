@@ -1027,6 +1027,7 @@ dependencies = [
  "kvm-ioctls",
  "libc",
  "postcard",
+ "tarit-proto",
  "tempfile",
  "vm-memory 0.18.0",
  "vmm-core",

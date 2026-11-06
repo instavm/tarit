@@ -452,6 +452,98 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_without_base_or_resume_still_parses() {
+        // Clients predating `base` and `resume` get an ordinary full snapshot.
+        let json = r#"{"op":"snapshot","diff":false,"live":false,"capture_disks":true}"#;
+        match serde_json::from_str::<ApiRequest>(json).unwrap() {
+            ApiRequest::Snapshot {
+                diff,
+                live,
+                capture_disks,
+                base,
+                resume,
+            } => {
+                assert!(!diff);
+                assert!(!live);
+                assert!(capture_disks);
+                assert_eq!(base, None);
+                assert!(!resume);
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn snapshot_base_and_resume_round_trip() {
+        let r = ApiRequest::Snapshot {
+            diff: false,
+            live: false,
+            capture_disks: true,
+            base: Some("/snapshots/prev.snap".into()),
+            resume: true,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains(r#""base":"/snapshots/prev.snap""#));
+        assert!(s.contains(r#""resume":true"#));
+        match serde_json::from_str::<ApiRequest>(&s).unwrap() {
+            ApiRequest::Snapshot {
+                diff,
+                live,
+                capture_disks,
+                base,
+                resume,
+            } => {
+                assert!(!diff);
+                assert!(!live);
+                assert!(capture_disks);
+                assert_eq!(base.as_deref(), Some("/snapshots/prev.snap"));
+                assert!(resume);
+            }
+            _ => panic!("expected snapshot"),
+        }
+
+        let base_only = ApiRequest::Snapshot {
+            diff: false,
+            live: false,
+            capture_disks: false,
+            base: Some("/b.snap".into()),
+            resume: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&base_only).unwrap(),
+            r#"{"op":"snapshot","diff":false,"live":false,"capture_disks":false,"base":"/b.snap"}"#
+        );
+    }
+
+    #[test]
+    fn snapshot_omits_unset_base_and_resume_on_the_wire() {
+        // A request that uses neither option serializes exactly as it did
+        // before they existed, so an older VMM sees no new fields.
+        let r = ApiRequest::Snapshot {
+            diff: true,
+            live: false,
+            capture_disks: false,
+            base: None,
+            resume: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"op":"snapshot","diff":true,"live":false,"capture_disks":false}"#
+        );
+    }
+
+    #[test]
+    fn snapshot_request_ignores_unknown_fields() {
+        // ApiRequest does not deny unknown fields: a VMM built from this
+        // revision accepts snapshot options added by a newer client.
+        let json = r#"{"op":"snapshot","diff":false,"base":"/b.snap","future_option":7}"#;
+        assert!(matches!(
+            serde_json::from_str::<ApiRequest>(json).unwrap(),
+            ApiRequest::Snapshot { base: Some(b), resume: false, .. } if b == "/b.snap"
+        ));
+    }
+
+    #[test]
     fn request_release_scratch_round_trips_with_exact_identity() {
         let r = ApiRequest::ReleaseScratch {
             path: "/snapshots/vmm-snap-1-2.snap".into(),

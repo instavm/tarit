@@ -912,6 +912,51 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_snapshot_with_base_and_resume_without_vm_returns_no_vm_err() {
+        let controller = VmmController::new();
+        let req: ApiRequest = serde_json::from_str(
+            r#"{"op":"snapshot","diff":false,"capture_disks":true,"base":"/snapshots/prev.snap","resume":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &req,
+            ApiRequest::Snapshot { base: Some(b), resume: true, .. } if b == "/snapshots/prev.snap"
+        ));
+        match dispatch(req, &controller) {
+            ApiResponse::Err { msg } => {
+                assert!(msg.contains("no VM"), "unexpected error: {msg}");
+                assert!(!msg.contains("bad request"), "unexpected error: {msg}");
+            }
+            other => panic!("expected no-VM error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_snapshot_base_and_resume_do_not_change_no_vm_error() {
+        let snapshot = |base: Option<String>, resume: bool| {
+            let controller = VmmController::new();
+            match dispatch(
+                ApiRequest::Snapshot {
+                    diff: false,
+                    live: false,
+                    capture_disks: false,
+                    base,
+                    resume,
+                },
+                &controller,
+            ) {
+                ApiResponse::Err { msg } => msg,
+                other => panic!("expected no-VM error, got {other:?}"),
+            }
+        };
+        let plain = snapshot(None, false);
+        assert!(plain.contains("no VM"), "unexpected error: {plain}");
+        assert_eq!(snapshot(Some("/b.snap".into()), false), plain);
+        assert_eq!(snapshot(None, true), plain);
+        assert_eq!(snapshot(Some("/b.snap".into()), true), plain);
+    }
+
+    #[test]
     fn dispatch_stop_without_vm_returns_ok() {
         let controller = VmmController::new();
         let resp = dispatch(ApiRequest::Stop, &controller);

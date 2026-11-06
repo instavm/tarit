@@ -192,6 +192,10 @@ A restore enables dirty-page tracking before the guest runs, so `snapshot --diff
 
 `snapshot --base PATH` (the API's `base`) takes a full, standalone snapshot while pausing the guest only long enough to write the pages it changed since `PATH`; the rest is copied from `PATH` after the guest resumes. `PATH` must be this VM's last full snapshot, or the snapshot it was restored from, unchanged: the VMM checks its header, size and checksums, and otherwise logs why and takes an ordinary full snapshot. The result is identical to a full snapshot and does not depend on `PATH` afterwards, so either file can be deleted. Use it for the checkpoint, resume, checkpoint loop, where a diff chain would keep every parent alive.
 
+After a restore you do not need `--base` for the first checkpoint: a VM restored lazily or from a mapped file keeps that file open anyway and uses it as the base, even if you delete or move it. Before any byte of a base is used, the VMM checks the base's memory CRC against its header; if they differ the snapshot fails and the next one is an ordinary full snapshot. A caller that pauses the VM itself (to capture other state in the same pause) can send the API's `resume: true` with `snapshot` so the VM resumes as soon as its memory is captured, before the copy from the base.
+
+After a lazy (UFFD) restore, KVM counts every page the guest has touched since the restore as dirty, reads included, so the pause covers those pages rather than only the ones it wrote.
+
 Restore inside a `vmm serve` process by sending the API `restore` request. `overlay` is optional.
 
 ```sh

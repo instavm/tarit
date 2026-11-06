@@ -34,8 +34,9 @@ declare -A SUITE=(
   [suspend]=e2e_suspend_resume.sh
   [snapshot-disk]=e2e_snapshot_disk.sh
   [cpu-refill]=e2e_cpu_refill.sh
+  [checkpoint]=e2e_checkpoint.sh
 )
-ORDER=(smoke cli ssh-pty image warmpool multitenant net lifecycle suspend snapshot-disk cpu-refill)
+ORDER=(smoke cli ssh-pty image warmpool multitenant net lifecycle suspend snapshot-disk checkpoint cpu-refill)
 [ "$#" -gt 0 ] && ORDER=("$@")
 
 declare -A RESULT; PASS=0; FAIL=0

@@ -1819,6 +1819,73 @@ mod tests {
     }
 
     #[test]
+    fn cli_snapshot_accepts_base() {
+        let cli = Cli::try_parse_from(["vmm", "snapshot", "--base", "/x"]).unwrap();
+        match cli.cmd {
+            Cmd::Snapshot {
+                diff,
+                live,
+                memory_only,
+                base,
+            } => {
+                assert!(!diff);
+                assert!(!live);
+                assert!(!memory_only);
+                assert_eq!(base.as_deref(), Some("/x"));
+            }
+            _ => panic!("expected snapshot command"),
+        }
+
+        let cli = Cli::try_parse_from(["vmm", "snap", "--base=/y"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Snapshot { base: Some(b), .. } if b == "/y"
+        ));
+
+        let cli = Cli::try_parse_from(["vmm", "snapshot"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Snapshot { base: None, .. }));
+    }
+
+    #[test]
+    fn cli_snapshot_base_conflicts_with_diff_and_live() {
+        for args in [
+            ["vmm", "snapshot", "--base", "/x", "--diff"],
+            ["vmm", "snapshot", "--diff", "--base", "/x"],
+            ["vmm", "snapshot", "--base", "/x", "--live"],
+            ["vmm", "snapshot", "--live", "--base", "/x"],
+        ] {
+            let error = Cli::try_parse_from(args).err().unwrap_or_else(|| {
+                panic!("expected {args:?} to be rejected");
+            });
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_snapshot_base_combines_with_memory_only() {
+        let cli =
+            Cli::try_parse_from(["vmm", "snapshot", "--memory-only", "--base", "/x"]).unwrap();
+        match cli.cmd {
+            Cmd::Snapshot {
+                diff,
+                live,
+                memory_only,
+                base,
+            } => {
+                assert!(!diff);
+                assert!(!live);
+                assert!(memory_only);
+                assert_eq!(base.as_deref(), Some("/x"));
+            }
+            _ => panic!("expected snapshot command"),
+        }
+    }
+
+    #[test]
     fn overlay_count_must_match_volume_count_when_present() {
         let volumes = vec!["/one.img".to_string(), "/two.img".to_string()];
         let overlays = vec!["/one.cow".to_string()];

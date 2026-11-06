@@ -24,6 +24,7 @@ libc.workspace = true
 tempfile = "3"
 env_logger = "0.10"
 crc32fast.workspace = true
+tarit-proto = { path = "../../../proto" }
 
 [features]
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vmm-core", "dep:vmm-snapshot", "dep:postcard", "dep:vmm-migration", "vmm-core/kvm", "vmm-core/boot"]
@@ -40,6 +41,11 @@ path = "snapshot_roundtrip.rs"
 [[test]]
 name = "egress_denial"
 path = "egress_denial.rs"
+
+[[test]]
+name = "checkpoint_base"
+path = "checkpoint_base.rs"
+required-features = ["kvm"]
 
 [[test]]
 name = "lifecycle_e2e"

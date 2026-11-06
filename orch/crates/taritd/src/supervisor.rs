@@ -12076,6 +12076,523 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A VMM control socket that answers every request with `respond` until
+    /// the test collects the requests it received, in arrival order.
+    struct ScriptedVmm {
+        stop: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<Vec<serde_json::Value>>>,
+    }
+
+    impl ScriptedVmm {
+        fn start(
+            socket_path: &Path,
+            mut respond: impl FnMut(&serde_json::Value) -> tarit_vmm_client::ApiResponse
+                + Send
+                + 'static,
+        ) -> Self {
+            let listener = std::os::unix::net::UnixListener::bind(socket_path)
+                .expect("bind scripted VMM socket");
+            listener
+                .set_nonblocking(true)
+                .expect("make scripted VMM socket nonblocking");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                let mut requests = Vec::new();
+                while !server_stop.load(Ordering::Acquire) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("accept scripted VMM client: {error}"),
+                    };
+                    stream
+                        .set_nonblocking(false)
+                        .expect("make scripted VMM stream blocking");
+                    let mut length = [0_u8; 4];
+                    stream.read_exact(&mut length).expect("read request length");
+                    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                    stream.read_exact(&mut body).expect("read request body");
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).expect("decode request");
+                    let response = serde_json::to_vec(&respond(&request)).expect("encode response");
+                    requests.push(request);
+                    stream
+                        .write_all(&(response.len() as u32).to_be_bytes())
+                        .expect("write response length");
+                    stream.write_all(&response).expect("write response body");
+                    stream.flush().expect("flush response");
+                }
+                requests
+            });
+            Self {
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn requests(mut self) -> Vec<serde_json::Value> {
+            self.stop.store(true, Ordering::Release);
+            self.server
+                .take()
+                .expect("scripted VMM server")
+                .join()
+                .expect("join scripted VMM server")
+        }
+    }
+
+    impl Drop for ScriptedVmm {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+
+    fn request_ops(requests: &[serde_json::Value]) -> Vec<&str> {
+        requests
+            .iter()
+            .map(|request| request["op"].as_str().expect("request op"))
+            .collect()
+    }
+
+    /// A supervisor with one running runtime whose VMM socket the test serves.
+    struct SnapshotFixture {
+        root: PathBuf,
+        supervisor: Arc<VmmSupervisor>,
+        id: Uuid,
+        socket_path: PathBuf,
+        /// Host directory the scripted VMM writes RAM scratch into, and the
+        /// same directory as the VMM names it.
+        scratch_host_dir: PathBuf,
+        scratch_vmm_dir: String,
+    }
+
+    impl SnapshotFixture {
+        fn new(name: &str, jailed: bool) -> Self {
+            let root = PathBuf::from(format!("target/taritd-{name}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut config = supervisor_config(&root);
+            if jailed {
+                // Leasing the test's own identity lets an unprivileged test
+                // own the jail's files exactly as a jailed VMM would.
+                config.vm_jail = Some(crate::config::VmJailConfig {
+                    base_dir: std::env::current_dir().unwrap().join(&root).join("jails"),
+                    uid_base: unsafe { libc::geteuid() },
+                    gid_base: unsafe { libc::getegid() },
+                    id_count: 1,
+                    profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+                    seccomp: true,
+                    pid_namespace: false,
+                    network_namespace: false,
+                });
+            }
+            let supervisor = Arc::new(VmmSupervisor::new(config));
+            let id = Uuid::new_v4();
+            let (scratch_host_dir, scratch_vmm_dir) = match &supervisor.jails {
+                Some(jails) => {
+                    let lease = jails.lease(id).unwrap();
+                    (lease.root.join("tmp"), "/tmp".to_string())
+                }
+                None => {
+                    let dir = root.join("vmm-tmp");
+                    let vmm_dir = dir.display().to_string();
+                    (dir, vmm_dir)
+                }
+            };
+            std::fs::create_dir_all(&scratch_host_dir).unwrap();
+            let socket_path = root.join("vmm.sock");
+            let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+            supervisor.running.lock().unwrap().insert(
+                id,
+                RunningVm::new(process.pid, socket_path.clone(), process, None),
+            );
+            Self {
+                root,
+                supervisor,
+                id,
+                socket_path,
+                scratch_host_dir,
+                scratch_vmm_dir,
+            }
+        }
+
+        fn snapshot_dir(&self) -> PathBuf {
+            self.supervisor.config.socket_dir.join("snapshots")
+        }
+
+        fn write_overlay(&self, contents: &[u8]) -> PathBuf {
+            let path = self.root.join("live.cow");
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            let mut file = options.open(&path).expect("create live disk upper");
+            file.write_all(contents).expect("write live disk upper");
+            file.sync_all().expect("sync live disk upper");
+            path
+        }
+
+        fn snapshot_dir_entries(&self) -> Vec<String> {
+            let mut names = std::fs::read_dir(self.snapshot_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
+        fn finish(self) {
+            let vm = self
+                .supervisor
+                .running
+                .lock()
+                .unwrap()
+                .remove(&self.id)
+                .expect("test runtime is still registered");
+            vm.process.kill_wait().unwrap();
+            if let Some(jails) = &self.supervisor.jails {
+                jails.release(self.id).unwrap();
+            }
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScriptedRam {
+        /// Write a private RAM scratch file and report it.
+        Written,
+        /// Report a RAM scratch path that does not exist.
+        Unclaimable,
+        /// Fail the snapshot request.
+        Failed,
+    }
+
+    const SCRIPTED_RAM: &[u8] = b"scripted RAM snapshot";
+
+    /// Contents of the disk uppers staged in the snapshot directory, as seen
+    /// by the VMM at each RAM snapshot request.
+    type StagedOverlays = Arc<Mutex<Vec<Vec<Vec<u8>>>>>;
+
+    fn staged_overlay_contents(snapshot_dir: &Path) -> Vec<Vec<u8>> {
+        let mut staged = std::fs::read_dir(snapshot_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(".stage-") && name.ends_with(".cow")
+            })
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        staged.sort();
+        staged
+    }
+
+    fn scripted_snapshot_vmm(
+        fixture: &SnapshotFixture,
+        ram: ScriptedRam,
+    ) -> (ScriptedVmm, StagedOverlays) {
+        let staged = StagedOverlays::default();
+        let observed = Arc::clone(&staged);
+        let snapshot_dir = fixture.snapshot_dir();
+        let scratch_host_dir = fixture.scratch_host_dir.clone();
+        let scratch_vmm_dir = fixture.scratch_vmm_dir.clone();
+        let mut snapshots = 0;
+        let vmm = ScriptedVmm::start(&fixture.socket_path, move |request| {
+            match request["op"].as_str() {
+                Some("pause" | "resume" | "release_scratch") => tarit_vmm_client::ApiResponse::Ok,
+                Some("snapshot") => {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(staged_overlay_contents(&snapshot_dir));
+                    snapshots += 1;
+                    let name = format!("vmm-snap-{snapshots}.snap");
+                    match ram {
+                        ScriptedRam::Failed => tarit_vmm_client::ApiResponse::Err {
+                            msg: "scripted RAM snapshot failure".into(),
+                        },
+                        ScriptedRam::Unclaimable | ScriptedRam::Written => {
+                            if matches!(ram, ScriptedRam::Written) {
+                                let mut options = OpenOptions::new();
+                                options.write(true).create_new(true).mode(0o600);
+                                let mut file = options
+                                    .open(scratch_host_dir.join(&name))
+                                    .expect("create RAM scratch");
+                                file.write_all(SCRIPTED_RAM).expect("write RAM scratch");
+                            }
+                            tarit_vmm_client::ApiResponse::Snapshot {
+                                path: format!("{scratch_vmm_dir}/{name}"),
+                                overlay_path: None,
+                                volume_paths: Vec::new(),
+                                integrity_path: None,
+                                live_stats: None,
+                            }
+                        }
+                    }
+                }
+                other => panic!("unexpected VMM request {other:?}"),
+            }
+        });
+        (vmm, staged)
+    }
+
+    #[test]
+    fn checkpoint_base_is_tracked_per_runtime_and_shared_by_its_clones() {
+        let fixture = SnapshotFixture::new("checkpoint-base", false);
+        let supervisor = &fixture.supervisor;
+        assert_eq!(
+            supervisor.checkpoint_base(fixture.id),
+            None,
+            "a new runtime has no checkpoint base"
+        );
+
+        supervisor.set_checkpoint_base(fixture.id, Some("/snapshots/a.snap".into()));
+        assert_eq!(
+            supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/a.snap")
+        );
+
+        let unknown = Uuid::new_v4();
+        supervisor.set_checkpoint_base(unknown, Some("/snapshots/b.snap".into()));
+        assert_eq!(supervisor.checkpoint_base(unknown), None);
+        assert!(
+            !supervisor.running.lock().unwrap().contains_key(&unknown),
+            "recording a base must not register a runtime"
+        );
+
+        let clone = supervisor
+            .running
+            .lock()
+            .unwrap()
+            .get(&fixture.id)
+            .cloned()
+            .unwrap();
+        clone.set_checkpoint_base(Some("/snapshots/c.snap".into()));
+        assert_eq!(
+            supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/c.snap"),
+            "a cloned runtime entry must update the registered runtime's base"
+        );
+        supervisor.set_checkpoint_base(fixture.id, None);
+        assert_eq!(*clone.checkpoint_base.lock().unwrap(), None);
+        drop(clone);
+        fixture.finish();
+    }
+
+    #[test]
+    fn paused_snapshot_captures_disk_upper_before_ram_and_passes_checkpoint_base() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-order", false);
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/snapshots/restored-from.snap".into()));
+        let disk = b"disk upper at the checkpoint";
+        let overlay = fixture.write_overlay(disk);
+        let (vmm, staged) = scripted_snapshot_vmm(&fixture, ScriptedRam::Written);
+
+        let bundle = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, true, Some(overlay), 1)
+            .expect("snapshot bundle");
+        let requests = vmm.requests();
+
+        assert_eq!(
+            request_ops(&requests),
+            ["pause", "snapshot", "resume", "release_scratch"]
+        );
+        assert_eq!(
+            requests[1],
+            serde_json::json!({
+                "op": "snapshot",
+                "diff": false,
+                "live": false,
+                "capture_disks": false,
+                "base": "/snapshots/restored-from.snap",
+                "resume": true,
+            })
+        );
+        assert_eq!(
+            *staged.lock().unwrap(),
+            vec![vec![disk.to_vec()]],
+            "the disk upper must be staged before RAM is requested"
+        );
+        assert_eq!(std::fs::read(bundle.snapshot_path()).unwrap(), SCRIPTED_RAM);
+        assert_eq!(
+            std::fs::read(bundle.overlay_path().expect("bundle disk upper")).unwrap(),
+            disk
+        );
+        assert!(
+            !fixture.scratch_host_dir.join("vmm-snap-1.snap").exists(),
+            "released RAM scratch must be removed"
+        );
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some(bundle.snapshot_path()),
+            "an unjailed runtime's next base is the durable RAM snapshot"
+        );
+        drop(bundle);
+        fixture.finish();
+    }
+
+    #[test]
+    fn snapshot_of_paused_vm_leaves_it_paused_and_chains_checkpoint_bases() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-paused", false);
+        let (vmm, staged) = scripted_snapshot_vmm(&fixture, ScriptedRam::Written);
+
+        let first = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("first snapshot bundle");
+        let second = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("second snapshot bundle");
+        let requests = vmm.requests();
+
+        assert_eq!(
+            request_ops(&requests),
+            ["snapshot", "release_scratch", "snapshot", "release_scratch"],
+            "a VM the caller already paused is neither paused nor resumed"
+        );
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "op": "snapshot",
+                "diff": false,
+                "live": false,
+                "capture_disks": false,
+            }),
+            "without a recorded base and with resume=false both are omitted"
+        );
+        assert_eq!(
+            requests[2],
+            serde_json::json!({
+                "op": "snapshot",
+                "diff": false,
+                "live": false,
+                "capture_disks": false,
+                "base": first.snapshot_path(),
+            }),
+            "the next checkpoint uses the previous one as its base"
+        );
+        assert_eq!(*staged.lock().unwrap(), vec![Vec::<Vec<u8>>::new(); 2]);
+        assert_ne!(first.snapshot_path(), second.snapshot_path());
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some(second.snapshot_path())
+        );
+        drop(first);
+        drop(second);
+        fixture.finish();
+    }
+
+    #[test]
+    fn failed_ram_snapshot_discards_staged_disk_upper_and_resumes_vm() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-ram-failure", false);
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/snapshots/previous.snap".into()));
+        let disk = b"disk upper";
+        let overlay = fixture.write_overlay(disk);
+        let (vmm, staged) = scripted_snapshot_vmm(&fixture, ScriptedRam::Failed);
+
+        let error = match fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, true, Some(overlay), 1)
+        {
+            Ok(_) => panic!("a failed RAM snapshot must fail the bundle"),
+            Err(error) => error,
+        };
+        let requests = vmm.requests();
+
+        assert!(error.to_string().contains("snapshot RAM"), "{error}");
+        assert_eq!(request_ops(&requests), ["pause", "snapshot", "resume"]);
+        assert_eq!(requests[1]["base"], "/snapshots/previous.snap");
+        assert_eq!(requests[1]["resume"], true);
+        assert_eq!(*staged.lock().unwrap(), vec![vec![disk.to_vec()]]);
+        assert_eq!(
+            fixture.snapshot_dir_entries(),
+            Vec::<String>::new(),
+            "the staged disk upper must be discarded"
+        );
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/previous.snap"),
+            "a failed snapshot keeps the previous base"
+        );
+        fixture.finish();
+    }
+
+    #[test]
+    fn unclaimable_ram_snapshot_discards_staged_disk_upper_and_resumes_vm() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-ram-claim", false);
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/snapshots/previous.snap".into()));
+        let overlay = fixture.write_overlay(b"disk upper");
+        let (vmm, _) = scripted_snapshot_vmm(&fixture, ScriptedRam::Unclaimable);
+
+        let error = match fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, true, Some(overlay), 1)
+        {
+            Ok(_) => panic!("an unclaimable RAM snapshot must fail the bundle"),
+            Err(error) => error,
+        };
+        let requests = vmm.requests();
+
+        assert!(
+            error.to_string().contains("capture RAM snapshot ownership"),
+            "{error}"
+        );
+        assert_eq!(request_ops(&requests), ["pause", "snapshot", "resume"]);
+        assert_eq!(fixture.snapshot_dir_entries(), Vec::<String>::new());
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/previous.snap")
+        );
+        fixture.finish();
+    }
+
+    #[test]
+    fn jailed_snapshot_uses_restore_base_then_clears_it() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-jailed", true);
+        assert!(fixture.supervisor.jails.is_some());
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/restore.snap".into()));
+        let (vmm, _) = scripted_snapshot_vmm(&fixture, ScriptedRam::Written);
+
+        let first = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("first jailed snapshot bundle");
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id),
+            None,
+            "a jailed VMM cannot see the durable snapshot, so no base is kept"
+        );
+        let second = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("second jailed snapshot bundle");
+        let requests = vmm.requests();
+
+        assert_eq!(
+            request_ops(&requests),
+            ["snapshot", "release_scratch", "snapshot", "release_scratch"]
+        );
+        assert_eq!(requests[0]["base"], "/restore.snap");
+        assert!(requests[2].get("base").is_none(), "{}", requests[2]);
+        assert_eq!(std::fs::read(first.snapshot_path()).unwrap(), SCRIPTED_RAM);
+        assert!(
+            !fixture.scratch_host_dir.join("vmm-snap-1.snap").exists(),
+            "released RAM scratch inside the jail must be removed"
+        );
+        assert_eq!(fixture.supervisor.checkpoint_base(fixture.id), None);
+        drop(first);
+        drop(second);
+        fixture.finish();
+    }
+
     #[test]
     fn sparse_artifact_hashes_match_reading_every_chunk() {
         let dir = PathBuf::from(format!("target/sparse-integrity-{}", Uuid::new_v4()));
