@@ -203,49 +203,74 @@ impl CowOverlay {
         })
     }
 
+    /// Overlay data for device offset `offset` lives at `data_offset + offset`.
+    fn overlay_offset(&self, offset: u64) -> Result<u64, BlkBackendError> {
+        self.header
+            .data_offset
+            .checked_add(offset)
+            .ok_or_else(|| BlkBackendError::Validation("overlay offset overflows".into()))
+    }
+
+    /// Read in runs of sectors that come from the same file: one pread per
+    /// run instead of one per 512-byte sector.
     fn read_at(&mut self, offset: u64, data: &mut [u8]) -> Result<(), BlkBackendError> {
-        for segment in BlockSegments::new(offset, data.len()) {
-            let dst = &mut data[segment.buffer_range()];
-            let source_offset = if self.is_dirty(segment.block) {
-                self.overlay_block_offset(segment.block)?
-                    .checked_add(segment.within_block as u64)
-                    .ok_or_else(|| BlkBackendError::Validation("overlay read overflows".into()))?
+        let mut segments = BlockSegments::new(offset, data.len()).peekable();
+        while let Some(first) = segments.next() {
+            let dirty = self.is_dirty(first.block);
+            let start = first.buffer_offset;
+            let mut end = start + first.len;
+            while let Some(next) = segments.peek() {
+                if self.is_dirty(next.block) != dirty {
+                    break;
+                }
+                end = next.buffer_offset + next.len;
+                segments.next();
+            }
+            let device_offset = offset
+                .checked_add(start as u64)
+                .ok_or_else(|| BlkBackendError::Validation("read offset overflows".into()))?;
+            if dirty {
+                let source = self.overlay_offset(device_offset)?;
+                read_exact_at(&mut self.overlay, source, &mut data[start..end])?;
             } else {
-                segment
-                    .absolute_offset()
-                    .ok_or_else(|| BlkBackendError::Validation("base read overflows".into()))?
-            };
-            if self.is_dirty(segment.block) {
-                read_exact_at(&mut self.overlay, source_offset, dst)?;
-            } else {
-                read_exact_at(&mut self.base, source_offset, dst)?;
+                read_exact_at(&mut self.base, device_offset, &mut data[start..end])?;
             }
         }
         Ok(())
     }
 
+    /// Copy up the base bytes of a partially written edge sector that is not
+    /// in the overlay yet, then write the whole request with one pwrite and
+    /// record the newly dirty sectors with one bitmap write. Data reaches the
+    /// overlay before the bitmap says to read it from there; both are durable
+    /// after the next flush.
     fn write_at(
         &mut self,
         offset: u64,
         data: &[u8],
         force_unit_access: bool,
     ) -> Result<(), BlkBackendError> {
-        for segment in BlockSegments::new(offset, data.len()) {
-            let dirty = self.is_dirty(segment.block);
-            let dst_offset = self
-                .overlay_block_offset(segment.block)?
-                .checked_add(segment.within_block as u64)
-                .ok_or_else(|| BlkBackendError::Validation("overlay write overflows".into()))?;
-
-            if !dirty && (segment.within_block != 0 || segment.len != SECTOR_SIZE_USIZE) {
-                self.copy_base_block_to_overlay(segment.block)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| BlkBackendError::Validation("overlay write overflows".into()))?;
+        let first_block = offset / SECTOR_SIZE;
+        let last_block = (end - 1) / SECTOR_SIZE;
+        for block in [first_block, last_block] {
+            let block_start = block * SECTOR_SIZE;
+            let covered = end.min(block_start + SECTOR_SIZE) - offset.max(block_start);
+            if covered < SECTOR_SIZE && !self.is_dirty(block) {
+                self.copy_base_block_to_overlay(block)?;
             }
-
-            write_all_at(&mut self.overlay, dst_offset, &data[segment.buffer_range()])?;
-            if !dirty {
-                self.mark_dirty(segment.block)?;
+            if first_block == last_block {
+                break;
             }
         }
+        let destination = self.overlay_offset(offset)?;
+        write_all_at(&mut self.overlay, destination, data)?;
+        self.mark_dirty_range(first_block, last_block)?;
 
         if force_unit_access {
             self.flush()?;
@@ -268,20 +293,27 @@ impl CowOverlay {
         self.bitmap[byte_idx] & bit != 0
     }
 
-    fn mark_dirty(&mut self, block: u64) -> Result<(), BlkBackendError> {
-        let byte_idx = (block / 8) as usize;
-        let bit = 1u8 << (block % 8);
-        self.bitmap[byte_idx] |= bit;
+    /// Mark sectors `first..=last` dirty and persist only the bitmap bytes
+    /// that changed, in one write.
+    fn mark_dirty_range(&mut self, first: u64, last: u64) -> Result<(), BlkBackendError> {
+        let mut changed: Option<(usize, usize)> = None;
+        for block in first..=last {
+            let byte_idx = (block / 8) as usize;
+            let bit = 1u8 << (block % 8);
+            if self.bitmap[byte_idx] & bit == 0 {
+                self.bitmap[byte_idx] |= bit;
+                changed = Some(changed.map_or((byte_idx, byte_idx), |(lo, _)| (lo, byte_idx)));
+            }
+        }
+        let Some((lo, hi)) = changed else {
+            return Ok(());
+        };
         let bitmap_offset = self
             .header
             .bitmap_offset
-            .checked_add(byte_idx as u64)
+            .checked_add(lo as u64)
             .ok_or_else(|| BlkBackendError::Validation("bitmap offset overflows".into()))?;
-        write_all_at(
-            &mut self.overlay,
-            bitmap_offset,
-            std::slice::from_ref(&self.bitmap[byte_idx]),
-        )?;
+        write_all_at(&mut self.overlay, bitmap_offset, &self.bitmap[lo..=hi])?;
         Ok(())
     }
 
@@ -743,24 +775,13 @@ impl BlkBackend {
     }
 }
 
+/// One sector's share of a request: its sector number, and where its bytes
+/// sit in the request buffer.
 #[derive(Clone, Copy)]
 struct BlockSegment {
     block: u64,
-    within_block: usize,
     len: usize,
     buffer_offset: usize,
-}
-
-impl BlockSegment {
-    fn buffer_range(self) -> std::ops::Range<usize> {
-        self.buffer_offset..self.buffer_offset + self.len
-    }
-
-    fn absolute_offset(self) -> Option<u64> {
-        self.block
-            .checked_mul(SECTOR_SIZE)?
-            .checked_add(self.within_block as u64)
-    }
 }
 
 struct BlockSegments {
@@ -791,7 +812,6 @@ impl Iterator for BlockSegments {
         let len = cmp::min(SECTOR_SIZE_USIZE - within_block, self.remaining);
         let segment = BlockSegment {
             block,
-            within_block,
             len,
             buffer_offset: self.buffer_offset,
         };
@@ -1123,6 +1143,60 @@ mod tests {
             service_read(&mut reopened, 1, SECTOR_SIZE_USIZE),
             [0xDD; 512]
         );
+    }
+
+    #[test]
+    fn cow_random_io_matches_a_byte_model_and_survives_reopen() {
+        // Unaligned, cross-sector and mixed overlay/base reads and writes
+        // against an in-memory copy of the device.
+        let dir = private_tempdir();
+        let base = dir.path().join("base.img");
+        let overlay = dir.path().join("vm.overlay");
+        let sectors = 96usize;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base_bytes: Vec<u8> = (0..sectors * SECTOR_SIZE_USIZE)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
+        std::fs::write(&base, &base_bytes).unwrap();
+        let mut model = base_bytes.clone();
+        let len = model.len() as u64;
+
+        let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
+        for round in 0..600u64 {
+            let offset = next() % len;
+            let max = (len - offset).min(8 * SECTOR_SIZE);
+            let size = (next() % max + 1) as usize;
+            let at = offset as usize;
+            if next() % 2 == 0 {
+                let data: Vec<u8> = (0..size)
+                    .map(|i| (round as usize + i) as u8 ^ 0xa5)
+                    .collect();
+                backend.write_at(offset, &data, false).unwrap();
+                model[at..at + size].copy_from_slice(&data);
+            } else {
+                let mut got = vec![0u8; size];
+                backend.read_at(offset, &mut got).unwrap();
+                assert_eq!(got, model[at..at + size], "read at {offset} len {size}");
+            }
+        }
+        let mut all = vec![0u8; model.len()];
+        backend.read_at(0, &mut all).unwrap();
+        assert_eq!(all, model);
+        backend.flush().unwrap();
+        drop(backend);
+
+        // The bitmap and data persist; the base is untouched.
+        let mut reopened = BlkBackend::open_cow(&base, &overlay).unwrap();
+        let mut all = vec![0u8; model.len()];
+        reopened.read_at(0, &mut all).unwrap();
+        assert_eq!(all, model);
+        assert_eq!(std::fs::read(&base).unwrap(), base_bytes);
     }
 
     #[test]
