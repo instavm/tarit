@@ -767,7 +767,12 @@ fn run(
     // Build the kernel cmdline, appending virtio_mmio.device entries for
     // each volume + the optional net device. The kernel needs these to
     // discover the MMIO devices.
-    let mut cmdline = cmdline.unwrap_or_else(vmm_loader::default_cmdline);
+    // Like `create`, mount an attached rootfs unless the caller supplies a
+    // complete command line; without `root=` the guest kernel panics.
+    let mut cmdline = cmdline.unwrap_or_else(|| match rootfs {
+        Some(_) => format!("root=/dev/vda rw {}", vmm_loader::default_cmdline()),
+        None => vmm_loader::default_cmdline(),
+    });
     let mut next_mmio = 0xd000_0000u64;
     let mut next_irq: u32 = 5;
     for _ in volumes.iter() {
@@ -1052,8 +1057,12 @@ fn boot_on_kvm(
     // controller restore path additionally queues a change notification before
     // any restored vCPU enters KVM_RUN.
     let vmgenid = vmm_core::vmgenid::VmGenId::new(mem)?;
-    vm.register_irqfd(vmgenid.eventfd(), vmm_core::vmgenid::VMGENID_GSI)
-        .map_err(|e| anyhow::anyhow!("VM Generation ID irqfd: {e}"))?;
+    // Its change notification is an interrupt, which needs the in-kernel
+    // IRQ chip that only full boot creates.
+    if full_boot {
+        vm.register_irqfd(vmgenid.eventfd(), vmm_core::vmgenid::VMGENID_GSI)
+            .map_err(|e| anyhow::anyhow!("VM Generation ID irqfd: {e}"))?;
+    }
 
     // Register irqfds + ioeventfds with KVM.
     for (i, evt) in irq_evts.iter().enumerate() {
