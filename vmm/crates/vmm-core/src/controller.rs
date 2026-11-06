@@ -991,6 +991,13 @@ impl VmmController {
         let template = crate::cpu_template::CpuTemplate::bare();
         let kvm_vm =
             crate::kvm::KvmVm::new_with_options(mem.clone(), devices, template, full_boot)?;
+        // Overlap the slow resampler registration with the rest of the wiring.
+        let balloon_irqfd = balloon
+            .as_ref()
+            .map(|wired| {
+                kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
+            })
+            .transpose()?;
 
         // Expose a fresh generation value from the first boot. The eventfd is
         // registered now and kept alive for the VM lifetime; it is triggered
@@ -1093,14 +1100,10 @@ impl VmmController {
         }
 
         let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
-        let balloon_irq_resample = match balloon {
+        let mut balloon_irq_resample = match balloon {
             Some(wired) => {
-                kvm_vm.register_irqfd_with_resample(
-                    &wired.irq_evt,
-                    &wired.resample_evt,
-                    wired.irq,
-                )?;
                 let loop_handle = BalloonIrqResample::spawn(
+                    balloon_irqfd,
                     wired.device,
                     wired
                         .irq_evt
@@ -1182,6 +1185,10 @@ impl VmmController {
                 serial.clone(),
             ));
             log::info!("SMP: AP vCPU {id} created (UNINITIALIZED, awaiting SIPI)");
+        }
+
+        if let Some(resample) = balloon_irq_resample.as_mut() {
+            resample.finish_registration()?;
         }
 
         let state_blob = serialize_state_blob(
@@ -1670,6 +1677,7 @@ impl VmmController {
         let start = Instant::now();
         let restored =
             restore_snapshot_with_policy(snapshot_path, memory_policy, memory_integrity.as_ref())?;
+        let memory_loaded = start.elapsed();
         let RestoredSnapshot {
             mem,
             state_blob,
@@ -1786,6 +1794,7 @@ impl VmmController {
         // thread resumed). A live snapshot must fail closed if reconstruction
         // fails; publishing a paused memory-only VM would hide incompatibility
         // and expose partially restored state.
+        let config_ready = start.elapsed();
         let (running, state) = match vcpu_full.as_ref() {
             Some(fs) => {
                 let restored = RestoredRuntimeState {
@@ -1805,6 +1814,7 @@ impl VmmController {
             None => (None, VmState::Paused),
         };
         let resumed = running.is_some();
+        let vm_built = start.elapsed();
         // With every guest write tracked since restore, the snapshot restored
         // here is the parent of the next diff snapshot: restore, run, and
         // checkpoint again writes only the pages the run touched.
@@ -1834,7 +1844,9 @@ impl VmmController {
         });
         drop(slot);
         if resumed {
-            if let Err(error) = await_clone_repair_barrier(self) {
+            if let Err(error) =
+                await_clone_repair_barrier(self).and_then(|()| self.finish_irq_registration())
+            {
                 // A clone whose kernel/userspace state was not repaired must
                 // never become externally usable. Taking the instance drops
                 // its vCPUs, devices, lazy handler, and private overlays.
@@ -1847,6 +1859,11 @@ impl VmmController {
             "VM restored in {:?} ({})",
             start.elapsed(),
             if resumed { "running" } else { "paused" }
+        );
+        log::debug!(
+            "restore phases: memory {memory_loaded:?}, config {config_ready:?}, \
+             vm built {vm_built:?}, guest repaired {:?}",
+            start.elapsed()
         );
         Ok(())
     }
@@ -2551,6 +2568,24 @@ fn build_clone_repair_v3_command(
     )
     .expect("writing timestamp hex to a String cannot fail");
     command
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+impl VmmController {
+    /// Finish interrupt registrations a restore started in the background.
+    /// The join happens outside the controller lock.
+    fn finish_irq_registration(&self) -> Result<()> {
+        let pending = self
+            .lock()
+            .as_mut()
+            .and_then(|vm| vm.running.as_mut())
+            .and_then(|running| running.balloon_irq_resample.as_mut())
+            .and_then(|resample| resample.registration.take());
+        match pending {
+            Some(mut pending) => pending.finish(),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -3379,6 +3414,17 @@ fn staged_owned_output(target: &Path) -> Result<OwnedScratchFile> {
     })
 }
 
+/// Publish VMM-private scratch that is removed when this process exits. It
+/// skips every fsync: after a host crash the VM it belongs to is gone too.
+fn publish_volatile_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<()> {
+    owned.rename_to_volatile(target).map_err(|error| {
+        VmmError::Snapshot(format!(
+            "publish scratch output {}: {error}",
+            target.display()
+        ))
+    })
+}
+
 fn persist_owned_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<()> {
     owned.file().sync_all().map_err(|error| {
         VmmError::Snapshot(format!(
@@ -3571,12 +3617,32 @@ fn privatize_template_volumes(config: &mut VmConfig) -> Result<Vec<OwnedScratchF
             if template_upper.is_none() && !template_disk {
                 continue;
             }
+            // The private upper lives in this VMM's runtime directory and is
+            // removed on exit, so it is published without fsyncs.
             let target = crate::gc::owned_overlay_path(&private_runtime_dir()?, index);
             let owned = match template_upper {
-                Some(upper) => seed_restore_overlay(&upper, &target)?,
+                Some(upper) => seed_overlay(&upper, &target, false)?,
                 None => {
                     let mut owned = staged_owned_output(&target)?;
-                    persist_owned_output(&mut owned, &target)?;
+                    let initialized =
+                        owned
+                            .file()
+                            .try_clone()
+                            .map_err(Into::into)
+                            .and_then(|mut file| {
+                                vmm_devices::virtio::blk_backend::init_volatile_cow_overlay(
+                                    &mut file,
+                                    Path::new(&volume.path),
+                                )
+                            });
+                    if let Err(error) = initialized {
+                        remove_owned_scratch_file(&owned);
+                        return Err(VmmError::Device(format!(
+                            "initialize private overlay for {}: {error}",
+                            volume.path
+                        )));
+                    }
+                    publish_volatile_output(&mut owned, &target)?;
                     owned
                 }
             };
@@ -3943,6 +4009,14 @@ fn reject_golden_overlay_target(
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
 fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile> {
+    seed_overlay(source, target, true)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn seed_overlay(source: &Path, target: &Path, durable: bool) -> Result<OwnedScratchFile> {
     if source == target {
         return Err(VmmError::InvalidConfig(format!(
             "restore overlay must differ from golden overlay: {}",
@@ -3970,7 +4044,12 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
             target.display()
         )));
     }
-    if let Err(error) = persist_owned_output(&mut owned_target, target) {
+    let published = if durable {
+        persist_owned_output(&mut owned_target, target)
+    } else {
+        publish_volatile_output(&mut owned_target, target)
+    };
+    if let Err(error) = published {
         remove_owned_scratch_file(&owned_target);
         return Err(error);
     }
@@ -3981,6 +4060,8 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
+/// Copy an overlay's contents. Durability is the caller's choice: a published
+/// copy is synced by `persist_owned_output`, VMM-private scratch is not.
 fn copy_restore_overlay(
     source: &mut std::fs::File,
     target: &mut std::fs::File,
@@ -3992,7 +4073,7 @@ fn copy_restore_overlay(
         const FICLONE: libc::Ioctl = 0x4004_9409;
         let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE, source.as_raw_fd()) };
         if cloned == 0 {
-            return target.sync_all();
+            return Ok(());
         }
         let error = std::io::Error::last_os_error();
         if !matches!(
@@ -4023,7 +4104,7 @@ fn copy_dense_restore_overlay(
     source.seek(SeekFrom::Start(0))?;
     target.seek(SeekFrom::Start(0))?;
     std::io::copy(source, target)?;
-    target.sync_all()
+    Ok(())
 }
 
 #[cfg(any(
@@ -6638,6 +6719,15 @@ fn build_running_vm(
 
     let template = crate::cpu_template::CpuTemplate::bare();
     let kvm_vm = crate::kvm::KvmVm::new_with_options(mem, devices, template, full_boot)?;
+    // The resampler registration waits out an SRCU grace period. Run it
+    // while the rest of the VM is wired and the guest reconnects; restore
+    // finishes it before reporting success.
+    let balloon_irqfd = balloon
+        .as_ref()
+        .map(|wired| {
+            kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
+        })
+        .transpose()?;
 
     // Track guest writes from the first restored instruction, so the next diff
     // snapshot contains only what changed since the snapshot restored here.
@@ -6751,8 +6841,8 @@ fn build_running_vm(
     let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
     let balloon_irq_resample = match balloon {
         Some(wired) => {
-            kvm_vm.register_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)?;
             let loop_handle = BalloonIrqResample::spawn(
+                balloon_irqfd,
                 wired.device,
                 wired
                     .irq_evt
@@ -6958,6 +7048,8 @@ struct WiredBalloon {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 pub struct BalloonIrqResample {
+    /// The irqfd registration, until it is finished.
+    registration: Option<crate::kvm::PendingIrqfd>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     /// Wakes the thread so teardown does not wait out its poll timeout.
     wake: vmm_sys_util::eventfd::EventFd,
@@ -7042,6 +7134,7 @@ fn tap_ipv4(name: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 impl BalloonIrqResample {
     fn spawn(
+        registration: Option<crate::kvm::PendingIrqfd>,
         device: Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>,
         irq_evt: vmm_sys_util::eventfd::EventFd,
         resample_evt: vmm_sys_util::eventfd::EventFd,
@@ -7086,10 +7179,19 @@ impl BalloonIrqResample {
             })
             .map_err(|error| VmmError::Kvm(format!("spawn balloon IRQ resample: {error}")))?;
         Ok(Self {
+            registration,
             stop,
             wake,
             handle: Some(handle),
         })
+    }
+
+    /// Wait for the balloon irqfd registration started alongside this loop.
+    fn finish_registration(&mut self) -> Result<()> {
+        match self.registration.as_mut() {
+            Some(pending) => pending.finish(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -7596,7 +7698,14 @@ mod tests {
             "template disk stays the lower"
         );
         let empty_upper = config.volumes[1].overlay.clone().unwrap();
-        assert_eq!(std::fs::metadata(&empty_upper).unwrap().len(), 0);
+        assert!(
+            vmm_devices::virtio::blk_backend::BlkBackend::open_cow(
+                Path::new(&disk_path),
+                Path::new(&empty_upper),
+            )
+            .is_ok(),
+            "the template disk gets an initialized private upper"
+        );
         assert_eq!(
             config.volumes[2].overlay.as_deref(),
             Some(live.to_str().unwrap()),

@@ -125,6 +125,43 @@ impl CowHeader {
     }
 }
 
+fn write_fresh_cow(overlay: &mut File, header: &CowHeader) -> Result<(), BlkBackendError> {
+    write_all_at(overlay, 0, &header.encode())?;
+    let bitmap = vec![0u8; usize_from_u64(header.bitmap_len, "bitmap length")?];
+    write_all_at(overlay, header.bitmap_offset, &bitmap)?;
+    overlay.set_len(header.data_offset)?;
+    Ok(())
+}
+
+/// Initialize an empty CoW overlay for `base_path` without syncing it.
+///
+/// Only for scratch overlays that the VMM creates in its private runtime
+/// directory and removes when it exits: after a host crash the VM they belong
+/// to is gone, so a durable header buys nothing and costs an fsync on every
+/// restore. [`BlkBackend::open_cow`] initializes and syncs any other empty
+/// overlay.
+pub fn init_volatile_cow_overlay(
+    overlay: &mut File,
+    base_path: &Path,
+) -> Result<(), BlkBackendError> {
+    if overlay.metadata()?.len() != 0 {
+        return Err(BlkBackendError::Validation(
+            "volatile CoW overlay must start empty".into(),
+        ));
+    }
+    let mut base_options = OpenOptions::new();
+    base_options.read(true);
+    #[cfg(unix)]
+    base_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let bytes = backing_size_bytes(&base_options.open(base_path)?)?;
+    if bytes == 0 || bytes % SECTOR_SIZE != 0 {
+        return Err(BlkBackendError::Validation(format!(
+            "CoW base size {bytes} is not a positive multiple of {SECTOR_SIZE}"
+        )));
+    }
+    write_fresh_cow(overlay, &CowHeader::new(bytes / SECTOR_SIZE)?)
+}
+
 struct CowOverlay {
     base: File,
     overlay: File,
@@ -137,11 +174,9 @@ impl CowOverlay {
         let expected = CowHeader::new(blocks)?;
         let overlay_len = overlay.metadata()?.len();
         let header = if overlay_len == 0 {
-            let header_buf = expected.encode();
-            write_all_at(&mut overlay, 0, &header_buf)?;
-            let bitmap = vec![0u8; usize_from_u64(expected.bitmap_len, "bitmap length")?];
-            write_all_at(&mut overlay, expected.bitmap_offset, &bitmap)?;
-            overlay.set_len(expected.data_offset)?;
+            write_fresh_cow(&mut overlay, &expected)?;
+            // A persistent overlay must reopen after a host crash even if the
+            // guest never flushed, so its header is durable before first use.
             overlay.sync_all()?;
             expected
         } else {
@@ -1133,6 +1168,48 @@ mod tests {
         assert_eq!(std::fs::read(&base).unwrap(), original_base);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn volatile_cow_overlay_opens_like_a_synced_one() {
+        let dir = private_tempdir();
+        let base = dir.path().join("base.img");
+        let volatile = dir.path().join("volatile.overlay");
+        let synced = dir.path().join("synced.overlay");
+        write_block_pattern(&base, &[0x10, 0x20, 0x30]);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&volatile)
+            .unwrap();
+        init_volatile_cow_overlay(&mut file, &base).unwrap();
+        drop(BlkBackend::open_cow(&base, &synced).unwrap());
+        assert_eq!(
+            std::fs::read(&volatile).unwrap(),
+            std::fs::read(&synced).unwrap(),
+            "the volatile initializer must write exactly what open_cow writes"
+        );
+
+        let mut backend = BlkBackend::open_cow(&base, &volatile).unwrap();
+        assert_eq!(
+            service_read(&mut backend, 1, SECTOR_SIZE_USIZE),
+            [0x20; 512]
+        );
+        service_write(&mut backend, 2, &[0xEE; SECTOR_SIZE_USIZE]);
+        assert_eq!(
+            service_read(&mut backend, 2, SECTOR_SIZE_USIZE),
+            [0xEE; 512]
+        );
+
+        // Never re-initialize an overlay that already holds data.
+        let mut used = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&volatile)
+            .unwrap();
+        assert!(init_volatile_cow_overlay(&mut used, &base).is_err());
     }
 
     #[test]

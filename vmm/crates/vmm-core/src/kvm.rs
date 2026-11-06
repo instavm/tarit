@@ -62,6 +62,48 @@ pub(crate) fn open_kvm() -> Result<kvm_ioctls::Kvm> {
 }
 
 /// A live KVM VM: the VM fd + the guest memory + the MMIO bus.
+/// `KVM_IRQFD`: `_IOW(KVMIO, 0x76, struct kvm_irqfd)`.
+// `libc::Ioctl` is c_ulong on glibc and c_int on musl.
+const KVM_IRQFD: libc::Ioctl = 0x4020_ae76 as libc::Ioctl;
+const _: () = assert!(std::mem::size_of::<kvm_bindings::kvm_irqfd>() == 0x20);
+
+/// An irqfd registration still running on its helper thread; see
+/// [`KvmVm::begin_irqfd_with_resample`]. Dropping it waits for the thread.
+pub struct PendingIrqfd {
+    gsi: u32,
+    handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl PendingIrqfd {
+    /// Wait for the registration and report its result.
+    pub fn finish(&mut self) -> Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        let gsi = self.gsi;
+        match handle.join() {
+            Ok(Ok(())) => {
+                log::info!("irqfd+resample registered: gsi={gsi}");
+                Ok(())
+            }
+            Ok(Err(e)) => Err(VmmError::Kvm(format!(
+                "register_irqfd_with_resample({gsi}): {e}"
+            ))),
+            Err(_) => Err(VmmError::Kvm(format!(
+                "register_irqfd_with_resample({gsi}): registration thread panicked"
+            ))),
+        }
+    }
+}
+
+impl Drop for PendingIrqfd {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct KvmVm {
     pub vm_fd: VmFd,
     pub mem: GuestMemory,
@@ -342,16 +384,22 @@ impl KvmVm {
         Ok(())
     }
 
-    /// Register a level-triggered irqfd and its guest-EOI resample event.
-    pub fn register_irqfd_with_resample(
+    /// Start registering a level-triggered irqfd and its guest-EOI resample
+    /// event.
+    ///
+    /// The GSI route is installed before this returns. The `KVM_IRQFD` call
+    /// itself runs on a helper thread because adding a resampler waits for an
+    /// SRCU grace period, several milliseconds that would otherwise sit on the
+    /// boot and restore path. The caller must [`PendingIrqfd::finish`] it
+    /// before publishing the VM; until then a signal on `evt` stays pending in
+    /// the eventfd and KVM injects it when the irqfd attaches.
+    pub fn begin_irqfd_with_resample(
         &self,
         evt: &EventFd,
         resample_evt: &EventFd,
         gsi: u32,
-    ) -> Result<()> {
-        self.vm_fd
-            .register_irqfd_with_resample(evt, resample_evt, gsi)
-            .map_err(|e| VmmError::Kvm(format!("register_irqfd_with_resample({gsi}): {e}")))?;
+    ) -> Result<PendingIrqfd> {
+        use std::os::fd::{AsRawFd, OwnedFd};
 
         let mut entry = kvm_bindings::kvm_irq_routing_entry {
             gsi,
@@ -360,14 +408,57 @@ impl KvmVm {
         };
         entry.u.irqchip.irqchip = kvm_bindings::KVM_IRQCHIP_IOAPIC;
         entry.u.irqchip.pin = gsi;
+        {
+            let mut entries = self
+                .routing_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.push(entry);
+            self.apply_gsi_routing(&entries)?;
+        }
 
-        let mut entries = self
-            .routing_entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        entries.push(entry);
-        self.apply_gsi_routing(&entries)?;
-        Ok(())
+        let dup = |fd: i32, what: &str| -> Result<OwnedFd> {
+            // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor that the
+            // returned OwnedFd owns exclusively.
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if duplicate < 0 {
+                return Err(VmmError::Kvm(format!(
+                    "dup {what} for irqfd({gsi}): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: `duplicate` is a fresh descriptor owned by nobody else.
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+        };
+        let vm = dup(self.vm_fd.as_raw_fd(), "VM fd")?;
+        let evt = dup(evt.as_raw_fd(), "irq eventfd")?;
+        let resample = dup(resample_evt.as_raw_fd(), "resample eventfd")?;
+        let handle = std::thread::Builder::new()
+            .name("kvm-irqfd".into())
+            .spawn(move || {
+                let irqfd = kvm_bindings::kvm_irqfd {
+                    fd: evt.as_raw_fd() as u32,
+                    resamplefd: resample.as_raw_fd() as u32,
+                    gsi,
+                    flags: kvm_bindings::KVM_IRQFD_FLAG_RESAMPLE,
+                    ..Default::default()
+                };
+                // SAFETY: `vm` is a KVM VM descriptor and the kernel reads
+                // exactly one kvm_irqfd from the pointer during the call. KVM
+                // takes its own references to both eventfds, so closing these
+                // duplicates afterwards does not detach the irqfd.
+                let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IRQFD, &irqfd) };
+                if ret == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+            .map_err(|e| VmmError::Kvm(format!("spawn irqfd({gsi}) registration: {e}")))?;
+        Ok(PendingIrqfd {
+            gsi,
+            handle: Some(handle),
+        })
     }
 
     /// Capture VM-level (not per-vCPU) state for a faithful resume: the
