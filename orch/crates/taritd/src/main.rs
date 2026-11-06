@@ -672,6 +672,7 @@ async fn run_server(
     );
     let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());
     let artifact_gc = spawn_artifact_gc(state.clone(), shutdown_rx.clone());
+    prewarm_file_digests(&state);
     let artifact_repair = spawn_artifact_repair(state.clone(), shutdown_rx.clone());
 
     let shutdown_signal_task = spawn_shutdown_signal(shutdown.clone(), shutdown_rx.clone());
@@ -784,6 +785,30 @@ fn artifact_references(
         snapshot_paths,
         runtime_paths,
     }
+}
+
+/// Hash the configured kernel and every registered image once in the
+/// background, so the first create or snapshot after a restart does not wait
+/// on a full-image digest. The digests are recomputed (not trusted) if a file
+/// changes; this only warms the cache.
+fn prewarm_file_digests(state: &AppState) {
+    let mut paths = vec![state.config.kernel.clone()];
+    if let Ok(store) = state.store.lock() {
+        if let Ok(images) = store.list_images() {
+            paths.extend(
+                images
+                    .into_iter()
+                    .map(|image| std::path::PathBuf::from(image.rootfs_path)),
+            );
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        for path in paths {
+            if let Err(error) = image::sha256_regular_file(&path) {
+                tracing::debug!(path = %path.display(), %error, "digest prewarm skipped");
+            }
+        }
+    });
 }
 
 fn spawn_artifact_gc(

@@ -583,6 +583,59 @@ fn validate_sha256_digest(digest: &str) -> Result<()> {
     Ok(())
 }
 
+/// Identity of a file's contents as far as the kernel reports it. Any write
+/// moves mtime and ctime, and ctime cannot be set from userspace without
+/// changing the clock (root, who can defeat any check here anyway).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
+    /// Timestamps come from a coarse clock, so a write in the same tick as the
+    /// last change would leave them unchanged. Only files that have been
+    /// quiet for longer than any tick are safe to remember.
+    fn settled(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        now.saturating_sub(self.ctime.0) >= DIGEST_CACHE_SETTLE_SECS
+    }
+}
+
+const DIGEST_CACHE_SETTLE_SECS: i64 = 2;
+const DIGEST_CACHE_ENTRIES: usize = 256;
+
+type DigestCache = std::sync::Mutex<std::collections::HashMap<(u64, u64), (FileIdentity, String)>>;
+
+fn digest_cache() -> &'static DigestCache {
+    static CACHE: std::sync::OnceLock<DigestCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// SHA-256 of a regular file's contents.
+///
+/// Admitted images and kernels are re-verified on every snapshot and restore;
+/// hashing a 1 GiB rootfs each time made a checkpoint cost half a second. A
+/// digest is reused only while the file keeps the exact identity (device,
+/// inode, size, mtime, ctime) it had before and after it was hashed, and only
+/// once it has been unchanged for longer than the timestamp clock's tick.
 pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
     let metadata =
         std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -594,10 +647,21 @@ pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     let file = options.open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let before = file.metadata()?;
+    if !before.file_type().is_file() {
         bail!("{} changed type while opening", path.display());
     }
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let identity = FileIdentity::of(&before);
+    let key = (identity.dev, identity.ino);
+    if identity.settled() {
+        let cache = digest_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, digest)) = cache.get(&key) {
+            if *cached == identity {
+                return Ok(digest.clone());
+            }
+        }
+    }
+    let mut reader = BufReader::with_capacity(1024 * 1024, &file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
@@ -607,7 +671,15 @@ pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    if identity.settled() && FileIdentity::of(&file.metadata()?) == identity {
+        let mut cache = digest_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= DIGEST_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, (identity, digest.clone()));
+    }
+    Ok(digest)
 }
 
 pub fn remove_image(config: &LocalImageConfig, image_ref: &ImageRef) -> Result<ImageRecord> {
@@ -852,6 +924,39 @@ fn remove_registered_file(images_dir: &Path, rootfs_path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_digests_are_reused_only_while_the_file_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("tarit-digest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image.ext4");
+        std::fs::write(&path, b"first contents").unwrap();
+        let fresh = sha256_regular_file(&path).unwrap();
+        assert_eq!(
+            fresh,
+            format!("sha256:{:x}", Sha256::digest(b"first contents"))
+        );
+        // A just-written file is never remembered; wait until it has settled.
+        std::thread::sleep(std::time::Duration::from_millis(
+            DIGEST_CACHE_SETTLE_SECS as u64 * 1000 + 200,
+        ));
+        assert_eq!(sha256_regular_file(&path).unwrap(), fresh);
+        let identity = FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        assert!(digest_cache()
+            .lock()
+            .unwrap()
+            .get(&(identity.dev, identity.ino))
+            .is_some_and(|(cached, digest)| *cached == identity && *digest == fresh));
+
+        // Rewriting the same inode changes its identity, so the old digest is
+        // never served for the new contents.
+        std::fs::write(&path, b"other contents!").unwrap();
+        assert_eq!(
+            sha256_regular_file(&path).unwrap(),
+            format!("sha256:{:x}", Sha256::digest(b"other contents!"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn installed_agent_is_derived_from_vmm_prefix() {
