@@ -826,9 +826,13 @@ def main():
     os.makedirs(RUN, exist_ok=True)
     os.makedirs(a.work, exist_ok=True)
     results = {"host": os.uname().nodename, "kernel": a.kernel, "mem": a.mem, "vcpus": a.vcpus}
-    for kind in a.only.split(","):
+    kinds = a.only.split(",")
+    for kind in kinds:
         results[kind] = {}
-        for s in a.scenarios.split(","):
+    # Alternate the VMMs scenario by scenario so a change in host load during
+    # a long run lands on both sides instead of on whichever ran last.
+    for s in a.scenarios.split(","):
+        for kind in kinds:
             print("== %s %s" % (kind, s), file=sys.stderr, flush=True)
             try:
                 try:
