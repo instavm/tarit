@@ -2674,12 +2674,13 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     // Scale-to-zero removes the supervisor gate, but not the VM. Check the
     // durable status before looking up a live-runtime gate so callers receive
     // a lifecycle conflict for hibernated VMs rather than a false 404.
-    ensure_vm_status(
+    let vm = ensure_vm_status(
         state,
         id,
         "snapshot",
         &[VmStatus::Running, VmStatus::Paused],
     )?;
+    ensure_no_data_volumes(state, &vm, "snapshot").await?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     Ok(snapshot_local_locked(state, id, diff, None, None)
@@ -2717,7 +2718,8 @@ pub async fn snapshot_local_for_fork(
             live_stats: None,
         });
     }
-    ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
+    let source = ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
+    ensure_no_data_volumes(state, &source, "fork").await?;
     let gate = state.supervisor.operation_gate(source_id)?;
     let _operation = gate.lock_owned().await;
     snapshot_local_locked(state, source_id, false, Some(child_id), Some(child_id)).await
@@ -4146,6 +4148,44 @@ fn validate_live_transition(
             target.as_str()
         )))
     }
+}
+
+/// A snapshot or fork child cannot reopen the source's persistent volumes:
+/// a writable one has a single writer, and the VMM refuses to restore a
+/// snapshot without its data devices. Reject before pausing the source so the
+/// caller gets a conflict instead of an unrestorable artifact. Hibernate keeps
+/// the same attachment and does not come through here.
+pub(crate) async fn ensure_no_data_volumes(
+    state: &AppState,
+    vm: &VmRecord,
+    operation: &str,
+) -> Result<(), OrchError> {
+    let Some(owner_key) = vm.owner_key.as_deref() else {
+        return Ok(());
+    };
+    let attached = if let Some(fleet) = &state.fleet {
+        fleet
+            .list_vm_volume_attachments(owner_key, vm.id)
+            .await
+            .map_err(crate::api::volume_fleet_err)?
+            .len()
+    } else {
+        state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .list_vm_volume_attachments(owner_key, vm.id)
+            .map_err(crate::api::store_err)?
+            .len()
+    };
+    if attached > 0 {
+        return Err(OrchError::Conflict(format!(
+            "cannot {operation} vm {} while it has {attached} persistent volume(s) attached; \
+             hibernate keeps them attached",
+            vm.id
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_vm_status(
@@ -5756,6 +5796,70 @@ mod tests {
             },
         );
         id
+    }
+
+    #[test]
+    fn snapshot_and_fork_refuse_vms_with_persistent_volumes() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let now = Utc::now();
+        let volume = tarit_types::VolumeRecord {
+            id: Uuid::new_v4(),
+            owner_key: "test".into(),
+            name: "data".into(),
+            provider: "local_block".into(),
+            storage_class: tarit_types::VolumeStorageClass::Block,
+            size_bytes: 4 * 1024 * 1024,
+            status: tarit_types::VolumeStatus::Available,
+            capabilities: tarit_types::VolumeCapabilities {
+                read_only_many: true,
+                read_write_once: true,
+                read_write_many: false,
+                snapshots: false,
+                clones: false,
+            },
+            host_id: Some(state.config.host_id.clone()),
+            region: None,
+            zone: None,
+            generation: 1,
+            revision: 1,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        {
+            let record = state.vm_cache.read().unwrap()[&id].clone();
+            let store = state.store.lock().unwrap();
+            store.insert_vm(&record).unwrap();
+            store.insert_volume(&volume).unwrap();
+            store
+                .bind_vm_volumes(&[tarit_types::VmVolumeAttachmentRecord {
+                    vm_id: id,
+                    volume_id: volume.id,
+                    device_index: 0,
+                    owner_key: "test".into(),
+                    mode: tarit_types::VolumeAttachmentMode::ReadWrite,
+                    volume_generation: 1,
+                    created_at: now,
+                }])
+                .unwrap();
+        }
+        let runtime = test_runtime();
+        for result in [
+            runtime
+                .block_on(snapshot_local(&state, id, false))
+                .map(drop),
+            runtime
+                .block_on(snapshot_local_for_fork(&state, id, Uuid::new_v4()))
+                .map(drop),
+        ] {
+            match result {
+                Err(OrchError::Conflict(message)) => {
+                    assert!(message.contains("persistent volume"), "{message}")
+                }
+                other => panic!("expected a volume conflict, got {:?}", other.err()),
+            }
+        }
     }
 
     #[test]
