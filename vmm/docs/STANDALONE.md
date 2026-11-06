@@ -253,6 +253,17 @@ sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 ```
 
+Any image a local Docker or Podman can run converts the same way with the `docker-daemon:` or `podman:` source. The engine pulls the image if needed (using its own registry logins) and exports the flattened root filesystem; `skopeo` and `umoci` are not needed. A `docker://` reference uses the same path automatically when `skopeo` or `umoci` is missing. This works without root: ownership, setuid/setgid bits and device nodes are written into the ext4 image with `debugfs` after `mke2fs`.
+
+```sh
+target/release/vmm pull docker-daemon:python:3.12-slim \
+  --output images/python.ext4 --size 1024 --agent guest/agent/vmm-agent
+target/release/vmm pull podman:gcr.io/distroless/python3-debian12 \
+  --output images/distroless.ext4 --size 1024 --agent guest/agent/vmm-agent
+```
+
+With the agent as init, the guest gets `/proc`, `/sys`, `/dev`, `/run`, `/tmp` and a loopback interface (`127.0.0.1`), so programs can reach servers they start inside the VM. Commands run through `/bin/sh -c`; images without a shell (distroless, `scratch`) run plain commands split on whitespace instead.
+
 Private registries can pass an auth file:
 
 ```sh

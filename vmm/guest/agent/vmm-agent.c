@@ -462,6 +462,24 @@ static bool dev_filesystem_is_mounted(void) {
  * the pseudo-filesystems a normal init would, so /dev/urandom, /dev/null, /proc
  * etc. exist for the workload (node reads /dev/urandom at startup). Must run
  * before we open the serial device, since /dev/ttyS0 lives on devtmpfs. */
+/* As PID 1 nothing else brings up loopback, and sandboxed programs talk to
+ * their own local servers over 127.0.0.1. The kernel assigns 127.0.0.1/8 and
+ * ::1 when the interface comes up. */
+static void bring_up_loopback(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return;
+    }
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    strncpy(request.ifr_name, "lo", IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFFLAGS, &request) == 0 && (request.ifr_flags & IFF_UP) == 0) {
+        request.ifr_flags = (short)(request.ifr_flags | IFF_UP | IFF_RUNNING);
+        (void)ioctl(fd, SIOCSIFFLAGS, &request);
+    }
+    close(fd);
+}
+
 static void setup_as_init(void) {
     mount_pseudo("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
     mount_pseudo("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
@@ -484,6 +502,7 @@ static void setup_as_init(void) {
     mount_pseudo("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
     mount_pseudo("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755");
     mount_pseudo("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777");
+    bring_up_loopback();
 
     /* Give children a usable PATH regardless of the image's shell profile. */
     if (getenv("PATH") == NULL) {
@@ -651,6 +670,33 @@ static int wait_for_child(pid_t pid) {
     }
 }
 
+/* Run a command in the exec child. Commands go through /bin/sh so pipes,
+ * redirects and quoting work. Images without a shell (distroless, scratch)
+ * still run plain commands: the line is split on spaces and tabs and
+ * executed directly from PATH. Returns only if nothing could be executed. */
+static void exec_command(const char *command) {
+    execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+    if (errno != ENOENT) {
+        return;
+    }
+    char *line = strdup(command);
+    if (line == NULL) {
+        return;
+    }
+    char *argv[64];
+    size_t argc = 0;
+    for (char *save = NULL, *word = strtok_r(line, " \t", &save);
+         word != NULL && argc < sizeof(argv) / sizeof(argv[0]) - 1;
+         word = strtok_r(NULL, " \t", &save)) {
+        argv[argc++] = word;
+    }
+    argv[argc] = NULL;
+    if (argc > 0) {
+        execvp(argv[0], argv);
+    }
+    free(line);
+}
+
 static void run_command(int serial_fd, const char *command) {
     int pipefd[2];
     bool wrote_output = false;
@@ -703,7 +749,7 @@ static void run_command(int serial_fd, const char *command) {
             _exit(127);
         }
         close(pipefd[1]);
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        exec_command(command);
         _exit(127);
     }
 
@@ -930,7 +976,7 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
         }
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        exec_command(command);
         _exit(127);
     }
 
