@@ -7200,26 +7200,16 @@ pub struct BalloonIrqResample {
 }
 
 /// Kernel `ip=` fragment that configures the guest's eth0 at boot from a
-/// NIC's `guest_ip`. The gateway and netmask come from the host side of the
-/// TAP (the address the operator assigned to it, e.g. `172.16.0.1/24`); a
-/// `guest_ip` written as `addr/prefix` supplies the netmask when the TAP has
-/// no IPv4 address.
+/// NIC's `guest_ip` (a plain address, as config validation requires). The
+/// gateway and netmask come from the host side of the TAP (the address the
+/// operator assigned to it, e.g. `172.16.0.1/24`); a TAP without an IPv4
+/// address gives a /24 and no gateway.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn guest_ip_boot_fragment(net: &crate::config::NetConfig) -> Option<String> {
-    let spec = net.guest_ip.as_deref()?;
-    let (addr, prefix) = match spec.split_once('/') {
-        Some((addr, prefix)) => (addr, prefix.parse::<u8>().ok().filter(|p| *p <= 32)),
-        None => (spec, None),
-    };
-    let guest: std::net::Ipv4Addr = addr.parse().ok()?;
+    let guest: std::net::Ipv4Addr = net.guest_ip.as_deref()?.parse().ok()?;
     let tap = tap_ipv4(&net.tap);
     let mask = tap
         .map(|(_, mask)| mask)
-        .or_else(|| {
-            prefix.map(|p| {
-                std::net::Ipv4Addr::from(u32::MAX.checked_shl(32 - u32::from(p)).unwrap_or(0))
-            })
-        })
         .unwrap_or(std::net::Ipv4Addr::new(255, 255, 255, 0));
     Some(format_ip_fragment(
         guest,

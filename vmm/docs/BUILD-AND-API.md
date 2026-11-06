@@ -376,7 +376,7 @@ exec agent at `/usr/sbin/vmm-agent` so the VM can service `exec` requests.
 | `net` | no | Network device list. Defaults to `[]` |
 | `net[].tap` | yes | Host TAP name |
 | `net[].guest_mac` | no | Guest MAC, or `null` |
-| `net[].guest_ip` | no | Guest IPv4, optionally `addr/prefix`, or `null`. Unless the kernel command line already has `ip=`, the VMM configures the guest's eth0 at boot with this address, using the TAP's host address and netmask as gateway and netmask |
+| `net[].guest_ip` | no | Guest IPv4 address (no prefix), or `null`. Unless the kernel command line already has `ip=`, the VMM configures the guest's eth0 at boot with this address, using the TAP's host address and netmask as gateway and netmask |
 | `net[].port_forwards` | no | Port forward list. Defaults to `[]`. Recorded for the orchestrator, which installs the DNAT rules; a VMM run on its own does not forward ports |
 | `net[].port_forwards[].host_port` | yes | Host port |
 | `net[].port_forwards[].guest_port` | yes | Guest port |
