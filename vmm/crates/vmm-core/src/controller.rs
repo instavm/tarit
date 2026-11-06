@@ -609,6 +609,7 @@ impl VmmController {
         capture_disks: bool,
     ) -> Result<(String, Vec<String>)> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Snapshot)?;
+        let started = std::time::Instant::now();
         let mut slot = self.lock();
         let vm = slot
             .as_mut()
@@ -679,6 +680,8 @@ impl VmmController {
         let mut captured_disks: Vec<OwnedScratchFile> = Vec::new();
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
         let _ = capture_disks;
+        let paused_at = started.elapsed();
+        let mut disks_at = paused_at;
         let snapshot_result = (|| -> Result<usize> {
             // Fold the vCPU state each thread captured during the pause above into
             // the stored state blob, so this snapshot is faithfully resumable (not
@@ -716,6 +719,7 @@ impl VmmController {
                 }
             }
 
+            disks_at = started.elapsed();
             // Write guest memory. When `diff` is requested and we have a parent
             // snapshot + KVM dirty logging on, write an INCREMENTAL snapshot: only
             // the pages dirtied since the parent, plus a pointer to the parent so
@@ -782,7 +786,26 @@ impl VmmController {
                     Ok(0)
                 }
             } else {
-                write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)?;
+                // Untouched pages of anonymous guest RAM are zero; pages of a
+                // file-backed or lazily (UFFD) restored guest are not, so
+                // those are always read.
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+                let populated = (vm.lazy_restore.is_none()
+                    && vm
+                        .guest_mem
+                        .as_ref()
+                        .is_some_and(|guest_mem| !guest_mem.is_file_backed()))
+                .then(|| populated_pages(mem_slice.as_ptr(), mem_slice.len()))
+                .flatten();
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+                let populated: Option<Vec<bool>> = None;
+                write_scratch_snapshot_file(
+                    &owned_snapshot,
+                    &state_blob,
+                    mem_slice,
+                    populated.as_deref(),
+                    false,
+                )?;
                 // Enable dirty logging (idempotent) + drain the initial bitmap so the
                 // next snapshot can diff against this full baseline.
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -811,6 +834,7 @@ impl VmmController {
             }
         })();
 
+        let written_at = started.elapsed();
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let io_resume_result = if io_paused_here {
             resume_running_io(vm)
@@ -852,6 +876,7 @@ impl VmmController {
                 return Err(error);
             }
         };
+        let resumed_at = started.elapsed();
         if let Err(error) = persist_owned_output(&mut owned_snapshot, &path_buf) {
             replay_consumed_dirty(vm, consumed_dirty.as_ref());
             remove_owned_scratch_file(&owned_snapshot);
@@ -877,6 +902,11 @@ impl VmmController {
         log::info!(
             "VM: snapshot saved to {path} ({mem_len} bytes mem, diff={diff}, {} disk(s) captured)",
             disk_paths.len()
+        );
+        log::debug!(
+            "snapshot phases: paused {paused_at:?}, disks {disks_at:?}, memory {written_at:?}, \
+             resumed {resumed_at:?}, persisted {:?}",
+            started.elapsed()
         );
         Ok((path, disk_paths))
     }
@@ -3098,7 +3128,10 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
             // we unregister the previous UFFD below.
             unsafe { std::slice::from_raw_parts(mem_ptr.cast_const(), mem_len) }
         };
-        if let Err(e) = write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)
+        // No populated-page hint: reading every page here is what resolves
+        // outstanding lazy-restore faults (see above).
+        if let Err(e) =
+            write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, None, false)
         {
             remove_owned_scratch_file(&owned_snapshot);
             return Err(e);
@@ -4271,9 +4304,10 @@ fn write_scratch_snapshot_file(
     owned_file: &OwnedScratchFile,
     state_blob: &[u8],
     mem_dump: &[u8],
+    populated: Option<&[bool]>,
     diff: bool,
 ) -> Result<()> {
-    write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, diff)
+    write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, populated, diff)
 }
 
 /// Assemble a full snapshot from a file-backed live pre-copy without ever
@@ -4517,13 +4551,14 @@ fn write_snapshot_file_with_mode(
     mode: SnapshotCreateMode,
 ) -> Result<()> {
     let file = open_snapshot_output(path, mode)?;
-    write_snapshot_to_file(&file, state_blob, mem_dump, diff)
+    write_snapshot_to_file(&file, state_blob, mem_dump, None, diff)
 }
 
 fn write_snapshot_to_file(
     mut file: &std::fs::File,
     state_blob: &[u8],
     mem_dump: &[u8],
+    populated: Option<&[bool]>,
     diff: bool,
 ) -> Result<()> {
     use std::io::Write;
@@ -4538,34 +4573,34 @@ fn write_snapshot_to_file(
     state_hasher.update(state_blob);
     state_hasher.update(&padding);
     let state_crc = state_hasher.finalize();
-    let mem_crc = crc32fast::hash(mem_dump);
     let flags: u16 = if diff { 1 } else { 0 };
     let mem_len = u64::try_from(mem_dump.len())
         .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
+    let mem_offset = FULL_SNAPSHOT_HEADER_LEN + state_len;
 
-    // Zero pages are left as holes below, so start from an empty file.
+    // Zero pages are left as holes, so start from an empty file. Memory goes
+    // first, in one pass that also computes its CRC (this runs while the
+    // guest is paused, so each byte of RAM is read once); the header that
+    // carries the CRC is written after it.
     file.set_len(0)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(MAGIC)
+    let mem_crc = write_sparse_at_with_crc(file, mem_offset, mem_dump, populated)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&SNAPSHOT_VERSION.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&flags.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&state_len.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&state_crc.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&mem_len.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&mem_crc.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(state_blob)
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&padding)
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    let mem_offset = FULL_SNAPSHOT_HEADER_LEN + state_len;
-    write_sparse_at(file, mem_offset, mem_dump).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    let mut header = Vec::with_capacity(FULL_SNAPSHOT_HEADER_LEN as usize + state_blob.len());
+    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    header.extend_from_slice(&flags.to_le_bytes());
+    header.extend_from_slice(&state_len.to_le_bytes());
+    header.extend_from_slice(&state_crc.to_le_bytes());
+    header.extend_from_slice(&mem_len.to_le_bytes());
+    header.extend_from_slice(&mem_crc.to_le_bytes());
+    header.extend_from_slice(state_blob);
+    header.extend_from_slice(&padding);
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&header, 0)
+            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    }
     file.set_len(mem_offset + mem_len)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.flush()
@@ -4576,10 +4611,22 @@ fn write_snapshot_to_file(
 }
 
 /// Write `data` at `offset`, skipping 4 KiB pages that are entirely zero so
-/// they stay holes in a freshly truncated file. Guest RAM is mostly untouched
-/// zero pages, so this cuts both the bytes written and the page cache a
-/// snapshot pins; holes read back as zeros, so the format is unchanged.
-fn write_sparse_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+/// they stay holes in a freshly truncated file, and return the CRC32 of all of
+/// `data`. Guest RAM is mostly untouched zero pages, so this cuts both the
+/// bytes written and the page cache a snapshot pins; holes read back as
+/// zeros, so the format is unchanged.
+///
+/// `populated` (one flag per whole page), when given, marks pages the kernel
+/// has never populated; those are zero without being read, which avoids
+/// faulting in every untouched page of a large guest. Runs of zero pages are
+/// folded into the CRC from precomputed zero-run CRCs, so only data pages are
+/// hashed byte by byte. The result equals hashing every byte.
+fn write_sparse_at_with_crc(
+    file: &std::fs::File,
+    offset: u64,
+    data: &[u8],
+    populated: Option<&[bool]>,
+) -> std::io::Result<u32> {
     use std::os::unix::fs::FileExt;
 
     const PAGE: usize = 4096;
@@ -4591,23 +4638,101 @@ fn write_sparse_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::R
             && words.iter().all(|w| *w == 0)
             && tail.iter().all(|b| *b == 0)
     };
+    let mut crc = crc32fast::Hasher::new();
+    let mut zero_pages = 0usize;
+    // Start of the pending run of data pages, if any.
+    let mut run: Option<usize> = None;
     let mut start = 0usize;
+    let mut index = 0usize;
     while start < data.len() {
-        // Skip a run of zero pages, then write the following run of data pages.
-        while start < data.len() && is_zero(&data[start..(start + PAGE).min(data.len())]) {
-            start += PAGE;
+        let end = (start + PAGE).min(data.len());
+        let whole = end - start == PAGE;
+        let unpopulated = whole && populated.is_some_and(|flags| flags.get(index) == Some(&false));
+        let zero = unpopulated || is_zero(&data[start..end]);
+        if zero && whole {
+            zero_pages += 1;
+        } else {
+            combine_zero_pages(&mut crc, std::mem::take(&mut zero_pages));
+            crc.update(&data[start..end]);
         }
-        let mut end = start;
-        while end < data.len() && !is_zero(&data[end..(end + PAGE).min(data.len())]) {
-            end += PAGE;
-        }
-        let end = end.min(data.len());
-        if end > start {
-            file.write_all_at(&data[start..end], offset + start as u64)?;
+        match (zero, run) {
+            (true, Some(first)) => {
+                file.write_all_at(&data[first..start], offset + first as u64)?;
+                run = None;
+            }
+            (false, None) => run = Some(start),
+            _ => {}
         }
         start = end;
+        index += 1;
     }
-    Ok(())
+    combine_zero_pages(&mut crc, zero_pages);
+    if let Some(first) = run {
+        file.write_all_at(&data[first..], offset + first as u64)?;
+    }
+    Ok(crc.finalize())
+}
+
+/// Extend `crc` with `pages` zero pages, using CRCs of power-of-two zero runs.
+fn combine_zero_pages(crc: &mut crc32fast::Hasher, pages: usize) {
+    static RUNS: std::sync::OnceLock<Vec<crc32fast::Hasher>> = std::sync::OnceLock::new();
+    if pages == 0 {
+        return;
+    }
+    // runs[k] hashes 2^k zero pages; 2^36 pages is 256 TiB.
+    const RUN_BITS: u32 = 36;
+    let runs = RUNS.get_or_init(|| {
+        let mut first = crc32fast::Hasher::new();
+        first.update(&[0u8; 4096]);
+        let mut runs = vec![first];
+        for _ in 1..RUN_BITS {
+            let mut doubled = runs.last().expect("non-empty").clone();
+            let last = runs.last().expect("non-empty").clone();
+            doubled.combine(&last);
+            runs.push(doubled);
+        }
+        runs
+    });
+    let mut remaining = pages;
+    while remaining >> RUN_BITS != 0 {
+        crc.combine(&runs[RUN_BITS as usize - 1]);
+        remaining -= 1usize << (RUN_BITS - 1);
+    }
+    for (bit, run) in runs.iter().enumerate().rev() {
+        if remaining & (1usize << bit) != 0 {
+            crc.combine(run);
+        }
+    }
+}
+
+/// Which pages of the host mapping `[addr, addr + len)` the kernel has
+/// populated (present in RAM or swapped out), from /proc/self/pagemap. In a
+/// private anonymous mapping every other page reads as zero. `None` when the
+/// map cannot be read, in which case every page must be read.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn populated_pages(addr: *const u8, len: usize) -> Option<Vec<bool>> {
+    use std::os::unix::fs::FileExt;
+
+    const PAGE: usize = 4096;
+    const PRESENT: u64 = 1 << 63;
+    const SWAPPED: u64 = 1 << 62;
+    if (addr as usize) % PAGE != 0 {
+        return None;
+    }
+    let pages = len / PAGE;
+    let pagemap = std::fs::File::open("/proc/self/pagemap").ok()?;
+    let mut raw = vec![0u8; pages * 8];
+    pagemap
+        .read_exact_at(&mut raw, (addr as usize / PAGE * 8) as u64)
+        .ok()?;
+    Some(
+        raw.chunks_exact(8)
+            .map(|entry| {
+                let entry = u64::from_le_bytes(entry.try_into().expect("8-byte entry"));
+                entry & (PRESENT | SWAPPED) != 0
+            })
+            .collect(),
+    )
 }
 
 /// Write an incremental (diff) snapshot: only the pages dirtied since the parent
@@ -7813,17 +7938,72 @@ mod tests {
         let _ = std::fs::remove_file(&beside);
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn unpopulated_anonymous_pages_are_written_as_zero_without_being_read() {
+        const PAGE: usize = 4096;
+        let pages = 512;
+        // SAFETY: a fresh private anonymous mapping owned by this test.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                pages * PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // SAFETY: the mapping above is pages * PAGE bytes and live until munmap.
+        let mem = unsafe { std::slice::from_raw_parts_mut(addr.cast::<u8>(), pages * PAGE) };
+        mem[3 * PAGE] = 1;
+        mem[300 * PAGE + 7] = 2;
+        mem[511 * PAGE..].fill(3);
+        // A touched-but-zero page is populated and must still be checked.
+        mem[100 * PAGE] = 5;
+        mem[100 * PAGE] = 0;
+
+        let populated = populated_pages(mem.as_ptr(), mem.len()).expect("pagemap");
+        assert!(populated[3] && populated[300] && populated[511] && populated[100]);
+        assert!(!populated[200], "never-touched pages are unpopulated");
+
+        let file = tempfile::tempfile().unwrap();
+        let crc = write_sparse_at_with_crc(&file, 0, mem, Some(&populated)).unwrap();
+        // Check before this test reads `mem` itself: reading would populate it.
+        let after = populated_pages(mem.as_ptr(), mem.len()).expect("pagemap");
+        assert!(
+            !after[200],
+            "the writer must not fault in unpopulated pages"
+        );
+        assert_eq!(crc, crc32fast::hash(mem));
+        file.set_len(mem.len() as u64).unwrap();
+        let mut back = vec![0u8; mem.len()];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut back, 0).unwrap();
+        assert_eq!(back, mem);
+        // SAFETY: unmapping exactly the mapping created above.
+        unsafe { libc::munmap(addr, pages * PAGE) };
+    }
+
     #[test]
     fn sparse_writes_skip_zero_pages_and_read_back_exactly() {
         use std::os::unix::fs::MetadataExt;
 
+        // Data in the first page, a lone page, a byte mid-run and a partial
+        // last page: every run boundary the writer has.
         let mut data = vec![0u8; 64 * 4096 + 100];
+        data[..10].fill(1);
         data[4096..8192].fill(7);
         data[40 * 4096 + 5] = 9;
         data[64 * 4096 + 99] = 3;
         let file = tempfile::tempfile().unwrap();
         file.set_len(0).unwrap();
-        write_sparse_at(&file, 8192, &data).unwrap();
+        let crc = write_sparse_at_with_crc(&file, 8192, &data, None).unwrap();
+        assert_eq!(
+            crc,
+            crc32fast::hash(&data),
+            "CRC covers zero and data pages"
+        );
         file.set_len(8192 + data.len() as u64).unwrap();
         let mut back = vec![0u8; data.len()];
         std::os::unix::fs::FileExt::read_exact_at(&file, &mut back, 8192).unwrap();
