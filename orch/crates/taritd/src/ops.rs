@@ -2765,11 +2765,19 @@ async fn snapshot_local_locked(
         if !running {
             return sup.snapshot_bundle_vm(id, diff, false, overlay_path, memory_mib);
         }
+        // The atomic live path clones the disk upper inside its final stop
+        // and therefore needs reflink. On ext4 or tmpfs take the atomic
+        // paused snapshot instead: memory and disk are captured in one pause
+        // (the disk by an extent copy) and the VM resumes. Check first, so a
+        // live attempt does not copy all of guest memory only to fail.
+        let reflink = overlay_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map_or(Some(true), crate::supervisor::directory_supports_reflink);
+        if reflink == Some(false) {
+            return sup.snapshot_bundle_vm(id, diff, true, overlay_path, memory_mib);
+        }
         match sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some()) {
-            // The atomic live path clones the disk upper inside its final
-            // stop and therefore needs reflink. On ext4 or tmpfs take the
-            // atomic paused snapshot instead: memory and disk are captured in
-            // one pause (the disk by an extent copy) and the VM resumes.
             Err(OrchError::Vmm(message)) if message.contains("requires reflink/FICLONE") => {
                 tracing::warn!(
                     %id,
@@ -2795,7 +2803,9 @@ async fn snapshot_local_locked(
             .await);
         }
     };
+    let integrity_started = std::time::Instant::now();
     let integrity = bundle.integrity()?;
+    let integrity_elapsed = integrity_started.elapsed();
     let admitted_image = if let Some(rootfs_path) = vm.rootfs_path.as_deref() {
         state
             .store
@@ -2899,6 +2909,12 @@ async fn snapshot_local_locked(
                 updated_at: record.created_at,
             }
         },
+    );
+    tracing::debug!(
+        vm = %id,
+        integrity = ?integrity_elapsed,
+        admission = ?integrity_started.elapsed().saturating_sub(integrity_elapsed),
+        "snapshot artifact phases"
     );
     let insert = {
         let store = state

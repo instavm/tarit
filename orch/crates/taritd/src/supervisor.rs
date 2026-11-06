@@ -2216,6 +2216,22 @@ fn read_exact_at(
     Ok(())
 }
 
+/// The first offset at or after `offset` that holds data, or `None` when only
+/// a hole remains. Filesystems without SEEK_DATA report everything as data.
+fn next_data_offset(file: &File, offset: u64) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let offset = i64::try_from(offset).ok()?;
+    // SAFETY: lseek on an owned, open descriptor; it only moves its offset.
+    let data = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
+    if data >= 0 {
+        return u64::try_from(data).ok();
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENXIO) => None,
+        _ => u64::try_from(offset).ok(),
+    }
+}
+
 fn hash_artifact_range(
     file: &File,
     kind: tarit_proto::ArtifactKind,
@@ -2234,7 +2250,22 @@ fn hash_artifact_range(
     // whole-file hash (one pread per MiB, not one syscall per 64 KiB chunk).
     let read_window = chunk_size.max(1024 * 1024);
     let mut buffer = vec![0u8; read_window as usize];
+    // Snapshot RAM files are sparse. A hole reads as zeros, so every whole
+    // chunk inside one has the same digest; skip reading those. The manifest
+    // is byte-for-byte what reading every chunk would produce.
+    let zero_chunk: [u8; 32] = Sha256::digest(vec![0u8; chunk_size as usize]).into();
     while offset < len {
+        let hole_chunks = match next_data_offset(file, start + offset) {
+            Some(data) => data.saturating_sub(start + offset) / chunk_size,
+            // No data after this offset: the rest of the range is a hole.
+            None => (len - offset) / chunk_size,
+        }
+        .min((len - offset) / chunk_size);
+        if hole_chunks > 0 {
+            chunk_hashes.extend(std::iter::repeat_n(zero_chunk, hole_chunks as usize));
+            offset += hole_chunks * chunk_size;
+            continue;
+        }
         let wanted = usize::try_from((len - offset).min(read_window))
             .map_err(|_| OrchError::Internal("integrity read length overflow".into()))?;
         read_exact_at(
@@ -7126,6 +7157,7 @@ impl VmmSupervisor {
         overlay_path: Option<PathBuf>,
         memory_mib: u64,
     ) -> Result<SnapshotBundle, OrchError> {
+        let started = Instant::now();
         let has_overlay = overlay_path.is_some();
         let _reservation = self.reserve_snapshot_space(id, memory_mib, has_overlay)?;
         let client = self.lifecycle_client_for(id)?;
@@ -7151,6 +7183,7 @@ impl VmmSupervisor {
                 ));
             }
         };
+        let ram_written = started.elapsed();
         let scratch_snapshot_host_path = self.host_path_for_vmm(id, &scratch_snapshot_path);
         // Keep the VMM's cleanup token armed until every member of the bundle
         // has been captured. A failed disk copy therefore cannot publish a
@@ -7187,6 +7220,7 @@ impl VmmSupervisor {
             None
         };
 
+        let disk_captured = started.elapsed();
         if resume_after {
             if let Err(error) = client.resume() {
                 if let Some((artifact, _)) = overlay_artifact {
@@ -7205,6 +7239,7 @@ impl VmmSupervisor {
             );
         }
 
+        let resumed = started.elapsed();
         let ram_staging = self.snapshot_ram_staging_path();
         let ram_destination = self.snapshot_ram_path();
         let ram_artifact = match copy_private_artifact_owned(
@@ -7243,6 +7278,7 @@ impl VmmSupervisor {
             ),
         }
 
+        let ram_claimed = started.elapsed();
         let overlay_path = overlay_artifact
             .as_ref()
             .map(|(_, destination)| destination.display().to_string());
@@ -7257,6 +7293,15 @@ impl VmmSupervisor {
                 return Err(error);
             }
         };
+        tracing::debug!(
+            vm = %id,
+            ?ram_written,
+            ?disk_captured,
+            ?resumed,
+            ?ram_claimed,
+            published = ?started.elapsed(),
+            "snapshot bundle phases"
+        );
         let bundle = SnapshotBundle {
             snapshot_path: ram_destination.display().to_string(),
             overlay_path,
@@ -8008,6 +8053,71 @@ fn copy_private_artifact_owned(
         return Err(error);
     }
     Ok(destination)
+}
+
+/// Whether files in `dir` can be reflinked (FICLONE). The atomic live snapshot
+/// clones the disk upper inside its final stop, so on a filesystem without
+/// reflink (ext4, tmpfs) it copies all of guest memory and then fails; callers
+/// use this to go straight to the paused snapshot instead. Probed once per
+/// filesystem with two scratch files. `None` means the probe itself could not
+/// run, and the caller should keep its previous behaviour.
+#[cfg(target_os = "linux")]
+pub(crate) fn directory_supports_reflink(dir: &Path) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    type ReflinkCache = std::sync::Mutex<HashMap<u64, bool>>;
+    static CACHE: std::sync::OnceLock<ReflinkCache> = std::sync::OnceLock::new();
+    let device = std::fs::metadata(dir).ok()?.dev();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(known) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&device) {
+        return Some(*known);
+    }
+
+    const FICLONE: libc::Ioctl = 0x4004_9409;
+    let probe = |name: &str| dir.join(format!(".reflink-probe-{}-{name}", Uuid::new_v4()));
+    let (source_path, clone_path) = (probe("source"), probe("clone"));
+    let create = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    };
+    let result = (|| {
+        let source = create(&source_path).ok()?;
+        source.write_all_at(&[0u8; 4096], 0).ok()?;
+        let clone = create(&clone_path).ok()?;
+        // SAFETY: both descriptors are open regular files owned by this
+        // function; the kernel does not retain them after the call.
+        let rc = unsafe { libc::ioctl(clone.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+        if rc == 0 {
+            return Some(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EOPNOTSUPP)
+            | Some(libc::ENOTTY)
+            | Some(libc::EXDEV)
+            | Some(libc::EINVAL) => Some(false),
+            _ => None,
+        }
+    })();
+    let _ = std::fs::remove_file(&source_path);
+    let _ = std::fs::remove_file(&clone_path);
+    if let Some(supported) = result {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device, supported);
+    }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn directory_supports_reflink(_dir: &Path) -> Option<bool> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -11903,6 +12013,52 @@ mod tests {
         );
 
         durable_artifact.remove().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sparse_artifact_hashes_match_reading_every_chunk() {
+        let dir = PathBuf::from(format!("target/sparse-integrity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chunk = 64 * 1024u64;
+        // Data, a long hole, data straddling a chunk edge, then a trailing
+        // hole that ends in a partial chunk.
+        let len = chunk * 40 + 1234;
+        let sparse_path = dir.join("sparse.bin");
+        let sparse = File::create(&sparse_path).unwrap();
+        sparse.set_len(len).unwrap();
+        sparse.write_all_at(&[0x11; 5000], 100).unwrap();
+        sparse
+            .write_all_at(&[0x22; 9000], chunk * 20 - 4000)
+            .unwrap();
+        let mut dense_bytes = vec![0u8; len as usize];
+        dense_bytes[100..5100].fill(0x11);
+        let edge = (chunk * 20 - 4000) as usize;
+        dense_bytes[edge..edge + 9000].fill(0x22);
+        let dense_path = dir.join("dense.bin");
+        std::fs::write(&dense_path, &dense_bytes).unwrap();
+
+        let kind = tarit_proto::ArtifactKind::Ram;
+        for start in [0, 4096] {
+            let range = len - start;
+            let from_sparse = hash_artifact_range(
+                &File::open(&sparse_path).unwrap(),
+                kind,
+                start,
+                range,
+                chunk,
+            )
+            .unwrap();
+            let expected: Vec<[u8; 32]> = dense_bytes[start as usize..]
+                .chunks(chunk as usize)
+                .map(|bytes| Sha256::digest(bytes).into())
+                .collect();
+            assert_eq!(from_sparse.chunk_hashes, expected, "start {start}");
+            let from_dense =
+                hash_artifact_range(&File::open(&dense_path).unwrap(), kind, start, range, chunk)
+                    .unwrap();
+            assert_eq!(from_dense.chunk_hashes, expected, "start {start}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
