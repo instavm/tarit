@@ -969,6 +969,9 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     }
 
     if (pid == 0) {
+        /* Own process group, so a command the host abandoned can be killed
+         * with everything it started in the foreground. */
+        (void)setpgid(0, 0);
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
         if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || dup2(stderr_pipe[1], STDERR_FILENO) < 0) {
@@ -980,23 +983,35 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
         _exit(127);
     }
 
+    (void)setpgid(pid, pid);
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
-    struct pollfd pfds[2];
+    /* Also watch the host connection. A host-side timeout drops it; without
+     * noticing, the agent would keep waiting on the command and every later
+     * exec (and a clone's entropy repair) would queue behind it. */
+    struct pollfd pfds[3];
     pfds[0].fd = stdout_pipe[0];
     pfds[0].events = POLLIN;
     pfds[0].revents = 0;
     pfds[1].fd = stderr_pipe[0];
     pfds[1].events = POLLIN;
     pfds[1].revents = 0;
+    pfds[2].fd = fd;
+    pfds[2].events = POLLRDHUP;
+    pfds[2].revents = 0;
+    bool host_gone = false;
 
-    while (pfds[0].fd >= 0 || pfds[1].fd >= 0) {
-        int prc = poll(pfds, 2, -1);
+    while (!host_gone && (pfds[0].fd >= 0 || pfds[1].fd >= 0)) {
+        int prc = poll(pfds, 3, -1);
         if (prc < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            break;
+        }
+        if (pfds[2].revents & (POLLRDHUP | POLLHUP | POLLERR)) {
+            host_gone = true;
             break;
         }
         for (size_t i = 0; i < 2; i++) {
@@ -1028,6 +1043,11 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     }
     if (stderr_pipe[0] >= 0) {
         close(stderr_pipe[0]);
+    }
+    if (host_gone) {
+        (void)kill(-pid, SIGKILL);
+        (void)wait_for_child(pid);
+        return;
     }
     (void)send_exec_exit(fd, request_id, wait_for_child(pid));
 }

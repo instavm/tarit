@@ -788,10 +788,14 @@ impl VirtioVsockMmio {
                 let mut buf = [0u8; HOST_READ_CHUNK];
                 match conn.stream.read(&mut buf) {
                     Ok(0) => {
+                        // The host end closed: it will neither send nor
+                        // receive. SEND is what tells the guest no more data
+                        // is coming (POLLRDHUP); RCV alone left a guest
+                        // blocked on the stream unaware the host had gone.
                         packets.push(host_packet(
                             *key,
                             op::SHUTDOWN,
-                            shutdown_flags::RCV,
+                            shutdown_flags::RCV | shutdown_flags::SEND,
                             Vec::new(),
                             conn.fwd_cnt,
                         ));
