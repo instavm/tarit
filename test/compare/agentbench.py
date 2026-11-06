@@ -500,6 +500,9 @@ def scen_session(kind, a, lab):
     """A coding-agent session: fetch, install, clone, test, build, serve."""
     rep = Report()
     v = vm(kind, a, lab, "sess")
+    # Whichever VMM boots first would otherwise also pay for creating the
+    # lab TAP inside its timed boot.
+    lab.tap(1)
     t = now()
     v.boot(slot=1, mem=a.mem)
     rep.metric("boot_to_ready_ms", (now() - t) * 1000)
