@@ -635,6 +635,10 @@ def scen_fork(kind, a, lab):
     parent.stop()
     n = a.forks
     clones = [vm(kind, a, lab, "fork%d" % i) for i in range(n)]
+    # Lab TAPs are created once per run; keep that out of whichever VMM's
+    # timed restores come first.
+    for i in range(n):
+        lab.tap(20 + i)
     results = [None] * n
     ready = [None] * n
     prep = [0.0] * n
@@ -713,6 +717,8 @@ def scen_burst(kind, a, lab):
     before = leak_probe(kind, a)
     n = a.burst
     sandboxes = [vm(kind, a, lab, "burst%d" % i) for i in range(n)]
+    for i in range(n):
+        lab.tap(40 + i)
     first_cmd = [None] * n
     errors = []
 
