@@ -77,6 +77,7 @@ and sustained load.
 | `fork`    | 8 clones of one warmed snapshot started at once, each moved to its own address | clones see the parent's disk but not each other's writes; boot ID, kernel RNG output and new UUIDs differ per clone; each clone is reachable at its own address |
 | `burst`   | 10 sandboxes restored at once, 30 commands each | every command returns the right answer; nothing is left behind afterwards |
 | `disk`    | 20k small files, tar round trip, a 256 MiB write with fsync, a cache drop, a generated C program | contents survive the cache drop and the round trip; the program is correct |
+| `net`     | three 256 MiB downloads from a static server on the host gateway (median throughput) | every download's SHA-256 matches the served file |
 | `soak`    | an exec every few milliseconds for 2 minutes with a pause and resume every 5 s | no failures; VMM file descriptors, threads and RSS stay flat |
 
 Networking is real and needs no root. The harness creates a user and network

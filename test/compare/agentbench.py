@@ -16,7 +16,7 @@ Scenarios (see README.md for what each verifies):
   disk     many small files, archives, a compile, large sequential writes
   soak     sustained exec load with pause/resume, watching for resource growth
 """
-import argparse, json, os, random, shutil, signal, socket, subprocess, sys
+import argparse, hashlib, json, os, random, shutil, signal, socket, subprocess, sys
 import tempfile, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +25,8 @@ import vmbench as vb  # noqa: E402  (shared agent protocol and helpers)
 GUEST_BOOT = (vb.CMDLINE + " root=/dev/vda rw init=/usr/sbin/vmm-agent")
 LAB_DNS = "10.0.2.3"          # slirp4netns resolver
 HOST_HTTP_PORT = 8080         # lab-side HTTP server guests can reach
+BULK_HTTP_PORT = 8090         # lab-side static server for bulk transfers
+BULK_MIB = 256
 NAME_RETRY = 3
 
 
@@ -50,6 +52,7 @@ class Lab:
         self.holder = None
         self.slirp = None
         self.http = None
+        self.bulk = None
         self.taps = set()
 
     def start(self):
@@ -98,6 +101,33 @@ class Lab:
             self.taps.add(name)
         return name
 
+    def bulk_file(self):
+        """A BULK_MIB random file served on every lab gateway, and its
+        SHA-256. Created and served on first use."""
+        if self.bulk is None:
+            directory = os.path.join(self.work, "bulk")
+            os.makedirs(directory, exist_ok=True)
+            digest = hashlib.sha256()
+            with open(os.path.join(directory, "bulk.bin"), "wb") as f:
+                for _ in range(BULK_MIB):
+                    chunk = os.urandom(1 << 20)
+                    digest.update(chunk)
+                    f.write(chunk)
+            server = subprocess.Popen(
+                self.prefix + [sys.executable, "-m", "http.server", str(BULK_HTTP_PORT),
+                               "--bind", "0.0.0.0", "--directory", directory],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.run("ip link set lo up")
+            deadline = now() + 10
+            while self.run("curl -sf -o /dev/null -r 0-0 http://127.0.0.1:%d/bulk.bin" % BULK_HTTP_PORT,
+                           check=False).returncode != 0:
+                if now() > deadline:
+                    server.kill()
+                    raise RuntimeError("bulk file server did not start")
+                time.sleep(0.05)
+            self.bulk = (server, digest.hexdigest())
+        return self.bulk[1]
+
     def http_hits(self, marker):
         try:
             with open(self.http_log) as f:
@@ -106,7 +136,7 @@ class Lab:
             return 0
 
     def stop(self):
-        for p in (self.http, self.slirp):
+        for p in (self.http, self.slirp, self.bulk[0] if self.bulk else None):
             if p and p.poll() is None:
                 p.kill()
                 p.wait()
@@ -807,8 +837,32 @@ def resource_probe(pid):
             "rss_kib": vb.pss_kib(target).get("Rss", 0)}
 
 
+def scen_net(kind, a, lab):
+    """Bulk download from the host gateway, verified byte for byte."""
+    rep = Report()
+    digest = lab.bulk_file()
+    v = vm(kind, a, lab, "net")
+    v.boot(slot=7, mem=a.mem)
+    try:
+        speeds, intact = [], 0
+        for _ in range(3):
+            code, out = try_exec(
+                v, "curl -sS -m 120 -o /tmp/bulk -w '%%{speed_download}\\n' http://172.16.7.1:%d/bulk.bin"
+                   " && sha256sum /tmp/bulk | cut -c1-64; rm -f /tmp/bulk" % BULK_HTTP_PORT, 180000)
+            lines = out.split() if code == 0 else []
+            if len(lines) == 2:
+                speeds.append(float(lines[0]) / 1e6)
+                intact += lines[1] == digest
+        rep.check("%d MiB download x3, contents intact" % BULK_MIB, intact == 3, "%d of 3 intact" % intact)
+        if speeds:
+            rep.metric("download_MBps", sorted(speeds)[len(speeds) // 2])
+    finally:
+        v.stop()
+    return rep.to_dict()
+
+
 SCEN = {"session": scen_session, "resume": scen_resume, "fork": scen_fork,
-        "burst": scen_burst, "disk": scen_disk, "soak": scen_soak}
+        "burst": scen_burst, "disk": scen_disk, "net": scen_net, "soak": scen_soak}
 
 
 def print_table(results):
@@ -838,7 +892,7 @@ def main():
     p.add_argument("--work", default="/var/tmp/agentbench/work")
     p.add_argument("--out", required=True)
     p.add_argument("--only", default="tarit,firecracker")
-    p.add_argument("--scenarios", default="session,resume,fork,burst,disk,soak")
+    p.add_argument("--scenarios", default="session,resume,fork,burst,disk,net,soak")
     p.add_argument("--vcpus", type=int, default=1)
     p.add_argument("--mem", type=int, default=1024)
     p.add_argument("--fork-mem", type=int, default=512)

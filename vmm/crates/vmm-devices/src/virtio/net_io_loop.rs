@@ -317,6 +317,10 @@ fn run(
         }
     ];
 
+    // A frame read from the tap that found no guest buffer (copying path).
+    let mut pending: Option<usize> = None;
+    let mut rx_blocked = false;
+
     'run: while !stop.load(Ordering::Relaxed) {
         // Pause request: acknowledge and park. While parked this thread
         // performs no guest-memory writes — the live snapshot's final stop
@@ -326,7 +330,9 @@ fn run(
             // if the counter is empty so a published descriptor cannot be
             // restored without the kick that made it visible. Drain TAP RX
             // while the vCPUs are stopped, then park before capture.
-            if !drain_kick(tx_kick_fd, &device) || !drain_tap(tap_fd, &device, &mut buf) {
+            if !drain_kick(tx_kick_fd, &device)
+                || drain_tap(tap_fd, &device, &mut buf, &mut pending) == Rx::Failed
+            {
                 break;
             }
             pause_ack.store(true, Ordering::SeqCst);
@@ -350,11 +356,34 @@ fn run(
             break;
         }
         apply_offloads(tap_fd, &device);
+        let mut tap_ready = false;
         for ev in &events[..n as usize] {
             match ev.u64 {
-                1 if !drain_tap(tap_fd, &device, &mut buf) => break 'run,
+                1 => tap_ready = true,
                 2 if !drain_kick(tx_kick_fd, &device) => break 'run,
                 3 => drain_wake(wake_fd),
+                _ => {}
+            }
+        }
+        // While blocked, retry on every wake-up (a queue kick after the guest
+        // posts buffers, or the timeout as a backstop).
+        if tap_ready || rx_blocked {
+            match drain_tap(tap_fd, &device, &mut buf, &mut pending) {
+                Rx::Failed => break,
+                Rx::Blocked if !rx_blocked => {
+                    if let Err(error) = watch_tap(ep, tap_fd, false) {
+                        log::error!("net_io_loop: stop watching tap: {error}");
+                        break;
+                    }
+                    rx_blocked = true;
+                }
+                Rx::Drained if rx_blocked => {
+                    if let Err(error) = watch_tap(ep, tap_fd, true) {
+                        log::error!("net_io_loop: watch tap: {error}");
+                        break;
+                    }
+                    rx_blocked = false;
+                }
                 _ => {}
             }
         }
@@ -364,44 +393,90 @@ fn run(
     unsafe { libc::close(ep) };
 }
 
-/// Pull all available frames from the tap (it's non-blocking) and push them
-/// to the guest RX queue. Stops at EAGAIN.
-fn drain_tap(tap_fd: RawFd, device: &Arc<VirtioNetMmio>, buf: &mut [u8]) -> bool {
+/// What [`drain_tap`] left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rx {
+    /// The tap is empty.
+    Drained,
+    /// The guest has no free receive buffer. Frames stay queued in the tap
+    /// (or in `pending`) until it posts one and kicks the queue: dropping
+    /// them instead makes TCP stall in retransmits, and with TSO the guest
+    /// posts few, large buffers that run out often.
+    Blocked,
+    Failed,
+}
+
+/// Move frames from the tap (non-blocking) into the guest's receive queue
+/// until the tap is empty or the guest has no free buffer. A frame read by
+/// the copying path that found no buffer is kept in `pending` (its length in
+/// `buf`) and delivered first next time.
+fn drain_tap(
+    tap_fd: RawFd,
+    device: &Arc<VirtioNetMmio>,
+    buf: &mut [u8],
+    pending: &mut Option<usize>,
+) -> Rx {
     apply_offloads(tap_fd, device);
-    // Deliver ready frames and interrupt the guest once per batch (at most
-    // RX_BATCH frames, so a steady stream still interrupts promptly).
+    // Interrupt the guest once per batch (at most RX_BATCH frames, so a
+    // steady stream still interrupts promptly).
     const RX_BATCH: usize = 64;
+    let signal = || match device.signal_rx() {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("net_io_loop: RX interrupt failed: {error}");
+            false
+        }
+    };
+    let deliver = |frame: &[u8]| {
+        if device.vnet_hdr() {
+            device.inject_rx_vnet_frame(frame)
+        } else {
+            device.inject_rx_packet_quiet(frame)
+        }
+    };
+    let mut unsignalled = 0usize;
+    if let Some(len) = *pending {
+        match deliver(&buf[..len]) {
+            Ok(true) => {
+                *pending = None;
+                unsignalled += 1;
+            }
+            Ok(false) => return Rx::Blocked,
+            Err(error) => {
+                log::error!("net_io_loop: device failed during RX: {error}");
+                return Rx::Failed;
+            }
+        }
+    }
     // With a virtio-net header the kernel writes frames straight into the
-    // guest's buffers.
+    // guest's buffers, reading nothing when there is no buffer.
     loop {
         match device.rx_from_vnet_tap(tap_fd, RX_BATCH) {
             Ok(Some((delivered, tap_empty))) => {
-                if delivered > 0 {
-                    if let Err(error) = device.signal_rx() {
-                        log::error!("net_io_loop: RX interrupt failed: {error}");
-                        return false;
-                    }
+                if (delivered > 0 || unsignalled > 0) && !signal() {
+                    return Rx::Failed;
                 }
+                unsignalled = 0;
                 if tap_empty {
-                    return true;
+                    return Rx::Drained;
                 }
-                if delivered == RX_BATCH {
-                    continue;
+                if delivered < RX_BATCH {
+                    // Out of guest buffers: blocked only if more is waiting.
+                    return if tap_readable(tap_fd) {
+                        Rx::Blocked
+                    } else {
+                        Rx::Drained
+                    };
                 }
-                // The guest has no free buffer. Fall through to the copying
-                // path, which drops the frame instead of leaving the tap
-                // readable (level-triggered epoll would spin on it).
-                break;
             }
             Ok(None) => break,
             Err(error) => {
                 log::error!("net_io_loop: device failed during RX: {error}");
-                return false;
+                return Rx::Failed;
             }
         }
     }
-    let mut pending = 0usize;
-    let keep_running = loop {
+    let state = loop {
         // SAFETY: `buf` is a valid writable slice for `buf.len()` bytes; invalid
         // or non-ready fds are reported by read and handled below.
         let rc = unsafe { libc::read(tap_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -413,48 +488,58 @@ fn drain_tap(tap_fd: RawFd, device: &Arc<VirtioNetMmio>, buf: &mut [u8]) -> bool
             ) {
                 log::warn!("net_io_loop: tap read: {err}");
             }
-            break true;
+            break Rx::Drained;
         }
         if rc == 0 {
-            break true;
+            break Rx::Drained;
         }
-        let frame = &buf[..rc as usize];
-        let delivered = if device.vnet_hdr() {
-            device.inject_rx_vnet_frame(frame)
-        } else {
-            device.inject_rx_packet_quiet(frame)
-        };
-        match delivered {
+        match deliver(&buf[..rc as usize]) {
             Ok(true) => {
-                pending += 1;
-                if pending == RX_BATCH {
-                    pending = 0;
-                    if let Err(error) = device.signal_rx() {
-                        log::error!("net_io_loop: RX interrupt failed: {error}");
-                        return false;
+                unsignalled += 1;
+                if unsignalled == RX_BATCH {
+                    unsignalled = 0;
+                    if !signal() {
+                        return Rx::Failed;
                     }
                 }
             }
             Ok(false) => {
-                log::debug!(
-                    "net_io_loop: RX queue full — dropping {}-byte frame",
-                    frame.len()
-                );
-                break true;
+                *pending = Some(rc as usize);
+                break Rx::Blocked;
             }
             Err(error) => {
                 log::error!("net_io_loop: device failed during RX: {error}");
-                break false;
+                return Rx::Failed;
             }
         }
     };
-    if pending > 0 {
-        if let Err(error) = device.signal_rx() {
-            log::error!("net_io_loop: RX interrupt failed: {error}");
-            return false;
-        }
+    if unsignalled > 0 && !signal() {
+        return Rx::Failed;
     }
-    keep_running
+    state
+}
+
+fn tap_readable(tap_fd: RawFd) -> bool {
+    let mut fd = libc::pollfd {
+        fd: tap_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `fd` is valid for the call; a zero timeout never blocks.
+    unsafe { libc::poll(&mut fd, 1, 0) > 0 && fd.revents & libc::POLLIN != 0 }
+}
+
+/// Watch the tap for input, or stop while the guest has no free buffer.
+fn watch_tap(ep: RawFd, tap_fd: RawFd, watch: bool) -> io::Result<()> {
+    let mut ev = libc::epoll_event {
+        events: if watch { libc::EPOLLIN as u32 } else { 0 },
+        u64: 1,
+    };
+    // SAFETY: `ev` is valid for the call; `tap_fd` is registered with `ep`.
+    if unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_MOD, tap_fd, &mut ev) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Give the tap the offloads the guest negotiated (or none after a reset).
@@ -544,6 +629,118 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
     use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    /// A device with an RX queue of 16 entries and none posted yet, and a
+    /// datagram socketpair standing in for its tap.
+    fn rx_device(vnet_hdr: bool) -> (Arc<VirtioNetMmio>, Arc<GuestMemoryMmap>, RawFd, RawFd) {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for both descriptors.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let mem =
+            Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap());
+        let device = Arc::new(VirtioNetMmio::new(7, [0x02, 0, 0, 0, 0, 1]));
+        device.set_guest_memory(mem.clone());
+        device.set_tap_fd(fds[1], vnet_hdr);
+        let irq = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        device.set_irq_evt(irq);
+        mem.write_obj(AvailRing { flags: 0, idx: 0 }, GuestAddress(0x20_1000))
+            .unwrap();
+        for (reg_addr, value) in [
+            (reg::QUEUE_SEL, 0),
+            (reg::QUEUE_NUM, 16),
+            (reg::QUEUE_DESC_LOW, 0x20_0000),
+            (reg::QUEUE_DRIVER_LOW, 0x20_1000),
+            (reg::QUEUE_DEVICE_LOW, 0x20_2000),
+            (reg::QUEUE_READY, 1),
+        ] {
+            device.mmio_write(reg_addr, value, 4).unwrap();
+        }
+        (device, mem, fds[1], fds[0])
+    }
+
+    /// Post receive buffer `n` (one 4 KiB descriptor) and publish it.
+    fn post_rx_buffer(mem: &GuestMemoryMmap, n: u16) {
+        mem.write_obj(
+            Descriptor {
+                addr: 0x30_0000 + n as u64 * 0x1000,
+                len: 4096,
+                flags: desc_flags::WRITE,
+                next: 0,
+            },
+            GuestAddress(0x20_0000 + n as u64 * 16),
+        )
+        .unwrap();
+        mem.write_obj(n, GuestAddress(0x20_1000 + 4 + n as u64 * 2))
+            .unwrap();
+        mem.write_obj(
+            AvailRing {
+                flags: 0,
+                idx: n + 1,
+            },
+            GuestAddress(0x20_1000),
+        )
+        .unwrap();
+    }
+
+    fn queued_bytes(fd: RawFd) -> isize {
+        let mut probe = [0u8; 2048];
+        // SAFETY: `probe` is writable for its length; MSG_PEEK leaves the
+        // datagram queued.
+        unsafe {
+            libc::recv(
+                fd,
+                probe.as_mut_ptr() as *mut libc::c_void,
+                probe.len(),
+                libc::MSG_PEEK,
+            )
+        }
+    }
+
+    #[test]
+    fn rx_waits_for_a_guest_buffer_instead_of_dropping() {
+        for vnet_hdr in [true, false] {
+            let (device, mem, tap, peer) = rx_device(vnet_hdr);
+            let mut frame = vec![0u8; if vnet_hdr { 12 } else { 0 }];
+            frame.extend_from_slice(&[0x42u8; 300]);
+            // SAFETY: `frame` is readable for its length.
+            unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) };
+            let mut buf = vec![0u8; super::super::net_transport::MAX_GSO_FRAME_BYTES];
+            let mut pending = None;
+
+            // No buffer: the frame is not lost (still queued, or held).
+            assert_eq!(drain_tap(tap, &device, &mut buf, &mut pending), Rx::Blocked);
+            if vnet_hdr {
+                assert_eq!(queued_bytes(tap), frame.len() as isize, "left in the tap");
+            } else {
+                assert_eq!(pending, Some(frame.len()), "held for the next buffer");
+            }
+            assert_eq!(device.rx_packets.load(Ordering::Relaxed), 0);
+
+            // The guest posts a buffer: the same frame is delivered.
+            post_rx_buffer(&mem, 0);
+            assert_eq!(drain_tap(tap, &device, &mut buf, &mut pending), Rx::Drained);
+            assert_eq!(device.rx_packets.load(Ordering::Relaxed), 1);
+            assert_eq!(pending, None);
+            let used_idx: u16 = mem.read_obj(GuestAddress(0x20_2000 + 2)).unwrap();
+            assert_eq!(used_idx, 1);
+            let mut landed = [0u8; 300];
+            mem.read_slice(&mut landed, GuestAddress(0x30_0000 + 12))
+                .unwrap();
+            assert!(landed.iter().all(|b| *b == 0x42));
+            for fd in [tap, peer] {
+                // SAFETY: both descriptors came from socketpair above.
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
 
     #[test]
     fn startup_rejects_an_invalid_tap_before_returning_success() {
