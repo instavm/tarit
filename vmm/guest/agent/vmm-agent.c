@@ -1880,6 +1880,13 @@ static void serve_pty_forever(void) {
 static void serve_vsock_forever(void) {
     char line[LINE_MAX_LEN];
     unsigned int reconnect_backoff_us = VSOCK_RECONNECT_BACKOFF_INITIAL_US;
+    /* Resolve the post-fork hook path once now, so its dentry (usually a
+     * negative one) is cached before any snapshot is taken. Each clone's
+     * repair then resolves it from memory instead of reading the root disk;
+     * the repair still opens the path for real, so a hook installed later
+     * runs as before. */
+    struct stat hook_st;
+    (void)lstat(POST_FORK_HOOK_PATH, &hook_st);
     for (;;) {
         int fd = vsock_connect_host();
         if (fd < 0) {
