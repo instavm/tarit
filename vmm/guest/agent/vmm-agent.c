@@ -1150,6 +1150,62 @@ static int write_resolv_conf(char dns[][64], size_t dns_count) {
     return close(fd);
 }
 
+/* Append `token` to dns[] when it is a literal IPv4 or IPv6 address. */
+static void add_boot_nameserver(char dns[][64], size_t *count, const char *token, size_t len) {
+    unsigned char addr[sizeof(struct in6_addr)];
+    char text[64];
+    if (*count >= 3 || len == 0 || len >= sizeof(text)) return;
+    memcpy(text, token, len);
+    text[len] = '\0';
+    if (inet_pton(AF_INET, text, addr) != 1 && inet_pton(AF_INET6, text, addr) != 1) return;
+    if (strcmp(text, "0.0.0.0") == 0) return;
+    memcpy(dns[(*count)++], text, len + 1);
+}
+
+/* Give a standalone guest a resolver at boot. `tarit.dns=ADDR[,ADDR]` on the
+ * kernel command line wins; otherwise use any nameservers the kernel learned
+ * from `ip=...:<dns0>:<dns1>` (published in /proc/net/pnp). An image that
+ * already ships a usable /etc/resolv.conf is left alone, and the orchestrator
+ * later rewrites it through the network repair when it provisions DNS. */
+static void configure_boot_dns(void) {
+    struct stat st;
+    if (stat("/etc/resolv.conf", &st) == 0 && st.st_size > 0) return;
+    char dns[3][64];
+    size_t count = 0;
+    char buf[4096];
+    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        buf[n > 0 ? n : 0] = '\0';
+        for (char *word = strtok(buf, " \n"); word != NULL; word = strtok(NULL, " \n")) {
+            if (strncmp(word, "tarit.dns=", 10) != 0) continue;
+            for (char *item = word + 10; *item != '\0';) {
+                size_t len = strcspn(item, ",");
+                add_boot_nameserver(dns, &count, item, len);
+                item += len + (item[len] == ',');
+            }
+        }
+    }
+    if (count == 0) {
+        FILE *pnp = fopen("/proc/net/pnp", "re");
+        char line[128];
+        while (pnp != NULL && fgets(line, sizeof(line), pnp) != NULL) {
+            if (strncmp(line, "nameserver ", 11) == 0) {
+                add_boot_nameserver(dns, &count, line + 11, strcspn(line + 11, " \n"));
+            }
+        }
+        if (pnp != NULL) fclose(pnp);
+    }
+    if (count == 0) return;
+    /* A dangling symlink (e.g. to systemd-resolved's stub) cannot be written
+     * through; replace it with a regular file. */
+    if (lstat("/etc/resolv.conf", &st) == 0 && S_ISLNK(st.st_mode)) {
+        (void)unlink("/etc/resolv.conf");
+    }
+    (void)write_resolv_conf(dns, count);
+}
+
 #ifdef __linux__
 static void init_ipv4_sockaddr(struct sockaddr *address, struct in_addr ipv4) {
     struct sockaddr_in *inet = (struct sockaddr_in *)address;
@@ -1950,6 +2006,7 @@ int main(void) {
     bool is_init = (getpid() == 1);
     if (is_init) {
         setup_as_init();
+        configure_boot_dns();
     }
 
 #ifdef __linux__

@@ -72,6 +72,13 @@ sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 ```
 
+For name resolution, add `tarit.dns=1.1.1.1[,second-server]` to the kernel
+command line. When the guest agent runs as init and the image has no usable
+`/etc/resolv.conf`, it writes one from that list (IPv4 or IPv6 literals; up to
+three). Without `tarit.dns=`, it uses nameservers the kernel learned from an
+`ip=...:<dns0>:<dns1>` argument. An image that already ships a non-empty
+`/etc/resolv.conf` is left alone. The orchestrator provisions DNS itself.
+
 ### `run` flags
 
 | Flag | Default | Meaning |
