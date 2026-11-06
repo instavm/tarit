@@ -680,6 +680,10 @@ impl VmmController {
         let mut captured_disks: Vec<OwnedScratchFile> = Vec::new();
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
         let _ = capture_disks;
+        // Set when the untouched pages of file-backed RAM are copied from
+        // their backing files after the guest resumes.
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let mut deferred_full: Option<DeferredFullSnapshot> = None;
         let paused_at = started.elapsed();
         let mut disks_at = paused_at;
         let snapshot_result = (|| -> Result<usize> {
@@ -786,19 +790,53 @@ impl VmmController {
                     Ok(0)
                 }
             } else {
-                // Untouched pages of anonymous guest RAM are zero; pages of a
-                // file-backed or lazily (UFFD) restored guest are not, so
-                // those are always read.
+                // Untouched pages of anonymous guest RAM are zero, and those of
+                // file-backed (mapped restore) RAM still hold their backing
+                // file's bytes, so neither is read during the pause. Lazily
+                // (UFFD) restored RAM, or RAM whose pagemap cannot be read, is
+                // read in full.
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-                let populated = (vm.lazy_restore.is_none()
-                    && vm
-                        .guest_mem
-                        .as_ref()
-                        .is_some_and(|guest_mem| !guest_mem.is_file_backed()))
-                .then(|| populated_pages(mem_slice.as_ptr(), mem_slice.len()))
-                .flatten();
+                let populated = vm
+                    .lazy_restore
+                    .is_none()
+                    .then(|| populated_pages(mem_slice.as_ptr(), mem_slice.len()))
+                    .flatten();
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
                 let populated: Option<Vec<bool>> = None;
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+                let file_ranges = vm
+                    .guest_mem
+                    .as_ref()
+                    .filter(|guest_mem| guest_mem.is_file_backed())
+                    .map(|guest_mem| guest_mem.file_backed_ranges());
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+                match (file_ranges, populated.as_deref()) {
+                    (Some(ranges), Some(populated)) => {
+                        deferred_full = Some(write_snapshot_memory_deferred(
+                            owned_snapshot.file(),
+                            &state_blob,
+                            mem_slice,
+                            populated,
+                            &ranges,
+                        )?);
+                    }
+                    // File-backed RAM without a pagemap must be read in full.
+                    (Some(_), None) => write_scratch_snapshot_file(
+                        &owned_snapshot,
+                        &state_blob,
+                        mem_slice,
+                        None,
+                        false,
+                    )?,
+                    (None, populated) => write_scratch_snapshot_file(
+                        &owned_snapshot,
+                        &state_blob,
+                        mem_slice,
+                        populated,
+                        false,
+                    )?,
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
                 write_scratch_snapshot_file(
                     &owned_snapshot,
                     &state_blob,
@@ -877,6 +915,19 @@ impl VmmController {
             }
         };
         let resumed_at = started.elapsed();
+        // The guest is running again; finish a deferred snapshot from its
+        // immutable backing files before the file is published.
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        if let Some(pending) = deferred_full.take() {
+            if let Err(error) = finish_deferred_snapshot(owned_snapshot.file(), pending) {
+                replay_consumed_dirty(vm, consumed_dirty.as_ref());
+                remove_owned_scratch_file(&owned_snapshot);
+                for disk in &captured_disks {
+                    remove_owned_scratch_file(disk);
+                }
+                return Err(error);
+            }
+        }
         if let Err(error) = persist_owned_output(&mut owned_snapshot, &path_buf) {
             replay_consumed_dirty(vm, consumed_dirty.as_ref());
             remove_owned_scratch_file(&owned_snapshot);
@@ -4554,60 +4605,283 @@ fn write_snapshot_file_with_mode(
     write_snapshot_to_file(&file, state_blob, mem_dump, None, diff)
 }
 
+/// Header fields of a full (or legacy diff) VMSN snapshot.
+struct SnapshotWriteLayout {
+    state_len: u64,
+    padding: usize,
+    state_crc: u32,
+    flags: u16,
+    mem_len: u64,
+    mem_offset: u64,
+}
+
+impl SnapshotWriteLayout {
+    fn new(state_blob: &[u8], mem_len: usize, diff: bool) -> Result<Self> {
+        let unpadded_state_len = u64::try_from(state_blob.len())
+            .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+        let state_len = page_aligned_state_len(unpadded_state_len)
+            .ok_or_else(|| VmmError::Snapshot("snapshot memory offset overflow".into()))?;
+        let padding = (state_len - unpadded_state_len) as usize;
+        let mut state_hasher = crc32fast::Hasher::new();
+        state_hasher.update(state_blob);
+        state_hasher.update(&vec![0u8; padding]);
+        Ok(Self {
+            state_len,
+            padding,
+            state_crc: state_hasher.finalize(),
+            flags: if diff { 1 } else { 0 },
+            mem_len: u64::try_from(mem_len)
+                .map_err(|_| VmmError::Snapshot("memory image too large".into()))?,
+            mem_offset: FULL_SNAPSHOT_HEADER_LEN + state_len,
+        })
+    }
+
+    /// Write the header and state in front of memory that is already in
+    /// place, then fix the length and record the verified RAM CRC.
+    fn finish(&self, mut file: &std::fs::File, state_blob: &[u8], mem_crc: u32) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        const MAGIC: &[u8; 4] = b"VMSN";
+
+        let mut header = Vec::with_capacity(FULL_SNAPSHOT_HEADER_LEN as usize + state_blob.len());
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        header.extend_from_slice(&self.flags.to_le_bytes());
+        header.extend_from_slice(&self.state_len.to_le_bytes());
+        header.extend_from_slice(&self.state_crc.to_le_bytes());
+        header.extend_from_slice(&self.mem_len.to_le_bytes());
+        header.extend_from_slice(&mem_crc.to_le_bytes());
+        header.extend_from_slice(state_blob);
+        header.extend_from_slice(&vec![0u8; self.padding]);
+        file.write_all_at(&header, 0)
+            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        file.set_len(self.mem_offset + self.mem_len)
+            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        file.flush()
+            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        record_ram_verified(file, self.mem_offset, self.mem_len, mem_crc);
+        Ok(())
+    }
+}
+
 fn write_snapshot_to_file(
-    mut file: &std::fs::File,
+    file: &std::fs::File,
     state_blob: &[u8],
     mem_dump: &[u8],
     populated: Option<&[bool]>,
     diff: bool,
 ) -> Result<()> {
-    use std::io::Write;
-    const MAGIC: &[u8; 4] = b"VMSN";
-
-    let unpadded_state_len = u64::try_from(state_blob.len())
-        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
-    let state_len = page_aligned_state_len(unpadded_state_len)
-        .ok_or_else(|| VmmError::Snapshot("snapshot memory offset overflow".into()))?;
-    let padding = vec![0u8; (state_len - unpadded_state_len) as usize];
-    let mut state_hasher = crc32fast::Hasher::new();
-    state_hasher.update(state_blob);
-    state_hasher.update(&padding);
-    let state_crc = state_hasher.finalize();
-    let flags: u16 = if diff { 1 } else { 0 };
-    let mem_len = u64::try_from(mem_dump.len())
-        .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
-    let mem_offset = FULL_SNAPSHOT_HEADER_LEN + state_len;
-
+    let layout = SnapshotWriteLayout::new(state_blob, mem_dump.len(), diff)?;
     // Zero pages are left as holes, so start from an empty file. Memory goes
     // first, in one pass that also computes its CRC (this runs while the
     // guest is paused, so each byte of RAM is read once); the header that
     // carries the CRC is written after it.
     file.set_len(0)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    let mem_crc = write_sparse_at_with_crc(file, mem_offset, mem_dump, populated)
+    let mem_crc = write_sparse_at_with_crc(file, layout.mem_offset, mem_dump, populated)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    let mut header = Vec::with_capacity(FULL_SNAPSHOT_HEADER_LEN as usize + state_blob.len());
-    header.extend_from_slice(MAGIC);
-    header.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
-    header.extend_from_slice(&flags.to_le_bytes());
-    header.extend_from_slice(&state_len.to_le_bytes());
-    header.extend_from_slice(&state_crc.to_le_bytes());
-    header.extend_from_slice(&mem_len.to_le_bytes());
-    header.extend_from_slice(&mem_crc.to_le_bytes());
-    header.extend_from_slice(state_blob);
-    header.extend_from_slice(&padding);
-    {
-        use std::os::unix::fs::FileExt;
-        file.write_all_at(&header, 0)
-            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    layout.finish(file, state_blob, mem_crc)
+}
+
+/// A full snapshot of file-backed guest RAM whose untouched pages are copied
+/// from their backing files after the guest resumes; see
+/// [`write_snapshot_memory_deferred`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+struct DeferredFullSnapshot {
+    state_blob: Vec<u8>,
+    layout: SnapshotWriteLayout,
+    /// (RAM offset, length, backing file, file offset), coalesced.
+    copies: Vec<(u64, u64, Arc<std::fs::File>, u64)>,
+}
+
+/// First half of a full snapshot of file-backed (restored) guest RAM, run
+/// while the guest is paused.
+///
+/// A restored guest's RAM is a private mapping of its snapshot, so most pages
+/// were never touched and still hold the snapshot file's bytes. Reading them
+/// through the mapping would fault every one in during the pause. Instead,
+/// pages the kernel has populated (touched or swapped) are written from
+/// memory now; untouched pages inside a file-backed run are queued to be
+/// copied from that immutable file after the guest resumes; untouched
+/// anonymous pages (never restored, or discarded by the balloon) are zero and
+/// stay holes. [`finish_deferred_snapshot`] completes the file.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_snapshot_memory_deferred(
+    file: &std::fs::File,
+    state_blob: &[u8],
+    mem: &[u8],
+    populated: &[bool],
+    ranges: &[vmm_memory_backend::backend::FileBackedRange],
+) -> Result<DeferredFullSnapshot> {
+    use std::os::unix::fs::FileExt;
+
+    const PAGE: usize = 4096;
+    let layout = SnapshotWriteLayout::new(state_blob, mem.len(), false)?;
+    if mem.len() % PAGE != 0 || populated.len() != mem.len() / PAGE {
+        return Err(VmmError::Snapshot(
+            "guest RAM is not a whole number of pages".into(),
+        ));
     }
-    file.set_len(mem_offset + mem_len)
+    file.set_len(0)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.flush()
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-    record_ram_verified(file, mem_offset, mem_len, mem_crc);
-    Ok(())
+    let is_zero = |page: &[u8]| {
+        // SAFETY: reinterpreting initialised bytes as u64 words is sound;
+        // align_to returns only the correctly aligned middle part.
+        let (head, words, tail) = unsafe { page.align_to::<u64>() };
+        head.iter().all(|b| *b == 0)
+            && words.iter().all(|w| *w == 0)
+            && tail.iter().all(|b| *b == 0)
+    };
+    let mut copies: Vec<(u64, u64, Arc<std::fs::File>, u64)> = Vec::new();
+    let mut run: Option<usize> = None;
+    let mut range_index = 0usize;
+    let flush_run = |run: &mut Option<usize>, end: usize| -> std::io::Result<()> {
+        if let Some(first) = run.take() {
+            file.write_all_at(&mem[first..end], layout.mem_offset + first as u64)?;
+        }
+        Ok(())
+    };
+    for (page, &touched) in populated.iter().enumerate() {
+        let start = page * PAGE;
+        if touched {
+            if is_zero(&mem[start..start + PAGE]) {
+                flush_run(&mut run, start).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+            } else if run.is_none() {
+                run = Some(start);
+            }
+            continue;
+        }
+        flush_run(&mut run, start).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        let at = start as u64;
+        while range_index < ranges.len()
+            && ranges[range_index].ram_offset + ranges[range_index].len <= at
+        {
+            range_index += 1;
+        }
+        let Some(range) = ranges.get(range_index).filter(|r| r.ram_offset <= at) else {
+            continue; // untouched anonymous page: zero
+        };
+        let file_at = range.file_offset + (at - range.ram_offset);
+        match copies.last_mut() {
+            Some((ram, len, source, source_at))
+                if *ram + *len == at
+                    && Arc::ptr_eq(source, &range.file)
+                    && *source_at + *len == file_at =>
+            {
+                *len += PAGE as u64;
+            }
+            _ => copies.push((at, PAGE as u64, Arc::clone(&range.file), file_at)),
+        }
+    }
+    flush_run(&mut run, mem.len()).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    Ok(DeferredFullSnapshot {
+        state_blob: state_blob.to_vec(),
+        layout,
+        copies,
+    })
+}
+
+/// Second half of [`write_snapshot_memory_deferred`], run after the guest
+/// resumes: copy the queued runs from their backing files (their holes stay
+/// holes), hash the assembled memory image, and write the header.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn finish_deferred_snapshot(file: &std::fs::File, snapshot: DeferredFullSnapshot) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    const CHUNK: u64 = 1024 * 1024;
+    let io = |e: std::io::Error| VmmError::Snapshot(e.to_string());
+    let base = snapshot.layout.mem_offset;
+    let mut buffer = vec![0u8; CHUNK as usize];
+    for (ram, len, source, source_at) in &snapshot.copies {
+        let end = source_at + len;
+        let mut pos = *source_at;
+        while pos < end {
+            let Some(data) = seek_data(source, pos)
+                .map_err(io)?
+                .filter(|data| *data < end)
+            else {
+                break;
+            };
+            let hole = seek_hole(source, data).map_err(io)?.min(end);
+            let mut at = data;
+            while at < hole {
+                let n = (hole - at).min(CHUNK) as usize;
+                source.read_exact_at(&mut buffer[..n], at).map_err(io)?;
+                file.write_all_at(&buffer[..n], base + ram + (at - source_at))
+                    .map_err(io)?;
+                at += n as u64;
+            }
+            pos = hole;
+        }
+    }
+    // The memory region is assembled; hash it from the file. Holes are zero
+    // pages and fold into the CRC without being read.
+    let mut crc = crc32fast::Hasher::new();
+    let mem_len = snapshot.layout.mem_len;
+    let mut pos = 0u64;
+    while pos < mem_len {
+        let data = seek_data(file, base + pos)
+            .map_err(io)?
+            .map_or(mem_len, |data| (data - base).min(mem_len));
+        let zero = data - pos;
+        if zero % 4096 != 0 {
+            return Err(VmmError::Snapshot(
+                "snapshot hole is not page aligned".into(),
+            ));
+        }
+        combine_zero_pages(&mut crc, (zero / 4096) as usize);
+        if data >= mem_len {
+            break;
+        }
+        let hole = (seek_hole(file, base + data).map_err(io)? - base).min(mem_len);
+        let mut at = data;
+        while at < hole {
+            let n = (hole - at).min(CHUNK) as usize;
+            file.read_exact_at(&mut buffer[..n], base + at)
+                .map_err(io)?;
+            crc.update(&buffer[..n]);
+            at += n as u64;
+        }
+        pos = hole;
+    }
+    snapshot
+        .layout
+        .finish(file, &snapshot.state_blob, crc.finalize())
+}
+
+/// `lseek(SEEK_DATA)`: the next offset at or after `offset` holding data, or
+/// `None` when only a hole remains.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn seek_data(file: &std::fs::File, offset: u64) -> std::io::Result<Option<u64>> {
+    use std::os::fd::AsRawFd;
+    let offset = i64::try_from(offset).map_err(|_| std::io::Error::other("offset overflow"))?;
+    // SAFETY: lseek on an open descriptor only moves its file offset; the
+    // reads above use positioned I/O and do not depend on it.
+    let data = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
+    if data >= 0 {
+        return Ok(Some(data as u64));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENXIO) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// `lseek(SEEK_HOLE)`: the next hole (or end of file) at or after `offset`.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn seek_hole(file: &std::fs::File, offset: u64) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    let offset = i64::try_from(offset).map_err(|_| std::io::Error::other("offset overflow"))?;
+    // SAFETY: as in `seek_data`.
+    let hole = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_HOLE) };
+    if hole >= 0 {
+        Ok(hole as u64)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Write `data` at `offset`, skipping 4 KiB pages that are entirely zero so
@@ -7973,6 +8247,75 @@ mod tests {
         assert_eq!(back, mem);
         // SAFETY: unmapping exactly the mapping created above.
         unsafe { libc::munmap(addr, pages * PAGE) };
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn deferred_snapshot_of_file_backed_ram_matches_a_full_read() {
+        use std::io::Write as _;
+        const PAGE: usize = 4096;
+        let pages = 256;
+
+        // A base image with data, zero pages and a hole, plus a newer run
+        // layered over part of it, as a chain restore maps them.
+        let mut base = tempfile::tempfile().unwrap();
+        let mut image = vec![0u8; pages * PAGE];
+        for page in 0..pages {
+            if page % 3 != 0 {
+                image[page * PAGE..(page + 1) * PAGE].fill((page % 251) as u8 + 1);
+            }
+        }
+        base.write_all(&image).unwrap();
+        base.set_len((pages * PAGE + PAGE) as u64).unwrap(); // trailing hole
+        let mut diff = tempfile::tempfile().unwrap();
+        diff.write_all(&vec![0xd1u8; 8 * PAGE]).unwrap();
+
+        let mem = vmm_memory_backend::GuestMemory::new((pages * PAGE) as u64).unwrap();
+        mem.map_file_private(&base, 0).unwrap();
+        mem.map_file_range_private(&diff, 0, (40 * PAGE) as u64, (8 * PAGE) as u64)
+            .unwrap();
+        // Guest writes, a guest write of zeros, and a balloon discard.
+        mem.write_phys((5 * PAGE) as u64, &[0xee; 100]).unwrap();
+        mem.write_phys((41 * PAGE) as u64, &[0x77; PAGE]).unwrap();
+        mem.write_phys((7 * PAGE) as u64, &[0u8; PAGE]).unwrap();
+        mem.discard_range((100 * PAGE) as u64, (10 * PAGE) as u64)
+            .unwrap();
+        mem.write_phys((105 * PAGE) as u64, &[0x55; 10]).unwrap();
+
+        // SAFETY: `mem` owns this mapping for the whole test.
+        let ram = unsafe { std::slice::from_raw_parts(mem.as_ptr(), pages * PAGE) };
+        let populated = populated_pages(ram.as_ptr(), ram.len()).expect("pagemap");
+        assert!(!populated[200], "page 200 untouched before the snapshot");
+        let state = b"state-blob".to_vec();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let pending = write_snapshot_memory_deferred(
+            out.as_file(),
+            &state,
+            ram,
+            &populated,
+            &mem.file_backed_ranges(),
+        )
+        .unwrap();
+        let after = populated_pages(ram.as_ptr(), ram.len()).expect("pagemap");
+        assert!(
+            !after[200],
+            "the paused half must not fault in untouched pages"
+        );
+        finish_deferred_snapshot(out.as_file(), pending).unwrap();
+
+        // Exactly what reading every byte of guest RAM would have written.
+        let expected = ram.to_vec();
+        let restored = eager_restore_snapshot(out.path().to_str().unwrap()).expect("restores");
+        // The reader returns the state with its page-alignment padding.
+        assert!(restored.state_blob.starts_with(&state));
+        assert!(restored.state_blob[state.len()..].iter().all(|b| *b == 0));
+        let mut back = vec![0u8; pages * PAGE];
+        restored.mem.read_phys(0, &mut back).unwrap();
+        assert_eq!(back, expected);
+        let mut header = [0u8; 32];
+        std::os::unix::fs::FileExt::read_exact_at(out.as_file(), &mut header, 0).unwrap();
+        let mem_crc = u32::from_le_bytes(header[28..32].try_into().unwrap());
+        assert_eq!(mem_crc, crc32fast::hash(&expected));
     }
 
     #[test]

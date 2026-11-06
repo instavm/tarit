@@ -13,6 +13,85 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap, GuestRegionMmap, MmapRegio
 pub const MMIO_GAP_START: u64 = 0xd000_0000;
 pub const MMIO_GAP_END: u64 = 0x1_0000_0000;
 
+/// A run of packed RAM that is a private mapping of a file. Until the guest
+/// writes a page of it, that page's contents are the file's bytes.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct FileBackedRange {
+    pub ram_offset: u64,
+    pub len: u64,
+    pub file: Arc<std::fs::File>,
+    pub file_offset: u64,
+}
+
+/// Non-overlapping file-backed runs keyed by RAM offset, plus one shared
+/// handle per mapped file so layered chain restores do not hold a descriptor
+/// per run.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct FileRanges {
+    runs: std::collections::BTreeMap<u64, (u64, Arc<std::fs::File>, u64)>,
+    files: std::collections::HashMap<(u64, u64), Arc<std::fs::File>>,
+}
+
+#[cfg(target_os = "linux")]
+impl FileRanges {
+    /// Drop `start..start + len` from every run, splitting partial overlaps.
+    fn forget(&mut self, start: u64, len: u64) {
+        let end = start + len;
+        let overlapping: Vec<u64> = self
+            .runs
+            .range(..end)
+            .filter(|(run_start, (run_len, _, _))| **run_start + *run_len > start)
+            .map(|(run_start, _)| *run_start)
+            .collect();
+        for run_start in overlapping {
+            let (run_len, file, file_offset) = self.runs.remove(&run_start).expect("listed run");
+            let run_end = run_start + run_len;
+            if run_start < start {
+                self.runs.insert(
+                    run_start,
+                    (start - run_start, Arc::clone(&file), file_offset),
+                );
+            }
+            if run_end > end {
+                self.runs.insert(
+                    end,
+                    (
+                        run_end - end,
+                        Arc::clone(&file),
+                        file_offset + (end - run_start),
+                    ),
+                );
+            }
+        }
+        self.files.retain(|_, file| Arc::strong_count(file) > 1);
+    }
+
+    fn record(
+        &mut self,
+        start: u64,
+        len: u64,
+        file: &std::fs::File,
+        file_offset: u64,
+    ) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        let shared = match self.files.get(&(metadata.dev(), metadata.ino())) {
+            Some(shared) => Arc::clone(shared),
+            None => {
+                let shared = Arc::new(file.try_clone()?);
+                self.files
+                    .insert((metadata.dev(), metadata.ino()), Arc::clone(&shared));
+                shared
+            }
+        };
+        self.forget(start, len);
+        self.runs.insert(start, (len, shared, file_offset));
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MemoryError {
     #[error("memory region creation failed: {0}")]
@@ -42,6 +121,9 @@ pub struct GuestMemory {
     /// a private file mapping would refault the snapshot's bytes, not zeros.
     #[cfg(target_os = "linux")]
     file_backed: Arc<std::sync::atomic::AtomicBool>,
+    /// Which RAM runs are currently private mappings of which file.
+    #[cfg(target_os = "linux")]
+    file_ranges: Arc<std::sync::Mutex<FileRanges>>,
 }
 
 impl GuestMemory {
@@ -113,6 +195,8 @@ impl GuestMemory {
             lazy_page_discard: Arc::new(RwLock::new(None)),
             #[cfg(target_os = "linux")]
             file_backed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(target_os = "linux")]
+            file_ranges: Arc::default(),
         })
     }
 
@@ -184,7 +268,33 @@ impl GuestMemory {
         }
         self.file_backed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.file_ranges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(ram_offset as u64, len as u64, file, file_offset)
+            .map_err(|error| {
+                MemoryError::Region(format!("record snapshot RAM mapping: {error}"))
+            })?;
         Ok(())
+    }
+
+    /// RAM runs that are currently private mappings of a file, in RAM order.
+    /// A page in one of these runs that the guest has not written still holds
+    /// the file's bytes at the corresponding offset.
+    #[cfg(target_os = "linux")]
+    pub fn file_backed_ranges(&self) -> Vec<FileBackedRange> {
+        self.file_ranges
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .runs
+            .iter()
+            .map(|(ram_offset, (len, file, file_offset))| FileBackedRange {
+                ram_offset: *ram_offset,
+                len: *len,
+                file: Arc::clone(file),
+                file_offset: *file_offset,
+            })
+            .collect()
     }
 
     /// Whether RAM is a private mapping of a snapshot file.
@@ -373,6 +483,10 @@ impl GuestMemory {
                     std::io::Error::last_os_error()
                 )));
             }
+            self.file_ranges
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .forget(offset as u64, len);
             self.host_dirty.mark_range(offset as u64, len);
             return Ok(());
         }
@@ -500,6 +614,48 @@ mod tests {
         assert!(page.iter().all(|&b| b == 0));
         m.read_phys(0, &mut page).unwrap();
         assert!(page.iter().all(|&b| b == 0x11), "neighbours untouched");
+    }
+
+    #[test]
+    fn file_backed_ranges_follow_layering_and_discards() {
+        use std::io::Write as _;
+
+        let mut base = tempfile::tempfile().expect("base image");
+        base.write_all(&vec![0x11u8; 16 * 4096]).unwrap();
+        let mut diff = tempfile::tempfile().expect("diff image");
+        diff.write_all(&vec![0x22u8; 4 * 4096]).unwrap();
+        let m = GuestMemory::new(16 * 4096).expect("guest memory");
+        m.map_file_private(&base, 0).unwrap();
+        // A chain restore layers a newer run over the base.
+        m.map_file_range_private(&diff, 4096, 4 * 4096, 2 * 4096)
+            .unwrap();
+        // A balloon discard makes a run anonymous again.
+        m.discard_range(10 * 4096, 2 * 4096).unwrap();
+
+        let runs: Vec<(u64, u64, u64)> = m
+            .file_backed_ranges()
+            .iter()
+            .map(|r| (r.ram_offset / 4096, r.len / 4096, r.file_offset / 4096))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![(0, 4, 0), (4, 2, 1), (6, 4, 6), (12, 4, 12)],
+            "base split around the diff run and the discarded hole"
+        );
+        let ranges = m.file_backed_ranges();
+        assert!(
+            Arc::ptr_eq(&ranges[0].file, &ranges[2].file),
+            "one handle per file"
+        );
+        // Every recorded run really holds its file's bytes.
+        for run in &ranges {
+            let mut page = [0u8; 4096];
+            m.read_phys(run.ram_offset, &mut page).unwrap();
+            let mut expected = [0u8; 4096];
+            std::os::unix::fs::FileExt::read_exact_at(&*run.file, &mut expected, run.file_offset)
+                .unwrap();
+            assert_eq!(page, expected);
+        }
     }
 
     #[test]
