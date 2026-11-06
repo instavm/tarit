@@ -356,11 +356,21 @@ struct ResolvedOciReference {
 }
 
 fn resolve_oci_reference(reference: &str) -> Result<ResolvedOciReference> {
-    let output = Command::new("skopeo")
+    let output = match Command::new("skopeo")
         .arg("inspect")
         .arg(reference)
         .output()
-        .context("run skopeo inspect to resolve immutable OCI digest")?;
+    {
+        Ok(output) => output,
+        // Hosts with Docker or Podman but no skopeo resolve the digest through
+        // the engine, which also uses its own registry credentials.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return resolve_with_engine(reference)
+        }
+        Err(error) => {
+            return Err(error).context("run skopeo inspect to resolve immutable OCI digest")
+        }
+    };
     if !output.status.success() {
         bail!(
             "skopeo inspect failed: {}",
@@ -368,6 +378,100 @@ fn resolve_oci_reference(reference: &str) -> Result<ResolvedOciReference> {
         );
     }
     resolved_reference_from_inspect(&output.stdout)
+}
+
+/// Resolve a `docker://` reference to an immutable digest with a local
+/// container engine: pull it, then read the registry digest it was pulled at.
+fn resolve_with_engine(reference: &str) -> Result<ResolvedOciReference> {
+    let name = reference.strip_prefix("docker://").context(
+        "skopeo is not installed; only docker:// references resolve through Docker or Podman",
+    )?;
+    if name.is_empty() || name.starts_with('-') {
+        bail!("invalid image reference {name:?}");
+    }
+    let engine = ["docker", "podman"]
+        .into_iter()
+        .find(|engine| {
+            Command::new(engine)
+                .arg("version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .context(
+            "neither skopeo nor a running Docker/Podman is available to resolve the image digest",
+        )?;
+    let pulled = Command::new(engine)
+        .args(["pull", "-q", name])
+        .output()
+        .with_context(|| format!("run {engine} pull"))?;
+    if !pulled.status.success() {
+        bail!(
+            "{engine} pull failed: {}",
+            String::from_utf8_lossy(&pulled.stderr).trim()
+        );
+    }
+    let inspected = Command::new(engine)
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RepoDigests}}",
+            name,
+        ])
+        .output()
+        .with_context(|| format!("run {engine} image inspect"))?;
+    if !inspected.status.success() {
+        bail!(
+            "{engine} image inspect failed: {}",
+            String::from_utf8_lossy(&inspected.stderr).trim()
+        );
+    }
+    let digests: Vec<String> = serde_json::from_slice(&inspected.stdout)
+        .with_context(|| format!("parse {engine} RepoDigests"))?;
+    resolved_reference_from_repo_digests(name, &digests)
+}
+
+/// Pick the digest recorded for `reference`'s repository and pin it under the
+/// fully qualified registry name skopeo would report.
+fn resolved_reference_from_repo_digests(
+    reference: &str,
+    digests: &[String],
+) -> Result<ResolvedOciReference> {
+    let repo = qualified_repository(reference);
+    let digest = digests
+        .iter()
+        .filter_map(|entry| entry.split_once('@'))
+        .find(|(name, _)| qualified_repository(name) == repo)
+        .map(|(_, digest)| digest.to_string())
+        .with_context(|| format!("no registry digest recorded for {repo}"))?;
+    validate_registry_name(&repo)?;
+    validate_sha256_digest(&digest)?;
+    let cosign_ref = format!("{repo}@{digest}");
+    Ok(ResolvedOciReference {
+        pinned_ref: format!("docker://{cosign_ref}"),
+        cosign_ref,
+        digest,
+    })
+}
+
+/// `python:3.12` -> `docker.io/library/python`, `ghcr.io/o/i:t` -> `ghcr.io/o/i`.
+fn qualified_repository(reference: &str) -> String {
+    let without_digest = reference.split('@').next().unwrap_or(reference);
+    let last_slash = without_digest.rfind('/').map_or(0, |index| index + 1);
+    let without_tag = match without_digest[last_slash..].rfind(':') {
+        Some(colon) => &without_digest[..last_slash + colon],
+        None => without_digest,
+    };
+    let first = without_tag.split('/').next().unwrap_or_default();
+    let has_registry = without_tag.contains('/')
+        && (first.contains('.') || first.contains(':') || first == "localhost");
+    if has_registry {
+        without_tag.to_string()
+    } else if without_tag.contains('/') {
+        format!("docker.io/{without_tag}")
+    } else {
+        format!("docker.io/library/{without_tag}")
+    }
 }
 
 fn resolved_reference_from_inspect(bytes: &[u8]) -> Result<ResolvedOciReference> {
@@ -811,6 +915,33 @@ mod tests {
         );
         assert!(parse_image_ref("node:").is_err());
         assert!(parse_image_ref("node:20:extra").is_err());
+    }
+
+    #[test]
+    fn engine_repo_digests_pin_the_qualified_repository() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let resolved =
+            resolved_reference_from_repo_digests("python:3.12-slim", &[format!("python@{digest}")])
+                .unwrap();
+        assert_eq!(
+            resolved.cosign_ref,
+            format!("docker.io/library/python@{digest}")
+        );
+        assert_eq!(
+            resolved.pinned_ref,
+            format!("docker://docker.io/library/python@{digest}")
+        );
+        assert_eq!(qualified_repository("ghcr.io/o/img:v1"), "ghcr.io/o/img");
+        assert_eq!(
+            qualified_repository("localhost:5000/app"),
+            "localhost:5000/app"
+        );
+        assert_eq!(qualified_repository("org/app:1"), "docker.io/org/app");
+        assert!(resolved_reference_from_repo_digests("python:3", &[]).is_err());
+        assert!(
+            resolved_reference_from_repo_digests("python:3", &["python@sha256:short".into()])
+                .is_err()
+        );
     }
 
     #[test]
