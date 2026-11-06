@@ -1171,6 +1171,22 @@ async fn fail_create_or_restore(
     }
 }
 
+/// A create whose request is refused while it is checked (an image it may not
+/// use, a volume it cannot attach) never started anything, so it leaves no
+/// VM behind: the caller is told the create was rejected, and a record in
+/// `error` would be a VM it never got. Failures after the boot started keep
+/// their `error` record, which shows what happened.
+async fn reject_unstarted_create(
+    state: &AppState,
+    id: Uuid,
+    cause: OrchError,
+) -> Result<(), OrchError> {
+    if lifecycle_state(state, id)?.is_none() {
+        return Err(cause);
+    }
+    rollback_shutdown_rejected_lifecycle(state, id, None, cause).await
+}
+
 /// A DELETE/stop-all has marked a supervisor-owned lifecycle for cancellation.
 /// Publication is never cancelled mid-await: the owner reaches this point only
 /// after the current fleet/SQLite/cache operation has returned, then tears down
@@ -1426,7 +1442,7 @@ async fn create_local_owned(
         Ok(req) => req,
         Err(error) => {
             state.supervisor.abort_unstarted_boot(&ticket).await;
-            fail_create_or_restore(state, id, error).await?;
+            reject_unstarted_create(state, id, error).await?;
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
@@ -1435,7 +1451,7 @@ async fn create_local_owned(
         Ok(volumes) => volumes,
         Err(error) => {
             state.supervisor.abort_unstarted_boot(&ticket).await;
-            fail_create_or_restore(state, id, error).await?;
+            reject_unstarted_create(state, id, error).await?;
             unreachable!("failed lifecycle helper always returns an error")
         }
     };
@@ -5357,6 +5373,44 @@ mod tests {
             OrchError::Overloaded { message, .. } if message == "taritd is shutting down"
         ));
         assert!(state.store.lock().unwrap().get_vm(id).is_err());
+        assert!(state.vm_cache.read().unwrap().get(&id).is_none());
+        assert!(lifecycle_state(&state, id).unwrap().is_none());
+        assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+    }
+
+    #[test]
+    fn a_create_rejected_before_it_starts_leaves_no_vm() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        let mut record = vm_get(&state, id).unwrap();
+        record.status = VmStatus::Creating;
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        commit_vm_record(&state, record.clone()).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Creating {
+                record,
+                phase: CreatingPhase::FleetClaimed,
+            },
+        )
+        .unwrap();
+        state.supervisor.reserve_existing_for_test(id);
+
+        let error = test_runtime()
+            .block_on(reject_unstarted_create(
+                &state,
+                id,
+                OrchError::Conflict("read-write volume attachment is exclusive".into()),
+            ))
+            .expect_err("the rejection is returned to the caller");
+
+        assert!(matches!(error, OrchError::Conflict(_)));
+        assert!(
+            state.store.lock().unwrap().get_vm(id).is_err(),
+            "no record left"
+        );
         assert!(state.vm_cache.read().unwrap().get(&id).is_none());
         assert!(lifecycle_state(&state, id).unwrap().is_none());
         assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
