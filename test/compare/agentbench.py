@@ -17,7 +17,7 @@ Scenarios (see README.md for what each verifies):
   soak     sustained exec load with pause/resume, watching for resource growth
 """
 import argparse, json, os, random, shutil, signal, socket, subprocess, sys
-import threading, time
+import tempfile, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vmbench as vb  # noqa: E402  (shared agent protocol and helpers)
@@ -700,13 +700,14 @@ def scen_burst(kind, a, lab):
 
 def leak_probe(kind, a):
     procs = sh(["pgrep", "-c", "-x", "vmm" if kind == "tarit" else "firecracker-v1."], check=False)
-    runtime = len(os.listdir("/tmp/.vmm-runtime")) if os.path.isdir("/tmp/.vmm-runtime") else 0
+    # The VMM keeps its runtime files under $TMPDIR, like tempfile does.
+    root = os.path.join(tempfile.gettempdir(), ".vmm-runtime")
+    runtime = os.listdir(root) if os.path.isdir(root) else []
     overlays = len(os.listdir(os.path.join(a.work, "overlays"))) \
         if os.path.isdir(os.path.join(a.work, "overlays")) else 0
     return {"vmm_processes": int(procs.stdout.strip() or 0),
             "runtime_dirs_with_files": sum(
-                1 for d in os.listdir("/tmp/.vmm-runtime") if os.listdir(os.path.join("/tmp/.vmm-runtime", d))
-            ) if runtime else 0,
+                1 for d in runtime if os.listdir(os.path.join(root, d))),
             "overlays": overlays}
 
 
