@@ -957,7 +957,8 @@ fn boot_on_kvm(
     // Build the device list with irqfds attached.
     let mut devices: Vec<(MmioRange, Box<dyn vmm_devices::bus::MmioDevice>)> = Vec::new();
     let mut mmio_base = 0xd000_0000u64;
-    let mut ioevent_addrs: Vec<(u64, vmm_sys_util::eventfd::EventFd)> = Vec::new();
+    // (QUEUE_NOTIFY address, kick eventfd, number of queues)
+    let mut ioevent_addrs: Vec<(u64, vmm_sys_util::eventfd::EventFd, u32)> = Vec::new();
     for (i, vol) in volumes.iter().enumerate() {
         let irq = 5 + i as u32;
 
@@ -1030,7 +1031,7 @@ fn boot_on_kvm(
             .map_err(|e| anyhow::anyhow!("net EventFd: {e}"))?;
         net_dev.set_irq_evt(net_irq_evt.try_clone()?);
         devices.push((MmioRange::new(mmio_base, 0x1000), Box::new(net_dev.clone())));
-        ioevent_addrs.push((mmio_base + 0x50, net_io_evt.try_clone()?));
+        ioevent_addrs.push((mmio_base + 0x50, net_io_evt.try_clone()?, 2));
         log::info!(
             "net: tap={} mac={:02x?} at mmio 0x{mmio_base:x} irq {irq}",
             tap.name,
@@ -1082,9 +1083,9 @@ fn boot_on_kvm(
             Err(e) => log::warn!("irqfd registration failed for volume {i}: {e}"),
         }
     }
-    for (addr, evt) in &ioevent_addrs {
-        match vm.register_ioeventfd(*addr, evt) {
-            Ok(_) => log::info!("ioeventfd registered for volume at 0x{addr:x}"),
+    for (addr, evt, queues) in &ioevent_addrs {
+        match vm.register_queue_notify(*addr, evt, *queues) {
+            Ok(_) => log::info!("ioeventfd registered at 0x{addr:x} ({queues} queues)"),
             Err(e) => log::warn!("ioeventfd registration failed at 0x{addr:x}: {e}"),
         }
     }

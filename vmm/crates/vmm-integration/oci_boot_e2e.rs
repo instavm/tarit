@@ -168,7 +168,7 @@ fn probe_virtio_blk_activation_inner(
         vm.register_irqfd(&irq_evt, VBLK_IRQ)
             .expect("register_irqfd");
     }
-    vm.register_ioeventfd(VBLK_MMIO_BASE + 0x50, &io_evt)
+    vm.register_queue_notify(VBLK_MMIO_BASE + 0x50, &io_evt, 1)
         .expect("register_ioeventfd");
 
     let mut vcpu = vm.create_vcpu(0).expect("create_vcpu");

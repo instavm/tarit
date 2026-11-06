@@ -314,12 +314,15 @@ impl KvmVm {
             .map_err(|e| VmmError::Memory(format!("read dirty log: {e}")))
     }
 
-    /// Register an ioeventfd for a MMIO address.
-    pub fn register_ioeventfd(&self, mmio_addr: u64, evt: &EventFd) -> Result<()> {
-        self.vm_fd
-            .register_ioevent(evt, &IoEventAddress::Mmio(mmio_addr), 0u32)
-            .map_err(|e| VmmError::Kvm(format!("register_ioevent(0x{mmio_addr:x}): {e}")))?;
-        log::debug!("ioeventfd registered: mmio=0x{mmio_addr:x}");
+    /// Route the guest's kicks of queues `0..queues` (the values it writes to
+    /// a virtio-mmio QUEUE_NOTIFY register at `mmio_addr`) to `evt`, so they
+    /// wake the device's I/O thread inside KVM instead of exiting to this
+    /// vCPU. KVM matches MMIO ioeventfds on the written value, so each queue
+    /// index needs its own registration.
+    pub fn register_queue_notify(&self, mmio_addr: u64, evt: &EventFd, queues: u32) -> Result<()> {
+        for queue in 0..queues {
+            self.register_ioeventfd_datamatch(mmio_addr, evt, queue)?;
+        }
         Ok(())
     }
 

@@ -366,6 +366,14 @@ impl Drop for OwnedOverlayGuard {
 }
 
 /// The VMM controller — owns at most one VM (1:1 process model).
+/// See [`VmmController::net_counters`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetCounters {
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    pub vcpu_kicks: u64,
+}
+
 pub struct VmmController {
     vm: Arc<Mutex<Option<VmInstance>>>,
     lifecycle: Mutex<Option<LifecycleOp>>,
@@ -1290,10 +1298,10 @@ impl VmmController {
         ));
         irq_evts.push(serial_evt);
 
-        // virtio-net: register an irqfd + a TX-queue ioeventfd per device and
-        // spawn its host<->tap I/O loop. The guest's TX kick lands on the I/O
-        // thread instead of exiting the vCPU. NetIoLoop + Tap are kept alive
-        // in RunningVm and dropped (loop first) on stop.
+        // virtio-net: register an irqfd and the receive and transmit queue
+        // kicks per device, and spawn its host<->tap I/O loop. Both kicks land
+        // on the I/O thread instead of exiting the vCPU. NetIoLoop + Tap are
+        // kept alive in RunningVm and dropped (loop first) on stop.
         let mut net_io_loops = Vec::new();
         let mut net_devices = Vec::new();
         let mut taps = Vec::new();
@@ -1307,7 +1315,7 @@ impl VmmController {
                 mmio_base,
             } = net;
             kvm_vm.register_irqfd(&irq_evt, irq)?;
-            kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt)?;
+            kvm_vm.register_queue_notify(mmio_base + 0x50, &io_evt, 2)?;
             let tap_fd = tap.fd;
             let kick_fd = {
                 use std::os::fd::AsRawFd;
@@ -2362,6 +2370,29 @@ impl VmmController {
         _shell: Option<String>,
     ) -> Result<()> {
         Err(VmmError::Kvm("AttachPty needs Linux+KVM+boot".into()))
+    }
+
+    /// Packet counters of each virtio-net device, in configuration order.
+    /// `vcpu_kicks` counts queue notifications the guest's vCPU had to hand
+    /// to the VMM itself; with every queue's kick routed to the device's I/O
+    /// thread it stays zero.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn net_counters(&self) -> Vec<NetCounters> {
+        let slot = self.lock();
+        slot.as_ref()
+            .and_then(|vm| vm.running.as_ref())
+            .map(|running| {
+                running
+                    .net_devices
+                    .iter()
+                    .map(|dev| NetCounters {
+                        tx_packets: dev.tx_packets.load(std::sync::atomic::Ordering::Relaxed),
+                        rx_packets: dev.rx_packets.load(std::sync::atomic::Ordering::Relaxed),
+                        vcpu_kicks: dev.notify_count.load(std::sync::atomic::Ordering::Relaxed),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -7589,7 +7620,7 @@ fn build_running_vm(
             mmio_base,
         } = net;
         kvm_vm.register_irqfd(&irq_evt, irq)?;
-        kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt)?;
+        kvm_vm.register_queue_notify(mmio_base + 0x50, &io_evt, 2)?;
         let tap_fd = tap.fd;
         let kick_fd = {
             use std::os::fd::AsRawFd;
