@@ -38,6 +38,27 @@ def sh(cmd, check=True, **kw):
     return subprocess.run(cmd, check=check, capture_output=True, text=True, **kw)
 
 
+def warm_page_cache(path):
+    """Read the data extents of `path` once, skipping holes."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size, at = os.fstat(fd).st_size, 0
+        while at < size:
+            try:
+                start = os.lseek(fd, at, os.SEEK_DATA)
+            except OSError:
+                break
+            end = os.lseek(fd, start, os.SEEK_HOLE)
+            while start < end:
+                chunk = os.pread(fd, min(8 << 20, end - start), start)
+                if not chunk:
+                    break
+                start += len(chunk)
+            at = end
+    finally:
+        os.close(fd)
+
+
 def die_with_harness():
     """preexec_fn: SIGKILL this child when the harness exits, even by a
     crash, so a failed run leaves no namespace or slirp4netns behind. Only
@@ -939,6 +960,10 @@ def main():
     # Turn SIGTERM into an exception so the lab namespace is always torn down.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     lab = Lab(a.work).start()
+    # Whichever VMM boots first would otherwise read the kernel and image
+    # from disk while the other finds them cached.
+    for path in (a.kernel, a.rootfs):
+        warm_page_cache(path)
     results = {k: {} for k in a.only.split(",")}
     try:
         for s in a.scenarios.split(","):
