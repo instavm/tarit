@@ -7486,20 +7486,58 @@ struct RestoredRuntimeState<'a> {
 /// 4 KiB ones (about 10 ms -> 4 ms for a 20 MiB kernel), and the guest's kernel
 /// is then mapped with huge pages, which shortens its boot as well. Only the
 /// kernel's own range is advised, so guest RAM density is unchanged.
-/// `VMM_KERNEL_HUGEPAGES=0` turns it off, e.g. on hosts where huge page
-/// allocation may stall on compaction.
+///
+/// Only when the host has plenty of free 2 MiB blocks: with few, a huge page
+/// fault compacts memory first and usually falls back to small pages anyway,
+/// which made a burst of 20 concurrent boots 40% slower on a fragmented host.
+/// `VMM_KERNEL_HUGEPAGES=0` turns it off entirely.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 pub fn back_kernel_with_huge_pages(
     mem: &vmm_memory_backend::GuestMemory,
     kernel: &std::path::Path,
 ) {
+    // Free blocks wanted per 2 MiB page the kernel needs: room for a burst of
+    // VMs booting at once without draining the free lists into compaction.
+    const MARGIN: u64 = 16;
     if std::env::var("VMM_KERNEL_HUGEPAGES").as_deref() == Ok("0") {
         return;
     }
-    if let Some((start, end)) = vmm_loader::x86_64::elf_load_extent(kernel) {
-        let advised = mem.advise_huge_pages(start, end - start);
-        log::debug!("kernel range {start:#x}..{end:#x} huge pages advised: {advised}");
-    }
+    let Some((start, end)) = vmm_loader::x86_64::elf_load_extent(kernel) else {
+        return;
+    };
+    let needed = (end - start).div_ceil(2 * 1024 * 1024);
+    let free = std::fs::read_to_string("/proc/buddyinfo")
+        .map(|info| free_huge_page_blocks(&info))
+        .unwrap_or(0);
+    let advised = free >= needed * MARGIN && mem.advise_huge_pages(start, end - start);
+    log::debug!(
+        "kernel range {start:#x}..{end:#x}: {needed} huge pages needed, {free} free, advised {advised}"
+    );
+}
+
+/// Free 2 MiB blocks across all zones in `/proc/buddyinfo` text (order 9 and
+/// larger; a free order-n block holds 2^(n-9) of them).
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn free_huge_page_blocks(buddyinfo: &str) -> u64 {
+    const HUGE_ORDER: usize = 9;
+    buddyinfo
+        .lines()
+        .flat_map(|line| {
+            line.split_whitespace()
+                .skip(4) // "Node 0, zone Normal"
+                .enumerate()
+                .filter(|(order, _)| *order >= HUGE_ORDER)
+                .filter_map(|(order, count)| {
+                    count
+                        .parse::<u64>()
+                        .ok()
+                        .map(|count| count << (order - HUGE_ORDER))
+                })
+        })
+        .sum()
 }
 
 /// Collect the startup reports of device workers started with `start_*`.
@@ -8387,6 +8425,16 @@ fn serialize_state_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_huge_page_blocks_counts_order_nine_and_up() {
+        let info = "Node 0, zone      DMA      2      1      0      0      0      0      0      0      1      2      2\n\
+                    Node 0, zone    DMA32   8196   4538   3208   2649   1798   1230    537    168     17      2      0\n\
+                    Node 0, zone   Normal  78576  37189  20208  13349   7715   4641   1790    675     70     16      3\n";
+        // order 9 + 2 x order 10: DMA 2 + 4, DMA32 2 + 0, Normal 16 + 6.
+        assert_eq!(free_huge_page_blocks(info), 30);
+        assert_eq!(free_huge_page_blocks(""), 0);
+    }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     #[test]
