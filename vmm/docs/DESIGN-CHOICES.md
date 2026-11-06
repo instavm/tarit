@@ -68,7 +68,7 @@ local APIC, causing the kernel to think there's no FPU.
 
 ## CPUID
 
-### Choice: Host passthrough with nested virtualization and x2APIC masked
+### Choice: Host passthrough with nested virtualization; x2APIC on bare metal only
 
 **Alternatives:**
 1. **Safe minimal CPUID**: mask off all extended features, keep only
@@ -80,8 +80,11 @@ local APIC, causing the kernel to think there's no FPU.
 **Why host passthrough:** The safe minimal CPUID caused triple-faults
 because it masked MTRR and PAT, which the kernel's early boot code
 requires. Host passthrough gives the kernel all the features it
-expects. We mask x2APIC (leaf 1 ECX[21]) because it causes issues on
-nested virt. We also always mask Intel VMX (leaf 1 ECX[5]) and AMD SVM
+expects. We mask x2APIC (leaf 1 ECX[21]) when the host itself runs under a
+hypervisor, because it causes issues on nested virt; on bare metal we offer it,
+since its MSR-based EOI is much cheaper than the trapped xAPIC MMIO write the
+guest makes for every interrupt. A snapshot taken in x2APIC mode does not
+restore on a host that masks it. We also always mask Intel VMX (leaf 1 ECX[5]) and AMD SVM
 (leaf `0x80000001` ECX[2]). The worker keeps `/dev/kvm` and nested
 virtualization, but a customer sandbox cannot advertise or initialize another
 hardware-virtualized layer. Tarit does not pass `/dev/kvm` into the guest.
