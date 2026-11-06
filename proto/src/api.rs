@@ -87,6 +87,12 @@ pub enum ApiRequest {
         /// an ordinary full snapshot. Ignored for diff and live snapshots.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<String>,
+        /// The caller paused this VM so it can capture other state (a disk
+        /// upper) in the same pause: resume it as soon as RAM is captured,
+        /// before the rest of the file is copied. Ignored unless the VM is
+        /// Paused, and for live snapshots.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resume: bool,
     },
     /// Transfer one exact VMM-owned scratch file to the caller.
     ReleaseScratch {
@@ -365,6 +371,7 @@ mod tests {
             live: false,
             capture_disks: false,
             base: None,
+            resume: false,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
@@ -378,6 +385,7 @@ mod tests {
             live: true,
             capture_disks: false,
             base: None,
+            resume: false,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
@@ -407,6 +415,7 @@ mod tests {
             live: false,
             capture_disks: true,
             base: None,
+            resume: false,
         };
         let back: ApiRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert!(matches!(

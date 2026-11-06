@@ -1388,6 +1388,7 @@ fn api_snapshot(
         live,
         capture_disks,
         base,
+        resume: false,
     };
     let body = serde_json::to_vec(&request)?;
     let response = send_raw(socket, &body)?;

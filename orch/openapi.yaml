@@ -1305,7 +1305,7 @@ paths:
                 diff:
                   type: boolean
                   default: false
-                  description: Must be false. Incremental orchestrator snapshots are disabled until durable parent-chain relocation is available.
+                  description: Accepted for compatibility. Every snapshot is standalone; capture pauses the guest only for pages changed since the snapshot it was restored from or last wrote, whenever the VMM can use that snapshot as a base.
       responses:
         "200":
           description: Opaque snapshot handle
@@ -1324,8 +1324,6 @@ paths:
           description: VM belongs to a different tenant
         "404":
           description: VM not found
-        "422":
-          description: Incremental snapshots are disabled; retry with `diff=false`.
         "409":
           description: VM lifecycle state does not support snapshots
   /v1/vms/{id}/fork:

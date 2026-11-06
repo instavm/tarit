@@ -158,7 +158,8 @@ class Gate:
 
     def snapshot(self, vm_id: str, diff: bool = False) -> str | None:
         current = self.vms[vm_id].status
-        expected = 422 if diff else (200 if current in {"running", "paused"} else 409)
+        # diff is accepted for compatibility; every snapshot is standalone.
+        expected = 200 if current in {"running", "paused"} else 409
         _, row = self.request(
             "POST", f"/v1/vms/{vm_id}/snapshot", {"diff": diff}, expected
         )
@@ -492,7 +493,7 @@ class Gate:
             paused_snapshot: self.snapshot_balloon_targets[paused_snapshot],
             running_snapshot: self.snapshot_balloon_targets[running_snapshot],
         }
-        assert self.snapshot(source, diff=True) is None
+        assert self.snapshot(source, diff=True) is not None
         assert self.transition(source, "hibernate") == 200
         assert self.transition(source, "hibernate") == 409
         assert self.transition(source, "pause") == 409

@@ -479,13 +479,28 @@ impl VmmClient {
     /// Callers that need to transfer the artifact must capture its identity and
     /// explicitly call `release_scratch` only after they hold local ownership.
     pub fn snapshot_unreleased(&self, diff: bool) -> Result<String, VmmError> {
+        self.snapshot_unreleased_with(diff, None, false)
+    }
+
+    /// [`Self::snapshot_unreleased`] with the VMM's checkpoint options:
+    /// `base`, a VMM-visible full snapshot this VM last wrote or was restored
+    /// from, lets the VMM pause only for pages changed since (the result is a
+    /// full snapshot either way); `resume` resumes a VM the caller paused as
+    /// soon as RAM is captured.
+    pub fn snapshot_unreleased_with(
+        &self,
+        diff: bool,
+        base: Option<&str>,
+        resume: bool,
+    ) -> Result<String, VmmError> {
         // The orchestrator manages disk uppers itself, so it asks for a
         // memory-only snapshot and rejects any disk artifact.
         match self.request_ok(&ApiRequest::Snapshot {
             diff,
             live: false,
             capture_disks: false,
-            base: None,
+            base: base.map(str::to_string),
+            resume,
         })? {
             ApiResponse::Snapshot {
                 path,
@@ -528,6 +543,7 @@ impl VmmClient {
             live: true,
             capture_disks: false,
             base: None,
+            resume: false,
         })? {
             ApiResponse::Snapshot {
                 path,

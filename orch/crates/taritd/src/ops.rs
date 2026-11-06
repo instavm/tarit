@@ -2270,9 +2270,7 @@ pub async fn hibernate_local(
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
-    let snapshot_path = snapshot_local_locked(state, id, false, Some(id), None)
-        .await?
-        .path;
+    let snapshot_path = snapshot_local_locked(state, id, Some(id), None).await?.path;
     let snapshot =
         verify_snapshot_access(state, &snapshot_path, current.owner_key.as_deref(), false)?;
     let owner_key = current.owner_key.as_ref().ok_or_else(|| {
@@ -2819,13 +2817,11 @@ fn release_failed_activation_reservation(
     }
 }
 
-pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<String, OrchError> {
-    if diff {
-        return Err(OrchError::Unprocessable(
-            "incremental orchestrator snapshots are disabled until durable parent-chain relocation is available; request a full snapshot with diff=false"
-                .into(),
-        ));
-    }
+/// Every orchestrator snapshot is a standalone full snapshot, so it can be
+/// restored, moved or deleted on its own. Capture is incremental whenever the
+/// VMM can use the runtime's last checkpoint as its base, whether or not the
+/// caller asked for `diff`, which is accepted for compatibility.
+pub async fn snapshot_local(state: &AppState, id: Uuid, _diff: bool) -> Result<String, OrchError> {
     // Scale-to-zero removes the supervisor gate, but not the VM. Check the
     // durable status before looking up a live-runtime gate so callers receive
     // a lifecycle conflict for hibernated VMs rather than a false 404.
@@ -2838,9 +2834,7 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, diff: bool) -> Result<St
     ensure_no_data_volumes(state, &vm, "snapshot").await?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
-    Ok(snapshot_local_locked(state, id, diff, None, None)
-        .await?
-        .path)
+    Ok(snapshot_local_locked(state, id, None, None).await?.path)
 }
 
 pub(crate) struct ForkSnapshotOutcome {
@@ -2877,7 +2871,7 @@ pub async fn snapshot_local_for_fork(
     ensure_no_data_volumes(state, &source, "fork").await?;
     let gate = state.supervisor.operation_gate(source_id)?;
     let _operation = gate.lock_owned().await;
-    snapshot_local_locked(state, source_id, false, Some(child_id), Some(child_id)).await
+    snapshot_local_locked(state, source_id, Some(child_id), Some(child_id)).await
 }
 
 pub fn bind_localized_snapshot_to_fork(
@@ -2898,7 +2892,6 @@ pub fn bind_localized_snapshot_to_fork(
 async fn snapshot_local_locked(
     state: &AppState,
     id: Uuid,
-    diff: bool,
     ephemeral_owner_vm_id: Option<Uuid>,
     snapshot_id: Option<Uuid>,
 ) -> Result<ForkSnapshotOutcome, OrchError> {
@@ -2918,7 +2911,7 @@ async fn snapshot_local_locked(
     let sup = Arc::clone(&state.supervisor);
     let bundle = tokio::task::spawn_blocking(move || {
         if !running {
-            return sup.snapshot_bundle_vm(id, diff, false, overlay_path, memory_mib);
+            return sup.snapshot_bundle_vm(id, false, overlay_path, memory_mib);
         }
         // The atomic live path clones the disk upper inside its final stop
         // and therefore needs reflink. On ext4 or tmpfs take the atomic
@@ -2930,7 +2923,7 @@ async fn snapshot_local_locked(
             .and_then(std::path::Path::parent)
             .map_or(Some(true), crate::supervisor::directory_supports_reflink);
         if reflink == Some(false) {
-            return sup.snapshot_bundle_vm(id, diff, true, overlay_path, memory_mib);
+            return sup.snapshot_bundle_vm(id, true, overlay_path, memory_mib);
         }
         match sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some()) {
             Err(OrchError::Vmm(message)) if message.contains("requires reflink/FICLONE") => {
@@ -2938,7 +2931,7 @@ async fn snapshot_local_locked(
                     %id,
                     "overlay filesystem lacks reflink; using a paused snapshot instead of a live one"
                 );
-                sup.snapshot_bundle_vm(id, diff, true, overlay_path, memory_mib)
+                sup.snapshot_bundle_vm(id, true, overlay_path, memory_mib)
             }
             other => other,
         }
@@ -4478,14 +4471,14 @@ mod tests {
     }
 
     #[test]
-    fn incremental_orchestrator_snapshot_is_rejected_before_vmm_lookup() {
+    fn incremental_orchestrator_snapshot_is_a_full_snapshot_request() {
+        // diff=true is no longer refused up front: it takes the same path as
+        // a full snapshot, so an unknown VM is a plain 404.
         let (state, _) = test_state_with_durable_writer();
         let error = test_runtime()
             .block_on(snapshot_local(&state, Uuid::new_v4(), true))
-            .expect_err("diff snapshots must fail before runtime lookup");
-        assert!(matches!(error, OrchError::Unprocessable(_)));
-        assert_eq!(error.http_status(), 422);
-        assert!(error.to_string().contains("diff=false"));
+            .expect_err("unknown VM");
+        assert_eq!(error.http_status(), 404, "{error}");
     }
 
     #[test]

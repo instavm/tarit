@@ -195,6 +195,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             live,
             capture_disks,
             base,
+            resume,
         } => {
             let result = if live && diff {
                 Err(vmm_core::error::VmmError::Snapshot(
@@ -253,7 +254,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 }
             } else {
                 controller
-                    .snapshot_with_options(diff, capture_disks, base.as_deref())
+                    .snapshot_with_options(diff, capture_disks, base.as_deref(), resume)
                     .map(|(path, volume_paths)| (path, None, volume_paths, None, None))
             };
             match result {
@@ -903,6 +904,7 @@ mod tests {
                 live: true,
                 capture_disks: false,
                 base: None,
+                resume: false,
             },
             &controller,
         );

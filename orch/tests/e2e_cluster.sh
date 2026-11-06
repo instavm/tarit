@@ -373,9 +373,9 @@ case_lifecycle_state_machine() {
   full_snap="$(json_get "$LAST_BODY" 'data["path"]')"
   echo "$full_snap" >"$RUN_DIR/full_snapshot_path"
   echo "$(json_get "$LAST_BODY" 'data["host_id"]')" >"$RUN_DIR/full_snapshot_host"
-  # Diff snapshots are fail-closed until durable parent-chain relocation ships.
+  # diff=true is accepted and, like every snapshot, is standalone.
   api 0 POST "/v1/vms/$vm_id/snapshot" '{"diff":true}' 60
-  expect_code 422
+  expect_code 200
   api 0 DELETE "/v1/vms/$vm_id" '' 20
   expect_code 204
   api 0 GET "/v1/vms/$vm_id/status" '' 10

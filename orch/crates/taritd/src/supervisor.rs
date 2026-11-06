@@ -904,6 +904,11 @@ struct RunningVm {
     /// must be observed as one transition. The gate is owned by the runtime
     /// entry, so deleting a VM also removes the only registry reference.
     operation_gate: Arc<AsyncMutex<()>>,
+    /// VMM-visible path of the full snapshot this runtime last wrote or was
+    /// restored from. Passed as the next snapshot's base so the VMM pauses
+    /// only for pages changed since; the VMM verifies it is exactly that
+    /// snapshot and otherwise takes an ordinary full snapshot.
+    checkpoint_base: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl RunningVm {
@@ -914,6 +919,13 @@ impl RunningVm {
             process,
             net,
             operation_gate: Arc::new(AsyncMutex::new(())),
+            checkpoint_base: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn set_checkpoint_base(&self, path: Option<String>) {
+        if let Ok(mut base) = self.checkpoint_base.lock() {
+            *base = path;
         }
     }
 }
@@ -5537,6 +5549,9 @@ impl VmmSupervisor {
         if !boot_can_publish(&ticket.control, self.is_shutting_down()) {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, self.shutdown_error()));
         }
+        // The restored snapshot stays in place while the VM runs (in the jail
+        // when jailed), so the first checkpoint can use it as its base.
+        vm.set_checkpoint_base(Some(restore_path.to_string()));
         self.require_restored_guest_ready_and_network(BootedVm {
             id,
             vm,
@@ -6882,6 +6897,23 @@ impl VmmSupervisor {
     /// Return the operation gate owned by this exact live runtime. Gates are
     /// not kept in a separate UUID map: removing the `RunningVm` drops the
     /// supervisor's reference, so churn cannot grow an unbounded registry.
+    fn checkpoint_base(&self, id: Uuid) -> Option<String> {
+        let running = self.running.lock().ok()?;
+        let base = running.get(&id)?.checkpoint_base.lock().ok()?;
+        base.clone()
+    }
+
+    fn set_checkpoint_base(&self, id: Uuid, path: Option<String>) {
+        if let Some(vm) = self
+            .running
+            .lock()
+            .ok()
+            .and_then(|running| running.get(&id).cloned())
+        {
+            vm.set_checkpoint_base(path);
+        }
+    }
+
     pub(crate) fn operation_gate(&self, id: Uuid) -> Result<Arc<AsyncMutex<()>>, OrchError> {
         self.running
             .lock()
@@ -7157,7 +7189,6 @@ impl VmmSupervisor {
     pub(crate) fn snapshot_bundle_vm(
         &self,
         id: Uuid,
-        diff: bool,
         resume_after: bool,
         overlay_path: Option<PathBuf>,
         memory_mib: u64,
@@ -7166,47 +7197,23 @@ impl VmmSupervisor {
         let has_overlay = overlay_path.is_some();
         let _reservation = self.reserve_snapshot_space(id, memory_mib, has_overlay)?;
         let client = self.lifecycle_client_for(id)?;
-        if resume_after {
-            // Pause is synchronous: it returns only after every vCPU has left
-            // KVM_RUN and completed its current MMIO handler. The pause window
-            // ends as soon as RAM is immutable and the disk upper is captured;
-            // moving immutable RAM into taritd's durable namespace happens
-            // only after resume.
-            client
-                .pause()
-                .map_err(|error| OrchError::Vmm(format!("pause for snapshot: {error}")))?;
-        }
-        let pause_started = resume_after.then(Instant::now);
-
-        let scratch_snapshot_path = match client.snapshot_unreleased(diff) {
-            Ok(path) => path,
-            Err(error) => {
-                return Err(compensate_snapshot_pause(
-                    &client,
-                    resume_after,
-                    OrchError::Vmm(format!("snapshot RAM: {error}")),
-                ));
-            }
-        };
-        let ram_written = started.elapsed();
-        let scratch_snapshot_host_path = self.host_path_for_vmm(id, &scratch_snapshot_path);
-        // Keep the VMM's cleanup token armed until every member of the bundle
-        // has been captured. A failed disk copy therefore cannot publish a
-        // RAM-only snapshot.
-        let scratch_ram_artifact = match OwnedArtifact::capture(&scratch_snapshot_host_path) {
-            Ok(artifact) => artifact,
-            Err(error) => {
-                return Err(compensate_snapshot_pause(
-                    &client,
-                    resume_after,
-                    OrchError::Internal(format!("capture RAM snapshot ownership: {error}")),
-                ));
-            }
-        };
         let expected_uid = self
             .jail_identity(id)?
             .map(|(uid, _)| uid)
             .unwrap_or_else(|| unsafe { libc::geteuid() });
+        if resume_after {
+            // Pause is synchronous: it returns only after every vCPU has left
+            // KVM_RUN and completed its current MMIO handler. The pause window
+            // covers the disk upper copy and the RAM capture; the VMM resumes
+            // the guest as soon as RAM is captured, and moving immutable RAM
+            // into taritd's durable namespace happens after that.
+            client
+                .pause()
+                .map_err(|error| OrchError::Vmm(format!("pause for snapshot: {error}")))?;
+        }
+
+        // Capture the disk upper first: the VMM resumes the guest once RAM is
+        // captured, so RAM must be the last member of the bundle taken.
         let overlay_artifact = if has_overlay {
             let source = overlay_path.expect("has_overlay is derived from overlay_path");
             let staging = self.snapshot_overlay_staging_path();
@@ -7224,24 +7231,54 @@ impl VmmSupervisor {
         } else {
             None
         };
-
         let disk_captured = started.elapsed();
-        if resume_after {
-            if let Err(error) = client.resume() {
-                if let Some((artifact, _)) = overlay_artifact {
-                    let _ = artifact.remove();
+        let discard_overlay = |overlay_artifact: Option<(OwnedArtifact, PathBuf)>| {
+            if let Some((artifact, _)) = overlay_artifact {
+                let _ = artifact.remove();
+            }
+        };
+
+        // Always a full snapshot. With the runtime's last checkpoint as its
+        // base the VMM pauses only for pages changed since and copies the rest
+        // from the base after the guest resumes.
+        let base = self.checkpoint_base(id);
+        let scratch_snapshot_path =
+            match client.snapshot_unreleased_with(false, base.as_deref(), resume_after) {
+                Ok(path) => path,
+                Err(error) => {
+                    discard_overlay(overlay_artifact);
+                    return Err(compensate_snapshot_pause(
+                        &client,
+                        resume_after,
+                        OrchError::Vmm(format!("snapshot RAM: {error}")),
+                    ));
                 }
+            };
+        let ram_written = started.elapsed();
+        let scratch_snapshot_host_path = self.host_path_for_vmm(id, &scratch_snapshot_path);
+        // Keep the VMM's cleanup token armed until every member of the bundle
+        // has been captured. A failed claim therefore cannot publish a
+        // RAM-only snapshot.
+        let scratch_ram_artifact = match OwnedArtifact::capture(&scratch_snapshot_host_path) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                discard_overlay(overlay_artifact);
+                return Err(compensate_snapshot_pause(
+                    &client,
+                    resume_after,
+                    OrchError::Internal(format!("capture RAM snapshot ownership: {error}")),
+                ));
+            }
+        };
+
+        if resume_after {
+            // A no-op unless the VMM could not resume the guest itself.
+            if let Err(error) = client.resume() {
+                discard_overlay(overlay_artifact);
                 return Err(OrchError::Vmm(format!(
                     "resume after disk-consistent snapshot: {error}; disk artifact was discarded and RAM scratch remains VMM-owned"
                 )));
             }
-            tracing::info!(
-                vm = %id,
-                paused_ms = pause_started
-                    .map(|started| started.elapsed().as_millis())
-                    .unwrap_or_default(),
-                "snapshot consistency pause completed before durable RAM transfer"
-            );
         }
 
         let resumed = started.elapsed();
@@ -7298,6 +7335,15 @@ impl VmmSupervisor {
                 return Err(error);
             }
         };
+        // The VMM's dirty log now counts from this snapshot. An unjailed VMM
+        // can read it from the durable store for the next checkpoint; a jailed
+        // one sees only its jail, where its old base no longer matches.
+        self.set_checkpoint_base(
+            id,
+            self.jails
+                .is_none()
+                .then(|| ram_destination.display().to_string()),
+        );
         tracing::debug!(
             vm = %id,
             ?ram_written,

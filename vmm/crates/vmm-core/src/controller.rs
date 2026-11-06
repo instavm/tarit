@@ -82,6 +82,11 @@ pub struct VmInstance {
     /// pause covers only the pages dirtied since. Cleared by anything else that
     /// consumes the dirty log (diff and live snapshots, suspend).
     pub base_identity: Option<[u8; 32]>,
+    /// The snapshot this VM was restored from, held open while it is still the
+    /// dirty log's reference, so a checkpoint can use it as its base without
+    /// the caller naming (or keeping) the file. Only lazy and mapped restores
+    /// hold it, since those keep the file open for the VM's life anyway.
+    pub restore_base: Option<Arc<std::fs::File>>,
     /// VMM-owned scratch files removed when this VM stops or is dropped.
     pub transient_files: VmTransientFiles,
     /// True once KVM dirty-page logging has been enabled for this VM (after the
@@ -509,6 +514,7 @@ impl VmmController {
                 created_at: std::time::Instant::now(),
                 last_snapshot: None,
                 base_identity: None,
+                restore_base: None,
                 transient_files: VmTransientFiles::default(),
                 dirty_logging: false,
                 config,
@@ -528,6 +534,7 @@ impl VmmController {
                 created_at: std::time::Instant::now(),
                 last_snapshot: None,
                 base_identity: None,
+                restore_base: None,
                 transient_files: VmTransientFiles::default(),
                 dirty_logging: false,
                 config,
@@ -617,7 +624,7 @@ impl VmmController {
         diff: bool,
         capture_disks: bool,
     ) -> Result<(String, Vec<String>)> {
-        self.snapshot_with_options(diff, capture_disks, None)
+        self.snapshot_with_options(diff, capture_disks, None, false)
     }
 
     /// [`Self::snapshot_with_disks`] with an optional `base`: a full snapshot
@@ -626,11 +633,14 @@ impl VmmController {
     /// writes only the pages dirtied since during the pause and copies the
     /// rest from `base` after the guest resumes. Any other `base` (or none)
     /// takes an ordinary full snapshot; the result is the same file either way.
+    /// With `resume_paused`, a VM the caller paused is resumed as soon as RAM
+    /// is captured, so the copy from `base` runs while the guest does.
     pub fn snapshot_with_options(
         &self,
         diff: bool,
         capture_disks: bool,
         base: Option<&str>,
+        resume_paused: bool,
     ) -> Result<(String, Vec<String>)> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Snapshot)?;
         let started = std::time::Instant::now();
@@ -795,23 +805,43 @@ impl VmmController {
             // A caller-supplied base that is exactly the snapshot the dirty
             // log counts from lets a full snapshot skip every clean page.
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-            let base_plan = if want_diff || !vm.dirty_logging || vm.lazy_restore.is_some() {
+            // Pages the guest has not dirtied since then equal the base, so they
+            // are never read here, even while a lazy (UFFD) restore is still
+            // filling them in.
+            let base_plan = if want_diff || !vm.dirty_logging {
+                None
+            } else if vm.base_identity.is_none() {
+                log::debug!("snapshot: no base (the dirty log has no full-snapshot reference)");
                 None
             } else {
-                base.zip(vm.base_identity.as_ref())
-                    .and_then(|(path, identity)| {
-                        open_snapshot_base(path, identity, mem_slice.len())
-                    })
+                vm.base_identity.as_ref().and_then(|identity| {
+                    base.and_then(|path| open_snapshot_base(path, identity, mem_slice.len()))
+                        .or_else(|| {
+                            let file = Arc::clone(vm.restore_base.as_ref()?);
+                            check_snapshot_base(
+                                file,
+                                identity,
+                                mem_slice.len(),
+                                "restored snapshot",
+                            )
+                        })
+                })
             };
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-            if let (Some((base_file, base_mem_offset)), Some(running)) =
+            if let (Some((base_file, base_mem_offset, base_mem_crc)), Some(running)) =
                 (base_plan, vm.running.as_ref())
             {
                 let mut dirty = running.kvm_vm.read_dirty()?;
+                let kvm_pages = dirty.len();
                 if let Some(guest_mem) = vm.guest_mem.as_ref() {
                     dirty.merge(&guest_mem.drain_host_dirty());
                 }
                 consumed_dirty = Some(dirty.clone());
+                log::debug!(
+                    "snapshot: {} pages dirty since the base ({kvm_pages} by the guest), \
+                     the rest copied after resume",
+                    dirty.len()
+                );
                 deferred_full = Some(write_snapshot_memory_from_base(
                     owned_snapshot.file(),
                     &state_blob,
@@ -819,6 +849,7 @@ impl VmmController {
                     &dirty,
                     base_file,
                     base_mem_offset,
+                    base_mem_crc,
                 )?);
                 return Ok(mem_slice.len());
             }
@@ -963,10 +994,15 @@ impl VmmController {
             vm.state = state_before;
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        let snapshot_result = match resume_result {
-            Ok(()) => snapshot_result,
-            Err(error) => Err(error),
+        let snapshot_result = match (resume_result, snapshot_result) {
+            (Ok(()), Ok(mem_len)) if resume_paused && state_before == VmState::Paused => {
+                resume_paused_vm(vm).map(|()| mem_len)
+            }
+            (Ok(()), snapshot_result) => snapshot_result,
+            (Err(error), _) => Err(error),
         };
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let _ = resume_paused;
         let mem_len = match snapshot_result {
             Ok(mem_len) => mem_len,
             Err(error) => {
@@ -983,8 +1019,15 @@ impl VmmController {
         // immutable backing files before the file is published.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         if let Some(pending) = deferred_full.take() {
+            let used_base = pending.verify_base.is_some();
             if let Err(error) = finish_deferred_snapshot(owned_snapshot.file(), pending) {
                 replay_consumed_dirty(vm, consumed_dirty.as_ref());
+                // A base that failed (say, its CRC no longer matches) is not
+                // offered again: the next snapshot is an ordinary full one.
+                if used_base {
+                    vm.base_identity = None;
+                    vm.restore_base = None;
+                }
                 remove_owned_scratch_file(&owned_snapshot);
                 for disk in &captured_disks {
                     remove_owned_scratch_file(disk);
@@ -1005,6 +1048,7 @@ impl VmmController {
         // can serve as a later base.
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         {
+            vm.restore_base = None;
             vm.base_identity = if wrote_diff || !vm.dirty_logging {
                 None
             } else {
@@ -1360,6 +1404,7 @@ impl VmmController {
             created_at: std::time::Instant::now(),
             last_snapshot: None,
             base_identity: None,
+            restore_base: None,
             transient_files: VmTransientFiles::from_owned_overlays(overlay_guard.disarm()),
             dirty_logging: false,
             config,
@@ -1416,6 +1461,7 @@ impl VmmController {
             }
             // A live snapshot consumes the dirty log.
             vm.base_identity = None;
+            vm.restore_base = None;
             let mem = vm
                 .guest_mem
                 .clone()
@@ -1985,11 +2031,18 @@ impl VmmController {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| snapshot_path.to_string())
         });
-        let base_identity = if dirty_logging {
-            full_snapshot_identity(Path::new(snapshot_path))
-        } else {
-            None
-        };
+        let restored_source = dirty_logging
+            .then(|| open_snapshot_input(Path::new(snapshot_path)).ok())
+            .flatten();
+        let base_identity = restored_source.as_ref().and_then(full_snapshot_identity_of);
+        let restore_base = restored_source
+            .filter(|_| base_identity.is_some() && (lazy_restore.is_some() || mem.is_file_backed()))
+            .map(Arc::new);
+        log::debug!(
+            "restore: dirty logging {dirty_logging}, base identity {}, holding source {}",
+            base_identity.is_some(),
+            restore_base.is_some()
+        );
 
         let mut slot = self.lock();
         *slot = Some(VmInstance {
@@ -1998,6 +2051,7 @@ impl VmmController {
             created_at: std::time::Instant::now(),
             last_snapshot,
             base_identity,
+            restore_base,
             transient_files: VmTransientFiles::from_owned_overlays(overlay_guard.disarm()),
             dirty_logging,
             config,
@@ -2081,6 +2135,7 @@ impl VmmController {
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
         vm.base_identity = None;
+        vm.restore_base = None;
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         {
@@ -2151,18 +2206,11 @@ impl VmmController {
             )));
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        resume_running_io(vm)?;
-        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        if let Err(error) = resume_running_vcpus(vm) {
-            let rollback = pause_running_io(vm).err();
-            return Err(match rollback {
-                Some(rollback) => VmmError::Device(format!(
-                    "resume vCPUs: {error}; failed to re-quiesce I/O workers: {rollback}"
-                )),
-                None => error,
-            });
+        resume_paused_vm(vm)?;
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        {
+            vm.state = VmState::Running;
         }
-        vm.state = VmState::Running;
         log::info!("VM resumed");
         Ok(())
     }
@@ -3098,6 +3146,24 @@ fn resume_running_io(vm: &VmInstance) -> Result<()> {
     Ok(())
 }
 
+/// Resume a Paused or Suspended VM: I/O workers first, then vCPUs. On
+/// failure the I/O workers are parked again and the VM stays paused.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn resume_paused_vm(vm: &mut VmInstance) -> Result<()> {
+    resume_running_io(vm)?;
+    if let Err(error) = resume_running_vcpus(vm) {
+        let rollback = pause_running_io(vm).err();
+        return Err(match rollback {
+            Some(rollback) => VmmError::Device(format!(
+                "resume vCPUs: {error}; failed to re-quiesce I/O workers: {rollback}"
+            )),
+            None => error,
+        });
+    }
+    vm.state = VmState::Running;
+    Ok(())
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn resume_running_vcpus(vm: &VmInstance) -> Result<()> {
     if let Some(r) = vm.running.as_ref() {
@@ -3585,6 +3651,10 @@ fn staged_owned_output(target: &Path) -> Result<OwnedScratchFile> {
 
 /// Publish VMM-private scratch that is removed when this process exits. It
 /// skips every fsync: after a host crash the VM it belongs to is gone too.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn publish_volatile_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<()> {
     owned.rename_to_volatile(target).map_err(|error| {
         VmmError::Snapshot(format!(
@@ -4778,6 +4848,10 @@ struct DeferredFullSnapshot {
     layout: SnapshotWriteLayout,
     /// (RAM offset, length, backing file, file offset), coalesced.
     copies: Vec<(u64, u64, Arc<std::fs::File>, u64)>,
+    /// For a snapshot taken against a base: the base's memory image (file,
+    /// offset, length) and the CRC its header records. Checked before any of
+    /// its bytes are trusted.
+    verify_base: Option<(Arc<std::fs::File>, u64, u64, u32)>,
 }
 
 /// First half of a full snapshot of file-backed (restored) guest RAM, run
@@ -4803,7 +4877,7 @@ fn write_snapshot_memory_deferred(
 
     const PAGE: usize = 4096;
     let layout = SnapshotWriteLayout::new(state_blob, mem.len(), false)?;
-    if mem.len() % PAGE != 0 || populated.len() != mem.len() / PAGE {
+    if !mem.len().is_multiple_of(PAGE) || populated.len() != mem.len() / PAGE {
         return Err(VmmError::Snapshot(
             "guest RAM is not a whole number of pages".into(),
         ));
@@ -4864,6 +4938,7 @@ fn write_snapshot_memory_deferred(
         state_blob: state_blob.to_vec(),
         layout,
         copies,
+        verify_base: None,
     })
 }
 
@@ -4878,11 +4953,6 @@ fn full_snapshot_identity_of(file: &std::fs::File) -> Option<[u8; 32]> {
     (&header[..4] == b"VMSN" && flags == 0).then_some(header)
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn full_snapshot_identity(path: &Path) -> Option<[u8; 32]> {
-    full_snapshot_identity_of(&open_snapshot_input(path).ok()?)
-}
-
 /// Open `path` as the base for a full snapshot if it is exactly the snapshot
 /// identified by `identity` and its memory image is `mem_len` bytes. Returns
 /// the file and the offset of its memory image.
@@ -4891,18 +4961,40 @@ fn open_snapshot_base(
     path: &str,
     identity: &[u8; 32],
     mem_len: usize,
-) -> Option<(Arc<std::fs::File>, u64)> {
-    let file = open_snapshot_input(Path::new(path)).ok()?;
+) -> Option<(Arc<std::fs::File>, u64, u32)> {
+    match open_snapshot_input(Path::new(path)) {
+        Ok(file) => check_snapshot_base(Arc::new(file), identity, mem_len, path),
+        Err(error) => {
+            log::info!("snapshot base {path} cannot be opened ({error}); not using it");
+            None
+        }
+    }
+}
+
+/// [`open_snapshot_base`] for an open `file`, named `label` in logs.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn check_snapshot_base(
+    file: Arc<std::fs::File>,
+    identity: &[u8; 32],
+    mem_len: usize,
+    label: &str,
+) -> Option<(Arc<std::fs::File>, u64, u32)> {
+    let skip = |why: &str| {
+        log::info!("snapshot base {label} {why}; not using it");
+        None
+    };
     if full_snapshot_identity_of(&file).as_ref() != Some(identity) {
-        log::info!("snapshot base {path} is not this VM's last snapshot; taking a full snapshot");
-        return None;
+        return skip("is not this VM's last snapshot");
     }
     let state_len = u64::from_le_bytes(identity[8..16].try_into().ok()?);
     let base_mem_len = u64::from_le_bytes(identity[20..28].try_into().ok()?);
+    let mem_crc = u32::from_le_bytes(identity[28..32].try_into().ok()?);
     let mem_offset = FULL_SNAPSHOT_HEADER_LEN.checked_add(state_len)?;
     let file_len = file.metadata().ok()?.len();
-    (base_mem_len == mem_len as u64 && mem_offset.checked_add(base_mem_len) == Some(file_len))
-        .then(|| (Arc::new(file), mem_offset))
+    if base_mem_len != mem_len as u64 || mem_offset.checked_add(base_mem_len) != Some(file_len) {
+        return skip("does not have this VM's memory size");
+    }
+    Some((file, mem_offset, mem_crc))
 }
 
 /// First half of a full snapshot taken against `base`, the snapshot the dirty
@@ -4917,6 +5009,7 @@ fn write_snapshot_memory_from_base(
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
     base: Arc<std::fs::File>,
     base_mem_offset: u64,
+    base_mem_crc: u32,
 ) -> Result<DeferredFullSnapshot> {
     use std::os::unix::fs::FileExt;
 
@@ -4953,6 +5046,12 @@ fn write_snapshot_memory_from_base(
         state_blob: state_blob.to_vec(),
         layout,
         copies,
+        verify_base: Some((
+            Arc::clone(&base),
+            base_mem_offset,
+            mem.len() as u64,
+            base_mem_crc,
+        )),
     })
 }
 
@@ -4967,6 +5066,14 @@ fn finish_deferred_snapshot(file: &std::fs::File, snapshot: DeferredFullSnapshot
     let io = |e: std::io::Error| VmmError::Snapshot(e.to_string());
     let base = snapshot.layout.mem_offset;
     let mut buffer = vec![0u8; CHUNK as usize];
+    if let Some((base_file, offset, len, expected)) = &snapshot.verify_base {
+        let actual = region_crc(base_file, *offset, *len, &mut buffer)?;
+        if actual != *expected {
+            return Err(VmmError::Snapshot(format!(
+                "snapshot base memory CRC is {actual:#010x}, its header records {expected:#010x}"
+            )));
+        }
+    }
     for (ram, len, source, source_at) in &snapshot.copies {
         let end = source_at + len;
         let mut pos = *source_at;
@@ -4989,39 +5096,46 @@ fn finish_deferred_snapshot(file: &std::fs::File, snapshot: DeferredFullSnapshot
             pos = hole;
         }
     }
-    // The memory region is assembled; hash it from the file. Holes are zero
-    // pages and fold into the CRC without being read.
+    // The memory region is assembled; hash it from the file.
+    let crc = region_crc(file, base, snapshot.layout.mem_len, &mut buffer)?;
+    snapshot.layout.finish(file, &snapshot.state_blob, crc)
+}
+
+/// CRC32 of `len` bytes of `file` from `offset`. Holes are zero pages and
+/// fold into the CRC without being read.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn region_crc(file: &std::fs::File, offset: u64, len: u64, buffer: &mut [u8]) -> Result<u32> {
+    use std::os::unix::fs::FileExt;
+
+    let io = |e: std::io::Error| VmmError::Snapshot(e.to_string());
     let mut crc = crc32fast::Hasher::new();
-    let mem_len = snapshot.layout.mem_len;
     let mut pos = 0u64;
-    while pos < mem_len {
-        let data = seek_data(file, base + pos)
+    while pos < len {
+        let data = seek_data(file, offset + pos)
             .map_err(io)?
-            .map_or(mem_len, |data| (data - base).min(mem_len));
+            .map_or(len, |data| (data - offset).min(len));
         let zero = data - pos;
-        if zero % 4096 != 0 {
+        if !zero.is_multiple_of(4096) {
             return Err(VmmError::Snapshot(
                 "snapshot hole is not page aligned".into(),
             ));
         }
         combine_zero_pages(&mut crc, (zero / 4096) as usize);
-        if data >= mem_len {
+        if data >= len {
             break;
         }
-        let hole = (seek_hole(file, base + data).map_err(io)? - base).min(mem_len);
+        let hole = (seek_hole(file, offset + data).map_err(io)? - offset).min(len);
         let mut at = data;
         while at < hole {
-            let n = (hole - at).min(CHUNK) as usize;
-            file.read_exact_at(&mut buffer[..n], base + at)
+            let n = ((hole - at) as usize).min(buffer.len());
+            file.read_exact_at(&mut buffer[..n], offset + at)
                 .map_err(io)?;
             crc.update(&buffer[..n]);
             at += n as u64;
         }
         pos = hole;
     }
-    snapshot
-        .layout
-        .finish(file, &snapshot.state_blob, crc.finalize())
+    Ok(crc.finalize())
 }
 
 /// `lseek(SEEK_DATA)`: the next offset at or after `offset` holding data, or
@@ -5164,7 +5278,7 @@ fn populated_pages(addr: *const u8, len: usize) -> Option<Vec<bool>> {
     const PAGE: usize = 4096;
     const PRESENT: u64 = 1 << 63;
     const SWAPPED: u64 = 1 << 62;
-    if (addr as usize) % PAGE != 0 {
+    if !(addr as usize).is_multiple_of(PAGE) {
         return None;
     }
     let pages = len / PAGE;
@@ -5174,11 +5288,10 @@ fn populated_pages(addr: *const u8, len: usize) -> Option<Vec<bool>> {
         .read_exact_at(&mut raw, (addr as usize / PAGE * 8) as u64)
         .ok()?;
     Some(
-        raw.chunks_exact(8)
-            .map(|entry| {
-                let entry = u64::from_le_bytes(entry.try_into().expect("8-byte entry"));
-                entry & (PRESENT | SWAPPED) != 0
-            })
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|entry| u64::from_le_bytes(*entry) & (PRESENT | SWAPPED) != 0)
             .collect(),
     )
 }
@@ -8149,6 +8262,7 @@ mod tests {
             created_at: std::time::Instant::now(),
             last_snapshot: None,
             base_identity: None,
+            restore_base: None,
             transient_files: VmTransientFiles::default(),
             dirty_logging: false,
             config: cfg(),
@@ -8494,6 +8608,11 @@ mod tests {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn full_snapshot_identity(path: &Path) -> Option<[u8; 32]> {
+        full_snapshot_identity_of(&open_snapshot_input(path).ok()?)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     fn write_full_snapshot_for_test(path: &Path, state: &[u8], mem: &[u8]) {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -8537,7 +8656,7 @@ mod tests {
         }
         dirty.mark((20 * PAGE) as u64);
 
-        let (file, offset) =
+        let (file, offset, crc) =
             open_snapshot_base(base.path().to_str().unwrap(), &identity, mem.len())
                 .expect("the base matches");
         let out = tempfile::NamedTempFile::new().unwrap();
@@ -8548,6 +8667,7 @@ mod tests {
             &dirty,
             file,
             offset,
+            crc,
         )
         .unwrap();
         finish_deferred_snapshot(out.as_file(), pending).unwrap();
@@ -8562,6 +8682,36 @@ mod tests {
         let mut back = vec![0u8; mem.len()];
         restored.mem.read_phys(0, &mut back).unwrap();
         assert_eq!(back, mem);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_from_a_base_whose_memory_changed_fails() {
+        use std::os::unix::fs::FileExt;
+        let mem = vec![7u8; 16 * 4096];
+        let base = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(base.path(), b"state", &mem);
+        let identity = full_snapshot_identity(base.path()).unwrap();
+        let (file, offset, crc) =
+            open_snapshot_base(base.path().to_str().unwrap(), &identity, mem.len()).unwrap();
+        // The header still matches, but a clean page's bytes do not.
+        base.as_file()
+            .write_all_at(&[9u8; 4096], offset + 3 * 4096)
+            .unwrap();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let dirty = vmm_memory_backend::dirty::DirtyBitmap::new();
+        let pending = write_snapshot_memory_from_base(
+            out.as_file(),
+            b"state",
+            &mem,
+            &dirty,
+            file,
+            offset,
+            crc,
+        )
+        .unwrap();
+        let error = finish_deferred_snapshot(out.as_file(), pending).unwrap_err();
+        assert!(error.to_string().contains("CRC"), "{error}");
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]

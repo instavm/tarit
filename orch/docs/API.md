@@ -470,9 +470,14 @@ unavailable).
 ### `POST /v1/vms/{id}/snapshot`
 
 Resolve the owner and publish an authenticated snapshot behind an opaque UUID.
-Host paths, physical host identity, and artifact locators remain private. Only
-full snapshots are accepted. `diff: true` returns `422` before contacting the
-VMM because durable parent-chain relocation is not implemented yet.
+Host paths, physical host identity, and artifact locators remain private.
+
+Every snapshot is a standalone full snapshot: it can be restored, forked or
+deleted without any other snapshot. Capture is incremental anyway. After the
+VM was restored or woken from a snapshot, or after its last snapshot on a node
+without VM jails, the guest is paused only to write the memory pages it changed
+since then; the rest is copied from that earlier snapshot after the guest
+resumes. `diff: true` is accepted and behaves the same way.
 
 Request:
 
@@ -491,7 +496,7 @@ Response `200`:
 ```
 
 Status codes: `200`, `401`, `403`, `404`, `409` (the lifecycle state does not
-support snapshots), `422` (`diff` is true), `500`.
+support snapshots), `500`.
 
 ### `GET /v1/snapshots`
 
