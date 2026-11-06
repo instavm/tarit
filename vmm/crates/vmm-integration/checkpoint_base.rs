@@ -166,6 +166,10 @@ fn first_checkpoint_after_restore_uses_the_restored_file_even_once_deleted() {
 
     let again = restore(&from_restore);
     check(&again, "m.1 m.2 ram-ok");
+    // virtio-rng keeps serving after a restore (its queue state is part of
+    // the snapshot); before, hwrng reads in a restored guest never returned.
+    let bytes = guest_stdout(&again, "sh -c 'timeout 10 head -c 64 /dev/hwrng | wc -c'");
+    assert_eq!(bytes.trim(), "64", "hwrng read after restore");
     again.stop().ok();
 }
 

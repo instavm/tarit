@@ -220,6 +220,15 @@ impl Serial {
         }
     }
 
+    /// Fire the interrupt again if the UART has one pending (IIR bit 0 clear).
+    /// Restoring the UART raises it once, but that happens before the
+    /// restored vCPUs run, so call this again after they do.
+    pub fn reassert_pending_interrupt(&self) {
+        if self.inner.lock().unwrap().state().interrupt_identification & 0x01 == 0 {
+            let _ = self.irq_evt.write(1);
+        }
+    }
+
     pub fn try_restore_snapshot(
         &mut self,
         state: SerialState,
@@ -380,11 +389,20 @@ mod tests {
             restored_irq.read().is_ok(),
             "restore did not reassert the pending RX interrupt"
         );
+        // Raised again once the restored vCPUs run.
+        restored.reassert_pending_interrupt();
+        assert!(
+            restored_irq.read().is_ok(),
+            "pending RX interrupt not raised again"
+        );
         let mut input = Vec::new();
         while restored.read(5) & 1 != 0 {
             input.push(restored.read(0));
         }
         assert_eq!(input, b"pending\n");
+        // Nothing pending once the guest drained it.
+        restored.reassert_pending_interrupt();
+        assert!(restored_irq.read().is_err(), "raised with nothing pending");
     }
 
     #[test]

@@ -5,7 +5,9 @@ use crate::persist::Persist;
 use crate::virtio::blk_transport::status_bits;
 use crate::virtio::regs::{reg, MAGIC};
 use crate::virtio::rng::{VirtioRng, DEVICE_ID_RNG};
-use crate::virtio::vqueue::{is_valid_queue_size, QueueConfig, VirtQueueProcessor, MAX_QUEUE_SIZE};
+use crate::virtio::vqueue::{
+    is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState, MAX_QUEUE_SIZE,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,6 +81,9 @@ pub struct VirtioRngMmioState {
     queues: Vec<QueueState>,
     pub activated: bool,
     pub interrupt_status: u32,
+    /// The queue cursor, so a restored device neither re-serves requests it
+    /// already completed nor skips ones the guest queued.
+    processor: Option<VirtQueueProcessorState>,
 }
 
 /// The virtio-mmio transport for an entropy device.
@@ -277,10 +282,34 @@ impl Persist for VirtioRngMmio {
             queues: self.queues.lock().unwrap().clone(),
             activated: self.activated.load(Ordering::Relaxed),
             interrupt_status: self.interrupt_status.load(Ordering::SeqCst),
+            processor: self
+                .processor
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(VirtQueueProcessor::save_state),
         }
     }
 
     fn restore(&mut self, state: Self::State) {
+        self.apply_state(state);
+    }
+}
+
+impl Persist for Arc<VirtioRngMmio> {
+    type State = VirtioRngMmioState;
+
+    fn save(&self) -> Self::State {
+        self.as_ref().save()
+    }
+
+    fn restore(&mut self, state: Self::State) {
+        self.apply_state(state);
+    }
+}
+
+impl VirtioRngMmio {
+    fn apply_state(&self, state: VirtioRngMmioState) {
         self.status.store(state.status, Ordering::Relaxed);
         self.queue_sel.store(state.queue_sel, Ordering::Relaxed);
         self.host_features_sel
@@ -295,7 +324,26 @@ impl Persist for VirtioRngMmio {
         self.activated.store(state.activated, Ordering::Relaxed);
         self.interrupt_status
             .store(state.interrupt_status, Ordering::SeqCst);
-        *self.processor.lock().unwrap() = None;
+        let processor = state
+            .processor
+            .zip(self.queue_config(QUEUE_RNG))
+            .map(|(cursor, config)| VirtQueueProcessor::from_state(config, cursor));
+        *self.processor.lock().unwrap() = processor;
+    }
+
+    /// Fire the interrupt again if one is still unacknowledged. A restore
+    /// brings back this status register but not the interrupt itself: one
+    /// raised just before the snapshot captured the vCPUs exists nowhere
+    /// else, and the guest would wait for it forever. The guest reads the
+    /// status before acting, so a repeated interrupt is harmless.
+    pub fn reassert_pending_interrupt(&self) {
+        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(evt) = self.irq_evt.lock().unwrap().as_ref() {
+            let _ = evt.write(1);
+        }
     }
 }
 
@@ -674,6 +722,67 @@ mod tests {
         restored.mmio_write(reg::QUEUE_SEL, 0, 4).unwrap();
         assert_eq!(restored.mmio_read(reg::QUEUE_NUM, 4).unwrap(), 128);
         assert_eq!(restored.mmio_read(reg::QUEUE_READY, 4).unwrap(), 1);
+    }
+
+    #[test]
+    fn restored_device_continues_from_its_queue_cursor() {
+        const DESC: u64 = 0x10_0000;
+        const AVAIL: u64 = 0x10_1000;
+        const USED: u64 = 0x10_2000;
+        const BUF: u64 = 0x10_3000;
+        let mem = new_mem();
+        for slot in 0..2u64 {
+            mem.write_obj(
+                Descriptor {
+                    addr: BUF + slot * 0x100,
+                    len: 32,
+                    flags: desc_flags::WRITE,
+                    next: 0,
+                },
+                GuestAddress(DESC + slot * 16),
+            )
+            .unwrap();
+        }
+        // One request queued and served before the snapshot.
+        mem.write_obj(0u16, GuestAddress(AVAIL + 4)).unwrap();
+        mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(AVAIL))
+            .unwrap();
+        let dev = new_dev();
+        dev.set_guest_memory(mem.clone());
+        configure_queue(&dev, DESC, AVAIL, USED, 16);
+        dev.mmio_write(reg::QUEUE_NOTIFY, 0, 4).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(USED + 2)).unwrap(), 1);
+        let state = dev.save();
+
+        let mut restored = new_dev();
+        restored.set_guest_memory(mem.clone());
+        restored.restore(state.clone());
+        assert_eq!(restored.save(), state, "cursor survives save/restore");
+
+        // A notify with nothing new must not serve request 0 a second time.
+        restored.mmio_write(reg::QUEUE_NOTIFY, 0, 4).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(USED + 2)).unwrap(), 1);
+        // The next request is served into the next used slot.
+        mem.write_obj(1u16, GuestAddress(AVAIL + 6)).unwrap();
+        mem.write_obj(AvailRing { flags: 0, idx: 2 }, GuestAddress(AVAIL))
+            .unwrap();
+        restored.mmio_write(reg::QUEUE_NOTIFY, 0, 4).unwrap();
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(USED + 2)).unwrap(), 2);
+        let used: UsedElem = mem.read_obj(GuestAddress(USED + 4 + 8)).unwrap();
+        assert_eq!(used.id, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_pending_interrupt_is_raised_again() {
+        let dev = new_dev();
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).expect("evt");
+        dev.set_irq_evt(evt.try_clone().expect("clone evt"));
+        dev.reassert_pending_interrupt();
+        assert!(evt.read().is_err(), "nothing pending, nothing raised");
+        dev.interrupt_status.store(1, Ordering::SeqCst);
+        dev.reassert_pending_interrupt();
+        assert_eq!(evt.read().expect("interrupt raised"), 1);
     }
 
     #[test]

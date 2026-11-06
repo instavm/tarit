@@ -72,6 +72,15 @@ jobs:
         run: |
           sudo -E env "PATH=$PATH" bash test/e2e.sh snapshot-disk
 
+      - name: Enforce checkpoint, restore and wake loops
+        env:
+          TARIT_KERNEL: /tmp/vmlinux.microvm
+          TARIT_ROOTFS: /tmp/vsock-rootfs.ext4
+          TARIT_VMM_BIN: ${{ github.workspace }}/vmm/target/release/vmm
+          TARITD_BIN: ${{ github.workspace }}/orch/target/release/taritd
+        run: |
+          sudo -E env "PATH=$PATH" bash test/e2e.sh checkpoint
+
       - name: Run KVM integration suite
         working-directory: vmm
         env:

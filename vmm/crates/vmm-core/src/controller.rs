@@ -41,6 +41,8 @@ pub struct RunningVm {
     pub blk_devices: Vec<Arc<vmm_devices::virtio::blk_transport::VirtioBlkMmio>>,
     pub net_devices: Vec<Arc<vmm_devices::virtio::net_transport::VirtioNetMmio>>,
     pub balloon_device: Option<Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>>,
+    /// virtio-rng transport, kept so snapshots carry its queue state.
+    pub rng_device: Option<Arc<vmm_devices::virtio::rng_transport::VirtioRngMmio>>,
     /// Reasserts the balloon's level IRQ after guest EOI when another virtio
     /// cause arrived during the interrupt-service window.
     pub balloon_irq_resample: Option<BalloonIrqResample>,
@@ -1156,6 +1158,7 @@ impl VmmController {
             blk_io_evts,
             blk_mmio_bases,
             nets,
+            rng,
             rng_irq,
             vsock,
             balloon,
@@ -1422,6 +1425,7 @@ impl VmmController {
                 blk_devices: blks,
                 net_devices,
                 balloon_device,
+                rng_device: Some(rng),
                 balloon_irq_resample,
                 taps,
                 vsock_pump,
@@ -2012,6 +2016,7 @@ impl VmmController {
                     virtio_net: &virtio_net,
                     vsock: vsock_state.as_ref(),
                     balloon: balloon_state.as_ref(),
+                    rng: saved.rng.as_ref(),
                 };
                 let running = build_running_vm(mem.clone(), &config, restored, entry)?;
                 (Some(running), VmState::Running)
@@ -3263,6 +3268,10 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Vec<u
     b.virtio_blk = virtio_blk;
     b.virtio_net = virtio_net;
     b.vsock = Some(vsock_state);
+    b.rng = running
+        .rng_device
+        .as_ref()
+        .map(|device| vmm_devices::persist::Persist::save(&**device));
     encode_state_blob(&b, Some(&balloon))
         .map_err(|error| VmmError::Snapshot(format!("serialize live device state: {error}")))
 }
@@ -6962,6 +6971,10 @@ pub struct StateBlob {
     /// unchanged.
     #[serde(skip)]
     pub serial_runtime: Option<vmm_devices::serial::SerialRuntimeState>,
+    /// virtio-rng queue state, also in a framed trailer. Older snapshots have
+    /// none and restore a fresh device.
+    #[serde(skip)]
+    pub rng: Option<vmm_devices::virtio::rng_transport::VirtioRngMmioState>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -7046,6 +7059,8 @@ const BALLOON_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTBLN01";
 const COMPATIBILITY_TRAILER_MAGIC: &[u8; 8] = b"TRTCMP01";
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const SERIAL_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTSER01";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const RNG_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTRNG01";
 #[cfg(all(
     target_arch = "x86_64",
     target_os = "linux",
@@ -7194,6 +7209,11 @@ fn decode_state_blob(
         blob.serial_runtime = Some(decoded);
         trailing = remaining;
     }
+    if trailing.starts_with(RNG_STATE_TRAILER_MAGIC) {
+        let (decoded, remaining) = decode_trailer(trailing, RNG_STATE_TRAILER_MAGIC)?;
+        blob.rng = Some(decoded);
+        trailing = remaining;
+    }
     let mut compatibility = None;
     if trailing.starts_with(COMPATIBILITY_TRAILER_MAGIC) {
         let (decoded, remaining) = decode_trailer(trailing, COMPATIBILITY_TRAILER_MAGIC)?;
@@ -7225,6 +7245,14 @@ fn encode_state_blob(
         let payload_len =
             u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
         bytes.extend_from_slice(SERIAL_STATE_TRAILER_MAGIC);
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+    if let Some(rng) = blob.rng.as_ref() {
+        let payload = postcard::to_allocvec(rng)?;
+        let payload_len =
+            u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
+        bytes.extend_from_slice(RNG_STATE_TRAILER_MAGIC);
         bytes.extend_from_slice(&payload_len.to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
@@ -7364,6 +7392,7 @@ struct RestoredRuntimeState<'a> {
     virtio_net: &'a [Vec<u8>],
     vsock: Option<&'a vmm_devices::virtio::vsock::VirtioVsockMmioState>,
     balloon: Option<&'a vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
+    rng: Option<&'a vmm_devices::virtio::rng_transport::VirtioRngMmioState>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -7390,11 +7419,15 @@ fn build_running_vm(
         blk_io_evts,
         blk_mmio_bases,
         nets,
+        mut rng,
         rng_irq,
         vsock,
         balloon,
     } = build_devices(config, &mem)?;
     restore_virtio_blk_states(&mut blks, restored.virtio_blk)?;
+    if let Some(state) = restored.rng {
+        vmm_devices::persist::Persist::restore(&mut rng, state.clone());
+    }
     let mut net_devices: Vec<_> = nets.iter().map(|n| n.dev.clone()).collect();
     restore_virtio_net_states(&mut net_devices, restored.virtio_net)?;
     let mut balloon = balloon;
@@ -7659,14 +7692,34 @@ fn build_running_vm(
     // stream down and the agent re-dials the host exec channel (the host side
     // already re-accepts the new connection). Done here, post-resume, so the RX
     // completion interrupt lands on a running vCPU instead of a paused LAPIC.
-    if let Some((dev, conns)) = vsock_reset {
+    if let Some((dev, conns)) = &vsock_reset {
         let resets = dev
-            .reset_restored_connections(&conns)
+            .reset_restored_connections(conns)
             .map_err(|error| VmmError::Device(format!("reset restored vsock streams: {error}")))?;
         if resets > 0 {
             log::info!("vsock restore: injected RST for {resets} restored stream(s)");
         }
     }
+
+    // A snapshot captures each vCPU (and its LAPIC) as it parks, before the
+    // I/O workers drain. A completion interrupt raised in between is in the
+    // device's status register and the used ring but in no saved LAPIC, so
+    // without a new one the guest waits on that I/O forever. Raise every
+    // still-pending device interrupt again now that the vCPUs run.
+    for blk in &blks {
+        blk.reassert_pending_interrupt();
+    }
+    for net in &net_devices {
+        net.reassert_pending_interrupt();
+    }
+    if let Some((dev, _)) = &vsock_reset {
+        dev.reassert_pending_interrupt();
+    }
+    if let Some(balloon) = &balloon_device {
+        balloon.reassert_pending_interrupt();
+    }
+    rng.reassert_pending_interrupt();
+    serial.reassert_pending_interrupt();
 
     Ok(RunningVm {
         kvm_vm,
@@ -7678,6 +7731,7 @@ fn build_running_vm(
         blk_devices: blks,
         net_devices,
         balloon_device,
+        rng_device: Some(rng),
         balloon_irq_resample,
         taps,
         vsock_pump,
@@ -7710,6 +7764,7 @@ struct WiredDevices {
     blk_io_evts: Vec<vmm_sys_util::eventfd::EventFd>,
     blk_mmio_bases: Vec<u64>,
     nets: Vec<WiredNet>,
+    rng: Arc<vmm_devices::virtio::rng_transport::VirtioRngMmio>,
     /// virtio-rng completion irqfd (gsi, EventFd), registered by the caller.
     rng_irq: Option<(u32, vmm_sys_util::eventfd::EventFd)>,
     /// virtio-vsock exec device (pump + control-socket accept wired by caller).
@@ -7994,7 +8049,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     let rng_slot = config.volumes.len() + config.net.len();
     let rng_irq_num = 5 + rng_slot as u32;
     let rng_mmio = MMIO_START + (rng_slot as u64) * 0x1000;
-    let rng_dev = VirtioRngMmio::new(rng_irq_num, VirtioRng::new());
+    let rng_dev = Arc::new(VirtioRngMmio::new(rng_irq_num, VirtioRng::new()));
     rng_dev.set_guest_memory(gm.clone());
     rng_dev.set_guest_dirty_tracker(host_dirty.clone());
     let rng_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
@@ -8004,7 +8059,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
             .try_clone()
             .map_err(|e| VmmError::Kvm(format!("EventFd clone: {e}")))?,
     );
-    devices.push((MmioRange::new(rng_mmio, 0x1000), Box::new(rng_dev)));
+    devices.push((MmioRange::new(rng_mmio, 0x1000), Box::new(rng_dev.clone())));
     acpi_devices.push((rng_mmio, 0x1000, rng_irq_num, true));
     log::info!("virtio-rng at mmio 0x{rng_mmio:x} irq {rng_irq_num}");
 
@@ -8081,6 +8136,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         blk_io_evts,
         blk_mmio_bases,
         nets,
+        rng: rng_dev,
         rng_irq: Some((rng_irq_num, rng_evt)),
         vsock: Some(WiredVsock {
             device: vsock_dev,
@@ -8183,6 +8239,7 @@ fn serialize_state_blob(
         virtio_net: Vec::new(),
         vsock: None,
         serial_runtime: None,
+        rng: None,
     };
 
     encode_state_blob(&blob, None).unwrap_or_default()
@@ -9488,14 +9545,29 @@ mod tests {
             in_buffer: b"pending".to_vec(),
         };
         decoded.serial_runtime = Some(serial_runtime.clone());
+        let rng = vmm_devices::virtio::rng_transport::VirtioRngMmio::new(
+            7,
+            vmm_devices::virtio::rng::VirtioRng::new(),
+        );
+        let rng_state = vmm_devices::persist::Persist::save(&rng);
+        decoded.rng = Some(rng_state.clone());
         let mut encoded = encode_state_blob(&decoded, Some(&balloon_state)).unwrap();
         encoded.resize(4096, 0);
         let (decoded_with_trailer, decoded_balloon, decoded_compatibility) =
             decode_state_blob(&encoded).unwrap();
         assert_eq!(decoded_with_trailer.kernel_path, "kernel");
         assert_eq!(decoded_with_trailer.serial_runtime, Some(serial_runtime));
+        assert_eq!(decoded_with_trailer.rng, Some(rng_state.clone()));
         assert_eq!(decoded_balloon, Some(balloon_state));
         decoded_compatibility.unwrap().validate().unwrap();
+
+        // The rng trailer also stands alone (no balloon or serial before it).
+        let mut rng_only = decode_state_blob(&bytes).unwrap().0;
+        rng_only.rng = Some(rng_state.clone());
+        let encoded = encode_state_blob(&rng_only, None).unwrap();
+        let (decoded_rng_only, no_balloon, _) = decode_state_blob(&encoded).unwrap();
+        assert_eq!(decoded_rng_only.rng, Some(rng_state));
+        assert!(no_balloon.is_none() && decoded_rng_only.serial_runtime.is_none());
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]

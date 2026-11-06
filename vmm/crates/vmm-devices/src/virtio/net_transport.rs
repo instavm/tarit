@@ -303,6 +303,23 @@ impl VirtioNetMmio {
         *self.lock_state(&self.irq_evt, "irq_evt") = Some(evt);
     }
 
+    /// Fire the interrupt again if one is still unacknowledged. A restore
+    /// brings back this status register but not the interrupt itself: one
+    /// raised just before the snapshot captured the vCPUs exists nowhere
+    /// else, and the guest would wait for it forever. The guest reads the
+    /// status before acting, so a repeated interrupt is harmless.
+    pub fn reassert_pending_interrupt(&self) {
+        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
+            if let Some(evt) = guard.as_ref() {
+                let _ = evt.write(1);
+            }
+        }
+    }
+
     fn trigger_interrupt(&self) -> MmioWriteResult {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
@@ -1335,5 +1352,18 @@ mod tests {
         restored.mmio_write(reg::QUEUE_SEL, 1, 4).unwrap();
         assert_eq!(restored.mmio_read(reg::QUEUE_NUM, 4).unwrap(), 32);
         assert_eq!(restored.mmio_read(reg::QUEUE_READY, 4).unwrap(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_pending_interrupt_is_raised_again() {
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).expect("evt");
+        dev.set_irq_evt(evt.try_clone().expect("clone evt"));
+        dev.reassert_pending_interrupt();
+        assert!(evt.read().is_err(), "nothing pending, nothing raised");
+        dev.interrupt_status.store(1, Ordering::SeqCst);
+        dev.reassert_pending_interrupt();
+        assert_eq!(evt.read().expect("interrupt raised"), 1);
     }
 }

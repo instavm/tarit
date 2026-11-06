@@ -69,10 +69,12 @@ class Lab:
             ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback",
              str(self.pid), "tap-slirp"],
             stdout=open(os.path.join(self.work, "slirp.log"), "wb"), stderr=subprocess.STDOUT)
-        deadline = now() + 5
-        while now() < deadline:
-            if "10.0.2.100" in self.run("ip -4 -br addr show tap-slirp").stdout:
-                break
+        # slirp4netns creates tap-slirp asynchronously; until it exists the
+        # query fails, so keep polling instead of treating that as an error.
+        deadline = now() + 10
+        while "10.0.2.100" not in self.run("ip -4 -br addr show tap-slirp", check=False).stdout:
+            if now() > deadline:
+                raise RuntimeError("slirp4netns did not configure tap-slirp; see slirp.log")
             time.sleep(0.05)
         self.run("sysctl -qw net.ipv4.ip_forward=1")
         self.run("nft add table ip lab && "

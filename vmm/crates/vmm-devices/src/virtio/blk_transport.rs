@@ -372,6 +372,23 @@ impl VirtioBlkMmio {
         *self.lock_state(&self.irq_evt, "irq_evt") = Some(evt);
     }
 
+    /// Fire the interrupt again if one is still unacknowledged. A restore
+    /// brings back this status register but not the interrupt itself: one
+    /// raised just before the snapshot captured the vCPUs exists nowhere
+    /// else, and the guest would wait for it forever. The guest reads the
+    /// status before acting, so a repeated interrupt is harmless.
+    pub fn reassert_pending_interrupt(&self) {
+        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
+            if let Some(evt) = guard.as_ref() {
+                let _ = evt.write(1);
+            }
+        }
+    }
+
     /// Signal an interrupt to the guest.
     #[cfg(target_os = "linux")]
     fn trigger_interrupt(&self) -> MmioWriteResult {
@@ -1467,5 +1484,36 @@ mod tests {
             restored.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(),
             state.interrupt_status as u64
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_pending_interrupt_is_raised_again() {
+        // A completion the guest has not acknowledged survives in the saved
+        // status register only.
+        let source = VirtioBlkMmio::new_stub(5, 2);
+        source
+            .interrupt_status
+            .store(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
+        let state = source.try_save().expect("save");
+
+        let mut restored = VirtioBlkMmio::new_stub(5, 2);
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).expect("evt");
+        restored.set_irq_evt(evt.try_clone().expect("clone evt"));
+        restored.restore(state);
+        assert!(evt.read().is_err(), "restore alone raises nothing");
+        restored.reassert_pending_interrupt();
+        assert_eq!(evt.read().expect("interrupt raised"), 1);
+        assert_eq!(
+            restored.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(),
+            u64::from(VIRTIO_MMIO_INT_VRING)
+        );
+
+        // Once the guest acknowledges it, nothing is raised again.
+        restored
+            .mmio_write(reg::INTERRUPT_ACK, u64::from(VIRTIO_MMIO_INT_VRING), 4)
+            .unwrap();
+        restored.reassert_pending_interrupt();
+        assert!(evt.read().is_err());
     }
 }
