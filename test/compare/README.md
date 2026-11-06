@@ -14,12 +14,18 @@ command line, vCPU count and memory size, and both run the same guest agent
 | `exec`     | round trip of `true`, 4 KiB of output, and `python3` on a running VM |
 | `snapshot` | full snapshot of a booted VM, then restore to first exec, repeatedly |
 | `chain`    | the agent loop: restore the latest checkpoint, run a step that adds state, take an incremental snapshot, repeat; every step checks all earlier state survived |
+| `fanout`   | fork N clones at once from a stopped parent's snapshot; each must see the parent's disk marker and no sibling's file |
 | `burst`    | boot N VMs at once; time until every one has run an exec |
 | `reliab`   | rounds of concurrent boots; counts VMs whose first exec never succeeds |
 
 For `chain`, Firecracker takes a `Diff` snapshot and merges it into the
 previous memory file with `rebase-snap`, because it cannot load a diff chain.
 The in-place merge is its cheapest option and overwrites older checkpoints.
+
+For `fanout`, Firecracker clones reopen the disk and vsock paths baked into
+the snapshot, so each clone gets its own copy of the parent's disk (timed as
+disk prep) and runs in an unprivileged user and mount namespace that
+bind-mounts its directory over those paths (`unshare -Urm`).
 
 ## Running
 

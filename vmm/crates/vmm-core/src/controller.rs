@@ -4365,6 +4365,8 @@ fn write_snapshot_to_file(
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.flush()
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    record_ram_verified(file, FULL_SNAPSHOT_HEADER_LEN + state_len, mem_len, mem_crc);
     Ok(())
 }
 
@@ -4436,10 +4438,14 @@ fn write_diff_snapshot_to_file(
     let mut data_len = 0usize;
     for &(offset, pages) in &runs {
         let start = offset as usize;
-        let end = (start + pages as usize * DIFF_PAGE_BYTES).min(mem.len());
+        let full_end = start + pages as usize * DIFF_PAGE_BYTES;
+        let end = full_end.min(mem.len());
         data_crc.update(&mem[start..end]);
+        // The reader checks the padded run, so pad the CRC the same way.
+        data_crc.update(&vec![0u8; full_end - end]);
         data_len += end - start;
     }
+    let data_crc = data_crc.finalize();
 
     let pbytes = parent.as_bytes();
     let parent_len = u32::try_from(pbytes.len())
@@ -4460,7 +4466,7 @@ fn write_diff_snapshot_to_file(
     header.extend_from_slice(&run_count.to_le_bytes());
     header.extend_from_slice(&crc32fast::hash(&index).to_le_bytes());
     header.extend_from_slice(&index);
-    header.extend_from_slice(&data_crc.finalize().to_le_bytes());
+    header.extend_from_slice(&data_crc.to_le_bytes());
     header.resize(header.len().next_multiple_of(DIFF_PAGE_BYTES), 0);
 
     let mut wr = |b: &[u8]| -> Result<()> {
@@ -4481,6 +4487,9 @@ fn write_diff_snapshot_to_file(
     }
     file.flush()
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    let padded_len: u64 =
+        runs.iter().map(|&(_, pages)| u64::from(pages)).sum::<u64>() * DIFF_PAGE_BYTES as u64;
+    record_ram_verified(file, header.len() as u64, padded_len, data_crc);
     Ok(data_len)
 }
 
@@ -5299,21 +5308,9 @@ fn verify_ram_crc_once(
     expected_crc: u32,
 ) -> Result<()> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
 
-    let metadata = file
-        .metadata()
+    let key = ram_verified_key(file, layout.mem_offset, layout.mem_len, expected_crc)
         .map_err(|e| VmmError::Snapshot(format!("stat {path_display}: {e}")))?;
-    let key = format!(
-        "v1:{}:{}:{}:{}.{}:{}:{}:{expected_crc:08x}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        layout.mem_offset,
-        layout.mem_len,
-    );
     let mut recorded = [0u8; 160];
     // SAFETY: valid fd, NUL-terminated name, and a writable buffer of the
     // stated length; fgetxattr writes at most that many bytes.
@@ -5348,6 +5345,51 @@ fn verify_ram_crc_once(
         )
     };
     Ok(())
+}
+
+/// Identity of one version of a snapshot file's RAM or page data: device,
+/// inode, length, mtime, layout and CRC.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn ram_verified_key(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+    crc: u32,
+) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(format!(
+        "v1:{}:{}:{}:{}.{}:{offset}:{len}:{crc:08x}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    ))
+}
+
+/// Record that a snapshot writer produced this exact file version from bytes
+/// it CRC'd itself, so restores (including many concurrent forks of a fresh
+/// snapshot) skip the one-time scan. Call after the last data write. Best
+/// effort: without xattr support the first restore verifies instead.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn record_ram_verified(file: &std::fs::File, offset: u64, len: u64, crc: u32) {
+    use std::os::fd::AsRawFd;
+
+    let Ok(key) = ram_verified_key(file, offset, len, crc) else {
+        return;
+    };
+    // SAFETY: valid fd, NUL-terminated name, readable value of stated length.
+    unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            RAM_VERIFIED_XATTR.as_ptr(),
+            key.as_ptr().cast(),
+            key.len(),
+            0,
+        )
+    };
 }
 
 /// CRC32 of a file range through a read-only mapping, without copying it.

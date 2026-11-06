@@ -270,6 +270,8 @@ class Tarit:
             self._call({"op": "stop"}, timeout=5)
         except Exception:
             pass
+        # `serve` keeps listening after a stop; SIGTERM shuts it down cleanly.
+        self.proc.terminate()
         try:
             self.proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
@@ -625,7 +627,156 @@ def scen_chain(kind, a, work):
             "vmm_pss_mib": summary(pss)}
 
 
-SCEN = {"chain": scen_chain, "cold": scen_cold, "exec": scen_exec, "snapshot": scen_snapshot, "burst": scen_burst,
+def _verify_clone(vm, i):
+    code, out = vm.exec("cat /root/who; ls /root | tr '\\n' ' '; echo c%d > /root/me" % i)
+    out = out.decode() if isinstance(out, bytes) else out
+    words = out.split()
+    # Must see the parent's marker and no sibling's file.
+    assert code == 0 and words[:1] == ["parent"] and "me" not in words, (code, out)
+
+
+def scen_fanout(kind, a, work):
+    """Fork N clones concurrently from a stopped parent's snapshot. Each clone
+    must see the parent's disk marker, write its own file and see no other
+    clone's file. Firecracker clones each need their own copy of the disk and
+    a mount namespace mapping it onto the path baked into the snapshot."""
+    n = a.burst
+    root = os.path.join(work, "%s-fan" % kind)
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, mode=0o700)
+    prep_ms, ready, pss, errors = [], [None] * n, [0.0] * n, []
+    if kind == "tarit":
+        base = os.path.join(root, "base.ext4")
+        fresh_rootfs(a.rootfs, base)
+        vm = make(kind, a)
+        vm._spawn("fanparent")
+        r = vm._call({"op": "create", "config": {
+            "kernel": {"path": a.kernel, "cmdline": "root=/dev/vda rw " + CMDLINE, "initramfs": None},
+            "memory": {"size_mib": a.mem}, "vcpus": {"count": a.vcpus},
+            "volumes": [{"path": base, "read_only": False,
+                         "overlay": os.path.join(root, "parent.cow"), "inherited_fd": None}],
+            "net": []}})
+        assert r.get("status") == "ok", r
+        vm.wait_exec()
+        assert vm.exec("echo parent > /root/who && python3 -c 'import json'")[0] == 0
+        t0 = now()
+        snap = vm.snapshot(root)
+        snap_ms = (now() - t0) * 1000
+        vm.stop()
+        golden = os.path.join(root, "golden.snap")
+        os.rename(snap["path"], golden)
+        if snap.get("overlay_path") and os.path.dirname(snap["overlay_path"]) != root:
+            os.rename(snap["overlay_path"], os.path.join(root, os.path.basename(snap["overlay_path"])))
+        vms = [make(kind, a) for _ in range(n)]
+
+        def one(i):
+            try:
+                t = now()
+                vms[i].restore("fan%d" % i, golden)
+                vms[i].wait_exec()
+                _verify_clone(vms[i], i)
+                ready[i] = (now() - t) * 1000
+                pss[i] = pss_kib(vms[i].pid()).get("Pss", 0) / 1024.0
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e)[:200])
+    else:
+        slot = os.path.join(RUN, "fcfan-slot")
+        os.makedirs(slot, exist_ok=True)
+        # Firecracker's API and vsock sockets live in each clone's directory;
+        # reach it through a short symlink to stay under the AF_UNIX limit.
+        short = os.path.join(RUN, "fcf")
+        if os.path.islink(short):
+            os.unlink(short)
+        os.symlink(root, short)
+        root_disk, root = root, short
+        parent_dir = os.path.join(root, "parent")
+        os.makedirs(parent_dir)
+        fresh_rootfs(a.rootfs, os.path.join(parent_dir, "rootfs.ext4"))
+        fc = make(kind, a)
+
+        def launch(vmobj, cdir, config=None):
+            for name in ("api.sock", "v.sock"):
+                if os.path.exists(os.path.join(cdir, name)):
+                    os.unlink(os.path.join(cdir, name))
+            vmobj.api = os.path.join(cdir, "api.sock")
+            vmobj.listener = AgentListener(os.path.join(cdir, "v.sock_1024"))
+            vmobj.log = open(os.path.join(cdir, "fc.log"), "wb")
+            cmd = "mount --bind %s %s && exec %s --api-sock %s --level Warning%s" % (
+                cdir, slot, vmobj.fc, vmobj.api, (" --config-file " + config) if config else "")
+            vmobj.proc = subprocess.Popen(["unshare", "-Urm", "sh", "-c", cmd],
+                                          stdout=vmobj.log, stderr=subprocess.STDOUT)
+            wait_path(vmobj.api)
+
+        cfg = {
+            "boot-source": {"kernel_image_path": a.kernel, "boot_args": CMDLINE},
+            "drives": [{"drive_id": "rootfs", "path_on_host": os.path.join(slot, "rootfs.ext4"),
+                        "is_root_device": True, "is_read_only": False}],
+            "machine-config": {"vcpu_count": a.vcpus, "mem_size_mib": a.mem},
+            "vsock": {"guest_cid": 3, "uds_path": os.path.join(slot, "v.sock")},
+        }
+        cfg_path = os.path.join(root, "parent.json")
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        launch(fc, parent_dir, cfg_path)
+        fc.wait_exec()
+        assert fc.exec("echo parent > /root/who && python3 -c 'import json' && sync")[0] == 0
+        t0 = now()
+        snapf = os.path.join(root, "golden.vmstate")
+        memf = os.path.join(root, "golden.mem")
+        fc._api("PATCH", "/vm", {"state": "Paused"})
+        fc._api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": snapf,
+                                            "mem_file_path": memf})
+        snap_ms = (now() - t0) * 1000
+        fc.stop()
+        vms = [make(kind, a) for _ in range(n)]
+        dirs = []
+        for i in range(n):
+            cdir = os.path.join(root, "c%d" % i)
+            os.makedirs(cdir)
+            t = now()
+            fresh_rootfs(os.path.join(parent_dir, "rootfs.ext4"), os.path.join(cdir, "rootfs.ext4"))
+            prep_ms.append((now() - t) * 1000)
+            dirs.append(cdir)
+
+        def one(i):
+            try:
+                t = now()
+                launch(vms[i], dirs[i])
+                vms[i]._api("PUT", "/snapshot/load", {
+                    "snapshot_path": snapf,
+                    "mem_backend": {"backend_type": "File", "backend_path": memf},
+                    "resume_vm": True})
+                vms[i].wait_exec()
+                _verify_clone(vms[i], i)
+                ready[i] = (now() - t) * 1000
+                pss[i] = pss_kib(vms[i].pid()).get("Pss", 0) / 1024.0
+            except Exception as e:  # noqa: BLE001
+                errors.append(repr(e)[:200])
+
+    th = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+    t0 = now()
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    all_ready = (now() - t0) * 1000
+    for v in vms:
+        v.stop()
+    if kind != "tarit":
+        os.unlink(root)
+        root = root_disk
+    disk_bytes = sum(os.stat(os.path.join(dp, f)).st_blocks * 512
+                     for dp, _, fs in os.walk(root) for f in fs)
+    shutil.rmtree(root, ignore_errors=True)
+    ok = [x for x in ready if x is not None]
+    return {"n": n, "ok": len(ok), "errors": errors[:3], "snapshot_ms": snap_ms,
+            "all_ready_ms": all_ready, "per_clone_ready_ms": summary(ok),
+            "per_clone_disk_prep_ms": summary(prep_ms) if prep_ms else None,
+            "disk_prep_total_ms": sum(prep_ms),
+            "total_pss_mib": sum(pss), "disk_used_mib": disk_bytes / 2**20}
+
+
+SCEN = {"fanout": scen_fanout, "chain": scen_chain, "cold": scen_cold, "exec": scen_exec, "snapshot": scen_snapshot, "burst": scen_burst,
         "reliab": scen_reliab}
 
 
