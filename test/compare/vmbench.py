@@ -10,6 +10,10 @@ import argparse, http.client, json, os, shutil, signal, socket, statistics
 import struct, subprocess, sys, tempfile, threading, time
 
 RUN = "/run/user/%d/vmbench" % os.getuid()
+# Firecracker's default drive cache_type, "Unsafe", ignores guest flushes, so
+# a guest fsync is not durable on the host. tarit always honours flushes, so
+# compare against Firecracker's durable "Writeback" mode unless asked not to.
+FC_CACHE_TYPE = os.environ.get("VMBENCH_FC_CACHE", "Writeback")
 VERBOSE = int(os.environ.get("VMBENCH_TARIT_VERBOSE", "0"))
 # Files `vmm snapshot` released to us. They live in the VMM's runtime directory
 # and belong to the caller, so each scenario removes whatever it did not move.
@@ -353,7 +357,7 @@ class Firecracker:
         cfg = {
             "boot-source": {"kernel_image_path": self.kernel, "boot_args": CMDLINE},
             "drives": [{"drive_id": "rootfs", "path_on_host": disk, "is_root_device": True,
-                        "is_read_only": False}],
+                        "is_read_only": False, "cache_type": FC_CACHE_TYPE}],
             "machine-config": {"vcpu_count": self.vcpus, "mem_size_mib": self.mem},
             "vsock": {"guest_cid": 3, "uds_path": None},
         }
@@ -733,7 +737,7 @@ def scen_fanout(kind, a, work):
         cfg = {
             "boot-source": {"kernel_image_path": a.kernel, "boot_args": CMDLINE},
             "drives": [{"drive_id": "rootfs", "path_on_host": os.path.join(slot, "rootfs.ext4"),
-                        "is_root_device": True, "is_read_only": False}],
+                        "is_root_device": True, "is_read_only": False, "cache_type": FC_CACHE_TYPE}],
             "machine-config": {"vcpu_count": a.vcpus, "mem_size_mib": a.mem},
             "vsock": {"guest_cid": 3, "uds_path": os.path.join(slot, "v.sock")},
         }
@@ -825,7 +829,8 @@ def main():
     a = p.parse_args()
     os.makedirs(RUN, exist_ok=True)
     os.makedirs(a.work, exist_ok=True)
-    results = {"host": os.uname().nodename, "kernel": a.kernel, "mem": a.mem, "vcpus": a.vcpus}
+    results = {"host": os.uname().nodename, "kernel": a.kernel, "mem": a.mem, "vcpus": a.vcpus,
+               "firecracker_cache_type": FC_CACHE_TYPE}
     kinds = a.only.split(",")
     for kind in kinds:
         results[kind] = {}

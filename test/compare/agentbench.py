@@ -285,7 +285,7 @@ class FirecrackerVM:
             "boot-source": {"kernel_image_path": self.a.kernel,
                             "boot_args": GUEST_BOOT + " " + ip + " tarit.dns=" + LAB_DNS},
             "drives": [{"drive_id": "rootfs", "path_on_host": disk, "is_root_device": True,
-                        "is_read_only": False}],
+                        "is_read_only": False, "cache_type": vb.FC_CACHE_TYPE}],
             "machine-config": {"vcpu_count": self.a.vcpus, "mem_size_mib": mem},
             "network-interfaces": [{"iface_id": "eth0", "host_dev_name": self.lab.tap(slot),
                                     "guest_mac": "02:fc:00:00:%02x:02" % slot}],
@@ -872,7 +872,7 @@ def main():
                                  "%d/%d checks passed" % (r["passed"], r["total"])),
                       file=sys.stderr, flush=True)
                 with open(a.out, "w") as f:
-                    json.dump(results, f, indent=2)
+                    json.dump({**results, "firecracker_cache_type": vb.FC_CACHE_TYPE}, f, indent=2)
     finally:
         lab.stop()
     print_table(results)

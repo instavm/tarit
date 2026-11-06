@@ -44,6 +44,15 @@ binary. Each disk copy is written back before timing so that neither VMM pays
 for the harness's own page-cache writeback. Snapshot files that `vmm snapshot` hands back belong to
 the caller; the harness removes them after each scenario.
 
+Both VMMs give the guest the same durability. tarit always passes a guest flush
+to the host; Firecracker's default drive `cache_type` (`Unsafe`) ignores it, so
+a guest fsync there is not durable. Both harnesses therefore run Firecracker
+with `cache_type: Writeback` and record that in the results file
+(`firecracker_cache_type`); set `VMBENCH_FC_CACHE=Unsafe` to measure the
+default instead. To compare disk work fairly, keep `--work` and `TMPDIR` on a
+filesystem with reflink (XFS or btrfs) so that Firecracker's per-VM disk copies
+are clones, as tarit's are.
+
 Debugging aids: `VMBENCH_TARIT_VERBOSE=1|2` raises tarit's log level,
 `VMBENCH_GDB=1` runs tarit under gdb and dumps every thread's stack when a VM
 goes exec-dead, and `VMBENCH_STRACE=openat` straces tarit with timestamps and
