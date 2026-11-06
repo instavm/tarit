@@ -26,7 +26,7 @@ ROWS = [
     ("Fork: per clone ready (ms)", "agent", "fork/metrics/per_clone_ready_ms/p50", True),
     ("20 clones of one snapshot: all ready (ms)", "vm", "fanout/all_ready_ms", True),
     ("20 clones of one snapshot: disk used (MiB)", "vm", "fanout/disk_used_mib", True),
-    ("Burst of 20 restores: all ready (ms)", "vm", "burst/all_ready_ms", True),
+    ("Burst of 20 cold boots at once: all ready (ms)", "vm", "burst/all_ready_ms", True),
     ("Burst of sandboxes: first command (ms)", "agent", "burst/metrics/time_to_first_command_ms/p50", True),
     ("Bulk download, checksummed (MB/s)", "agent", "net/metrics/download_MBps", False),
     ("Disk: 20k small files (ms)", "agent", "disk/metrics/step_ms/20k small files", True),

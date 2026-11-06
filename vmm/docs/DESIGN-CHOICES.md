@@ -148,9 +148,15 @@ loadable segments and advises that range (rounded to 2 MiB) for
 thousands of small ones, and KVM maps the guest kernel with huge pages, which
 also shortens the guest's own boot: cold boot to first command went from
 ~99 ms to ~87 ms on a Ryzen 5 5600G, for about 1.3 MiB more VMM memory.
-Guest RAM outside the kernel keeps 4 KiB pages. With the host's THP `defrag`
-set to `madvise`, a huge page fault may compact memory synchronously on a
-badly fragmented host; `VMM_KERNEL_HUGEPAGES=0` turns the advice off.
+Guest RAM outside the kernel keeps 4 KiB pages.
+
+The advice is given only while `/proc/buddyinfo` shows at least 16 free
+2 MiB blocks per huge page the kernel needs. With the host's THP `defrag` set
+to `madvise`, a huge page fault on a fragmented host compacts memory first
+and often falls back to 4 KiB pages anyway; on such a host twenty concurrent
+boots were 40% slower with the advice than without. Below the threshold the
+kernel loads into 4 KiB pages as before. `VMM_KERNEL_HUGEPAGES=0` turns the
+advice off entirely.
 
 ## Snapshot Format
 
