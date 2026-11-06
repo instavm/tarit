@@ -379,7 +379,9 @@ enum Cmd {
         overlay: Vec<String>,
     },
 
-    /// Restore a VM from a snapshot file.
+    /// Restore a VM from a snapshot file. With a `vmm serve` listening on
+    /// --socket, the VM is restored there; otherwise this process restores it
+    /// and serves its API on --socket until stopped.
     #[command(alias = "load")]
     Restore {
         /// Path to the snapshot file.
@@ -1190,8 +1192,11 @@ fn restore(
     controller
         .restore_with_overrides(&snapshot, None, None, memory_policy.into())
         .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
-    println!("Restored VM from {snapshot}");
-    Ok(())
+    // Keep the restored VM alive and controllable: this process now serves
+    // its API, exactly as `vmm serve` followed by a `restore` request would.
+    println!("Restored VM from {snapshot}; serving its API on {socket}");
+    vmm_api::rpc::serve_with_controller(socket, controller)
+        .map_err(|e| anyhow::anyhow!("api serve: {e}"))
 }
 
 fn api_socket_is_listening(socket: &str) -> Result<bool> {

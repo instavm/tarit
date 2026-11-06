@@ -121,7 +121,7 @@ sudo vmm --socket /tmp/vm.sock snapshot --diff       # incremental (dirty pages 
 sudo vmm --socket /tmp/vm.sock snapshot --live       # live: guest keeps running
 sudo vmm --socket /tmp/vm.sock suspend               # release resident guest RAM
 sudo vmm --socket /tmp/vm.sock resume
-sudo vmm restore --snapshot /path/to.snap            # restore into a new VMM process
+sudo vmm --socket /tmp/vm2.sock restore --snapshot /path/to.snap  # restore in a new VMM process that serves its API
 ```
 
 Tarit also does **live snapshots** (`snapshot --live`): pre-copy rounds run
@@ -195,7 +195,7 @@ tested, and consumed on its own. Both depend on `proto/` for the wire types.
 
 - Host: x86_64 Linux with KVM. Development also works on macOS for building and
   cross-checking; running microVMs needs KVM.
-- Not yet implemented: aarch64 guests, virtio-balloon.
+- Not yet implemented: aarch64 guests.
 
 ## Self-hosting
 
