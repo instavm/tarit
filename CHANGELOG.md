@@ -109,6 +109,9 @@ versions may contain breaking changes.
   before the pool was consulted, and the pool only serves creates without one,
   so every create cold-booted. Creates naming an image are served by a class
   built from that image.
+- A warm-pool refill fills back to the class's target, as documented. Each
+  round started a bounded number of VMs and re-checked the low watermark, so a
+  refill stopped as soon as the pool crossed it: a target of 100 settled at 76.
 - A warm-pool golden VM runs a command before its snapshot, so a clone's first
   command no longer reads the guest shell and libc from disk (about 2 MiB,
   20-40 ms).

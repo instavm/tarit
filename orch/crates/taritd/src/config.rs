@@ -96,6 +96,26 @@ impl WarmClass {
             self.high_watermark,
         )
     }
+
+    /// How many VMs a replenisher round should start. A refill starts once
+    /// depth falls below the low watermark and continues across rounds until
+    /// the pool is back at target; `filling` carries that between rounds.
+    /// Rounds start a bounded number of VMs each, so without it a refill
+    /// stopped as soon as it crossed the low watermark.
+    pub fn refill_round(&self, depth: usize, filling: &mut bool) -> usize {
+        let target = self.target.min(self.high_watermark);
+        if depth < self.low_watermark {
+            *filling = true;
+        }
+        if depth >= target {
+            *filling = false;
+        }
+        if *filling {
+            target - depth
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2312,6 +2332,25 @@ mod tests {
         assert_eq!(class.refill_needed(5), 3);
         assert_eq!(class.refill_needed(0), 8);
         assert_eq!(class.refill_needed(10), 0);
+    }
+
+    #[test]
+    fn a_refill_continues_across_rounds_until_the_pool_is_at_target() {
+        let class = WarmClassSpec::default_class().finish().unwrap();
+        let mut filling = false;
+
+        assert_eq!(class.refill_round(6, &mut filling), 0, "not below low");
+        assert_eq!(class.refill_round(5, &mut filling), 3);
+        assert_eq!(
+            class.refill_round(7, &mut filling),
+            1,
+            "past low, not at target"
+        );
+        assert_eq!(class.refill_round(8, &mut filling), 0);
+        assert_eq!(class.refill_round(7, &mut filling), 0, "refill finished");
+        assert_eq!(class.refill_round(0, &mut filling), 8);
+        assert_eq!(class.refill_round(10, &mut filling), 0);
+        assert!(!filling);
     }
 
     #[test]

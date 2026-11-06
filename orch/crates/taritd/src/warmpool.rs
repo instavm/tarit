@@ -141,6 +141,7 @@ pub(crate) fn spawn_replenisher(
     let worker_children = Arc::clone(&children);
     Some(Replenisher {
         handle: tokio::spawn(async move {
+            let mut filling = vec![false; classes.len()];
             'replenish: loop {
                 worker_children.reap_finished().await;
                 if worker_cancelled.load(Ordering::Acquire) || shutdown_pending(&shutdown_rx) {
@@ -172,7 +173,7 @@ pub(crate) fn spawn_replenisher(
                     }
                 }
                 let mut did_work = false;
-                for class in &classes {
+                for (index, class) in classes.iter().enumerate() {
                     if worker_cancelled.load(Ordering::Acquire) || shutdown_pending(&shutdown_rx) {
                         worker_cancelled.store(true, Ordering::Release);
                         break 'replenish;
@@ -191,7 +192,7 @@ pub(crate) fn spawn_replenisher(
                     if worker_cancelled.load(Ordering::Acquire) {
                         break 'replenish;
                     }
-                    let need = class.refill_needed(have);
+                    let need = class.refill_round(have, &mut filling[index]);
                     if need == 0 {
                         continue;
                     }
@@ -267,7 +268,7 @@ pub(crate) fn spawn_replenisher(
                         if worker_cancelled.load(Ordering::Acquire) {
                             break 'replenish;
                         }
-                        let need = class.refill_needed(have);
+                        let need = class.refill_round(have, &mut filling[index]);
                         if need == 0 {
                             continue;
                         }
