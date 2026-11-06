@@ -1241,6 +1241,8 @@ impl VmmController {
                 kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
             })
             .transpose()?;
+        // Install the remaining devices' interrupt routes in one update.
+        kvm_vm.defer_gsi_routing();
 
         // Expose a fresh generation value from the first boot. The eventfd is
         // registered now and kept alive for the VM lifetime; it is triggered
@@ -1410,6 +1412,7 @@ impl VmmController {
             None => (None, None, None),
         };
 
+        kvm_vm.commit_gsi_routing()?;
         let vcpu = kvm_vm.create_vcpu(0)?;
         kvm_vm.setup_vcpu_for_bzimage_boot_full(&vcpu, &loaded, full_boot)?;
         let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
@@ -7517,6 +7520,9 @@ fn build_running_vm(
 
     let template = crate::cpu_template::CpuTemplate::bare();
     let kvm_vm = crate::kvm::KvmVm::new_with_options(mem, devices, template, full_boot)?;
+    // Install the devices' interrupt routes in one update (the balloon's
+    // resampler registration, which comes last, installs them).
+    kvm_vm.defer_gsi_routing();
     // Keep handles to the balloon's eventfds for its irqfd registration,
     // which starts once every other GSI route is in place (below).
     let balloon_irqfd_fds = balloon
@@ -7722,6 +7728,7 @@ fn build_running_vm(
         resample.registration =
             Some(kvm_vm.begin_irqfd_with_resample(&irq_evt, &resample_evt, irq)?);
     }
+    kvm_vm.commit_gsi_routing()?;
     let vcpu = kvm_vm.create_vcpu(0)?;
     // CPUID must be set on the fresh vCPU before the saved MSRs/state are
     // applied; the captured LAPIC already carries the LVT config, so we do not

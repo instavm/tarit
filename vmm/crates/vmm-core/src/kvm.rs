@@ -112,6 +112,9 @@ pub struct KvmVm {
     pub template: CpuTemplate,
     /// GSI routing entries accumulated for KVM_SET_GSI_ROUTING.
     routing_entries: std::sync::Mutex<Vec<kvm_bindings::kvm_irq_routing_entry>>,
+    /// While set, [`Self::register_irqfd`] records its route without
+    /// installing the table; see [`Self::defer_gsi_routing`].
+    routing_deferred: std::sync::atomic::AtomicBool,
 }
 
 /// VM-level (not per-vCPU) KVM state captured for a faithful resume: the
@@ -246,6 +249,7 @@ impl KvmVm {
             slots,
             template,
             routing_entries: std::sync::Mutex::new(Vec::new()),
+            routing_deferred: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -360,6 +364,32 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Collect the GSI routes of the [`Self::register_irqfd`] calls that
+    /// follow and install them together at [`Self::commit_gsi_routing`].
+    /// Every KVM_SET_GSI_ROUTING waits out an SRCU grace period, so wiring a
+    /// VM's devices one route at a time cost boot and restore a grace period
+    /// per device. An irqfd registered before its route exists is re-pointed
+    /// by KVM when the routing table is installed.
+    pub fn defer_gsi_routing(&self) {
+        self.routing_deferred
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Install the routes collected since [`Self::defer_gsi_routing`].
+    pub fn commit_gsi_routing(&self) -> Result<()> {
+        if !self
+            .routing_deferred
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let entries = self
+            .routing_entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.apply_gsi_routing(&entries)
+    }
+
     /// Register an existing EventFd as an irqfd for a GSI.
     /// Also adds a GSI routing entry routing the GSI to the in-kernel
     /// IOAPIC.
@@ -382,7 +412,12 @@ impl KvmVm {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         entries.push(entry);
-        self.apply_gsi_routing(&entries)?;
+        if !self
+            .routing_deferred
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.apply_gsi_routing(&entries)?;
+        }
         log::info!("irqfd+routing registered: gsi={gsi} → IOAPIC pin {gsi}");
         Ok(())
     }
@@ -417,6 +452,9 @@ impl KvmVm {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             entries.push(entry);
+            // Installs any deferred routes along with this one.
+            self.routing_deferred
+                .store(false, std::sync::atomic::Ordering::Release);
             self.apply_gsi_routing(&entries)?;
         }
 
