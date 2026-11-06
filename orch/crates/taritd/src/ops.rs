@@ -825,6 +825,161 @@ async fn cleanup_hibernation_snapshots_for_vm(
     cleanup_ephemeral_snapshots(state, snapshots).await
 }
 
+/// User snapshots on this node visible to `tenant` (`None` for an admin key).
+/// Fork and hibernation snapshots are managed by their VM and not listed.
+pub fn list_snapshots_local(
+    state: &AppState,
+    tenant: Option<&str>,
+) -> Result<Vec<tarit_store::SnapshotRecord>, OrchError> {
+    let snapshots = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+        .list_snapshots()
+        .map_err(crate::api::store_err)?;
+    Ok(snapshots
+        .into_iter()
+        .filter(|snapshot| snapshot.ephemeral_owner_vm_id.is_none())
+        .filter(|snapshot| snapshot.host_id == state.config.host_id)
+        .filter(|snapshot| tenant.is_none() || snapshot.owner_key.as_deref() == tenant)
+        .collect())
+}
+
+/// Delete a user snapshot that nothing still needs.
+///
+/// A snapshot is refused (409) while a branch head references its artifact,
+/// a hibernated VM would wake from it, or a fork owns it. Metadata is retired
+/// first and atomically, so a concurrent branch or wake either wins and keeps
+/// the snapshot or loses and finds it gone; the files are removed only after
+/// that, and a crash in between leaves unreferenced files for the
+/// owned-artifact sweep rather than metadata pointing at missing files.
+pub async fn delete_snapshot_local(
+    state: &AppState,
+    tenant: Option<&str>,
+    snapshot_id: Uuid,
+) -> Result<(), OrchError> {
+    let not_found = || OrchError::NotFound(format!("snapshot {snapshot_id} not found"));
+    let snapshot = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+        let snapshot = store
+            .get_snapshot_by_id(snapshot_id)
+            .map_err(crate::api::store_err)?
+            .ok_or_else(not_found)?;
+        if tenant.is_some() && snapshot.owner_key.as_deref() != tenant {
+            return Err(not_found());
+        }
+        if snapshot.host_id != state.config.host_id {
+            return Err(OrchError::Unprocessable(
+                "snapshot is stored on another node; delete it through that node".into(),
+            ));
+        }
+        if snapshot.ephemeral_owner_vm_id.is_some() {
+            return Err(OrchError::Conflict(format!(
+                "snapshot {snapshot_id} is managed by a fork or hibernated VM"
+            )));
+        }
+        let hibernations = store.list_hibernations().map_err(crate::api::store_err)?;
+        if let Some(hibernation) = hibernations
+            .iter()
+            .find(|hibernation| hibernation.snapshot_path == snapshot.path)
+        {
+            return Err(OrchError::Conflict(format!(
+                "snapshot {snapshot_id} is the wake image of hibernated VM {}",
+                hibernation.vm_id
+            )));
+        }
+        snapshot
+    };
+    let owner_key = snapshot.owner_key.clone();
+    let has_artifact = match owner_key.as_deref() {
+        Some(owner_key) => match state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .get_artifact(owner_key, snapshot_id)
+        {
+            Ok(artifact) if artifact.reference_count != 0 => {
+                return Err(OrchError::Conflict(format!(
+                    "snapshot {snapshot_id} is referenced by {} branch head(s)",
+                    artifact.reference_count
+                )));
+            }
+            Ok(_) => true,
+            Err(tarit_store::StoreError::NotFound) => false,
+            Err(error) => return Err(crate::api::store_err(error)),
+        },
+        None => false,
+    };
+    if let (Some(fleet), Some(owner_key)) = (state.fleet.as_ref(), owner_key.as_deref()) {
+        if has_artifact {
+            match fleet
+                .delete_artifact_if_unreferenced(owner_key, snapshot_id)
+                .await
+            {
+                Ok(_) | Err(tarit_fleet::FleetError::NotFound) => {}
+                Err(tarit_fleet::FleetError::Conflict(message)) => {
+                    return Err(OrchError::Conflict(format!(
+                        "snapshot {snapshot_id} is still referenced: {message}"
+                    )));
+                }
+                Err(error) => {
+                    return Err(OrchError::Unavailable(format!(
+                        "retire snapshot artifact from fleet: {error}"
+                    )));
+                }
+            }
+        }
+        fleet
+            .delete_snapshot_by_id(owner_key, snapshot_id)
+            .await
+            .map_err(|error| {
+                OrchError::Unavailable(format!("retire snapshot from fleet: {error}"))
+            })?;
+    }
+    {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+        // Re-check under the same lock a hibernation must take to bind it.
+        if store
+            .list_hibernations()
+            .map_err(crate::api::store_err)?
+            .iter()
+            .any(|hibernation| hibernation.snapshot_path == snapshot.path)
+        {
+            return Err(OrchError::Conflict(format!(
+                "snapshot {snapshot_id} became the wake image of a hibernated VM"
+            )));
+        }
+        let retired = match (has_artifact, owner_key.as_deref()) {
+            (true, Some(owner_key)) => store
+                .delete_local_replica_metadata_if_unreferenced(
+                    owner_key,
+                    snapshot_id,
+                    &snapshot.path,
+                )
+                .map(drop),
+            _ => store.delete_snapshot(&snapshot.path),
+        };
+        match retired {
+            Ok(()) => {}
+            Err(tarit_store::StoreError::NotFound) => return Err(not_found()),
+            Err(tarit_store::StoreError::Conflict(message)) => {
+                return Err(OrchError::Conflict(format!(
+                    "snapshot {snapshot_id} is still referenced: {message}"
+                )));
+            }
+            Err(error) => return Err(crate::api::store_err(error)),
+        }
+    }
+    crate::disk::delete_owned_snapshot_components(&state.config.socket_dir, &snapshot)?;
+    Ok(())
+}
+
 async fn cleanup_ephemeral_snapshots(
     state: &AppState,
     snapshots: Vec<tarit_store::SnapshotRecord>,
@@ -5876,6 +6031,88 @@ mod tests {
                 other => panic!("expected a volume conflict, got {:?}", other.err()),
             }
         }
+    }
+
+    #[test]
+    fn snapshot_delete_refuses_snapshots_something_still_needs() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let now = Utc::now();
+        let snapshot = |path: &str, ephemeral: Option<Uuid>| tarit_store::SnapshotRecord {
+            snapshot_id: Uuid::new_v4(),
+            path: path.into(),
+            overlay_path: None,
+            host_id: state.config.host_id.clone(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: Some("key-a".into()),
+            vm_id: Uuid::new_v4(),
+            ephemeral_owner_vm_id: ephemeral,
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: None,
+            rootfs_path: None,
+            rootfs_read_only: None,
+            cmdline: None,
+            content_digest: None,
+            size_bytes: Some(4096),
+            created_at: now,
+        };
+        let wake = snapshot("/private/wake.ram", None);
+        let forked = snapshot("/private/fork.ram", Some(Uuid::new_v4()));
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_snapshot(&wake).unwrap();
+            store.insert_snapshot(&forked).unwrap();
+            store
+                .upsert_hibernation(&tarit_store::HibernationRecord {
+                    vm_id: Uuid::new_v4(),
+                    owner_key: "tenant-a".into(),
+                    snapshot_path: wake.path.clone(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        let runtime = test_runtime();
+        let delete = |tenant: &str, id: Uuid| {
+            runtime.block_on(delete_snapshot_local(&state, Some(tenant), id))
+        };
+
+        assert!(matches!(
+            delete("tenant-b", wake.snapshot_id),
+            Err(OrchError::NotFound(_))
+        ));
+        assert!(matches!(
+            delete("tenant-a", wake.snapshot_id),
+            Err(OrchError::Conflict(message)) if message.contains("hibernated")
+        ));
+        assert!(matches!(
+            delete("tenant-a", forked.snapshot_id),
+            Err(OrchError::Conflict(_))
+        ));
+        assert!(matches!(
+            delete("tenant-a", Uuid::new_v4()),
+            Err(OrchError::NotFound(_))
+        ));
+        // Refused deletes leave every record in place.
+        let store = state.store.lock().unwrap();
+        assert!(store
+            .get_snapshot_by_id(wake.snapshot_id)
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_snapshot_by_id(forked.snapshot_id)
+            .unwrap()
+            .is_some());
+        drop(store);
+        let listed = list_snapshots_local(&state, Some("tenant-a")).unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
+            vec![wake.snapshot_id],
+            "fork-owned snapshots are not listed"
+        );
+        assert!(list_snapshots_local(&state, Some("tenant-b"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

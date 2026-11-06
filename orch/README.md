@@ -142,8 +142,10 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 | DELETE | `/v1/vms/{id}` | Resolve owner, stop the VM, mark it stopped locally, clear fleet ownership. |
 | POST | `/v1/vms/{id}/pause` | Resolve owner and pause. |
 | POST | `/v1/vms/{id}/resume` | Resolve owner and resume. |
-| POST | `/v1/vms/{id}/snapshot` | Resolve owner and snapshot, returning `path` and `host_id`. |
-| POST | `/v1/restore` | Restore a node-local snapshot, optionally routed by `host_id`. |
+| POST | `/v1/vms/{id}/snapshot` | Resolve owner and snapshot, returning an opaque `snapshot_id`. |
+| GET | `/v1/snapshots` | List the tenant's snapshots on this node. |
+| DELETE | `/v1/snapshots/{id}` | Delete a snapshot no branch, hibernated VM, or fork still needs. |
+| POST | `/v1/restore` | Restore from a `snapshot_id`, routed to the node that holds it. |
 | POST | `/v1/execute` | Resolve owner and run a command synchronously, returning the finished record. |
 | POST | `/v1/execute_async` | Resolve owner and run a command asynchronously. |
 | GET | `/v1/executions/{id}` | Get an execution record stored on the API node that accepted it. |

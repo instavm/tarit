@@ -1007,6 +1007,7 @@ pub mod audit_action {
     pub const SUSPEND: &str = "suspend";
     pub const RESUME: &str = "resume";
     pub const SNAPSHOT: &str = "snapshot";
+    pub const DELETE_SNAPSHOT: &str = "delete_snapshot";
     pub const FORK: &str = "fork";
     pub const HIBERNATE: &str = "hibernate";
     pub const CREATE_BRANCH: &str = "create_branch";

@@ -227,6 +227,29 @@ components:
         updated_at:
           type: string
           format: date-time
+    Snapshot:
+      type: object
+      additionalProperties: false
+      required: [snapshot_id, source_vm_id, created_at]
+      properties:
+        snapshot_id:
+          type: string
+          format: uuid
+        source_vm_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        size_bytes:
+          type: integer
+          format: uint64
+        memory_mib:
+          type: integer
+          format: uint64
+        vcpus:
+          type: integer
+          minimum: 1
     CreateVolumeRequest:
       type: object
       additionalProperties: false
@@ -462,7 +485,7 @@ components:
           format: uuid
         action:
           type: string
-          enum: [create, delete, pause, suspend, resume, snapshot, fork, hibernate, create_branch, update_branch, delete_branch, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token, create_volume, delete_volume, set_balloon]
+          enum: [create, delete, pause, suspend, resume, snapshot, delete_snapshot, fork, hibernate, create_branch, update_branch, delete_branch, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token, create_volume, delete_volume, set_balloon]
         outcome:
           type: string
           enum: [attempt, ok, denied, error]
@@ -1336,6 +1359,47 @@ paths:
           description: Host capacity is unavailable
         "503":
           description: A source peer/session, durable fleet, verified artifact replica, or configured replication policy is unavailable
+  /v1/snapshots:
+    get:
+      operationId: listSnapshots
+      summary: List the tenant's snapshots on this node
+      description: Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not listed.
+      responses:
+        "200":
+          description: Tenant snapshots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Snapshot"
+        "401":
+          description: Missing or invalid API key
+  /v1/snapshots/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      operationId: deleteSnapshot
+      summary: Delete a snapshot nothing still needs
+      description: Removes the snapshot's metadata and files. Refused while a branch head references it, a hibernated VM would wake from it, or a fork owns it.
+      responses:
+        "204":
+          description: Snapshot deleted
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Snapshot absent or belongs to another tenant
+        "409":
+          description: Snapshot is still referenced
+        "422":
+          description: Snapshot is held by another node
+        "503":
+          description: Fleet store unavailable
   /v1/restore:
     post:
       operationId: restoreVm

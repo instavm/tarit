@@ -516,6 +516,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vms/{id}/hibernate", post(hibernate_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
         .route("/v1/vms/{id}/snapshot", post(snapshot_vm))
+        .route("/v1/snapshots", get(list_snapshots))
+        .route("/v1/snapshots/{id}", delete(delete_snapshot))
         .route("/v1/vms/{id}/fork", post(fork_vm))
         .route("/v1/restore", post(restore_vm))
         .route("/v1/execute_async", post(execute_async))
@@ -3739,6 +3741,62 @@ async fn update_branch_head(
         Some(format!("branch_id={id};revision={}", branch.revision)),
     );
     Ok(Json(branch))
+}
+
+/// A tenant's snapshot as the public API shows it: an opaque handle plus the
+/// shape it restores to. Host placement and storage paths stay private.
+#[derive(Debug, Serialize)]
+struct PublicSnapshot {
+    snapshot_id: Uuid,
+    source_vm_id: Uuid,
+    created_at: chrono::DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vcpus: Option<u8>,
+}
+
+/// Snapshots this node holds for the caller's tenant, oldest first.
+async fn list_snapshots(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> Result<Json<Vec<PublicSnapshot>>, ApiError> {
+    let mut snapshots = ops::list_snapshots_local(&state, Some(&identity.tenant))?;
+    snapshots.sort_by_key(|snapshot| snapshot.created_at);
+    Ok(Json(
+        snapshots
+            .into_iter()
+            .map(|snapshot| PublicSnapshot {
+                snapshot_id: snapshot.snapshot_id,
+                source_vm_id: snapshot.vm_id,
+                created_at: snapshot.created_at,
+                size_bytes: snapshot.size_bytes,
+                memory_mib: snapshot.memory_mib,
+                vcpus: snapshot.vcpus,
+            })
+            .collect(),
+    ))
+}
+
+/// Delete a snapshot nothing still needs. Refused with 409 while a branch,
+/// hibernated VM, or fork depends on it.
+async fn delete_snapshot(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    ops::delete_snapshot_local(&state, Some(&identity.tenant), id).await?;
+    audit::record(
+        &state,
+        &identity,
+        audit_action::DELETE_SNAPSHOT,
+        None,
+        audit_outcome::OK,
+        Some(format!("snapshot_id={id}")),
+    );
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn delete_branch(

@@ -487,6 +487,41 @@ Response `200`:
 Status codes: `200`, `401`, `403`, `404`, `409` (the lifecycle state does not
 support snapshots), `422` (`diff` is true), `500`.
 
+### `GET /v1/snapshots`
+
+List the caller's snapshots held by this node, oldest first. Snapshots owned
+by a fork or used as a hibernated VM's wake image are managed by that VM and
+are not listed.
+
+Response `200`:
+
+```json
+[
+  {
+    "snapshot_id": "uuid",
+    "source_vm_id": "uuid",
+    "created_at": "2026-11-06T07:52:00Z",
+    "size_bytes": 41943040,
+    "memory_mib": 256,
+    "vcpus": 1
+  }
+]
+```
+
+Status codes: `200`, `401`.
+
+### `DELETE /v1/snapshots/{id}`
+
+Delete a snapshot and its files. Snapshots are kept until deleted, so a client
+that checkpoints often should delete the ones it no longer needs; otherwise
+the node eventually reaches disk pressure and refuses new snapshots with `429`.
+A snapshot that a branch head references, a hibernated VM would wake from, or
+a fork owns is refused. Delete the branch first to release a branch head.
+
+Status codes: `204`, `401`, `404` (unknown, or another tenant's), `409`
+(still referenced), `422` (held by another node), `503` (fleet store
+unavailable).
+
 ### `POST /v1/restore`
 
 Restore a VM from an opaque tenant-owned snapshot handle. The control plane
