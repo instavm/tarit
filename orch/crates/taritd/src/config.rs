@@ -31,6 +31,10 @@ pub struct WarmClass {
     pub rootfs: Option<PathBuf>,
     /// Registered image reference (`name[:tag]`) to resolve before warm refill.
     pub image: Option<String>,
+    /// Command the golden VM runs before its snapshot, so every clone starts
+    /// with what it read in the page cache. Without one the golden runs
+    /// `true`, which warms the shell every command starts through.
+    pub prewarm: Option<String>,
 }
 
 impl WarmClass {
@@ -47,6 +51,7 @@ impl WarmClass {
             restore: spec.restore,
             rootfs: spec.rootfs,
             image: spec.image,
+            prewarm: spec.prewarm,
         };
         class.validate_watermarks()?;
         class.validate_image_rootfs()?;
@@ -383,6 +388,8 @@ struct WarmClassFile {
     rootfs: Option<String>,
     #[serde(default)]
     image: Option<String>,
+    #[serde(default)]
+    prewarm: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +403,7 @@ struct WarmClassSpec {
     restore: bool,
     rootfs: Option<PathBuf>,
     image: Option<String>,
+    prewarm: Option<String>,
 }
 
 impl WarmClassSpec {
@@ -410,6 +418,7 @@ impl WarmClassSpec {
             restore: false,
             rootfs: None,
             image: None,
+            prewarm: None,
         }
     }
 
@@ -424,6 +433,7 @@ impl WarmClassSpec {
             restore: file.restore.unwrap_or(false),
             rootfs: file.rootfs.as_ref().map(|s| expand_path(s)),
             image: file.image.clone(),
+            prewarm: file.prewarm.clone(),
         }
     }
 
@@ -1744,6 +1754,13 @@ fn apply_warm_pool_env(draft: &mut WarmPoolDraft) {
             }
         }
     }
+    if let Ok(command) = env::var("TARIT_WARM_POOL_PREWARM") {
+        if !command.trim().is_empty() {
+            if let Some(first) = draft.classes.first_mut() {
+                first.prewarm = Some(command.trim().to_string());
+            }
+        }
+    }
     if let Ok(path) = env::var("TARIT_REFILL_CGROUP") {
         draft.refill_cgroup.path = non_empty_path(&path);
     }
@@ -2317,6 +2334,7 @@ mod tests {
             high_watermark = 11
             restore = true
             rootfs = "target/taritd-config-test/rootfs.ext4"
+            prewarm = "node -e 0"
             "#,
         )
         .unwrap();
@@ -2339,6 +2357,7 @@ mod tests {
         assert_eq!(class.target, 8);
         assert_eq!(class.high_watermark, 11);
         assert!(class.restore);
+        assert_eq!(class.prewarm.as_deref(), Some("node -e 0"));
         assert_eq!(
             class.rootfs,
             Some(PathBuf::from("target/taritd-config-test/rootfs.ext4"))

@@ -51,6 +51,8 @@ const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// 5-second per-read stream timeout of a plain client, which a multi-GiB
 /// guest cannot meet.
 const LIFECYCLE_OP_TIMEOUT: Duration = Duration::from_secs(600);
+/// Upper bound for a warm class's golden prewarm command.
+const GOLDEN_PREWARM_TIMEOUT_MS: u64 = 120_000;
 /// Margin on top of the guest-side exec timeout for VMM scheduling and
 /// response marshalling. The plain client's 5s per-read socket timeout is
 /// shorter than most exec budgets, so exec must use a deadline client sized
@@ -5806,6 +5808,31 @@ impl VmmSupervisor {
                 task.mark_terminal_converged();
             }
             return Err(error);
+        }
+        // Every command starts through the guest's shell. Running one before
+        // the snapshot puts the shell, the loader and libc in every clone's
+        // page cache; otherwise each clone reads them from disk on its first
+        // command. A failing prewarm fails the golden rather than leaving a
+        // class different from what it was configured to be.
+        let socket_path = booted.vm.socket_path.clone();
+        let command = class.prewarm.clone().unwrap_or_else(|| "true".into());
+        let prewarm_error = match tokio::task::spawn_blocking(move || {
+            VmmClient::new(&socket_path)
+                .with_request_timeout(LIFECYCLE_OP_TIMEOUT)
+                .exec(&command, GOLDEN_PREWARM_TIMEOUT_MS)
+        })
+        .await
+        {
+            Ok(Ok((0, ..))) => None,
+            Ok(Ok((code, _, stderr, _))) => Some(OrchError::Vmm(format!(
+                "golden prewarm exited {code}: {}",
+                stderr.trim().chars().take(512).collect::<String>()
+            ))),
+            Ok(Err(error)) => Some(OrchError::Vmm(format!("golden prewarm: {error}"))),
+            Err(error) => Some(OrchError::Internal(format!("golden prewarm task: {error}"))),
+        };
+        if let Some(error) = prewarm_error {
+            return Err(self.cleanup_boot_failure(id, &booted.control, &booted.vm, error));
         }
         let _reservation =
             match self.reserve_snapshot_space(id, spec.memory_mib, spec.rootfs_path.is_some()) {

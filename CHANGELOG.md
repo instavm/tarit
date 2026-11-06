@@ -20,6 +20,9 @@ versions may contain breaking changes.
   checkpoint restores on its own; snapshots of VMs on storage without reflink
   use a paused, extent-copied capture.
 - Snapshot list and delete endpoints.
+- Warm-pool classes take a `prewarm` command (`TARIT_WARM_POOL_PREWARM`) that
+  the golden VM runs before its snapshot, so clones start with an image's
+  runtime in their page cache.
 - Docker and Podman images run as VMs without root (`vmm pull
   docker-daemon:`/`podman:`), and images build without skopeo.
 - `test/compare/`: a head-to-head harness against Firecracker covering cold
@@ -99,6 +102,13 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- The warm pool now serves API creates. The API gave every create an id
+  before the pool was consulted, and the pool only serves creates without one,
+  so every create cold-booted. Creates naming an image are served by a class
+  built from that image.
+- A warm-pool golden VM runs a command before its snapshot, so a clone's first
+  command no longer reads the guest shell and libc from disk (about 2 MiB,
+  20-40 ms).
 - AMD guests boot: the hypervisor CPUID bit is advertised.
 - Confined path opens fail with EACCES instead of killing the thread.
 - Restored guests no longer hang on a device interrupt raised just before

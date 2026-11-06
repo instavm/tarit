@@ -235,6 +235,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_CPU_OVERCOMMIT` | No | `4.0` | Warm-pool CPU overcommit ratio. |
 | `TARIT_WARM_POOL_ROOTFS` | No | unset | Override rootfs for the first warm-pool class. |
 | `TARIT_WARM_POOL_IMAGE` | No | unset | Override rootfs for the first warm-pool class by registered image `name[:tag]`. |
+| `TARIT_WARM_POOL_PREWARM` | No | unset | Command the first warm-pool class's golden VM runs before its snapshot, e.g. `node -e 0` for a Node image. |
 | `TARIT_REGION` | No | `local` | Topology label included in autoscaler decisions. |
 | `TARIT_ZONE` | No | same as `TARIT_REGION` | Topology label included in autoscaler decisions. |
 | `TARIT_CLOUD` | No | `onprem` | Topology label included in autoscaler decisions. |
@@ -294,12 +295,15 @@ high_watermark = 10
 restore = true
 rootfs = "/var/lib/taritd/rootfs.ext4"
 # or: image = "node20"
+# prewarm = "node -e 0"
 ```
 
 With `restore = true`, `taritd` cold-boots one ready golden VM for the class,
 takes a snapshot, tears down the builder, then refills that class by restoring
-clones from the golden. Each restored clone receives its own writable CoW
-overlay; `restore = false` keeps the bounded cold-boot refill path. Refill starts
+clones from the golden. Before its snapshot the golden runs `true`, so clones
+start with the guest shell in their page cache, or the class's `prewarm`
+command, which can do the same for an image's runtime; a failing command fails
+the golden. Each restored clone receives its own writable CoW overlay; `restore = false` keeps the bounded cold-boot refill path. Refill starts
 only below `low_watermark`, fills back to `target`, and uses the optional
 low-weight refill cgroup when `TARIT_REFILL_CGROUP`/`refill_cgroup` is set.
 
