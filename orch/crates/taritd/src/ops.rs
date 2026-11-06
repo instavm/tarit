@@ -1343,6 +1343,12 @@ async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> bool 
     .await;
     match restored {
         Ok(Ok(())) => true,
+        // A full host is expected during a burst; the create waits for
+        // capacity like any other.
+        Ok(Err(error @ OrchError::Overloaded { .. })) => {
+            tracing::debug!(%error, "on-demand warm restore deferred");
+            false
+        }
         Ok(Err(error)) => {
             tracing::warn!(%error, "on-demand warm restore failed");
             false
