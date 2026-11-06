@@ -1293,6 +1293,33 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
     .await
 }
 
+/// The spawn configuration a warm VM must have to serve `req`, or `None` when
+/// the pool can't serve it. A request naming a registered image is matched by
+/// the rootfs that image resolves to, after the same admission check a cold
+/// start makes, so a pool class built from the image serves it. A request
+/// that fails to resolve skips the pool; the cold path resolves it again and
+/// rejects the create with the error.
+fn warm_pool_spawn_config(
+    state: &AppState,
+    req: &CreateVmRequest,
+) -> Result<Option<VmSpawnConfig>, OrchError> {
+    if !state.config.warm_pool.enabled || req.id.is_some() || !req.volumes.is_empty() {
+        return Ok(None);
+    }
+    if req.image.is_none() {
+        return Ok(Some(VmSpawnConfig::from_defaults(&state.config, req)));
+    }
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock".into()))?;
+    Ok(
+        image::resolve_request_image(&store, req, &state.config.image_admission_policy)
+            .ok()
+            .map(|resolved| VmSpawnConfig::from_defaults(&state.config, &resolved)),
+    )
+}
+
 async fn create_local_owned(
     state: &AppState,
     req: &CreateVmRequest,
@@ -1301,26 +1328,22 @@ async fn create_local_owned(
 ) -> Result<VmRecord, OrchError> {
     let now = Utc::now();
     let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
-    let warm_enabled = state.config.warm_pool.enabled
-        && req.id.is_none()
-        && req.image.is_none()
-        && req.volumes.is_empty();
 
-    if warm_enabled {
+    if let Some(warm_cfg) = warm_pool_spawn_config(state, req)? {
         let lifecycle_id = Arc::new(std::sync::Mutex::new(id));
         let publication_state = state.clone();
-        let publication_cfg = unverified_cfg.clone();
+        let publication_cfg = warm_cfg.clone();
         let owner_key = req.owner_key.clone();
         let api_key_id = req.api_key_id.clone();
         let registration_state = state.clone();
-        let registration_cfg = unverified_cfg.clone();
+        let registration_cfg = warm_cfg.clone();
         let registration_owner = req.owner_key.clone();
         let registration_api_key = req.api_key_id.clone();
         let registration_lifecycle_id = Arc::clone(&lifecycle_id);
         let taken = state
             .supervisor
             .take_warm_with_publication(
-                &unverified_cfg,
+                &warm_cfg,
                 task,
                 move |warm_id| {
                     let registration_state = registration_state.clone();
@@ -5376,6 +5399,84 @@ mod tests {
         assert!(state.vm_cache.read().unwrap().get(&id).is_none());
         assert!(lifecycle_state(&state, id).unwrap().is_none());
         assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
+    }
+
+    #[test]
+    fn the_warm_pool_serves_a_request_for_its_image() {
+        let (mut state, _writes) = test_state_with_durable_writer();
+        state.config.warm_pool.enabled = true;
+        let dir = PathBuf::from(format!("target/warm-image-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rootfs = dir.join("node.ext4");
+        std::fs::write(&rootfs, b"node rootfs").unwrap();
+        let source_digest = format!("sha256:{}", "4".repeat(64));
+        state
+            .store
+            .lock()
+            .unwrap()
+            .upsert_image(&tarit_store::ImageRecord {
+                name: "node".into(),
+                tag: "22".into(),
+                rootfs_path: rootfs.display().to_string(),
+                created_at: Utc::now(),
+                size_bytes: std::fs::metadata(&rootfs).unwrap().len(),
+                source_ref: format!("docker://docker.io/library/node@{source_digest}"),
+                source_digest: Some(source_digest),
+                rootfs_digest: Some(image::sha256_regular_file(&rootfs).unwrap()),
+                agent_digest: Some(format!("sha256:{}", "5".repeat(64))),
+                provenance_key_digest: None,
+                provenance_verified_at: None,
+                golden_snapshot_path: None,
+            })
+            .unwrap();
+        let request = |image: Option<&str>| CreateVmRequest {
+            id: None,
+            owner_key: Some("test".into()),
+            api_key_id: None,
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: None,
+            image: image.map(Into::into),
+            rootfs_path: None,
+            cmdline: None,
+            volumes: Vec::new(),
+            egress: None,
+        };
+
+        let by_image = warm_pool_spawn_config(&state, &request(Some("node:22")))
+            .unwrap()
+            .expect("a registered image can be served warm");
+        let by_path = VmSpawnConfig::from_defaults(
+            &state.config,
+            &CreateVmRequest {
+                rootfs_path: Some(rootfs.display().to_string()),
+                ..request(None)
+            },
+        );
+        assert!(by_image == by_path, "matches a class built from the image");
+        let default = warm_pool_spawn_config(&state, &request(None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.rootfs_path, Some(state.config.rootfs.clone()));
+
+        assert!(
+            warm_pool_spawn_config(&state, &request(Some("node:20")))
+                .unwrap()
+                .is_none(),
+            "an unknown image is left to the cold path to reject"
+        );
+        std::fs::write(&rootfs, b"tampered rootfs").unwrap();
+        assert!(
+            warm_pool_spawn_config(&state, &request(Some("node:22")))
+                .unwrap()
+                .is_none(),
+            "an image failing admission is never served warm"
+        );
+        state.config.warm_pool.enabled = false;
+        assert!(warm_pool_spawn_config(&state, &request(None))
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

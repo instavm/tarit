@@ -1675,7 +1675,13 @@ async fn create_vm_impl(
     ensure_create_admission_open(state)?;
     req.owner_key = Some(identity.tenant.clone());
     req.api_key_id = Some(identity.api_key_id.clone());
-    let id = *req.id.get_or_insert_with(Uuid::new_v4);
+    // The quota reservation is held under the caller's id when it chose one,
+    // fencing concurrent creates of the same id. Otherwise it is held under a
+    // fresh id and the request keeps none, so a warm-pool VM, which already
+    // has its own id, can serve it. Until the reservation is released such a
+    // VM counts twice toward the tenant's quota, which can only refuse a
+    // concurrent create at the limit, never admit one past it.
+    let id = req.id.unwrap_or_else(Uuid::new_v4);
     enforce_create_path_policy(identity, &req)?;
     enforce_image_admission_policy(identity, &req, &state.config.image_admission_policy)?;
     match cluster::resolve_owner(state, id).await {
@@ -1693,12 +1699,13 @@ async fn create_vm_impl(
     }
     let reserved = reserve_vm_quota(state, identity, id).await?;
     let mut result = create_vm_after_quota(state, identity, req).await;
-    if let (Ok(_), Some(egress)) = (&result, egress) {
-        if let Err(error) = apply_create_egress(state, identity, id, egress).await {
+    if let (Ok((_, created)), Some(egress)) = (&result, egress) {
+        let vm = created.id;
+        if let Err(error) = apply_create_egress(state, identity, vm, egress).await {
             // All or nothing: never leave a VM running without the policy the
             // caller asked for.
-            if let Err(cleanup) = delete_owned_vm(state, identity, id).await {
-                tracing::error!(vm = %id, %cleanup,
+            if let Err(cleanup) = delete_owned_vm(state, identity, vm).await {
+                tracing::error!(vm = %vm, %cleanup,
                     "failed to remove VM whose create-time egress policy could not be applied");
             }
             result = Err(error.into());
@@ -4296,6 +4303,45 @@ mod tests {
     use std::time::Duration;
     use tarit_store::Store;
     use tower::ServiceExt;
+
+    #[test]
+    fn a_create_without_an_id_is_served_from_the_warm_pool() {
+        let (mut state, mut writes) = test_state_with_audit();
+        state.config.warm_pool.enabled = true;
+        let request: CreateVmRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        let warm_id = Uuid::new_v4();
+        state
+            .supervisor
+            .seed_warm_for_test(
+                warm_id,
+                crate::supervisor::VmSpawnConfig::from_defaults(&state.config, &request),
+            )
+            .unwrap();
+        let runtime = test_runtime();
+
+        let created = runtime.block_on(async {
+            tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            let response = request_json(
+                router(state.clone()),
+                "POST",
+                "/v1/vms",
+                "tenant-a-key",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            response_json(response).await
+        });
+
+        assert_eq!(created["id"], warm_id.to_string());
+        assert_eq!(created["startup_path"], "warm");
+    }
 
     #[test]
     fn overloaded_response_includes_retry_after() {
