@@ -5010,6 +5010,7 @@ mod tests {
                     tarit_vmm_client::ApiResponse::Snapshot {
                         path: server_scratch.clone(),
                         overlay_path: None,
+                        volume_paths: Vec::new(),
                         integrity_path: Some(server_integrity_scratch.clone()),
                         live_stats: Some(tarit_vmm_client::LiveSnapshotStats {
                             rounds: 2,

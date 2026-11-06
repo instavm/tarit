@@ -190,7 +190,11 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 msg: format!("{e}"),
             },
         },
-        ApiRequest::Snapshot { diff, live } => {
+        ApiRequest::Snapshot {
+            diff,
+            live,
+            capture_disks,
+        } => {
             let result = if live && diff {
                 Err(vmm_core::error::VmmError::Snapshot(
                     "live diff snapshots are not supported".into(),
@@ -234,6 +238,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                             (
                                 result.snapshot_path,
                                 result.overlay_path,
+                                Vec::new(),
                                 result.integrity_path,
                                 Some(live_stats),
                             )
@@ -247,16 +252,19 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 }
             } else {
                 controller
-                    .snapshot_with_overlay(diff)
-                    .map(|(path, overlay_path)| (path, overlay_path, None, None))
+                    .snapshot_with_disks(diff, capture_disks)
+                    .map(|(path, volume_paths)| (path, None, volume_paths, None, None))
             };
             match result {
-                Ok((path, overlay_path, integrity_path, live_stats)) => ApiResponse::Snapshot {
-                    path,
-                    overlay_path,
-                    integrity_path,
-                    live_stats,
-                },
+                Ok((path, overlay_path, volume_paths, integrity_path, live_stats)) => {
+                    ApiResponse::Snapshot {
+                        path,
+                        overlay_path,
+                        volume_paths,
+                        integrity_path,
+                        live_stats,
+                    }
+                }
                 Err(e) => ApiResponse::Err {
                     msg: format!("{e}"),
                 },
@@ -889,6 +897,7 @@ mod tests {
             ApiRequest::Snapshot {
                 diff: false,
                 live: true,
+                capture_disks: false,
             },
             &controller,
         );

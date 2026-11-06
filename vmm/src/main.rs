@@ -452,6 +452,12 @@ enum Cmd {
         /// blacks out for a sub-millisecond final stop.
         #[arg(long, conflicts_with = "diff")]
         live: bool,
+
+        /// Capture memory only. By default a regular snapshot also captures
+        /// every writable disk, so it can be restored or forked after the VM
+        /// is gone.
+        #[arg(long, conflicts_with = "live")]
+        memory_only: bool,
     },
 
     /// Execute a command in the guest VM (via the API).
@@ -640,7 +646,11 @@ fn main() -> Result<()> {
             },
             cgroup,
         ),
-        Cmd::Snapshot { diff, live } => api_snapshot(&cli.socket, diff, live),
+        Cmd::Snapshot {
+            diff,
+            live,
+            memory_only,
+        } => api_snapshot(&cli.socket, diff, live, !live && !memory_only),
         Cmd::Create {
             kernel,
             cmdline,
@@ -1325,23 +1335,29 @@ fn apply_serve_cgroup(
     Ok(())
 }
 
-fn api_snapshot(socket: &str, diff: bool, live: bool) -> Result<()> {
-    let request = vmm_api::types::ApiRequest::Snapshot { diff, live };
+fn api_snapshot(socket: &str, diff: bool, live: bool, capture_disks: bool) -> Result<()> {
+    let request = vmm_api::types::ApiRequest::Snapshot {
+        diff,
+        live,
+        capture_disks,
+    };
     let body = serde_json::to_vec(&request)?;
     let response = send_raw(socket, &body)?;
     let response: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;
-    let (path, overlay_path, integrity_path) = match &response {
+    let (path, overlay_path, volume_paths, integrity_path) = match &response {
         vmm_api::types::ApiResponse::Snapshot {
             path,
             overlay_path,
+            volume_paths,
             integrity_path,
             ..
-        } => (path, overlay_path, integrity_path),
+        } => (path, overlay_path, volume_paths, integrity_path),
         vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("snapshot failed: {msg}"),
         other => anyhow::bail!("unexpected snapshot response: {other:?}"),
     };
     for owned_path in std::iter::once(path)
         .chain(overlay_path.iter())
+        .chain(volume_paths.iter())
         .chain(integrity_path.iter())
     {
         let identity =

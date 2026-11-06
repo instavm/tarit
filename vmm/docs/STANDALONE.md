@@ -161,6 +161,7 @@ target/release/vmm --socket /tmp/vmm.sock suspend
 target/release/vmm --socket /tmp/vmm.sock resume
 target/release/vmm --socket /tmp/vmm.sock snapshot
 target/release/vmm --socket /tmp/vmm.sock snapshot --diff
+target/release/vmm --socket /tmp/vmm.sock snapshot --memory-only
 target/release/vmm --socket /tmp/vmm.sock snapshot --live
 target/release/vmm --socket /tmp/vmm.sock update-egress \
   --allow 10.0.0.0/8:443/tcp \
@@ -168,6 +169,18 @@ target/release/vmm --socket /tmp/vmm.sock update-egress \
   --allow-existing
 target/release/vmm --socket /tmp/vmm.sock stop
 ```
+
+### Snapshots, disks, and forks
+
+A regular `snapshot` (full or `--diff`) also captures every writable disk in the same pause as memory, so the snapshot can be restored after the source VM is gone and forked any number of times at once:
+
+- a volume with a CoW `overlay` has its upper copied;
+- a disk the guest writes directly is copied whole and becomes the read-only lower of each restore;
+- read-only volumes and inherited (orchestrator persistent) volumes are not copied.
+
+Copies use reflink when the filesystem supports it and otherwise copy only the allocated extents. The command prints the captured files as `volume_paths` and releases them to you with the snapshot. Keep them with the snapshot file: restore looks for a moved capture beside the snapshot. Captured disks carry the `user.tarit.disk-template` xattr; every restore writes to its own private overlay in the VMM runtime directory, removed when the VM stops, so captures never change. Use `snapshot --memory-only` for the old memory-only behaviour (the API's `capture_disks: false`, which the orchestrator uses because it manages disks itself). Live snapshots capture a single overlay and require reflink.
+
+A restore enables dirty-page tracking before the guest runs, so `snapshot --diff` after a restore writes only the pages the guest changed since that snapshot. Restoring the tip of a diff chain maps the base image and the long page runs of each diff directly, so it does not slow down as the chain grows.
 
 Restore inside a `vmm serve` process by sending the API `restore` request. `overlay` is optional.
 

@@ -75,6 +75,12 @@ pub enum ApiRequest {
         /// older clients' requests still parse.
         #[serde(default)]
         live: bool,
+        /// For a regular (non-live) snapshot, also capture every writable
+        /// disk in the same pause, so the snapshot can be restored or forked
+        /// after the source VM is gone. Callers that manage disks themselves
+        /// leave this false.
+        #[serde(default)]
+        capture_disks: bool,
     },
     /// Transfer one exact VMM-owned scratch file to the caller.
     ReleaseScratch {
@@ -173,6 +179,10 @@ pub enum ApiResponse {
         /// snapshot. Absent for memory-only and legacy snapshots.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         overlay_path: Option<String>,
+        /// Further disks captured by a `capture_disks` snapshot, beyond
+        /// `overlay_path`. Each is a VMM-owned scratch file until released.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        volume_paths: Vec<String>,
         /// VMM-generated chunk hashes for the exact live RAM snapshot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         integrity_path: Option<String>,
@@ -342,10 +352,11 @@ mod tests {
         let r = ApiRequest::Snapshot {
             diff: true,
             live: false,
+            capture_disks: false,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, ApiRequest::Snapshot { diff, live } if diff && !live));
+        assert!(matches!(back, ApiRequest::Snapshot { diff, live, .. } if diff && !live));
     }
 
     #[test]
@@ -353,17 +364,68 @@ mod tests {
         let r = ApiRequest::Snapshot {
             diff: false,
             live: true,
+            capture_disks: false,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, ApiRequest::Snapshot { diff, live } if !diff && live));
+        assert!(matches!(back, ApiRequest::Snapshot { diff, live, .. } if !diff && live));
     }
 
     #[test]
     fn request_snapshot_without_live_field_still_parses() {
         // Wire compat: requests from clients predating the `live` flag.
         let back: ApiRequest = serde_json::from_str(r#"{"op":"snapshot","diff":true}"#).unwrap();
-        assert!(matches!(back, ApiRequest::Snapshot { diff, live } if diff && !live));
+        assert!(matches!(back, ApiRequest::Snapshot { diff, live, .. } if diff && !live));
+    }
+
+    #[test]
+    fn snapshot_disk_capture_is_opt_in_and_round_trips() {
+        // Clients predating `capture_disks` keep memory-only snapshots.
+        let back: ApiRequest = serde_json::from_str(r#"{"op":"snapshot","diff":false}"#).unwrap();
+        assert!(matches!(
+            back,
+            ApiRequest::Snapshot {
+                capture_disks: false,
+                ..
+            }
+        ));
+        let r = ApiRequest::Snapshot {
+            diff: true,
+            live: false,
+            capture_disks: true,
+        };
+        let back: ApiRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            ApiRequest::Snapshot {
+                capture_disks: true,
+                ..
+            }
+        ));
+
+        // An empty volume list stays off the wire; a populated one survives.
+        let none = ApiResponse::Snapshot {
+            path: "/s".into(),
+            overlay_path: None,
+            volume_paths: Vec::new(),
+            integrity_path: None,
+            live_stats: None,
+        };
+        assert!(!serde_json::to_string(&none)
+            .unwrap()
+            .contains("volume_paths"));
+        let some = ApiResponse::Snapshot {
+            path: "/s".into(),
+            overlay_path: Some("/root.cow".into()),
+            volume_paths: vec!["/data.cow".into()],
+            integrity_path: None,
+            live_stats: None,
+        };
+        let back: ApiResponse =
+            serde_json::from_str(&serde_json::to_string(&some).unwrap()).unwrap();
+        assert!(
+            matches!(back, ApiResponse::Snapshot { volume_paths, .. } if volume_paths == ["/data.cow"])
+        );
     }
 
     #[test]
@@ -520,6 +582,7 @@ mod tests {
             ApiResponse::Snapshot {
                 path: "/p".into(),
                 overlay_path: None,
+                volume_paths: Vec::new(),
                 integrity_path: None,
                 live_stats: None,
             },
@@ -546,6 +609,7 @@ mod tests {
         let response = ApiResponse::Snapshot {
             path: "/snapshots/live.snap".into(),
             overlay_path: Some("/snapshots/live.overlay".into()),
+            volume_paths: Vec::new(),
             integrity_path: Some("/snapshots/live.integrity".into()),
             live_stats: Some(stats.clone()),
         };

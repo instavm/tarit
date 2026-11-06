@@ -479,13 +479,20 @@ impl VmmClient {
     /// Callers that need to transfer the artifact must capture its identity and
     /// explicitly call `release_scratch` only after they hold local ownership.
     pub fn snapshot_unreleased(&self, diff: bool) -> Result<String, VmmError> {
-        match self.request_ok(&ApiRequest::Snapshot { diff, live: false })? {
+        // The orchestrator manages disk uppers itself, so it asks for a
+        // memory-only snapshot and rejects any disk artifact.
+        match self.request_ok(&ApiRequest::Snapshot {
+            diff,
+            live: false,
+            capture_disks: false,
+        })? {
             ApiResponse::Snapshot {
                 path,
                 overlay_path: None,
+                volume_paths,
                 integrity_path: None,
                 live_stats: None,
-            } => Ok(path),
+            } if volume_paths.is_empty() => Ok(path),
             ApiResponse::Snapshot {
                 integrity_path: Some(_),
                 ..
@@ -493,7 +500,6 @@ impl VmmClient {
                 "non-live snapshot unexpectedly returned a live artifact".into(),
             )),
             ApiResponse::Snapshot {
-                overlay_path: Some(_),
                 integrity_path: None,
                 ..
             } => Err(VmmError::Api(
@@ -519,12 +525,14 @@ impl VmmClient {
         match self.request_ok(&ApiRequest::Snapshot {
             diff: false,
             live: true,
+            capture_disks: false,
         })? {
             ApiResponse::Snapshot {
                 path,
                 overlay_path,
                 integrity_path: Some(integrity_path),
                 live_stats: Some(live_stats),
+                ..
             } => Ok((path, overlay_path, integrity_path, live_stats)),
             ApiResponse::Snapshot {
                 integrity_path: None,

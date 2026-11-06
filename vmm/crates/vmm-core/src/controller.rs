@@ -297,6 +297,11 @@ impl OwnedOverlayGuard {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn adopt(&mut self, files: Vec<OwnedScratchFile>) {
+        self.files.extend(files);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     fn disarm(mut self) -> Vec<OwnedScratchFile> {
         self.armed = false;
         std::mem::take(&mut self.files)
@@ -588,16 +593,21 @@ impl VmmController {
     }
 
     pub fn snapshot(&self, diff: bool) -> Result<String> {
-        self.snapshot_with_overlay(diff).map(|(path, _)| path)
+        self.snapshot_with_disks(diff, false).map(|(path, _)| path)
     }
 
-    /// Take a full or diff snapshot and, when the VM writes through a CoW disk
-    /// overlay, a copy of that overlay captured in the same pause. Returns the
-    /// snapshot path and the captured overlay path; both are VMM-owned
-    /// scratch files until released. The snapshot's saved config points at
-    /// the captured overlay, so restoring it later (or many times, as forks)
-    /// seeds each VM's disk from the state that matches the memory image.
-    pub fn snapshot_with_overlay(&self, diff: bool) -> Result<(String, Option<String>)> {
+    /// Take a full or diff snapshot. With `capture_disks`, also capture every
+    /// writable disk in the same pause: a CoW overlay is copied as an overlay
+    /// template, a disk written directly is copied as a disk template. The
+    /// snapshot's saved config points at the captures, so it can be restored
+    /// later, or forked many times, with each VM's disks seeded from the state
+    /// that matches the memory image. Returns the snapshot path and the
+    /// captured disks; all are VMM-owned scratch files until released.
+    pub fn snapshot_with_disks(
+        &self,
+        diff: bool,
+        capture_disks: bool,
+    ) -> Result<(String, Vec<String>)> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Snapshot)?;
         let mut slot = self.lock();
         let vm = slot
@@ -666,7 +676,9 @@ impl VmmController {
             not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")),
             allow(unused_mut)
         )]
-        let mut captured_overlay: Option<OwnedScratchFile> = None;
+        let mut captured_disks: Vec<OwnedScratchFile> = Vec::new();
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let _ = capture_disks;
         let snapshot_result = (|| -> Result<usize> {
             // Fold the vCPU state each thread captured during the pause above into
             // the stored state blob, so this snapshot is faithfully resumable (not
@@ -677,34 +689,32 @@ impl VmmController {
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             capture_live_state(vm)?;
 
-            // Capture the disk upper in the same pause as memory. Only the
-            // single-overlay layout that restore can seed is captured.
+            // Capture every writable disk in the same pause as memory.
+            // Read-only volumes never change, and inherited (orchestrator
+            // persistent) volumes deliberately live outside snapshots.
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-            let overlay_rewrite = {
-                let overlays = vm
-                    .config
-                    .volumes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, volume)| volume.overlay.clone().map(|o| (index, o)))
-                    .collect::<Vec<_>>();
-                match overlays.as_slice() {
-                    [(index, source)] if vm.running.is_some() => {
-                        let captured = capture_snapshot_overlay(Path::new(source))?;
-                        let path = captured.path().to_string_lossy().into_owned();
-                        captured_overlay = Some(captured);
-                        Some((*index, path))
+            let mut volume_rewrites: Vec<(usize, CapturedDisk)> = Vec::new();
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            if capture_disks && vm.running.is_some() {
+                for (index, volume) in vm.config.volumes.iter().enumerate() {
+                    if volume.read_only || volume.inherited_fd.is_some() {
+                        continue;
                     }
-                    [] | [_] => None,
-                    _ => {
-                        log::warn!(
-                            "snapshot: {} writable disk overlays; disk state is not captured",
-                            overlays.len()
-                        );
-                        None
-                    }
+                    let (captured, kind) = match volume.overlay.as_deref() {
+                        Some(upper) => (
+                            capture_snapshot_overlay(Path::new(upper))?,
+                            CapturedDisk::Overlay as fn(String) -> CapturedDisk,
+                        ),
+                        None => (
+                            capture_snapshot_disk(Path::new(&volume.path))?,
+                            CapturedDisk::Disk as fn(String) -> CapturedDisk,
+                        ),
+                    };
+                    volume_rewrites
+                        .push((index, kind(captured.path().to_string_lossy().into_owned())));
+                    captured_disks.push(captured);
                 }
-            };
+            }
 
             // Write guest memory. When `diff` is requested and we have a parent
             // snapshot + KVM dirty logging on, write an INCREMENTAL snapshot: only
@@ -733,9 +743,10 @@ impl VmmController {
             };
             let state_blob: Vec<u8> = vm.state_blob.clone().unwrap_or_default();
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-            let state_blob = match overlay_rewrite {
-                Some((index, path)) => with_snapshot_overlay(&state_blob, index, &path)?,
-                None => state_blob,
+            let state_blob = if volume_rewrites.is_empty() {
+                state_blob
+            } else {
+                with_snapshot_volumes(&state_blob, &volume_rewrites)?
             };
 
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -835,8 +846,8 @@ impl VmmController {
             Err(error) => {
                 replay_consumed_dirty(vm, consumed_dirty.as_ref());
                 remove_owned_scratch_file(&owned_snapshot);
-                if let Some(overlay) = captured_overlay.as_ref() {
-                    remove_owned_scratch_file(overlay);
+                for disk in &captured_disks {
+                    remove_owned_scratch_file(disk);
                 }
                 return Err(error);
             }
@@ -844,27 +855,30 @@ impl VmmController {
         if let Err(error) = persist_owned_output(&mut owned_snapshot, &path_buf) {
             replay_consumed_dirty(vm, consumed_dirty.as_ref());
             remove_owned_scratch_file(&owned_snapshot);
-            if let Some(overlay) = captured_overlay.as_ref() {
-                remove_owned_scratch_file(overlay);
+            for disk in &captured_disks {
+                remove_owned_scratch_file(disk);
             }
             return Err(error);
         }
         vm.last_snapshot = Some(path.clone());
         vm.transient_files.add_snapshot(owned_snapshot);
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        let overlay_path = captured_overlay.map(|overlay| {
-            let overlay_path = overlay.path().to_string_lossy().into_owned();
-            vm.transient_files.add_live_snapshot_owned(overlay);
-            overlay_path
-        });
-        // Disk capture needs a running KVM VM, so other builds never set it.
+        let disk_paths = captured_disks
+            .into_iter()
+            .map(|disk| {
+                let disk_path = disk.path().to_string_lossy().into_owned();
+                vm.transient_files.add_live_snapshot_owned(disk);
+                disk_path
+            })
+            .collect::<Vec<_>>();
+        // Disk capture needs a running KVM VM, so other builds never fill it.
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
-        let overlay_path: Option<String> = captured_overlay.map(|_| unreachable!());
+        let disk_paths: Vec<String> = captured_disks.into_iter().map(|_| unreachable!()).collect();
         log::info!(
-            "VM: snapshot saved to {path} ({mem_len} bytes mem, diff={diff}, disk overlay={})",
-            overlay_path.as_deref().unwrap_or("none")
+            "VM: snapshot saved to {path} ({mem_len} bytes mem, diff={diff}, {} disk(s) captured)",
+            disk_paths.len()
         );
-        Ok((path, overlay_path))
+        Ok((path, disk_paths))
     }
 
     /// Transfer an exact, currently-owned scratch artifact to the caller.
@@ -1736,16 +1750,13 @@ impl VmmController {
         };
         apply_restore_network_override(&mut config, net_override)?;
         apply_restore_volume_override(&mut config, volume_override)?;
-        relocate_moved_snapshot_overlay(&mut config, snapshot_path);
-        let overlay = match overlay {
-            Some(target) => Some(target),
-            None => private_overlay_for_disk_template(&config)?,
-        };
-        let overlay_guard = match overlay.as_deref() {
+        relocate_moved_snapshot_disks(&mut config, snapshot_path);
+        let mut overlay_guard = match overlay.as_deref() {
             Some(target) => prepare_restore_overlay(&config, target)?,
             None => OwnedOverlayGuard::from_created(Vec::new()),
         };
         apply_restore_overlay(&mut config, overlay)?;
+        overlay_guard.adopt(privatize_template_volumes(&mut config)?);
         config.validate()?;
 
         // Keep the owned state blob aligned with the restored config. Future
@@ -3387,9 +3398,69 @@ fn capture_live_overlay(source: &Path) -> Result<OwnedScratchFile> {
 /// overlay's allocated extents, which costs the bytes the guest has written.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn capture_snapshot_overlay(source: &Path) -> Result<OwnedScratchFile> {
+    let captured = capture_overlay(source, false)?;
+    mark_disk_template(&captured);
+    Ok(captured)
+}
+
+/// How a writable volume was captured by a disk-capturing snapshot.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+enum CapturedDisk {
+    /// Copy of the volume's CoW upper; the lower image is unchanged.
+    Overlay(String),
+    /// Copy of a disk the guest wrote directly; it becomes the lower image.
+    Disk(String),
+}
+
+/// Capture a disk the guest writes directly (no CoW upper) while the VM is
+/// paused. The source is not VMM-owned, so it is only opened read-only. The
+/// copy goes beside it when that directory is private (so a reflink can
+/// apply), otherwise into the VMM's private runtime directory.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn capture_snapshot_disk(source: &Path) -> Result<OwnedScratchFile> {
+    use std::os::unix::fs::MetadataExt;
+
+    let private_parent = source
+        .parent()
+        .and_then(|dir| std::fs::metadata(dir).ok())
+        .is_some_and(|meta| meta.uid() == nix_uid() && meta.mode() & 0o077 == 0);
+    let dir = match source.parent() {
+        Some(parent) if private_parent => parent.to_path_buf(),
+        _ => private_runtime_dir()?,
+    };
+    let target = crate::gc::owned_overlay_path(&dir, 0);
+    let mut captured = staged_owned_output(&target)?;
+    let copied = (|| -> std::io::Result<()> {
+        let mut source_file = std::fs::File::open(source)?;
+        let mut target_file = captured.file().try_clone()?;
+        copy_restore_overlay(&mut source_file, &mut target_file)
+    })();
+    if let Err(error) = copied {
+        remove_owned_scratch_file(&captured);
+        return Err(VmmError::Snapshot(format!(
+            "capture disk {}: {error}",
+            source.display()
+        )));
+    }
+    if let Err(error) = persist_owned_output(&mut captured, &target) {
+        remove_owned_scratch_file(&captured);
+        return Err(error);
+    }
+    mark_disk_template(&captured);
+    Ok(captured)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn nix_uid() -> u32 {
+    // SAFETY: getuid has no preconditions.
+    unsafe { libc::getuid() }
+}
+
+/// Mark a captured disk as a template that restores must never write.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn mark_disk_template(captured: &OwnedScratchFile) {
     use std::os::fd::AsRawFd;
 
-    let captured = capture_overlay(source, false)?;
     // SAFETY: valid fd, NUL-terminated name, and a one-byte readable value.
     let marked = unsafe {
         libc::fsetxattr(
@@ -3402,13 +3473,12 @@ fn capture_snapshot_overlay(source: &Path) -> Result<OwnedScratchFile> {
     };
     if marked != 0 {
         log::warn!(
-            "snapshot: cannot mark captured overlay {} as a disk template: {}; \
+            "snapshot: cannot mark captured disk {} as a template: {}; \
              restores must pass an explicit overlay target",
             captured.path().display(),
             std::io::Error::last_os_error()
         );
     }
-    Ok(captured)
 }
 
 /// xattr on a disk overlay captured by a snapshot. Such an overlay is the
@@ -3436,64 +3506,101 @@ fn is_disk_template(path: &Path) -> bool {
     n == 1 && value[0] == b'1'
 }
 
-/// A snapshot and its captured disk overlay may be moved together. If the
-/// recorded overlay path no longer exists but a file of the same name sits
+/// A snapshot and its captured disks may be moved together. When a recorded
+/// disk or overlay path no longer exists but a file of the same name sits
 /// beside the snapshot, use that one.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn relocate_moved_snapshot_overlay(config: &mut VmConfig, snapshot_path: &str) {
-    let Some(index) = restore_overlay_volume_index(&config.volumes) else {
+fn relocate_moved_snapshot_disks(config: &mut VmConfig, snapshot_path: &str) {
+    let Some(dir) = Path::new(snapshot_path).parent() else {
         return;
     };
-    let Some(recorded) = config.volumes[index].overlay.clone() else {
-        return;
+    let beside = |recorded: &str| -> Option<String> {
+        let recorded = Path::new(recorded);
+        if recorded.exists() {
+            return None;
+        }
+        let sibling = dir.join(recorded.file_name()?);
+        sibling.is_file().then(|| {
+            log::info!("restore: using {} beside the snapshot", sibling.display());
+            sibling.to_string_lossy().into_owned()
+        })
     };
-    let recorded = PathBuf::from(recorded);
-    if recorded.exists() {
-        return;
-    }
-    let (Some(name), Some(dir)) = (recorded.file_name(), Path::new(snapshot_path).parent()) else {
-        return;
-    };
-    let sibling = dir.join(name);
-    if sibling.is_file() {
-        log::info!(
-            "restore: using disk overlay {} beside the snapshot",
-            sibling.display()
-        );
-        config.volumes[index].overlay = Some(sibling.to_string_lossy().into_owned());
+    for volume in &mut config.volumes {
+        if let Some(moved) = volume.overlay.as_deref().and_then(beside) {
+            volume.overlay = Some(moved);
+        }
+        if volume.inherited_fd.is_none() {
+            if let Some(moved) = beside(&volume.path) {
+                volume.path = moved;
+            }
+        }
     }
 }
 
-/// Restoring a snapshot whose disk is a captured template without an explicit
-/// overlay target gets a private overlay seeded from the template in the
-/// VMM's runtime directory (removed when the VM stops), so the template stays
-/// untouched and can be restored or forked again.
+/// Give every volume that would otherwise write a captured template its own
+/// private upper in the VMM's runtime directory (removed when the VM stops):
+/// a template overlay is copied, and a template disk gets an empty overlay
+/// over it as the read-only lower. Templates therefore never change, and any
+/// number of VMs can be restored or forked from one snapshot at once.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn private_overlay_for_disk_template(config: &VmConfig) -> Result<Option<String>> {
-    let Some(index) = restore_overlay_volume_index(&config.volumes) else {
-        return Ok(None);
-    };
-    let Some(recorded) = config.volumes[index].overlay.as_deref() else {
-        return Ok(None);
-    };
-    if !is_disk_template(Path::new(recorded)) {
-        return Ok(None);
+fn privatize_template_volumes(config: &mut VmConfig) -> Result<Vec<OwnedScratchFile>> {
+    let mut created: Vec<OwnedScratchFile> = Vec::new();
+    let result = (|| -> Result<()> {
+        for (index, volume) in config.volumes.iter_mut().enumerate() {
+            let template_upper = volume
+                .overlay
+                .as_deref()
+                .filter(|upper| is_disk_template(Path::new(upper)))
+                .map(PathBuf::from);
+            let template_disk = volume.overlay.is_none()
+                && !volume.read_only
+                && volume.inherited_fd.is_none()
+                && is_disk_template(Path::new(&volume.path));
+            if template_upper.is_none() && !template_disk {
+                continue;
+            }
+            let target = crate::gc::owned_overlay_path(&private_runtime_dir()?, index);
+            let owned = match template_upper {
+                Some(upper) => seed_restore_overlay(&upper, &target)?,
+                None => {
+                    let mut owned = staged_owned_output(&target)?;
+                    persist_owned_output(&mut owned, &target)?;
+                    owned
+                }
+            };
+            volume.overlay = Some(target.to_string_lossy().into_owned());
+            created.push(owned);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for file in &created {
+            remove_owned_scratch_file(file);
+        }
+        return Err(error);
     }
-    let target = crate::gc::owned_overlay_path(&private_runtime_dir()?, index);
-    Ok(Some(target.to_string_lossy().into_owned()))
+    Ok(created)
 }
 
-/// Return `blob` with volume `index` pointing at `overlay` as its disk upper,
-/// keeping every other field and trailer.
+/// Return `blob` with each captured volume pointing at its capture, keeping
+/// every other field and trailer.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn with_snapshot_overlay(blob: &[u8], index: usize, overlay: &str) -> Result<Vec<u8>> {
+fn with_snapshot_volumes(blob: &[u8], rewrites: &[(usize, CapturedDisk)]) -> Result<Vec<u8>> {
     let (mut decoded, balloon, _) = decode_state_blob(blob)
-        .ok_or_else(|| VmmError::Snapshot("decode snapshot state for disk overlay".into()))?;
-    let volume = decoded
-        .volumes
-        .get_mut(index)
-        .ok_or_else(|| VmmError::Snapshot(format!("snapshot state has no volume {index}")))?;
-    volume.overlay = Some(overlay.to_string());
+        .ok_or_else(|| VmmError::Snapshot("decode snapshot state for disk capture".into()))?;
+    for (index, capture) in rewrites {
+        let volume = decoded
+            .volumes
+            .get_mut(*index)
+            .ok_or_else(|| VmmError::Snapshot(format!("snapshot state has no volume {index}")))?;
+        match capture {
+            CapturedDisk::Overlay(path) => volume.overlay = Some(path.clone()),
+            CapturedDisk::Disk(path) => {
+                volume.path = path.clone();
+                volume.overlay = None;
+            }
+        }
+    }
     encode_state_blob(&decoded, balloon.as_ref())
         .map_err(|error| VmmError::Snapshot(format!("encode snapshot state: {error}")))
 }
@@ -7289,23 +7396,79 @@ mod tests {
         assert!(is_disk_template(captured.path()));
         assert!(!is_disk_template(&live), "the live upper is not a template");
 
-        // Restores of the template get a private upper; plain overlays don't.
-        let mut config = cfg();
-        config.volumes = vec![VolumeConfig {
-            path: "/base/rootfs.ext4".into(),
-            read_only: false,
-            overlay: Some(captured.path().to_string_lossy().into_owned()),
-            inherited_fd: None,
-        }];
-        let private = private_overlay_for_disk_template(&config).unwrap().unwrap();
-        assert_ne!(Path::new(&private), captured.path());
-        config.volumes[0].overlay = Some(live.to_string_lossy().into_owned());
-        assert!(private_overlay_for_disk_template(&config)
-            .unwrap()
-            .is_none());
+        // A disk written directly is captured whole, from outside the VMM's
+        // private directories, and is also a template.
+        let shared = std::env::temp_dir().join(format!("t-direct-{}.img", std::process::id()));
+        {
+            let file = std::fs::File::create(&shared).unwrap();
+            file.set_len(8 << 20).unwrap();
+            file.write_all_at(&[0x5A; 4096], 1 << 20).unwrap();
+        }
+        let disk = capture_snapshot_disk(&shared).unwrap();
+        disk.file().read_exact_at(&mut page, 1 << 20).unwrap();
+        assert_eq!(page, [0x5A; 4096]);
+        assert!(is_disk_template(disk.path()));
 
-        remove_owned_scratch_file(&captured);
+        // Restore gives every template volume a private upper and leaves
+        // plain overlays, read-only disks and the templates themselves alone.
+        let captured_path = captured.path().to_string_lossy().into_owned();
+        let disk_path = disk.path().to_string_lossy().into_owned();
+        let mut config = cfg();
+        config.volumes = vec![
+            VolumeConfig {
+                path: "/base/rootfs.ext4".into(),
+                read_only: false,
+                overlay: Some(captured_path.clone()),
+                inherited_fd: None,
+            },
+            VolumeConfig {
+                path: disk_path.clone(),
+                read_only: false,
+                overlay: None,
+                inherited_fd: None,
+            },
+            VolumeConfig {
+                path: "/base/data.ext4".into(),
+                read_only: false,
+                overlay: Some(live.to_string_lossy().into_owned()),
+                inherited_fd: None,
+            },
+            VolumeConfig {
+                path: disk_path.clone(),
+                read_only: true,
+                overlay: None,
+                inherited_fd: None,
+            },
+        ];
+        let private = privatize_template_volumes(&mut config).unwrap();
+        assert_eq!(private.len(), 2);
+        let seeded = config.volumes[0].overlay.clone().unwrap();
+        assert_ne!(seeded, captured_path);
+        let seeded_file = std::fs::File::open(&seeded).unwrap();
+        seeded_file.read_exact_at(&mut page, 4096).unwrap();
+        assert_eq!(page, [0xAB; 4096], "template upper is copied");
+        assert!(!is_disk_template(Path::new(&seeded)));
+        assert_eq!(
+            config.volumes[1].path, disk_path,
+            "template disk stays the lower"
+        );
+        let empty_upper = config.volumes[1].overlay.clone().unwrap();
+        assert_eq!(std::fs::metadata(&empty_upper).unwrap().len(), 0);
+        assert_eq!(
+            config.volumes[2].overlay.as_deref(),
+            Some(live.to_str().unwrap()),
+            "a plain overlay is not a template"
+        );
+        assert!(
+            config.volumes[3].overlay.is_none(),
+            "read-only disks need no upper"
+        );
+
+        for file in private.iter().chain([&captured, &disk]) {
+            remove_owned_scratch_file(file);
+        }
         let _ = std::fs::remove_file(&live);
+        let _ = std::fs::remove_file(&shared);
     }
 
     // The snapshot state must name the captured overlay while keeping every
@@ -7333,15 +7496,27 @@ mod tests {
             ..Default::default()
         };
         let encoded = encode_state_blob(&blob, None).unwrap();
-        let rewritten = with_snapshot_overlay(&encoded, 0, "/snap/captured.cow").unwrap();
+        let rewritten = with_snapshot_volumes(
+            &encoded,
+            &[
+                (0, CapturedDisk::Overlay("/snap/captured.cow".into())),
+                (1, CapturedDisk::Disk("/snap/data.img".into())),
+            ],
+        )
+        .unwrap();
         let (decoded, _, _) = decode_state_blob(&rewritten).unwrap();
+        assert_eq!(decoded.volumes[0].path, "/base/rootfs.ext4");
         assert_eq!(
             decoded.volumes[0].overlay.as_deref(),
             Some("/snap/captured.cow")
         );
-        assert_eq!(decoded.volumes[1].path, "/data.ext4");
+        assert_eq!(decoded.volumes[1].path, "/snap/data.img");
+        assert!(decoded.volumes[1].overlay.is_none());
         assert_eq!((decoded.mem_size, decoded.vcpus), (1 << 20, 2));
-        assert!(with_snapshot_overlay(&encoded, 5, "/x.cow").is_err());
+        assert!(
+            with_snapshot_volumes(&encoded, &[(5, CapturedDisk::Overlay("/x.cow".into()))])
+                .is_err()
+        );
     }
 
     // A snapshot moved together with its captured overlay still finds it.
@@ -7360,7 +7535,7 @@ mod tests {
             inherited_fd: None,
         }];
         let snapshot = dir.join("t-moved.snap");
-        relocate_moved_snapshot_overlay(&mut config, snapshot.to_str().unwrap());
+        relocate_moved_snapshot_disks(&mut config, snapshot.to_str().unwrap());
         assert_eq!(
             config.volumes[0].overlay.as_deref(),
             Some(beside.to_str().unwrap())
