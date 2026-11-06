@@ -23,6 +23,9 @@ versions may contain breaking changes.
 - Warm-pool classes take a `prewarm` command (`TARIT_WARM_POOL_PREWARM`) that
   the golden VM runs before its snapshot, so clones start with an image's
   runtime in their page cache.
+- A create that finds the warm pool empty restores a clone of its class's
+  golden snapshot on demand instead of cold-booting, so a burst larger than
+  the pool is served at restore speed.
 - Docker and Podman images run as VMs without root (`vmm pull
   docker-daemon:`/`podman:`), and images build without skopeo.
 - `test/compare/`: a head-to-head harness against Firecracker covering cold

@@ -202,7 +202,7 @@ pub(crate) fn spawn_replenisher(
                             if let Some(path) = golden.get(&key).cloned() {
                                 Some(path)
                             } else {
-                                let sup = Arc::clone(&sup);
+                                let golden_sup = Arc::clone(&sup);
                                 let class = class.clone();
                                 let blocking_cancelled = Arc::clone(&worker_cancelled);
                                 match await_blocking(
@@ -215,7 +215,7 @@ pub(crate) fn spawn_replenisher(
                                                 })
                                             } else {
                                                 tokio::runtime::Handle::current()
-                                                    .block_on(sup.create_golden(class))
+                                                    .block_on(golden_sup.create_golden(class))
                                             }
                                         })
                                         .await,
@@ -237,6 +237,7 @@ pub(crate) fn spawn_replenisher(
                                             overlay_path = ?bundle.overlay_path(),
                                             "warm golden snapshot created"
                                         );
+                                        sup.publish_golden(key.clone(), bundle.clone());
                                         golden.insert(key, bundle);
                                     }
                                     Ok(Err(e)) => {

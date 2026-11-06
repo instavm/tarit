@@ -2994,6 +2994,9 @@ pub struct VmmSupervisor {
     warm_handoff_pause: Mutex<Option<SpawnAttachmentPause>>,
     scheduler: Arc<Scheduler>,
     golden_artifacts: Mutex<Vec<OwnedArtifact>>,
+    /// Ready golden snapshot of each restore warm class, by the class's
+    /// spawn configuration. Its files live until shutdown.
+    goldens: Mutex<HashMap<VmSpawnConfig, GoldenBundle>>,
     in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
     unexpected_exits: Mutex<VecDeque<UnexpectedVmmExit>>,
     net: Option<NetProvisioner>,
@@ -3195,6 +3198,7 @@ impl VmmSupervisor {
             warm_handoff_pause: Mutex::new(None),
             scheduler,
             golden_artifacts: Mutex::new(Vec::new()),
+            goldens: Mutex::new(HashMap::new()),
             in_progress_artifacts: Arc::new(Mutex::new(HashSet::new())),
             unexpected_exits: Mutex::new(VecDeque::new()),
             net,
@@ -6120,6 +6124,18 @@ impl VmmSupervisor {
             .lock()
             .map(|w| w.iter().filter(|x| &x.spec == want).count())
             .unwrap_or(0)
+    }
+
+    /// Make a warm class's golden snapshot available for on-demand restores.
+    pub(crate) fn publish_golden(&self, spec: VmSpawnConfig, bundle: GoldenBundle) {
+        if let Ok(mut goldens) = self.goldens.lock() {
+            goldens.insert(spec, bundle);
+        }
+    }
+
+    /// The ready golden snapshot for a warm class's spawn configuration.
+    pub(crate) fn golden(&self, spec: &VmSpawnConfig) -> Option<GoldenBundle> {
+        self.goldens.lock().ok()?.get(spec).cloned()
     }
 
     fn remember_golden_artifacts(

@@ -1320,6 +1320,40 @@ fn warm_pool_spawn_config(
     )
 }
 
+/// How many golden clones a create restores on demand before cold-booting.
+const ON_DEMAND_WARM_RESTORES: usize = 3;
+
+/// Restore one clone of the golden snapshot of the restore warm class whose
+/// VMs `spec` describes into the pool. Returns false when no such class has a
+/// ready golden or the restore failed.
+async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> bool {
+    let Some(class) = state.config.warm_pool.classes.iter().find(|class| {
+        class.restore && VmSpawnConfig::from_warm_class(&state.config, class) == *spec
+    }) else {
+        return false;
+    };
+    let Some(bundle) = state.supervisor.golden(spec) else {
+        return false;
+    };
+    let supervisor = Arc::clone(&state.supervisor);
+    let class = class.clone();
+    let restored = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(supervisor.spawn_warm_restore(class, bundle))
+    })
+    .await;
+    match restored {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "on-demand warm restore failed");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(%error, "on-demand warm restore task failed");
+            false
+        }
+    }
+}
+
 async fn create_local_owned(
     state: &AppState,
     req: &CreateVmRequest,
@@ -1330,92 +1364,108 @@ async fn create_local_owned(
     let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
 
     if let Some(warm_cfg) = warm_pool_spawn_config(state, req)? {
-        let lifecycle_id = Arc::new(std::sync::Mutex::new(id));
-        let publication_state = state.clone();
-        let publication_cfg = warm_cfg.clone();
-        let owner_key = req.owner_key.clone();
-        let api_key_id = req.api_key_id.clone();
-        let registration_state = state.clone();
-        let registration_cfg = warm_cfg.clone();
-        let registration_owner = req.owner_key.clone();
-        let registration_api_key = req.api_key_id.clone();
-        let registration_lifecycle_id = Arc::clone(&lifecycle_id);
-        let taken = state
-            .supervisor
-            .take_warm_with_publication(
-                &warm_cfg,
-                task,
-                move |warm_id| {
-                    let registration_state = registration_state.clone();
-                    let mut record = creating_record(
-                        &registration_state,
-                        &registration_cfg,
-                        warm_id,
-                        registration_owner,
-                        registration_api_key,
-                        now,
-                    );
-                    record.startup_path = Some(VmStartupPath::Warm);
-                    async move {
-                        *registration_lifecycle_id.lock().map_err(|_| {
+        // A create that finds the pool empty restores a clone of the class's
+        // golden into it and claims again, so a burst larger than the pool
+        // is served at restore speed. A concurrent create may claim that
+        // clone first, hence the retries before the cold boot.
+        let mut restores = 0;
+        loop {
+            let lifecycle_id = Arc::new(std::sync::Mutex::new(id));
+            let publication_state = state.clone();
+            let publication_cfg = warm_cfg.clone();
+            let owner_key = req.owner_key.clone();
+            let api_key_id = req.api_key_id.clone();
+            let registration_state = state.clone();
+            let registration_cfg = warm_cfg.clone();
+            let registration_owner = req.owner_key.clone();
+            let registration_api_key = req.api_key_id.clone();
+            let registration_lifecycle_id = Arc::clone(&lifecycle_id);
+            let taken = state
+                .supervisor
+                .take_warm_with_publication(
+                    &warm_cfg,
+                    task,
+                    move |warm_id| {
+                        let registration_state = registration_state.clone();
+                        let mut record = creating_record(
+                            &registration_state,
+                            &registration_cfg,
+                            warm_id,
+                            registration_owner,
+                            registration_api_key,
+                            now,
+                        );
+                        record.startup_path = Some(VmStartupPath::Warm);
+                        async move {
+                            *registration_lifecycle_id.lock().map_err(|_| {
+                                OrchError::Internal("warm lifecycle id lock poisoned".into())
+                            })? = warm_id;
+                            register_warm_creating_record(&registration_state, record).await
+                        }
+                    },
+                    move |id, pid, socket_path| {
+                        let mut record = running_record(
+                            &publication_state,
+                            &publication_cfg,
+                            id,
+                            pid,
+                            &socket_path,
+                            owner_key,
+                            api_key_id,
+                            now,
+                        );
+                        record.startup_path = Some(VmStartupPath::Warm);
+                        async move {
+                            publish_running_record(&publication_state, record.clone()).await?;
+                            Ok(record)
+                        }
+                    },
+                )
+                .await;
+            match taken? {
+                WarmClaimOutcome::Published(record) => {
+                    if task.is_cancelled() {
+                        return finish_cancelled_lifecycle(
+                            state,
+                            record.id,
+                            task,
+                            lifecycle_cancelled_error(),
+                        )
+                        .await;
+                    }
+                    mark_running(state, record.clone())?;
+                    let id = record.id;
+                    tracing::info!(id = %id, host = %state.config.host_id, "create: warm pool");
+                    return Ok(record);
+                }
+                WarmClaimOutcome::NoMatch => {
+                    if restores < ON_DEMAND_WARM_RESTORES
+                        && !task.is_cancelled()
+                        && restore_warm_on_demand(state, &warm_cfg).await
+                    {
+                        restores += 1;
+                        continue;
+                    }
+                    break;
+                }
+                WarmClaimOutcome::PreRuntimeFailure(error) => {
+                    if task.is_cancelled() {
+                        let lifecycle_id = *lifecycle_id.lock().map_err(|_| {
                             OrchError::Internal("warm lifecycle id lock poisoned".into())
-                        })? = warm_id;
-                        register_warm_creating_record(&registration_state, record).await
+                        })?;
+                        return finish_cancelled_lifecycle(state, lifecycle_id, task, error).await;
                     }
-                },
-                move |id, pid, socket_path| {
-                    let mut record = running_record(
-                        &publication_state,
-                        &publication_cfg,
-                        id,
-                        pid,
-                        &socket_path,
-                        owner_key,
-                        api_key_id,
-                        now,
-                    );
-                    record.startup_path = Some(VmStartupPath::Warm);
-                    async move {
-                        publish_running_record(&publication_state, record.clone()).await?;
-                        Ok(record)
+                    return Err(error);
+                }
+                WarmClaimOutcome::RetainedPublicationFailure(error) => {
+                    if task.is_cancelled() {
+                        let lifecycle_id = *lifecycle_id.lock().map_err(|_| {
+                            OrchError::Internal("warm lifecycle id lock poisoned".into())
+                        })?;
+                        return finish_cancelled_lifecycle(state, lifecycle_id, task, error).await;
                     }
-                },
-            )
-            .await;
-        match taken? {
-            WarmClaimOutcome::Published(record) => {
-                if task.is_cancelled() {
-                    return finish_cancelled_lifecycle(
-                        state,
-                        record.id,
-                        task,
-                        lifecycle_cancelled_error(),
-                    )
-                    .await;
+                    return Err(error);
                 }
-                mark_running(state, record.clone())?;
-                let id = record.id;
-                tracing::info!(id = %id, host = %state.config.host_id, "create: warm pool");
-                return Ok(record);
-            }
-            WarmClaimOutcome::NoMatch => {}
-            WarmClaimOutcome::PreRuntimeFailure(error) => {
-                if task.is_cancelled() {
-                    let lifecycle_id = *lifecycle_id.lock().map_err(|_| {
-                        OrchError::Internal("warm lifecycle id lock poisoned".into())
-                    })?;
-                    return finish_cancelled_lifecycle(state, lifecycle_id, task, error).await;
-                }
-                return Err(error);
-            }
-            WarmClaimOutcome::RetainedPublicationFailure(error) => {
-                if task.is_cancelled() {
-                    let lifecycle_id = *lifecycle_id.lock().map_err(|_| {
-                        OrchError::Internal("warm lifecycle id lock poisoned".into())
-                    })?;
-                    return finish_cancelled_lifecycle(state, lifecycle_id, task, error).await;
-                }
-                return Err(error);
             }
         }
     }
