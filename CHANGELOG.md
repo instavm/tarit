@@ -12,6 +12,22 @@ versions may contain breaking changes.
 
 ### Added
 
+- Incremental checkpoints through taritd: snapshots accept `diff=true`, and
+  every checkpoint after the first (or after a restore or wake) pauses the
+  guest only for pages changed since the previous one, while still producing
+  a standalone snapshot. The VMM exposes the same as `vmm snapshot --base`.
+- Every snapshot can capture the guest's writable disks with its memory, so a
+  checkpoint restores on its own; snapshots of VMs on storage without reflink
+  use a paused, extent-copied capture.
+- Snapshot list and delete endpoints.
+- Docker and Podman images run as VMs without root (`vmm pull
+  docker-daemon:`/`podman:`), and images build without skopeo.
+- `test/compare/`: a head-to-head harness against Firecracker covering cold
+  boot, exec, snapshots, restore chains, fan-out, bursts, reliability, and an
+  agent-workload suite (coding session, resume, fork, burst, disk, bulk
+  network, soak) with correctness checks.
+- `VmmController::net_counters` reports per-device packet counts and queue
+  kicks the vCPU had to handle.
 - Generated Python and TypeScript clients now cover the public OpenAPI contract.
   Their handwritten layers provide API-key setup, typed failures,
   deadline-bounded execution polling, stable-child-id live-fork retries, and
@@ -32,6 +48,27 @@ versions may contain breaking changes.
 
 ### Changed
 
+- virtio-net offers checksum and segmentation offloads, mergeable receive
+  buffers, EVENT_IDX, and 1024-entry queues, receives straight into guest
+  buffers, and waits for receive buffers instead of dropping frames. Both
+  queue kicks reach the network thread through KVM. Bulk download in a 1 vCPU
+  guest is on par with Firecracker.
+- Restores map the RAM image instead of copying it; restore and teardown no
+  longer wait in polling loops.
+- Full and live snapshots are sparse: zero pages are not written. Live
+  snapshots of lazily restored guests read untouched pages from the restore
+  snapshot (verified against its integrity manifest) instead of faulting all
+  of RAM in. Through taritd, a 1 GiB guest using 200 MiB checkpoints in about
+  2 s into 250 MiB, down from 5-8 s and 1 GiB.
+- The copy-on-write disk issues one syscall per run of sectors instead of
+  one per 512-byte sector.
+- virtio-blk supports EVENT_IDX and advertises read-only devices.
+- x2APIC is offered to guests on bare-metal hosts.
+- taritd boots guests with a quiet console and derives its default capacity
+  from the host.
+- The SSH gateway declines keys that are not registered when they are
+  offered, without a delay: an agent's other keys no longer cost each login a
+  second apiece.
 - Live snapshots now pause, capture, and resume every configured vCPU through
   one bounded barrier; live fork supports SMP guests instead of rejecting them.
 - Hibernated exec, PTY, SSH, and public-share requests now join the same
@@ -62,6 +99,17 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- AMD guests boot: the hypervisor CPUID bit is advertised.
+- Confined path opens fail with EACCES instead of killing the thread.
+- Restored guests no longer hang on a device interrupt raised just before
+  the snapshot; virtio-rng state is part of the snapshot.
+- Large guest block writes no longer hang the disk; a timed-out command no
+  longer wedges the guest agent.
+- A runtime directory stays in place while any VM in the process uses it.
+- Unpacking an OCI image in a user namespace that maps only part of the ID
+  range no longer fails on files it cannot chown.
+- A create rejected while its request is checked (an image it may not use, a
+  volume it cannot attach) leaves no VM record behind.
 - Pause, suspend, and snapshot now require block, network, and vsock workers to
   acknowledge quiescence before capturing state or releasing guest RAM. Resume
   waits for every worker to leave its parked state before restarting vCPUs, so
