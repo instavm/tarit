@@ -2760,10 +2760,22 @@ async fn snapshot_local_locked(
     let memory_mib = vm.memory_mib;
     let sup = Arc::clone(&state.supervisor);
     let bundle = tokio::task::spawn_blocking(move || {
-        if running {
-            sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some())
-        } else {
-            sup.snapshot_bundle_vm(id, diff, false, overlay_path, memory_mib)
+        if !running {
+            return sup.snapshot_bundle_vm(id, diff, false, overlay_path, memory_mib);
+        }
+        match sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some()) {
+            // The atomic live path clones the disk upper inside its final
+            // stop and therefore needs reflink. On ext4 or tmpfs take the
+            // atomic paused snapshot instead: memory and disk are captured in
+            // one pause (the disk by an extent copy) and the VM resumes.
+            Err(OrchError::Vmm(message)) if message.contains("requires reflink/FICLONE") => {
+                tracing::warn!(
+                    %id,
+                    "overlay filesystem lacks reflink; using a paused snapshot instead of a live one"
+                );
+                sup.snapshot_bundle_vm(id, diff, true, overlay_path, memory_mib)
+            }
+            other => other,
         }
     })
     .await;

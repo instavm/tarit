@@ -16,7 +16,7 @@ can exec into and SSH into. For the full option list see
 
 ## 1. Build both binaries
 
-`taritd` (this repo) and the `vmm` microVM backend (sibling repo):
+`taritd` and the `vmm` microVM backend, both in this repository:
 
 ```sh
 cd /path/to/tarit/orch
