@@ -353,8 +353,7 @@ fn convert_engine_image(
     }
     check_tool(engine)?;
     check_tool("mke2fs")?;
-    // SAFETY: geteuid has no preconditions.
-    let rootless = unsafe { libc::geteuid() } != 0;
+    let rootless = !can_set_any_owner();
     if rootless {
         check_tool("debugfs")?;
     }
@@ -1406,6 +1405,26 @@ fn run_command(mut cmd: Command, name: &str) -> Result<(), OciError> {
     Ok(())
 }
 
+/// Whether this process can give files any owner: root in a user namespace
+/// that maps every ID (the initial one, or a full mapping). Root in a user
+/// namespace that maps only its own IDs (as `unshare -Ur` does) cannot chown
+/// to an image's other owners, so it unpacks the rootless way and records
+/// them for the image instead.
+fn can_set_any_owner() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    let full = |path: &str| std::fs::read_to_string(path).is_ok_and(|map| maps_every_id(&map));
+    full("/proc/self/uid_map") && full("/proc/self/gid_map")
+}
+
+/// A `uid_map`/`gid_map` that maps IDs 0..2^32-1 onto themselves.
+fn maps_every_id(map: &str) -> bool {
+    let fields: Vec<&str> = map.split_whitespace().collect();
+    fields == ["0", "0", "4294967295"]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1421,6 +1440,18 @@ mod tests {
             Some(("podman", "ghcr.io/o/i:t"))
         );
         assert_eq!(engine_image_source("docker://alpine:3.20"), None);
+    }
+
+    #[test]
+    fn only_a_full_id_mapping_counts_as_able_to_set_any_owner() {
+        assert!(maps_every_id("         0          0 4294967295\n"));
+        assert!(
+            !maps_every_id("         0       1000          1\n"),
+            "unshare -Ur"
+        );
+        assert!(!maps_every_id("0 0 65536\n"));
+        assert!(!maps_every_id("0 0 4294967295\n1 2 3\n"));
+        assert!(!maps_every_id(""));
     }
 
     #[test]
