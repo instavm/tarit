@@ -6719,13 +6719,20 @@ fn build_running_vm(
 
     let template = crate::cpu_template::CpuTemplate::bare();
     let kvm_vm = crate::kvm::KvmVm::new_with_options(mem, devices, template, full_boot)?;
-    // The resampler registration waits out an SRCU grace period. Run it
-    // while the rest of the VM is wired and the guest reconnects; restore
-    // finishes it before reporting success.
-    let balloon_irqfd = balloon
+    // Keep handles to the balloon's eventfds for its irqfd registration,
+    // which starts once every other GSI route is in place (below).
+    let balloon_irqfd_fds = balloon
         .as_ref()
-        .map(|wired| {
-            kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
+        .map(|wired| -> Result<_> {
+            let clone = |evt: &vmm_sys_util::eventfd::EventFd| {
+                evt.try_clone()
+                    .map_err(|error| VmmError::Kvm(format!("balloon irq clone: {error}")))
+            };
+            Ok((
+                clone(&wired.irq_evt)?,
+                clone(&wired.resample_evt)?,
+                wired.irq,
+            ))
         })
         .transpose()?;
 
@@ -6839,10 +6846,10 @@ fn build_running_vm(
         irq_evts.push(evt);
     }
     let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
-    let balloon_irq_resample = match balloon {
+    let mut balloon_irq_resample = match balloon {
         Some(wired) => {
             let loop_handle = BalloonIrqResample::spawn(
-                balloon_irqfd,
+                None,
                 wired.device,
                 wired
                     .irq_evt
@@ -6906,6 +6913,17 @@ fn build_running_vm(
         None => (None, None, None, None),
     };
 
+    // The resampler registration waits out an SRCU grace period, and every
+    // GSI routing update waits for the same SRCU domain. Start it after the
+    // last route is installed so the two do not queue behind each other; it
+    // then overlaps vCPU startup and the guest's reconnect, and restore
+    // finishes it before reporting success.
+    if let (Some((irq_evt, resample_evt, irq)), Some(resample)) =
+        (balloon_irqfd_fds, balloon_irq_resample.as_mut())
+    {
+        resample.registration =
+            Some(kvm_vm.begin_irqfd_with_resample(&irq_evt, &resample_evt, irq)?);
+    }
     let vcpu = kvm_vm.create_vcpu(0)?;
     // CPUID must be set on the fresh vCPU before the saved MSRs/state are
     // applied; the captured LAPIC already carries the LVT config, so we do not
