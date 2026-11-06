@@ -16,7 +16,7 @@ use crate::rate_limit::RateLimiter;
 use crate::virtio::blk_transport::status_bits;
 use crate::virtio::regs::{reg, MAGIC};
 use crate::virtio::vqueue::{
-    is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState, MAX_QUEUE_SIZE,
+    is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState,
 };
 use serde::{Deserialize, Serialize};
 use std::os::fd::RawFd;
@@ -39,6 +39,12 @@ pub const VIRTIO_NET_HDR_LEN: usize = 12;
 
 /// Byte offset of `num_buffers` within `virtio_net_hdr_v1` (last u16).
 const VIRTIO_NET_HDR_NUM_BUFFERS_OFF: usize = 10;
+
+/// Queue size offered for virtio-net. With receive TSO and no mergeable
+/// buffers Linux posts each receive buffer as a ~19-descriptor chain, so a
+/// 256-entry ring holds only about 13 and runs dry between refills; 1024
+/// entries hold about 53.
+pub const NET_QUEUE_SIZE_MAX: u16 = 1024;
 
 /// Max Ethernet frame we accept end-to-end (header + 1500 MTU + slack).
 const MAX_FRAME_BYTES: usize = 1600;
@@ -105,7 +111,7 @@ struct QueueState {
 
 impl QueueState {
     fn valid_size(&self) -> bool {
-        is_valid_queue_size(self.size, MAX_QUEUE_SIZE)
+        is_valid_queue_size(self.size, NET_QUEUE_SIZE_MAX)
     }
 
     fn set_size(&mut self, size: u32) {
@@ -120,11 +126,11 @@ impl QueueState {
             self.ready = false;
             return;
         }
-        if is_valid_queue_size(size, MAX_QUEUE_SIZE) {
+        if is_valid_queue_size(size, NET_QUEUE_SIZE_MAX) {
             self.size = size;
         } else {
             log::warn!(
-                "virtio-net: invalid QUEUE_NUM {size} (must be power-of-two <= {MAX_QUEUE_SIZE})"
+                "virtio-net: invalid QUEUE_NUM {size} (must be power-of-two <= {NET_QUEUE_SIZE_MAX})"
             );
             self.size = 0;
             self.ready = false;
@@ -1110,7 +1116,7 @@ impl MmioDevice for VirtioNetMmio {
                     1 << 0
                 }
             }
-            reg::QUEUE_NUM_MAX => MAX_QUEUE_SIZE as u32,
+            reg::QUEUE_NUM_MAX => NET_QUEUE_SIZE_MAX as u32,
             reg::STATUS => self.status.load(Ordering::Relaxed),
             reg::INTERRUPT_STATUS => self.interrupt_status.load(Ordering::SeqCst),
             reg::CONFIG_GENERATION => 0,

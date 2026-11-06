@@ -13,6 +13,10 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// Maximum virtio-mmio queue size this VMM offers to guests.
 pub const MAX_QUEUE_SIZE: u16 = 256;
 
+/// Largest queue any device offers (virtio-net's, see `NET_QUEUE_SIZE_MAX`);
+/// the processor accepts up to this, each device enforces its own offer.
+pub const MAX_SUPPORTED_QUEUE_SIZE: u16 = 1024;
+
 /// Maximum per-descriptor length (1 MiB). Descriptors exceeding this are
 /// rejected to prevent guest-driven OOM allocation attacks.
 pub const MAX_DESC_LEN: u32 = 1024 * 1024;
@@ -189,7 +193,7 @@ pub struct QueueConfig {
 
 impl QueueConfig {
     fn has_valid_size(&self) -> bool {
-        is_valid_queue_size(self.size, MAX_QUEUE_SIZE)
+        is_valid_queue_size(self.size, MAX_SUPPORTED_QUEUE_SIZE)
     }
 }
 
