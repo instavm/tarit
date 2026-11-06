@@ -803,6 +803,8 @@ fn run(
 
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(all(target_os = "linux", feature = "boot"))]
+        vmm_core::controller::back_kernel_with_huge_pages(&mem, std::path::Path::new(&kernel));
         let loaded = vmm_loader::load(
             &mem.inner,
             &kernel,

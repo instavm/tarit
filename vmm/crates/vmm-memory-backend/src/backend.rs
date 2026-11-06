@@ -473,6 +473,39 @@ impl GuestMemory {
             .map(crate::uffd_restore::LazyPageDiscard::snapshot_fence)
     }
 
+    /// Ask the host to back guest RAM at `gpa..gpa + len` with transparent
+    /// huge pages (rounded out to 2 MiB). Meant for the guest kernel's image
+    /// before it is loaded: the host then allocates a few 2 MiB pages instead
+    /// of thousands of 4 KiB ones, and KVM can map the kernel with huge
+    /// pages. Advice only: where THP is unavailable this does nothing.
+    #[cfg(target_os = "linux")]
+    pub fn advise_huge_pages(&self, gpa: u64, len: u64) -> bool {
+        const HUGE: u64 = 2 * 1024 * 1024;
+        let start = gpa / HUGE * HUGE;
+        let Some(end) = gpa
+            .checked_add(len)
+            .and_then(|end| end.checked_add(HUGE - 1))
+            .map(|end| end / HUGE * HUGE)
+        else {
+            return false;
+        };
+        let Some(offset) = self.gpa_range_to_offset(start, end - start) else {
+            return false;
+        };
+        let (Ok(offset), Ok(len)) = (usize::try_from(offset), usize::try_from(end - start)) else {
+            return false;
+        };
+        // SAFETY: the range lies inside this live guest mapping (checked by
+        // gpa_range_to_offset); MADV_HUGEPAGE changes no contents.
+        unsafe {
+            libc::madvise(
+                (self.as_ptr() as *mut u8).add(offset).cast(),
+                len,
+                libc::MADV_HUGEPAGE,
+            ) == 0
+        }
+    }
+
     /// Release page-aligned guest RAM while preserving zero-on-refault
     /// semantics for both fresh anonymous memory and UFFD lazy restores.
     #[cfg(target_os = "linux")]
@@ -561,6 +594,21 @@ impl GuestMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn huge_page_advice_stays_inside_guest_ram() {
+        let mem = GuestMemory::new(64 * 1024 * 1024).unwrap();
+        // Rounded out to 2 MiB, still inside RAM: advised (or a no-op where
+        // the host has no THP, which madvise reports as an error).
+        let thp = std::path::Path::new("/sys/kernel/mm/transparent_hugepage/enabled").exists();
+        assert_eq!(mem.advise_huge_pages(0x100_0000 + 123, 0x30_0000), thp);
+        assert!(
+            !mem.advise_huge_pages(60 * 1024 * 1024, 8 * 1024 * 1024),
+            "past the end"
+        );
+        assert!(!mem.advise_huge_pages(u64::MAX - 10, 100), "overflow");
+    }
     use vm_memory::{GuestMemoryBackend as _, GuestMemoryRegion as _};
 
     #[test]

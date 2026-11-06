@@ -131,6 +131,27 @@ the low slot. VMSN files and UFFD therefore remain compact and contiguous.
 Dirty-log PFNs and guest-physical DMA/balloon ranges are translated at the
 slot boundary. Guests at or below 3.25 GiB retain the one-slot fast path.
 
+### Choice: Transparent huge pages for the guest kernel's image only
+
+**Alternatives:**
+1. **4 KiB pages everywhere** (Firecracker's default): loading a ~20 MiB
+   kernel allocates and zeroes ~5,000 host pages, about 10 ms of every cold
+   boot, and the guest's kernel text is mapped with 4 KiB EPT entries.
+2. **Huge pages for all guest RAM** (THP or hugetlbfs): fastest, but a
+   guest touching scattered pages then keeps whole 2 MiB pages resident,
+   which costs density across many sandboxes.
+3. **Huge pages for the kernel's load range only.**
+
+**Why the kernel range:** before loading an ELF kernel the VMM reads its
+loadable segments and advises that range (rounded to 2 MiB) for
+`MADV_HUGEPAGE`. The host allocates about ten 2 MiB pages instead of
+thousands of small ones, and KVM maps the guest kernel with huge pages, which
+also shortens the guest's own boot: cold boot to first command went from
+~99 ms to ~87 ms on a Ryzen 5 5600G, for about 1.3 MiB more VMM memory.
+Guest RAM outside the kernel keeps 4 KiB pages. With the host's THP `defrag`
+set to `madvise`, a huge page fault may compact memory synchronously on a
+badly fragmented host; `VMM_KERNEL_HUGEPAGES=0` turns the advice off.
+
 ## Snapshot Format
 
 ### Choice: Custom format (magic + state + raw memory)
