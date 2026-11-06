@@ -179,33 +179,13 @@ static int decode_clone_repair_request(const char *command,
     return 0;
 }
 
-/* The stage file a repair reports progress through (for the host's timeout
- * diagnostics). It is opened once per repair and rewritten in place: a fresh
- * open, truncate and close per stage was a noticeable share of every
- * restore. */
-static int clone_repair_stage_fd = -1;
-
 static void set_clone_repair_stage(const char *stage) {
-    if (clone_repair_stage_fd < 0) {
-        clone_repair_stage_fd = open(CLONE_REPAIR_STAGE_PATH,
-                                     O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
-        if (clone_repair_stage_fd < 0) return;
-    }
-    char line[32];
-    int len = snprintf(line, sizeof(line), "%s\n", stage);
-    if (len <= 0 || (size_t)len >= sizeof(line)) return;
-    /* Diagnostic only: a failed write must not fail the repair. */
-    if (pwrite(clone_repair_stage_fd, line, (size_t)len, 0) == len &&
-        ftruncate(clone_repair_stage_fd, len) < 0) {
-        return;
-    }
-}
-
-static void close_clone_repair_stage(void) {
-    if (clone_repair_stage_fd >= 0) {
-        (void)close(clone_repair_stage_fd);
-        clone_repair_stage_fd = -1;
-    }
+    int fd = open(CLONE_REPAIR_STAGE_PATH,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    (void)write_all(fd, stage, strlen(stage));
+    (void)write_all(fd, "\n", 1);
+    (void)close(fd);
 }
 
 static int run_post_fork_hook(const char *clone_id) {
@@ -373,7 +353,6 @@ static int repair_clone_entropy(const char *command, char clone_id[33], int *pro
 out:
     {
         int saved_errno = errno;
-        close_clone_repair_stage();
         if (random_fd >= 0) close(random_fd);
         if (marker >= 0) close(marker);
         if (boot_id_file >= 0) close(boot_id_file);
@@ -382,42 +361,6 @@ out:
         errno = saved_errno;
     }
     return rc;
-}
-#endif
-
-#ifdef __linux__
-/* Bind /run/tarit/boot-id over the kernel's boot_id at startup, holding the
- * kernel's own value. A clone's repair then only rewrites that file, and the
- * bind mount it would otherwise make (about half a millisecond of every
- * restore) is already in place in the snapshot. A restarted agent finds the
- * file already holding the value /proc reports and leaves the mount alone. */
-static void prepare_boot_id_overlay(void) {
-    char current[38];
-    char existing[38];
-    int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return;
-    ssize_t len = read(fd, current, sizeof(current));
-    close(fd);
-    if (len != 37) return;
-    if (mkdir("/run/tarit", 0700) < 0 && errno != EEXIST) return;
-    fd = open("/run/tarit/boot-id", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd >= 0) {
-        ssize_t have = read(fd, existing, sizeof(existing));
-        close(fd);
-        if (have == len && memcmp(existing, current, (size_t)len) == 0) return;
-    }
-    fd = open("/run/tarit/boot-id", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0444);
-    if (fd < 0) return;
-    int written = write_all(fd, current, (size_t)len);
-    close(fd);
-    if (written < 0) return;
-    if (mount("/run/tarit/boot-id", "/proc/sys/kernel/random/boot_id", NULL, MS_BIND, NULL) < 0) {
-        return;
-    }
-    if (mount(NULL, "/proc/sys/kernel/random/boot_id", NULL,
-              MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) < 0) {
-        (void)umount2("/proc/sys/kernel/random/boot_id", MNT_DETACH);
-    }
 }
 #endif
 
@@ -2087,8 +2030,6 @@ int main(void) {
     }
 
 #ifdef __linux__
-    prepare_boot_id_overlay();
-
     /* Fork a dedicated vsock exec server; the parent keeps serving serial as a
      * fallback. The host uses whichever channel it opened, so only one runs a
      * given command. Fork a second vsock server for host-initiated PTY sessions
