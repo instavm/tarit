@@ -219,14 +219,15 @@ plane; do not send it `/v1/*`, `/internal/v1/*`, or control-plane credentials.
 
 ## Usage stats and audit trail
 
-See [USAGE-AND-AUDIT.md](USAGE-AND-AUDIT.md). Attribution and the query APIs need
-cluster mode (`TARIT_DATABASE_URL` set); the meter always runs and buffers to
-the local outbox otherwise.
+See [USAGE-AND-AUDIT.md](USAGE-AND-AUDIT.md). The meter always runs. With
+`TARIT_DATABASE_URL` set, events flush to PostgreSQL; without it, the query APIs
+answer from the local outbox.
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `TARIT_USAGE_METER_INTERVAL_SECS` | u64 | `30` | How often the VM-runtime meter bills alive local VMs. |
 | `TARIT_USAGE_FLUSH_INTERVAL_SECS` | u64 | `10` | How often the flusher pushes local usage/audit outboxes to PostgreSQL. |
+| `TARIT_LOCAL_USAGE_RETENTION_DAYS` | u64 | `90` | Without a fleet database, days of local usage/audit rows to keep (`0` keeps them forever). |
 
 ## TOML config reference
 

@@ -3974,17 +3974,14 @@ struct UsageQuery {
     api_key_id: Option<String>,
 }
 
-/// Aggregated usage stats per API key, read from the primary store. Admins see
-/// every key (optionally filtered by `api_key_id`); a non-admin key sees only
-/// its own. This is raw metering, not billing; a layer above interprets it.
+/// Aggregated usage stats per API key, read from the primary store (or the
+/// local outbox on a host without one). Admins see every key (optionally
+/// filtered by `api_key_id`); a non-admin key sees only its own. This is raw metering, not billing; a layer above interprets it.
 async fn usage_stats(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Vec<UsageSummary>>, ApiError> {
-    let fleet = state.fleet.as_ref().ok_or_else(|| {
-        OrchError::Internal("usage stats require a fleet store (TARIT_DATABASE_URL)".into())
-    })?;
     let to = q.to.unwrap_or_else(Utc::now);
     let from = q.from.unwrap_or_else(|| to - chrono::Duration::days(30));
     let key_filter = if identity.is_admin() {
@@ -3992,10 +3989,20 @@ async fn usage_stats(
     } else {
         Some(identity.api_key_id.as_str())
     };
-    let out = fleet
-        .usage_summary(key_filter, from, to)
-        .await
-        .map_err(|e| OrchError::Internal(format!("usage summary: {e}")))?;
+    let out = match state.fleet.as_ref() {
+        Some(fleet) => fleet
+            .usage_summary(key_filter, from, to)
+            .await
+            .map_err(|e| OrchError::Internal(format!("usage summary: {e}")))?,
+        // A single host without a fleet store keeps its events in the local
+        // outbox, which is then the source of truth.
+        None => state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .local_usage_summary(key_filter, from, to)
+            .map_err(|e| OrchError::Internal(format!("usage summary: {e}")))?,
+    };
     Ok(Json(out))
 }
 
@@ -4006,26 +4013,32 @@ struct AuditQuery {
     limit: Option<i64>,
 }
 
-/// Recent audit trail from the primary store, newest first. Admins see every
+/// Recent audit trail from the primary store (or the local outbox on a host
+/// without one), newest first. Admins see every
 /// key; a non-admin key sees only its own actions.
 async fn audit_log(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
-    let fleet = state.fleet.as_ref().ok_or_else(|| {
-        OrchError::Internal("audit log requires a fleet store (TARIT_DATABASE_URL)".into())
-    })?;
     let key_filter = if identity.is_admin() {
         q.api_key_id.as_deref()
     } else {
         Some(identity.api_key_id.as_str())
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let out = fleet
-        .list_audit(key_filter, q.vm_id, limit)
-        .await
-        .map_err(|e| OrchError::Internal(format!("audit list: {e}")))?;
+    let out = match state.fleet.as_ref() {
+        Some(fleet) => fleet
+            .list_audit(key_filter, q.vm_id, limit)
+            .await
+            .map_err(|e| OrchError::Internal(format!("audit list: {e}")))?,
+        None => state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .list_local_audit(key_filter, q.vm_id, limit)
+            .map_err(|e| OrchError::Internal(format!("audit list: {e}")))?,
+    };
     Ok(Json(out))
 }
 

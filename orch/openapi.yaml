@@ -2170,7 +2170,7 @@ paths:
     get:
       operationId: getUsage
       summary: Aggregated usage stats per API key
-      description: Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
+      description: Raw metering (VM runtime seconds, exec counts and durations) from the primary store, or from the node's local outbox when no fleet database (TARIT_DATABASE_URL) is configured. Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
       parameters:
         - name: from
           in: query
@@ -2204,12 +2204,12 @@ paths:
         "401":
           description: Missing or invalid API key
         "500":
-          description: No fleet database configured, or store failure
+          description: Store failure
   /v1/audit:
     get:
       operationId: listAuditEvents
       summary: Recent audit trail
-      description: Audited actions from the primary store, newest first; requires a fleet database (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+      description: Audited actions from the primary store (or the node's local outbox without a fleet database), newest first. Admins see every key; a non-admin key sees only its own actions.
       parameters:
         - name: api_key_id
           in: query
@@ -2243,4 +2243,4 @@ paths:
         "401":
           description: Missing or invalid API key
         "500":
-          description: No fleet database configured, or store failure
+          description: Store failure

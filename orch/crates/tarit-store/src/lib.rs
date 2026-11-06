@@ -8,9 +8,9 @@ use tarit_types::{
     ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
     ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
     ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ShareRecord,
-    ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, VmRecord, VmRuntimeLayout, VmStartupPath,
-    VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord,
-    VolumeStatus, VolumeStorageClass,
+    ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, UsageSummary, VmRecord, VmRuntimeLayout,
+    VmStartupPath, VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities,
+    VolumeRecord, VolumeStatus, VolumeStorageClass,
 };
 use uuid::Uuid;
 
@@ -416,6 +416,8 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS usage_outbox_unsent ON usage_outbox(sent);
              CREATE INDEX IF NOT EXISTS audit_outbox_unsent ON audit_outbox(sent);
+             CREATE INDEX IF NOT EXISTS usage_outbox_window_end ON usage_outbox(window_end);
+             CREATE INDEX IF NOT EXISTS audit_outbox_created_at ON audit_outbox(created_at);
              CREATE INDEX IF NOT EXISTS shares_owner ON shares(owner_key, created_at DESC);
              CREATE INDEX IF NOT EXISTS shares_vm ON shares(vm_id);
              CREATE INDEX IF NOT EXISTS artifacts_owner_created
@@ -2811,6 +2813,81 @@ impl Store {
         Ok(())
     }
 
+    /// Per-key usage totals over `[from, to)` from the local outbox, sent or
+    /// not. A single host without a fleet store keeps its events here, so this
+    /// is its source of truth. Timestamps are UTC RFC3339, so text order is
+    /// time order.
+    pub fn local_usage_summary(
+        &self,
+        api_key_id: Option<&str>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<UsageSummary>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT api_key_id, owner_key,
+               COALESCE(SUM(CASE WHEN kind = 'vm_runtime' THEN seconds END), 0.0),
+               COALESCE(SUM(CASE WHEN kind = 'exec' THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = 'exec' THEN duration_ms END), 0)
+             FROM usage_outbox
+             WHERE window_end >= ?2 AND window_end < ?3
+               AND (?1 IS NULL OR api_key_id = ?1)
+             GROUP BY api_key_id, owner_key
+             ORDER BY api_key_id",
+        )?;
+        let rows = stmt.query_map(
+            params![api_key_id, from.to_rfc3339(), to.to_rfc3339()],
+            |row| {
+                Ok(UsageSummary {
+                    api_key_id: row.get(0)?,
+                    owner_key: row.get(1)?,
+                    vm_runtime_seconds: row.get(2)?,
+                    exec_count: row.get(3)?,
+                    exec_duration_ms: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Recent audit events from the local outbox, newest first.
+    pub fn list_local_audit(
+        &self,
+        api_key_id: Option<&str>,
+        vm_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<AuditEvent>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, api_key_id, owner_key, host_id, vm_id, action, outcome, detail, created_at
+             FROM audit_outbox
+             WHERE (?1 IS NULL OR api_key_id = ?1)
+               AND (?2 IS NULL OR vm_id = ?2)
+             ORDER BY created_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![api_key_id, vm_id.map(|id| id.to_string()), limit],
+            row_to_audit,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Drop every outbox row older than `older_than`, sent or not. Only for a
+    /// host with no fleet store, where nothing is ever marked sent.
+    pub fn prune_local_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
+        let older_than = older_than.to_rfc3339();
+        self.conn.execute(
+            "DELETE FROM usage_outbox WHERE created_at < ?1",
+            params![older_than],
+        )?;
+        self.conn.execute(
+            "DELETE FROM audit_outbox WHERE created_at < ?1",
+            params![older_than],
+        )?;
+        Ok(())
+    }
+
     pub fn prune_sent_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
         let older_than = older_than.to_rfc3339();
         self.conn.execute(
@@ -4507,6 +4584,91 @@ mod tests {
         store.mark_audit_sent(&[audit.id]).unwrap();
         assert!(store.list_unsent_usage(10).unwrap().is_empty());
         assert!(store.list_unsent_audit(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_outbox_serves_usage_and_audit_without_a_fleet() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let vm_id = Uuid::new_v4();
+        let usage = |key: &str, kind, seconds, duration_ms, at| UsageEvent {
+            id: Uuid::new_v4(),
+            api_key_id: key.into(),
+            owner_key: "owner".into(),
+            host_id: "host".into(),
+            vm_id,
+            kind,
+            seconds,
+            duration_ms,
+            window_start: at,
+            window_end: at,
+            created_at: at,
+        };
+        let old = now - chrono::Duration::days(40);
+        store
+            .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(10.0), None, now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(2.5), None, now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("a", UsageKind::Exec, None, Some(7), now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("b", UsageKind::Exec, None, Some(3), now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(99.0), None, old))
+            .unwrap();
+
+        let from = now - chrono::Duration::days(30);
+        let to = now + chrono::Duration::seconds(1);
+        let all = store.local_usage_summary(None, from, to).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].api_key_id, "a");
+        assert_eq!(all[0].vm_runtime_seconds, 12.5);
+        assert_eq!((all[0].exec_count, all[0].exec_duration_ms), (1, 7));
+        assert_eq!((all[1].vm_runtime_seconds, all[1].exec_count), (0.0, 1));
+        let only_b = store.local_usage_summary(Some("b"), from, to).unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].api_key_id, "b");
+
+        let audit = |key: &str, vm: Option<Uuid>, action: &str, at| AuditEvent {
+            id: Uuid::new_v4(),
+            api_key_id: key.into(),
+            owner_key: "owner".into(),
+            host_id: "host".into(),
+            vm_id: vm,
+            action: action.into(),
+            outcome: "ok".into(),
+            detail: None,
+            created_at: at,
+        };
+        store
+            .enqueue_audit(&audit("a", Some(vm_id), "create", old))
+            .unwrap();
+        store
+            .enqueue_audit(&audit("a", Some(vm_id), "exec", now))
+            .unwrap();
+        store.enqueue_audit(&audit("b", None, "ssh", now)).unwrap();
+        let newest = store.list_local_audit(Some("a"), None, 10).unwrap();
+        assert_eq!(
+            newest.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(),
+            ["exec", "create"]
+        );
+        assert_eq!(
+            store.list_local_audit(None, Some(vm_id), 1).unwrap()[0].action,
+            "exec"
+        );
+
+        store
+            .prune_local_outbox(now - chrono::Duration::days(30))
+            .unwrap();
+        assert_eq!(store.list_local_audit(None, None, 10).unwrap().len(), 2);
+        let wide = store
+            .local_usage_summary(Some("a"), old - chrono::Duration::days(1), to)
+            .unwrap();
+        assert_eq!(wide[0].vm_runtime_seconds, 12.5);
     }
 
     #[test]

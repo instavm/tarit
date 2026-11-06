@@ -153,8 +153,8 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 | POST | `/v1/vms/{id}/pty/sessions/{pty_id}/resize` | Update a PTY session's recorded dimensions. |
 | WS | `/v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` | Bridge WebSocket PTY bytes to the owning local VMM stream. One connection is active per session; the session can reconnect after disconnect. |
 | GET | `/v1/cluster` | Admin-only cluster capacity and health summary. |
-| GET | `/v1/usage` | Per-key usage stats from the primary store (admin: all keys; user: own). |
-| GET | `/v1/audit` | Per-key audit trail from the primary store (admin: all keys; user: own). |
+| GET | `/v1/usage` | Per-key usage stats from the primary store or local outbox (admin: all keys; user: own). |
+| GET | `/v1/audit` | Per-key audit trail from the primary store or local outbox (admin: all keys; user: own). |
 
 Full request and response schemas are in [docs/API.md](docs/API.md).
 

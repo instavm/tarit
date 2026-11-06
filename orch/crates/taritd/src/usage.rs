@@ -22,6 +22,7 @@ use tarit_types::{UsageEvent, UsageKind, VmStatus};
 use crate::api::{AppState, StoreWrite};
 
 const FLUSH_BATCH: usize = 500;
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// A local alive VM the meter needs: id, key id, tenant, and creation time.
 type AliveVm = (Uuid, Option<String>, Option<String>, DateTime<Utc>);
@@ -194,20 +195,52 @@ fn runtime_event(
 pub fn spawn_outbox_flusher(
     state: AppState,
     interval_secs: u64,
+    local_retention_days: u64,
     mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let fleet = state.fleet.clone()?;
+    let fleet = state.fleet.clone();
+    let interval = Duration::from_secs(interval_secs.max(1));
     Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+        let mut tick = tokio::time::interval(interval);
+        let mut last_prune: Option<std::time::Instant> = None;
         loop {
             tokio::select! {
                 biased;
                 _ = wait_for_shutdown(&mut shutdown_rx) => break,
                 _ = tick.tick() => {}
             }
-            flush_once(&state, &fleet).await;
+            if let Some(fleet) = fleet.as_ref() {
+                flush_once(&state, fleet).await;
+            }
+            if last_prune.is_none_or(|at| at.elapsed() >= PRUNE_INTERVAL) {
+                last_prune = Some(std::time::Instant::now());
+                prune_outbox(&state, fleet.is_some(), local_retention_days);
+            }
         }
     }))
+}
+
+/// Keep the local outbox bounded. With a fleet store, rows already flushed
+/// there are only kept for a day. Without one the outbox is the source of
+/// truth, so rows are kept for `local_retention_days` (0 keeps them forever).
+fn prune_outbox(state: &AppState, has_fleet: bool, local_retention_days: u64) {
+    let Ok(store) = state.store.lock() else {
+        return;
+    };
+    let result = if has_fleet {
+        store.prune_sent_outbox(Utc::now() - chrono::Duration::days(1))
+    } else if local_retention_days > 0 {
+        let days = i64::try_from(local_retention_days).unwrap_or(i64::MAX);
+        let cutoff = chrono::Duration::try_days(days)
+            .and_then(|age| Utc::now().checked_sub_signed(age))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        store.prune_local_outbox(cutoff)
+    } else {
+        Ok(())
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, "usage/audit outbox prune failed");
+    }
 }
 
 async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<Option<&'static str>>) {

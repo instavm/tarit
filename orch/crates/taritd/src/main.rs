@@ -649,8 +649,8 @@ async fn run_server(
     );
 
     // Usage metering (VM runtime seconds) plus write-behind flush of usage and
-    // audit events to the primary store. The meter always runs; the flusher is a
-    // no-op without a fleet (single-host keeps events in the local outbox).
+    // audit events to the primary store. The meter always runs. Without a fleet
+    // the local outbox is the source of truth and is pruned by age.
     let meter_secs = std::env::var("TARIT_USAGE_METER_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -660,8 +660,16 @@ async fn run_server(
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
     let usage_meter = usage::spawn_usage_meter(state.clone(), meter_secs, shutdown_rx.clone());
-    let outbox_flusher =
-        usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
+    let local_retention_days = std::env::var("TARIT_LOCAL_USAGE_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+    let outbox_flusher = usage::spawn_outbox_flusher(
+        state.clone(),
+        flush_secs,
+        local_retention_days,
+        shutdown_rx.clone(),
+    );
     let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());
     let artifact_gc = spawn_artifact_gc(state.clone(), shutdown_rx.clone());
     let artifact_repair = spawn_artifact_repair(state.clone(), shutdown_rx.clone());

@@ -644,7 +644,7 @@ Status codes: `200`, `401`, `403`, `500`.
 
 ### `GET /v1/usage`
 
-Aggregated per-key usage stats from the primary store. Requires a fleet database. Admins see every key; a non-admin key sees only its own. Query parameters: `from`, `to` (RFC3339; default last 30 days), and `api_key_id` (admin only).
+Aggregated per-key usage stats from the primary store, or from the node's local outbox when no fleet database is configured. Admins see every key; a non-admin key sees only its own. Query parameters: `from`, `to` (RFC3339; default last 30 days), and `api_key_id` (admin only).
 
 ```json
 [
@@ -652,11 +652,11 @@ Aggregated per-key usage stats from the primary store. Requires a fleet database
 ]
 ```
 
-Status codes: `200`, `401`, `500` (500 if no fleet database is configured).
+Status codes: `200`, `401`, `500`.
 
 ### `GET /v1/audit`
 
-Recent audit trail, newest first. Requires a fleet database. Admins see every key; a non-admin key sees only its own. Query parameters: `api_key_id` (admin only), `vm_id`, `limit` (default 100, max 1000).
+Recent audit trail, newest first, from the primary store or, without a fleet database, the node's local outbox. Admins see every key; a non-admin key sees only its own. Query parameters: `api_key_id` (admin only), `vm_id`, `limit` (default 100, max 1000).
 
 ```json
 [
