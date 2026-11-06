@@ -400,10 +400,13 @@ impl VirtioNetMmio {
         )
     }
 
-    /// Hand the transport a tap fd. The fd's lifetime is the caller's; the
-    /// transport only uses it for `write(2)` on TX.
-    pub fn set_tap_fd(&self, fd: RawFd) {
+    /// Hand the transport a tap fd and whether its frames carry a virtio-net
+    /// header (`Tap::vnet_hdr`), which decides the frame format on the fd.
+    /// The fd's lifetime is the caller's; the transport only uses it for
+    /// `write(2)` on TX.
+    pub fn set_tap_fd(&self, fd: RawFd, vnet_hdr: bool) {
         *self.lock_state(&self.tap_fd, "tap_fd") = Some(fd);
+        self.set_vnet_hdr(vnet_hdr);
     }
 
     /// Record that the tap's frames carry a virtio-net header. Must be set
@@ -1345,7 +1348,7 @@ mod tests {
         dev.set_guest_memory(mem.clone());
         dev.set_vnet_hdr(true);
         let (tap, peer) = frame_pipe();
-        dev.set_tap_fd(tap);
+        dev.set_tap_fd(tap, true);
         negotiate(&dev, net_features::OFFLOADS);
         const DESC: u64 = 0x10_0000;
         const AVAIL: u64 = 0x10_1000;

@@ -591,7 +591,7 @@ mod tests {
             Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap());
         let device = Arc::new(VirtioNetMmio::new(7, [0x02, 0, 0, 0, 0, 1]));
         device.set_guest_memory(mem.clone());
-        device.set_tap_fd(dev_fd);
+        device.set_tap_fd(dev_fd, false);
 
         let irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).expect("irq evt");
         device.set_irq_evt(irq_evt.try_clone().unwrap());

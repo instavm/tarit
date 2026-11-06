@@ -8062,8 +8062,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         let dev = Arc::new(VirtioNetMmio::new(irq, mac));
         dev.set_guest_memory(gm.clone());
         dev.set_guest_dirty_tracker(host_dirty.clone());
-        dev.set_tap_fd(tap.fd);
-        dev.set_vnet_hdr(tap.vnet_hdr);
+        dev.set_tap_fd(tap.fd, tap.vnet_hdr);
         let irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
             .map_err(|e| VmmError::Kvm(format!("EventFd: {e}")))?;
         let io_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
