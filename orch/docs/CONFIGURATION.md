@@ -157,6 +157,7 @@ The `TARIT_CONFIG` TOML schema does not define an `[autoscale]` table. Configure
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `TARIT_ENABLE_NET` | bool | `false` | Enable per-VM tap devices, `/30` addressing, and NAT. Requires host networking privileges. |
+| `TARIT_GUEST_DNS` | comma-separated IPs (at most 3) | unset | Resolvers written to networked guests' `/etc/resolv.conf` at boot and whenever a restored or forked guest's network is repaired. Requires `TARIT_ENABLE_NET=1`. Egress to them still needs an allowlist entry. |
 | `TARIT_NET_STATE` | path | next to `TARIT_DB` with `.net.json` appended to the DB file name | Persistent per-VM tap/IP slot state. With the default DB, this is `~/.taritd/fleet.db.net.json`. `~/` is expanded when set. |
 
 ## Access / SSH gateway

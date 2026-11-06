@@ -248,7 +248,8 @@ Request:
   "kernel_path": "optional admin-only kernel override",
   "image": "optional registered image name[:tag]",
   "rootfs_path": "optional admin-only rootfs override, empty string means no rootfs",
-  "cmdline": "optional kernel command line override"
+  "cmdline": "optional kernel command line override",
+  "egress": { "allowlist": ["0.0.0.0/0:443/tcp", "10.0.0.2/32:53/udp"], "allow_existing": false }
 }
 ```
 
@@ -263,6 +264,11 @@ Defaults from `tarit-types` and `Config`:
 | `image` | unset; when present it resolves through the node-local image registry and cannot be combined with `rootfs_path` |
 | `rootfs_path` | `TARIT_ROOTFS`; admin-only override; empty string disables rootfs |
 | `cmdline` | default virtio block kernel cmdline when rootfs exists, otherwise `console=ttyS0 panic=1` |
+| `egress` | unset. With `TARIT_ENABLE_NET=1` a VM can reach nothing until it has an egress policy; set one here (same form as `PATCH /v1/egress/vm/{id}`) to create the VM with it. An invalid policy is rejected with `400` before anything is created, and if it cannot be applied the new VM is removed and the create fails. |
+
+A fork inherits its source's egress policy. Networked guests get the resolvers
+in `TARIT_GUEST_DNS`; allow them in the egress policy (for example
+`<resolver>/32:53/udp`) for name resolution to work.
 
 Response `201`: `VmRecord`.
 

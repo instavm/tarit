@@ -645,6 +645,10 @@ pub struct Config {
     /// Provision per-VM host networking (tap + /30 + NAT). Requires
     /// CAP_NET_ADMIN (run taritd as root). Off by default.
     pub enable_net: bool,
+    /// Resolvers given to networked guests (`TARIT_GUEST_DNS`), at boot and
+    /// whenever a restored or forked guest's network is repaired. Egress to
+    /// them still needs an allowlist entry like any other destination.
+    pub guest_dns: Vec<String>,
     /// Request read-only guest mount semantics (`ro` kernel cmdline). The host
     /// always opens the base image immutably and gives each VM a private CoW
     /// overlay, regardless of this setting. Env TARIT_ROOTFS_READONLY.
@@ -838,6 +842,10 @@ impl Config {
         )?;
 
         let enable_net = env_bool_checked("TARIT_ENABLE_NET", false)?;
+        let guest_dns = parse_guest_dns(std::env::var("TARIT_GUEST_DNS").ok().as_deref())?;
+        if !guest_dns.is_empty() && !enable_net {
+            bail!("TARIT_GUEST_DNS requires TARIT_ENABLE_NET=1");
+        }
 
         let rootfs_read_only = env_bool_checked("TARIT_ROOTFS_READONLY", false)?;
 
@@ -980,6 +988,7 @@ impl Config {
             rpc_addr,
             allow_insecure_peer_http,
             enable_net,
+            guest_dns,
             rootfs_read_only,
             metrics_expose_tenant_labels,
             api_max_in_flight,
@@ -1041,6 +1050,7 @@ impl fmt::Debug for Config {
             .field("rpc_addr", &self.rpc_addr)
             .field("allow_insecure_peer_http", &self.allow_insecure_peer_http)
             .field("enable_net", &self.enable_net)
+            .field("guest_dns", &self.guest_dns)
             .field("rootfs_read_only", &self.rootfs_read_only)
             .field(
                 "metrics_expose_tenant_labels",
@@ -1290,6 +1300,30 @@ fn validate_rpc_addr(
         bail!("TARIT_PRODUCTION requires HTTPS peer RPC and forbids insecure peer HTTP");
     }
     Ok(())
+}
+
+/// Comma-separated IPv4 or IPv6 resolver addresses, at most three (what a
+/// guest's resolv.conf uses).
+fn parse_guest_dns(value: Option<&str>) -> Result<Vec<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let servers = value
+        .split(',')
+        .map(|server| {
+            let server = server.trim();
+            server
+                .parse::<std::net::IpAddr>()
+                .map(|address| address.to_string())
+                .map_err(|_| {
+                    anyhow::anyhow!("TARIT_GUEST_DNS entry {server:?} is not an IP address")
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if servers.len() > 3 {
+        bail!("TARIT_GUEST_DNS allows at most three resolvers");
+    }
+    Ok(servers)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -154,6 +154,18 @@ components:
           uniqueItems: true
           items:
             $ref: "#/components/schemas/VmVolumeAttachmentRequest"
+        egress:
+          type: object
+          description: Egress policy applied as the VM is created, in the same form as PATCH /v1/egress/vm/{id}. Without one, a networked VM can reach nothing. Invalid policies are rejected before anything is created; if the policy cannot be applied, the VM is removed and the create fails.
+          required: [allowlist]
+          properties:
+            allowlist:
+              type: array
+              items:
+                type: string
+            allow_existing:
+              type: boolean
+              default: false
     VmVolumeAttachmentRequest:
       type: object
       additionalProperties: false

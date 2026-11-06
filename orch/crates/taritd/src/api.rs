@@ -1685,8 +1685,25 @@ async fn create_vm_impl(
         Err(OrchError::NotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
+    // A create-time egress policy is validated before anything is created and
+    // applied once the VM exists, wherever it was placed.
+    let egress = req.egress.take();
+    if let Some(egress) = &egress {
+        crate::net::normalize_tenant_egress_allowlist(&egress.allowlist)?;
+    }
     let reserved = reserve_vm_quota(state, identity, id).await?;
-    let result = create_vm_after_quota(state, identity, req).await;
+    let mut result = create_vm_after_quota(state, identity, req).await;
+    if let (Ok(_), Some(egress)) = (&result, egress) {
+        if let Err(error) = apply_create_egress(state, identity, id, egress).await {
+            // All or nothing: never leave a VM running without the policy the
+            // caller asked for.
+            if let Err(cleanup) = delete_owned_vm(state, identity, id).await {
+                tracing::error!(vm = %id, %cleanup,
+                    "failed to remove VM whose create-time egress policy could not be applied");
+            }
+            result = Err(error.into());
+        }
+    }
     if reserved {
         if let Err(error) = release_vm_quota(state, identity, id).await {
             tracing::warn!(vm = %id, tenant = %identity.tenant, %error,
@@ -1694,6 +1711,80 @@ async fn create_vm_impl(
         }
     }
     result
+}
+
+async fn apply_create_egress(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+    egress: EgressUpdateRequest,
+) -> Result<(), OrchError> {
+    match cluster::resolve_owner(state, id).await? {
+        Owner::Local => {
+            ops::egress_local(state, id, egress.allowlist, egress.allow_existing).await?;
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.egress_remote(&rpc, id, &egress, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+        }
+    }
+    Ok(())
+}
+
+async fn inherit_source_egress(
+    state: &AppState,
+    identity: &ApiIdentity,
+    source_id: Uuid,
+    child_id: Uuid,
+) -> Result<(), OrchError> {
+    let policy = match cluster::resolve_owner(state, source_id).await? {
+        Owner::Local => ops::get_egress_policy_local(state, source_id, &identity.tenant)?,
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || {
+                peer.get_egress_policy_remote(&rpc, source_id, &identity)
+            })
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+        }
+    };
+    if policy.allowlist.is_empty() && !policy.allow_existing {
+        return Ok(());
+    }
+    apply_create_egress(
+        state,
+        identity,
+        child_id,
+        EgressUpdateRequest {
+            allowlist: policy.allowlist,
+            allow_existing: policy.allow_existing,
+        },
+    )
+    .await
+}
+
+async fn delete_owned_vm(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> Result<(), OrchError> {
+    match cluster::resolve_owner(state, id).await? {
+        Owner::Local => {
+            ops::stop_local(state, id).await?;
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.stop_remote(&rpc, id, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+        }
+    }
+    Ok(())
 }
 
 fn enforce_image_admission_policy(
@@ -3054,6 +3145,16 @@ async fn fork_vm(
             live_termination = ?metrics.live_snapshot.as_ref().map(|value| value.termination),
             "fork phase measurements"
         );
+        // A fork can reach exactly what its source could: inherit the
+        // source's egress policy, or remove the child rather than hand back a
+        // VM with different network access than the caller expects.
+        if let Err(error) = inherit_source_egress(&state, &identity, source_id, child_id).await {
+            if let Err(cleanup) = delete_owned_vm(&state, &identity, child_id).await {
+                tracing::error!(vm = %child_id, %cleanup,
+                    "failed to remove fork child whose egress policy could not be inherited");
+            }
+            return Err(error);
+        }
         audit::record(
             &state,
             &identity,
@@ -5179,6 +5280,7 @@ mod tests {
             rootfs_path: None,
             cmdline: None,
             volumes: Vec::new(),
+            egress: None,
         };
         assert!(matches!(
             enforce_create_path_policy(&user, &req),
@@ -6226,6 +6328,7 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,

@@ -5248,6 +5248,7 @@ impl VmmSupervisor {
         let vmm_config = build_vmm_config(
             &runtime.vm_config,
             vm.net.as_ref(),
+            &self.config.guest_dns,
             runtime.guest_overlay.clone(),
             &runtime.data_volumes,
         );
@@ -5310,8 +5311,12 @@ impl VmmSupervisor {
             ));
         }
         if let Some(allocation) = &booted.vm.net {
-            let repaired = rebind_restored_guest_network(&booted.vm.socket_path, allocation)
-                .and_then(|()| verify_restored_guest_connectivity(allocation));
+            let repaired = rebind_restored_guest_network(
+                &booted.vm.socket_path,
+                allocation,
+                &self.config.guest_dns,
+            )
+            .and_then(|()| verify_restored_guest_connectivity(allocation));
             if let Err(error) = repaired {
                 return Err(self.cleanup_boot_failure(
                     booted.id,
@@ -8861,6 +8866,7 @@ impl TryFrom<&NetAlloc> for RestoredGuestNetwork {
 fn rebind_restored_guest_network(
     socket_path: &Path,
     allocation: &NetAlloc,
+    guest_dns: &[String],
 ) -> Result<(), OrchError> {
     let network = RestoredGuestNetwork::try_from(allocation)?;
     let client = VmmClient::new(socket_path)
@@ -8871,7 +8877,7 @@ fn rebind_restored_guest_network(
             addr: network.guest_ip.to_string(),
             prefix: network.prefix,
             gateway: network.gateway.to_string(),
-            dns_servers: Vec::new(),
+            dns_servers: guest_dns.to_vec(),
         })
         .map_err(|error| OrchError::Vmm(format!("restore guest network rebind: {error}")))?;
 
@@ -8922,6 +8928,7 @@ fn verify_restored_guest_connectivity(_allocation: &NetAlloc) -> Result<(), Orch
 fn build_vmm_config(
     cfg: &VmSpawnConfig,
     net: Option<&NetAlloc>,
+    guest_dns: &[String],
     overlay: Option<String>,
     data_volumes: &[PreparedBlockAttachment],
 ) -> VmConfig {
@@ -8949,11 +8956,15 @@ fn build_vmm_config(
 
     // With per-VM networking, attach a virtio-net device on the provisioned tap
     // and append the kernel `ip=` fragment so the guest configures eth0 at boot.
+    // The guest agent writes /etc/resolv.conf from `tarit.dns=` at boot.
     let (nets, cmdline) = match net {
-        Some(a) => (
-            vec![net_config_for_allocation(a)],
-            format!("{} {}", base_cmdline.trim(), a.ip_cmdline()),
-        ),
+        Some(a) => {
+            let mut cmdline = format!("{} {}", base_cmdline.trim(), a.ip_cmdline());
+            if !guest_dns.is_empty() {
+                cmdline.push_str(&format!(" tarit.dns={}", guest_dns.join(",")));
+            }
+            (vec![net_config_for_allocation(a)], cmdline)
+        }
         None => (vec![], base_cmdline),
     };
 
@@ -9276,6 +9287,7 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
@@ -9715,6 +9727,7 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
@@ -10275,7 +10288,7 @@ mod tests {
             Some(expected.clone())
         );
 
-        let vmm_config = build_vmm_config(&cfg, None, Some(expected.clone()), &[]);
+        let vmm_config = build_vmm_config(&cfg, None, &[], Some(expected.clone()), &[]);
         assert_eq!(vmm_config.volumes.len(), 1);
         assert_eq!(vmm_config.volumes[0].overlay, Some(expected));
         assert!(!vmm_config.volumes[0].read_only);
@@ -10289,6 +10302,7 @@ mod tests {
         let rw_config = build_vmm_config(
             &configured_rw,
             None,
+            &[],
             supervisor.overlay_path_for_config(id, &configured_rw),
             &[],
         );
@@ -10328,7 +10342,7 @@ mod tests {
             unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
             0
         );
-        let vmm = build_vmm_config(&runtime.vm_config, None, None, &runtime.data_volumes);
+        let vmm = build_vmm_config(&runtime.vm_config, None, &[], None, &runtime.data_volumes);
         assert_eq!(vmm.volumes.len(), 1);
         assert_eq!(vmm.volumes[0].path, format!("volume:{volume_id}"));
         assert_eq!(vmm.volumes[0].inherited_fd, Some(raw_fd));
@@ -11720,7 +11734,7 @@ mod tests {
             ]
         );
 
-        rebind_restored_guest_network(&socket_path, &allocation).unwrap();
+        rebind_restored_guest_network(&socket_path, &allocation, &[]).unwrap();
 
         server.join().unwrap();
         std::fs::remove_file(socket_path).unwrap();
@@ -11738,7 +11752,7 @@ mod tests {
         };
 
         let error =
-            rebind_restored_guest_network(Path::new("missing.sock"), &allocation).unwrap_err();
+            rebind_restored_guest_network(Path::new("missing.sock"), &allocation, &[]).unwrap_err();
 
         assert!(error.to_string().contains("parse restored guest IPv4"));
     }

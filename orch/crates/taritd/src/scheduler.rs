@@ -316,6 +316,7 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: true,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,

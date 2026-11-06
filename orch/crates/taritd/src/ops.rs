@@ -5636,6 +5636,7 @@ mod tests {
                 rootfs_path: None,
                 cmdline: None,
                 volumes: Vec::new(),
+                egress: None,
             },
         );
         let id = Uuid::new_v4();
@@ -5669,6 +5670,7 @@ mod tests {
                         rootfs_path: None,
                         cmdline: None,
                         volumes: Vec::new(),
+                        egress: None,
                     },
                 )
                 .await
@@ -5872,6 +5874,7 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
