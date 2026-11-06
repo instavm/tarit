@@ -15,7 +15,7 @@ pub const MAX_QUEUE_SIZE: u16 = 256;
 
 /// Maximum per-descriptor length (1 MiB). Descriptors exceeding this are
 /// rejected to prevent guest-driven OOM allocation attacks.
-const MAX_DESC_LEN: u32 = 1024 * 1024;
+pub const MAX_DESC_LEN: u32 = 1024 * 1024;
 
 /// Maximum total bytes across all descriptors in a single chain (4 MiB).
 const MAX_CHAIN_BYTES: usize = 4 * 1024 * 1024;

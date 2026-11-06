@@ -29,7 +29,12 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// implement the used_event/avail_event suppression that EVENT_IDX requires.
 /// Advertising it made the guest complete exactly one request and then stall,
 /// because its notification bookkeeping diverged from ours.
-const BLK_FEATURES_LOW: u32 = 1 << 9; // FLUSH
+/// VIRTIO_BLK_F_SIZE_MAX (bit 1) caps every data segment at the virtqueue's
+/// per-descriptor limit. Without it Linux sends one segment per request of
+/// any size, and a segment over that limit was rejected and never completed,
+/// hanging the guest's I/O under large sequential writes.
+const BLK_FEATURES_LOW: u32 = (1 << 9) | VIRTIO_BLK_F_SIZE_MAX; // FLUSH + SIZE_MAX
+const VIRTIO_BLK_F_SIZE_MAX: u32 = 1 << 1;
 /// VIRTIO_BLK_F_RO (bit 5): offered only for a read-only backend, so the guest
 /// marks the disk read-only instead of discovering it through write errors.
 const VIRTIO_BLK_F_RO: u32 = 1 << 5;
@@ -829,13 +834,14 @@ impl MmioDevice for VirtioBlkMmio {
                 let backend = self.lock_state(&self.backend, "backend");
                 match &*backend {
                     Some(b) => {
-                        let cap_bytes = b.sectors.to_le_bytes();
-                        let blk_size: u32 = 512;
-                        let size_bytes = blk_size.to_le_bytes();
-                        // Build the config space: [capacity u64][blk_size u32]
+                        // virtio-blk config space (virtio 1.x §5.2.4):
+                        // [capacity u64][size_max u32]. Fields for features
+                        // we do not offer (seg_max, geometry, blk_size, ...)
+                        // read as zero.
                         let mut cfg = [0u8; 12];
-                        cfg[..8].copy_from_slice(&cap_bytes);
-                        cfg[8..12].copy_from_slice(&size_bytes);
+                        cfg[..8].copy_from_slice(&b.sectors.to_le_bytes());
+                        cfg[8..12]
+                            .copy_from_slice(&crate::virtio::vqueue::MAX_DESC_LEN.to_le_bytes());
                         // Return the requested 4-byte window.
                         let end = (cfg_off + 4).min(cfg.len());
                         if cfg_off < end {
@@ -1335,6 +1341,22 @@ mod tests {
         clock.advance(1_000_000_000);
         dev.process_queue(0).unwrap();
         assert_eq!(used_idx(&mem), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn size_max_matches_the_descriptor_limit_at_its_spec_offset() {
+        let (backend, path) = new_test_backend("blk-size-max");
+        let dev = VirtioBlkMmio::new(5, backend);
+        dev.mmio_write(reg::HOST_FEATURES_SEL, 0, 4).unwrap();
+        let features = dev.mmio_read(reg::HOST_FEATURES, 4).unwrap();
+        assert_ne!(features & u64::from(VIRTIO_BLK_F_SIZE_MAX), 0);
+        assert_eq!(
+            dev.mmio_read(reg::CONFIG + 8, 4).unwrap(),
+            u64::from(crate::virtio::vqueue::MAX_DESC_LEN)
+        );
+        // 4096-byte test disk = 8 sectors.
+        assert_eq!(dev.mmio_read(reg::CONFIG, 4).unwrap(), 8);
         std::fs::remove_file(path).unwrap();
     }
 
