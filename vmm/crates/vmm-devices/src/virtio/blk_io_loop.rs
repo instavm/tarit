@@ -27,10 +27,20 @@ pub struct BlkIoLoop {
     pause_ack: Arc<AtomicBool>,
     wake_evt: EventFd,
     handle: Option<JoinHandle<()>>,
+    startup: Option<super::worker_startup::PendingStartup>,
     pub device: Arc<VirtioBlkMmio>,
 }
 
 impl BlkIoLoop {
+    /// Wait for a worker from [`start_blk_io_loop`] to report that its
+    /// sandbox is installed. Required before the guest runs.
+    pub fn wait_ready(&mut self) -> io::Result<()> {
+        match self.startup.take() {
+            Some(startup) => startup.wait(&mut self.handle),
+            None => Ok(()),
+        }
+    }
+
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.pause_req.store(false, Ordering::SeqCst);
@@ -136,6 +146,14 @@ impl Drop for BlkIoLoop {
 /// Spawn a queue worker. `kick_fd` must be the non-blocking eventfd registered
 /// for queue 0 at this device's QUEUE_NOTIFY MMIO address.
 pub fn spawn_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Result<BlkIoLoop> {
+    let mut worker = start_blk_io_loop(device, kick_fd)?;
+    worker.wait_ready()?;
+    Ok(worker)
+}
+
+/// [`spawn_blk_io_loop`] without waiting for the worker's startup report;
+/// call [`BlkIoLoop::wait_ready`] before the guest runs.
+pub fn start_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Result<BlkIoLoop> {
     // SAFETY: F_GETFD inspects the descriptor without retaining it. The
     // controller owns the descriptor for the returned worker's lifetime.
     if unsafe { libc::fcntl(kick_fd, libc::F_GETFD) } < 0 {
@@ -161,7 +179,9 @@ pub fn spawn_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Resu
         .name("virtio-blk-io".into())
         .spawn(move || {
             if let Err(error) = vmm_jailer::seccomp::SeccompProfile::block().install() {
-                let _ = ready_tx.send(Err(error));
+                let _ = ready_tx.send(Err(io::Error::other(format!(
+                    "install block I/O worker sandbox: {error}"
+                ))));
                 return;
             }
             if ready_tx.send(Ok(())).is_err() {
@@ -181,28 +201,16 @@ pub fn spawn_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Resu
             }
         })?;
 
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = handle.join();
-            return Err(io::Error::other(format!(
-                "install block I/O worker sandbox: {error}"
-            )));
-        }
-        Err(error) => {
-            let _ = handle.join();
-            return Err(io::Error::other(format!(
-                "block I/O worker exited during startup: {error}"
-            )));
-        }
-    }
-
     Ok(BlkIoLoop {
         stop,
         pause_req,
         pause_ack,
         wake_evt,
         handle: Some(handle),
+        startup: Some(super::worker_startup::PendingStartup::new(
+            ready_rx,
+            "block I/O worker",
+        )),
         device,
     })
 }

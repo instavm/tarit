@@ -31,8 +31,20 @@ pub struct NetIoLoop {
     pause_ack: Arc<AtomicBool>,
     wake_evt: EventFd,
     handle: Option<JoinHandle<()>>,
+    startup: Option<super::worker_startup::PendingStartup>,
     /// Caller may inspect packet counts via the device after stop.
     pub device: Arc<VirtioNetMmio>,
+}
+
+impl NetIoLoop {
+    /// Wait for a worker from [`start_net_io_loop`] to report that its
+    /// sandbox is installed. Required before the guest runs.
+    pub fn wait_ready(&mut self) -> io::Result<()> {
+        match self.startup.take() {
+            Some(startup) => startup.wait(&mut self.handle),
+            None => Ok(()),
+        }
+    }
 }
 
 struct WorkerControl {
@@ -154,6 +166,18 @@ pub fn spawn_net_io_loop(
     tap_fd: RawFd,
     tx_kick_fd: RawFd,
 ) -> io::Result<NetIoLoop> {
+    let mut worker = start_net_io_loop(device, tap_fd, tx_kick_fd)?;
+    worker.wait_ready()?;
+    Ok(worker)
+}
+
+/// [`spawn_net_io_loop`] without waiting for the worker's startup report;
+/// call [`NetIoLoop::wait_ready`] before the guest runs.
+pub fn start_net_io_loop(
+    device: Arc<VirtioNetMmio>,
+    tap_fd: RawFd,
+    tx_kick_fd: RawFd,
+) -> io::Result<NetIoLoop> {
     let stop = Arc::new(AtomicBool::new(false));
     let pause_req = Arc::new(AtomicBool::new(false));
     let pause_ack = Arc::new(AtomicBool::new(false));
@@ -194,26 +218,16 @@ pub fn spawn_net_io_loop(
             }
         })?;
 
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = handle.join();
-            return Err(error);
-        }
-        Err(error) => {
-            let _ = handle.join();
-            return Err(io::Error::other(format!(
-                "network I/O worker exited during startup: {error}"
-            )));
-        }
-    }
-
     Ok(NetIoLoop {
         stop,
         pause_req,
         pause_ack,
         wake_evt,
         handle: Some(handle),
+        startup: Some(super::worker_startup::PendingStartup::new(
+            ready_rx,
+            "network I/O worker",
+        )),
         device,
     })
 }

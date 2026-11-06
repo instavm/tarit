@@ -1264,7 +1264,7 @@ impl VmmController {
         {
             kvm_vm.register_ioeventfd_datamatch(mmio_base + 0x50, &io_evt, 0)?;
             use std::os::fd::AsRawFd;
-            let io_loop = vmm_devices::virtio::blk_io_loop::spawn_blk_io_loop(
+            let io_loop = vmm_devices::virtio::blk_io_loop::start_blk_io_loop(
                 Arc::clone(device),
                 io_evt.as_raw_fd(),
             )
@@ -1323,7 +1323,7 @@ impl VmmController {
                 use std::os::fd::AsRawFd;
                 io_evt.as_raw_fd()
             };
-            let io_loop = vmm_devices::virtio::net_io_loop::spawn_net_io_loop(
+            let io_loop = vmm_devices::virtio::net_io_loop::start_net_io_loop(
                 dev.clone(),
                 tap_fd,
                 kick_fd,
@@ -1367,7 +1367,7 @@ impl VmmController {
         // pump. A configured vsock device is an admitted control channel, so
         // worker or socket setup failure must fail creation rather than publish
         // a VM whose PTY/SSH/exec behavior differs from its configuration.
-        let (vsock_pump, vsock_exec, vsock_pty) = match vsock {
+        let (mut vsock_pump, vsock_exec, vsock_pty) = match vsock {
             Some(wv) => {
                 kvm_vm.register_irqfd(&wv.irq_evt, wv.irq)?;
                 irq_evts.push(wv.irq_evt);
@@ -1380,7 +1380,7 @@ impl VmmController {
                 use std::os::fd::AsRawFd;
                 let tx_kick_fd = wv.io_evt.as_raw_fd();
                 let device = wv.device;
-                let pump = vmm_devices::virtio::vsock_io_loop::spawn_vsock_pump(
+                let pump = vmm_devices::virtio::vsock_io_loop::start_vsock_pump(
                     device.clone(),
                     tx_kick_fd,
                 )
@@ -1412,6 +1412,9 @@ impl VmmController {
             None => (None, None, None),
         };
 
+        // The workers above started in parallel; each must have its sandbox
+        // in place before the guest runs.
+        wait_for_device_workers(&mut blk_io_loops, &mut net_io_loops, vsock_pump.as_mut())?;
         kvm_vm.commit_gsi_routing()?;
         let vcpu = kvm_vm.create_vcpu(0)?;
         kvm_vm.setup_vcpu_for_bzimage_boot_full(&vcpu, &loaded, full_boot)?;
@@ -7477,6 +7480,31 @@ struct RestoredRuntimeState<'a> {
     rng: Option<&'a vmm_devices::virtio::rng_transport::VirtioRngMmioState>,
 }
 
+/// Collect the startup reports of device workers started with `start_*`.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn wait_for_device_workers(
+    blk: &mut [vmm_devices::virtio::blk_io_loop::BlkIoLoop],
+    net: &mut [vmm_devices::virtio::net_io_loop::NetIoLoop],
+    vsock: Option<&mut vmm_devices::virtio::vsock_io_loop::VsockPump>,
+) -> Result<()> {
+    for (i, worker) in blk.iter_mut().enumerate() {
+        worker.wait_ready().map_err(|error| {
+            VmmError::Device(format!("start block I/O worker for volume {i}: {error}"))
+        })?;
+    }
+    for worker in net {
+        worker
+            .wait_ready()
+            .map_err(|error| VmmError::Device(format!("start network I/O worker: {error}")))?;
+    }
+    if let Some(worker) = vsock {
+        worker
+            .wait_ready()
+            .map_err(|error| VmmError::Device(format!("start vsock worker: {error}")))?;
+    }
+    Ok(())
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn build_running_vm(
     mem: vmm_memory_backend::GuestMemory,
@@ -7575,7 +7603,7 @@ fn build_running_vm(
     {
         kvm_vm.register_ioeventfd_datamatch(mmio_base + 0x50, &io_evt, 0)?;
         use std::os::fd::AsRawFd;
-        let io_loop = vmm_devices::virtio::blk_io_loop::spawn_blk_io_loop(
+        let io_loop = vmm_devices::virtio::blk_io_loop::start_blk_io_loop(
             Arc::clone(device),
             io_evt.as_raw_fd(),
         )
@@ -7632,7 +7660,7 @@ fn build_running_vm(
             use std::os::fd::AsRawFd;
             io_evt.as_raw_fd()
         };
-        let io_loop = vmm_devices::virtio::net_io_loop::spawn_net_io_loop(dev, tap_fd, kick_fd)
+        let io_loop = vmm_devices::virtio::net_io_loop::start_net_io_loop(dev, tap_fd, kick_fd)
             .map_err(|error| {
                 VmmError::Device(format!("spawn restored network I/O worker: {error}"))
             })?;
@@ -7669,7 +7697,7 @@ fn build_running_vm(
 
     // Wire the virtio-vsock exec channel (matching create_live), so a restored
     // VM re-establishes exec-over-vsock when the guest agent re-dials.
-    let (vsock_pump, vsock_exec, vsock_pty, vsock_reset) = match vsock {
+    let (mut vsock_pump, vsock_exec, vsock_pty, vsock_reset) = match vsock {
         Some(wv) => {
             kvm_vm.register_irqfd(&wv.irq_evt, wv.irq)?;
             irq_evts.push(wv.irq_evt);
@@ -7687,7 +7715,7 @@ fn build_running_vm(
                 (device.clone(), state.connections.clone())
             });
             let pump =
-                vmm_devices::virtio::vsock_io_loop::spawn_vsock_pump(device.clone(), tx_kick_fd)
+                vmm_devices::virtio::vsock_io_loop::start_vsock_pump(device.clone(), tx_kick_fd)
                     .map_err(|error| {
                         VmmError::Device(format!("spawn restored vsock worker: {error}"))
                     })?;
@@ -7728,6 +7756,9 @@ fn build_running_vm(
         resample.registration =
             Some(kvm_vm.begin_irqfd_with_resample(&irq_evt, &resample_evt, irq)?);
     }
+    // The workers above started in parallel; each must have its sandbox
+    // in place before the guest runs.
+    wait_for_device_workers(&mut blk_io_loops, &mut net_io_loops, vsock_pump.as_mut())?;
     kvm_vm.commit_gsi_routing()?;
     let vcpu = kvm_vm.create_vcpu(0)?;
     // CPUID must be set on the fresh vCPU before the saved MSRs/state are
