@@ -30,6 +30,9 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// Advertising it made the guest complete exactly one request and then stall,
 /// because its notification bookkeeping diverged from ours.
 const BLK_FEATURES_LOW: u32 = 1 << 9; // FLUSH
+/// VIRTIO_BLK_F_RO (bit 5): offered only for a read-only backend, so the guest
+/// marks the disk read-only instead of discovering it through write errors.
+const VIRTIO_BLK_F_RO: u32 = 1 << 5;
 const BLK_FEATURES_HIGH: u32 = 1; // bit 32 = VIRTIO_F_VERSION_1
 
 /// virtio interrupt status bits.
@@ -789,7 +792,14 @@ impl MmioDevice for VirtioBlkMmio {
                 // Page 0 = bits 0-31 (EVENT_IDX, FLUSH, etc.)
                 // Page 1 = bits 32-63 (VIRTIO_F_VERSION_1)
                 match self.host_features_sel.load(Ordering::Relaxed) {
-                    0 => BLK_FEATURES_LOW,
+                    0 => {
+                        let backend = self.lock_state(&self.backend, "backend");
+                        if backend.as_ref().is_some_and(|b| b.read_only) {
+                            BLK_FEATURES_LOW | VIRTIO_BLK_F_RO
+                        } else {
+                            BLK_FEATURES_LOW
+                        }
+                    }
                     1 => BLK_FEATURES_HIGH,
                     _ => 0,
                 }
@@ -1325,6 +1335,23 @@ mod tests {
         clock.advance(1_000_000_000);
         dev.process_queue(0).unwrap();
         assert_eq!(used_idx(&mem), 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_only_backends_offer_the_ro_feature() {
+        let (backend, path) = new_test_backend("blk-ro-feature");
+        drop(backend);
+        let host_features_low = |read_only| {
+            let dev = VirtioBlkMmio::new(5, BlkBackend::open(&path, read_only).unwrap());
+            dev.mmio_write(reg::HOST_FEATURES_SEL, 0, 4).unwrap();
+            dev.mmio_read(reg::HOST_FEATURES, 4).unwrap()
+        };
+        assert_eq!(host_features_low(false), u64::from(BLK_FEATURES_LOW));
+        assert_eq!(
+            host_features_low(true),
+            u64::from(BLK_FEATURES_LOW | VIRTIO_BLK_F_RO)
+        );
         std::fs::remove_file(path).unwrap();
     }
 
