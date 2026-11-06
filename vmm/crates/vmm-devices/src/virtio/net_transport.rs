@@ -62,6 +62,10 @@ pub mod net_features {
     pub const GUEST_TSO6: u32 = 1 << 8;
     pub const HOST_TSO4: u32 = 1 << 11;
     pub const HOST_TSO6: u32 = 1 << 12;
+    /// VIRTIO_NET_F_MRG_RXBUF: a received frame may span several receive
+    /// buffers, so the driver posts small single-page buffers instead of a
+    /// 64 KiB chain per frame when it accepts segmentation offload.
+    pub const MRG_RXBUF: u32 = 1 << 15;
     /// VIRTIO_RING_F_EVENT_IDX: interrupts and kicks only when the other
     /// side asks for them.
     pub const RING_EVENT_IDX: u32 = 1 << 29;
@@ -427,7 +431,7 @@ impl VirtioNetMmio {
 
     /// Low feature word offered to the guest.
     pub fn host_features(&self) -> u32 {
-        let features = self.features | net_features::RING_EVENT_IDX;
+        let features = self.features | net_features::RING_EVENT_IDX | net_features::MRG_RXBUF;
         if self.vnet_hdr() {
             features | net_features::OFFLOADS
         } else {
@@ -437,6 +441,10 @@ impl VirtioNetMmio {
 
     fn event_idx(&self) -> bool {
         self.guest_features.load(Ordering::Relaxed) & net_features::RING_EVENT_IDX != 0
+    }
+
+    fn mergeable(&self) -> bool {
+        self.guest_features.load(Ordering::Relaxed) & net_features::MRG_RXBUF != 0
     }
 
     /// Offload features the guest negotiated.
@@ -719,6 +727,19 @@ impl VirtioNetMmio {
         processor.set_event_idx(self.event_idx());
         let old_used = processor.last_used_idx();
 
+        if self.mergeable() {
+            let (delivered, tap_empty) =
+                self.rx_mergeable_from_tap(processor, &mem, dirty.as_ref(), tap_fd, max_frames);
+            if delivered > 0 && processor.needs_notification(&mem, old_used) {
+                self.rx_irq_pending.store(true, Ordering::Release);
+            }
+            drop(proc_guard);
+            if self.is_failed() {
+                return Err(MmioError::Device);
+            }
+            return Ok(Some((delivered, tap_empty)));
+        }
+
         let mut delivered = 0usize;
         let mut tap_empty = false;
         processor.process_queue_descriptors_dirty(&mem, dirty.as_ref(), |_readable, writable| {
@@ -806,6 +827,232 @@ impl VirtioNetMmio {
         Ok(Some((delivered, tap_empty)))
     }
 
+    /// Whether a received frame's header uses only offloads the guest
+    /// accepted. A tap holds the previous driver's offloads until the new
+    /// one's are applied, so this can briefly fail.
+    fn rx_header_allowed(&self, header: &[u8; VIRTIO_NET_HDR_LEN]) -> bool {
+        let accepted = self.guest_features.load(Ordering::Relaxed);
+        let needs_csum = header[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM != 0;
+        let gso_ok = match header[1] {
+            VIRTIO_NET_HDR_GSO_NONE => true,
+            VIRTIO_NET_HDR_GSO_TCPV4 => accepted & net_features::GUEST_TSO4 != 0,
+            VIRTIO_NET_HDR_GSO_TCPV6 => accepted & net_features::GUEST_TSO6 != 0,
+            _ => false,
+        };
+        (!needs_csum || accepted & net_features::GUEST_CSUM != 0) && gso_ok
+    }
+
+    /// Largest frame, header included, the guest can be handed: a
+    /// segmentation-offload frame once it accepted one, else one MTU.
+    fn rx_frame_limit(&self) -> usize {
+        let accepted = self.guest_features.load(Ordering::Relaxed);
+        if accepted & (net_features::GUEST_TSO4 | net_features::GUEST_TSO6) != 0 {
+            MAX_GSO_FRAME_BYTES
+        } else {
+            MAX_FRAME_BYTES
+        }
+    }
+
+    /// [`Self::rx_from_vnet_tap`] with mergeable receive buffers: each frame
+    /// is read straight into as many posted buffers as it fills, and only
+    /// once they can hold the largest frame the tap may return (a frame
+    /// cut short would be corrupt).
+    #[cfg(target_os = "linux")]
+    fn rx_mergeable_from_tap(
+        &self,
+        processor: &mut VirtQueueProcessor,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        tap_fd: RawFd,
+        max_frames: usize,
+    ) -> (usize, bool) {
+        use vm_memory::GuestMemoryBackend;
+
+        let limit = self.rx_frame_limit();
+        let mut delivered = 0usize;
+        let mut tap_empty = false;
+        let mut buffers: Vec<(u64, u32)> = Vec::new();
+        let mut capacities: Vec<usize> = Vec::new();
+        let mut lens: Vec<u32> = Vec::new();
+        loop {
+            let mut waiting = false;
+            while delivered < max_frames {
+                buffers.clear();
+                capacities.clear();
+                let mut room = 0usize;
+                for chain in processor.peek_writable(mem, limit) {
+                    buffers.extend_from_slice(&chain.buffers);
+                    capacities.push(chain.capacity);
+                    room += chain.capacity;
+                    if room >= limit {
+                        break;
+                    }
+                }
+                if room < limit {
+                    waiting = true;
+                    break;
+                }
+                let mut guards = Vec::with_capacity(buffers.len());
+                let mut iovecs = Vec::with_capacity(buffers.len());
+                for &(addr, len) in &buffers {
+                    let Ok(slice) = mem.get_slice(GuestAddress(addr), len as usize) else {
+                        break;
+                    };
+                    let guard = slice.ptr_guard_mut();
+                    iovecs.push(libc::iovec {
+                        iov_base: guard.as_ptr() as *mut libc::c_void,
+                        iov_len: len as usize,
+                    });
+                    guards.push(guard);
+                }
+                if iovecs.len() < buffers.len() {
+                    // Validated buffers that do not map.
+                    self.fail_device("receive buffer outside guest memory");
+                    break;
+                }
+                // SAFETY: every iovec points into guest memory kept mapped by
+                // its guard for the duration of the call.
+                let rc =
+                    unsafe { libc::readv(tap_fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
+                drop(guards);
+                if rc < 0 {
+                    tap_empty = true;
+                    break;
+                }
+                let len = rc as usize;
+                // The buffers stay posted for the next frame if this one is
+                // empty or uses offloads the guest did not accept.
+                let mut header = [0u8; VIRTIO_NET_HDR_LEN];
+                if len <= VIRTIO_NET_HDR_LEN
+                    || read_chain(mem, &buffers, 0, &mut header).is_err()
+                    || !self.rx_header_allowed(&header)
+                {
+                    log::debug!(
+                        "virtio-net: dropping an empty frame or one with unaccepted offloads"
+                    );
+                    continue;
+                }
+                lens.clear();
+                let mut left = len;
+                for &capacity in &capacities {
+                    if left == 0 {
+                        break;
+                    }
+                    let take = left.min(capacity);
+                    lens.push(take as u32);
+                    left -= take;
+                }
+                if write_chain(
+                    mem,
+                    &buffers,
+                    VIRTIO_NET_HDR_NUM_BUFFERS_OFF,
+                    &(lens.len() as u16).to_le_bytes(),
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                if let Some(dirty) = dirty {
+                    let mut left = len;
+                    for &(addr, size) in &buffers {
+                        let take = left.min(size as usize);
+                        dirty.mark_guest_range(addr, take as u64);
+                        left -= take;
+                        if left == 0 {
+                            break;
+                        }
+                    }
+                }
+                processor.use_peeked(mem, dirty, &lens);
+                delivered += 1;
+                self.rx_packets.fetch_add(1, Ordering::Relaxed);
+                self.rx_bytes
+                    .fetch_add((len - VIRTIO_NET_HDR_LEN) as u64, Ordering::Relaxed);
+            }
+            // Buffers posted after the kick request was read would not kick.
+            if !processor.publish_used(mem, dirty) || !waiting || self.is_failed() {
+                return (delivered, tap_empty);
+            }
+        }
+    }
+
+    /// Copy one frame into as many mergeable receive buffers as it needs.
+    /// `Ok(false)` while the posted buffers cannot hold it yet.
+    fn inject_rx_mergeable(
+        &self,
+        processor: &mut VirtQueueProcessor,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        header: [u8; VIRTIO_NET_HDR_LEN],
+        packet: &[u8],
+    ) -> Result<bool, MmioError> {
+        let need = VIRTIO_NET_HDR_LEN + packet.len();
+        loop {
+            let room: usize = processor
+                .peek_writable(mem, need)
+                .iter()
+                .map(|chain| chain.capacity)
+                .sum();
+            if room >= need {
+                break;
+            }
+            if !processor.publish_used(mem, dirty) {
+                return Ok(false);
+            }
+        }
+        match self.rate_limit_allows(packet.len() as u64) {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(_) => return Err(MmioError::Device),
+        }
+        let mut lens = Vec::new();
+        let mut left = need;
+        for chain in processor.peek_writable(mem, need) {
+            if left == 0 {
+                break;
+            }
+            let take = left.min(chain.capacity);
+            lens.push(take as u32);
+            left -= take;
+        }
+        let mut header = header;
+        header[VIRTIO_NET_HDR_NUM_BUFFERS_OFF..]
+            .copy_from_slice(&(lens.len() as u16).to_le_bytes());
+        let mut sources = [&header[..], packet].into_iter();
+        let mut source: &[u8] = sources.next().unwrap_or_default();
+        'copy: for chain in processor.peek_writable(mem, need).iter().take(lens.len()) {
+            for &(addr, len) in &chain.buffers {
+                let mut at = addr;
+                let mut room = len as usize;
+                while room > 0 {
+                    while source.is_empty() {
+                        match sources.next() {
+                            Some(next) => source = next,
+                            None => break 'copy,
+                        }
+                    }
+                    let take = room.min(source.len());
+                    if mem.write_slice(&source[..take], GuestAddress(at)).is_err() {
+                        self.fail_device("receive buffer write failed");
+                        return Err(MmioError::Device);
+                    }
+                    if let Some(dirty) = dirty {
+                        dirty.mark_guest_range(at, take as u64);
+                    }
+                    source = &source[take..];
+                    room -= take;
+                    at += take as u64;
+                }
+            }
+        }
+        processor.use_peeked(mem, dirty, &lens);
+        processor.publish_used(mem, dirty);
+        self.rx_packets.fetch_add(1, Ordering::Relaxed);
+        self.rx_bytes
+            .fetch_add(packet.len() as u64, Ordering::Relaxed);
+        Ok(true)
+    }
+
     fn inject_rx(
         &self,
         header: Option<[u8; VIRTIO_NET_HDR_LEN]>,
@@ -842,6 +1089,21 @@ impl VirtioNetMmio {
         }
         proc_guard.as_mut().unwrap().set_event_idx(self.event_idx());
         let old_used = proc_guard.as_ref().unwrap().last_used_idx();
+
+        if self.mergeable() {
+            let header = header.unwrap_or_default();
+            let processor = proc_guard.as_mut().unwrap();
+            let delivered =
+                self.inject_rx_mergeable(processor, &mem, dirty.as_ref(), header, packet)?;
+            if delivered && processor.needs_notification(&mem, old_used) {
+                if notify {
+                    self.trigger_interrupt()?;
+                } else {
+                    self.rx_irq_pending.store(true, Ordering::Release);
+                }
+            }
+            return Ok(delivered);
+        }
 
         let mut delivered = false;
         let mut processing_failed = false;
@@ -1566,6 +1828,207 @@ mod tests {
         let avail_event: u16 = mem.read_obj(GuestAddress(used + 4 + 8 * 16)).unwrap();
         assert_eq!(avail_event, 3);
         close_fds(&[tap, peer]);
+    }
+
+    /// `count` single-descriptor receive buffers of `len` bytes, the layout
+    /// Linux posts with mergeable buffers. Returns the buffer base (buffer
+    /// `i` at `base + i * 0x1000`) and the used ring address.
+    fn post_mergeable_buffers(
+        dev: &VirtioNetMmio,
+        mem: &GuestMemoryMmap,
+        count: u16,
+        len: u32,
+    ) -> (u64, u64) {
+        use crate::virtio::vqueue::desc_flags;
+        const DESC: u64 = 0x20_0000;
+        const AVAIL: u64 = 0x20_1000;
+        const USED: u64 = 0x20_2000;
+        const BUF: u64 = 0x21_0000;
+        for i in 0..count as u64 {
+            mem.write_obj(
+                Descriptor {
+                    addr: BUF + i * 0x1000,
+                    len,
+                    flags: desc_flags::WRITE,
+                    next: 0,
+                },
+                GuestAddress(DESC + i * 16),
+            )
+            .unwrap();
+            mem.write_obj(i as u16, GuestAddress(AVAIL + 4 + i * 2))
+                .unwrap();
+        }
+        mem.write_obj(
+            AvailRing {
+                flags: 0,
+                idx: count,
+            },
+            GuestAddress(AVAIL),
+        )
+        .unwrap();
+        configure_net_queue(dev, 0, DESC, AVAIL, USED);
+        (BUF, USED)
+    }
+
+    fn publish_rx_buffers(mem: &GuestMemoryMmap, count: u16) {
+        mem.write_obj(
+            AvailRing {
+                flags: 0,
+                idx: count,
+            },
+            GuestAddress(0x20_1000),
+        )
+        .unwrap();
+    }
+
+    fn used_entry(mem: &GuestMemoryMmap, used: u64, slot: u64) -> (u32, u32) {
+        let entry: UsedElem = mem.read_obj(GuestAddress(used + 4 + slot * 8)).unwrap();
+        (entry.id, entry.len)
+    }
+
+    fn num_buffers(mem: &GuestMemoryMmap, buf: u64) -> u16 {
+        mem.read_obj(GuestAddress(buf + VIRTIO_NET_HDR_NUM_BUFFERS_OFF as u64))
+            .unwrap()
+    }
+
+    #[test]
+    fn mergeable_buffers_are_offered_and_negotiated() {
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        assert_ne!(dev.host_features() & net_features::MRG_RXBUF, 0);
+        negotiate(&dev, net_features::MRG_RXBUF);
+        assert!(dev.mergeable());
+        negotiate(&dev, 0);
+        assert!(!dev.mergeable());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mergeable_rx_from_a_tap_spreads_a_frame_over_buffers() {
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        dev.set_vnet_hdr(true);
+        negotiate(
+            &dev,
+            net_features::GUEST_CSUM | net_features::MRG_RXBUF | net_features::RING_EVENT_IDX,
+        );
+        let (buf, used) = post_mergeable_buffers(&dev, &mem, 4, 1024);
+        let (tap, peer) = frame_pipe();
+        let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+        frame.extend((0..1500u32).map(|i| i as u8));
+        // SAFETY: `frame` is readable for its length.
+        unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) };
+
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((1, true)));
+        assert_eq!(net_used_idx(&mem, used), 2);
+        assert_eq!(used_entry(&mem, used, 0), (0, 1024));
+        assert_eq!(used_entry(&mem, used, 1), (1, 1512 - 1024));
+        assert_eq!(num_buffers(&mem, buf), 2);
+        let mut got = vec![0u8; 1512];
+        mem.read_slice(&mut got[..1024], GuestAddress(buf)).unwrap();
+        mem.read_slice(&mut got[1024..], GuestAddress(buf + 0x1000))
+            .unwrap();
+        assert_eq!(&got[VIRTIO_NET_HDR_LEN..], &frame[VIRTIO_NET_HDR_LEN..]);
+        assert_eq!(dev.rx_bytes.load(Ordering::Relaxed), 1500);
+        close_fds(&[tap, peer]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mergeable_rx_waits_until_buffers_hold_the_largest_frame() {
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        dev.set_vnet_hdr(true);
+        negotiate(
+            &dev,
+            net_features::GUEST_CSUM | net_features::MRG_RXBUF | net_features::RING_EVENT_IDX,
+        );
+        let (buf, used) = post_mergeable_buffers(&dev, &mem, 4, 1024);
+        publish_rx_buffers(&mem, 1);
+        let (tap, peer) = frame_pipe();
+        let mut frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+        frame.extend_from_slice(&[9u8; 100]);
+        // SAFETY: `frame` is readable for its length.
+        unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) };
+
+        // 1024 bytes cannot hold an MTU frame: the frame stays in the tap
+        // and the driver is asked to kick once it posts past buffer 1.
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((0, false)));
+        assert_eq!(net_used_idx(&mem, used), 0);
+        let avail_event: u16 = mem.read_obj(GuestAddress(used + 4 + 16 * 8)).unwrap();
+        assert_eq!(avail_event, 1);
+
+        publish_rx_buffers(&mem, 2);
+        // Delivered; the one buffer left is too small to read the next
+        // frame into, so the tap is not read again (nor known to be empty).
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((1, false)));
+        assert_eq!(used_entry(&mem, used, 0), (0, 112));
+        assert_eq!(num_buffers(&mem, buf), 1);
+
+        // With receive TSO accepted the bar is a 64 KiB frame.
+        let tso = VirtioNetMmio::new(6, [0; 6]);
+        tso.set_guest_memory(mem.clone());
+        tso.set_vnet_hdr(true);
+        negotiate(&tso, net_features::OFFLOADS | net_features::MRG_RXBUF);
+        post_mergeable_buffers(&tso, &mem, 16, 1024);
+        // SAFETY: `frame` is readable for its length.
+        unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) };
+        assert_eq!(tso.rx_from_vnet_tap(tap, 64).unwrap(), Some((0, false)));
+        close_fds(&[tap, peer]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mergeable_rx_keeps_buffers_for_a_frame_it_drops() {
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        dev.set_vnet_hdr(true);
+        negotiate(&dev, net_features::GUEST_CSUM | net_features::MRG_RXBUF);
+        let (_, used) = post_mergeable_buffers(&dev, &mem, 4, 1024);
+        let (tap, peer) = frame_pipe();
+        let mut tso_frame = vec![0u8; VIRTIO_NET_HDR_LEN];
+        tso_frame[1] = VIRTIO_NET_HDR_GSO_TCPV4;
+        tso_frame.extend_from_slice(&[1u8; 100]);
+        let mut plain = vec![0u8; VIRTIO_NET_HDR_LEN];
+        plain.extend_from_slice(&[2u8; 100]);
+        for frame in [&tso_frame, &plain] {
+            // SAFETY: `frame` is readable for its length.
+            unsafe { libc::write(peer, frame.as_ptr() as *const libc::c_void, frame.len()) };
+        }
+        assert_eq!(dev.rx_from_vnet_tap(tap, 64).unwrap(), Some((1, true)));
+        assert_eq!(net_used_idx(&mem, used), 1, "only the accepted frame");
+        assert_eq!(used_entry(&mem, used, 0), (0, 112));
+        close_fds(&[tap, peer]);
+    }
+
+    #[test]
+    fn mergeable_copy_path_spreads_a_packet_or_waits() {
+        let mem = new_mem();
+        let dev = VirtioNetMmio::new(6, [0; 6]);
+        dev.set_guest_memory(mem.clone());
+        negotiate(&dev, net_features::MRG_RXBUF);
+        let (buf, used) = post_mergeable_buffers(&dev, &mem, 3, 1024);
+        publish_rx_buffers(&mem, 1);
+        let packet: Vec<u8> = (0..1500u32).map(|i| (i * 7) as u8).collect();
+        assert!(
+            !dev.inject_rx_packet(&packet).unwrap(),
+            "1024 bytes cannot hold it"
+        );
+        assert_eq!(net_used_idx(&mem, used), 0);
+
+        publish_rx_buffers(&mem, 3);
+        assert!(dev.inject_rx_packet(&packet).unwrap());
+        assert_eq!(net_used_idx(&mem, used), 2);
+        assert_eq!(used_entry(&mem, used, 0), (0, 1024));
+        assert_eq!(used_entry(&mem, used, 1), (1, 1512 - 1024));
+        assert_eq!(num_buffers(&mem, buf), 2);
+        let mut got = vec![0u8; 1512];
+        mem.read_slice(&mut got[..1024], GuestAddress(buf)).unwrap();
+        mem.read_slice(&mut got[1024..], GuestAddress(buf + 0x1000))
+            .unwrap();
+        assert_eq!(&got[VIRTIO_NET_HDR_LEN..], &packet[..]);
     }
 
     #[test]

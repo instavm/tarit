@@ -203,6 +203,14 @@ struct DescriptorChain {
     len: u32,
 }
 
+/// A device-writable chain seen on the avail ring but not yet used.
+#[derive(Debug, Clone)]
+pub struct PeekedChain {
+    pub head: u16,
+    pub buffers: Vec<(u64, u32)>,
+    pub capacity: usize,
+}
+
 /// A virtqueue processor. Walks the avail ring, processes descriptor chains,
 /// and updates the used ring.
 pub struct VirtQueueProcessor {
@@ -213,6 +221,11 @@ pub struct VirtQueueProcessor {
     /// when it needs an interrupt and the device says (`avail_event`) when
     /// it needs a kick, instead of one of each per buffer.
     event_idx: bool,
+    /// Chains at avail positions `last_avail_idx..` already walked by
+    /// [`Self::peek_writable`]. Still the driver's until used, so nothing
+    /// here is device state: snapshots carry only the two indices and a
+    /// processor rebuilt from them walks the ring again.
+    peeked: std::collections::VecDeque<PeekedChain>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,6 +245,7 @@ impl VirtQueueProcessor {
             last_avail_idx,
             last_used_idx,
             event_idx: false,
+            peeked: Default::default(),
         }
     }
 
@@ -241,6 +255,7 @@ impl VirtQueueProcessor {
             last_avail_idx: state.last_avail_idx,
             last_used_idx: state.last_used_idx,
             event_idx: false,
+            peeked: Default::default(),
         }
     }
 
@@ -255,6 +270,15 @@ impl VirtQueueProcessor {
     /// queue config registers). Does NOT reset indices — the processor
     /// tracks its position across calls.
     pub fn update_config(&mut self, config: QueueConfig) {
+        let c = &self.config;
+        if c.size != config.size
+            || c.desc_table_addr != config.desc_table_addr
+            || c.avail_ring_addr != config.avail_ring_addr
+            || c.used_ring_addr != config.used_ring_addr
+            || c.ready != config.ready
+        {
+            self.peeked.clear();
+        }
         self.config = config;
     }
 
@@ -413,7 +437,6 @@ impl VirtQueueProcessor {
         let mut desc_idx = head_desc_idx;
         let mut readable = Vec::new();
         let mut writable = Vec::new();
-        let mut visited = vec![false; self.config.size as usize];
         let mut chain_bytes = 0usize;
         let mut chain_len = 0usize;
 
@@ -425,19 +448,15 @@ impl VirtQueueProcessor {
                 );
                 return None;
             }
-            let visited_slot = desc_idx as usize;
-            if visited[visited_slot] {
-                log::warn!("vqueue: descriptor loop at index {desc_idx} — rejecting chain");
-                return None;
-            }
+            // A chain longer than the table revisits a descriptor: this
+            // bound rejects every loop without tracking visited entries.
             if chain_len >= self.config.size as usize {
                 log::warn!(
-                    "vqueue: descriptor chain exceeds queue size {} — rejecting chain",
+                    "vqueue: descriptor chain exceeds queue size {} (or loops) — rejecting chain",
                     self.config.size
                 );
                 return None;
             }
-            visited[visited_slot] = true;
 
             let desc_addr = self.desc_addr(desc_idx)?;
             let desc: Descriptor = match read_obj_mem::<Descriptor>(mem, desc_addr) {
@@ -805,6 +824,112 @@ impl VirtQueueProcessor {
             }
         }
     }
+
+    /// The device-writable chains at the front of the avail ring, without
+    /// using them, walking newly published entries until they hold `want`
+    /// bytes or the ring has no more. Used for receive buffers a frame may
+    /// span (VIRTIO_NET_F_MRG_RXBUF). A malformed chain at the front is
+    /// skipped as [`Self::process_queue_descriptors`] skips it; one behind
+    /// a good chain ends the walk until it reaches the front.
+    pub fn peek_writable(&mut self, mem: &GuestMemoryMmap, want: usize) -> &[PeekedChain] {
+        if !self.queue_is_usable(mem, "peek_writable") {
+            self.peeked.clear();
+            return self.peeked.make_contiguous();
+        }
+        let mut have: usize = self.peeked.iter().map(|chain| chain.capacity).sum();
+        let avail_idx = checked_guest_addr(self.config.avail_ring_addr, 2, "avail idx address")
+            .and_then(|addr| read_obj_mem::<u16>(mem, addr));
+        if let Some(avail_idx) = avail_idx {
+            // A driver never has more than a ring's worth outstanding.
+            while have < want
+                && (self.peeked.len() as u16)
+                    < avail_idx
+                        .wrapping_sub(self.last_avail_idx)
+                        .min(self.config.size)
+            {
+                let position = self.last_avail_idx.wrapping_add(self.peeked.len() as u16);
+                let slot = (position % self.config.size) as u64;
+                let Some(head) = checked_add_u64(4, slot * 2, "avail ring entry offset")
+                    .and_then(|off| {
+                        checked_guest_addr(self.config.avail_ring_addr, off, "avail entry")
+                    })
+                    .and_then(|addr| read_obj_mem::<u16>(mem, addr))
+                else {
+                    break;
+                };
+                let chain = self
+                    .walk_descriptor_chain(mem, head)
+                    .filter(|chain| chain.readable.is_empty() && !chain.writable.is_empty());
+                match chain {
+                    Some(chain) => {
+                        let capacity = chain.writable.iter().map(|&(_, len)| len as usize).sum();
+                        have += capacity;
+                        self.peeked.push_back(PeekedChain {
+                            head,
+                            buffers: chain.writable,
+                            capacity,
+                        });
+                    }
+                    None if self.peeked.is_empty() => {
+                        log::warn!("vqueue: skipping a malformed receive chain");
+                        self.reject_available_chain();
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.peeked.make_contiguous()
+    }
+
+    /// Use the first `lens.len()` peeked chains, in order, the i-th with
+    /// `lens[i]` bytes written. The used index is published by
+    /// [`Self::publish_used`].
+    pub fn use_peeked(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        lens: &[u32],
+    ) {
+        for &len in lens {
+            let Some(chain) = self.peeked.pop_front() else {
+                return;
+            };
+            if let Some(addr) = self.used_entry_addr() {
+                let used = UsedElem {
+                    id: chain.head as u32,
+                    len,
+                };
+                let _ = write_obj_mem(mem, dirty, used, addr);
+            }
+            self.last_used_idx = self.last_used_idx.wrapping_add(1);
+            self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+        }
+    }
+
+    /// Publish the used index after [`Self::use_peeked`]. With EVENT_IDX,
+    /// ask the driver to kick only for buffers beyond those already seen,
+    /// and return whether some were published before that request landed
+    /// (the driver will not kick for those, so look again).
+    pub fn publish_used(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+    ) -> bool {
+        if let Some(addr) = self.used_idx_addr() {
+            let _ = write_obj_mem(mem, dirty, self.last_used_idx, addr);
+        }
+        if !self.event_idx {
+            return false;
+        }
+        let seen = self.last_avail_idx.wrapping_add(self.peeked.len() as u16);
+        if let Some(addr) = self.avail_event_addr() {
+            let _ = write_obj_mem(mem, dirty, seen, addr);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        checked_guest_addr(self.config.avail_ring_addr, 2, "avail idx address")
+            .and_then(|addr| read_obj_mem::<u16>(mem, addr))
+            .is_some_and(|idx| idx != seen)
+    }
 }
 
 #[cfg(test)]
@@ -856,6 +981,109 @@ mod tests {
         });
         processor.set_event_idx(true);
         (mem, processor)
+    }
+
+    /// [`event_idx_queue`] with device-writable 16-byte buffers, as a
+    /// receive queue posts them.
+    fn receive_queue(size: u16, published: u16) -> (GuestMemoryMmap, VirtQueueProcessor) {
+        let (mem, processor) = event_idx_queue(size, published);
+        for i in 0..size as u64 {
+            mem.write_obj(desc_flags::WRITE, GuestAddress(0x1_0000 + i * 16 + 12))
+                .unwrap();
+        }
+        (mem, processor)
+    }
+
+    fn used_entry(mem: &GuestMemoryMmap, slot: u64) -> UsedElem {
+        mem.read_obj(GuestAddress(0x3_0000 + 4 + slot * 8)).unwrap()
+    }
+
+    #[test]
+    fn peeking_leaves_chains_available_until_they_are_used() {
+        let (mem, mut processor) = receive_queue(8, 3);
+        let first = processor.peek_writable(&mem, 1).to_vec();
+        assert_eq!(first.len(), 1, "one 16-byte chain covers 1 byte");
+        assert_eq!((first[0].head, first[0].capacity), (0, 16));
+        assert_eq!(
+            processor.peek_writable(&mem, 40).len(),
+            3,
+            "all three cover 40"
+        );
+        assert_eq!(
+            processor.peek_writable(&mem, 1000).len(),
+            3,
+            "no more published"
+        );
+        assert_eq!(processor.avail_idx(), 0, "nothing consumed by peeking");
+
+        processor.use_peeked(&mem, None, &[16, 4]);
+        assert!(!processor.publish_used(&mem, None));
+        let used_idx: u16 = mem.read_obj(GuestAddress(0x3_0000 + 2)).unwrap();
+        assert_eq!(used_idx, 2);
+        assert_eq!((used_entry(&mem, 0).id, used_entry(&mem, 0).len), (0, 16));
+        assert_eq!((used_entry(&mem, 1).id, used_entry(&mem, 1).len), (1, 4));
+        assert_eq!(processor.avail_idx(), 2);
+        // The third stays peeked: the driver is asked to kick only past it.
+        assert_eq!(processor.peek_writable(&mem, 1)[0].head, 2);
+        let avail_event: u16 = mem.read_obj(GuestAddress(0x3_0000 + 4 + 8 * 8)).unwrap();
+        assert_eq!(avail_event, 3);
+    }
+
+    #[test]
+    fn publishing_reports_buffers_posted_before_the_kick_request() {
+        let (mem, mut processor) = receive_queue(8, 2);
+        assert_eq!(processor.peek_writable(&mem, 1000).len(), 2);
+        assert!(!processor.publish_used(&mem, None), "nothing new");
+        // Published after the device looked but before avail_event = 2 was
+        // visible: the driver will not kick for it.
+        mem.write_obj(AvailRing { flags: 0, idx: 3 }, GuestAddress(0x2_0000))
+            .unwrap();
+        assert!(processor.publish_used(&mem, None), "look again");
+        assert_eq!(processor.peek_writable(&mem, 1000).len(), 3);
+    }
+
+    #[test]
+    fn a_malformed_receive_chain_is_skipped_only_at_the_front() {
+        let (mem, mut processor) = receive_queue(8, 3);
+        // Chain 1 is device-readable: not a receive buffer.
+        mem.write_obj(0u16, GuestAddress(0x1_0000 + 16 + 12))
+            .unwrap();
+        let heads: Vec<u16> = processor
+            .peek_writable(&mem, 1000)
+            .iter()
+            .map(|chain| chain.head)
+            .collect();
+        assert_eq!(heads, [0], "the walk stops behind a good chain");
+        processor.use_peeked(&mem, None, &[16]);
+        let heads: Vec<u16> = processor
+            .peek_writable(&mem, 1000)
+            .iter()
+            .map(|chain| chain.head)
+            .collect();
+        assert_eq!(heads, [2], "at the front it is skipped");
+        assert_eq!(processor.avail_idx(), 2);
+    }
+
+    #[test]
+    fn moving_the_rings_forgets_peeked_chains() {
+        let (mem, mut processor) = receive_queue(8, 2);
+        assert_eq!(processor.peek_writable(&mem, 1000).len(), 2);
+        processor.update_config(QueueConfig {
+            size: 8,
+            desc_table_addr: 0x1_0000,
+            avail_ring_addr: 0x2_0000,
+            used_ring_addr: 0x3_0000,
+            ready: true,
+        });
+        assert_eq!(processor.peeked.len(), 2, "same rings keep the walk");
+        processor.update_config(QueueConfig {
+            size: 8,
+            desc_table_addr: 0x1_0000,
+            avail_ring_addr: 0x2_0000,
+            used_ring_addr: 0x3_8000,
+            ready: true,
+        });
+        assert!(processor.peeked.is_empty());
     }
 
     #[test]
