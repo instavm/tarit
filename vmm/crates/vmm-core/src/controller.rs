@@ -4462,6 +4462,9 @@ fn write_snapshot_to_file(
     let mem_len = u64::try_from(mem_dump.len())
         .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
 
+    // Zero pages are left as holes below, so start from an empty file.
+    file.set_len(0)
+        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.write_all(MAGIC)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.write_all(&SNAPSHOT_VERSION.to_le_bytes())
@@ -4480,12 +4483,49 @@ fn write_snapshot_to_file(
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.write_all(&padding)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(mem_dump)
+    let mem_offset = FULL_SNAPSHOT_HEADER_LEN + state_len;
+    write_sparse_at(file, mem_offset, mem_dump).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    file.set_len(mem_offset + mem_len)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     file.flush()
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-    record_ram_verified(file, FULL_SNAPSHOT_HEADER_LEN + state_len, mem_len, mem_crc);
+    record_ram_verified(file, mem_offset, mem_len, mem_crc);
+    Ok(())
+}
+
+/// Write `data` at `offset`, skipping 4 KiB pages that are entirely zero so
+/// they stay holes in a freshly truncated file. Guest RAM is mostly untouched
+/// zero pages, so this cuts both the bytes written and the page cache a
+/// snapshot pins; holes read back as zeros, so the format is unchanged.
+fn write_sparse_at(file: &std::fs::File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    const PAGE: usize = 4096;
+    let is_zero = |page: &[u8]| {
+        // SAFETY: reinterpreting initialised bytes as u64 words is sound;
+        // align_to returns only the correctly aligned middle part.
+        let (head, words, tail) = unsafe { page.align_to::<u64>() };
+        head.iter().all(|b| *b == 0)
+            && words.iter().all(|w| *w == 0)
+            && tail.iter().all(|b| *b == 0)
+    };
+    let mut start = 0usize;
+    while start < data.len() {
+        // Skip a run of zero pages, then write the following run of data pages.
+        while start < data.len() && is_zero(&data[start..(start + PAGE).min(data.len())]) {
+            start += PAGE;
+        }
+        let mut end = start;
+        while end < data.len() && !is_zero(&data[end..(end + PAGE).min(data.len())]) {
+            end += PAGE;
+        }
+        let end = end.min(data.len());
+        if end > start {
+            file.write_all_at(&data[start..end], offset + start as u64)?;
+        }
+        start = end;
+    }
     Ok(())
 }
 
@@ -7628,6 +7668,28 @@ mod tests {
             Some(beside.to_str().unwrap())
         );
         let _ = std::fs::remove_file(&beside);
+    }
+
+    #[test]
+    fn sparse_writes_skip_zero_pages_and_read_back_exactly() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut data = vec![0u8; 64 * 4096 + 100];
+        data[4096..8192].fill(7);
+        data[40 * 4096 + 5] = 9;
+        data[64 * 4096 + 99] = 3;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(0).unwrap();
+        write_sparse_at(&file, 8192, &data).unwrap();
+        file.set_len(8192 + data.len() as u64).unwrap();
+        let mut back = vec![0u8; data.len()];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut back, 8192).unwrap();
+        assert_eq!(back, data);
+        let allocated = file.metadata().unwrap().blocks() * 512;
+        assert!(
+            allocated <= 4 * 4096,
+            "zero pages must stay holes: {allocated}"
+        );
     }
 
     #[test]
