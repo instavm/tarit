@@ -460,6 +460,13 @@ enum Cmd {
         /// is gone.
         #[arg(long, conflicts_with = "live")]
         memory_only: bool,
+
+        /// The full snapshot this VM last wrote or was restored from, kept by
+        /// the caller. If it matches exactly, the pause covers only pages
+        /// changed since and the rest is copied from it after the guest
+        /// resumes; the result is an ordinary full snapshot either way.
+        #[arg(long, conflicts_with_all = ["diff", "live"])]
+        base: Option<String>,
     },
 
     /// Execute a command in the guest VM (via the API).
@@ -652,7 +659,8 @@ fn main() -> Result<()> {
             diff,
             live,
             memory_only,
-        } => api_snapshot(&cli.socket, diff, live, !live && !memory_only),
+            base,
+        } => api_snapshot(&cli.socket, diff, live, !live && !memory_only, base),
         Cmd::Create {
             kernel,
             cmdline,
@@ -1368,11 +1376,18 @@ fn api_update_egress(socket: &str, allowlist: Vec<String>, allow_existing: bool)
     }
 }
 
-fn api_snapshot(socket: &str, diff: bool, live: bool, capture_disks: bool) -> Result<()> {
+fn api_snapshot(
+    socket: &str,
+    diff: bool,
+    live: bool,
+    capture_disks: bool,
+    base: Option<String>,
+) -> Result<()> {
     let request = vmm_api::types::ApiRequest::Snapshot {
         diff,
         live,
         capture_disks,
+        base,
     };
     let body = serde_json::to_vec(&request)?;
     let response = send_raw(socket, &body)?;

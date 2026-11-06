@@ -168,6 +168,7 @@ target/release/vmm --socket /tmp/vmm.sock suspend
 target/release/vmm --socket /tmp/vmm.sock resume
 target/release/vmm --socket /tmp/vmm.sock snapshot
 target/release/vmm --socket /tmp/vmm.sock snapshot --diff
+target/release/vmm --socket /tmp/vmm.sock snapshot --base /path/to/last.snap
 target/release/vmm --socket /tmp/vmm.sock snapshot --memory-only
 target/release/vmm --socket /tmp/vmm.sock snapshot --live
 target/release/vmm --socket /tmp/vmm.sock update-egress \
@@ -188,6 +189,8 @@ A regular `snapshot` (full or `--diff`) also captures every writable disk in the
 Copies use reflink when the filesystem supports it and otherwise copy only the allocated extents. The command prints the captured files as `volume_paths` and releases them to you with the snapshot. Keep them with the snapshot file: restore looks for a moved capture beside the snapshot. Captured disks carry the `user.tarit.disk-template` xattr; every restore writes to its own private overlay in the VMM runtime directory, removed when the VM stops, so captures never change. Use `snapshot --memory-only` for the old memory-only behaviour (the API's `capture_disks: false`, which the orchestrator uses because it manages disks itself). Live snapshots capture a single overlay and require reflink.
 
 A restore enables dirty-page tracking before the guest runs, so `snapshot --diff` after a restore writes only the pages the guest changed since that snapshot. Restoring the tip of a diff chain maps the base image and the long page runs of each diff directly, so it does not slow down as the chain grows.
+
+`snapshot --base PATH` (the API's `base`) takes a full, standalone snapshot while pausing the guest only long enough to write the pages it changed since `PATH`; the rest is copied from `PATH` after the guest resumes. `PATH` must be this VM's last full snapshot, or the snapshot it was restored from, unchanged: the VMM checks its header, size and checksums, and otherwise logs why and takes an ordinary full snapshot. The result is identical to a full snapshot and does not depend on `PATH` afterwards, so either file can be deleted. Use it for the checkpoint, resume, checkpoint loop, where a diff chain would keep every parent alive.
 
 Restore inside a `vmm serve` process by sending the API `restore` request. `overlay` is optional.
 

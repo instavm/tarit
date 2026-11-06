@@ -81,6 +81,12 @@ pub enum ApiRequest {
         /// leave this false.
         #[serde(default)]
         capture_disks: bool,
+        /// A full snapshot file the caller kept from this VM's previous
+        /// checkpoint. If it is exactly the snapshot the VM's dirty log counts
+        /// from, the pause covers only pages dirtied since; otherwise this is
+        /// an ordinary full snapshot. Ignored for diff and live snapshots.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
     },
     /// Transfer one exact VMM-owned scratch file to the caller.
     ReleaseScratch {
@@ -358,6 +364,7 @@ mod tests {
             diff: true,
             live: false,
             capture_disks: false,
+            base: None,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
@@ -370,6 +377,7 @@ mod tests {
             diff: false,
             live: true,
             capture_disks: false,
+            base: None,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: ApiRequest = serde_json::from_str(&s).unwrap();
@@ -398,6 +406,7 @@ mod tests {
             diff: true,
             live: false,
             capture_disks: true,
+            base: None,
         };
         let back: ApiRequest = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
         assert!(matches!(

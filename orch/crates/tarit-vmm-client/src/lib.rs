@@ -485,6 +485,7 @@ impl VmmClient {
             diff,
             live: false,
             capture_disks: false,
+            base: None,
         })? {
             ApiResponse::Snapshot {
                 path,
@@ -526,6 +527,7 @@ impl VmmClient {
             diff: false,
             live: true,
             capture_disks: false,
+            base: None,
         })? {
             ApiResponse::Snapshot {
                 path,
