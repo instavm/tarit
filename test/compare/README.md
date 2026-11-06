@@ -93,11 +93,13 @@ guest `172.16.N.2`; guests resolve names through slirp's resolver via
 (`agentbench_http.py`) records which guest called, which proves guest-to-host
 traffic per clone.
 
-Both VMMs use the same image: build it from any Docker image with tarit's
-converter, for example one with Python, git and a C toolchain:
+Both VMMs use the same image, built from
+[`agent-image/Dockerfile`](agent-image/Dockerfile) (Python, git, a C toolchain)
+and converted with tarit's converter:
 
 ```sh
-target/release/vmm pull docker-daemon:IMAGE --output /var/tmp/agentbench/agent.ext4 \
+docker build -t tarit-agentbench:1 test/compare/agent-image
+target/release/vmm pull docker-daemon:tarit-agentbench:1 --output /var/tmp/agentbench/agent.ext4 \
   --size 3072 --agent guest/agent/vmm-agent
 python3 test/compare/agentbench.py \
   --tarit vmm/target/release/vmm \
