@@ -1023,7 +1023,7 @@ fn boot_on_kvm(
         let irq = 5 + volumes.len() as u32;
         let net_dev = std::sync::Arc::new(VirtioNetMmio::new(irq, mac));
         net_dev.set_guest_memory(guest_mem.clone());
-        net_dev.set_tap_fd(tap.fd);
+        net_dev.set_tap_fd(tap.fd, tap.vnet_hdr);
         let net_irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
             .map_err(|e| anyhow::anyhow!("net EventFd: {e}"))?;
         let net_io_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)

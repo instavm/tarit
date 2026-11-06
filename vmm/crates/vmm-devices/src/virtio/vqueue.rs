@@ -814,6 +814,103 @@ mod tests {
         assert_eq!(c.size, 0);
     }
 
+    /// A queue of `size` single-descriptor chains at fixed addresses, with
+    /// `published` of them in the avail ring.
+    fn event_idx_queue(size: u16, published: u16) -> (GuestMemoryMmap, VirtQueueProcessor) {
+        const DESC: u64 = 0x1_0000;
+        const AVAIL: u64 = 0x2_0000;
+        const USED: u64 = 0x3_0000;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 1024 * 1024)]).unwrap();
+        for i in 0..size {
+            mem.write_obj(
+                Descriptor {
+                    addr: 0x4_0000 + i as u64 * 0x100,
+                    len: 16,
+                    flags: 0,
+                    next: 0,
+                },
+                GuestAddress(DESC + i as u64 * 16),
+            )
+            .unwrap();
+            mem.write_obj(i, GuestAddress(AVAIL + 4 + i as u64 * 2))
+                .unwrap();
+        }
+        mem.write_obj(
+            AvailRing {
+                flags: 0,
+                idx: published,
+            },
+            GuestAddress(AVAIL),
+        )
+        .unwrap();
+        let mut processor = VirtQueueProcessor::new(QueueConfig {
+            size,
+            desc_table_addr: DESC,
+            avail_ring_addr: AVAIL,
+            used_ring_addr: USED,
+            ready: true,
+        });
+        processor.set_event_idx(true);
+        (mem, processor)
+    }
+
+    #[test]
+    fn event_idx_publishes_avail_event_and_catches_late_buffers() {
+        let (mem, mut processor) = event_idx_queue(8, 2);
+        // While the first chain is handled the driver publishes a third one;
+        // the pass must not end without it, since the driver will not kick.
+        let mut handled = 0;
+        let processed = processor.process_queue_descriptors_dirty(&mem, None, |_, _| {
+            handled += 1;
+            if handled == 1 {
+                mem.write_obj(AvailRing { flags: 0, idx: 3 }, GuestAddress(0x2_0000))
+                    .unwrap();
+            }
+            Some(0)
+        });
+        assert_eq!(processed, 3);
+        let avail_event: u16 = mem.read_obj(GuestAddress(0x3_0000 + 4 + 8 * 8)).unwrap();
+        assert_eq!(avail_event, 3, "kick me when you publish past 3");
+        let used_idx: u16 = mem.read_obj(GuestAddress(0x3_0000 + 2)).unwrap();
+        assert_eq!(used_idx, 3);
+    }
+
+    #[test]
+    fn event_idx_notifies_only_when_used_event_is_passed() {
+        let (mem, mut processor) = event_idx_queue(8, 4);
+        // used_event sits after the avail ring entries.
+        mem.write_obj(1u16, GuestAddress(0x2_0000 + 4 + 8 * 2))
+            .unwrap();
+        let old = processor.last_used_idx();
+        processor.process_queue_descriptors_dirty(&mem, None, |_, _| Some(0));
+        assert!(
+            processor.needs_notification(&mem, old),
+            "used 0..4 passed used_event 1"
+        );
+        let old = processor.last_used_idx();
+        assert!(!processor.needs_notification(&mem, old), "nothing new");
+        // Without EVENT_IDX every new used entry notifies.
+        processor.set_event_idx(false);
+        assert!(processor.needs_notification(&mem, old));
+        // A driver asking for an interrupt further ahead gets none yet.
+        let (mem, mut processor) = event_idx_queue(8, 2);
+        mem.write_obj(5u16, GuestAddress(0x2_0000 + 4 + 8 * 2))
+            .unwrap();
+        processor.process_queue_descriptors_dirty(&mem, None, |_, _| Some(0));
+        assert!(!processor.needs_notification(&mem, 0));
+    }
+
+    #[test]
+    fn without_event_idx_nothing_is_written_after_the_used_ring() {
+        let (mem, mut processor) = event_idx_queue(8, 2);
+        processor.set_event_idx(false);
+        mem.write_obj(0xbeefu16, GuestAddress(0x3_0000 + 4 + 8 * 8))
+            .unwrap();
+        processor.process_queue_descriptors_dirty(&mem, None, |_, _| Some(0));
+        let after: u16 = mem.read_obj(GuestAddress(0x3_0000 + 4 + 8 * 8)).unwrap();
+        assert_eq!(after, 0xbeef);
+    }
+
     #[test]
     fn processor_starts_with_zero_indices() {
         let p = VirtQueueProcessor::new(QueueConfig {

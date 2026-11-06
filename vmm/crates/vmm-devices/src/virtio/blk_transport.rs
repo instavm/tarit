@@ -24,16 +24,17 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// VIRTIO_F_VERSION_1 (bit 32) is required for virtio-mmio v2 devices.
 /// VIRTIO_BLK_F_FLUSH (bit 9) enables flush support.
 ///
-/// We deliberately do NOT advertise VIRTIO_RING_F_EVENT_IDX (bit 29): our
-/// virtqueue processor uses simple avail/used-index notification and does not
-/// implement the used_event/avail_event suppression that EVENT_IDX requires.
-/// Advertising it made the guest complete exactly one request and then stall,
-/// because its notification bookkeeping diverged from ours.
+/// VIRTIO_RING_F_EVENT_IDX (bit 29): the queue processor honours the driver's
+/// used_event and publishes avail_event (re-checking the ring after it), so
+/// the guest interrupts and kicks only when the other side asks. (Offering it
+/// before the processor wrote avail_event left the guest waiting for
+/// permission to kick after its first request.)
 /// VIRTIO_BLK_F_SIZE_MAX (bit 1) caps every data segment at the virtqueue's
 /// per-descriptor limit. Without it Linux sends one segment per request of
 /// any size, and a segment over that limit was rejected and never completed,
 /// hanging the guest's I/O under large sequential writes.
-const BLK_FEATURES_LOW: u32 = (1 << 9) | VIRTIO_BLK_F_SIZE_MAX; // FLUSH + SIZE_MAX
+const BLK_FEATURES_LOW: u32 = (1 << 9) | VIRTIO_BLK_F_SIZE_MAX | VIRTIO_RING_F_EVENT_IDX; // FLUSH + SIZE_MAX + EVENT_IDX
+const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
 const VIRTIO_BLK_F_SIZE_MAX: u32 = 1 << 1;
 /// VIRTIO_BLK_F_RO (bit 5): offered only for a read-only backend, so the guest
 /// marks the disk read-only instead of discovering it through write errors.
@@ -579,6 +580,10 @@ impl VirtioBlkMmio {
         } else {
             proc_guard.as_mut().unwrap().update_config(config);
         }
+        let event_idx =
+            self.guest_features_low.load(Ordering::Relaxed) & VIRTIO_RING_F_EVENT_IDX != 0;
+        proc_guard.as_mut().unwrap().set_event_idx(event_idx);
+        let old_used = proc_guard.as_ref().unwrap().last_used_idx();
 
         let mut backend_guard = self.try_lock_state(&self.backend, "backend")?;
         if backend_guard.is_none() {
@@ -717,7 +722,13 @@ impl VirtioBlkMmio {
         // If we processed any requests, signal an interrupt to the guest.
         if _count > 0 {
             log::debug!("BLK process_queue: processed {_count} request(s)");
-            self.trigger_interrupt()?;
+            if proc_guard
+                .as_ref()
+                .unwrap()
+                .needs_notification(&mem, old_used)
+            {
+                self.trigger_interrupt()?;
+            }
         }
         if processing_failed || self.is_failed() {
             Err(MmioError::Device)
