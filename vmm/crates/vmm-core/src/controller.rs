@@ -5405,13 +5405,29 @@ fn resolve_snapshot_parent(parent: &str, snapshot_root: &Path) -> Result<PathBuf
         return Err(VmmError::Snapshot("empty diff parent path".into()));
     }
     let parent_path = Path::new(parent);
-    let candidate = if parent_path.is_absolute() {
+    let mut candidate = if parent_path.is_absolute() {
         parent_path.to_path_buf()
     } else {
         snapshot_root.join(parent_path)
     };
+    // A chain released by the VMM is usually moved to its own directory; the
+    // recorded parent path then points at the old location. Accept the file
+    // of the same name beside the tip.
+    if !candidate.exists() {
+        if let Some(beside) = parent_path
+            .file_name()
+            .map(|name| snapshot_root.join(name))
+            .filter(|beside| beside.exists())
+        {
+            candidate = beside;
+        }
+    }
     let metadata = std::fs::symlink_metadata(&candidate).map_err(|e| {
-        VmmError::Snapshot(format!("stat diff parent {}: {e}", candidate.display()))
+        VmmError::Snapshot(format!(
+            "stat diff parent {}: {e}; keep every snapshot of a chain in one directory \
+             under the names the VMM gave them",
+            candidate.display()
+        ))
     })?;
     if !metadata.file_type().is_file() {
         return Err(VmmError::Snapshot(format!(
@@ -7690,6 +7706,52 @@ mod tests {
             allocated <= 4 * 4096,
             "zero pages must stay holes: {allocated}"
         );
+    }
+
+    // A chain written in one directory and moved to another under the same
+    // names still restores: the recorded parent path is stale.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn moved_diff_chain_finds_its_parent_beside_the_tip() {
+        use vmm_memory_backend::dirty::DirtyBitmap;
+        let pid = std::process::id();
+        let first = private_runtime_dir()
+            .unwrap()
+            .join(format!("t-chain-a-{pid}"));
+        let moved = private_runtime_dir()
+            .unwrap()
+            .join(format!("t-chain-b-{pid}"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        let mib = usize::try_from(crate::config::MIB).expect("MiB fits usize");
+        let mem = vec![0x31u8; mib];
+        let base = first.join("base.snap");
+        write_snapshot_file(base.to_str().unwrap(), b"b", &mem, false).unwrap();
+        let mut next = mem.clone();
+        next[..4096].fill(0x42);
+        let mut dirty = DirtyBitmap::new();
+        dirty.mark(0);
+        let tip = first.join("tip.snap");
+        write_diff_snapshot_file(
+            tip.to_str().unwrap(),
+            base.to_str().unwrap(),
+            b"t",
+            &next,
+            &dirty,
+        )
+        .unwrap();
+        for name in ["base.snap", "tip.snap"] {
+            std::fs::rename(first.join(name), moved.join(name)).unwrap();
+        }
+        let (gm, state, _) =
+            load_snapshot_chain_with(moved.join("tip.snap").to_str().unwrap(), RamLoad::Map)
+                .unwrap();
+        assert_eq!(state, b"t");
+        let mut page = [0u8; 4096];
+        gm.read_phys(0, &mut page).unwrap();
+        assert_eq!(page, [0x42; 4096]);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&moved);
     }
 
     #[test]
