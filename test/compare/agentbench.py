@@ -38,6 +38,15 @@ def sh(cmd, check=True, **kw):
     return subprocess.run(cmd, check=check, capture_output=True, text=True, **kw)
 
 
+def die_with_harness():
+    """preexec_fn: SIGKILL this child when the harness exits, even by a
+    crash, so a failed run leaves no namespace or slirp4netns behind. Only
+    for children started on the main thread: the signal follows the thread
+    that spawned the child."""
+    import ctypes
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+
+
 # ------------------------------------------------------------------ the lab
 class Lab:
     """Rootless user+network namespace with internet egress via slirp4netns.
@@ -56,8 +65,16 @@ class Lab:
         self.taps = set()
 
     def start(self):
-        self.holder = subprocess.Popen(["unshare", "-Urn", "--fork", "sleep", "infinity"],
-                                       start_new_session=True)
+        try:
+            return self._start()
+        except BaseException:
+            self.stop()
+            raise
+
+    def _start(self):
+        os.makedirs(self.work, exist_ok=True)
+        self.holder = subprocess.Popen(["unshare", "-Urn", "--fork", "--kill-child", "sleep", "infinity"],
+                                       start_new_session=True, preexec_fn=die_with_harness)
         # The namespaced sleep is the holder's child.
         deadline = now() + 5
         self.pid = None
@@ -71,7 +88,8 @@ class Lab:
         self.slirp = subprocess.Popen(
             ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback",
              str(self.pid), "tap-slirp"],
-            stdout=open(os.path.join(self.work, "slirp.log"), "wb"), stderr=subprocess.STDOUT)
+            stdout=open(os.path.join(self.work, "slirp.log"), "wb"), stderr=subprocess.STDOUT,
+            preexec_fn=die_with_harness)
         # slirp4netns creates tap-slirp asynchronously; until it exists the
         # query fails, so keep polling instead of treating that as an error.
         deadline = now() + 10
@@ -87,7 +105,8 @@ class Lab:
         self.http_log = os.path.join(self.work, "lab-http.log")
         self.http = subprocess.Popen(self.prefix + [sys.executable, server, str(HOST_HTTP_PORT),
                                                     self.http_log],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     preexec_fn=die_with_harness)
         return self
 
     def run(self, script, check=True):
@@ -116,7 +135,7 @@ class Lab:
             server = subprocess.Popen(
                 self.prefix + [sys.executable, "-m", "http.server", str(BULK_HTTP_PORT),
                                "--bind", "0.0.0.0", "--directory", directory],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=die_with_harness)
             self.run("ip link set lo up")
             deadline = now() + 10
             while self.run("curl -sf -o /dev/null -r 0-0 http://127.0.0.1:%d/bulk.bin" % BULK_HTTP_PORT,
