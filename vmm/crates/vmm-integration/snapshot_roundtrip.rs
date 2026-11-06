@@ -28,6 +28,9 @@ fn local_test_dir(name: &str) -> PathBuf {
     let dir =
         workspace_path("target/test-work").join(format!("{name}-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // The VMM refuses overlays in group/world-writable directories, so do not
+    // depend on the caller's umask.
+    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
     dir
 }
 
@@ -109,6 +112,13 @@ fn restored_clones_get_private_rootfs_overlays() {
         .release_scratch(&snap_path, snapshot_identity)
         .expect("transfer golden snapshot ownership");
     artifacts.snapshots.push(PathBuf::from(&snap_path));
+    // The VMM created the golden overlay, so it would remove it on stop; the
+    // restores below reuse it as their template, so take ownership first.
+    let overlay_identity = vmm_core::gc::OwnedScratchFile::identity_for(&golden_overlay)
+        .expect("golden overlay identity");
+    golden
+        .release_scratch(&golden_overlay.to_string_lossy(), overlay_identity)
+        .expect("transfer golden overlay ownership");
     golden.stop().ok();
     let original_golden_overlay =
         std::fs::read(&golden_overlay).expect("read reusable golden overlay");
@@ -121,7 +131,6 @@ fn restored_clones_get_private_rootfs_overlays() {
         .exec(&format!("sh -c 'echo clone-a > {marker} && sync'"), 30_000)
         .expect("write marker in clone A");
     assert_eq!(code, 0, "clone A marker write must succeed");
-    clone_a.stop().ok();
 
     let clone_b = VmmController::new();
     clone_b
@@ -140,8 +149,9 @@ fn restored_clones_get_private_rootfs_overlays() {
         .expect("execute command in clone B");
     assert_eq!(code, 0, "clone B command must succeed: {out}");
     assert!(out.contains("clone-b"));
-    clone_b.stop().ok();
 
+    // Each clone's overlay is VMM-owned and removed when it stops, so compare
+    // them while both run (a removed file's inode number can be reused).
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -173,6 +183,8 @@ fn restored_clones_get_private_rootfs_overlays() {
             "clones must not share a writable backing file"
         );
     }
+    clone_a.stop().ok();
+    clone_b.stop().ok();
 
     assert_eq!(
         std::fs::read(&base_rootfs).expect("reread base rootfs"),

@@ -102,6 +102,9 @@ pub struct VmInstance {
     pub lazy_restore: Option<vmm_memory_backend::LazyRestore>,
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub running: Option<RunningVm>,
+    /// Keeps the process's private runtime directory in place while this VM
+    /// exists. Declared last, so it is released after everything above.
+    pub runtime_dir: RuntimeDirUse,
 }
 
 impl Drop for VmInstance {
@@ -113,7 +116,32 @@ impl Drop for VmInstance {
             self.lazy_restore = None;
         }
         self.transient_files.cleanup();
-        cleanup_private_runtime_dir();
+    }
+}
+
+/// VMs in this process (built or being built) that keep files in its private
+/// runtime directory. The directory is removed when the last one goes, under
+/// the same lock that registers a new one, so one VM's teardown cannot remove
+/// it while another VM is staging a socket or file there.
+static RUNTIME_DIR_USERS: Mutex<usize> = Mutex::new(0);
+
+#[derive(Debug)]
+pub struct RuntimeDirUse(());
+
+impl RuntimeDirUse {
+    pub(crate) fn acquire() -> Self {
+        *RUNTIME_DIR_USERS.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Self(())
+    }
+}
+
+impl Drop for RuntimeDirUse {
+    fn drop(&mut self) {
+        let mut users = RUNTIME_DIR_USERS.lock().unwrap_or_else(|e| e.into_inner());
+        *users = users.saturating_sub(1);
+        if *users == 0 {
+            cleanup_private_runtime_dir();
+        }
     }
 }
 
@@ -525,6 +553,7 @@ impl VmmController {
                 mem_dump: None,
                 lazy_restore: None,
                 running: None,
+                runtime_dir: RuntimeDirUse::acquire(),
             });
         }
 
@@ -547,6 +576,7 @@ impl VmmController {
                 lazy_restore: None,
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
                 running: None,
+                runtime_dir: RuntimeDirUse::acquire(),
             });
         }
 
@@ -1102,6 +1132,8 @@ impl VmmController {
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub fn create_live(&self, config: VmConfig) -> Result<()> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Create)?;
+        // Taken before the first runtime file (the vsock socket) is staged.
+        let runtime_dir = RuntimeDirUse::acquire();
         use crate::vcpu_thread::VcpuThread;
         use vmm_loader::load;
         use vmm_memory_backend::GuestMemory;
@@ -1435,6 +1467,7 @@ impl VmmController {
                 keep_alive_fds: irq_evts,
                 dirty_logging_from_start: false,
             }),
+            runtime_dir,
         });
 
         log::info!("VM: created (live, full_boot={full_boot}) — vCPU executing in background");
@@ -1883,6 +1916,7 @@ impl VmmController {
         use std::time::Instant;
 
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Restore)?;
+        let runtime_dir = RuntimeDirUse::acquire();
         let start = Instant::now();
         let restored =
             restore_snapshot_with_policy(snapshot_path, memory_policy, memory_integrity.as_ref())?;
@@ -2065,6 +2099,7 @@ impl VmmController {
             mem_dump: None,
             lazy_restore,
             running,
+            runtime_dir,
         });
         drop(slot);
         if resumed {
@@ -8330,6 +8365,7 @@ mod tests {
             lazy_restore: None,
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             running: None,
+            runtime_dir: RuntimeDirUse::acquire(),
         });
         controller
     }

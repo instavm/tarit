@@ -126,32 +126,13 @@ impl OwnedControlSocket {
         std::fs::remove_file(&self.path)?;
         Ok(true)
     }
-
-    fn remove_empty_private_parent(&self) {
-        let expected = std::env::temp_dir()
-            .join(".vmm-runtime")
-            .join(format!("vmm-{}", std::process::id()));
-        if self.path.parent() != Some(expected.as_path()) {
-            return;
-        }
-        if let Err(error) = std::fs::remove_dir(&expected) {
-            if !matches!(
-                error.kind(),
-                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
-            ) {
-                log::warn!(
-                    "remove empty vsock runtime dir {}: {error}",
-                    expected.display()
-                );
-            }
-        }
-    }
 }
 
 impl Drop for OwnedControlSocket {
     fn drop(&mut self) {
         match self.remove() {
-            Ok(_) => self.remove_empty_private_parent(),
+            // The VM's runtime-directory guard removes the directory.
+            Ok(_) => {}
             Err(error) => {
                 log::warn!(
                     "remove vsock control socket {}: {error}",
