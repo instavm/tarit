@@ -41,11 +41,13 @@ python3 test/compare/vmbench.py \
 The rootfs must use `vmm-agent` as init. Socket paths are created under
 `/run/user/$UID/vmbench`. Firecracker's `rebase-snap` must sit next to its
 binary. Each disk copy is written back before timing so that neither VMM pays
-for the harness's own page-cache writeback.
+for the harness's own page-cache writeback. Snapshot files that `vmm snapshot` hands back belong to
+the caller; the harness removes them after each scenario.
 
 Debugging aids: `VMBENCH_TARIT_VERBOSE=1|2` raises tarit's log level,
 `VMBENCH_GDB=1` runs tarit under gdb and dumps every thread's stack when a VM
-goes exec-dead, and `VMBENCH_STRACE=openat` straces tarit.
+goes exec-dead, and `VMBENCH_STRACE=openat` straces tarit with timestamps and
+per-call durations (`VMBENCH_STRACE_K=1` adds stack traces).
 
 Publish results with the commit, host CPU and kernel, guest kernel, rootfs
 identity, and the raw JSON.

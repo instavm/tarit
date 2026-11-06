@@ -11,6 +11,17 @@ import struct, subprocess, sys, tempfile, threading, time
 
 RUN = "/run/user/%d/vmbench" % os.getuid()
 VERBOSE = int(os.environ.get("VMBENCH_TARIT_VERBOSE", "0"))
+# Files `vmm snapshot` released to us. They live in the VMM's runtime directory
+# and belong to the caller, so each scenario removes whatever it did not move.
+RELEASED = []
+
+
+def remove_released():
+    while RELEASED:
+        try:
+            os.unlink(RELEASED.pop())
+        except FileNotFoundError:
+            pass
 GDB = os.environ.get("VMBENCH_GDB") == "1"
 CMDLINE = ("console=ttyS0 quiet loglevel=0 reboot=k panic=-1 nomodule pci=off "
            "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd swiotlb=noforce "
@@ -183,7 +194,8 @@ class Tarit:
                     "-ex", "handle SIGPIPE SIGUSR1 SIGUSR2 SIGCHLD nostop noprint pass",
                     "-ex", "run", "-ex", "thread apply all bt 40", "-ex", "kill", "--args"] + args
         elif os.environ.get("VMBENCH_STRACE"):
-            args = ["strace", "-f", "-k", "-e", "trace=" + os.environ["VMBENCH_STRACE"],
+            stacks = ["-k"] if os.environ.get("VMBENCH_STRACE_K") else []
+            args = ["strace", "-f", "-tt", "-T"] + stacks + ["-e", "trace=" + os.environ["VMBENCH_STRACE"],
                     "-e", "signal=SIGSYS", "-o", os.path.join(RUN, "t-%s.strace" % tag)] + args
         self.proc = subprocess.Popen(args, stdout=self.log, stderr=subprocess.STDOUT)
         wait_path(self.sock, timeout=120 if GDB else 5)
@@ -238,6 +250,7 @@ class Tarit:
                              capture_output=True, text=True, timeout=120)
         r = json.loads(out.stdout)
         assert r.get("status") == "snapshot", (r, out.stderr)
+        RELEASED.extend(r.get("volume_paths", []))
         dest = os.path.join(out_dir, "tarit-d%d.snap" % step)
         os.rename(r["path"], dest)
         return dest
@@ -250,6 +263,7 @@ class Tarit:
                              capture_output=True, text=True, timeout=120)
         r = json.loads(out.stdout)
         assert r.get("status") == "snapshot", (r, out.stderr)
+        RELEASED.extend([r["path"]] + r.get("volume_paths", []))
         return r
 
     def restore(self, tag, snap, policy="auto"):
@@ -301,9 +315,20 @@ class Firecracker:
         self.listener = None
 
     def _api(self, method, path, body=None):
-        c = UHTTP(self.api)
-        c.request(method, path, json.dumps(body) if body is not None else None,
-                  {"Content-Type": "application/json"})
+        # The socket path exists between bind() and listen(); retry a refused
+        # connect exactly like the tarit client does.
+        end = now() + 2.0
+        while True:
+            c = UHTTP(self.api)
+            try:
+                c.request(method, path, json.dumps(body) if body is not None else None,
+                          {"Content-Type": "application/json"})
+                break
+            except ConnectionRefusedError:
+                c.close()
+                if now() > end:
+                    raise
+                time.sleep(0.001)
         r = c.getresponse()
         data = r.read()
         c.close()
@@ -665,8 +690,6 @@ def scen_fanout(kind, a, work):
         vm.stop()
         golden = os.path.join(root, "golden.snap")
         os.rename(snap["path"], golden)
-        if snap.get("overlay_path") and os.path.dirname(snap["overlay_path"]) != root:
-            os.rename(snap["overlay_path"], os.path.join(root, os.path.basename(snap["overlay_path"])))
         vms = [make(kind, a) for _ in range(n)]
 
         def one(i):
@@ -808,7 +831,10 @@ def main():
         for s in a.scenarios.split(","):
             print("== %s %s" % (kind, s), file=sys.stderr, flush=True)
             try:
-                results[kind][s] = SCEN[s](kind, a, a.work)
+                try:
+                    results[kind][s] = SCEN[s](kind, a, a.work)
+                finally:
+                    remove_released()
             except Exception as e:  # noqa: BLE001
                 results[kind][s] = {"error": repr(e)}
             print(json.dumps(results[kind][s]), file=sys.stderr, flush=True)
