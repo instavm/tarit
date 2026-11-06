@@ -9218,6 +9218,15 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn unrelated process");
+        // Until the child execs it is still a copy of this test binary, which
+        // fails the check for a different reason on a loaded host.
+        let exe = PathBuf::from(format!("/proc/{}/exe", child.id()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_link(&exe).is_ok_and(|path| path.ends_with("sleep"))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let result = verify_live_vmm(child.id(), &socket, None, Path::new("sleep"), &allowed_uids);
         let _ = child.kill();
         let _ = child.wait();
