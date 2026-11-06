@@ -4669,9 +4669,6 @@ fn write_scratch_snapshot_file_from_memory_file(
         log::warn!(
             "live_snapshot: RAM range reflink unavailable ({error}); using streamed publication"
         );
-        output
-            .seek(SeekFrom::Start(mem_offset))
-            .map_err(|error| VmmError::Snapshot(format!("seek snapshot RAM: {error}")))?;
     }
 
     let mut source = memory_file
@@ -4697,9 +4694,14 @@ fn write_scratch_snapshot_file_from_memory_file(
                 .map(|bytes| -> [u8; 32] { Sha256::digest(bytes).into() }),
         );
         if !reflinked {
-            output
-                .write_all(&buffer[..chunk])
-                .map_err(|error| VmmError::Snapshot(format!("stream snapshot RAM: {error}")))?;
+            // The memory range of the freshly sized output is a hole: zero
+            // pages stay holes, as they are in the staged image.
+            crate::live_snapshot::write_nonzero_pages(
+                &output,
+                &buffer[..chunk],
+                mem_offset + copied,
+            )
+            .map_err(|error| VmmError::Snapshot(format!("stream snapshot RAM: {error}")))?;
         }
         let chunk_u64 = chunk as u64;
         drop_file_cache(memory_file, copied, chunk_u64);

@@ -422,6 +422,44 @@ impl GuestMemory {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
+    /// The UFFD lazy-restore hook while RAM still depends on it.
+    #[cfg(target_os = "linux")]
+    pub fn lazy_page_discard(&self) -> Option<crate::uffd_restore::LazyPageDiscard> {
+        self.lazy_page_discard
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Which pages of guest RAM the kernel has populated (present or swapped
+    /// out), from /proc/self/pagemap: in anonymous memory every other page is
+    /// zero, in lazily restored memory every other page still comes from the
+    /// snapshot. `None` when the map cannot be read.
+    #[cfg(target_os = "linux")]
+    pub fn populated_pages(&self) -> Option<Vec<bool>> {
+        use std::os::unix::fs::FileExt;
+        const PAGE: usize = 4096;
+        const PRESENT: u64 = 1 << 63;
+        const SWAPPED: u64 = 1 << 62;
+        let addr = self.as_ptr() as usize;
+        let len = usize::try_from(self.size_bytes).ok()?;
+        if !addr.is_multiple_of(PAGE) {
+            return None;
+        }
+        let pagemap = std::fs::File::open("/proc/self/pagemap").ok()?;
+        let mut raw = vec![0u8; len / PAGE * 8];
+        pagemap
+            .read_exact_at(&mut raw, (addr / PAGE * 8) as u64)
+            .ok()?;
+        Some(
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|entry| u64::from_le_bytes(*entry) & (PRESENT | SWAPPED) != 0)
+                .collect(),
+        )
+    }
+
     /// Return the exclusion fence used by host-side readers of lazily restored
     /// RAM. Holding its write side prevents balloon MADV_DONTNEED calls while
     /// the caller walks pages; the UFFD handler remains unfenced and can serve

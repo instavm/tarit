@@ -212,3 +212,89 @@ fn checkpoint_after_lazy_restore_matches_a_full_snapshot() {
     check(&again, "m.1 m.2 ram-ok");
     again.stop().ok();
 }
+
+/// Bytes of `path` that hold data (not holes).
+fn allocated(path: &str) -> u64 {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).expect("open snapshot");
+    let (mut at, mut data) = (0i64, 0u64);
+    loop {
+        // SAFETY: plain lseek on a descriptor this function owns.
+        let start = unsafe { libc::lseek(file.as_raw_fd(), at, libc::SEEK_DATA) };
+        if start < 0 {
+            return data;
+        }
+        // SAFETY: as above.
+        let end = unsafe { libc::lseek(file.as_raw_fd(), start, libc::SEEK_HOLE) };
+        data += (end - start) as u64;
+        at = end;
+    }
+}
+
+fn resident_bytes() -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").expect("statm");
+    let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+    pages * 4096
+}
+
+#[test]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
+fn live_snapshot_after_lazy_restore_takes_untouched_ram_from_the_snapshot() {
+    let mut files = Files::default();
+    let source = VmmController::new();
+    source
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest");
+    guest_stdout(&source, SEED);
+    mark(&source, 1);
+    let a = take(&source, None, false, &mut files);
+    source.stop().ok();
+
+    let restored = VmmController::new();
+    let lazy = restored.restore_with_resource_overrides(
+        &a,
+        None,
+        None,
+        None,
+        tarit_proto::RestoreMemoryPolicy::Lazy,
+        None,
+    );
+    if let Err(error) = lazy {
+        eprintln!("skipping: lazy (UFFD) restore unavailable here: {error}");
+        return;
+    }
+    mark(&restored, 2);
+    let before = resident_bytes();
+    let result = restored
+        .live_snapshot(vmm_core::live_snapshot::LiveSnapshotConfig::default())
+        .expect("live snapshot of a lazily restored guest");
+    let grown = resident_bytes().saturating_sub(before);
+    for file in std::iter::once(&result.snapshot_path)
+        .chain(result.overlay_path.iter())
+        .chain(result.integrity_path.iter())
+    {
+        let identity = vmm_core::gc::OwnedScratchFile::identity_for(Path::new(file))
+            .expect("snapshot identity");
+        restored
+            .release_scratch(file, identity)
+            .expect("transfer snapshot ownership");
+        files.0.push(file.clone());
+    }
+    restored.stop().ok();
+    // Untouched RAM came from the snapshot file, not through the mapping:
+    // the copy neither faulted all 256 MiB into the guest nor wrote the
+    // zero pages out.
+    assert!(
+        grown < 64 << 20,
+        "the snapshot faulted {grown} bytes of restored RAM in"
+    );
+    let data = allocated(&result.snapshot_path);
+    assert!(
+        data < 128 << 20,
+        "the snapshot of a mostly idle 256 MiB guest holds {data} bytes"
+    );
+
+    let again = restore(&result.snapshot_path);
+    check(&again, "m.1 m.2 ram-ok");
+    again.stop().ok();
+}

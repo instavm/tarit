@@ -366,6 +366,87 @@ fn copy_page_run(mem: &GuestMemory, dest: &File, start_pfn: u64, end_pfn: u64) -
     Ok(pages)
 }
 
+/// Write `source` at offset `at` of a file whose range there is still a
+/// hole (freshly sized), leaving all-zero pages as holes: they read back as
+/// zero. Most of a guest's RAM is usually free and zero, so this keeps the
+/// image sparse and avoids writing and syncing it. Runs of non-zero pages
+/// are written with one call each. Returns the bytes written. Never for a
+/// range that may already hold data: its zero pages would not be cleared.
+pub(crate) fn write_nonzero_pages(dest: &File, source: &[u8], at: u64) -> std::io::Result<u64> {
+    let page = PAGE_SIZE as usize;
+    let is_zero = |bytes: &[u8]| {
+        // SAFETY: reinterpreting initialised bytes as u64 words is sound;
+        // align_to returns only the correctly aligned middle part.
+        let (head, words, tail) = unsafe { bytes.align_to::<u64>() };
+        head.iter().all(|b| *b == 0)
+            && words.iter().all(|w| *w == 0)
+            && tail.iter().all(|b| *b == 0)
+    };
+    let mut written = 0u64;
+    let mut run: Option<usize> = None;
+    let mut start = 0usize;
+    while start < source.len() {
+        let end = (start + page).min(source.len());
+        if is_zero(&source[start..end]) {
+            if let Some(first) = run.take() {
+                dest.write_all_at(&source[first..start], at + first as u64)?;
+                written += (start - first) as u64;
+            }
+        } else if run.is_none() {
+            run = Some(start);
+        }
+        start = end;
+    }
+    if let Some(first) = run {
+        dest.write_all_at(&source[first..], at + first as u64)?;
+        written += (source.len() - first) as u64;
+    }
+    Ok(written)
+}
+
+/// [`write_nonzero_pages`] for lazily restored RAM. Pages the guest has not
+/// touched are taken from the restore snapshot, verified as the fault handler
+/// verifies them, rather than read through the mapping: that would fault
+/// every page into guest memory, making the copy slow and leaving the VM
+/// holding all of its RAM. Populated pages are read from memory. A page
+/// populated after the page map is read holds the snapshot's bytes until the
+/// guest or a device writes it, and those writes are in the dirty log.
+fn write_lazy_restored_pages(
+    dest: &File,
+    mem: &GuestMemory,
+    source: &[u8],
+    lazy: &vmm_memory_backend::uffd_restore::LazyPageDiscard,
+) -> Result<u64> {
+    let page = PAGE_SIZE as usize;
+    let populated = mem
+        .populated_pages()
+        .ok_or_else(|| VmmError::Snapshot("read the guest page map".into()))?;
+    let chunk = lazy.untouched_chunk();
+    let mut buffer = vec![0u8; chunk];
+    let mut written = 0u64;
+    let mut start = 0usize;
+    while start < source.len() {
+        let end = (start + chunk).min(source.len());
+        let pages = &populated[start / page..end / page];
+        let write = if pages.iter().all(|touched| *touched) {
+            write_nonzero_pages(dest, &source[start..end], start as u64)
+        } else {
+            let bytes = &mut buffer[..end - start];
+            lazy.read_untouched(start, bytes)
+                .map_err(|error| VmmError::Snapshot(format!("read restored RAM: {error}")))?;
+            for (index, _) in pages.iter().enumerate().filter(|(_, touched)| **touched) {
+                let at = index * page;
+                bytes[at..at + page].copy_from_slice(&source[start + at..start + at + page]);
+            }
+            write_nonzero_pages(dest, bytes, start as u64)
+        };
+        written +=
+            write.map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?;
+        start = end;
+    }
+    Ok(written)
+}
+
 /// Copy every page named by `dirty` into the staged file.
 fn copy_dirty_pages(mem: &GuestMemory, dest: &File, dirty: &DirtyBitmap) -> Result<u64> {
     let mut copied = 0u64;
@@ -537,11 +618,15 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     });
     // SAFETY: GuestMemory guarantees the mapping for `size_bytes`; the
-    // positioned write copies it immediately and retains no pointer.
+    // positioned writes copy it immediately and retain no pointer.
     let source = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem_size) };
-    memory_file
-        .write_all_at(source, 0)
-        .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?;
+    // A page that is zero now and written later is in the dirty log, so a
+    // later round or the final stop copies it.
+    let bulk_written = match mem.lazy_page_discard() {
+        Some(lazy) => write_lazy_restored_pages(memory_file, mem, source, &lazy)?,
+        None => write_nonzero_pages(memory_file, source, 0)
+            .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?,
+    };
     drop(_bulk_read_guard);
     // Bulk writeback and cache eviction happen while the guest is running.
     // This keeps the staging image reclaimable instead of pinning a second
@@ -551,11 +636,13 @@ where
         .map_err(|error| VmmError::Snapshot(format!("sync bulk staged RAM: {error}")))?;
     drop_staged_cache(memory_file, mem.size_bytes);
     let bulk_elapsed = bulk_start.elapsed();
-    let mut total_pages_copied = mem.size_bytes / PAGE_SIZE;
+    let mut total_pages_copied = bulk_written / PAGE_SIZE;
+    // Measured on the bytes written: skipped zero pages cost a scan, not a
+    // write, and would overstate how fast dirty pages can be copied.
     let mut copy_bandwidth_bps =
-        bandwidth_sample(mem.size_bytes, bulk_elapsed).unwrap_or(DEFAULT_COPY_BANDWIDTH_BPS);
+        bandwidth_sample(bulk_written, bulk_elapsed).unwrap_or(DEFAULT_COPY_BANDWIDTH_BPS);
     log::info!(
-        "live_snapshot: bulk copy of {} bytes in {bulk_elapsed:?} ({copy_bandwidth_bps} B/s)",
+        "live_snapshot: bulk copy of {bulk_written} of {} bytes in {bulk_elapsed:?} ({copy_bandwidth_bps} B/s)",
         mem.size_bytes
     );
     inject_live_snapshot_failure("bulk")?;
@@ -844,6 +931,42 @@ mod tests {
         };
         assert!(returned.contains(PAGE_SIZE));
         assert!(mem.drain_host_dirty().is_empty());
+    }
+
+    #[test]
+    fn first_pass_leaves_zero_pages_as_holes() {
+        use std::os::fd::AsRawFd;
+        let page = PAGE_SIZE as usize;
+        // Pages: data, zero, zero, data, data, zero (a trailing hole), plus
+        // a page that is zero except for its last byte.
+        let mut source = vec![0u8; 7 * page];
+        source[..page].fill(0x5a);
+        source[3 * page..5 * page].fill(0xa5);
+        source[7 * page - 1] = 1;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(source.len() as u64).unwrap();
+
+        let written = write_nonzero_pages(&file, &source, 0).unwrap();
+        assert_eq!(written, 4 * PAGE_SIZE);
+        let mut back = vec![0xffu8; source.len()];
+        file.read_exact_at(&mut back, 0).unwrap();
+        assert!(back == source, "the image reads back exactly");
+
+        // Only the written runs are allocated.
+        let mut data = 0i64;
+        let mut at = 0i64;
+        loop {
+            // SAFETY: plain lseek on a descriptor the test owns.
+            let start = unsafe { libc::lseek(file.as_raw_fd(), at, libc::SEEK_DATA) };
+            if start < 0 {
+                break;
+            }
+            // SAFETY: as above.
+            let end = unsafe { libc::lseek(file.as_raw_fd(), start, libc::SEEK_HOLE) };
+            data += end - start;
+            at = end;
+        }
+        assert_eq!(data as u64, 4 * PAGE_SIZE);
     }
 
     #[test]

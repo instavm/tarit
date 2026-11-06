@@ -51,11 +51,91 @@ pub struct LazyPageDiscard {
     // fence: it must always remain able to resolve the snapshot reader's
     // missing-page fault.
     snapshot_fence: std::sync::Arc<std::sync::RwLock<()>>,
+    // The snapshot the handler serves missing pages from.
+    source: LazySource,
 }
+
+/// Where a lazily restored guest's missing pages come from.
+#[derive(Clone)]
+struct LazySource {
+    file: std::sync::Arc<std::fs::File>,
+    offset: u64,
+    integrity: Option<std::sync::Arc<ChunkIntegrity>>,
+}
+
+/// Chunk size of [`LazyPageDiscard::read_untouched`] without a manifest.
+const UNTOUCHED_READ_CHUNK: usize = 2 * 1024 * 1024;
 
 impl LazyPageDiscard {
     pub fn snapshot_fence(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
         self.snapshot_fence.clone()
+    }
+
+    /// The unit [`Self::read_untouched`] reads: one integrity chunk, or
+    /// 2 MiB without a manifest.
+    pub fn untouched_chunk(&self) -> usize {
+        self.source
+            .integrity
+            .as_ref()
+            .map_or(UNTOUCHED_READ_CHUNK, |integrity| integrity.chunk_size)
+    }
+
+    /// The bytes guest RAM at `offset..offset + out.len()` resolves to where
+    /// the guest has not touched it, produced the way the fault handler
+    /// produces them: read from the snapshot, each chunk checked against the
+    /// integrity manifest when there is one, balloon-discarded pages zero.
+    /// A host-side reader (a snapshot) uses this instead of reading through
+    /// the mapping, which would fault every page into guest memory.
+    /// `offset` must start a chunk; `out` covers whole chunks, the last one
+    /// possibly cut short by the end of RAM. A chunk that fails its check is
+    /// an error here (the handler, which cannot leave a fault unresolved,
+    /// terminates the VMM on one).
+    pub fn read_untouched(&self, offset: usize, out: &mut [u8]) -> Result<(), UffdRestoreError> {
+        use std::os::unix::fs::FileExt;
+        const PAGE_SIZE: usize = 4096;
+        let chunk = self.untouched_chunk();
+        let end = offset
+            .checked_add(out.len())
+            .filter(|end| *end <= self.guest_len)
+            .ok_or_else(|| UffdRestoreError::Uffd("untouched read beyond guest RAM".into()))?;
+        if !offset.is_multiple_of(chunk)
+            || (!out.len().is_multiple_of(chunk) && end != self.guest_len)
+        {
+            return Err(UffdRestoreError::Uffd(
+                "untouched read must cover whole chunks".into(),
+            ));
+        }
+        self.source
+            .file
+            .read_exact_at(out, self.source.offset + offset as u64)?;
+        if let Some(integrity) = self.source.integrity.as_ref() {
+            for (index, bytes) in out.chunks(chunk).enumerate() {
+                let chunk_index = offset / chunk + index;
+                let matches = integrity
+                    .chunk_hashes
+                    .get(chunk_index)
+                    .is_some_and(|expected| chunk_sha256_matches(bytes, expected));
+                if !matches {
+                    return Err(UffdRestoreError::Uffd(format!(
+                        "snapshot integrity failure at chunk {chunk_index}"
+                    )));
+                }
+            }
+        }
+        let discarded = self
+            .discarded_pages
+            .lock()
+            .map_err(|_| UffdRestoreError::Uffd("discard bitmap lock poisoned".into()))?;
+        for (index, page) in out.chunks_mut(PAGE_SIZE).enumerate() {
+            if discarded
+                .get(offset / PAGE_SIZE + index)
+                .copied()
+                .unwrap_or(false)
+            {
+                page.fill(0);
+            }
+        }
+        Ok(())
     }
 
     pub fn discard(&self, offset: usize, len: usize) -> Result<(), UffdRestoreError> {
@@ -478,6 +558,9 @@ pub fn start_lazy_restore_with_integrity(
     let guest_base_val = guest_mem_ptr as usize;
     let snapshot_len_clone = snapshot_payload_len;
     let pages_clone = pages_served.clone();
+    // A host-side snapshot reads untouched pages from the same snapshot.
+    let source_file = snapshot_file.try_clone()?;
+    let source_integrity = chunk_integrity.clone().map(std::sync::Arc::new);
     let shutdown_clone = shutdown.clone();
     let handler_shutdown = shutdown.clone();
     let handler_discarded_pages = discarded_pages.clone();
@@ -539,6 +622,11 @@ pub fn start_lazy_restore_with_integrity(
             guest_len: guest_mem_len,
             discarded_pages,
             snapshot_fence,
+            source: LazySource {
+                file: std::sync::Arc::new(source_file),
+                offset: snapshot_offset,
+                integrity: source_integrity,
+            },
         },
     })
 }
@@ -1163,6 +1251,96 @@ mod tests {
         let mut corrupted = original;
         corrupted[32 * 1024] ^= 1;
         assert!(!chunk_sha256_matches(&corrupted, &expected));
+    }
+
+    #[test]
+    fn untouched_reads_match_what_a_fault_would_serve() {
+        const PAGE: usize = 4096;
+        const CHUNK: usize = PAGE * 2;
+        const LEN: usize = CHUNK * 2;
+        let path = std::env::temp_dir().join(format!(
+            "tarit-uffd-untouched-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let snapshot: Vec<u8> = (0..LEN).map(|i| (i / PAGE + 1) as u8).collect();
+        file.write_all(&snapshot).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: one private anonymous mapping, unmapped exactly once below.
+        let guest = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest, libc::MAP_FAILED);
+        let hashes = snapshot
+            .chunks(CHUNK)
+            .map(|chunk| Sha256::digest(chunk).into())
+            .collect();
+        let lazy = match start_lazy_restore_with_integrity(
+            guest.cast(),
+            LEN,
+            &file,
+            0,
+            LEN as u64,
+            None,
+            Some(ChunkIntegrity {
+                chunk_size: CHUNK,
+                chunk_hashes: hashes,
+            }),
+        ) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                // SAFETY: `guest` is the live mapping created above.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                std::fs::remove_file(path).unwrap();
+                return;
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
+        let source = lazy.page_discard();
+        assert_eq!(source.untouched_chunk(), CHUNK);
+        // Page 1 is returned by the balloon before anything faults it in.
+        source.discard(PAGE, PAGE).unwrap();
+        let mut out = vec![0xffu8; LEN];
+        source.read_untouched(0, &mut out).unwrap();
+        let mut expected = snapshot.clone();
+        expected[PAGE..2 * PAGE].fill(0);
+        assert!(out == expected, "snapshot bytes, discarded page zero");
+        // Reading never faulted guest memory in.
+        let mut residency = [0u8; LEN / PAGE];
+        // SAFETY: `guest` is mapped for LEN bytes; one byte per page.
+        assert_eq!(
+            unsafe { libc::mincore(guest, LEN, residency.as_mut_ptr()) },
+            0
+        );
+        assert!(residency.iter().all(|page| page & 1 == 0));
+        // Partial chunks are refused; a corrupted chunk is an error.
+        assert!(source.read_untouched(PAGE, &mut out[..PAGE]).is_err());
+        std::os::unix::fs::FileExt::write_all_at(&file, &[0], (CHUNK + 5) as u64).unwrap();
+        assert!(source.read_untouched(CHUNK, &mut out[..CHUNK]).is_err());
+        assert!(source.read_untouched(0, &mut out[..CHUNK]).is_ok());
+
+        drop(lazy);
+        // SAFETY: `guest` is still mapped.
+        assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
