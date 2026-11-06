@@ -21,3 +21,7 @@ orch/e/
 
 # Guest exec agent built by `make agent`
 /vmm/guest/agent/vmm-agent
+
+# Python bytecode
+__pycache__/
+*.pyc
