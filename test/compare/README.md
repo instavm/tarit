@@ -49,7 +49,12 @@ to the host; Firecracker's default drive `cache_type` (`Unsafe`) ignores it, so
 a guest fsync there is not durable. Both harnesses therefore run Firecracker
 with `cache_type: Writeback` and record that in the results file
 (`firecracker_cache_type`); set `VMBENCH_FC_CACHE=Unsafe` to measure the
-default instead. To compare disk work fairly, keep `--work` and `TMPDIR` on a
+default instead. Snapshots are compared the same way: tarit syncs a snapshot
+to disk before returning it, while Firecracker leaves its snapshot files in
+the page cache, where a host crash loses them. The harnesses sync
+Firecracker's snapshot files inside the timed window
+(`firecracker_snapshots_synced`; `VMBENCH_FC_SYNC_SNAPSHOTS=0` measures
+without). To compare disk work fairly, keep `--work` and `TMPDIR` on a
 filesystem with reflink (XFS or btrfs) so that Firecracker's per-VM disk copies
 are clones, as tarit's are.
 

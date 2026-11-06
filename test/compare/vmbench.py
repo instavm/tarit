@@ -14,6 +14,10 @@ RUN = "/run/user/%d/vmbench" % os.getuid()
 # a guest fsync is not durable on the host. tarit always honours flushes, so
 # compare against Firecracker's durable "Writeback" mode unless asked not to.
 FC_CACHE_TYPE = os.environ.get("VMBENCH_FC_CACHE", "Writeback")
+# tarit syncs a snapshot to disk before returning it; Firecracker leaves its
+# files in the page cache. A checkpoint lost with the host is no checkpoint,
+# so Firecracker's snapshot files are synced inside the timed window too.
+FC_SYNC_SNAPSHOTS = os.environ.get("VMBENCH_FC_SYNC_SNAPSHOTS", "1") != "0"
 VERBOSE = int(os.environ.get("VMBENCH_TARIT_VERBOSE", "0"))
 # Files `vmm snapshot` released to us. They live in the VMM's runtime directory
 # and belong to the caller, so each scenario removes whatever it did not move.
@@ -58,6 +62,19 @@ def wait_path(path, timeout=5.0):
         if now() > end:
             raise TimeoutError(path)
         time.sleep(0.0005)
+
+
+def durable(*paths):
+    """Make Firecracker snapshot files durable, as tarit's are on return:
+    sync each file, then each directory holding one (the new names)."""
+    if not FC_SYNC_SNAPSHOTS:
+        return
+    for path in list(paths) + sorted({os.path.dirname(os.path.abspath(p)) for p in paths}):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def fresh_rootfs(src, dst):
@@ -383,6 +400,7 @@ class Firecracker:
         self._api("PATCH", "/vm", {"state": "Paused"})
         self._api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": snap,
                                               "mem_file_path": mem})
+        durable(snap, mem)
         return {"snapshot_path": snap, "mem_path": mem}
 
     def diff_snapshot(self, out_dir, step, prev):
@@ -400,6 +418,7 @@ class Firecracker:
         subprocess.run([rebase, "--base-file", prev["mem_path"], "--diff-file", diff_mem],
                        check=True, capture_output=True)
         os.unlink(diff_mem)
+        durable(snap, prev["mem_path"])
         return {"snapshot_path": snap, "mem_path": prev["mem_path"], "vsock": prev["vsock"],
                 "track_dirty_pages": True, "diff_bytes": 0}
 
@@ -753,6 +772,7 @@ def scen_fanout(kind, a, work):
         fc._api("PATCH", "/vm", {"state": "Paused"})
         fc._api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": snapf,
                                             "mem_file_path": memf})
+        durable(snapf, memf)
         snap_ms = (now() - t0) * 1000
         fc.stop()
         vms = [make(kind, a) for _ in range(n)]
@@ -830,7 +850,8 @@ def main():
     os.makedirs(RUN, exist_ok=True)
     os.makedirs(a.work, exist_ok=True)
     results = {"host": os.uname().nodename, "kernel": a.kernel, "mem": a.mem, "vcpus": a.vcpus,
-               "firecracker_cache_type": FC_CACHE_TYPE}
+               "firecracker_cache_type": FC_CACHE_TYPE,
+               "firecracker_snapshots_synced": FC_SYNC_SNAPSHOTS}
     kinds = a.only.split(",")
     for kind in kinds:
         results[kind] = {}

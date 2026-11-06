@@ -370,6 +370,7 @@ class FirecrackerVM:
         self.pause()
         self._api("PUT", "/snapshot/create", {"snapshot_type": "Full", "snapshot_path": snap,
                                               "mem_file_path": mem})
+        vb.durable(snap, mem)
         vb.fresh_rootfs(os.path.join(self.dir, "rootfs.ext4"), disk)
         self.resume()
         return {"vmstate": snap, "mem": mem, "disk": disk, "disk_dir": self.dir}
@@ -954,7 +955,8 @@ def main():
                                  "%d/%d checks passed" % (r["passed"], r["total"])),
                       file=sys.stderr, flush=True)
                 with open(a.out, "w") as f:
-                    json.dump({**results, "firecracker_cache_type": vb.FC_CACHE_TYPE}, f, indent=2)
+                    json.dump({**results, "firecracker_cache_type": vb.FC_CACHE_TYPE,
+                               "firecracker_snapshots_synced": vb.FC_SYNC_SNAPSHOTS}, f, indent=2)
     finally:
         lab.stop()
     print_table(results)
