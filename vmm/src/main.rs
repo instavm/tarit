@@ -694,13 +694,7 @@ fn main() -> Result<()> {
         Cmd::UpdateEgress {
             allow,
             allow_existing,
-        } => api_request(
-            &cli.socket,
-            &vmm_api::types::ApiRequest::UpdateEgress {
-                allowlist: allow,
-                allow_existing,
-            },
-        ),
+        } => api_update_egress(&cli.socket, allow, allow_existing),
         Cmd::Pull {
             image,
             output,
@@ -1333,6 +1327,31 @@ fn apply_serve_cgroup(
         .map_err(|e| anyhow::anyhow!("cgroup apply: {e}"))?;
     log::info!("serve: cgroup applied: {cgroup_path}");
     Ok(())
+}
+
+fn api_update_egress(socket: &str, allowlist: Vec<String>, allow_existing: bool) -> Result<()> {
+    let request = vmm_api::types::ApiRequest::UpdateEgress {
+        allowlist,
+        allow_existing,
+    };
+    let response = send_raw(socket, &serde_json::to_vec(&request)?)?;
+    let parsed: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;
+    println!("{}", serde_json::to_string_pretty(&parsed)?);
+    match parsed {
+        vmm_api::types::ApiResponse::EgressUpdated {
+            enforced: false, ..
+        } => {
+            eprintln!(
+                "warning: the egress policy was validated but NOT enforced. This VMM is not \
+                 confined to a per-VM network namespace (serve --jail --netns), so guest \
+                 traffic is unrestricted unless you enforce the policy on the host."
+            );
+            Ok(())
+        }
+        vmm_api::types::ApiResponse::EgressUpdated { .. } => Ok(()),
+        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("update-egress failed: {msg}"),
+        other => anyhow::bail!("unexpected update-egress response: {other:?}"),
+    }
 }
 
 fn api_snapshot(socket: &str, diff: bool, live: bool, capture_disks: bool) -> Result<()> {

@@ -59,7 +59,7 @@ sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 ```
 
-Attach virtio-net to a host TAP. The orchestrator or operator is responsible for host networking and guest IP configuration.
+Attach virtio-net to a host TAP. The operator creates the TAP and gives it a host address; with `guest_ip` set (API `net[].guest_ip`), the VMM configures the guest's eth0 at boot using the TAP's address as gateway, unless the kernel command line already has `ip=`. Routing and NAT beyond the TAP stay with the operator or orchestrator.
 
 ```sh
 sudo ip tuntap add dev tap0 mode tap
@@ -309,4 +309,4 @@ sudo target/release/vmm serve \
   --cpuset 0-1
 ```
 
-Live egress updates are intended to be enforced inside a per-VM network namespace. Without `--netns`, `update-egress` validates and reports rule counts without applying host-wide nftables changes.
+Live egress updates are enforced only inside a per-VM network namespace (`serve --jail --netns`), where the default-drop chain affects that VM alone. Without it, `update-egress` validates the policy and answers `"enforced": false`, and the CLI prints a warning: guest traffic is then unrestricted unless you enforce the policy on the host.

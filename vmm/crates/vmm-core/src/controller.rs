@@ -914,11 +914,23 @@ impl VmmController {
 
         let mem_size = config.memory.size_bytes()?;
         let mem = GuestMemory::new(mem_size).map_err(|e| VmmError::Memory(e.to_string()))?;
-        let cmdline = if config.kernel.cmdline.is_empty() {
+        let mut cmdline = if config.kernel.cmdline.is_empty() {
             vmm_loader::default_cmdline()
         } else {
             config.kernel.cmdline.clone()
         };
+        // Configure the guest's eth0 at boot from the NIC's guest_ip unless the
+        // caller (for example the orchestrator) already passes `ip=`.
+        if !cmdline
+            .split_whitespace()
+            .any(|word| word.starts_with("ip="))
+        {
+            if let Some(fragment) = config.net.first().and_then(guest_ip_boot_fragment) {
+                log::info!("net: configuring guest eth0 with {fragment}");
+                cmdline.push(' ');
+                cmdline.push_str(&fragment);
+            }
+        }
 
         // Running VMs always need an in-kernel IRQCHIP + PIT. Without it KVM has
         // no LAPIC to service the guest timer, so HLT exits to userspace and the
@@ -6896,6 +6908,81 @@ pub struct BalloonIrqResample {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Kernel `ip=` fragment that configures the guest's eth0 at boot from a
+/// NIC's `guest_ip`. The gateway and netmask come from the host side of the
+/// TAP (the address the operator assigned to it, e.g. `172.16.0.1/24`); a
+/// `guest_ip` written as `addr/prefix` supplies the netmask when the TAP has
+/// no IPv4 address.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn guest_ip_boot_fragment(net: &crate::config::NetConfig) -> Option<String> {
+    let spec = net.guest_ip.as_deref()?;
+    let (addr, prefix) = match spec.split_once('/') {
+        Some((addr, prefix)) => (addr, prefix.parse::<u8>().ok().filter(|p| *p <= 32)),
+        None => (spec, None),
+    };
+    let guest: std::net::Ipv4Addr = addr.parse().ok()?;
+    let tap = tap_ipv4(&net.tap);
+    let mask = tap
+        .map(|(_, mask)| mask)
+        .or_else(|| {
+            prefix.map(|p| {
+                std::net::Ipv4Addr::from(u32::MAX.checked_shl(32 - u32::from(p)).unwrap_or(0))
+            })
+        })
+        .unwrap_or(std::net::Ipv4Addr::new(255, 255, 255, 0));
+    Some(format_ip_fragment(
+        guest,
+        tap.map(|(gateway, _)| gateway),
+        mask,
+    ))
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn format_ip_fragment(
+    guest: std::net::Ipv4Addr,
+    gateway: Option<std::net::Ipv4Addr>,
+    mask: std::net::Ipv4Addr,
+) -> String {
+    let gateway = gateway.map(|g| g.to_string()).unwrap_or_default();
+    format!("ip={guest}::{gateway}:{mask}::eth0:off")
+}
+
+/// IPv4 address and netmask assigned to a host interface, if any.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn tap_ipv4(name: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ {
+        return None;
+    }
+    // SAFETY: plain socket creation; the fd is closed below.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let query = |request: libc::c_ulong| -> Option<std::net::Ipv4Addr> {
+        // SAFETY: ifreq is plain old data; zeroed is a valid value.
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in ifr.ifr_name.iter_mut().zip(name.bytes()) {
+            *dst = src as libc::c_char;
+        }
+        // SAFETY: valid socket fd and a properly sized, NUL-terminated ifreq.
+        if unsafe { libc::ioctl(fd, request as _, &mut ifr) } != 0 {
+            return None;
+        }
+        // SAFETY: for SIOCGIFADDR/SIOCGIFNETMASK the kernel fills a sockaddr_in.
+        let sin = unsafe {
+            *(&ifr.ifr_ifru.ifru_addr as *const libc::sockaddr as *const libc::sockaddr_in)
+        };
+        Some(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+    };
+    let result = query(libc::SIOCGIFADDR).zip(query(libc::SIOCGIFNETMASK));
+    // SAFETY: closing the fd opened above.
+    unsafe { libc::close(fd) };
+    result
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 impl BalloonIrqResample {
     fn spawn(
@@ -7541,6 +7628,27 @@ mod tests {
             Some(beside.to_str().unwrap())
         );
         let _ = std::fs::remove_file(&beside);
+    }
+
+    #[test]
+    fn guest_ip_fragment_matches_kernel_ip_syntax() {
+        use std::net::Ipv4Addr;
+        assert_eq!(
+            format_ip_fragment(
+                Ipv4Addr::new(172, 16, 0, 2),
+                Some(Ipv4Addr::new(172, 16, 0, 1)),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            "ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+        );
+        assert_eq!(
+            format_ip_fragment(
+                Ipv4Addr::new(10, 0, 0, 5),
+                None,
+                Ipv4Addr::new(255, 255, 255, 252)
+            ),
+            "ip=10.0.0.5:::255.255.255.252::eth0:off"
+        );
     }
 
     #[test]

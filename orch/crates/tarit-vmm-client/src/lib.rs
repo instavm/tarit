@@ -588,7 +588,7 @@ impl VmmClient {
             allowlist,
             allow_existing,
         })? {
-            ApiResponse::EgressUpdated { rules_applied } => Ok(rules_applied),
+            ApiResponse::EgressUpdated { rules_applied, .. } => Ok(rules_applied),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
     }

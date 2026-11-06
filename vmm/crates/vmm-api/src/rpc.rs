@@ -358,6 +358,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                         log::info!("egress: applied {} rules via nft", result.rules_applied);
                         ApiResponse::EgressUpdated {
                             rules_applied: result.rules_applied,
+                            enforced: true,
                         }
                     }
                     Err(e) => {
@@ -369,13 +370,15 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 }
             } else {
                 let result = compile_egress_update(&update);
-                log::info!(
-                    "egress: compiled {} rules → {} nft commands (enforcement off: no netns, not applied)",
-                    result.rules_applied,
-                    result.nft_commands.len()
+                log::warn!(
+                    "egress: validated {} rules but did NOT enforce them: this VMM is not \
+                     confined to a per-VM network namespace (serve --jail --netns), so the \
+                     guest's traffic is unrestricted unless the caller enforces the policy",
+                    result.rules_applied
                 );
                 ApiResponse::EgressUpdated {
                     rules_applied: result.rules_applied,
+                    enforced: false,
                 }
             }
         }

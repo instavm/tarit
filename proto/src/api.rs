@@ -200,6 +200,11 @@ pub enum ApiResponse {
     },
     EgressUpdated {
         rules_applied: usize,
+        /// Whether the rules were programmed into netfilter. A VMM that is not
+        /// confined to a per-VM network namespace only validates the policy;
+        /// enforcement is then the caller's job. Absent from older VMMs.
+        #[serde(default)]
+        enforced: bool,
     },
     Balloon {
         target_mib: u64,
