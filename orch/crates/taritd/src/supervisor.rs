@@ -31,7 +31,13 @@ use tarit_volume::{AccessMode, PreparedBlockAttachment};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5";
+/// Guest kernel command line for VMs created without one. `quiet loglevel=4`
+/// keeps errors (and the early console for panics) but not the routine boot
+/// log: every console byte is a VM exit, and logging the full boot more than
+/// doubled time to first command (about 250 ms vs 107 ms). Devices are
+/// described by ACPI, so no `virtio_mmio.device=` entries (an extra one makes
+/// the guest probe the same device twice and log -EBUSY).
+pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 quiet loglevel=4 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw";
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const RESUME_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_READY_EXEC_TIMEOUT: Duration = Duration::from_secs(1);
