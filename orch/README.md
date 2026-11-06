@@ -186,7 +186,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `taritd ssh-key list` | List active SSH keys. |
 | `taritd ssh-key rm <key_id>` | Remove an SSH key. |
 | `taritd pty <id> [--shell <S>]` | Attach an interactive PTY over WebSocket. |
-| `taritd ssh <id> [--ssh-host <HOST>] [--ssh-port <PORT>] [extra ssh args...]` | Open the VM through the SSH gateway. Host and port default from `TARIT_SSH_GATEWAY_ADDR` (`127.0.0.1:2222`). |
+| `taritd ssh <id> [--ssh-host <HOST>] [--ssh-port <PORT>] [ssh options...] [command...]` | Open the VM through the SSH gateway. Host and port default from `TARIT_SSH_GATEWAY_ADDR` (`127.0.0.1:2222`). Options go before the destination; the first other word (or anything after `--`) is the remote command. With `-i`, only that key is offered. |
 
 ## Environment variable reference
 
@@ -261,8 +261,14 @@ export TARIT_SSH_GATEWAY=1
 export TARIT_SSH_GATEWAY_ADDR='0.0.0.0:2222'
 ./target/release/taritd
 
-ssh -p 2222 <vm_id>@<taritd-host>
+ssh -p 2222 -i ~/.ssh/tarit -o IdentitiesOnly=yes <vm_id>@<taritd-host>
 ```
+
+The gateway answers every offered key the same way, so which keys are
+registered cannot be probed, and it rejects each wrong key after a one-second
+delay. Offer only the registered key (`-i ... -o IdentitiesOnly=yes`); a client
+that tries several agent keys first waits about a second for each.
+`taritd ssh <id> -i KEY [ssh options] [command]` adds `IdentitiesOnly` for you.
 
 Optional warm-pool TOML shape:
 

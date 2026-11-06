@@ -832,14 +832,62 @@ fn run_ssh(args: SshArgs) -> Result<()> {
     let (default_host, default_port) = ssh_gateway_addr();
     let host = args.ssh_host.unwrap_or(default_host);
     let port = args.ssh_port.unwrap_or(default_port);
+    let (options, command) = split_ssh_args(&args.extra_args);
     let status = ProcessCommand::new("ssh")
         .arg("-p")
         .arg(port.to_string())
+        .args(&options)
         .arg(format!("{}@{host}", args.id))
-        .args(args.extra_args)
+        .args(&command)
         .status()
         .context("run ssh")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Split `taritd ssh` trailing arguments the way ssh parses its own command
+/// line: options (and their values) come first and must precede the
+/// destination; the first other word starts the remote command, as does
+/// anything after `--`.
+///
+/// With an explicit identity, only that key is offered (`IdentitiesOnly`)
+/// unless the caller chose otherwise: the gateway answers every offered key
+/// alike so registered keys cannot be enumerated, and rejects each wrong one
+/// after a delay, so agent keys tried first would cost about a second each.
+fn split_ssh_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+    // ssh(1) options that take a value.
+    const WITH_VALUE: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+    let mut options = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" {
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            let mut command = vec![arg.clone()];
+            command.extend(rest.cloned());
+            return (with_identities_only(options), command);
+        };
+        options.push(arg.clone());
+        // "-i key" carries its value in the next word; "-ikey" does not.
+        if flags.len() == 1 && WITH_VALUE.contains(flags) {
+            if let Some(value) = rest.next() {
+                options.push(value.clone());
+            }
+        }
+    }
+    (with_identities_only(options), rest.cloned().collect())
+}
+
+fn with_identities_only(mut options: Vec<String>) -> Vec<String> {
+    let has_identity = options.iter().any(|option| option.starts_with("-i"));
+    let chose = options
+        .iter()
+        .any(|option| option.to_ascii_lowercase().contains("identitiesonly"));
+    if has_identity && !chose {
+        options.push("-o".into());
+        options.push("IdentitiesOnly=yes".into());
+    }
+    options
 }
 
 fn ssh_gateway_addr() -> (String, u16) {
@@ -967,6 +1015,27 @@ enum PtyServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_options_precede_the_destination_and_the_rest_is_the_command() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_ssh_args(&args(&["-i", "key", "-tt", "uname", "-a"])),
+            (
+                args(&["-i", "key", "-tt", "-o", "IdentitiesOnly=yes"]),
+                args(&["uname", "-a"])
+            )
+        );
+        assert_eq!(
+            split_ssh_args(&args(&["-o", "IdentitiesOnly=no", "-ikey", "--", "-x"])),
+            (args(&["-o", "IdentitiesOnly=no", "-ikey"]), args(&["-x"]))
+        );
+        assert_eq!(
+            split_ssh_args(&args(&["-v", "true"])),
+            (args(&["-v"]), args(&["true"]))
+        );
+        assert_eq!(split_ssh_args(&[]), (vec![], vec![]));
+    }
 
     #[test]
     fn bare_args_dispatch_to_server() {
