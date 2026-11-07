@@ -1,9 +1,33 @@
-//! Virtio-mem over MMIO for new hotplug-ready templates.
+//! Virtio-mem over MMIO for hotplug-ready VMs and templates.
+//!
+//! Boot RAM is ordinary low memory and is never part of this device. The
+//! device owns a fixed aperture at [`REGION_START`] (4 GiB) of 128 MiB blocks.
+//! The host sets a *requested size* (the hotplug amount, excluding boot RAM);
+//! the guest driver plugs or unplugs blocks until its plugged size matches.
+//! Unplugged blocks are discarded (`MADV_DONTNEED`, coordinated with lazy UFFD
+//! restore through [`GuestMemory::discard_range`]) so host RSS drops.
+//!
 //! No UNPLUGGED_INACCESSIBLE feature is advertised. The entire private aperture
-//! is mapped and reserved against host admission/cgroups, including unplugged
-//! blocks; guests cannot escape their maximum reservation by bypassing the driver.
-//! New RAM becomes Linux System RAM only when the virtio-mem driver plugs and
-//! onlines it. The public API supports grow-only targets.
+//! stays mapped and KVM-registered, including unplugged blocks; it is reserved
+//! against host admission/cgroups, so guests cannot escape their maximum
+//! reservation by bypassing the driver. New RAM becomes Linux System RAM only
+//! when the virtio-mem driver plugs and onlines it.
+//!
+//! Request semantics follow the virtio-mem specification (virtio v1.2 §5.15)
+//! and Linux's `include/uapi/linux/virtio_mem.h`:
+//! * PLUG: every block in range must be unplugged (else ERROR), and the result
+//!   may not exceed the requested size (else NACK).
+//! * UNPLUG: every block in range must be plugged (else ERROR). Allowed even
+//!   when it takes the plugged size below the requested size.
+//! * UNPLUG_ALL: unplugs and discards every plugged block. Linux sends it only
+//!   from driver probe when the device reports plugged memory (a fresh guest
+//!   kernel after reboot/kexec); a restored guest never re-probes, so restore
+//!   keeps its plugged blocks. Boot RAM is outside the aperture and is never
+//!   touched.
+//! * STATE: PLUGGED / UNPLUGGED / MIXED from the bitmap.
+//!
+//! A discard failure answers BUSY and leaves the bitmap unchanged; the driver
+//! retries, and re-discarding an already discarded block is harmless.
 
 use crate::bus::{MmioDevice, MmioReadResult, MmioWriteResult};
 use crate::persist::Persist;
@@ -28,6 +52,33 @@ const FEATURES_LOW: u32 = 0;
 const FEATURES_HIGH: u32 = 1; // VIRTIO_F_VERSION_1 (bit 32)
 const INT_VRING: u32 = 0x1;
 const INT_CONFIG: u32 = 0x2;
+
+const REQ_PLUG: u16 = 0;
+const REQ_UNPLUG: u16 = 1;
+const REQ_UNPLUG_ALL: u16 = 2;
+const REQ_STATE: u16 = 3;
+const RESP_ACK: u16 = 0;
+const RESP_NACK: u16 = 1;
+const RESP_BUSY: u16 = 2;
+const RESP_ERROR: u16 = 3;
+const STATE_PLUGGED: u16 = 0;
+const STATE_UNPLUGGED: u16 = 1;
+const STATE_MIXED: u16 = 2;
+
+/// Point-in-time hotplug sizes, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMemStatus {
+    /// Device block size (the plug/unplug granularity).
+    pub block_size: u64,
+    /// Fixed RAM below the MMIO gap, outside the device.
+    pub boot_size: u64,
+    /// Size of the hotplug aperture (maximum - boot).
+    pub region_size: u64,
+    /// Blocks the guest driver has plugged and not unplugged.
+    pub plugged_size: u64,
+    /// Host-requested hotplug size the driver converges towards.
+    pub requested_size: u64,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct QueueState {
@@ -163,11 +214,64 @@ impl VirtioMemMmio {
         self.interrupt_status.load(Ordering::SeqCst) != 0
     }
 
-    /// User-visible requests only grow. Device unplug requests are still
-    /// supported for driver reset/recovery; they do not reduce the reservation.
+    /// Grow-only total-RAM target (boot + hotplug), as used by restore.
     pub fn set_target_total_mib(&self, total_mib: u64) -> Result<(), String> {
         self.prepare_restore_target_total_mib(total_mib)?;
         self.reassert_pending_interrupt();
+        Ok(())
+    }
+
+    /// Size of the hotplug aperture in bytes.
+    pub fn region_size(&self) -> u64 {
+        self.memory.size_bytes - self.memory.low_size_bytes
+    }
+
+    pub fn status(&self) -> VirtioMemStatus {
+        // Read both sizes under the bitmap lock so they describe one instant
+        // with respect to guest requests.
+        let _plugged = self.plugged.lock().unwrap_or_else(|p| p.into_inner());
+        VirtioMemStatus {
+            block_size: BLOCK_SIZE,
+            boot_size: self.memory.low_size_bytes,
+            region_size: self.region_size(),
+            plugged_size: u64::from(self.actual_pages()) * PAGE_SIZE,
+            requested_size: u64::from(self.target_pages()) * PAGE_SIZE,
+        }
+    }
+
+    /// Live resize of a running guest: set the requested hotplug size in
+    /// bytes (excluding boot RAM). Growing and shrinking are both allowed;
+    /// `0` asks the driver to unplug everything. The value must be a multiple
+    /// of [`BLOCK_SIZE`] and at most [`Self::region_size`]. Always bumps the
+    /// config generation and raises the config-change interrupt, so repeating
+    /// the current value re-kicks a driver that is backing off after a failed
+    /// unplug.
+    pub fn set_requested_size(&self, bytes: u64) -> Result<(), String> {
+        const MIB: u64 = 1024 * 1024;
+        let region = self.region_size();
+        if bytes > region {
+            return Err(format!(
+                "requested hotplug size {} MiB exceeds the {} MiB virtio-mem region",
+                bytes / MIB,
+                region / MIB
+            ));
+        }
+        if !bytes.is_multiple_of(BLOCK_SIZE) {
+            return Err(format!(
+                "requested hotplug size must be a multiple of the {} MiB block size",
+                BLOCK_SIZE / MIB
+            ));
+        }
+        let pages = u32::try_from(bytes / PAGE_SIZE)
+            .map_err(|_| "requested hotplug size overflows the device".to_string())?;
+        {
+            // Serialize with in-flight PLUG checks, which read the target
+            // while holding the bitmap lock.
+            let _plugged = self.plugged.lock().unwrap_or_else(|p| p.into_inner());
+            self.target_pages.store(pages, Ordering::Release);
+            self.config_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.trigger_interrupt(INT_CONFIG);
         Ok(())
     }
 
@@ -282,76 +386,97 @@ impl VirtioMemMmio {
                 .filter(|end| *end <= plugged.len())
                 .map(|end| n..end)
         });
-        let result: u16 = if kind == 2 {
-            // Initial driver probe can issue UNPLUG_ALL. Keep the fixed aperture
-            // usable, and zero memory before acknowledging any later reset.
-            if total != 0
-                && self
-                    .memory
-                    .discard_range(
-                        REGION_START,
-                        self.memory.size_bytes - self.memory.low_size_bytes,
-                    )
-                    .is_err()
-            {
-                2
+        let result: u16 = if kind == REQ_UNPLUG_ALL {
+            // Discard only plugged blocks: unplugged ones hold no guest data
+            // the driver relies on, and discarding the whole aperture would
+            // mark every page host-dirty (bloating the next diff snapshot) and
+            // walk every page under lazy restore.
+            if self.discard_plugged_runs(&plugged).is_err() {
+                RESP_BUSY
             } else {
                 plugged.fill(false);
                 self.actual_pages.store(0, Ordering::Release);
-                0
+                RESP_ACK
             }
         } else if let Some(range) = range.filter(|_| count != 0) {
             let present = plugged[range.clone()].iter().filter(|p| **p).count();
             match kind {
-                0 if present != 0 => 3,
-                0 if ((total + count) as u64) * BLOCK_SIZE
-                    > u64::from(self.target_pages()) * PAGE_SIZE =>
+                REQ_PLUG if present != 0 => RESP_ERROR,
+                REQ_PLUG
+                    if ((total + count) as u64) * BLOCK_SIZE
+                        > u64::from(self.target_pages()) * PAGE_SIZE =>
                 {
-                    1
+                    RESP_NACK
                 }
-                0 => {
+                REQ_PLUG => {
                     plugged[range].fill(true);
                     self.actual_pages.store(
                         ((total + count) as u64 * BLOCK_SIZE / PAGE_SIZE) as u32,
                         Ordering::Release,
                     );
-                    0
+                    RESP_ACK
                 }
-                1 if present != count => 3,
-                1 => {
-                    if self
-                        .memory
-                        .discard_range(address, count as u64 * BLOCK_SIZE)
-                        .is_err()
-                    {
-                        2
+                REQ_UNPLUG if present != count => RESP_ERROR,
+                REQ_UNPLUG => {
+                    if self.discard_blocks(range.start, count).is_err() {
+                        RESP_BUSY
                     } else {
                         plugged[range].fill(false);
                         self.actual_pages.store(
                             ((total - count) as u64 * BLOCK_SIZE / PAGE_SIZE) as u32,
                             Ordering::Release,
                         );
-                        0
+                        RESP_ACK
                     }
                 }
-                3 => {
+                REQ_STATE => {
                     let state: u16 = if present == count {
-                        0
+                        STATE_PLUGGED
                     } else if present == 0 {
-                        1
+                        STATE_UNPLUGGED
                     } else {
-                        2
+                        STATE_MIXED
                     };
                     reply[8..10].copy_from_slice(&state.to_le_bytes());
-                    0
+                    RESP_ACK
                 }
-                _ => 3,
+                _ => RESP_ERROR,
             }
         } else {
-            3
+            RESP_ERROR
         };
         reply[0..2].copy_from_slice(&result.to_le_bytes());
         reply
+    }
+
+    /// Release the host backing of `count` blocks starting at block `first`.
+    /// `GuestMemory::discard_range` marks the packed range host-dirty (so diff
+    /// snapshots record the zeroed pages) and, under lazy restore, records the
+    /// pages as discarded so the UFFD handler resolves later faults with zeroes
+    /// instead of resurrecting snapshot bytes, under the snapshot fence.
+    fn discard_blocks(&self, first: usize, count: usize) -> Result<(), String> {
+        self.memory
+            .discard_range(
+                REGION_START + first as u64 * BLOCK_SIZE,
+                count as u64 * BLOCK_SIZE,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn discard_plugged_runs(&self, plugged: &[bool]) -> Result<(), String> {
+        let mut index = 0;
+        while index < plugged.len() {
+            if !plugged[index] {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < plugged.len() && plugged[index] {
+                index += 1;
+            }
+            self.discard_blocks(start, index - start)?;
+        }
+        Ok(())
     }
 
     fn process_queue(&self, queue_index: usize) -> usize {
@@ -633,6 +758,9 @@ impl MmioDevice for VirtioMemMmio {
 }
 
 impl VirtioMemMmioState {
+    /// Validate a saved device state against the restored maximum. Plugged
+    /// may exceed requested: a snapshot can be taken while the guest is still
+    /// unplugging after a live shrink (or could not unplug unmovable memory).
     pub fn validate_layout(&self, maximum: u64) -> Result<(), String> {
         if self.maximum_bytes != maximum
             || self.boot_bytes == 0
@@ -644,7 +772,6 @@ impl VirtioMemMmioState {
             || !(u64::from(self.target_pages) * PAGE_SIZE).is_multiple_of(BLOCK_SIZE)
             || self.actual_pages as u64 * PAGE_SIZE
                 != self.plugged.iter().filter(|p| **p).count() as u64 * BLOCK_SIZE
-            || self.actual_pages > self.target_pages
             || self.queues.len() != 1
             || self.processors.len() != 1
         {
@@ -831,6 +958,337 @@ mod tests {
         );
         assert_eq!(restored.plugged_total_mib(), 512);
     }
+    /// 2 boot blocks + a 6-block (768 MiB) aperture.
+    fn wide_dev() -> VirtioMemMmio {
+        VirtioMemMmio::new(
+            10,
+            GuestMemory::new_hotplug(8 * BLOCK_SIZE, 2 * BLOCK_SIZE).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn block(index: u64) -> u64 {
+        REGION_START + index * BLOCK_SIZE
+    }
+
+    fn resp(reply: [u8; 10]) -> u16 {
+        u16::from_le_bytes([reply[0], reply[1]])
+    }
+
+    fn state_of(d: &VirtioMemMmio, first: u64, blocks: u16) -> u16 {
+        let reply = d.request(&request(REQ_STATE, block(first), blocks));
+        assert_eq!(resp(reply), RESP_ACK);
+        u16::from_le_bytes([reply[8], reply[9]])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn page_is_resident(d: &VirtioMemMmio, gpa: u64) -> bool {
+        let offset = d.memory.gpa_to_offset(gpa).unwrap() as usize;
+        let mut residency = 0u8;
+        // SAFETY: `offset` is a page-aligned offset inside the live mapping;
+        // mincore writes exactly one byte for one page.
+        let rc = unsafe {
+            libc::mincore(
+                d.memory.as_ptr().add(offset) as *mut libc::c_void,
+                PAGE_SIZE as usize,
+                &mut residency,
+            )
+        };
+        assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+        residency & 1 == 1
+    }
+
+    #[test]
+    fn live_grow_shrink_and_unplug_follow_the_requested_size() {
+        let d = wide_dev();
+        assert_eq!(
+            d.status(),
+            VirtioMemStatus {
+                block_size: BLOCK_SIZE,
+                boot_size: 2 * BLOCK_SIZE,
+                region_size: 6 * BLOCK_SIZE,
+                plugged_size: 0,
+                requested_size: 0,
+            }
+        );
+        // Grow: plug up to the requested size, then NACK beyond it.
+        d.set_requested_size(3 * BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(0), 3))), RESP_ACK);
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(3), 1))), RESP_NACK);
+        assert_eq!(state_of(&d, 0, 3), STATE_PLUGGED);
+        assert_eq!(state_of(&d, 2, 2), STATE_MIXED);
+        assert_eq!(state_of(&d, 3, 3), STATE_UNPLUGGED);
+
+        // Shrink: allowed live; plugged stays until the guest unplugs.
+        d.set_requested_size(BLOCK_SIZE).unwrap();
+        assert_eq!(d.status().requested_size, BLOCK_SIZE);
+        assert_eq!(d.status().plugged_size, 3 * BLOCK_SIZE);
+        assert_eq!(
+            d.mmio_read(reg::CONFIG + 48, 8).unwrap(),
+            BLOCK_SIZE,
+            "requested_size config field"
+        );
+        assert_eq!(
+            d.mmio_read(reg::CONFIG + 40, 8).unwrap(),
+            3 * BLOCK_SIZE,
+            "plugged_size config field"
+        );
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG, block(1), 2))), RESP_ACK);
+        assert_eq!(d.status().plugged_size, BLOCK_SIZE);
+        assert_eq!(state_of(&d, 1, 2), STATE_UNPLUGGED);
+        // Unplugging blocks that are not (all) plugged is an error and
+        // changes nothing.
+        let before = d.save();
+        assert_eq!(
+            resp(d.request(&request(REQ_UNPLUG, block(0), 2))),
+            RESP_ERROR
+        );
+        assert_eq!(d.save(), before);
+        // Plugging is NACKed while at or above the requested size.
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(1), 1))), RESP_NACK);
+
+        // Shrink to zero: the driver unplugs the rest block by block.
+        d.set_requested_size(0).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG, block(0), 1))), RESP_ACK);
+        assert_eq!(d.status().plugged_size, 0);
+        assert_eq!(state_of(&d, 0, 6), STATE_UNPLUGGED);
+
+        // Grow again after a full shrink.
+        d.set_requested_size(6 * BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(0), 6))), RESP_ACK);
+        assert_eq!(d.status().plugged_size, 6 * BLOCK_SIZE);
+    }
+
+    #[test]
+    fn requested_size_outside_the_aperture_or_misaligned_is_rejected() {
+        let d = wide_dev();
+        d.set_requested_size(2 * BLOCK_SIZE).unwrap();
+        let before = d.save();
+        for bytes in [
+            7 * BLOCK_SIZE,
+            u64::MAX,
+            BLOCK_SIZE / 2,
+            BLOCK_SIZE + PAGE_SIZE,
+            1,
+        ] {
+            let error = d.set_requested_size(bytes).unwrap_err();
+            assert!(
+                error.contains("exceeds") || error.contains("multiple"),
+                "{error}"
+            );
+            assert_eq!(d.save(), before, "rejected target must not change state");
+        }
+        d.set_requested_size(6 * BLOCK_SIZE).unwrap();
+        d.set_requested_size(0).unwrap();
+    }
+
+    #[test]
+    fn set_requested_size_raises_a_config_change() {
+        let d = wide_dev();
+        let generation = d.mmio_read(reg::CONFIG_GENERATION, 4).unwrap();
+        d.set_requested_size(BLOCK_SIZE).unwrap();
+        assert_eq!(
+            d.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap() & u64::from(INT_CONFIG),
+            u64::from(INT_CONFIG)
+        );
+        assert_ne!(d.mmio_read(reg::CONFIG_GENERATION, 4).unwrap(), generation);
+        d.mmio_write(reg::INTERRUPT_ACK, u64::from(INT_CONFIG), 4)
+            .unwrap();
+        assert!(!d.has_pending_interrupt());
+        // Re-sending the same value re-kicks the driver.
+        d.set_requested_size(BLOCK_SIZE).unwrap();
+        assert!(d.has_pending_interrupt());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn set_requested_size_signals_the_irq_eventfd() {
+        use vmm_sys_util::eventfd::EventFd;
+        let d = wide_dev();
+        let irq = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        d.set_irq_evt(irq.try_clone().unwrap());
+        d.set_requested_size(2 * BLOCK_SIZE).unwrap();
+        assert_eq!(irq.read().unwrap(), 1);
+        assert!(d.set_requested_size(3).is_err());
+        assert_eq!(
+            irq.read().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn unplug_all_discards_only_plugged_blocks_and_never_boot_ram() {
+        let d = wide_dev();
+        d.set_requested_size(2 * BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(0), 2))), RESP_ACK);
+        d.memory.write_phys(0x10_0000, &[0x11; 16]).unwrap();
+        d.memory.write_phys(block(1) + 0x2000, &[0x22; 16]).unwrap();
+        // The driver must not use unplugged memory, but nothing prevents a
+        // guest from touching it; UNPLUG_ALL does not need to scrub it.
+        d.memory.write_phys(block(4), &[0x44; 16]).unwrap();
+        d.memory.drain_host_dirty();
+
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG_ALL, 0, 0))), RESP_ACK);
+        let status = d.status();
+        assert_eq!(status.plugged_size, 0);
+        assert_eq!(
+            status.requested_size,
+            2 * BLOCK_SIZE,
+            "UNPLUG_ALL keeps the request"
+        );
+        assert_eq!(state_of(&d, 0, 6), STATE_UNPLUGGED);
+
+        let mut bytes = [0xff; 16];
+        d.memory.read_phys(block(1) + 0x2000, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 16], "plugged block was discarded");
+        d.memory.read_phys(0x10_0000, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x11; 16], "boot RAM is outside the aperture");
+        d.memory.read_phys(block(4), &mut bytes).unwrap();
+        assert_eq!(bytes, [0x44; 16], "unplugged block was not rediscarded");
+
+        let dirty = d.memory.drain_host_dirty();
+        let boot = d.memory.low_size_bytes;
+        assert!(dirty.contains(boot));
+        assert!(dirty.contains(boot + BLOCK_SIZE + 0x2000));
+        assert!(!dirty.contains(boot + 4 * BLOCK_SIZE));
+        assert!(!dirty.contains(0x10_0000));
+        assert_eq!(dirty.len() as u64, 2 * BLOCK_SIZE / PAGE_SIZE);
+
+        // Nothing plugged: still ACKed, nothing discarded.
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG_ALL, 0, 0))), RESP_ACK);
+        assert!(d.memory.drain_host_dirty().is_empty());
+    }
+
+    #[test]
+    fn device_reset_keeps_plugged_blocks_for_the_next_driver_probe() {
+        // Spec: plugged state survives device reset. A re-probing driver (new
+        // guest kernel) sees plugged_size != 0 and issues UNPLUG_ALL; a
+        // restored guest never re-probes and keeps its blocks.
+        let d = wide_dev();
+        d.set_requested_size(BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(2), 1))), RESP_ACK);
+        d.memory.write_phys(block(2), &[0x5a; 8]).unwrap();
+        d.mmio_write(reg::STATUS, 0, 4).unwrap();
+        assert_eq!(d.mmio_read(reg::CONFIG + 40, 8).unwrap(), BLOCK_SIZE);
+        assert_eq!(d.status().requested_size, BLOCK_SIZE);
+        let mut bytes = [0; 8];
+        d.memory.read_phys(block(2), &mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 8]);
+
+        let restored = wide_dev();
+        restored.restore_checked(d.save()).unwrap();
+        assert_eq!(state_of(&restored, 2, 1), STATE_PLUGGED);
+        assert_eq!(restored.status().plugged_size, BLOCK_SIZE);
+    }
+
+    #[test]
+    fn snapshot_round_trips_after_unplug_and_mid_shrink() {
+        let d = wide_dev();
+        d.set_requested_size(4 * BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(0), 4))), RESP_ACK);
+        d.set_requested_size(BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG, block(1), 1))), RESP_ACK);
+        // Mid-shrink: three blocks still plugged against a one-block request.
+        let saved = d.save();
+        saved.validate_layout(8 * BLOCK_SIZE).unwrap();
+        let restored = wide_dev();
+        restored.restore_checked(saved.clone()).unwrap();
+        assert_eq!(restored.status(), d.status());
+        assert_eq!(state_of(&restored, 0, 1), STATE_PLUGGED);
+        assert_eq!(state_of(&restored, 1, 1), STATE_UNPLUGGED);
+        assert_eq!(state_of(&restored, 2, 2), STATE_PLUGGED);
+        // The restored device keeps converging the same way.
+        assert_eq!(
+            resp(restored.request(&request(REQ_UNPLUG, block(2), 2))),
+            RESP_ACK
+        );
+        assert_eq!(restored.status().plugged_size, BLOCK_SIZE);
+
+        // A forged plugged count that disagrees with the bitmap is rejected.
+        let mut forged = saved;
+        forged.actual_pages += (BLOCK_SIZE / PAGE_SIZE) as u32;
+        assert!(wide_dev().restore_checked(forged).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unplug_returns_resident_backing_to_the_host() {
+        let d = wide_dev();
+        d.set_requested_size(2 * BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(0), 2))), RESP_ACK);
+        let touched = [block(0), block(0) + 0x10_0000, block(1) + 0x3000];
+        for gpa in touched {
+            d.memory.write_phys(gpa, &[0xa5; 64]).unwrap();
+            assert!(page_is_resident(&d, gpa));
+        }
+        d.set_requested_size(BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG, block(1), 1))), RESP_ACK);
+        assert!(page_is_resident(&d, block(0)));
+        assert!(!page_is_resident(&d, block(1) + 0x3000));
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG_ALL, 0, 0))), RESP_ACK);
+        for gpa in touched {
+            assert!(!page_is_resident(&d, gpa), "{gpa:#x} still resident");
+        }
+    }
+
+    /// UNPLUG of a lazily restored block must go through the UFFD discard
+    /// bitmap: a later fault returns zeroes, never the snapshot bytes, for
+    /// both a page faulted in before the unplug and one never touched.
+    /// Requires userfaultfd; skips where the kernel or sandbox denies it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unplug_under_lazy_restore_never_resurrects_snapshot_bytes() {
+        use std::io::{Seek, SeekFrom, Write};
+        use vmm_memory_backend::{start_lazy_restore_with_integrity, UffdRestoreError};
+
+        let memory = GuestMemory::new_hotplug(4 * BLOCK_SIZE, 2 * BLOCK_SIZE).unwrap();
+        let len = memory.size_bytes;
+        let boot = memory.low_size_bytes;
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(len).unwrap();
+        for packed in [boot, boot + PAGE_SIZE] {
+            file.seek(SeekFrom::Start(packed)).unwrap();
+            file.write_all(&[0x5a; PAGE_SIZE as usize]).unwrap();
+        }
+        file.sync_all().unwrap();
+        let lazy = match start_lazy_restore_with_integrity(
+            memory.as_ptr() as *mut u8,
+            len as usize,
+            &file,
+            0,
+            len,
+            Some(memory.host_dirty_tracker()),
+            None,
+        ) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::ENOSYS)) =>
+            {
+                eprintln!("skipping: userfaultfd unavailable ({error})");
+                return;
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
+        memory.set_lazy_page_discard(lazy.page_discard());
+        let d = VirtioMemMmio::new(10, memory.clone()).unwrap();
+        d.set_requested_size(BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(0), 1))), RESP_ACK);
+        let mut bytes = [0; 8];
+        d.memory.read_phys(block(0), &mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 8], "lazy fault serves snapshot bytes");
+
+        d.set_requested_size(0).unwrap();
+        d.memory.drain_host_dirty();
+        assert_eq!(resp(d.request(&request(REQ_UNPLUG, block(0), 1))), RESP_ACK);
+        for gpa in [block(0), block(0) + PAGE_SIZE] {
+            d.memory.read_phys(gpa, &mut bytes).unwrap();
+            assert_eq!(bytes, [0; 8], "{gpa:#x} resurrected snapshot bytes");
+        }
+        assert!(d.memory.drain_host_dirty().contains(boot + PAGE_SIZE));
+        drop(d);
+        drop(lazy);
+    }
+
     #[test]
     fn config_uses_virtio_mem_wire_offsets_and_rejects_forged_state() {
         let d = dev();
