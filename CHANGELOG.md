@@ -132,9 +132,10 @@ versions may contain breaking changes.
 - x2APIC is offered to guests on bare-metal hosts.
 - taritd boots guests with a quiet console and derives its default capacity
   from the host.
-- The SSH gateway declines keys that are not registered when they are
-  offered, without a delay: an agent's other keys no longer cost each login a
-  second apiece.
+- The SSH gateway rejects a wrong key without the one-second delay, so an
+  agent's other keys no longer cost each login a second apiece. Every offered
+  key still gets the same answer; registration is checked only after the
+  client signs, so offers cannot reveal which keys are registered.
 - Live snapshots now pause, capture, and resume every configured vCPU through
   one bounded barrier; live fork supports SMP guests instead of rejecting them.
 - Hibernated exec, PTY, SSH, and public-share requests now join the same

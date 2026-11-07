@@ -31,9 +31,10 @@ pub(crate) async fn run(state: AppState, listener: TcpListener) -> Result<()> {
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::PublicKey);
     // No delay on rejection. Only public keys are accepted, so there is no
-    // secret to guess, and declining an offered key already tells the client
-    // whether it is registered, as any SSH server does. A delay would only
-    // slow every login by one interval per unrelated key in the user's agent.
+    // secret to guess, and a key is only ever rejected after the client has
+    // signed with it, which proves it holds the private key: the answer tells
+    // nobody anything about keys they do not hold. A delay would only slow
+    // every login by one interval per unrelated key in the user's agent.
     // russh still caps authentication attempts per connection.
     let config = Arc::new(server::Config {
         methods,
@@ -237,40 +238,19 @@ impl Drop for GatewayHandler {
 impl server::Handler for GatewayHandler {
     type Error = russh::Error;
 
-    /// Decline a key that cannot log in when the client offers it, before it
-    /// signs anything. An agent usually offers several keys in turn; accepting
-    /// every offer only to reject the signature cost each login a rejection
-    /// per unrelated key.
+    /// Answer every offered key the same way. Whether a key is registered is
+    /// looked up only once the client has signed with it (`auth_publickey`),
+    /// so an offer, which needs no private key, cannot be used to find out
+    /// which public keys some tenant has registered.
     async fn auth_publickey_offered(
         &mut self,
         user: &str,
-        key: &PublicKey,
+        _key: &PublicKey,
     ) -> Result<server::Auth, Self::Error> {
-        let Ok(vm_id) = parse_target_vm_id(user) else {
+        if parse_target_vm_id(user).is_err() {
             return Ok(server::Auth::reject());
-        };
-        let Ok(fingerprint) = public_key_fingerprint_sha256(key) else {
-            return Ok(server::Auth::reject());
-        };
-        match lookup_active_key(&self.state, fingerprint.clone()).await {
-            Ok(Some(_)) => Ok(server::Auth::Accept),
-            Ok(None) => {
-                crate::audit::record_parts(
-                    &self.state,
-                    "",
-                    "",
-                    tarit_types::audit_action::SSH_ATTEMPT,
-                    Some(vm_id),
-                    tarit_types::audit_outcome::DENIED,
-                    Some(fingerprint),
-                );
-                Ok(server::Auth::reject())
-            }
-            Err(e) => {
-                tracing::warn!(user, peer = ?self.peer_addr, "SSH gateway key lookup failed: {e}");
-                Ok(server::Auth::reject())
-            }
         }
+        Ok(server::Auth::Accept)
     }
 
     async fn auth_publickey(
@@ -1029,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn unregistered_keys_are_declined_when_offered() {
+    fn offers_do_not_reveal_which_keys_are_registered() {
         let state = test_state();
         let registered = PublicKey::from_openssh(ED25519_KEY).unwrap();
         state
@@ -1053,20 +1033,20 @@ mod tests {
             .unwrap();
         let mut handler = GatewayHandler::new(state, None);
         let vm = Uuid::new_v4().to_string();
+
         let offered = |handler: &mut GatewayHandler, user: &str, key: &PublicKey| {
             runtime
                 .block_on(handler.auth_publickey_offered(user, key))
                 .unwrap()
         };
-
         assert_eq!(
             offered(&mut handler, &vm, &registered),
             server::Auth::Accept
         );
-        assert_ne!(
+        assert_eq!(
             offered(&mut handler, &vm, &other),
             server::Auth::Accept,
-            "an agent's other keys are declined up front"
+            "an unregistered key gets the same answer as a registered one"
         );
         assert_ne!(
             offered(&mut handler, "root", &registered),
@@ -1074,6 +1054,15 @@ mod tests {
             "the user must name a VM"
         );
         assert!(handler.auth.is_none(), "an offer authenticates nothing");
+
+        // Only a signed attempt is checked against the registry.
+        let signed = |handler: &mut GatewayHandler, key: &PublicKey| {
+            runtime.block_on(handler.auth_publickey(&vm, key)).unwrap()
+        };
+        assert_ne!(signed(&mut handler, &other), server::Auth::Accept);
+        assert!(handler.auth.is_none());
+        assert_eq!(signed(&mut handler, &registered), server::Auth::Accept);
+        assert!(handler.auth.is_some());
     }
 
     #[test]

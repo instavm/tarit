@@ -268,11 +268,13 @@ export TARIT_SSH_GATEWAY_ADDR='0.0.0.0:2222'
 ssh -p 2222 -i ~/.ssh/tarit -o IdentitiesOnly=yes <vm_id>@<taritd-host>
 ```
 
-The gateway answers every offered key the same way, so which keys are
-registered cannot be probed, and it rejects each wrong key after a one-second
-delay. Offer only the registered key (`-i ... -o IdentitiesOnly=yes`); a client
-that tries several agent keys first waits about a second for each.
-`taritd ssh <id> -i KEY [ssh options] [command]` adds `IdentitiesOnly` for you.
+The gateway answers every offered key the same way and checks a key against
+the registry only after the client has signed with it, so which keys are
+registered cannot be probed without holding them. A wrong key is rejected
+without delay; a client that tries several agent keys first signs once with
+each. Offering only the registered key (`-i ... -o IdentitiesOnly=yes`) avoids
+that; `taritd ssh <id> -i KEY [ssh options] [command]` adds `IdentitiesOnly`
+for you.
 
 Optional warm-pool TOML shape:
 
