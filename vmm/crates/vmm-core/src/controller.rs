@@ -1112,7 +1112,12 @@ impl VmmController {
 
         let vcpu = kvm_vm.create_vcpu(0)?;
         kvm_vm.setup_vcpu_for_bzimage_boot_full(&vcpu, &loaded, full_boot)?;
-        let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
+        let vcpu_thread = VcpuThread::spawn(
+            crate::vcpu::VcpuId(0),
+            vcpu,
+            kvm_vm.mmio_bus.clone(),
+            serial.clone(),
+        )?;
 
         // SMP: create the application processors (vCPU ids 1..count). Each AP
         // gets CPUID (with its APIC id) + MP_STATE=UNINITIALIZED and its own
@@ -1123,10 +1128,11 @@ impl VmmController {
             let ap = kvm_vm.create_vcpu(id)?;
             kvm_vm.setup_ap_vcpu(&ap, id)?;
             ap_threads.push(VcpuThread::spawn(
+                crate::vcpu::VcpuId(id),
                 ap,
                 kvm_vm.mmio_bus.clone(),
                 serial.clone(),
-            ));
+            )?);
             log::info!("SMP: AP vCPU {id} created (UNINITIALIZED, awaiting SIPI)");
         }
 
@@ -6064,7 +6070,12 @@ fn build_running_vm(
         // safety hint, not a reason to discard an otherwise valid restore.
         log::warn!("restored BSP clock notification unavailable: {error}");
     }
-    let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
+    let vcpu_thread = VcpuThread::spawn(
+        crate::vcpu::VcpuId(0),
+        vcpu,
+        kvm_vm.mmio_bus.clone(),
+        serial.clone(),
+    )?;
 
     // SMP restore (phase B): recreate each AP (id 1..N) and re-apply its captured
     // state (which includes its RUNNABLE MP_STATE + LAPIC), so the restored VM
@@ -6081,10 +6092,11 @@ fn build_running_vm(
             log::warn!("restored AP {id} clock notification unavailable: {error}");
         }
         ap_threads.push(VcpuThread::spawn(
+            crate::vcpu::VcpuId(id),
             ap,
             kvm_vm.mmio_bus.clone(),
             serial.clone(),
-        ));
+        )?);
     }
 
     // The target was staged before vCPUs started. Signal only after every saved

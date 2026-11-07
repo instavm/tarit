@@ -5,6 +5,7 @@
 #![cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 
 use crate::error::{Result, VmmError};
+use crate::vcpu::VcpuId;
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,12 +58,14 @@ pub struct VcpuThread {
 }
 
 impl VcpuThread {
-    /// Spawn a vCPU thread that runs KVM_RUN in a loop.
+    /// Spawn a vCPU thread, named after `id` (see [`VcpuId::thread_name`]),
+    /// that runs KVM_RUN in a loop.
     pub fn spawn(
+        id: VcpuId,
         mut vcpu: VcpuFd,
         mmio_bus: Arc<MmioBus>,
         serial: Arc<vmm_devices::serial::Serial>,
-    ) -> Self {
+    ) -> Result<Self> {
         let control = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
@@ -77,7 +80,7 @@ impl VcpuThread {
         let captured_state = Arc::new(Mutex::new(None));
         let captured_for_thread = captured_state.clone();
 
-        let handle = thread::spawn(move || -> Result<()> {
+        let handle = id.spawn_thread(move || -> Result<()> {
             // Install a no-op SIGALRM handler so the signal interrupts
             // KVM_RUN (returns EINTR) without killing the process.
             // SAFETY: sigaction is called with a valid signal number and a
@@ -257,8 +260,10 @@ impl VcpuThread {
             })();
             result
         });
+        let handle =
+            handle.map_err(|e| VmmError::Kvm(format!("spawn {}: {e}", id.thread_name())))?;
 
-        Self {
+        Ok(Self {
             handle: Some(handle),
             control,
             stop_flag,
@@ -267,7 +272,7 @@ impl VcpuThread {
             tid,
             serial,
             captured_state,
-        }
+        })
     }
 
     /// True once the vCPU run loop has exited (clean stop, guest crash, etc.).

@@ -37,6 +37,8 @@ versions may contain breaking changes.
 
 ### Changed
 
+- vCPU threads are named `vcpu N` (N = vCPU id) so host tooling can find them,
+  for example to place only vCPU threads in a cgroup v2 threaded child.
 - Live snapshots now pause, capture, and resume every configured vCPU through
   one bounded barrier; live fork supports SMP guests instead of rejecting them.
 - Hibernated exec, PTY, SSH, and public-share requests now join the same
