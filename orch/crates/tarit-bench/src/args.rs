@@ -140,7 +140,7 @@ impl Args {
             Mode::Sequential => std::slice::from_ref(&self.iterations),
             Mode::Staggered | Mode::Burst => std::slice::from_ref(&self.concurrency),
             Mode::All => &[self.iterations, self.concurrency],
-            // The sample count is whatever the rate and duration produce.
+            // Known only once the run ends; verify_performance checks it.
             Mode::Sustained => &[],
         };
         if self.max_p95_ms.is_some() && sample_counts.iter().any(|count| *count < 20) {

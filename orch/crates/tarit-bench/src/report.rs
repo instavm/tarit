@@ -180,6 +180,23 @@ impl ModeOutcome {
             }
         }
 
+        // A tail gate needs enough samples to mean anything. Other modes are
+        // checked before they run; a sustained run's count is only known now.
+        let samples = self.iterations.len();
+        let sustained = self.mode == args::Mode::Sustained;
+        if sustained && ctx.max_p95_ms.is_some() && samples < 20 {
+            anyhow::bail!(
+                "{} produced {samples} samples; a p95 gate needs at least 20",
+                self.mode.as_str()
+            );
+        }
+        if sustained && ctx.max_p99_ms.is_some() && samples < 100 {
+            anyhow::bail!(
+                "{} produced {samples} samples; a p99 gate needs at least 100",
+                self.mode.as_str()
+            );
+        }
+
         let Some(stats) = result.summary.tti_ms else {
             if ctx.max_median_ms.is_some() || ctx.max_p95_ms.is_some() || ctx.max_p99_ms.is_some() {
                 anyhow::bail!(
@@ -424,6 +441,19 @@ mod tests {
             duration: Duration::from_secs(1),
             max_in_flight: 1,
         }
+    }
+
+    #[test]
+    fn a_tail_gate_rejects_a_run_with_too_few_samples() {
+        let mut ctx = context();
+        ctx.max_p95_ms = None;
+        ctx.max_p99_ms = Some(1_000);
+        let outcome = ModeOutcome::new(
+            args::Mode::Sustained,
+            vec![IterationResult::success(5), IterationResult::success(6)],
+        );
+        let error = outcome.verify_performance(&ctx).unwrap_err().to_string();
+        assert!(error.contains("at least 100"), "{error}");
     }
 
     #[test]

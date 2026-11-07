@@ -141,8 +141,17 @@ async fn run_sustained(client: SharedClient, ctx: &RunContext) -> ModeOutcome {
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let mut handles = Vec::new();
     let mut shed = 0usize;
-    while started.elapsed() < ctx.duration {
-        ticks.tick().await;
+    let deadline = tokio::time::Instant::from_std(started + ctx.duration);
+    loop {
+        // A tick due after the deadline launches nothing, however low the
+        // rate.
+        tokio::select! {
+            _ = ticks.tick() => {}
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
         let Ok(permit) = in_flight.clone().try_acquire_owned() else {
             shed += 1;
             continue;
