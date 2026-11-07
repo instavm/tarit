@@ -1921,6 +1921,111 @@ enum RestoreOverlay {
     Seeded(PathBuf),
 }
 
+/// A restore's private disk upper being seeded from its snapshot (copied,
+/// handed to the jail's uid, and checked against the snapshot manifest) on
+/// a thread of its own. Dropping it unfinished waits for the thread and
+/// removes whatever it wrote.
+struct OverlaySeeding {
+    destination: PathBuf,
+    thread: Option<std::thread::JoinHandle<Result<(), OrchError>>>,
+    spawn_error: Option<OrchError>,
+    keep: bool,
+}
+
+impl OverlaySeeding {
+    fn start(
+        source: PathBuf,
+        destination: PathBuf,
+        jail_owner: Option<(u32, u32)>,
+        integrity: Option<tarit_proto::ArtifactIntegrity>,
+        chunk_size: u64,
+    ) -> Self {
+        let target = destination.clone();
+        let spawned = std::thread::Builder::new()
+            .name("seed-overlay".into())
+            .spawn(move || {
+                seed_restore_overlay(&source, &target, jail_owner, integrity.as_ref(), chunk_size)
+            });
+        let (thread, spawn_error) = match spawned {
+            Ok(thread) => (Some(thread), None),
+            Err(error) => (
+                None,
+                Some(OrchError::Internal(format!(
+                    "start seeding the restore disk upper: {error}"
+                ))),
+            ),
+        };
+        Self {
+            destination,
+            thread,
+            spawn_error,
+            keep: false,
+        }
+    }
+
+    /// Wait for the seeding and return how it went; a seeded upper is kept.
+    fn finish(mut self) -> Result<(), OrchError> {
+        if let Some(error) = self.spawn_error.take() {
+            return Err(error);
+        }
+        let result = match self.thread.take().map(std::thread::JoinHandle::join) {
+            Some(Ok(result)) => result,
+            Some(Err(_)) => Err(OrchError::Internal(
+                "seeding the restore disk upper panicked".into(),
+            )),
+            None => Err(OrchError::Internal(
+                "restore disk upper was not seeded".into(),
+            )),
+        };
+        self.keep = result.is_ok();
+        result
+    }
+}
+
+impl Drop for OverlaySeeding {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if !self.keep {
+            if let Err(error) = remove_file_if_present(&self.destination) {
+                tracing::warn!(
+                    path = %self.destination.display(),
+                    %error,
+                    "remove unused restore disk upper"
+                );
+            }
+        }
+    }
+}
+
+fn seed_restore_overlay(
+    source: &Path,
+    destination: &Path,
+    jail_owner: Option<(u32, u32)>,
+    integrity: Option<&tarit_proto::ArtifactIntegrity>,
+    chunk_size: u64,
+) -> Result<(), OrchError> {
+    copy_private_artifact(source, destination).map_err(|error| {
+        OrchError::Internal(format!("seed private restore disk upper: {error}"))
+    })?;
+    if let Some((uid, gid)) = jail_owner {
+        set_jail_owner_mode(destination, uid, gid, 0o600)?;
+    }
+    if let Some(integrity) = integrity {
+        let artifact = OwnedArtifact::capture(destination).map_err(|error| {
+            OrchError::Internal(format!("capture seeded restore disk upper: {error}"))
+        })?;
+        verify_file_artifact_integrity(
+            &artifact._file,
+            integrity,
+            chunk_size,
+            "seeded restore disk",
+        )?;
+    }
+    Ok(())
+}
+
 impl SnapshotBundle {
     pub(crate) fn snapshot_path(&self) -> &str {
         &self.snapshot_path
@@ -5546,6 +5651,26 @@ impl VmmSupervisor {
             }
             None => (None, None, 0),
         };
+        // Seeding and verifying the private disk upper needs nothing from the
+        // VMM, so it runs while the network is provisioned and the VMM process
+        // starts. Its result is taken below, where the seeding used to run;
+        // every earlier return joins it and removes what it wrote.
+        let mut seeding = match &overlay {
+            RestoreOverlay::None => None,
+            RestoreOverlay::Seeded(source) => {
+                let destination = runtime
+                    .host_overlay
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(self.overlay_path_for(id)));
+                Some(OverlaySeeding::start(
+                    source.clone(),
+                    destination,
+                    runtime.jail.as_ref().map(|jail| (jail.uid, jail.gid)),
+                    overlay_integrity.clone(),
+                    integrity_chunk_size,
+                ))
+            }
+        };
         let net_alloc = match &self.net {
             Some(provisioner) => {
                 match provisioner.provision_with_owner_and_policy(
@@ -5592,57 +5717,12 @@ impl VmmSupervisor {
         // durable snapshot this destination is seeded from SnapshotRecord's
         // owned disk artifact; the source overlay path serialized in RAM state
         // is never reopened.
-        let overlay = match overlay {
-            RestoreOverlay::None => None,
-            RestoreOverlay::Seeded(source) => {
-                let destination = runtime
-                    .host_overlay
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(self.overlay_path_for(id)));
-                if let Err(error) = copy_private_artifact(&source, &destination) {
-                    return Err(self.cleanup_boot_failure(
-                        id,
-                        &ticket.control,
-                        &base_vm,
-                        OrchError::Internal(format!("seed private restore disk upper: {error}")),
-                    ));
-                }
-                if let Some(jail) = &runtime.jail {
-                    if let Err(error) = set_jail_owner_mode(&destination, jail.uid, jail.gid, 0o600)
-                    {
-                        return Err(self.cleanup_boot_failure(
-                            id,
-                            &ticket.control,
-                            &base_vm,
-                            error,
-                        ));
-                    }
-                }
-                if let Some(integrity) = overlay_integrity.as_ref() {
-                    let destination_artifact =
-                        OwnedArtifact::capture(&destination).map_err(|error| {
-                            self.cleanup_boot_failure(
-                                id,
-                                &ticket.control,
-                                &base_vm,
-                                OrchError::Internal(format!(
-                                    "capture seeded restore disk upper: {error}"
-                                )),
-                            )
-                        })?;
-                    if let Err(error) = verify_file_artifact_integrity(
-                        &destination_artifact._file,
-                        integrity,
-                        integrity_chunk_size,
-                        "seeded restore disk",
-                    ) {
-                        return Err(self.cleanup_boot_failure(
-                            id,
-                            &ticket.control,
-                            &base_vm,
-                            error,
-                        ));
-                    }
+        let overlay = match seeding.take() {
+            None => None,
+            Some(seeding) => {
+                let destination = seeding.destination.clone();
+                if let Err(error) = seeding.finish() {
+                    return Err(self.cleanup_boot_failure(id, &ticket.control, &base_vm, error));
                 }
                 runtime
                     .guest_overlay
@@ -12000,6 +12080,59 @@ mod tests {
             .learned_warm_classes(Duration::from_millis(10))
             .is_empty());
         assert!(supervisor.learned_classes_snapshot().is_empty());
+    }
+
+    #[test]
+    fn overlay_seeding_keeps_a_verified_upper_and_cleans_up_otherwise() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/overlay-seeding-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("snapshot.cow");
+        std::fs::write(&source, vec![7u8; 128 * 1024]).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let chunk = 64 * 1024;
+        let manifest = hash_artifact_range(
+            &File::open(&source).unwrap(),
+            tarit_proto::ArtifactKind::Overlay,
+            0,
+            128 * 1024,
+            chunk,
+        )
+        .unwrap();
+
+        let kept = dir.join("kept.cow");
+        let seeding = OverlaySeeding::start(
+            source.clone(),
+            kept.clone(),
+            None,
+            Some(manifest.clone()),
+            chunk,
+        );
+        seeding.finish().unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), vec![7u8; 128 * 1024]);
+
+        // An abandoned restore leaves nothing behind.
+        let dropped = dir.join("dropped.cow");
+        drop(OverlaySeeding::start(
+            source.clone(),
+            dropped.clone(),
+            None,
+            None,
+            chunk,
+        ));
+        assert!(!dropped.exists());
+
+        // A seeded upper that does not match the manifest is refused and removed.
+        let mut wrong = manifest;
+        wrong.chunk_hashes[1] = [0u8; 32];
+        let damaged = dir.join("damaged.cow");
+        let error = OverlaySeeding::start(source, damaged.clone(), None, Some(wrong), chunk)
+            .finish()
+            .unwrap_err();
+        assert!(error.to_string().contains("integrity"), "{error}");
+        assert!(!damaged.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

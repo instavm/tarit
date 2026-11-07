@@ -71,6 +71,9 @@ versions may contain breaking changes.
 
 ### Changed
 
+- A restore or fork child seeds and verifies its private disk upper while
+  the network is provisioned and the VMM process starts, instead of after.
+
 - Finished command records, with their captured output, are deleted after
   `TARIT_EXECUTION_RETENTION_HOURS` (default 24; 0 keeps them). Every
   `/v1/execute` stored one, so a busy host's database grew without bound.
