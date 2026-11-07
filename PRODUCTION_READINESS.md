@@ -80,9 +80,11 @@ its scope.
   SHA-256 before extraction, then enforces disk-size-derived limits for layers,
   compressed and expanded bytes, entries, individual files, and paths. Limit
   failures publish no rootfs and remove the private build workspace.
-- Orchestrated snapshots are full snapshots only. Incremental requests fail
-  with `422` until every parent can be relocated into a durable manifest-backed
-  chain; direct VMM incremental snapshots remain available for local testing.
+- Every orchestrated snapshot is standalone: it never depends on a parent at
+  restore. An incremental request (`diff=true`) pauses the guest only for pages
+  changed since the VM's previous checkpoint and copies the rest from that
+  checkpoint after resume; direct VMM parent/diff chains remain available for
+  local testing.
 - Python and TypeScript SDKs are generated from the checked-in OpenAPI contract.
   CI rejects generation drift, type-checks and packages both clients, and tests
   typed tenant denials, bounded execution polling, stable-ID fork retry, and
