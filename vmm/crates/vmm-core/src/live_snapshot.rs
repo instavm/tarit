@@ -26,6 +26,9 @@ pub const PAGE_SIZE: u64 = 4096;
 /// over-estimated bandwidth makes [`decide`] stop immediately — which is what
 /// previously made the pre-copy loop a no-op.
 const BANDWIDTH_SAMPLE_MIN_BYTES: u64 = 1 << 20;
+/// The most untouched restored RAM shared from the restore snapshot in one
+/// clone call.
+const CLONE_RUN_BYTES: usize = 32 << 20;
 
 /// Fallback bandwidth estimate when no round has produced a usable sample.
 const DEFAULT_COPY_BANDWIDTH_BPS: u64 = 500_000_000;
@@ -425,7 +428,38 @@ fn write_lazy_restored_pages(
     let mut buffer = vec![0u8; chunk];
     let mut written = 0u64;
     let mut start = 0usize;
+    // On a filesystem that shares blocks, runs of chunks the guest never
+    // touched are cloned from the restore snapshot (still verified) instead
+    // of written: nothing to copy now or to sync later.
+    let mut cloning = true;
     while start < source.len() {
+        if cloning {
+            let untouched = |at: usize| {
+                let end = (at + chunk).min(source.len());
+                populated[at / page..end / page]
+                    .iter()
+                    .all(|touched| !*touched)
+            };
+            let mut run_end = start;
+            while run_end < source.len() && run_end - start < CLONE_RUN_BYTES && untouched(run_end)
+            {
+                run_end = (run_end + chunk).min(source.len());
+            }
+            if run_end > start {
+                use vmm_memory_backend::uffd_restore::CloneOutcome;
+                match lazy
+                    .clone_untouched(start, run_end - start, dest, start as u64)
+                    .map_err(|error| VmmError::Snapshot(format!("clone restored RAM: {error}")))?
+                {
+                    CloneOutcome::Cloned => {
+                        start = run_end;
+                        continue;
+                    }
+                    CloneOutcome::NotThisRange => {}
+                    CloneOutcome::Unsupported => cloning = false,
+                }
+            }
+        }
         let end = (start + chunk).min(source.len());
         let pages = &populated[start / page..end / page];
         let write = if pages.iter().all(|touched| *touched) {

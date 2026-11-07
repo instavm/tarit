@@ -58,12 +58,25 @@ pub struct LazyPageDiscard {
     source: LazySource,
 }
 
+/// What [`LazyPageDiscard::clone_untouched`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneOutcome {
+    /// The range now shares the snapshot's blocks.
+    Cloned,
+    /// Not for this range (a discarded page, or misaligned); others may clone.
+    NotThisRange,
+    /// The files cannot share blocks; no range will clone.
+    Unsupported,
+}
+
 /// Where a lazily restored guest's missing pages come from.
 #[derive(Clone)]
 struct LazySource {
     file: std::sync::Arc<std::fs::File>,
     offset: u64,
     integrity: Option<std::sync::Arc<ChunkIntegrity>>,
+    /// The manifest hash of an all-zero chunk, when there is a manifest.
+    zero_chunk_hash: Option<[u8; 32]>,
 }
 
 /// Chunk size of [`LazyPageDiscard::read_untouched`] without a manifest.
@@ -108,22 +121,31 @@ impl LazyPageDiscard {
                 "untouched read must cover whole chunks".into(),
             ));
         }
-        self.source
-            .file
-            .read_exact_at(out, self.source.offset + offset as u64)?;
         if let Some(integrity) = self.source.integrity.as_ref() {
-            for (index, bytes) in out.chunks(chunk).enumerate() {
+            for (index, bytes) in out.chunks_mut(chunk).enumerate() {
                 let chunk_index = offset / chunk + index;
-                let matches = integrity
-                    .chunk_hashes
-                    .get(chunk_index)
-                    .is_some_and(|expected| chunk_sha256_matches(bytes, expected));
-                if !matches {
+                let expected = integrity.chunk_hashes.get(chunk_index).ok_or_else(|| {
+                    UffdRestoreError::Uffd(format!("no integrity hash for chunk {chunk_index}"))
+                })?;
+                // As in the fault handler: a chunk recorded as all zeros is
+                // zeros, with nothing to read or verify.
+                if bytes.len() == chunk && self.source.zero_chunk_hash.as_ref() == Some(expected) {
+                    bytes.fill(0);
+                    continue;
+                }
+                self.source
+                    .file
+                    .read_exact_at(bytes, self.source.offset + (offset + index * chunk) as u64)?;
+                if !chunk_sha256_matches(bytes, expected) {
                     return Err(UffdRestoreError::Uffd(format!(
                         "snapshot integrity failure at chunk {chunk_index}"
                     )));
                 }
             }
+        } else {
+            self.source
+                .file
+                .read_exact_at(out, self.source.offset + offset as u64)?;
         }
         let discarded = self
             .discarded_pages
@@ -139,6 +161,105 @@ impl LazyPageDiscard {
             }
         }
         Ok(())
+    }
+
+    /// Put the snapshot bytes behind untouched guest RAM `offset..offset +
+    /// len` into `dest` at `dest_offset` by sharing the snapshot file's
+    /// blocks (a reflink) instead of writing them. Each chunk is first
+    /// checked against the integrity manifest, as [`Self::read_untouched`]
+    /// checks it, so a damaged chunk is an error rather than carried into
+    /// `dest` under a new hash. When nothing was cloned the caller writes
+    /// the bytes itself.
+    pub fn clone_untouched(
+        &self,
+        offset: usize,
+        len: usize,
+        dest: &std::fs::File,
+        dest_offset: u64,
+    ) -> Result<CloneOutcome, UffdRestoreError> {
+        use std::os::unix::fs::FileExt;
+        const PAGE_SIZE: usize = 4096;
+        const BLOCK: u64 = 4096;
+        // struct file_clone_range from linux/fs.h.
+        #[repr(C)]
+        struct FileCloneRange {
+            src_fd: i64,
+            src_offset: u64,
+            src_length: u64,
+            dest_offset: u64,
+        }
+        const FICLONERANGE: libc::Ioctl = 0x4020_940D;
+
+        let src_offset = self.source.offset + offset as u64;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.guest_len)
+            .ok_or_else(|| UffdRestoreError::Uffd("untouched clone beyond guest RAM".into()))?;
+        if len == 0
+            || !src_offset.is_multiple_of(BLOCK)
+            || !dest_offset.is_multiple_of(BLOCK)
+            || !(len as u64).is_multiple_of(BLOCK)
+        {
+            return Ok(CloneOutcome::NotThisRange);
+        }
+        {
+            let discarded = self
+                .discarded_pages
+                .lock()
+                .map_err(|_| UffdRestoreError::Uffd("discard bitmap lock poisoned".into()))?;
+            if (offset / PAGE_SIZE..end.div_ceil(PAGE_SIZE))
+                .any(|page| discarded.get(page).copied().unwrap_or(false))
+            {
+                return Ok(CloneOutcome::NotThisRange);
+            }
+        }
+        if let Some(integrity) = self.source.integrity.as_ref() {
+            let chunk = integrity.chunk_size;
+            if !offset.is_multiple_of(chunk)
+                || (!len.is_multiple_of(chunk) && end != self.guest_len)
+            {
+                return Ok(CloneOutcome::NotThisRange);
+            }
+            let mut buffer = vec![0u8; chunk];
+            for at in (offset..end).step_by(chunk) {
+                let chunk_index = at / chunk;
+                let expected = integrity.chunk_hashes.get(chunk_index).ok_or_else(|| {
+                    UffdRestoreError::Uffd(format!("no integrity hash for chunk {chunk_index}"))
+                })?;
+                let bytes = &mut buffer[..chunk.min(end - at)];
+                if bytes.len() == chunk && self.source.zero_chunk_hash.as_ref() == Some(expected) {
+                    continue;
+                }
+                self.source
+                    .file
+                    .read_exact_at(bytes, self.source.offset + at as u64)?;
+                if !chunk_sha256_matches(bytes, expected) {
+                    return Err(UffdRestoreError::Uffd(format!(
+                        "snapshot integrity failure at chunk {chunk_index}"
+                    )));
+                }
+            }
+        }
+        let range = FileCloneRange {
+            src_fd: i64::from(self.source.file.as_raw_fd()),
+            src_offset,
+            src_length: len as u64,
+            dest_offset,
+        };
+        // SAFETY: `range` is a fully initialised file_clone_range that the
+        // kernel only reads; both descriptors are open.
+        let rc = unsafe {
+            libc::ioctl(
+                dest.as_raw_fd(),
+                FICLONERANGE,
+                &range as *const FileCloneRange,
+            )
+        };
+        Ok(if rc == 0 {
+            CloneOutcome::Cloned
+        } else {
+            CloneOutcome::Unsupported
+        })
     }
 
     pub fn discard(&self, offset: usize, len: usize) -> Result<(), UffdRestoreError> {
@@ -671,6 +792,9 @@ pub fn start_lazy_restore_with_integrity(
             source: LazySource {
                 file: std::sync::Arc::new(source_file),
                 offset: snapshot_offset,
+                zero_chunk_hash: source_integrity
+                    .as_ref()
+                    .map(|integrity| Sha256::digest(vec![0u8; integrity.chunk_size]).into()),
                 integrity: source_integrity,
             },
         },
@@ -1448,6 +1572,128 @@ mod tests {
         // SAFETY: `guest` is still mapped.
         assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn untouched_ram_clones_verified_and_refuses_damage_or_discards() {
+        const PAGE: usize = 4096;
+        const CHUNK: usize = PAGE * 4;
+        const LEN: usize = CHUNK * 4;
+        let dir = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = dir.join(format!(
+            "tarit-uffd-clone-src-{}-{unique}",
+            std::process::id()
+        ));
+        let dest_path = dir.join(format!(
+            "tarit-uffd-clone-dst-{}-{unique}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // Chunk 0 is a hole; the rest hold data.
+        let mut snapshot = vec![0u8; LEN];
+        for (index, byte) in snapshot[CHUNK..].iter_mut().enumerate() {
+            *byte = (index / PAGE + 3) as u8;
+        }
+        file.set_len(LEN as u64).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&file, &snapshot[CHUNK..], CHUNK as u64).unwrap();
+        file.sync_all().unwrap();
+        let hashes = snapshot
+            .chunks(CHUNK)
+            .map(|c| Sha256::digest(c).into())
+            .collect();
+        // SAFETY: one private anonymous mapping, unmapped exactly once below.
+        let guest = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest, libc::MAP_FAILED);
+        let cleanup = || {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&dest_path);
+        };
+        let lazy = match start_lazy_restore_with_integrity(
+            guest.cast(),
+            LEN,
+            &file,
+            0,
+            LEN as u64,
+            None,
+            Some(ChunkIntegrity {
+                chunk_size: CHUNK,
+                chunk_hashes: hashes,
+            }),
+        ) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                // SAFETY: `guest` is the live mapping created above.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                cleanup();
+                return;
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
+        let source = lazy.page_discard();
+        let dest = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&dest_path)
+            .unwrap();
+        dest.set_len(LEN as u64).unwrap();
+
+        match source.clone_untouched(0, 2 * CHUNK, &dest, 0).unwrap() {
+            CloneOutcome::Unsupported => {
+                // This filesystem cannot share blocks; callers write instead.
+                drop(lazy);
+                // SAFETY: `guest` is still mapped.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                cleanup();
+                return;
+            }
+            outcome => assert_eq!(outcome, CloneOutcome::Cloned),
+        }
+        let mut cloned = vec![0xffu8; 2 * CHUNK];
+        std::os::unix::fs::FileExt::read_exact_at(&dest, &mut cloned, 0).unwrap();
+        assert!(
+            cloned == snapshot[..2 * CHUNK],
+            "cloned bytes are the snapshot's"
+        );
+
+        // A discarded page keeps its range from being cloned.
+        source.discard(2 * CHUNK + PAGE, PAGE).unwrap();
+        assert_eq!(
+            source
+                .clone_untouched(2 * CHUNK, CHUNK, &dest, 2 * CHUNK as u64)
+                .unwrap(),
+            CloneOutcome::NotThisRange
+        );
+        // Damage in the snapshot is caught before anything is shared.
+        std::os::unix::fs::FileExt::write_all_at(&file, &[0], (3 * CHUNK + 9) as u64).unwrap();
+        assert!(source
+            .clone_untouched(3 * CHUNK, CHUNK, &dest, 3 * CHUNK as u64)
+            .is_err());
+
+        drop(lazy);
+        // SAFETY: `guest` is still mapped.
+        assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+        cleanup();
     }
 
     #[test]

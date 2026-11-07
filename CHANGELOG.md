@@ -64,6 +64,15 @@ versions may contain breaking changes.
 
 ### Changed
 
+- Live snapshots of lazily restored VMs (every checkpoint after a restore,
+  and every fork) do much less I/O. Untouched memory the restore snapshot
+  records as all zeros is neither read nor hashed; on a reflink filesystem
+  the rest of the untouched memory shares the restore snapshot's blocks,
+  after each chunk is checked against its manifest, instead of being
+  written and synced; and publication hashes only the staged image's data
+  extents. For a 256 MiB node:22 sandbox the live snapshot went from about
+  500 to 250 ms and the bytes written from 84 to 22 MiB.
+
 - virtio-blk reads go straight into guest memory with one `preadv` per
   request (per run of sectors, under a copy-on-write overlay) instead of
   through a freshly zeroed bounce buffer: large reads from the host page

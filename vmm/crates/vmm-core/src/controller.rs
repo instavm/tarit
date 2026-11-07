@@ -4111,6 +4111,51 @@ fn full_snapshot_layout_for_lengths(state_len: u64, mem_len: u64) -> Option<Full
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+/// The byte ranges of `file` below `len` that hold data, from
+/// `SEEK_DATA`/`SEEK_HOLE`; everything else reads as zero. A filesystem that
+/// does not report holes reports the whole file as data.
+fn file_data_extents(file: &std::fs::File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let mut extents = Vec::new();
+    let mut at = 0u64;
+    while at < len {
+        let offset = libc::off_t::try_from(at)
+            .map_err(|_| std::io::Error::other("file offset does not fit off_t"))?;
+        // SAFETY: lseek on an open fd reads no memory.
+        let data = unsafe { libc::lseek(fd, offset, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break; // only a hole remains
+            }
+            return Err(error);
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let (start, end) = (data as u64, (hole as u64).min(len));
+        if start >= len {
+            break;
+        }
+        extents.push((start, end));
+        at = end;
+    }
+    Ok(extents)
+}
+
+/// Whether `[at, at + len)` overlaps any of the sorted `extents`.
+fn ranges_overlap(extents: &[(u64, u64)], at: u64, len: u64) -> bool {
+    let end = at + len;
+    let first = extents.partition_point(|&(_, extent_end)| extent_end <= at);
+    extents
+        .get(first)
+        .is_some_and(|&(extent_start, _)| extent_start < end)
+}
+
 fn drop_file_cache(file: &std::fs::File, offset: u64, len: u64) {
     use std::os::fd::AsRawFd;
 
@@ -4610,7 +4655,7 @@ fn write_scratch_snapshot_file_from_memory_file(
     diff: bool,
 ) -> Result<tarit_proto::IntegrityManifest> {
     use sha2::{Digest as _, Sha256};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
 
     const MAGIC: &[u8; 4] = b"VMSN";
@@ -4709,12 +4754,14 @@ fn write_scratch_snapshot_file_from_memory_file(
         );
     }
 
-    let mut source = memory_file
-        .try_clone()
-        .map_err(|error| VmmError::Snapshot(format!("clone staged RAM: {error}")))?;
-    source
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| VmmError::Snapshot(format!("seek staged RAM: {error}")))?;
+    // The staged image is sparse: guest RAM that is zero was never written.
+    // Its holes need no reading, hashing or writing; their integrity hashes
+    // and CRC contribution are those of zeros.
+    let data_extents = file_data_extents(memory_file, mem_len)
+        .map_err(|error| VmmError::Snapshot(format!("map staged RAM extents: {error}")))?;
+    let zero_chunk_hash: [u8; 32] = Sha256::digest(vec![0u8; INTEGRITY_CHUNK_BYTES]).into();
+    let mut zero_chunk_crc = crc32fast::Hasher::new();
+    zero_chunk_crc.update(&vec![0u8; INTEGRITY_CHUNK_BYTES]);
     let mut hasher = crc32fast::Hasher::new();
     let mut memory_chunk_hashes = Vec::new();
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
@@ -4722,15 +4769,23 @@ fn write_scratch_snapshot_file_from_memory_file(
     let mut synced = 0u64;
     while copied < mem_len {
         let chunk = (mem_len - copied).min(buffer.len() as u64) as usize;
-        source
-            .read_exact(&mut buffer[..chunk])
-            .map_err(|error| VmmError::Snapshot(format!("read staged RAM: {error}")))?;
-        hasher.update(&buffer[..chunk]);
-        memory_chunk_hashes.extend(
-            buffer[..chunk]
-                .chunks(INTEGRITY_CHUNK_BYTES)
-                .map(|bytes| -> [u8; 32] { Sha256::digest(bytes).into() }),
-        );
+        for (index, at) in (copied..copied + chunk as u64)
+            .step_by(INTEGRITY_CHUNK_BYTES)
+            .enumerate()
+        {
+            let len = (copied + chunk as u64 - at).min(INTEGRITY_CHUNK_BYTES as u64);
+            let bytes = &mut buffer[index * INTEGRITY_CHUNK_BYTES..][..len as usize];
+            if len == INTEGRITY_CHUNK_BYTES as u64 && !ranges_overlap(&data_extents, at, len) {
+                bytes.fill(0);
+                hasher.combine(&zero_chunk_crc);
+                memory_chunk_hashes.push(zero_chunk_hash);
+                continue;
+            }
+            std::os::unix::fs::FileExt::read_exact_at(memory_file, bytes, at)
+                .map_err(|error| VmmError::Snapshot(format!("read staged RAM: {error}")))?;
+            hasher.update(bytes);
+            memory_chunk_hashes.push(Sha256::digest(&*bytes).into());
+        }
         if !reflinked {
             // The memory range of the freshly sized output is a hole: zero
             // pages stay holes, as they are in the staged image.
@@ -9606,6 +9661,82 @@ mod tests {
         assert_eq!(layout.state_len, 123);
         assert_eq!(layout.mem_offset, FULL_SNAPSHOT_HEADER_LEN + 123);
         assert_eq!(layout.mem_len, 2 * 4096);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn a_sparse_staged_image_publishes_the_same_bytes_and_hashes_as_a_dense_one() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::FileExt;
+
+        let dir = private_runtime_dir().unwrap();
+        let nonce = format!(
+            "sparse-live-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source_path = dir.join(format!("{nonce}-memory.raw"));
+        let output_path = dir.join(format!("{nonce}-snapshot.snap"));
+        let source = OwnedScratchFile::create_new(&source_path).unwrap();
+        let output = OwnedScratchFile::create_new(&output_path).unwrap();
+        // 9 MiB plus a partial chunk: mostly holes, with data that starts and
+        // ends inside chunks and a non-zero tail.
+        let len = 9 * 1024 * 1024 + 4096 + 11;
+        let mut memory = vec![0u8; len];
+        for (at, size) in [
+            (100_000usize, 5000usize),
+            (4 * 1024 * 1024 + 7, 70_000),
+            (len - 3000, 3000),
+        ] {
+            for (index, byte) in memory[at..at + size].iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(13).wrapping_add(1);
+            }
+            source
+                .file()
+                .write_all_at(&memory[at..at + size], at as u64)
+                .unwrap();
+        }
+        source.file().set_len(len as u64).unwrap();
+
+        let manifest = write_scratch_snapshot_file_from_memory_file(
+            &output,
+            b"sparse state",
+            source.file(),
+            len as u64,
+            false,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&output_path).unwrap();
+        let padded_state_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mem_offset = 32 + padded_state_len;
+        assert_eq!(&bytes[mem_offset..], memory);
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            crc32fast::hash(&memory)
+        );
+        let ram = manifest.artifact(tarit_proto::ArtifactKind::Ram).unwrap();
+        let expected: Vec<[u8; 32]> = memory
+            .chunks(tarit_proto::INTEGRITY_CHUNK_SIZE as usize)
+            .map(|chunk| Sha256::digest(chunk).into())
+            .collect();
+        assert_eq!(ram.chunk_hashes, expected);
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[test]
+    fn ranges_overlap_finds_data_around_a_range() {
+        let extents = [(10, 20), (40, 50)];
+        assert!(!super::ranges_overlap(&extents, 0, 10));
+        assert!(super::ranges_overlap(&extents, 0, 11));
+        assert!(!super::ranges_overlap(&extents, 20, 20));
+        assert!(super::ranges_overlap(&extents, 45, 100));
+        assert!(!super::ranges_overlap(&extents, 50, 100));
+        assert!(!super::ranges_overlap(&[], 0, 100));
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
