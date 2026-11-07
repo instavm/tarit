@@ -15,8 +15,9 @@ T = TypeVar("T", bound="SnapshotVmBody")
 class SnapshotVmBody:
     """
     Attributes:
-        diff (bool | Unset): Must be false. Incremental orchestrator snapshots are disabled until durable parent-chain
-            relocation is available. Default: False.
+        diff (bool | Unset): Accepted for compatibility. Every snapshot is standalone; capture pauses the guest only for
+            pages changed since the snapshot it was restored from or last wrote, whenever the VMM can use that snapshot as a
+            base. Default: False.
     """
 
     diff: bool | Unset = False

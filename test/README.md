@@ -94,6 +94,26 @@ sudo MODE=cold N=50 test/bench.sh   # cold-boot each VM instead of restore-from-
 
 Results print as a table and are written under `bench-results/`.
 
+## Soak at scale (any running taritd, no root)
+
+`test/soak/api_soak.py` keeps N sandboxes busy through the public API for a
+fixed time. Each worker owns one VM and mixes commands, disk writes read
+back after `sync`, checkpoint-and-restore into a new VM, fork, pause and
+resume, and delete-and-recreate; a restored or forked VM must hold the
+marker its source wrote. It samples taritd's memory and open files and the
+host's VMM processes, deletes everything it made, and fails on an error
+rate above `--max-error-rate` (default 0.1%), any data mismatch, or
+anything left behind.
+
+```sh
+TARIT_URL=http://127.0.0.1:8080 TARIT_API_KEY=... \
+  test/soak/api_soak.py --vms 100 --minutes 30 --image node:22 --out soak.json
+```
+
+taritd needs room for twice `--vms` (restores and forks overlap their
+source): raise `TARIT_MAX_VMS`, `TARIT_MAX_VCPUS` and, on a small host,
+`TARIT_MAX_MEMORY_MIB`.
+
 ## 3. Multi-node cluster (spins up + destroys EC2)
 
 Provisions an ephemeral N-node cluster, forms it against a self-contained

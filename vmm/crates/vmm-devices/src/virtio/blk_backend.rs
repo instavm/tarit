@@ -125,6 +125,43 @@ impl CowHeader {
     }
 }
 
+fn write_fresh_cow(overlay: &mut File, header: &CowHeader) -> Result<(), BlkBackendError> {
+    write_all_at(overlay, 0, &header.encode())?;
+    let bitmap = vec![0u8; usize_from_u64(header.bitmap_len, "bitmap length")?];
+    write_all_at(overlay, header.bitmap_offset, &bitmap)?;
+    overlay.set_len(header.data_offset)?;
+    Ok(())
+}
+
+/// Initialize an empty CoW overlay for `base_path` without syncing it.
+///
+/// Only for scratch overlays that the VMM creates in its private runtime
+/// directory and removes when it exits: after a host crash the VM they belong
+/// to is gone, so a durable header buys nothing and costs an fsync on every
+/// restore. [`BlkBackend::open_cow`] initializes and syncs any other empty
+/// overlay.
+pub fn init_volatile_cow_overlay(
+    overlay: &mut File,
+    base_path: &Path,
+) -> Result<(), BlkBackendError> {
+    if overlay.metadata()?.len() != 0 {
+        return Err(BlkBackendError::Validation(
+            "volatile CoW overlay must start empty".into(),
+        ));
+    }
+    let mut base_options = OpenOptions::new();
+    base_options.read(true);
+    #[cfg(unix)]
+    base_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let bytes = backing_size_bytes(&base_options.open(base_path)?)?;
+    if bytes == 0 || bytes % SECTOR_SIZE != 0 {
+        return Err(BlkBackendError::Validation(format!(
+            "CoW base size {bytes} is not a positive multiple of {SECTOR_SIZE}"
+        )));
+    }
+    write_fresh_cow(overlay, &CowHeader::new(bytes / SECTOR_SIZE)?)
+}
+
 struct CowOverlay {
     base: File,
     overlay: File,
@@ -137,11 +174,9 @@ impl CowOverlay {
         let expected = CowHeader::new(blocks)?;
         let overlay_len = overlay.metadata()?.len();
         let header = if overlay_len == 0 {
-            let header_buf = expected.encode();
-            write_all_at(&mut overlay, 0, &header_buf)?;
-            let bitmap = vec![0u8; usize_from_u64(expected.bitmap_len, "bitmap length")?];
-            write_all_at(&mut overlay, expected.bitmap_offset, &bitmap)?;
-            overlay.set_len(expected.data_offset)?;
+            write_fresh_cow(&mut overlay, &expected)?;
+            // A persistent overlay must reopen after a host crash even if the
+            // guest never flushed, so its header is durable before first use.
             overlay.sync_all()?;
             expected
         } else {
@@ -168,49 +203,104 @@ impl CowOverlay {
         })
     }
 
+    /// Overlay data for device offset `offset` lives at `data_offset + offset`.
+    fn overlay_offset(&self, offset: u64) -> Result<u64, BlkBackendError> {
+        self.header
+            .data_offset
+            .checked_add(offset)
+            .ok_or_else(|| BlkBackendError::Validation("overlay offset overflows".into()))
+    }
+
+    /// Read in runs of sectors that come from the same file: one pread per
+    /// run instead of one per 512-byte sector.
     fn read_at(&mut self, offset: u64, data: &mut [u8]) -> Result<(), BlkBackendError> {
-        for segment in BlockSegments::new(offset, data.len()) {
-            let dst = &mut data[segment.buffer_range()];
-            let source_offset = if self.is_dirty(segment.block) {
-                self.overlay_block_offset(segment.block)?
-                    .checked_add(segment.within_block as u64)
-                    .ok_or_else(|| BlkBackendError::Validation("overlay read overflows".into()))?
+        let mut segments = BlockSegments::new(offset, data.len()).peekable();
+        while let Some(first) = segments.next() {
+            let dirty = self.is_dirty(first.block);
+            let start = first.buffer_offset;
+            let mut end = start + first.len;
+            while let Some(next) = segments.peek() {
+                if self.is_dirty(next.block) != dirty {
+                    break;
+                }
+                end = next.buffer_offset + next.len;
+                segments.next();
+            }
+            let device_offset = offset
+                .checked_add(start as u64)
+                .ok_or_else(|| BlkBackendError::Validation("read offset overflows".into()))?;
+            if dirty {
+                let source = self.overlay_offset(device_offset)?;
+                read_exact_at(&mut self.overlay, source, &mut data[start..end])?;
             } else {
-                segment
-                    .absolute_offset()
-                    .ok_or_else(|| BlkBackendError::Validation("base read overflows".into()))?
-            };
-            if self.is_dirty(segment.block) {
-                read_exact_at(&mut self.overlay, source_offset, dst)?;
-            } else {
-                read_exact_at(&mut self.base, source_offset, dst)?;
+                read_exact_at(&mut self.base, device_offset, &mut data[start..end])?;
             }
         }
         Ok(())
     }
 
+    /// [`Self::read_at`] into guest buffers: one preadv per run of sectors
+    /// that come from the same file.
+    fn read_vectored_at(&self, offset: u64, iov: &[libc::iovec]) -> Result<(), BlkBackendError> {
+        let len = iov_total(iov);
+        let mut segments = BlockSegments::new(offset, len).peekable();
+        while let Some(first) = segments.next() {
+            let dirty = self.is_dirty(first.block);
+            let start = first.buffer_offset;
+            let mut end = start + first.len;
+            while let Some(next) = segments.peek() {
+                if self.is_dirty(next.block) != dirty {
+                    break;
+                }
+                end = next.buffer_offset + next.len;
+                segments.next();
+            }
+            let device_offset = offset
+                .checked_add(start as u64)
+                .ok_or_else(|| BlkBackendError::Validation("read offset overflows".into()))?;
+            let run = iov_range(iov, start, end);
+            if dirty {
+                let source = self.overlay_offset(device_offset)?;
+                preadv_exact(self.overlay.as_raw_fd(), &run, source)?;
+            } else {
+                preadv_exact(self.base.as_raw_fd(), &run, device_offset)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy up the base bytes of a partially written edge sector that is not
+    /// in the overlay yet, then write the whole request with one pwrite and
+    /// record the newly dirty sectors with one bitmap write. Data reaches the
+    /// overlay before the bitmap says to read it from there; both are durable
+    /// after the next flush.
     fn write_at(
         &mut self,
         offset: u64,
         data: &[u8],
         force_unit_access: bool,
     ) -> Result<(), BlkBackendError> {
-        for segment in BlockSegments::new(offset, data.len()) {
-            let dirty = self.is_dirty(segment.block);
-            let dst_offset = self
-                .overlay_block_offset(segment.block)?
-                .checked_add(segment.within_block as u64)
-                .ok_or_else(|| BlkBackendError::Validation("overlay write overflows".into()))?;
-
-            if !dirty && (segment.within_block != 0 || segment.len != SECTOR_SIZE_USIZE) {
-                self.copy_base_block_to_overlay(segment.block)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| BlkBackendError::Validation("overlay write overflows".into()))?;
+        let first_block = offset / SECTOR_SIZE;
+        let last_block = (end - 1) / SECTOR_SIZE;
+        for block in [first_block, last_block] {
+            let block_start = block * SECTOR_SIZE;
+            let covered = end.min(block_start + SECTOR_SIZE) - offset.max(block_start);
+            if covered < SECTOR_SIZE && !self.is_dirty(block) {
+                self.copy_base_block_to_overlay(block)?;
             }
-
-            write_all_at(&mut self.overlay, dst_offset, &data[segment.buffer_range()])?;
-            if !dirty {
-                self.mark_dirty(segment.block)?;
+            if first_block == last_block {
+                break;
             }
         }
+        let destination = self.overlay_offset(offset)?;
+        write_all_at(&mut self.overlay, destination, data)?;
+        self.mark_dirty_range(first_block, last_block)?;
 
         if force_unit_access {
             self.flush()?;
@@ -233,20 +323,27 @@ impl CowOverlay {
         self.bitmap[byte_idx] & bit != 0
     }
 
-    fn mark_dirty(&mut self, block: u64) -> Result<(), BlkBackendError> {
-        let byte_idx = (block / 8) as usize;
-        let bit = 1u8 << (block % 8);
-        self.bitmap[byte_idx] |= bit;
+    /// Mark sectors `first..=last` dirty and persist only the bitmap bytes
+    /// that changed, in one write.
+    fn mark_dirty_range(&mut self, first: u64, last: u64) -> Result<(), BlkBackendError> {
+        let mut changed: Option<(usize, usize)> = None;
+        for block in first..=last {
+            let byte_idx = (block / 8) as usize;
+            let bit = 1u8 << (block % 8);
+            if self.bitmap[byte_idx] & bit == 0 {
+                self.bitmap[byte_idx] |= bit;
+                changed = Some(changed.map_or((byte_idx, byte_idx), |(lo, _)| (lo, byte_idx)));
+            }
+        }
+        let Some((lo, hi)) = changed else {
+            return Ok(());
+        };
         let bitmap_offset = self
             .header
             .bitmap_offset
-            .checked_add(byte_idx as u64)
+            .checked_add(lo as u64)
             .ok_or_else(|| BlkBackendError::Validation("bitmap offset overflows".into()))?;
-        write_all_at(
-            &mut self.overlay,
-            bitmap_offset,
-            std::slice::from_ref(&self.bitmap[byte_idx]),
-        )?;
+        write_all_at(&mut self.overlay, bitmap_offset, &self.bitmap[lo..=hi])?;
         Ok(())
     }
 
@@ -563,6 +660,18 @@ impl BlkBackend {
     }
 
     #[cfg(feature = "test-failpoints")]
+    fn test_service_delay(&self) -> Option<DelayedServiceGuard> {
+        if self.service_delay.is_zero() {
+            return None;
+        }
+        self.delayed_services
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = DelayedServiceGuard(std::sync::Arc::clone(&self.delayed_services));
+        std::thread::sleep(self.service_delay);
+        Some(guard)
+    }
+
+    #[cfg(feature = "test-failpoints")]
     pub(crate) fn test_delayed_services_counter(
         &self,
     ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
@@ -577,15 +686,7 @@ impl BlkBackend {
     /// Returns the status byte to write back to the guest's status descriptor.
     pub fn service(&mut self, header: &BlkReqHeader, data: &mut [u8]) -> u8 {
         #[cfg(feature = "test-failpoints")]
-        let _delay_guard = if self.service_delay.is_zero() {
-            None
-        } else {
-            self.delayed_services
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let guard = DelayedServiceGuard(std::sync::Arc::clone(&self.delayed_services));
-            std::thread::sleep(self.service_delay);
-            Some(guard)
-        };
+        let _delay_guard = self.test_service_delay();
 
         // Validate the request.
         let (op, offset, force_unit_access) = match self.validate_service_req(header, data.len()) {
@@ -634,6 +735,42 @@ impl BlkBackend {
                 status::UNSUPP
             }
         }
+    }
+
+    /// Service a read (`IN`) request straight into guest memory, with the
+    /// validation and status of [`Self::service`]. `iov` lists the request's
+    /// data buffers in order; it saves the bounce buffer and its copy, and
+    /// reads a request in one syscall however the guest scattered it.
+    ///
+    /// # Safety
+    ///
+    /// Every iovec must describe writable memory that stays mapped, and that
+    /// nothing in this process reads or writes, for the duration of the call.
+    pub unsafe fn service_read_into(&mut self, header: &BlkReqHeader, iov: &[libc::iovec]) -> u8 {
+        #[cfg(feature = "test-failpoints")]
+        let _delay_guard = self.test_service_delay();
+        if header.req_type & !VIRTIO_BLK_T_BARRIER != req_type::IN {
+            log::warn!("blk: vectored service of a non-read request");
+            return status::IO_ERR;
+        }
+        let offset = match self.validate_service_req(header, iov_total(iov)) {
+            Ok((_, offset, _)) => offset,
+            Err(e) => {
+                log::warn!("blk: validation failed: {e}");
+                return status::IO_ERR;
+            }
+        };
+        let result = match &self.storage {
+            BackendStorage::Raw(file) => {
+                preadv_exact(file.as_raw_fd(), iov, offset).map_err(BlkBackendError::from)
+            }
+            BackendStorage::Cow(cow) => cow.read_vectored_at(offset, iov),
+        };
+        if let Err(e) = result {
+            log::warn!("blk: read failed: {e}");
+            return status::IO_ERR;
+        }
+        status::OK
     }
 
     /// Get the raw fd (for epoll-based I/O).
@@ -708,24 +845,13 @@ impl BlkBackend {
     }
 }
 
+/// One sector's share of a request: its sector number, and where its bytes
+/// sit in the request buffer.
 #[derive(Clone, Copy)]
 struct BlockSegment {
     block: u64,
-    within_block: usize,
     len: usize,
     buffer_offset: usize,
-}
-
-impl BlockSegment {
-    fn buffer_range(self) -> std::ops::Range<usize> {
-        self.buffer_offset..self.buffer_offset + self.len
-    }
-
-    fn absolute_offset(self) -> Option<u64> {
-        self.block
-            .checked_mul(SECTOR_SIZE)?
-            .checked_add(self.within_block as u64)
-    }
 }
 
 struct BlockSegments {
@@ -756,7 +882,6 @@ impl Iterator for BlockSegments {
         let len = cmp::min(SECTOR_SIZE_USIZE - within_block, self.remaining);
         let segment = BlockSegment {
             block,
-            within_block,
             len,
             buffer_offset: self.buffer_offset,
         };
@@ -815,6 +940,75 @@ fn validate_unused_bitmap_bits(bitmap: &[u8], blocks: u64) -> Result<(), BlkBack
         return Err(BlkBackendError::Validation(
             "overlay bitmap has bits beyond base length".into(),
         ));
+    }
+    Ok(())
+}
+
+fn iov_total(iov: &[libc::iovec]) -> usize {
+    iov.iter().map(|v| v.iov_len).sum()
+}
+
+/// The part of `iov` covering bytes `start..end` of the whole list.
+fn iov_range(iov: &[libc::iovec], start: usize, end: usize) -> Vec<libc::iovec> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for v in iov {
+        let (lo, hi) = (at, at + v.iov_len);
+        at = hi;
+        if hi <= start || lo >= end {
+            continue;
+        }
+        let from = start.max(lo) - lo;
+        let to = end.min(hi) - lo;
+        out.push(libc::iovec {
+            // SAFETY: `from` is within this iovec, so the pointer stays in it.
+            iov_base: unsafe { v.iov_base.cast::<u8>().add(from) }.cast(),
+            iov_len: to - from,
+        });
+    }
+    out
+}
+
+/// Fill every byte of `iov` from `fd` at `offset`, retrying short reads; a
+/// read past the end of the file is an error, as for `read_exact`.
+fn preadv_exact(fd: std::os::fd::RawFd, iov: &[libc::iovec], offset: u64) -> std::io::Result<()> {
+    let mut iov = iov.to_vec();
+    iov.retain(|v| v.iov_len > 0);
+    let mut first = 0usize;
+    let mut offset = offset;
+    while first < iov.len() {
+        let count = (iov.len() - first).min(libc::UIO_MAXIOV as usize);
+        let file_offset = libc::off_t::try_from(offset).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflows")
+        })?;
+        // SAFETY: the iovecs describe caller-owned writable memory (see
+        // `service_read_into`) and `count` stays within the list.
+        let n =
+            unsafe { libc::preadv(fd, iov[first..].as_ptr(), count as libc::c_int, file_offset) };
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let mut done = n as usize;
+        offset += done as u64;
+        while done > 0 {
+            let v = &mut iov[first];
+            if done >= v.iov_len {
+                done -= v.iov_len;
+                first += 1;
+            } else {
+                // SAFETY: `done` is within this iovec.
+                v.iov_base = unsafe { v.iov_base.cast::<u8>().add(done) }.cast();
+                v.iov_len -= done;
+                done = 0;
+            }
+        }
     }
     Ok(())
 }
@@ -1064,6 +1258,74 @@ mod tests {
     }
 
     #[test]
+    fn reads_into_scattered_buffers_match_the_bounce_path() {
+        let dir = private_tempdir();
+        let base = dir.path().join("base.img");
+        let overlay = dir.path().join("vm.overlay");
+        let pattern: Vec<u8> = (0..16u8).map(|i| 0x10 + i).collect();
+        write_block_pattern(&base, &pattern);
+        let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
+        // Overlay runs inside the range, so the read alternates files.
+        service_write(&mut backend, 3, &[0xA1; 2 * SECTOR_SIZE_USIZE]);
+        service_write(&mut backend, 9, &[0xB2; SECTOR_SIZE_USIZE]);
+
+        let expected = service_read(&mut backend, 1, 12 * SECTOR_SIZE_USIZE);
+        // Buffers of uneven sizes that cut across sector boundaries.
+        let sizes = [700usize, 1, 2047, 512, 1500, 1384];
+        assert_eq!(sizes.iter().sum::<usize>(), 12 * SECTOR_SIZE_USIZE);
+        let mut buffers: Vec<Vec<u8>> = sizes.iter().map(|&n| vec![0xEE; n]).collect();
+        let iov: Vec<libc::iovec> = buffers
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr().cast(),
+                iov_len: b.len(),
+            })
+            .collect();
+        // SAFETY: the iovecs cover `buffers`, untouched until the call returns.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::IN, 1), &iov) };
+        assert_eq!(status, status::OK);
+        assert_eq!(buffers.concat(), expected);
+
+        // Past the end of the device is refused like the bounce path.
+        let mut tail = vec![0u8; 2 * SECTOR_SIZE_USIZE];
+        let iov = [libc::iovec {
+            iov_base: tail.as_mut_ptr().cast(),
+            iov_len: tail.len(),
+        }];
+        // SAFETY: as above.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::IN, 15), &iov) };
+        assert_eq!(status, status::IO_ERR);
+        // And a write is never serviced through the read path.
+        // SAFETY: as above.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::OUT, 0), &iov) };
+        assert_eq!(status, status::IO_ERR);
+    }
+
+    #[test]
+    fn raw_reads_into_buffers_cover_many_iovecs() {
+        let dir = private_tempdir();
+        let path = dir.path().join("raw.img");
+        let pattern: Vec<u8> = (0..64u8).collect();
+        write_block_pattern(&path, &pattern);
+        let mut backend = BlkBackend::open(&path, true).unwrap();
+        let expected = service_read(&mut backend, 0, 64 * SECTOR_SIZE_USIZE);
+        // More iovecs than one preadv takes at a time.
+        let mut buffers = vec![[0u8; 8]; 64 * SECTOR_SIZE_USIZE / 8];
+        let iov: Vec<libc::iovec> = buffers
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr().cast(),
+                iov_len: b.len(),
+            })
+            .collect();
+        assert!(iov.len() > libc::UIO_MAXIOV as usize);
+        // SAFETY: the iovecs cover `buffers`, untouched until the call returns.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::IN, 0), &iov) };
+        assert_eq!(status, status::OK);
+        assert_eq!(buffers.concat(), expected);
+    }
+
+    #[test]
     fn cow_overlay_dirty_bitmap_persists_after_reopen() {
         let dir = private_tempdir();
         let base = dir.path().join("base.img");
@@ -1088,6 +1350,60 @@ mod tests {
             service_read(&mut reopened, 1, SECTOR_SIZE_USIZE),
             [0xDD; 512]
         );
+    }
+
+    #[test]
+    fn cow_random_io_matches_a_byte_model_and_survives_reopen() {
+        // Unaligned, cross-sector and mixed overlay/base reads and writes
+        // against an in-memory copy of the device.
+        let dir = private_tempdir();
+        let base = dir.path().join("base.img");
+        let overlay = dir.path().join("vm.overlay");
+        let sectors = 96usize;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let base_bytes: Vec<u8> = (0..sectors * SECTOR_SIZE_USIZE)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
+        std::fs::write(&base, &base_bytes).unwrap();
+        let mut model = base_bytes.clone();
+        let len = model.len() as u64;
+
+        let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
+        for round in 0..600u64 {
+            let offset = next() % len;
+            let max = (len - offset).min(8 * SECTOR_SIZE);
+            let size = (next() % max + 1) as usize;
+            let at = offset as usize;
+            if next() % 2 == 0 {
+                let data: Vec<u8> = (0..size)
+                    .map(|i| (round as usize + i) as u8 ^ 0xa5)
+                    .collect();
+                backend.write_at(offset, &data, false).unwrap();
+                model[at..at + size].copy_from_slice(&data);
+            } else {
+                let mut got = vec![0u8; size];
+                backend.read_at(offset, &mut got).unwrap();
+                assert_eq!(got, model[at..at + size], "read at {offset} len {size}");
+            }
+        }
+        let mut all = vec![0u8; model.len()];
+        backend.read_at(0, &mut all).unwrap();
+        assert_eq!(all, model);
+        backend.flush().unwrap();
+        drop(backend);
+
+        // The bitmap and data persist; the base is untouched.
+        let mut reopened = BlkBackend::open_cow(&base, &overlay).unwrap();
+        let mut all = vec![0u8; model.len()];
+        reopened.read_at(0, &mut all).unwrap();
+        assert_eq!(all, model);
+        assert_eq!(std::fs::read(&base).unwrap(), base_bytes);
     }
 
     #[test]
@@ -1133,6 +1449,48 @@ mod tests {
         assert_eq!(std::fs::read(&base).unwrap(), original_base);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn volatile_cow_overlay_opens_like_a_synced_one() {
+        let dir = private_tempdir();
+        let base = dir.path().join("base.img");
+        let volatile = dir.path().join("volatile.overlay");
+        let synced = dir.path().join("synced.overlay");
+        write_block_pattern(&base, &[0x10, 0x20, 0x30]);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&volatile)
+            .unwrap();
+        init_volatile_cow_overlay(&mut file, &base).unwrap();
+        drop(BlkBackend::open_cow(&base, &synced).unwrap());
+        assert_eq!(
+            std::fs::read(&volatile).unwrap(),
+            std::fs::read(&synced).unwrap(),
+            "the volatile initializer must write exactly what open_cow writes"
+        );
+
+        let mut backend = BlkBackend::open_cow(&base, &volatile).unwrap();
+        assert_eq!(
+            service_read(&mut backend, 1, SECTOR_SIZE_USIZE),
+            [0x20; 512]
+        );
+        service_write(&mut backend, 2, &[0xEE; SECTOR_SIZE_USIZE]);
+        assert_eq!(
+            service_read(&mut backend, 2, SECTOR_SIZE_USIZE),
+            [0xEE; 512]
+        );
+
+        // Never re-initialize an overlay that already holds data.
+        let mut used = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&volatile)
+            .unwrap();
+        assert!(init_volatile_cow_overlay(&mut used, &base).is_err());
     }
 
     #[test]

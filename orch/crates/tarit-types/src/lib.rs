@@ -852,6 +852,10 @@ pub struct CreateVmRequest {
     pub cmdline: Option<String>,
     #[serde(default)]
     pub volumes: Vec<VmVolumeAttachmentRequest>,
+    /// Egress policy to apply as the VM is created, in the same form as
+    /// `PATCH /v1/egress/vm/{id}`. Without it a networked VM can reach nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressUpdateRequest>,
 }
 
 fn default_memory_mib() -> u64 {
@@ -1010,6 +1014,7 @@ pub mod audit_action {
     pub const SUSPEND: &str = "suspend";
     pub const RESUME: &str = "resume";
     pub const SNAPSHOT: &str = "snapshot";
+    pub const DELETE_SNAPSHOT: &str = "delete_snapshot";
     pub const FORK: &str = "fork";
     pub const HIBERNATE: &str = "hibernate";
     pub const CREATE_BRANCH: &str = "create_branch";

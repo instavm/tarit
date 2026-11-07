@@ -16,7 +16,7 @@ can exec into and SSH into. For the full option list see
 
 ## 1. Build both binaries
 
-`taritd` (this repo) and the `vmm` microVM backend (sibling repo):
+`taritd` and the `vmm` microVM backend, both in this repository:
 
 ```sh
 cd /path/to/tarit/orch
@@ -96,9 +96,13 @@ id; the gateway authenticates by registered key and bridges to the guest PTY:
 ```sh
 export TARIT_SSH_GATEWAY=1
 export TARIT_SSH_GATEWAY_ADDR='0.0.0.0:2222'
-# restart taritd with these set, then:
-ssh -p 2222 "$vm"@<taritd-host>
+# restart taritd with these set, then offer only the registered key:
+ssh -p 2222 -i ~/.ssh/tarit -o IdentitiesOnly=yes "$vm"@<taritd-host>
+# or: ./target/release/taritd ssh "$vm" -i ~/.ssh/tarit uname -a
 ```
+
+Each unregistered key a client offers first costs about a second, because the
+gateway rejects wrong keys after a delay without revealing which keys exist.
 
 The same PTY stream is available over WebSocket at
 `WS /v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` (binary frames are

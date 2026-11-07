@@ -105,6 +105,19 @@ pub enum ImageCommand {
     Verify(ImageRemoveArgs),
     #[command(about = "Remove unreferenced images older than a threshold")]
     Gc(ImageGcArgs),
+    #[command(
+        about = "Set or clear the command an image's warm golden VM runs before its snapshot"
+    )]
+    Prewarm(ImagePrewarmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ImagePrewarmArgs {
+    #[arg(value_name = "NAME[:TAG]")]
+    name: String,
+    /// The command, e.g. `node -e 0`; omit it to clear the image's prewarm.
+    #[arg(value_name = "COMMAND")]
+    command: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -116,6 +129,10 @@ pub struct ImageBuildArgs {
     /// Output filesystem size in MiB. This also determines OCI unpack limits.
     #[arg(long, default_value_t = 1024, value_name = "MIB")]
     size: u64,
+    /// Command the image's warm golden VM runs before its snapshot, e.g.
+    /// `node -e 0`, so sandboxes start with the runtime already read in.
+    #[arg(long, value_name = "COMMAND")]
+    prewarm: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -428,7 +445,32 @@ fn image(command: ImageCommand, json_output: bool) -> Result<()> {
         ImageCommand::Remove(args) => image_remove(args, json_output),
         ImageCommand::Verify(args) => image_verify(args, json_output),
         ImageCommand::Gc(args) => image_gc(args, json_output),
+        ImageCommand::Prewarm(args) => image_prewarm(args, json_output),
     }
+}
+
+fn image_prewarm(args: ImagePrewarmArgs, json_output: bool) -> Result<()> {
+    let config = crate::image::LocalImageConfig::from_env()?;
+    let image_ref = crate::image::parse_image_ref(&args.name)?;
+    let store = tarit_store::Store::open(&config.db_path)
+        .with_context(|| format!("open {}", config.db_path.display()))?;
+    let mut image = store
+        .get_image(&image_ref.name, &image_ref.tag)
+        .with_context(|| format!("image {}", image_ref.label()))?;
+    image.prewarm = args
+        .command
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty());
+    store.upsert_image(&image).context("update image")?;
+    if json_output {
+        println!("{}", image_json(&image));
+    } else {
+        match &image.prewarm {
+            Some(command) => println!("{}:{} prewarm: {command}", image.name, image.tag),
+            None => println!("{}:{} prewarm cleared", image.name, image.tag),
+        }
+    }
+    Ok(())
 }
 
 fn image_verify(args: ImageRemoveArgs, json_output: bool) -> Result<()> {
@@ -463,6 +505,10 @@ fn image_build(args: ImageBuildArgs, json_output: bool) -> Result<()> {
         db_path: config.db_path,
         images_dir: config.images_dir,
         admission_policy: config.admission_policy,
+        prewarm: args
+            .prewarm
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty()),
     })?;
     if json_output {
         println!("{}", image_json(&image));
@@ -832,14 +878,62 @@ fn run_ssh(args: SshArgs) -> Result<()> {
     let (default_host, default_port) = ssh_gateway_addr();
     let host = args.ssh_host.unwrap_or(default_host);
     let port = args.ssh_port.unwrap_or(default_port);
+    let (options, command) = split_ssh_args(&args.extra_args);
     let status = ProcessCommand::new("ssh")
         .arg("-p")
         .arg(port.to_string())
+        .args(&options)
         .arg(format!("{}@{host}", args.id))
-        .args(args.extra_args)
+        .args(&command)
         .status()
         .context("run ssh")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Split `taritd ssh` trailing arguments the way ssh parses its own command
+/// line: options (and their values) come first and must precede the
+/// destination; the first other word starts the remote command, as does
+/// anything after `--`.
+///
+/// With an explicit identity, only that key is offered (`IdentitiesOnly`)
+/// unless the caller chose otherwise: the gateway answers every offered key
+/// alike so registered keys cannot be enumerated, and rejects each wrong one
+/// after a delay, so agent keys tried first would cost about a second each.
+fn split_ssh_args(args: &[String]) -> (Vec<String>, Vec<String>) {
+    // ssh(1) options that take a value.
+    const WITH_VALUE: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+    let mut options = Vec::new();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--" {
+            break;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            let mut command = vec![arg.clone()];
+            command.extend(rest.cloned());
+            return (with_identities_only(options), command);
+        };
+        options.push(arg.clone());
+        // "-i key" carries its value in the next word; "-ikey" does not.
+        if flags.len() == 1 && WITH_VALUE.contains(flags) {
+            if let Some(value) = rest.next() {
+                options.push(value.clone());
+            }
+        }
+    }
+    (with_identities_only(options), rest.cloned().collect())
+}
+
+fn with_identities_only(mut options: Vec<String>) -> Vec<String> {
+    let has_identity = options.iter().any(|option| option.starts_with("-i"));
+    let chose = options
+        .iter()
+        .any(|option| option.to_ascii_lowercase().contains("identitiesonly"));
+    if has_identity && !chose {
+        options.push("-o".into());
+        options.push("IdentitiesOnly=yes".into());
+    }
+    options
 }
 
 fn ssh_gateway_addr() -> (String, u16) {
@@ -891,6 +985,7 @@ fn image_json(image: &tarit_store::ImageRecord) -> Value {
         "provenance_key_digest": image.provenance_key_digest,
         "provenance_verified_at": image.provenance_verified_at,
         "golden_snapshot_path": image.golden_snapshot_path,
+        "prewarm": image.prewarm,
     })
 }
 
@@ -967,6 +1062,27 @@ enum PtyServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_options_precede_the_destination_and_the_rest_is_the_command() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            split_ssh_args(&args(&["-i", "key", "-tt", "uname", "-a"])),
+            (
+                args(&["-i", "key", "-tt", "-o", "IdentitiesOnly=yes"]),
+                args(&["uname", "-a"])
+            )
+        );
+        assert_eq!(
+            split_ssh_args(&args(&["-o", "IdentitiesOnly=no", "-ikey", "--", "-x"])),
+            (args(&["-o", "IdentitiesOnly=no", "-ikey"]), args(&["-x"]))
+        );
+        assert_eq!(
+            split_ssh_args(&args(&["-v", "true"])),
+            (args(&["-v"]), args(&["true"]))
+        );
+        assert_eq!(split_ssh_args(&[]), (vec![], vec![]));
+    }
 
     #[test]
     fn bare_args_dispatch_to_server() {

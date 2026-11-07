@@ -68,7 +68,7 @@ local APIC, causing the kernel to think there's no FPU.
 
 ## CPUID
 
-### Choice: Host passthrough with nested virtualization and x2APIC masked
+### Choice: Host passthrough with nested virtualization; x2APIC on bare metal only
 
 **Alternatives:**
 1. **Safe minimal CPUID**: mask off all extended features, keep only
@@ -80,8 +80,11 @@ local APIC, causing the kernel to think there's no FPU.
 **Why host passthrough:** The safe minimal CPUID caused triple-faults
 because it masked MTRR and PAT, which the kernel's early boot code
 requires. Host passthrough gives the kernel all the features it
-expects. We mask x2APIC (leaf 1 ECX[21]) because it causes issues on
-nested virt. We also always mask Intel VMX (leaf 1 ECX[5]) and AMD SVM
+expects. We mask x2APIC (leaf 1 ECX[21]) when the host itself runs under a
+hypervisor, because it causes issues on nested virt; on bare metal we offer it,
+since its MSR-based EOI is much cheaper than the trapped xAPIC MMIO write the
+guest makes for every interrupt. A snapshot taken in x2APIC mode does not
+restore on a host that masks it. We also always mask Intel VMX (leaf 1 ECX[5]) and AMD SVM
 (leaf `0x80000001` ECX[2]). The worker keeps `/dev/kvm` and nested
 virtualization, but a customer sandbox cannot advertise or initialize another
 hardware-virtualized layer. Tarit does not pass `/dev/kvm` into the guest.
@@ -127,6 +130,33 @@ contiguous host mapping: the high KVM slot points into the packed bytes after
 the low slot. VMSN files and UFFD therefore remain compact and contiguous.
 Dirty-log PFNs and guest-physical DMA/balloon ranges are translated at the
 slot boundary. Guests at or below 3.25 GiB retain the one-slot fast path.
+
+### Choice: Transparent huge pages for the guest kernel's image only
+
+**Alternatives:**
+1. **4 KiB pages everywhere** (Firecracker's default): loading a ~20 MiB
+   kernel allocates and zeroes ~5,000 host pages, about 10 ms of every cold
+   boot, and the guest's kernel text is mapped with 4 KiB EPT entries.
+2. **Huge pages for all guest RAM** (THP or hugetlbfs): fastest, but a
+   guest touching scattered pages then keeps whole 2 MiB pages resident,
+   which costs density across many sandboxes.
+3. **Huge pages for the kernel's load range only.**
+
+**Why the kernel range:** before loading an ELF kernel the VMM reads its
+loadable segments and advises that range (rounded to 2 MiB) for
+`MADV_HUGEPAGE`. The host allocates about ten 2 MiB pages instead of
+thousands of small ones, and KVM maps the guest kernel with huge pages, which
+also shortens the guest's own boot: cold boot to first command went from
+~99 ms to ~87 ms on a Ryzen 5 5600G, for about 1.3 MiB more VMM memory.
+Guest RAM outside the kernel keeps 4 KiB pages.
+
+The advice is given only while `/proc/buddyinfo` shows at least 16 free
+2 MiB blocks per huge page the kernel needs. With the host's THP `defrag` set
+to `madvise`, a huge page fault on a fragmented host compacts memory first
+and often falls back to 4 KiB pages anyway; on such a host twenty concurrent
+boots were 40% slower with the advice than without. Below the threshold the
+kernel loads into 4 KiB pages as before. `VMM_KERNEL_HUGEPAGES=0` turns the
+advice off entirely.
 
 ## Snapshot Format
 

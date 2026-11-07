@@ -572,6 +572,23 @@ impl VirtioVsockMmio {
         *self.lock_state(&self.irq_evt, "irq_evt") = Some(evt);
     }
 
+    /// Fire the interrupt again if one is still unacknowledged. A restore
+    /// brings back this status register but not the interrupt itself: one
+    /// raised just before the snapshot captured the vCPUs exists nowhere
+    /// else, and the guest would wait for it forever. The guest reads the
+    /// status before acting, so a repeated interrupt is harmless.
+    pub fn reassert_pending_interrupt(&self) {
+        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
+            if let Some(evt) = guard.as_ref() {
+                let _ = evt.write(1);
+            }
+        }
+    }
+
     fn trigger_interrupt(&self) -> MmioWriteResult {
         self.interrupt_status
             .fetch_or(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
@@ -788,10 +805,14 @@ impl VirtioVsockMmio {
                 let mut buf = [0u8; HOST_READ_CHUNK];
                 match conn.stream.read(&mut buf) {
                     Ok(0) => {
+                        // The host end closed: it will neither send nor
+                        // receive. SEND is what tells the guest no more data
+                        // is coming (POLLRDHUP); RCV alone left a guest
+                        // blocked on the stream unaware the host had gone.
                         packets.push(host_packet(
                             *key,
                             op::SHUTDOWN,
-                            shutdown_flags::RCV,
+                            shutdown_flags::RCV | shutdown_flags::SEND,
                             Vec::new(),
                             conn.fwd_cnt,
                         ));
@@ -2080,5 +2101,18 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(dev.pending_rx.lock().unwrap().len(), MAX_PENDING_RX);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_pending_interrupt_is_raised_again() {
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).expect("evt");
+        dev.set_irq_evt(evt.try_clone().expect("clone evt"));
+        dev.reassert_pending_interrupt();
+        assert!(evt.read().is_err(), "nothing pending, nothing raised");
+        dev.interrupt_status.store(1, Ordering::SeqCst);
+        dev.reassert_pending_interrupt();
+        assert_eq!(evt.read().expect("interrupt raised"), 1);
     }
 }

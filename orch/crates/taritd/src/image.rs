@@ -152,6 +152,8 @@ pub struct BuildImageOptions {
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
     pub admission_policy: ImageAdmissionPolicy,
+    /// Stored with the image for its warm pool (see `ImageRecord::prewarm`).
+    pub prewarm: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -275,6 +277,7 @@ fn build_image_inner(
             .as_ref()
             .map(|_| Utc::now()),
         golden_snapshot_path: None,
+        prewarm: opts.prewarm.clone(),
     };
     store.upsert_image(&image).context("register image")?;
     Ok(image)
@@ -356,11 +359,21 @@ struct ResolvedOciReference {
 }
 
 fn resolve_oci_reference(reference: &str) -> Result<ResolvedOciReference> {
-    let output = Command::new("skopeo")
+    let output = match Command::new("skopeo")
         .arg("inspect")
         .arg(reference)
         .output()
-        .context("run skopeo inspect to resolve immutable OCI digest")?;
+    {
+        Ok(output) => output,
+        // Hosts with Docker or Podman but no skopeo resolve the digest through
+        // the engine, which also uses its own registry credentials.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return resolve_with_engine(reference)
+        }
+        Err(error) => {
+            return Err(error).context("run skopeo inspect to resolve immutable OCI digest")
+        }
+    };
     if !output.status.success() {
         bail!(
             "skopeo inspect failed: {}",
@@ -368,6 +381,100 @@ fn resolve_oci_reference(reference: &str) -> Result<ResolvedOciReference> {
         );
     }
     resolved_reference_from_inspect(&output.stdout)
+}
+
+/// Resolve a `docker://` reference to an immutable digest with a local
+/// container engine: pull it, then read the registry digest it was pulled at.
+fn resolve_with_engine(reference: &str) -> Result<ResolvedOciReference> {
+    let name = reference.strip_prefix("docker://").context(
+        "skopeo is not installed; only docker:// references resolve through Docker or Podman",
+    )?;
+    if name.is_empty() || name.starts_with('-') {
+        bail!("invalid image reference {name:?}");
+    }
+    let engine = ["docker", "podman"]
+        .into_iter()
+        .find(|engine| {
+            Command::new(engine)
+                .arg("version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
+        .context(
+            "neither skopeo nor a running Docker/Podman is available to resolve the image digest",
+        )?;
+    let pulled = Command::new(engine)
+        .args(["pull", "-q", name])
+        .output()
+        .with_context(|| format!("run {engine} pull"))?;
+    if !pulled.status.success() {
+        bail!(
+            "{engine} pull failed: {}",
+            String::from_utf8_lossy(&pulled.stderr).trim()
+        );
+    }
+    let inspected = Command::new(engine)
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RepoDigests}}",
+            name,
+        ])
+        .output()
+        .with_context(|| format!("run {engine} image inspect"))?;
+    if !inspected.status.success() {
+        bail!(
+            "{engine} image inspect failed: {}",
+            String::from_utf8_lossy(&inspected.stderr).trim()
+        );
+    }
+    let digests: Vec<String> = serde_json::from_slice(&inspected.stdout)
+        .with_context(|| format!("parse {engine} RepoDigests"))?;
+    resolved_reference_from_repo_digests(name, &digests)
+}
+
+/// Pick the digest recorded for `reference`'s repository and pin it under the
+/// fully qualified registry name skopeo would report.
+fn resolved_reference_from_repo_digests(
+    reference: &str,
+    digests: &[String],
+) -> Result<ResolvedOciReference> {
+    let repo = qualified_repository(reference);
+    let digest = digests
+        .iter()
+        .filter_map(|entry| entry.split_once('@'))
+        .find(|(name, _)| qualified_repository(name) == repo)
+        .map(|(_, digest)| digest.to_string())
+        .with_context(|| format!("no registry digest recorded for {repo}"))?;
+    validate_registry_name(&repo)?;
+    validate_sha256_digest(&digest)?;
+    let cosign_ref = format!("{repo}@{digest}");
+    Ok(ResolvedOciReference {
+        pinned_ref: format!("docker://{cosign_ref}"),
+        cosign_ref,
+        digest,
+    })
+}
+
+/// `python:3.12` -> `docker.io/library/python`, `ghcr.io/o/i:t` -> `ghcr.io/o/i`.
+fn qualified_repository(reference: &str) -> String {
+    let without_digest = reference.split('@').next().unwrap_or(reference);
+    let last_slash = without_digest.rfind('/').map_or(0, |index| index + 1);
+    let without_tag = match without_digest[last_slash..].rfind(':') {
+        Some(colon) => &without_digest[..last_slash + colon],
+        None => without_digest,
+    };
+    let first = without_tag.split('/').next().unwrap_or_default();
+    let has_registry = without_tag.contains('/')
+        && (first.contains('.') || first.contains(':') || first == "localhost");
+    if has_registry {
+        without_tag.to_string()
+    } else if without_tag.contains('/') {
+        format!("docker.io/{without_tag}")
+    } else {
+        format!("docker.io/library/{without_tag}")
+    }
 }
 
 fn resolved_reference_from_inspect(bytes: &[u8]) -> Result<ResolvedOciReference> {
@@ -479,6 +586,59 @@ fn validate_sha256_digest(digest: &str) -> Result<()> {
     Ok(())
 }
 
+/// Identity of a file's contents as far as the kernel reports it. Any write
+/// moves mtime and ctime, and ctime cannot be set from userspace without
+/// changing the clock (root, who can defeat any check here anyway).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
+    /// Timestamps come from a coarse clock, so a write in the same tick as the
+    /// last change would leave them unchanged. Only files that have been
+    /// quiet for longer than any tick are safe to remember.
+    fn settled(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        now.saturating_sub(self.ctime.0) >= DIGEST_CACHE_SETTLE_SECS
+    }
+}
+
+const DIGEST_CACHE_SETTLE_SECS: i64 = 2;
+const DIGEST_CACHE_ENTRIES: usize = 256;
+
+type DigestCache = std::sync::Mutex<std::collections::HashMap<(u64, u64), (FileIdentity, String)>>;
+
+fn digest_cache() -> &'static DigestCache {
+    static CACHE: std::sync::OnceLock<DigestCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// SHA-256 of a regular file's contents.
+///
+/// Admitted images and kernels are re-verified on every snapshot and restore;
+/// hashing a 1 GiB rootfs each time made a checkpoint cost half a second. A
+/// digest is reused only while the file keeps the exact identity (device,
+/// inode, size, mtime, ctime) it had before and after it was hashed, and only
+/// once it has been unchanged for longer than the timestamp clock's tick.
 pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
     let metadata =
         std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -490,10 +650,21 @@ pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     let file = options.open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let before = file.metadata()?;
+    if !before.file_type().is_file() {
         bail!("{} changed type while opening", path.display());
     }
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let identity = FileIdentity::of(&before);
+    let key = (identity.dev, identity.ino);
+    if identity.settled() {
+        let cache = digest_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, digest)) = cache.get(&key) {
+            if *cached == identity {
+                return Ok(digest.clone());
+            }
+        }
+    }
+    let mut reader = BufReader::with_capacity(1024 * 1024, &file);
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
@@ -503,7 +674,15 @@ pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    let digest = format!("sha256:{:x}", hasher.finalize());
+    if identity.settled() && FileIdentity::of(&file.metadata()?) == identity {
+        let mut cache = digest_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= DIGEST_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, (identity, digest.clone()));
+    }
+    Ok(digest)
 }
 
 pub fn remove_image(config: &LocalImageConfig, image_ref: &ImageRef) -> Result<ImageRecord> {
@@ -750,6 +929,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_digests_are_reused_only_while_the_file_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("tarit-digest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image.ext4");
+        std::fs::write(&path, b"first contents").unwrap();
+        let fresh = sha256_regular_file(&path).unwrap();
+        assert_eq!(
+            fresh,
+            format!("sha256:{:x}", Sha256::digest(b"first contents"))
+        );
+        // A just-written file is never remembered; wait until it has settled.
+        std::thread::sleep(std::time::Duration::from_millis(
+            DIGEST_CACHE_SETTLE_SECS as u64 * 1000 + 200,
+        ));
+        assert_eq!(sha256_regular_file(&path).unwrap(), fresh);
+        let identity = FileIdentity::of(&std::fs::metadata(&path).unwrap());
+        assert!(digest_cache()
+            .lock()
+            .unwrap()
+            .get(&(identity.dev, identity.ino))
+            .is_some_and(|(cached, digest)| *cached == identity && *digest == fresh));
+
+        // Rewriting the same inode changes its identity, so the old digest is
+        // never served for the new contents.
+        std::fs::write(&path, b"other contents!").unwrap();
+        assert_eq!(
+            sha256_regular_file(&path).unwrap(),
+            format!("sha256:{:x}", Sha256::digest(b"other contents!"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn installed_agent_is_derived_from_vmm_prefix() {
         assert_eq!(
             default_vmm_agent(Path::new("/opt/tarit/bin/vmm")),
@@ -790,6 +1002,7 @@ mod tests {
             provenance_key_digest: None,
             provenance_verified_at: None,
             golden_snapshot_path: None,
+            prewarm: None,
         }
     }
 
@@ -811,6 +1024,33 @@ mod tests {
         );
         assert!(parse_image_ref("node:").is_err());
         assert!(parse_image_ref("node:20:extra").is_err());
+    }
+
+    #[test]
+    fn engine_repo_digests_pin_the_qualified_repository() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let resolved =
+            resolved_reference_from_repo_digests("python:3.12-slim", &[format!("python@{digest}")])
+                .unwrap();
+        assert_eq!(
+            resolved.cosign_ref,
+            format!("docker.io/library/python@{digest}")
+        );
+        assert_eq!(
+            resolved.pinned_ref,
+            format!("docker://docker.io/library/python@{digest}")
+        );
+        assert_eq!(qualified_repository("ghcr.io/o/img:v1"), "ghcr.io/o/img");
+        assert_eq!(
+            qualified_repository("localhost:5000/app"),
+            "localhost:5000/app"
+        );
+        assert_eq!(qualified_repository("org/app:1"), "docker.io/org/app");
+        assert!(resolved_reference_from_repo_digests("python:3", &[]).is_err());
+        assert!(
+            resolved_reference_from_repo_digests("python:3", &["python@sha256:short".into()])
+                .is_err()
+        );
     }
 
     #[test]
@@ -867,6 +1107,7 @@ mod tests {
             provenance_key_digest: Some(sha256_regular_file(&trusted_key).unwrap()),
             provenance_verified_at: Some(Utc::now()),
             golden_snapshot_path: None,
+            prewarm: None,
         };
         let signed_policy = ImageAdmissionPolicy {
             require_signature: true,

@@ -59,7 +59,7 @@ sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 ```
 
-Attach virtio-net to a host TAP. The orchestrator or operator is responsible for host networking and guest IP configuration.
+Attach virtio-net to a host TAP. The operator creates the TAP and gives it a host address; with `guest_ip` set (API `net[].guest_ip`), the VMM configures the guest's eth0 at boot using the TAP's address as gateway, unless the kernel command line already has `ip=`. Routing and NAT beyond the TAP stay with the operator or orchestrator.
 
 ```sh
 sudo ip tuntap add dev tap0 mode tap
@@ -71,6 +71,13 @@ sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --full-boot \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 ```
+
+For name resolution, add `tarit.dns=1.1.1.1[,second-server]` to the kernel
+command line. When the guest agent runs as init and the image has no usable
+`/etc/resolv.conf`, it writes one from that list (IPv4 or IPv6 literals; up to
+three). Without `tarit.dns=`, it uses nameservers the kernel learned from an
+`ip=...:<dns0>:<dns1>` argument. An image that already ships a non-empty
+`/etc/resolv.conf` is left alone. The orchestrator provisions DNS itself.
 
 ### `run` flags
 
@@ -161,6 +168,8 @@ target/release/vmm --socket /tmp/vmm.sock suspend
 target/release/vmm --socket /tmp/vmm.sock resume
 target/release/vmm --socket /tmp/vmm.sock snapshot
 target/release/vmm --socket /tmp/vmm.sock snapshot --diff
+target/release/vmm --socket /tmp/vmm.sock snapshot --base /path/to/last.snap
+target/release/vmm --socket /tmp/vmm.sock snapshot --memory-only
 target/release/vmm --socket /tmp/vmm.sock snapshot --live
 target/release/vmm --socket /tmp/vmm.sock update-egress \
   --allow 10.0.0.0/8:443/tcp \
@@ -168,6 +177,24 @@ target/release/vmm --socket /tmp/vmm.sock update-egress \
   --allow-existing
 target/release/vmm --socket /tmp/vmm.sock stop
 ```
+
+### Snapshots, disks, and forks
+
+A regular `snapshot` (full or `--diff`) also captures every writable disk in the same pause as memory, so the snapshot can be restored after the source VM is gone and forked any number of times at once:
+
+- a volume with a CoW `overlay` has its upper copied;
+- a disk the guest writes directly is copied whole and becomes the read-only lower of each restore;
+- read-only volumes and inherited (orchestrator persistent) volumes are not copied.
+
+Copies use reflink when the filesystem supports it and otherwise copy only the allocated extents. The command prints the captured files as `volume_paths` and releases them to you with the snapshot. Keep them with the snapshot file: restore looks for a moved capture beside the snapshot. Captured disks carry the `user.tarit.disk-template` xattr; every restore writes to its own private overlay in the VMM runtime directory, removed when the VM stops, so captures never change. Use `snapshot --memory-only` for the old memory-only behaviour (the API's `capture_disks: false`, which the orchestrator uses because it manages disks itself). Live snapshots capture a single overlay and require reflink.
+
+A restore enables dirty-page tracking before the guest runs, so `snapshot --diff` after a restore writes only the pages the guest changed since that snapshot. Restoring the tip of a diff chain maps the base image and the long page runs of each diff directly, so it does not slow down as the chain grows.
+
+`snapshot --base PATH` (the API's `base`) takes a full, standalone snapshot while pausing the guest only long enough to write the pages it changed since `PATH`; the rest is copied from `PATH` after the guest resumes. `PATH` must be this VM's last full snapshot, or the snapshot it was restored from, unchanged: the VMM checks its header, size and checksums, and otherwise logs why and takes an ordinary full snapshot. The result is identical to a full snapshot and does not depend on `PATH` afterwards, so either file can be deleted. Use it for the checkpoint, resume, checkpoint loop, where a diff chain would keep every parent alive.
+
+After a restore you do not need `--base` for the first checkpoint: a VM restored lazily or from a mapped file keeps that file open anyway and uses it as the base, even if you delete or move it. Before any byte of a base is used, the VMM checks the base's memory CRC against its header; if they differ the snapshot fails and the next one is an ordinary full snapshot. A caller that pauses the VM itself (to capture other state in the same pause) can send the API's `resume: true` with `snapshot` so the VM resumes as soon as its memory is captured, before the copy from the base.
+
+After a lazy (UFFD) restore, KVM counts every page the guest has touched since the restore as dirty, reads included, so the pause covers those pages rather than only the ones it wrote.
 
 Restore inside a `vmm serve` process by sending the API `restore` request. `overlay` is optional.
 
@@ -240,6 +267,17 @@ sudo target/release/vmm run --kernel ../guest-assets/vmlinux \
   --cmdline "root=/dev/vda console=ttyS0 reboot=k panic=1 nokaslr"
 ```
 
+Any image a local Docker or Podman can run converts the same way with the `docker-daemon:` or `podman:` source. The engine pulls the image if needed (using its own registry logins) and exports the flattened root filesystem; `skopeo` and `umoci` are not needed. A `docker://` reference uses the same path automatically when `skopeo` or `umoci` is missing. This works without root: ownership, setuid/setgid bits and device nodes are written into the ext4 image with `debugfs` after `mke2fs`.
+
+```sh
+target/release/vmm pull docker-daemon:python:3.12-slim \
+  --output images/python.ext4 --size 1024 --agent guest/agent/vmm-agent
+target/release/vmm pull podman:gcr.io/distroless/python3-debian12 \
+  --output images/distroless.ext4 --size 1024 --agent guest/agent/vmm-agent
+```
+
+With the agent as init, the guest gets `/proc`, `/sys`, `/dev`, `/run`, `/tmp` and a loopback interface (`127.0.0.1`), so programs can reach servers they start inside the VM. Commands run through `/bin/sh -c`; images without a shell (distroless, `scratch`) run plain commands split on whitespace instead.
+
 Private registries can pass an auth file:
 
 ```sh
@@ -285,4 +323,4 @@ sudo target/release/vmm serve \
   --cpuset 0-1
 ```
 
-Live egress updates are intended to be enforced inside a per-VM network namespace. Without `--netns`, `update-egress` validates and reports rule counts without applying host-wide nftables changes.
+Live egress updates are enforced only inside a per-VM network namespace (`serve --jail --netns`), where the default-drop chain affects that VM alone. Without it, `update-egress` validates the policy and answers `"enforced": false`, and the CLI prints a warning: guest traffic is then unrestricted unless you enforce the policy on the host.

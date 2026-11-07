@@ -15,7 +15,8 @@ T = TypeVar("T", bound="RestoreBranchRequest")
 class RestoreBranchRequest:
     """
     Attributes:
-        id (UUID | Unset): Optional id for the isolated restored VM; generated when omitted.
+        id (UUID | Unset): Optional id for the isolated restored VM; generated when omitted. Ids of deleted VMs stay
+            reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     """
 
     id: UUID | Unset = UNSET

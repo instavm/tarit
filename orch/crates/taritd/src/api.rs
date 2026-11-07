@@ -516,6 +516,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/vms/{id}/hibernate", post(hibernate_vm))
         .route("/v1/vms/{id}/resume", post(resume_vm))
         .route("/v1/vms/{id}/snapshot", post(snapshot_vm))
+        .route("/v1/snapshots", get(list_snapshots))
+        .route("/v1/snapshots/{id}", delete(delete_snapshot))
         .route("/v1/vms/{id}/fork", post(fork_vm))
         .route("/v1/restore", post(restore_vm))
         .route("/v1/execute_async", post(execute_async))
@@ -1673,7 +1675,13 @@ async fn create_vm_impl(
     ensure_create_admission_open(state)?;
     req.owner_key = Some(identity.tenant.clone());
     req.api_key_id = Some(identity.api_key_id.clone());
-    let id = *req.id.get_or_insert_with(Uuid::new_v4);
+    // The quota reservation is held under the caller's id when it chose one,
+    // fencing concurrent creates of the same id. Otherwise it is held under a
+    // fresh id and the request keeps none, so a warm-pool VM, which already
+    // has its own id, can serve it. Until the reservation is released such a
+    // VM counts twice toward the tenant's quota, which can only refuse a
+    // concurrent create at the limit, never admit one past it.
+    let id = req.id.unwrap_or_else(Uuid::new_v4);
     enforce_create_path_policy(identity, &req)?;
     enforce_image_admission_policy(identity, &req, &state.config.image_admission_policy)?;
     match cluster::resolve_owner(state, id).await {
@@ -1683,8 +1691,26 @@ async fn create_vm_impl(
         Err(OrchError::NotFound(_)) => {}
         Err(e) => return Err(e.into()),
     }
+    // A create-time egress policy is validated before anything is created and
+    // applied once the VM exists, wherever it was placed.
+    let egress = req.egress.take();
+    if let Some(egress) = &egress {
+        crate::net::normalize_tenant_egress_allowlist(&egress.allowlist)?;
+    }
     let reserved = reserve_vm_quota(state, identity, id).await?;
-    let result = create_vm_after_quota(state, identity, req).await;
+    let mut result = create_vm_after_quota(state, identity, req).await;
+    if let (Ok((_, created)), Some(egress)) = (&result, egress) {
+        let vm = created.id;
+        if let Err(error) = apply_create_egress(state, identity, vm, egress).await {
+            // All or nothing: never leave a VM running without the policy the
+            // caller asked for.
+            if let Err(cleanup) = delete_owned_vm(state, identity, vm).await {
+                tracing::error!(vm = %vm, %cleanup,
+                    "failed to remove VM whose create-time egress policy could not be applied");
+            }
+            result = Err(error.into());
+        }
+    }
     if reserved {
         if let Err(error) = release_vm_quota(state, identity, id).await {
             tracing::warn!(vm = %id, tenant = %identity.tenant, %error,
@@ -1692,6 +1718,80 @@ async fn create_vm_impl(
         }
     }
     result
+}
+
+async fn apply_create_egress(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+    egress: EgressUpdateRequest,
+) -> Result<(), OrchError> {
+    match cluster::resolve_owner(state, id).await? {
+        Owner::Local => {
+            ops::egress_local(state, id, egress.allowlist, egress.allow_existing).await?;
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.egress_remote(&rpc, id, &egress, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+        }
+    }
+    Ok(())
+}
+
+async fn inherit_source_egress(
+    state: &AppState,
+    identity: &ApiIdentity,
+    source_id: Uuid,
+    child_id: Uuid,
+) -> Result<(), OrchError> {
+    let policy = match cluster::resolve_owner(state, source_id).await? {
+        Owner::Local => ops::get_egress_policy_local(state, source_id, &identity.tenant)?,
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || {
+                peer.get_egress_policy_remote(&rpc, source_id, &identity)
+            })
+            .await
+            .map_err(|e| OrchError::Internal(format!("join: {e}")))??
+        }
+    };
+    if policy.allowlist.is_empty() && !policy.allow_existing {
+        return Ok(());
+    }
+    apply_create_egress(
+        state,
+        identity,
+        child_id,
+        EgressUpdateRequest {
+            allowlist: policy.allowlist,
+            allow_existing: policy.allow_existing,
+        },
+    )
+    .await
+}
+
+async fn delete_owned_vm(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> Result<(), OrchError> {
+    match cluster::resolve_owner(state, id).await? {
+        Owner::Local => {
+            ops::stop_local(state, id).await?;
+        }
+        Owner::Remote(rpc) => {
+            let peer = Arc::clone(&state.peer);
+            let identity = identity.clone();
+            tokio::task::spawn_blocking(move || peer.stop_remote(&rpc, id, &identity))
+                .await
+                .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+        }
+    }
+    Ok(())
 }
 
 fn enforce_image_admission_policy(
@@ -1740,6 +1840,7 @@ async fn create_vm_after_quota(
     // admission timeout do we return 429 + Retry-After. As long as one node in
     // the fleet can take the VM, the request succeeds.
     let deadline = Instant::now() + Duration::from_millis(state.config.admission_timeout_ms);
+    let mut capacity_wait = None;
     loop {
         let last_overloaded = match ops::create_local(state, &req).await {
             Ok(record) => return Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record)))),
@@ -1763,12 +1864,28 @@ async fn create_vm_after_quota(
             }
         }
 
-        if is_network_pool_exhausted(&last_overloaded) {
+        // Neither a full network pool nor a host shutting down frees a slot by
+        // waiting, and a create waiting out its deadline during shutdown would
+        // hold the HTTP drain open to its own timeout.
+        if is_network_pool_exhausted(&last_overloaded) || state.supervisor.is_shutting_down() {
             return Err(OrchError::Overloaded {
                 message: last_overloaded,
                 retry_after_secs: 1,
             }
             .into());
+        }
+
+        // Idle warm VMs of classes this create cannot use hold capacity that
+        // nobody is using: stop one and try again at once.
+        if last_overloaded.contains(crate::supervisor::HOST_CAPACITY_EXHAUSTED) {
+            capacity_wait.get_or_insert_with(|| state.supervisor.wait_for_capacity());
+            let supervisor = Arc::clone(&state.supervisor);
+            if tokio::task::spawn_blocking(move || supervisor.reclaim_idle_warm())
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
         }
 
         if Instant::now() >= deadline {
@@ -3061,6 +3178,16 @@ async fn fork_vm(
             live_termination = ?metrics.live_snapshot.as_ref().map(|value| value.termination),
             "fork phase measurements"
         );
+        // A fork can reach exactly what its source could: inherit the
+        // source's egress policy, or remove the child rather than hand back a
+        // VM with different network access than the caller expects.
+        if let Err(error) = inherit_source_egress(&state, &identity, source_id, child_id).await {
+            if let Err(cleanup) = delete_owned_vm(&state, &identity, child_id).await {
+                tracing::error!(vm = %child_id, %cleanup,
+                    "failed to remove fork child whose egress policy could not be inherited");
+            }
+            return Err(error);
+        }
         audit::record(
             &state,
             &identity,
@@ -3750,6 +3877,62 @@ async fn update_branch_head(
     Ok(Json(branch))
 }
 
+/// A tenant's snapshot as the public API shows it: an opaque handle plus the
+/// shape it restores to. Host placement and storage paths stay private.
+#[derive(Debug, Serialize)]
+struct PublicSnapshot {
+    snapshot_id: Uuid,
+    source_vm_id: Uuid,
+    created_at: chrono::DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_mib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vcpus: Option<u8>,
+}
+
+/// Snapshots this node holds for the caller's tenant, oldest first.
+async fn list_snapshots(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> Result<Json<Vec<PublicSnapshot>>, ApiError> {
+    let mut snapshots = ops::list_snapshots_local(&state, Some(&identity.tenant))?;
+    snapshots.sort_by_key(|snapshot| snapshot.created_at);
+    Ok(Json(
+        snapshots
+            .into_iter()
+            .map(|snapshot| PublicSnapshot {
+                snapshot_id: snapshot.snapshot_id,
+                source_vm_id: snapshot.vm_id,
+                created_at: snapshot.created_at,
+                size_bytes: snapshot.size_bytes,
+                memory_mib: snapshot.memory_mib,
+                vcpus: snapshot.vcpus,
+            })
+            .collect(),
+    ))
+}
+
+/// Delete a snapshot nothing still needs. Refused with 409 while a branch,
+/// hibernated VM, or fork depends on it.
+async fn delete_snapshot(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    ops::delete_snapshot_local(&state, Some(&identity.tenant), id).await?;
+    audit::record(
+        &state,
+        &identity,
+        audit_action::DELETE_SNAPSHOT,
+        None,
+        audit_outcome::OK,
+        Some(format!("snapshot_id={id}")),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn delete_branch(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
@@ -3930,15 +4113,19 @@ async fn warm_pool_status(
     Extension(identity): Extension<ApiIdentity>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&identity)?;
+    let learned = state.supervisor.learned_classes_snapshot();
     let classes = state
         .config
         .warm_pool
         .classes
         .iter()
-        .map(|class| {
+        .map(|class| (class, false))
+        .chain(learned.iter().map(|class| (class, true)))
+        .map(|(class, learned)| {
             let spawn = VmSpawnConfig::from_warm_class(&state.config, class);
             let depth = state.supervisor.warm_count(&spawn);
             serde_json::json!({
+                "learned": learned,
                 "vcpus": class.vcpus,
                 "memory_mib": class.memory_mib,
                 "hard_floor": class.hard_floor,
@@ -3961,7 +4148,13 @@ async fn warm_pool_status(
         "enabled": state.config.warm_pool.enabled,
         "cpu_overcommit": state.config.warm_pool.cpu_overcommit,
         "replenish_concurrency": state.config.warm_pool.replenish_concurrency,
-        "total_target": state.config.warm_pool.total_target(),
+        "total_target": state.config.warm_pool.total_target()
+            + learned.iter().map(|class| class.target).sum::<usize>(),
+        "learn": {
+            "max_classes": state.config.warm_pool.learn.max_classes,
+            "target": state.config.warm_pool.learn.target,
+            "idle_secs": state.config.warm_pool.learn.idle.as_secs(),
+        },
         "disk_pressure": {
             "active": disk_pressure.pressured,
             "used_bytes": disk_pressure.used_bytes,
@@ -3983,17 +4176,14 @@ struct UsageQuery {
     api_key_id: Option<String>,
 }
 
-/// Aggregated usage stats per API key, read from the primary store. Admins see
-/// every key (optionally filtered by `api_key_id`); a non-admin key sees only
-/// its own. This is raw metering, not billing; a layer above interprets it.
+/// Aggregated usage stats per API key, read from the primary store (or the
+/// local outbox on a host without one). Admins see every key (optionally
+/// filtered by `api_key_id`); a non-admin key sees only its own. This is raw metering, not billing; a layer above interprets it.
 async fn usage_stats(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Query(q): Query<UsageQuery>,
 ) -> Result<Json<Vec<UsageSummary>>, ApiError> {
-    let fleet = state.fleet.as_ref().ok_or_else(|| {
-        OrchError::Internal("usage stats require a fleet store (TARIT_DATABASE_URL)".into())
-    })?;
     let to = q.to.unwrap_or_else(Utc::now);
     let from = q.from.unwrap_or_else(|| to - chrono::Duration::days(30));
     let key_filter = if identity.is_admin() {
@@ -4001,10 +4191,20 @@ async fn usage_stats(
     } else {
         Some(identity.api_key_id.as_str())
     };
-    let out = fleet
-        .usage_summary(key_filter, from, to)
-        .await
-        .map_err(|e| OrchError::Internal(format!("usage summary: {e}")))?;
+    let out = match state.fleet.as_ref() {
+        Some(fleet) => fleet
+            .usage_summary(key_filter, from, to)
+            .await
+            .map_err(|e| OrchError::Internal(format!("usage summary: {e}")))?,
+        // A single host without a fleet store keeps its events in the local
+        // outbox, which is then the source of truth.
+        None => state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .local_usage_summary(key_filter, from, to)
+            .map_err(|e| OrchError::Internal(format!("usage summary: {e}")))?,
+    };
     Ok(Json(out))
 }
 
@@ -4015,26 +4215,32 @@ struct AuditQuery {
     limit: Option<i64>,
 }
 
-/// Recent audit trail from the primary store, newest first. Admins see every
+/// Recent audit trail from the primary store (or the local outbox on a host
+/// without one), newest first. Admins see every
 /// key; a non-admin key sees only its own actions.
 async fn audit_log(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
-    let fleet = state.fleet.as_ref().ok_or_else(|| {
-        OrchError::Internal("audit log requires a fleet store (TARIT_DATABASE_URL)".into())
-    })?;
     let key_filter = if identity.is_admin() {
         q.api_key_id.as_deref()
     } else {
         Some(identity.api_key_id.as_str())
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let out = fleet
-        .list_audit(key_filter, q.vm_id, limit)
-        .await
-        .map_err(|e| OrchError::Internal(format!("audit list: {e}")))?;
+    let out = match state.fleet.as_ref() {
+        Some(fleet) => fleet
+            .list_audit(key_filter, q.vm_id, limit)
+            .await
+            .map_err(|e| OrchError::Internal(format!("audit list: {e}")))?,
+        None => state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .list_local_audit(key_filter, q.vm_id, limit)
+            .map_err(|e| OrchError::Internal(format!("audit list: {e}")))?,
+    };
     Ok(Json(out))
 }
 
@@ -4133,6 +4339,45 @@ mod tests {
     use std::time::Duration;
     use tarit_store::Store;
     use tower::ServiceExt;
+
+    #[test]
+    fn a_create_without_an_id_is_served_from_the_warm_pool() {
+        let (mut state, mut writes) = test_state_with_audit();
+        state.config.warm_pool.enabled = true;
+        let request: CreateVmRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        let warm_id = Uuid::new_v4();
+        state
+            .supervisor
+            .seed_warm_for_test(
+                warm_id,
+                crate::supervisor::VmSpawnConfig::from_defaults(&state.config, &request),
+            )
+            .unwrap();
+        let runtime = test_runtime();
+
+        let created = runtime.block_on(async {
+            tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            let response = request_json(
+                router(state.clone()),
+                "POST",
+                "/v1/vms",
+                "tenant-a-key",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            response_json(response).await
+        });
+
+        assert_eq!(created["id"], warm_id.to_string());
+        assert_eq!(created["startup_path"], "warm");
+    }
 
     #[test]
     fn overloaded_response_includes_retry_after() {
@@ -5021,6 +5266,37 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_ends_a_create_waiting_for_capacity() {
+        let (mut state, _writes) = test_state_with_audit();
+        state.config.admission_timeout_ms = 60_000;
+        for _ in 0..state.config.max_vms {
+            state.supervisor.reserve_existing_for_test(Uuid::new_v4());
+        }
+        let app = router(state.clone());
+        let rt = test_runtime();
+
+        let response = rt.block_on(async {
+            let create = tokio::spawn(request_json(
+                app,
+                "POST",
+                "/v1/vms",
+                "admin-key",
+                serde_json::json!({"memory_mib": 256, "vcpus": 1}),
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!create.is_finished(), "the create waits for a slot");
+            state.supervisor.begin_shutdown();
+            tokio::time::timeout(Duration::from_secs(5), create)
+                .await
+                .expect("shutdown must end the wait instead of the admission deadline")
+                .unwrap()
+        });
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(rt);
+    }
+
+    #[test]
     fn user_cannot_call_admin_cluster_route() {
         let app = router(test_state());
         let rt = test_runtime();
@@ -5118,6 +5394,7 @@ mod tests {
             rootfs_path: None,
             cmdline: None,
             volumes: Vec::new(),
+            egress: None,
         };
         assert!(matches!(
             enforce_create_path_policy(&user, &req),
@@ -6165,9 +6442,11 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,

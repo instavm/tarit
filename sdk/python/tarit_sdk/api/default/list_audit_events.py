@@ -84,8 +84,8 @@ def sync_detailed(
 ) -> Response[Any | list[AuditEvent]]:
     """Recent audit trail
 
-     Audited actions from the primary store, newest first; requires a fleet database
-    (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+     Audited actions from the primary store (or the node's local outbox without a fleet database), newest
+    first. Admins see every key; a non-admin key sees only its own actions.
 
     Args:
         api_key_id (str | Unset):
@@ -122,8 +122,8 @@ def sync(
 ) -> Any | list[AuditEvent] | None:
     """Recent audit trail
 
-     Audited actions from the primary store, newest first; requires a fleet database
-    (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+     Audited actions from the primary store (or the node's local outbox without a fleet database), newest
+    first. Admins see every key; a non-admin key sees only its own actions.
 
     Args:
         api_key_id (str | Unset):
@@ -155,8 +155,8 @@ async def asyncio_detailed(
 ) -> Response[Any | list[AuditEvent]]:
     """Recent audit trail
 
-     Audited actions from the primary store, newest first; requires a fleet database
-    (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+     Audited actions from the primary store (or the node's local outbox without a fleet database), newest
+    first. Admins see every key; a non-admin key sees only its own actions.
 
     Args:
         api_key_id (str | Unset):
@@ -191,8 +191,8 @@ async def asyncio(
 ) -> Any | list[AuditEvent] | None:
     """Recent audit trail
 
-     Audited actions from the primary store, newest first; requires a fleet database
-    (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+     Audited actions from the primary store (or the node's local outbox without a fleet database), newest
+    first. Admins see every key; a non-admin key sees only its own actions.
 
     Args:
         api_key_id (str | Unset):

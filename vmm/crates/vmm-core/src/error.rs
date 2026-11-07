@@ -18,6 +18,10 @@ pub enum VmmError {
         /// Whether every partially parked worker was confirmed running again.
         /// A false value requires callers to keep vCPUs paused.
         vcpus_may_resume: bool,
+        /// A healthy worker was still busy with backing I/O when the budget
+        /// ran out, and everything was released again: the VM is unchanged
+        /// and the same request can succeed later.
+        retryable: bool,
     },
     #[error("snapshot error: {0}")]
     Snapshot(String),
@@ -28,6 +32,18 @@ pub enum VmmError {
 pub type Result<T> = std::result::Result<T, VmmError>;
 
 impl VmmError {
+    /// Whether the request failed without changing the VM and may be sent
+    /// again, typically once the host is less loaded.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::IoQuiescence {
+                retryable: true,
+                ..
+            }
+        )
+    }
+
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "kvm"))]
     pub(crate) fn vcpus_may_resume_after_io_error(&self) -> bool {
         match self {

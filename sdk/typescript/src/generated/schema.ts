@@ -407,6 +407,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/snapshots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the tenant's snapshots on this node
+         * @description Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not listed.
+         */
+        get: operations["listSnapshots"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/snapshots/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a snapshot nothing still needs
+         * @description Removes the snapshot's metadata and files. Refused while a branch head references it, a hibernated VM would wake from it, or a fork owns it.
+         */
+        delete: operations["deleteSnapshot"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/restore": {
         parameters: {
             query?: never;
@@ -761,7 +803,7 @@ export interface paths {
         };
         /**
          * Aggregated usage stats per API key
-         * @description Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
+         * @description Raw metering (VM runtime seconds, exec counts and durations) from the primary store, or from the node's local outbox when no fleet database (TARIT_DATABASE_URL) is configured. Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
          */
         get: operations["getUsage"];
         put?: never;
@@ -781,7 +823,7 @@ export interface paths {
         };
         /**
          * Recent audit trail
-         * @description Audited actions from the primary store, newest first; requires a fleet database (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+         * @description Audited actions from the primary store (or the node's local outbox without a fleet database), newest first. Admins see every key; a non-admin key sees only its own actions.
          */
         get: operations["listAuditEvents"];
         put?: never;
@@ -864,7 +906,10 @@ export interface components {
         };
         /** @description All fields optional; defaults come from node configuration. Persistent block attachments are explicit, ordered after the root disk, exact-host constrained for local_block, and remain external across snapshot/hibernate operations. */
         CreateVmRequest: {
-            /** Format: uuid */
+            /**
+             * Format: uuid
+             * @description Optional VM id; generated when omitted. A create with the id of an existing VM is refused with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
+             */
             id?: string;
             /** @description Fixed boot RAM for new virtio-mem templates. memory_mib is the fully reserved maximum and must be larger and 128-MiB aligned. */
             boot_memory_mib?: number;
@@ -877,6 +922,12 @@ export interface components {
             rootfs_path?: string;
             cmdline?: string;
             volumes?: components["schemas"]["VmVolumeAttachmentRequest"][];
+            /** @description Egress policy applied as the VM is created, in the same form as PATCH /v1/egress/vm/{id}. Without one, a networked VM can reach nothing. Invalid policies are rejected before anything is created; if the policy cannot be applied, the VM is removed and the create fails. */
+            egress?: {
+                allowlist: string[];
+                /** @default false */
+                allow_existing: boolean;
+            };
         };
         VmVolumeAttachmentRequest: {
             /** Format: uuid */
@@ -916,6 +967,19 @@ export interface components {
             /** Format: date-time */
             updated_at: string;
         };
+        Snapshot: {
+            /** Format: uuid */
+            snapshot_id: string;
+            /** Format: uuid */
+            source_vm_id: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: uint64 */
+            size_bytes?: number;
+            /** Format: uint64 */
+            memory_mib?: number;
+            vcpus?: number;
+        };
         CreateVolumeRequest: {
             /**
              * Format: uuid
@@ -941,21 +1005,21 @@ export interface components {
             snapshot_id: string;
             /**
              * Format: uuid
-             * @description Optional id for the restored VM; generated when omitted.
+             * @description Optional id for the restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
              */
             id?: string;
         };
         RestoreBranchRequest: {
             /**
              * Format: uuid
-             * @description Optional id for the isolated restored VM; generated when omitted.
+             * @description Optional id for the isolated restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
              */
             id?: string;
         };
         ForkVmRequest: {
             /**
              * Format: uuid
-             * @description Optional child VM id; generated when omitted.
+             * @description Optional child VM id; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
              */
             id?: string;
         };
@@ -1073,7 +1137,7 @@ export interface components {
             /** Format: uuid */
             vm_id?: string | null;
             /** @enum {string} */
-            action: "create" | "delete" | "pause" | "suspend" | "resume" | "snapshot" | "fork" | "hibernate" | "create_branch" | "update_branch" | "delete_branch" | "restore" | "exec" | "attach_pty" | "ssh_attempt" | "update_egress" | "create_share" | "update_share" | "revoke_share" | "issue_share_token" | "create_volume" | "delete_volume" | "set_balloon";
+            action: "create" | "delete" | "pause" | "suspend" | "resume" | "snapshot" | "delete_snapshot" | "fork" | "hibernate" | "create_branch" | "update_branch" | "delete_branch" | "restore" | "exec" | "attach_pty" | "ssh_attempt" | "update_egress" | "create_share" | "update_share" | "revoke_share" | "issue_share_token" | "create_volume" | "delete_volume" | "set_balloon";
             /** @enum {string} */
             outcome: "attempt" | "ok" | "denied" | "error";
             detail?: string | null;
@@ -2148,6 +2212,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     resumeVm: {
@@ -2262,6 +2333,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     hibernateVm: {
@@ -2312,6 +2390,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Remote hibernation is unavailable until fenced peer lifecycle routing is enabled */
             503: {
                 headers: {
@@ -2334,7 +2419,7 @@ export interface operations {
             content: {
                 "application/json": {
                     /**
-                     * @description Must be false. Incremental orchestrator snapshots are disabled until durable parent-chain relocation is available.
+                     * @description Accepted for compatibility. Every snapshot is standalone; capture pauses the guest only for pages changed since the snapshot it was restored from or last wrote, whenever the VMM can use that snapshot as a base.
                      * @default false
                      */
                     diff?: boolean;
@@ -2382,8 +2467,8 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Incremental snapshots are disabled; retry with `diff=false`. */
-            422: {
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2452,7 +2537,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Host capacity is unavailable */
+            /** @description Host capacity is unavailable, or the source VM's storage was too busy to pause in time. Retry after the Retry-After header */
             429: {
                 headers: {
                     [name: string]: unknown;
@@ -2460,6 +2545,88 @@ export interface operations {
                 content?: never;
             };
             /** @description A source peer/session, durable fleet, verified artifact replica, or configured replication policy is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listSnapshots: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tenant snapshots */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Snapshot"][];
+                };
+            };
+            /** @description Missing or invalid API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    deleteSnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Snapshot deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid API key */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Snapshot absent or belongs to another tenant */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Snapshot is still referenced */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Snapshot is held by another node */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Fleet store unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -3818,7 +3985,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description No fleet database configured, or store failure */
+            /** @description Store failure */
             500: {
                 headers: {
                     [name: string]: unknown;
@@ -3857,7 +4024,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description No fleet database configured, or store failure */
+            /** @description Store failure */
             500: {
                 headers: {
                     [name: string]: unknown;

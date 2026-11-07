@@ -383,7 +383,9 @@ enum Cmd {
         overlay: Vec<String>,
     },
 
-    /// Restore a VM from a snapshot file.
+    /// Restore a VM from a snapshot file. With a `vmm serve` listening on
+    /// --socket, the VM is restored there; otherwise this process restores it
+    /// and serves its API on --socket until stopped.
     #[command(alias = "load")]
     Restore {
         /// Path to the snapshot file.
@@ -460,6 +462,19 @@ enum Cmd {
         /// blacks out for a sub-millisecond final stop.
         #[arg(long, conflicts_with = "diff")]
         live: bool,
+
+        /// Capture memory only. By default a regular snapshot also captures
+        /// every writable disk, so it can be restored or forked after the VM
+        /// is gone.
+        #[arg(long, conflicts_with = "live")]
+        memory_only: bool,
+
+        /// The full snapshot this VM last wrote or was restored from, kept by
+        /// the caller. If it matches exactly, the pause covers only pages
+        /// changed since and the rest is copied from it after the guest
+        /// resumes; the result is an ordinary full snapshot either way.
+        #[arg(long, conflicts_with_all = ["diff", "live"])]
+        base: Option<String>,
     },
 
     /// Execute a command in the guest VM (via the API).
@@ -673,7 +688,12 @@ fn main() -> Result<()> {
             },
             cgroup,
         ),
-        Cmd::Snapshot { diff, live } => api_snapshot(&cli.socket, diff, live),
+        Cmd::Snapshot {
+            diff,
+            live,
+            memory_only,
+            base,
+        } => api_snapshot(&cli.socket, diff, live, !live && !memory_only, base),
         Cmd::Create {
             kernel,
             cmdline,
@@ -732,13 +752,7 @@ fn main() -> Result<()> {
         Cmd::UpdateEgress {
             allow,
             allow_existing,
-        } => api_request(
-            &cli.socket,
-            &vmm_api::types::ApiRequest::UpdateEgress {
-                allowlist: allow,
-                allow_existing,
-            },
-        ),
+        } => api_update_egress(&cli.socket, allow, allow_existing),
         Cmd::Pull {
             image,
             output,
@@ -811,7 +825,12 @@ fn run(
     // Build the kernel cmdline, appending virtio_mmio.device entries for
     // each volume + the optional net device. The kernel needs these to
     // discover the MMIO devices.
-    let mut cmdline = cmdline.unwrap_or_else(vmm_loader::default_cmdline);
+    // Like `create`, mount an attached rootfs unless the caller supplies a
+    // complete command line; without `root=` the guest kernel panics.
+    let mut cmdline = cmdline.unwrap_or_else(|| match rootfs {
+        Some(_) => format!("root=/dev/vda rw {}", vmm_loader::default_cmdline()),
+        None => vmm_loader::default_cmdline(),
+    });
     let mut next_mmio = 0xd000_0000u64;
     let mut next_irq: u32 = 5;
     for _ in volumes.iter() {
@@ -832,6 +851,8 @@ fn run(
 
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(all(target_os = "linux", feature = "boot"))]
+        vmm_core::controller::back_kernel_with_huge_pages(&mem, std::path::Path::new(&kernel));
         let loaded = vmm_loader::load(
             &mem.inner,
             &kernel,
@@ -990,7 +1011,8 @@ fn boot_on_kvm(
     // Build the device list with irqfds attached.
     let mut devices: Vec<(MmioRange, Box<dyn vmm_devices::bus::MmioDevice>)> = Vec::new();
     let mut mmio_base = 0xd000_0000u64;
-    let mut ioevent_addrs: Vec<(u64, vmm_sys_util::eventfd::EventFd)> = Vec::new();
+    // (QUEUE_NOTIFY address, kick eventfd, number of queues)
+    let mut ioevent_addrs: Vec<(u64, vmm_sys_util::eventfd::EventFd, u32)> = Vec::new();
     for (i, vol) in volumes.iter().enumerate() {
         let irq = 5 + i as u32;
 
@@ -1056,14 +1078,14 @@ fn boot_on_kvm(
         let irq = 5 + volumes.len() as u32;
         let net_dev = std::sync::Arc::new(VirtioNetMmio::new(irq, mac));
         net_dev.set_guest_memory(guest_mem.clone());
-        net_dev.set_tap_fd(tap.fd);
+        net_dev.set_tap_fd(tap.fd, tap.vnet_hdr);
         let net_irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
             .map_err(|e| anyhow::anyhow!("net EventFd: {e}"))?;
         let net_io_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
             .map_err(|e| anyhow::anyhow!("net EventFd: {e}"))?;
         net_dev.set_irq_evt(net_irq_evt.try_clone()?);
         devices.push((MmioRange::new(mmio_base, 0x1000), Box::new(net_dev.clone())));
-        ioevent_addrs.push((mmio_base + 0x50, net_io_evt.try_clone()?));
+        ioevent_addrs.push((mmio_base + 0x50, net_io_evt.try_clone()?, 2));
         log::info!(
             "net: tap={} mac={:02x?} at mmio 0x{mmio_base:x} irq {irq}",
             tap.name,
@@ -1100,8 +1122,12 @@ fn boot_on_kvm(
     // controller restore path additionally queues a change notification before
     // any restored vCPU enters KVM_RUN.
     let vmgenid = vmm_core::vmgenid::VmGenId::new(mem)?;
-    vm.register_irqfd(vmgenid.eventfd(), vmm_core::vmgenid::VMGENID_GSI)
-        .map_err(|e| anyhow::anyhow!("VM Generation ID irqfd: {e}"))?;
+    // Its change notification is an interrupt, which needs the in-kernel
+    // IRQ chip that only full boot creates.
+    if full_boot {
+        vm.register_irqfd(vmgenid.eventfd(), vmm_core::vmgenid::VMGENID_GSI)
+            .map_err(|e| anyhow::anyhow!("VM Generation ID irqfd: {e}"))?;
+    }
 
     // Register irqfds + ioeventfds with KVM.
     for (i, evt) in irq_evts.iter().enumerate() {
@@ -1111,9 +1137,9 @@ fn boot_on_kvm(
             Err(e) => log::warn!("irqfd registration failed for volume {i}: {e}"),
         }
     }
-    for (addr, evt) in &ioevent_addrs {
-        match vm.register_ioeventfd(*addr, evt) {
-            Ok(_) => log::info!("ioeventfd registered for volume at 0x{addr:x}"),
+    for (addr, evt, queues) in &ioevent_addrs {
+        match vm.register_queue_notify(*addr, evt, *queues) {
+            Ok(_) => log::info!("ioeventfd registered at 0x{addr:x} ({queues} queues)"),
             Err(e) => log::warn!("ioeventfd registration failed at 0x{addr:x}: {e}"),
         }
     }
@@ -1239,8 +1265,11 @@ fn restore(
             target_memory_mib,
         )
         .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
-    println!("Restored VM from {snapshot}");
-    Ok(())
+    // Keep the restored VM alive and controllable: this process now serves
+    // its API, exactly as `vmm serve` followed by a `restore` request would.
+    println!("Restored VM from {snapshot}; serving its API on {socket}");
+    vmm_api::rpc::serve_with_controller(socket, controller)
+        .map_err(|e| anyhow::anyhow!("api serve: {e}"))
 }
 
 fn api_socket_is_listening(socket: &str) -> Result<bool> {
@@ -1387,23 +1416,62 @@ fn apply_serve_cgroup(
     Ok(())
 }
 
-fn api_snapshot(socket: &str, diff: bool, live: bool) -> Result<()> {
-    let request = vmm_api::types::ApiRequest::Snapshot { diff, live };
+fn api_update_egress(socket: &str, allowlist: Vec<String>, allow_existing: bool) -> Result<()> {
+    let request = vmm_api::types::ApiRequest::UpdateEgress {
+        allowlist,
+        allow_existing,
+    };
+    let response = send_raw(socket, &serde_json::to_vec(&request)?)?;
+    let parsed: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;
+    println!("{}", serde_json::to_string_pretty(&parsed)?);
+    match parsed {
+        vmm_api::types::ApiResponse::EgressUpdated {
+            enforced: false, ..
+        } => {
+            eprintln!(
+                "warning: the egress policy was validated but NOT enforced. This VMM is not \
+                 confined to a per-VM network namespace (serve --jail --netns), so guest \
+                 traffic is unrestricted unless you enforce the policy on the host."
+            );
+            Ok(())
+        }
+        vmm_api::types::ApiResponse::EgressUpdated { .. } => Ok(()),
+        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("update-egress failed: {msg}"),
+        other => anyhow::bail!("unexpected update-egress response: {other:?}"),
+    }
+}
+
+fn api_snapshot(
+    socket: &str,
+    diff: bool,
+    live: bool,
+    capture_disks: bool,
+    base: Option<String>,
+) -> Result<()> {
+    let request = vmm_api::types::ApiRequest::Snapshot {
+        diff,
+        live,
+        capture_disks,
+        base,
+        resume: false,
+    };
     let body = serde_json::to_vec(&request)?;
     let response = send_raw(socket, &body)?;
     let response: vmm_api::types::ApiResponse = serde_json::from_slice(&response)?;
-    let (path, overlay_path, integrity_path) = match &response {
+    let (path, overlay_path, volume_paths, integrity_path) = match &response {
         vmm_api::types::ApiResponse::Snapshot {
             path,
             overlay_path,
+            volume_paths,
             integrity_path,
             ..
-        } => (path, overlay_path, integrity_path),
+        } => (path, overlay_path, volume_paths, integrity_path),
         vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("snapshot failed: {msg}"),
         other => anyhow::bail!("unexpected snapshot response: {other:?}"),
     };
     for owned_path in std::iter::once(path)
         .chain(overlay_path.iter())
+        .chain(volume_paths.iter())
         .chain(integrity_path.iter())
     {
         let identity =
@@ -1882,6 +1950,73 @@ mod tests {
             _ => panic!("expected attach-pty command"),
         }
         assert_eq!(cli.socket, "/run/vmm.sock");
+    }
+
+    #[test]
+    fn cli_snapshot_accepts_base() {
+        let cli = Cli::try_parse_from(["vmm", "snapshot", "--base", "/x"]).unwrap();
+        match cli.cmd {
+            Cmd::Snapshot {
+                diff,
+                live,
+                memory_only,
+                base,
+            } => {
+                assert!(!diff);
+                assert!(!live);
+                assert!(!memory_only);
+                assert_eq!(base.as_deref(), Some("/x"));
+            }
+            _ => panic!("expected snapshot command"),
+        }
+
+        let cli = Cli::try_parse_from(["vmm", "snap", "--base=/y"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Snapshot { base: Some(b), .. } if b == "/y"
+        ));
+
+        let cli = Cli::try_parse_from(["vmm", "snapshot"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Snapshot { base: None, .. }));
+    }
+
+    #[test]
+    fn cli_snapshot_base_conflicts_with_diff_and_live() {
+        for args in [
+            ["vmm", "snapshot", "--base", "/x", "--diff"],
+            ["vmm", "snapshot", "--diff", "--base", "/x"],
+            ["vmm", "snapshot", "--base", "/x", "--live"],
+            ["vmm", "snapshot", "--live", "--base", "/x"],
+        ] {
+            let error = Cli::try_parse_from(args).err().unwrap_or_else(|| {
+                panic!("expected {args:?} to be rejected");
+            });
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_snapshot_base_combines_with_memory_only() {
+        let cli =
+            Cli::try_parse_from(["vmm", "snapshot", "--memory-only", "--base", "/x"]).unwrap();
+        match cli.cmd {
+            Cmd::Snapshot {
+                diff,
+                live,
+                memory_only,
+                base,
+            } => {
+                assert!(!diff);
+                assert!(!live);
+                assert!(memory_only);
+                assert_eq!(base.as_deref(), Some("/x"));
+            }
+            _ => panic!("expected snapshot command"),
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod transport;
 pub mod vqueue;
 pub mod vsock;
 pub mod vsock_io_loop;
+pub mod worker_startup;
 
 pub use balloon::VirtioBalloonMmio;
 pub use blk::VirtioBlk;

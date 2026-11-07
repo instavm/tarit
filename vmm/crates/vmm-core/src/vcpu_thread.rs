@@ -100,21 +100,10 @@ impl VcpuThread {
             let my_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
             tid_for_thread.store(my_tid, Ordering::SeqCst);
 
-            // Warm up glibc's allocator BEFORE seccomp closes off openat. On the
-            // first large (mmap-backed) allocation glibc lazily reads
-            // /proc/sys/vm/overcommit_memory; if that first big allocation
-            // happens later in the run loop (e.g. buffering a chatty guest's
-            // serial output), the openat is rejected with SIGSYS and the vCPU
-            // thread is killed mid-boot. Forcing the read here, while syscalls
-            // are unrestricted, makes glibc cache the result so the steady-state
-            // run loop never needs openat.
-            {
-                let mut warm = vec![0; 8 * 1024 * 1024];
-                warm[0] = 1;
-                warm[8 * 1024 * 1024 - 1] = 1;
-                std::hint::black_box(&warm);
-                drop(warm);
-            }
+            // glibc may lazily open /proc files from inside malloc/free (the
+            // first non-main arena heap trim reads overcommit_memory). The
+            // seccomp profiles answer path opens with EACCES rather than
+            // SIGSYS, so no allocator warm-up is needed here.
 
             // Install the seccomp filter for this dedicated vCPU
             // thread. The filter is per-thread; the controller's thread is

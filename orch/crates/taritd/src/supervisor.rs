@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Condvar, Mutex, RwLock, RwLockReadGuard,
 };
 use std::time::{Duration, Instant};
@@ -31,7 +31,13 @@ use tarit_volume::{AccessMode, PreparedBlockAttachment};
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw virtio_mmio.device=4K@0xd0000000:5";
+/// Guest kernel command line for VMs created without one. `quiet loglevel=4`
+/// keeps errors (and the early console for panics) but not the routine boot
+/// log: every console byte is a VM exit, and logging the full boot more than
+/// doubled time to first command (about 250 ms vs 107 ms). Devices are
+/// described by ACPI, so no `virtio_mmio.device=` entries (an extra one makes
+/// the guest probe the same device twice and log -EBUSY).
+pub const DEFAULT_CMDLINE: &str = "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 quiet loglevel=4 reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw";
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const RESUME_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_READY_EXEC_TIMEOUT: Duration = Duration::from_secs(1);
@@ -45,6 +51,8 @@ const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// 5-second per-read stream timeout of a plain client, which a multi-GiB
 /// guest cannot meet.
 const LIFECYCLE_OP_TIMEOUT: Duration = Duration::from_secs(600);
+/// Upper bound for a warm class's golden prewarm command.
+const GOLDEN_PREWARM_TIMEOUT_MS: u64 = 120_000;
 /// Margin on top of the guest-side exec timeout for VMM scheduling and
 /// response marshalling. The plain client's 5s per-read socket timeout is
 /// shorter than most exec budgets, so exec must use a deadline client sized
@@ -62,6 +70,10 @@ const TUNSETIFF: libc::c_ulong = 0x400454ca;
 const IFF_TAP: u16 = 0x0002;
 #[cfg(target_os = "linux")]
 const IFF_NO_PI: u16 = 0x1000;
+/// Frames carry a virtio-net header, so the VMM can offer the guest
+/// checksum and segmentation offloads (it checks for this flag).
+#[cfg(target_os = "linux")]
+const IFF_VNET_HDR: u16 = 0x4000;
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -93,7 +105,7 @@ fn open_inherited_tap(tap_name: &str) -> Result<OwnedFd, OrchError> {
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let mut ifreq = TapIfreq {
         name: [0; 16],
-        flags: IFF_TAP | IFF_NO_PI,
+        flags: IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
         _pad: [0; 22],
     };
     ifreq.name[..tap_name.len()].copy_from_slice(tap_name.as_bytes());
@@ -919,6 +931,11 @@ struct RunningVm {
     /// must be observed as one transition. The gate is owned by the runtime
     /// entry, so deleting a VM also removes the only registry reference.
     operation_gate: Arc<AsyncMutex<()>>,
+    /// VMM-visible path of the full snapshot this runtime last wrote or was
+    /// restored from. Passed as the next snapshot's base so the VMM pauses
+    /// only for pages changed since; the VMM verifies it is exactly that
+    /// snapshot and otherwise takes an ordinary full snapshot.
+    checkpoint_base: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl RunningVm {
@@ -929,6 +946,13 @@ impl RunningVm {
             process,
             net,
             operation_gate: Arc::new(AsyncMutex::new(())),
+            checkpoint_base: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn set_checkpoint_base(&self, path: Option<String>) {
+        if let Ok(mut base) = self.checkpoint_base.lock() {
+            *base = path;
         }
     }
 }
@@ -1912,6 +1936,111 @@ enum RestoreOverlay {
     Seeded(PathBuf),
 }
 
+/// A restore's private disk upper being seeded from its snapshot (copied,
+/// handed to the jail's uid, and checked against the snapshot manifest) on
+/// a thread of its own. Dropping it unfinished waits for the thread and
+/// removes whatever it wrote.
+struct OverlaySeeding {
+    destination: PathBuf,
+    thread: Option<std::thread::JoinHandle<Result<(), OrchError>>>,
+    spawn_error: Option<OrchError>,
+    keep: bool,
+}
+
+impl OverlaySeeding {
+    fn start(
+        source: PathBuf,
+        destination: PathBuf,
+        jail_owner: Option<(u32, u32)>,
+        integrity: Option<tarit_proto::ArtifactIntegrity>,
+        chunk_size: u64,
+    ) -> Self {
+        let target = destination.clone();
+        let spawned = std::thread::Builder::new()
+            .name("seed-overlay".into())
+            .spawn(move || {
+                seed_restore_overlay(&source, &target, jail_owner, integrity.as_ref(), chunk_size)
+            });
+        let (thread, spawn_error) = match spawned {
+            Ok(thread) => (Some(thread), None),
+            Err(error) => (
+                None,
+                Some(OrchError::Internal(format!(
+                    "start seeding the restore disk upper: {error}"
+                ))),
+            ),
+        };
+        Self {
+            destination,
+            thread,
+            spawn_error,
+            keep: false,
+        }
+    }
+
+    /// Wait for the seeding and return how it went; a seeded upper is kept.
+    fn finish(mut self) -> Result<(), OrchError> {
+        if let Some(error) = self.spawn_error.take() {
+            return Err(error);
+        }
+        let result = match self.thread.take().map(std::thread::JoinHandle::join) {
+            Some(Ok(result)) => result,
+            Some(Err(_)) => Err(OrchError::Internal(
+                "seeding the restore disk upper panicked".into(),
+            )),
+            None => Err(OrchError::Internal(
+                "restore disk upper was not seeded".into(),
+            )),
+        };
+        self.keep = result.is_ok();
+        result
+    }
+}
+
+impl Drop for OverlaySeeding {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if !self.keep {
+            if let Err(error) = remove_file_if_present(&self.destination) {
+                tracing::warn!(
+                    path = %self.destination.display(),
+                    %error,
+                    "remove unused restore disk upper"
+                );
+            }
+        }
+    }
+}
+
+fn seed_restore_overlay(
+    source: &Path,
+    destination: &Path,
+    jail_owner: Option<(u32, u32)>,
+    integrity: Option<&tarit_proto::ArtifactIntegrity>,
+    chunk_size: u64,
+) -> Result<(), OrchError> {
+    copy_private_artifact(source, destination).map_err(|error| {
+        OrchError::Internal(format!("seed private restore disk upper: {error}"))
+    })?;
+    if let Some((uid, gid)) = jail_owner {
+        set_jail_owner_mode(destination, uid, gid, 0o600)?;
+    }
+    if let Some(integrity) = integrity {
+        let artifact = OwnedArtifact::capture(destination).map_err(|error| {
+            OrchError::Internal(format!("capture seeded restore disk upper: {error}"))
+        })?;
+        verify_file_artifact_integrity(
+            &artifact._file,
+            integrity,
+            chunk_size,
+            "seeded restore disk",
+        )?;
+    }
+    Ok(())
+}
+
 impl SnapshotBundle {
     pub(crate) fn snapshot_path(&self) -> &str {
         &self.snapshot_path
@@ -2096,6 +2225,7 @@ fn snapshot_integrity_manifest(
         ));
     }
     let chunk_size = u64::from(tarit_proto::INTEGRITY_CHUNK_SIZE);
+    let mut working_set = Vec::new();
     let mut manifest_artifacts = if let Some(precomputed) = precomputed {
         let metadata_chunks = memory_offset.div_ceil(chunk_size);
         let memory_chunks = memory_len.div_ceil(chunk_size);
@@ -2113,9 +2243,15 @@ fn snapshot_integrity_manifest(
             .metadata()
             .map_err(|error| OrchError::Internal(format!("stat live integrity sidecar: {error}")))?
             .len();
-        if actual_len != expected_len {
+        // A sidecar with a working set appends its chunk count and bitmap.
+        let with_working_set = memory_chunks
+            .div_ceil(8)
+            .checked_add(8)
+            .and_then(|extra| expected_len.checked_add(extra))
+            .ok_or_else(|| OrchError::Internal("live integrity size overflow".into()))?;
+        if actual_len != expected_len && actual_len != with_working_set {
             return Err(OrchError::BadRequest(format!(
-                "live integrity sidecar length mismatch: got {actual_len}, expected {expected_len}"
+                "live integrity sidecar length mismatch: got {actual_len}, expected {expected_len} or {with_working_set}"
             )));
         }
         let mut encoded = vec![
@@ -2171,6 +2307,7 @@ fn snapshot_integrity_manifest(
             ram_chunks = memory.chunk_hashes.len(),
             "adopted VMM live integrity sidecar without rereading RAM"
         );
+        working_set = manifest.working_set;
         manifest.artifacts
     } else {
         vec![
@@ -2207,6 +2344,7 @@ fn snapshot_integrity_manifest(
     Ok(tarit_proto::IntegrityManifest {
         chunk_size: tarit_proto::INTEGRITY_CHUNK_SIZE,
         artifacts: manifest_artifacts,
+        working_set,
     })
 }
 
@@ -2231,6 +2369,22 @@ fn read_exact_at(
     Ok(())
 }
 
+/// The first offset at or after `offset` that holds data, or `None` when only
+/// a hole remains. Filesystems without SEEK_DATA report everything as data.
+fn next_data_offset(file: &File, offset: u64) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let offset = i64::try_from(offset).ok()?;
+    // SAFETY: lseek on an owned, open descriptor; it only moves its offset.
+    let data = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
+    if data >= 0 {
+        return u64::try_from(data).ok();
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENXIO) => None,
+        _ => u64::try_from(offset).ok(),
+    }
+}
+
 fn hash_artifact_range(
     file: &File,
     kind: tarit_proto::ArtifactKind,
@@ -2249,7 +2403,22 @@ fn hash_artifact_range(
     // whole-file hash (one pread per MiB, not one syscall per 64 KiB chunk).
     let read_window = chunk_size.max(1024 * 1024);
     let mut buffer = vec![0u8; read_window as usize];
+    // Snapshot RAM files are sparse. A hole reads as zeros, so every whole
+    // chunk inside one has the same digest; skip reading those. The manifest
+    // is byte-for-byte what reading every chunk would produce.
+    let zero_chunk: [u8; 32] = Sha256::digest(vec![0u8; chunk_size as usize]).into();
     while offset < len {
+        let hole_chunks = match next_data_offset(file, start + offset) {
+            Some(data) => data.saturating_sub(start + offset) / chunk_size,
+            // No data after this offset: the rest of the range is a hole.
+            None => (len - offset) / chunk_size,
+        }
+        .min((len - offset) / chunk_size);
+        if hole_chunks > 0 {
+            chunk_hashes.extend(std::iter::repeat_n(zero_chunk, hole_chunks as usize));
+            offset += hole_chunks * chunk_size;
+            continue;
+        }
         let wanted = usize::try_from((len - offset).min(read_window))
             .map_err(|_| OrchError::Internal("integrity read length overflow".into()))?;
         read_exact_at(
@@ -2837,6 +3006,44 @@ struct WarmVm {
     spec: VmSpawnConfig,
 }
 
+/// A warm class added for a shape creates asked for (see
+/// [`VmmSupervisor::learn_warm_class`]).
+#[derive(Debug, Clone)]
+struct LearnedClass {
+    class: WarmClass,
+    last_demand: Instant,
+}
+
+/// Prefix of the error a boot gets when the host has no capacity for it.
+pub(crate) const HOST_CAPACITY_EXHAUSTED: &str = "host resource capacity exhausted";
+
+/// A create counted in [`VmmSupervisor::wait_for_capacity`].
+pub(crate) struct CapacityWaiter<'a> {
+    waiters: &'a AtomicUsize,
+}
+
+impl Drop for CapacityWaiter<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A warm VM selected by one claim. Dropping it, however the claim ends,
+/// makes the VM selectable again if it is still parked.
+struct WarmClaim<'a> {
+    claims: &'a Mutex<HashSet<Uuid>>,
+    id: Uuid,
+}
+
+impl Drop for WarmClaim<'_> {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpawnPurpose {
     Live,
@@ -2935,15 +3142,25 @@ pub struct VmmSupervisor {
     artifact_owners: Mutex<HashSet<Uuid>>,
     network_leases: Mutex<HashMap<Uuid, NetworkLeaseState>>,
     booting: Mutex<HashMap<Uuid, BootingVm>>,
-    /// Serializes VMM spawn registration with shutdown's boot cancellation sweep.
+    /// Orders VMM spawn registration and lifecycle publication against
+    /// shutdown's boot cancellation sweep, VM stops, exit reconciliation and
+    /// re-adoption. Boots, publications and warm claims hold it shared, so
+    /// they proceed in parallel, each touching only its own VM's entries; the
+    /// others hold it exclusively and so never interleave with any of them.
     ///
     /// Lifecycle publication orders locks as `boot_gate` -> `running`/`warm` ->
     /// `booting`. It is async because Running publication intentionally holds it
     /// through fleet and durable-store acknowledgement, never while holding a
     /// synchronous supervisor lock.
-    boot_gate: AsyncMutex<()>,
+    boot_gate: tokio::sync::RwLock<()>,
+    /// Warm VMs a claim has selected and not yet finished with, so that
+    /// concurrent claims select different VMs.
+    warm_claims: Mutex<HashSet<Uuid>>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
+    /// Creates waiting for host capacity. While any wait, warm refills defer
+    /// to them instead of taking the capacity they are waiting for.
+    capacity_waiters: AtomicUsize,
     /// Async lifecycle/refill workers are owned here rather than by the API or
     /// replenisher future that awaits their result. Shutdown can therefore mark,
     /// enumerate, and wait every worker before tearing resources down.
@@ -2954,7 +3171,16 @@ pub struct VmmSupervisor {
     warm_handoff_pause: Mutex<Option<SpawnAttachmentPause>>,
     scheduler: Arc<Scheduler>,
     golden_artifacts: Mutex<Vec<OwnedArtifact>>,
+    /// Ready golden snapshot of each restore warm class, by the class's
+    /// spawn configuration. Its files live until the class is retired or
+    /// taritd shuts down.
+    goldens: Mutex<HashMap<VmSpawnConfig, GoldenBundle>>,
+    /// Warm classes taritd added on its own for VM shapes that creates ask
+    /// for, with when each was last asked for.
+    learned: Mutex<HashMap<VmSpawnConfig, LearnedClass>>,
     in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Bounds snapshot captures running at once (TARIT_MAX_CONCURRENT_SNAPSHOTS).
+    snapshot_permits: Arc<tokio::sync::Semaphore>,
     unexpected_exits: Mutex<VecDeque<UnexpectedVmmExit>>,
     net: Option<NetProvisioner>,
     jails: Option<JailManager>,
@@ -3140,14 +3366,19 @@ impl VmmSupervisor {
         } else {
             None
         };
+        let snapshot_permits = Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_snapshots.max(1),
+        ));
         Ok(Self {
             config,
             running: Mutex::new(HashMap::new()),
             artifact_owners: Mutex::new(artifact_owners),
             network_leases: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
-            boot_gate: AsyncMutex::new(()),
+            boot_gate: tokio::sync::RwLock::new(()),
+            warm_claims: Mutex::new(HashSet::new()),
             warm: Mutex::new(VecDeque::new()),
+            capacity_waiters: AtomicUsize::new(0),
             owned_tasks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             spawn_attachment_pause: Mutex::new(None),
@@ -3155,7 +3386,10 @@ impl VmmSupervisor {
             warm_handoff_pause: Mutex::new(None),
             scheduler,
             golden_artifacts: Mutex::new(Vec::new()),
+            goldens: Mutex::new(HashMap::new()),
+            learned: Mutex::new(HashMap::new()),
             in_progress_artifacts: Arc::new(Mutex::new(HashSet::new())),
+            snapshot_permits,
             unexpected_exits: Mutex::new(VecDeque::new()),
             net,
             jails,
@@ -3604,7 +3838,7 @@ impl VmmSupervisor {
         // obtain the gate, preventing a late pause/resume result from replacing
         // the terminal error state.
         let _operation = operation_gate.blocking_lock();
-        let gate = self.boot_gate.blocking_lock();
+        let gate = self.boot_gate.blocking_write();
         let location = self
             .running
             .lock()
@@ -3908,6 +4142,18 @@ impl VmmSupervisor {
         self.disk_pressure.refresh()
     }
 
+    /// Wait for a turn to capture a snapshot. Held until the snapshot's
+    /// files are durable, so writes and syncs of different VMs' snapshots do
+    /// not all share the device at once.
+    pub(crate) async fn snapshot_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, OrchError> {
+        Arc::clone(&self.snapshot_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| OrchError::Unavailable("snapshot capture is shut down".into()))
+    }
+
     pub(crate) fn disk_sweep_interval(&self) -> Duration {
         self.disk_pressure.sweep_interval()
     }
@@ -4149,7 +4395,7 @@ impl VmmSupervisor {
             SpawnPurpose::Live => "VM create or restore",
             SpawnPurpose::Refill => "warm-pool refill",
         })?;
-        let _gate = self.boot_gate.lock().await;
+        let _gate = self.boot_gate.read().await;
         if self.is_shutting_down() {
             return Err(self.shutdown_error());
         }
@@ -4167,6 +4413,8 @@ impl VmmSupervisor {
 
         let control = Arc::new(BootControl::new(purpose));
         let socket_path = self.socket_path_for(id);
+        // The ownership registration is atomic, so of two concurrent boots of
+        // one id only one gets past it.
         self.register_artifact_owner(id)?;
         let registered = self
             .booting
@@ -4204,7 +4452,7 @@ impl VmmSupervisor {
                 ReservationError::VmLimit
                 | ReservationError::VcpuLimit
                 | ReservationError::MemoryLimit => OrchError::Overloaded {
-                    message: format!("host resource capacity exhausted: {error:?}"),
+                    message: format!("{HOST_CAPACITY_EXHAUSTED}: {error:?}"),
                     retry_after_secs: 1,
                 },
             });
@@ -4493,6 +4741,68 @@ impl VmmSupervisor {
         Ok(control)
     }
 
+    /// Whether any create is waiting for host capacity right now.
+    pub(crate) fn creates_waiting_for_capacity(&self) -> bool {
+        self.capacity_waiters.load(Ordering::Acquire) > 0
+    }
+
+    /// Count a create as waiting for host capacity until the guard drops.
+    pub(crate) fn wait_for_capacity(&self) -> CapacityWaiter<'_> {
+        self.capacity_waiters.fetch_add(1, Ordering::AcqRel);
+        CapacityWaiter {
+            waiters: &self.capacity_waiters,
+        }
+    }
+
+    /// Stop one idle warm VM so that a create which found the host full can
+    /// take its capacity. Only VMs no claim has selected are eligible; a
+    /// waiting create's own class has none of those, or it would have claimed
+    /// one. Returns whether a VM was stopped and its capacity released.
+    pub(crate) fn reclaim_idle_warm(&self) -> bool {
+        self.reclaim_idle_warm_where(|_| true)
+    }
+
+    /// Whether any parked warm VM's spawn configuration fails `keep`.
+    pub(crate) fn has_warm_outside(&self, keep: impl Fn(&VmSpawnConfig) -> bool) -> bool {
+        self.warm
+            .lock()
+            .map(|warm| warm.iter().any(|vm| !keep(&vm.spec)))
+            .unwrap_or(false)
+    }
+
+    /// Stop one unclaimed warm VM whose spawn configuration `select` accepts.
+    pub(crate) fn reclaim_idle_warm_where(&self, select: impl Fn(&VmSpawnConfig) -> bool) -> bool {
+        let gate = self.boot_gate.blocking_write();
+        if self.is_shutting_down() {
+            return false;
+        }
+        let taken = self.warm.lock().ok().and_then(|mut warm| {
+            let claims = self.warm_claims.lock().ok()?;
+            let restoring = self.owned_tasks.lock().ok()?;
+            let index = warm.iter().position(|vm| {
+                !claims.contains(&vm.id) && !restoring.contains_key(&vm.id) && select(&vm.spec)
+            })?;
+            warm.remove(index)
+        });
+        drop(gate);
+        let Some(warm_vm) = taken else {
+            return false;
+        };
+        let _ = VmmClient::new(&warm_vm.vm.socket_path).stop();
+        match self.teardown_vm(warm_vm.id, &warm_vm.vm) {
+            Ok(()) => {
+                self.release_reservation_after_cleanup(warm_vm.id);
+                tracing::info!(vm = %warm_vm.id, "stopped an idle warm VM");
+                true
+            }
+            Err(error) => {
+                // The VMM may still be alive, so its capacity stays reserved.
+                tracing::error!(vm = %warm_vm.id, %error, "idle warm VM teardown incomplete");
+                false
+            }
+        }
+    }
+
     fn release_reservation_after_cleanup(&self, id: Uuid) {
         self.scheduler.release(id);
     }
@@ -4506,7 +4816,7 @@ impl VmmSupervisor {
     /// The lifecycle owner performs the durable Error/Stopped transition and
     /// releases its reservation afterwards, so this only removes the boot entry.
     pub(crate) async fn abort_unstarted_boot(&self, ticket: &BootTicket) {
-        let _gate = self.boot_gate.lock().await;
+        let _gate = self.boot_gate.read().await;
         let is_current = self
             .booting
             .lock()
@@ -4730,7 +5040,7 @@ impl VmmSupervisor {
         let BootedVm { id, vm, control } = booted;
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
-        let gate = self.boot_gate.lock().await;
+        let gate = self.boot_gate.read().await;
         let boot_is_current = match self.booting.lock() {
             Ok(booting) => {
                 boot_can_publish(&control, self.is_shutting_down())
@@ -4807,7 +5117,7 @@ impl VmmSupervisor {
         spec: VmSpawnConfig,
     ) -> Result<(), OrchError> {
         let BootedVm { id, vm, control } = booted;
-        let gate = self.boot_gate.lock().await;
+        let gate = self.boot_gate.read().await;
         let mut warm = match self.warm.lock() {
             Ok(warm) => warm,
             Err(_) => {
@@ -4988,7 +5298,7 @@ impl VmmSupervisor {
         let socket_path = runtime.host_socket.clone();
         let _ = std::fs::remove_file(&socket_path);
         let cgroup_args = self.cgroup_args(id, ticket.shape, runtime)?;
-        let boot_gate = self.boot_gate.blocking_lock();
+        let boot_gate = self.boot_gate.blocking_read();
         let can_start = !self.is_shutting_down()
             && !ticket.control.is_cancelled()
             && self
@@ -5230,6 +5540,7 @@ impl VmmSupervisor {
         let vmm_config = build_vmm_config(
             &runtime.vm_config,
             vm.net.as_ref(),
+            &self.config.guest_dns,
             runtime.guest_overlay.clone(),
             &runtime.data_volumes,
         );
@@ -5292,8 +5603,12 @@ impl VmmSupervisor {
             ));
         }
         if let Some(allocation) = &booted.vm.net {
-            let repaired = rebind_restored_guest_network(&booted.vm.socket_path, allocation)
-                .and_then(|()| verify_restored_guest_connectivity(allocation));
+            let repaired = rebind_restored_guest_network(
+                &booted.vm.socket_path,
+                allocation,
+                &self.config.guest_dns,
+            )
+            .and_then(|()| verify_restored_guest_connectivity(allocation));
             if let Err(error) = repaired {
                 return Err(self.cleanup_boot_failure(
                     booted.id,
@@ -5376,6 +5691,26 @@ impl VmmSupervisor {
             }
             None => (None, None, 0),
         };
+        // Seeding and verifying the private disk upper needs nothing from the
+        // VMM, so it runs while the network is provisioned and the VMM process
+        // starts. Its result is taken below, where the seeding used to run;
+        // every earlier return joins it and removes what it wrote.
+        let mut seeding = match &overlay {
+            RestoreOverlay::None => None,
+            RestoreOverlay::Seeded(source) => {
+                let destination = runtime
+                    .host_overlay
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(self.overlay_path_for(id)));
+                Some(OverlaySeeding::start(
+                    source.clone(),
+                    destination,
+                    runtime.jail.as_ref().map(|jail| (jail.uid, jail.gid)),
+                    overlay_integrity.clone(),
+                    integrity_chunk_size,
+                ))
+            }
+        };
         let net_alloc = match &self.net {
             Some(provisioner) => {
                 match provisioner.provision_with_owner_and_policy(
@@ -5422,57 +5757,12 @@ impl VmmSupervisor {
         // durable snapshot this destination is seeded from SnapshotRecord's
         // owned disk artifact; the source overlay path serialized in RAM state
         // is never reopened.
-        let overlay = match overlay {
-            RestoreOverlay::None => None,
-            RestoreOverlay::Seeded(source) => {
-                let destination = runtime
-                    .host_overlay
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(self.overlay_path_for(id)));
-                if let Err(error) = copy_private_artifact(&source, &destination) {
-                    return Err(self.cleanup_boot_failure(
-                        id,
-                        &ticket.control,
-                        &base_vm,
-                        OrchError::Internal(format!("seed private restore disk upper: {error}")),
-                    ));
-                }
-                if let Some(jail) = &runtime.jail {
-                    if let Err(error) = set_jail_owner_mode(&destination, jail.uid, jail.gid, 0o600)
-                    {
-                        return Err(self.cleanup_boot_failure(
-                            id,
-                            &ticket.control,
-                            &base_vm,
-                            error,
-                        ));
-                    }
-                }
-                if let Some(integrity) = overlay_integrity.as_ref() {
-                    let destination_artifact =
-                        OwnedArtifact::capture(&destination).map_err(|error| {
-                            self.cleanup_boot_failure(
-                                id,
-                                &ticket.control,
-                                &base_vm,
-                                OrchError::Internal(format!(
-                                    "capture seeded restore disk upper: {error}"
-                                )),
-                            )
-                        })?;
-                    if let Err(error) = verify_file_artifact_integrity(
-                        &destination_artifact._file,
-                        integrity,
-                        integrity_chunk_size,
-                        "seeded restore disk",
-                    ) {
-                        return Err(self.cleanup_boot_failure(
-                            id,
-                            &ticket.control,
-                            &base_vm,
-                            error,
-                        ));
-                    }
+        let overlay = match seeding.take() {
+            None => None,
+            Some(seeding) => {
+                let destination = seeding.destination.clone();
+                if let Err(error) = seeding.finish() {
+                    return Err(self.cleanup_boot_failure(id, &ticket.control, &base_vm, error));
                 }
                 runtime
                     .guest_overlay
@@ -5515,6 +5805,9 @@ impl VmmSupervisor {
         if !boot_can_publish(&ticket.control, self.is_shutting_down()) {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, self.shutdown_error()));
         }
+        // The restored snapshot stays in place while the VM runs (in the jail
+        // when jailed), so the first checkpoint can use it as its base.
+        vm.set_checkpoint_base(Some(restore_path.to_string()));
         self.require_restored_guest_ready_and_network(BootedVm {
             id,
             vm,
@@ -5760,6 +6053,31 @@ impl VmmSupervisor {
             }
             return Err(error);
         }
+        // Every command starts through the guest's shell. Running one before
+        // the snapshot puts the shell, the loader and libc in every clone's
+        // page cache; otherwise each clone reads them from disk on its first
+        // command. A failing prewarm fails the golden rather than leaving a
+        // class different from what it was configured to be.
+        let socket_path = booted.vm.socket_path.clone();
+        let command = class.prewarm.clone().unwrap_or_else(|| "true".into());
+        let prewarm_error = match tokio::task::spawn_blocking(move || {
+            VmmClient::new(&socket_path)
+                .with_request_timeout(LIFECYCLE_OP_TIMEOUT)
+                .exec(&command, GOLDEN_PREWARM_TIMEOUT_MS)
+        })
+        .await
+        {
+            Ok(Ok((0, ..))) => None,
+            Ok(Ok((code, _, stderr, _))) => Some(OrchError::Vmm(format!(
+                "golden prewarm exited {code}: {}",
+                stderr.trim().chars().take(512).collect::<String>()
+            ))),
+            Ok(Err(error)) => Some(OrchError::Vmm(format!("golden prewarm: {error}"))),
+            Err(error) => Some(OrchError::Internal(format!("golden prewarm task: {error}"))),
+        };
+        if let Some(error) = prewarm_error {
+            return Err(self.cleanup_boot_failure(id, &booted.control, &booted.vm, error));
+        }
         let _reservation =
             match self.reserve_snapshot_space(id, spec.memory_mib, spec.rootfs_path.is_some()) {
                 Ok(reservation) => reservation,
@@ -5768,9 +6086,14 @@ impl VmmSupervisor {
                 }
             };
         let socket_path = booted.vm.socket_path.clone();
+        // The golden stays paused from here until it is torn down, so its
+        // disk upper cannot change between the RAM snapshot and the copy.
         let snapshot_vmm_path = match tokio::task::spawn_blocking(move || {
-            VmmClient::new(&socket_path)
-                .with_request_timeout(LIFECYCLE_OP_TIMEOUT)
+            let client = VmmClient::new(&socket_path).with_request_timeout(LIFECYCLE_OP_TIMEOUT);
+            client
+                .pause()
+                .map_err(|error| OrchError::Vmm(format!("pause golden: {error}")))?;
+            client
                 .snapshot_unreleased(false)
                 .map_err(|error| OrchError::Vmm(format!("snapshot golden: {error}")))
         })
@@ -5977,20 +6300,41 @@ impl VmmSupervisor {
         F: FnOnce(Uuid, u32, PathBuf) -> Fut + Send,
         Fut: std::future::Future<Output = Result<T, PublicationFailure>> + Send,
     {
-        let _gate = self.boot_gate.lock().await;
+        let _gate = self.boot_gate.read().await;
         if self.is_shutting_down() || task.is_cancelled() {
             return Ok(WarmClaimOutcome::NoMatch);
         }
-        let candidate_id = {
+        let claim = {
             let warm = self
                 .warm
                 .lock()
                 .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
-            let Some(warm_vm) = warm.iter().find(|warm_vm| &warm_vm.spec == want) else {
+            let mut claims = self
+                .warm_claims
+                .lock()
+                .map_err(|_| OrchError::Internal("warm claim lock poisoned".into()))?;
+            // A VM whose own restore task has published it but not finished
+            // yet still holds that task under its id; a claim taking the id
+            // over now would conflict with it, so wait for the next VM.
+            let restoring = self
+                .owned_tasks
+                .lock()
+                .map_err(|_| OrchError::Internal("owned task lock poisoned".into()))?;
+            let Some(warm_vm) = warm.iter().find(|warm_vm| {
+                &warm_vm.spec == want
+                    && !claims.contains(&warm_vm.id)
+                    && !restoring.contains_key(&warm_vm.id)
+            }) else {
                 return Ok(WarmClaimOutcome::NoMatch);
             };
-            warm_vm.id
+            drop(restoring);
+            claims.insert(warm_vm.id);
+            WarmClaim {
+                claims: &self.warm_claims,
+                id: warm_vm.id,
+            }
         };
+        let candidate_id = claim.id;
         self.bind_owned_task(candidate_id, task)?;
         if let Err(error) = register_lifecycle(candidate_id).await {
             return Ok(WarmClaimOutcome::PreRuntimeFailure(error));
@@ -6046,6 +6390,192 @@ impl VmmSupervisor {
             .lock()
             .map(|w| w.iter().filter(|x| &x.spec == want).count())
             .unwrap_or(0)
+    }
+
+    /// Make a warm class's golden snapshot available for on-demand restores.
+    pub(crate) fn publish_golden(&self, spec: VmSpawnConfig, bundle: GoldenBundle) {
+        if let Ok(mut goldens) = self.goldens.lock() {
+            goldens.insert(spec, bundle);
+        }
+    }
+
+    /// The ready golden snapshot for a warm class's spawn configuration.
+    pub(crate) fn golden(&self, spec: &VmSpawnConfig) -> Option<GoldenBundle> {
+        self.goldens.lock().ok()?.get(spec).cloned()
+    }
+
+    /// Drop the golden snapshots of classes `keep` rejects and delete their
+    /// files. Clones already restored from one keep their own open mappings
+    /// and disk copies, so removing the files does not disturb them.
+    pub(crate) fn retain_goldens(&self, keep: impl Fn(&VmSpawnConfig) -> bool) {
+        let retired = match self.goldens.lock() {
+            Ok(mut goldens) => {
+                let retired = goldens
+                    .iter()
+                    .filter(|(spec, _)| !keep(spec))
+                    .map(|(spec, bundle)| (spec.clone(), bundle.clone()))
+                    .collect::<Vec<_>>();
+                for (spec, _) in &retired {
+                    goldens.remove(spec);
+                }
+                retired
+            }
+            Err(_) => return,
+        };
+        if retired.is_empty() {
+            return;
+        }
+        let paths = retired
+            .iter()
+            .flat_map(|(_, bundle)| {
+                std::iter::once(PathBuf::from(bundle.snapshot_path()))
+                    .chain(bundle.overlay_path().map(PathBuf::from))
+            })
+            .collect::<HashSet<_>>();
+        let artifacts = {
+            let mut registered = self.golden_artifacts.lock().unwrap_or_else(|poisoned| {
+                tracing::error!("golden artifact lock poisoned while retiring goldens");
+                poisoned.into_inner()
+            });
+            let (taken, kept) = registered
+                .drain(..)
+                .partition::<Vec<_>, _>(|artifact| paths.contains(artifact.path()));
+            *registered = kept;
+            taken
+        };
+        for (spec, _) in &retired {
+            tracing::info!(
+                vcpus = spec.vcpus,
+                memory_mib = spec.memory_mib,
+                rootfs = ?spec.rootfs_path.as_ref(),
+                "retired warm golden snapshot"
+            );
+        }
+        cleanup_golden_artifacts(artifacts);
+    }
+
+    /// Add a warm class for a shape that creates ask for and no configured
+    /// class serves, or note fresh demand for one already added. At most
+    /// `limit` learned classes are kept; adding one past that forgets the one
+    /// asked for least recently. Returns whether `spec` is now learned.
+    pub(crate) fn learn_warm_class(
+        &self,
+        spec: VmSpawnConfig,
+        class: WarmClass,
+        limit: usize,
+    ) -> bool {
+        let Ok(mut learned) = self.learned.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if let Some(entry) = learned.get_mut(&spec) {
+            entry.last_demand = now;
+            return true;
+        }
+        if limit == 0 {
+            return false;
+        }
+        while learned.len() >= limit {
+            let Some(oldest) = learned
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_demand)
+                .map(|(spec, _)| spec.clone())
+            else {
+                break;
+            };
+            learned.remove(&oldest);
+        }
+        tracing::info!(
+            vcpus = spec.vcpus,
+            memory_mib = spec.memory_mib,
+            rootfs = ?spec.rootfs_path.as_ref(),
+            target = class.target,
+            "learned a warm class for a shape in demand"
+        );
+        learned.insert(
+            spec,
+            LearnedClass {
+                class,
+                last_demand: now,
+            },
+        );
+        true
+    }
+
+    /// Give a learned class a new prewarm command. Its golden snapshot is
+    /// retired so the next one runs the command; warm VMs already restored
+    /// stay usable. Returns whether `spec` is a learned class.
+    pub(crate) fn set_learned_prewarm(
+        &self,
+        spec: &VmSpawnConfig,
+        prewarm: Option<String>,
+    ) -> bool {
+        let changed = {
+            let Ok(mut learned) = self.learned.lock() else {
+                return false;
+            };
+            let Some(entry) = learned.get_mut(spec) else {
+                return false;
+            };
+            let changed = entry.class.prewarm != prewarm;
+            entry.class.prewarm = prewarm;
+            changed
+        };
+        if changed {
+            self.retain_goldens(|golden| golden != spec);
+        }
+        true
+    }
+
+    /// Note a create for `spec` if it is a learned class, keeping the class
+    /// alive. Returns whether it is one.
+    pub(crate) fn note_learned_demand(&self, spec: &VmSpawnConfig) -> bool {
+        let Ok(mut learned) = self.learned.lock() else {
+            return false;
+        };
+        let Some(entry) = learned.get_mut(spec) else {
+            return false;
+        };
+        entry.last_demand = Instant::now();
+        true
+    }
+
+    /// Forget learned classes nobody asked for in `idle`, then return the
+    /// classes that remain.
+    pub(crate) fn learned_warm_classes(&self, idle: Duration) -> Vec<WarmClass> {
+        let Ok(mut learned) = self.learned.lock() else {
+            return Vec::new();
+        };
+        learned.retain(|spec, entry| {
+            let keep = entry.last_demand.elapsed() < idle;
+            if !keep {
+                tracing::info!(
+                    vcpus = spec.vcpus,
+                    memory_mib = spec.memory_mib,
+                    rootfs = ?spec.rootfs_path.as_ref(),
+                    "forgot an idle learned warm class"
+                );
+            }
+            keep
+        });
+        learned.values().map(|entry| entry.class.clone()).collect()
+    }
+
+    /// The learned classes as they stand, without retiring idle ones.
+    pub(crate) fn learned_classes_snapshot(&self) -> Vec<WarmClass> {
+        self.learned
+            .lock()
+            .map(|learned| learned.values().map(|entry| entry.class.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The learned class whose VMs `spec` describes, if any.
+    pub(crate) fn learned_warm_class(&self, spec: &VmSpawnConfig) -> Option<WarmClass> {
+        self.learned
+            .lock()
+            .ok()?
+            .get(spec)
+            .map(|entry| entry.class.clone())
     }
 
     fn remember_golden_artifacts(
@@ -6648,7 +7178,7 @@ impl VmmSupervisor {
         };
         let vm = RunningVm::new(pid, socket_path, process, net);
         {
-            let gate = self.boot_gate.lock().await;
+            let gate = self.boot_gate.write().await;
             if let Err(error) = self.scheduler.reserve_existing(
                 record.id,
                 ResourceShape::new(record.vcpus, record.memory_mib),
@@ -6860,6 +7390,23 @@ impl VmmSupervisor {
     /// Return the operation gate owned by this exact live runtime. Gates are
     /// not kept in a separate UUID map: removing the `RunningVm` drops the
     /// supervisor's reference, so churn cannot grow an unbounded registry.
+    fn checkpoint_base(&self, id: Uuid) -> Option<String> {
+        let running = self.running.lock().ok()?;
+        let base = running.get(&id)?.checkpoint_base.lock().ok()?;
+        base.clone()
+    }
+
+    fn set_checkpoint_base(&self, id: Uuid, path: Option<String>) {
+        if let Some(vm) = self
+            .running
+            .lock()
+            .ok()
+            .and_then(|running| running.get(&id).cloned())
+        {
+            vm.set_checkpoint_base(path);
+        }
+    }
+
     pub(crate) fn operation_gate(&self, id: Uuid) -> Result<Arc<AsyncMutex<()>>, OrchError> {
         self.running
             .lock()
@@ -6871,7 +7418,7 @@ impl VmmSupervisor {
 
     pub fn stop_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let booting = {
-            let _gate = self.boot_gate.blocking_lock();
+            let _gate = self.boot_gate.blocking_write();
             let booting_vm = self
                 .booting
                 .lock()
@@ -6892,7 +7439,7 @@ impl VmmSupervisor {
         // Remove from the running map under the lifecycle gate, then do slow
         // teardown without any lock held.
         let running = {
-            let _gate = self.boot_gate.blocking_lock();
+            let _gate = self.boot_gate.blocking_write();
             let mut guard = self
                 .running
                 .lock()
@@ -6901,7 +7448,7 @@ impl VmmSupervisor {
         };
         let Some(running) = running else {
             let warm = {
-                let _gate = self.boot_gate.blocking_lock();
+                let _gate = self.boot_gate.blocking_write();
                 let mut warm = self
                     .warm
                     .lock()
@@ -6957,14 +7504,16 @@ impl VmmSupervisor {
 
     pub fn pause_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let client = self.lifecycle_client_for(id)?;
-        client.pause().map_err(|e| OrchError::Vmm(e.to_string()))
+        client
+            .pause()
+            .map_err(|error| vmm_call_error("pause", error))
     }
 
     pub fn suspend_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let client = self.lifecycle_client_for(id)?;
         client
             .suspend()
-            .map_err(|error| OrchError::Vmm(error.to_string()))
+            .map_err(|error| vmm_call_error("suspend", error))
     }
 
     pub fn resume_vm(&self, id: Uuid) -> Result<(), OrchError> {
@@ -7135,54 +7684,31 @@ impl VmmSupervisor {
     pub(crate) fn snapshot_bundle_vm(
         &self,
         id: Uuid,
-        diff: bool,
         resume_after: bool,
         overlay_path: Option<PathBuf>,
         memory_mib: u64,
     ) -> Result<SnapshotBundle, OrchError> {
+        let started = Instant::now();
         let has_overlay = overlay_path.is_some();
         let _reservation = self.reserve_snapshot_space(id, memory_mib, has_overlay)?;
         let client = self.lifecycle_client_for(id)?;
-        if resume_after {
-            // Pause is synchronous: it returns only after every vCPU has left
-            // KVM_RUN and completed its current MMIO handler. The pause window
-            // ends as soon as RAM is immutable and the disk upper is captured;
-            // moving immutable RAM into taritd's durable namespace happens
-            // only after resume.
-            client
-                .pause()
-                .map_err(|error| OrchError::Vmm(format!("pause for snapshot: {error}")))?;
-        }
-        let pause_started = resume_after.then(Instant::now);
-
-        let scratch_snapshot_path = match client.snapshot_unreleased(diff) {
-            Ok(path) => path,
-            Err(error) => {
-                return Err(compensate_snapshot_pause(
-                    &client,
-                    resume_after,
-                    OrchError::Vmm(format!("snapshot RAM: {error}")),
-                ));
-            }
-        };
-        let scratch_snapshot_host_path = self.host_path_for_vmm(id, &scratch_snapshot_path);
-        // Keep the VMM's cleanup token armed until every member of the bundle
-        // has been captured. A failed disk copy therefore cannot publish a
-        // RAM-only snapshot.
-        let scratch_ram_artifact = match OwnedArtifact::capture(&scratch_snapshot_host_path) {
-            Ok(artifact) => artifact,
-            Err(error) => {
-                return Err(compensate_snapshot_pause(
-                    &client,
-                    resume_after,
-                    OrchError::Internal(format!("capture RAM snapshot ownership: {error}")),
-                ));
-            }
-        };
         let expected_uid = self
             .jail_identity(id)?
             .map(|(uid, _)| uid)
             .unwrap_or_else(|| unsafe { libc::geteuid() });
+        if resume_after {
+            // Pause is synchronous: it returns only after every vCPU has left
+            // KVM_RUN and completed its current MMIO handler. The pause window
+            // covers the disk upper copy and the RAM capture; the VMM resumes
+            // the guest as soon as RAM is captured, and moving immutable RAM
+            // into taritd's durable namespace happens after that.
+            client
+                .pause()
+                .map_err(|error| vmm_call_error("pause for snapshot", error))?;
+        }
+
+        // Capture the disk upper first: the VMM resumes the guest once RAM is
+        // captured, so RAM must be the last member of the bundle taken.
         let overlay_artifact = if has_overlay {
             let source = overlay_path.expect("has_overlay is derived from overlay_path");
             let staging = self.snapshot_overlay_staging_path();
@@ -7200,25 +7726,57 @@ impl VmmSupervisor {
         } else {
             None
         };
+        let disk_captured = started.elapsed();
+        let discard_overlay = |overlay_artifact: Option<(OwnedArtifact, PathBuf)>| {
+            if let Some((artifact, _)) = overlay_artifact {
+                let _ = artifact.remove();
+            }
+        };
+
+        // Always a full snapshot. With the runtime's last checkpoint as its
+        // base the VMM pauses only for pages changed since and copies the rest
+        // from the base after the guest resumes.
+        let base = self.checkpoint_base(id);
+        let scratch_snapshot_path =
+            match client.snapshot_unreleased_with(false, base.as_deref(), resume_after) {
+                Ok(path) => path,
+                Err(error) => {
+                    discard_overlay(overlay_artifact);
+                    return Err(compensate_snapshot_pause(
+                        &client,
+                        resume_after,
+                        vmm_call_error("snapshot RAM", error),
+                    ));
+                }
+            };
+        let ram_written = started.elapsed();
+        let scratch_snapshot_host_path = self.host_path_for_vmm(id, &scratch_snapshot_path);
+        // Keep the VMM's cleanup token armed until every member of the bundle
+        // has been captured. A failed claim therefore cannot publish a
+        // RAM-only snapshot.
+        let scratch_ram_artifact = match OwnedArtifact::capture(&scratch_snapshot_host_path) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                discard_overlay(overlay_artifact);
+                return Err(compensate_snapshot_pause(
+                    &client,
+                    resume_after,
+                    OrchError::Internal(format!("capture RAM snapshot ownership: {error}")),
+                ));
+            }
+        };
 
         if resume_after {
+            // A no-op unless the VMM could not resume the guest itself.
             if let Err(error) = client.resume() {
-                if let Some((artifact, _)) = overlay_artifact {
-                    let _ = artifact.remove();
-                }
+                discard_overlay(overlay_artifact);
                 return Err(OrchError::Vmm(format!(
                     "resume after disk-consistent snapshot: {error}; disk artifact was discarded and RAM scratch remains VMM-owned"
                 )));
             }
-            tracing::info!(
-                vm = %id,
-                paused_ms = pause_started
-                    .map(|started| started.elapsed().as_millis())
-                    .unwrap_or_default(),
-                "snapshot consistency pause completed before durable RAM transfer"
-            );
         }
 
+        let resumed = started.elapsed();
         let ram_staging = self.snapshot_ram_staging_path();
         let ram_destination = self.snapshot_ram_path();
         let ram_artifact = match copy_private_artifact_owned(
@@ -7257,6 +7815,7 @@ impl VmmSupervisor {
             ),
         }
 
+        let ram_claimed = started.elapsed();
         let overlay_path = overlay_artifact
             .as_ref()
             .map(|(_, destination)| destination.display().to_string());
@@ -7271,6 +7830,24 @@ impl VmmSupervisor {
                 return Err(error);
             }
         };
+        // The VMM's dirty log now counts from this snapshot. An unjailed VMM
+        // can read it from the durable store for the next checkpoint; a jailed
+        // one sees only its jail, where its old base no longer matches.
+        self.set_checkpoint_base(
+            id,
+            self.jails
+                .is_none()
+                .then(|| ram_destination.display().to_string()),
+        );
+        tracing::debug!(
+            vm = %id,
+            ?ram_written,
+            ?disk_captured,
+            ?resumed,
+            ?ram_claimed,
+            published = ?started.elapsed(),
+            "snapshot bundle phases"
+        );
         let bundle = SnapshotBundle {
             snapshot_path: ram_destination.display().to_string(),
             overlay_path,
@@ -7304,7 +7881,7 @@ impl VmmSupervisor {
             live_stats,
         ) = client
             .live_snapshot_unreleased()
-            .map_err(|error| OrchError::Vmm(format!("atomic live snapshot: {error}")))?;
+            .map_err(|error| vmm_call_error("atomic live snapshot", error))?;
         if scratch_overlay_vmm_path.is_some() != expects_overlay {
             return Err(OrchError::Vmm(format!(
                 "atomic live snapshot disk mismatch: expected overlay={expects_overlay}, VMM returned overlay={}",
@@ -7531,7 +8108,7 @@ impl VmmSupervisor {
 
     pub(crate) fn stop_all(&self) -> Result<ShutdownSummary, Box<ShutdownFailure>> {
         let (booting, owned_tasks) = {
-            let _gate = self.boot_gate.blocking_lock();
+            let _gate = self.boot_gate.blocking_write();
             // This is the linearization point with user lifecycle publication:
             // after it, no boot can enter its durable Running publication.
             self.shutting_down.store(true, Ordering::SeqCst);
@@ -8024,6 +8601,71 @@ fn copy_private_artifact_owned(
     Ok(destination)
 }
 
+/// Whether files in `dir` can be reflinked (FICLONE). The atomic live snapshot
+/// clones the disk upper inside its final stop, so on a filesystem without
+/// reflink (ext4, tmpfs) it copies all of guest memory and then fails; callers
+/// use this to go straight to the paused snapshot instead. Probed once per
+/// filesystem with two scratch files. `None` means the probe itself could not
+/// run, and the caller should keep its previous behaviour.
+#[cfg(target_os = "linux")]
+pub(crate) fn directory_supports_reflink(dir: &Path) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    type ReflinkCache = std::sync::Mutex<HashMap<u64, bool>>;
+    static CACHE: std::sync::OnceLock<ReflinkCache> = std::sync::OnceLock::new();
+    let device = std::fs::metadata(dir).ok()?.dev();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(known) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&device) {
+        return Some(*known);
+    }
+
+    const FICLONE: libc::Ioctl = 0x4004_9409;
+    let probe = |name: &str| dir.join(format!(".reflink-probe-{}-{name}", Uuid::new_v4()));
+    let (source_path, clone_path) = (probe("source"), probe("clone"));
+    let create = |path: &Path| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    };
+    let result = (|| {
+        let source = create(&source_path).ok()?;
+        source.write_all_at(&[0u8; 4096], 0).ok()?;
+        let clone = create(&clone_path).ok()?;
+        // SAFETY: both descriptors are open regular files owned by this
+        // function; the kernel does not retain them after the call.
+        let rc = unsafe { libc::ioctl(clone.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+        if rc == 0 {
+            return Some(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EOPNOTSUPP)
+            | Some(libc::ENOTTY)
+            | Some(libc::EXDEV)
+            | Some(libc::EINVAL) => Some(false),
+            _ => None,
+        }
+    })();
+    let _ = std::fs::remove_file(&source_path);
+    let _ = std::fs::remove_file(&clone_path);
+    if let Some(supported) = result {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device, supported);
+    }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn directory_supports_reflink(_dir: &Path) -> Option<bool> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -8116,6 +8758,25 @@ fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std
         offset += amount as u64;
     }
     destination.set_len(source_len)
+}
+
+/// Seconds a caller is asked to wait after the VMM reported it was too busy.
+const VMM_BUSY_RETRY_AFTER_SECS: u64 = 2;
+
+/// Map a failed VMM call. A refusal that left the VM unchanged (block I/O
+/// that did not settle within the pause budget on a loaded host) becomes a
+/// retryable overload rather than an internal error.
+fn vmm_call_error(operation: &str, error: tarit_vmm_client::VmmError) -> OrchError {
+    match error {
+        tarit_vmm_client::VmmError::Busy(reason) => {
+            tracing::warn!(operation, %reason, "VMM refused a busy request; caller may retry");
+            OrchError::Overloaded {
+                message: format!("{operation}: the VM's storage is busy, retry later"),
+                retry_after_secs: VMM_BUSY_RETRY_AFTER_SECS,
+            }
+        }
+        other => OrchError::Vmm(format!("{operation}: {other}")),
+    }
 }
 
 fn compensate_snapshot_pause(
@@ -8765,6 +9426,7 @@ impl TryFrom<&NetAlloc> for RestoredGuestNetwork {
 fn rebind_restored_guest_network(
     socket_path: &Path,
     allocation: &NetAlloc,
+    guest_dns: &[String],
 ) -> Result<(), OrchError> {
     let network = RestoredGuestNetwork::try_from(allocation)?;
     let client = VmmClient::new(socket_path)
@@ -8775,7 +9437,7 @@ fn rebind_restored_guest_network(
             addr: network.guest_ip.to_string(),
             prefix: network.prefix,
             gateway: network.gateway.to_string(),
-            dns_servers: Vec::new(),
+            dns_servers: guest_dns.to_vec(),
         })
         .map_err(|error| OrchError::Vmm(format!("restore guest network rebind: {error}")))?;
 
@@ -8826,6 +9488,7 @@ fn verify_restored_guest_connectivity(_allocation: &NetAlloc) -> Result<(), Orch
 fn build_vmm_config(
     cfg: &VmSpawnConfig,
     net: Option<&NetAlloc>,
+    guest_dns: &[String],
     overlay: Option<String>,
     data_volumes: &[PreparedBlockAttachment],
 ) -> VmConfig {
@@ -8853,11 +9516,15 @@ fn build_vmm_config(
 
     // With per-VM networking, attach a virtio-net device on the provisioned tap
     // and append the kernel `ip=` fragment so the guest configures eth0 at boot.
+    // The guest agent writes /etc/resolv.conf from `tarit.dns=` at boot.
     let (nets, cmdline) = match net {
-        Some(a) => (
-            vec![net_config_for_allocation(a)],
-            format!("{} {}", base_cmdline.trim(), a.ip_cmdline()),
-        ),
+        Some(a) => {
+            let mut cmdline = format!("{} {}", base_cmdline.trim(), a.ip_cmdline());
+            if !guest_dns.is_empty() {
+                cmdline.push_str(&format!(" tarit.dns={}", guest_dns.join(",")));
+            }
+            (vec![net_config_for_allocation(a)], cmdline)
+        }
         None => (vec![], base_cmdline),
     };
 
@@ -8926,6 +9593,23 @@ mod tests {
     use tarit_volume::BlockVolumeProvider;
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_vmm_becomes_a_retryable_overload_not_an_internal_error() {
+        let busy = vmm_call_error(
+            "pause for snapshot",
+            tarit_vmm_client::VmmError::Busy("block I/O worker quiescence timed out".into()),
+        );
+        assert_eq!(busy.http_status(), 429);
+        assert_eq!(busy.retry_after_secs(), Some(VMM_BUSY_RETRY_AFTER_SECS));
+        assert!(!busy.to_string().contains("quiescence"), "{busy}");
+
+        let failed = vmm_call_error(
+            "pause for snapshot",
+            tarit_vmm_client::VmmError::Api("vsock worker quiescence timed out".into()),
+        );
+        assert_eq!(failed.http_status(), 500);
+    }
+
     #[test]
     fn tap_descriptor_becomes_inheritable_only_in_the_vmm_child() {
         let mut pipe_fds = [-1; 2];
@@ -9013,6 +9697,15 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn unrelated process");
+        // Until the child execs it is still a copy of this test binary, which
+        // fails the check for a different reason on a loaded host.
+        let exe = PathBuf::from(format!("/proc/{}/exe", child.id()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_link(&exe).is_ok_and(|path| path.ends_with("sleep"))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         let result = verify_live_vmm(child.id(), &socket, None, Path::new("sleep"), &allowed_uids);
         let _ = child.kill();
         let _ = child.wait();
@@ -9181,9 +9874,11 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
@@ -9250,7 +9945,7 @@ mod tests {
         requested.boot_memory_mib = Some(2048);
         requested.target_memory_mib = Some(4096);
         let jailed = requested.with_jail_paths(Some(PathBuf::from(JAIL_ROOTFS_PATH)));
-        let vmm = build_vmm_config(&jailed, None, None, &[]);
+        let vmm = build_vmm_config(&jailed, None, &[], None, &[]);
         assert_eq!(vmm.memory.boot_size_mib, Some(2048));
         assert_eq!(vmm.memory.size_mib, 4096);
         assert_eq!(jailed.target_memory_mib, Some(4096));
@@ -9654,9 +10349,11 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
@@ -10214,7 +10911,7 @@ mod tests {
             Some(expected.clone())
         );
 
-        let vmm_config = build_vmm_config(&cfg, None, Some(expected.clone()), &[]);
+        let vmm_config = build_vmm_config(&cfg, None, &[], Some(expected.clone()), &[]);
         assert_eq!(vmm_config.volumes.len(), 1);
         assert_eq!(vmm_config.volumes[0].overlay, Some(expected));
         assert!(!vmm_config.volumes[0].read_only);
@@ -10228,6 +10925,7 @@ mod tests {
         let rw_config = build_vmm_config(
             &configured_rw,
             None,
+            &[],
             supervisor.overlay_path_for_config(id, &configured_rw),
             &[],
         );
@@ -10267,7 +10965,7 @@ mod tests {
             unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
             0
         );
-        let vmm = build_vmm_config(&runtime.vm_config, None, None, &runtime.data_volumes);
+        let vmm = build_vmm_config(&runtime.vm_config, None, &[], None, &runtime.data_volumes);
         assert_eq!(vmm.volumes.len(), 1);
         assert_eq!(vmm.volumes[0].path, format!("volume:{volume_id}"));
         assert_eq!(vmm.volumes[0].inherited_fd, Some(raw_fd));
@@ -11423,6 +12121,258 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_create_reclaims_an_idle_warm_vm_but_never_a_claimed_one() {
+        let supervisor = test_supervisor();
+        let spec = spawn_config(false, Some(PathBuf::from("/images/a.ext4")));
+        let mut ids = Vec::new();
+        for name in ["idle", "claimed"] {
+            let id = Uuid::new_v4();
+            supervisor
+                .scheduler
+                .try_reserve(id, ResourceShape::new(1, 1))
+                .unwrap();
+            let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+            supervisor.warm.lock().unwrap().push_back(WarmVm {
+                id,
+                vm: RunningVm::new(
+                    process.pid,
+                    PathBuf::from(format!("target/taritd-supervisor-test/reclaim-{name}-{id}")),
+                    process,
+                    None,
+                ),
+                spec: spec.clone(),
+            });
+            ids.push(id);
+        }
+        let (idle, claimed) = (ids[0], ids[1]);
+        // Selected first in queue order, so the claim must be what spares it.
+        supervisor.warm.lock().unwrap().swap(0, 1);
+        supervisor.warm_claims.lock().unwrap().insert(claimed);
+
+        assert!(supervisor.reclaim_idle_warm());
+        assert!(!supervisor.scheduler.is_reserved(idle));
+        assert!(supervisor.scheduler.is_reserved(claimed));
+        assert_eq!(supervisor.warm_count(&spec), 1);
+
+        assert!(!supervisor.reclaim_idle_warm(), "only a claimed VM is left");
+        assert_eq!(supervisor.warm_count(&spec), 1);
+
+        supervisor.warm_claims.lock().unwrap().remove(&claimed);
+        assert!(supervisor.reclaim_idle_warm());
+        assert_eq!(supervisor.warm_count(&spec), 0);
+    }
+
+    #[test]
+    fn learned_classes_keep_the_most_recently_demanded_and_expire_when_idle() {
+        let supervisor = test_supervisor();
+        let spec = |name: &str| spawn_config(false, Some(PathBuf::from(format!("/images/{name}"))));
+        let class = |name: &str| {
+            WarmClass::learned(
+                1,
+                256,
+                Some(PathBuf::from(format!("/images/{name}"))),
+                4,
+                None,
+            )
+        };
+        assert!(supervisor.learn_warm_class(spec("a"), class("a"), 2));
+        assert!(supervisor.learn_warm_class(spec("b"), class("b"), 2));
+        // Fresh demand for a makes b the least recently asked for.
+        assert!(supervisor.learn_warm_class(spec("a"), class("a"), 2));
+        assert!(supervisor.learn_warm_class(spec("c"), class("c"), 2));
+        assert!(supervisor.learned_warm_class(&spec("a")).is_some());
+        assert!(supervisor.learned_warm_class(&spec("b")).is_none());
+        assert!(supervisor.learned_warm_class(&spec("c")).is_some());
+        assert!(!supervisor.learn_warm_class(spec("d"), class("d"), 0));
+
+        assert_eq!(
+            supervisor
+                .learned_warm_classes(Duration::from_secs(60))
+                .len(),
+            2
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(supervisor
+            .learned_warm_classes(Duration::from_millis(10))
+            .is_empty());
+        assert!(supervisor.learned_classes_snapshot().is_empty());
+    }
+
+    #[test]
+    fn overlay_seeding_keeps_a_verified_upper_and_cleans_up_otherwise() {
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/overlay-seeding-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("snapshot.cow");
+        std::fs::write(&source, vec![7u8; 128 * 1024]).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let chunk = 64 * 1024;
+        let manifest = hash_artifact_range(
+            &File::open(&source).unwrap(),
+            tarit_proto::ArtifactKind::Overlay,
+            0,
+            128 * 1024,
+            chunk,
+        )
+        .unwrap();
+
+        let kept = dir.join("kept.cow");
+        let seeding = OverlaySeeding::start(
+            source.clone(),
+            kept.clone(),
+            None,
+            Some(manifest.clone()),
+            chunk,
+        );
+        seeding.finish().unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), vec![7u8; 128 * 1024]);
+
+        // An abandoned restore leaves nothing behind.
+        let dropped = dir.join("dropped.cow");
+        drop(OverlaySeeding::start(
+            source.clone(),
+            dropped.clone(),
+            None,
+            None,
+            chunk,
+        ));
+        assert!(!dropped.exists());
+
+        // A seeded upper that does not match the manifest is refused and removed.
+        let mut wrong = manifest;
+        wrong.chunk_hashes[1] = [0u8; 32];
+        let damaged = dir.join("damaged.cow");
+        let error = OverlaySeeding::start(source, damaged.clone(), None, Some(wrong), chunk)
+            .finish()
+            .unwrap_err();
+        assert!(error.to_string().contains("integrity"), "{error}");
+        assert!(!damaged.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_prewarm_for_a_learned_class_retires_its_golden() {
+        let supervisor = test_supervisor();
+        let spec = spawn_config(false, Some(PathBuf::from("/images/node")));
+        let other = spawn_config(false, Some(PathBuf::from("/images/py")));
+        let class = WarmClass::learned(1, 256, Some(PathBuf::from("/images/node")), 4, None);
+        assert!(!supervisor.set_learned_prewarm(&spec, Some("node -e 0".into())));
+        assert!(supervisor.learn_warm_class(spec.clone(), class, 4));
+        let bundle = |name: &str| GoldenBundle {
+            snapshot_path: format!("target/never-created/{name}.snap"),
+            overlay_path: None,
+        };
+        supervisor.publish_golden(spec.clone(), bundle("node"));
+        supervisor.publish_golden(other.clone(), bundle("py"));
+
+        // The same command keeps the golden.
+        assert!(supervisor.set_learned_prewarm(&spec, None));
+        assert!(supervisor.golden(&spec).is_some());
+
+        assert!(supervisor.set_learned_prewarm(&spec, Some("node -e 0".into())));
+        assert!(supervisor.golden(&spec).is_none());
+        assert!(supervisor.golden(&other).is_some());
+        assert_eq!(
+            supervisor
+                .learned_warm_class(&spec)
+                .unwrap()
+                .prewarm
+                .as_deref(),
+            Some("node -e 0")
+        );
+    }
+
+    #[test]
+    fn retiring_a_golden_deletes_only_its_own_files() {
+        let supervisor = test_supervisor();
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/retire-goldens-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bundles = Vec::new();
+        for name in ["kept", "retired"] {
+            let snapshot = dir.join(format!("{name}.snap"));
+            let overlay = dir.join(format!("{name}.cow"));
+            std::fs::write(&snapshot, b"memory").unwrap();
+            std::fs::write(&overlay, b"disk").unwrap();
+            let mut artifacts = vec![
+                OwnedArtifact::capture(&snapshot).unwrap(),
+                OwnedArtifact::capture(&overlay).unwrap(),
+            ];
+            supervisor.remember_golden_artifacts(&mut artifacts, &[]);
+            let spec = spawn_config(false, Some(PathBuf::from(format!("/images/{name}"))));
+            supervisor.publish_golden(
+                spec.clone(),
+                GoldenBundle {
+                    snapshot_path: snapshot.display().to_string(),
+                    overlay_path: Some(overlay.display().to_string()),
+                },
+            );
+            bundles.push((spec, snapshot, overlay));
+        }
+        let (kept, retired) = (&bundles[0], &bundles[1]);
+
+        supervisor.retain_goldens(|spec| spec == &kept.0);
+
+        assert!(supervisor.golden(&kept.0).is_some());
+        assert!(supervisor.golden(&retired.0).is_none());
+        assert!(kept.1.exists() && kept.2.exists());
+        assert!(!retired.1.exists() && !retired.2.exists());
+        assert_eq!(supervisor.golden_artifacts.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_warm_vm_still_held_by_its_restore_task_is_not_claimed_yet() {
+        let supervisor = test_supervisor();
+        let spec = spawn_config(false, Some(PathBuf::from("/images/a.ext4")));
+        let id = Uuid::new_v4();
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        supervisor.warm.lock().unwrap().push_back(WarmVm {
+            id,
+            vm: RunningVm::new(
+                process.pid,
+                PathBuf::from("restoring-warm.sock"),
+                process,
+                None,
+            ),
+            spec: spec.clone(),
+        });
+        // The restore that published this VM has not finished its task.
+        let restore = supervisor
+            .begin_owned_task(id, SpawnPurpose::Refill)
+            .unwrap();
+        let claim = || {
+            let task = OwnedTaskControl::new();
+            test_runtime().block_on(supervisor.take_warm_with_publication(
+                &spec,
+                &task,
+                |_| async { Ok(()) },
+                |_, _, _| async { Ok::<(), PublicationFailure>(()) },
+            ))
+        };
+        assert!(matches!(claim(), Ok(WarmClaimOutcome::NoMatch)));
+        assert!(!supervisor.reclaim_idle_warm());
+        assert_eq!(supervisor.warm_count(&spec), 1);
+
+        supervisor.finish_owned_task(&restore, Ok(()));
+        assert!(!matches!(claim(), Ok(WarmClaimOutcome::NoMatch)));
+    }
+
+    #[test]
+    fn capacity_waiters_are_counted_while_their_guards_live() {
+        let supervisor = test_supervisor();
+        assert!(!supervisor.creates_waiting_for_capacity());
+        let first = supervisor.wait_for_capacity();
+        let second = supervisor.wait_for_capacity();
+        drop(first);
+        assert!(supervisor.creates_waiting_for_capacity());
+        drop(second);
+        assert!(!supervisor.creates_waiting_for_capacity());
+    }
+
+    #[test]
     fn failed_boot_cleanup_retains_its_scheduler_reservation() {
         let supervisor = test_supervisor();
         let id = Uuid::new_v4();
@@ -11659,7 +12609,7 @@ mod tests {
             ]
         );
 
-        rebind_restored_guest_network(&socket_path, &allocation).unwrap();
+        rebind_restored_guest_network(&socket_path, &allocation, &[]).unwrap();
 
         server.join().unwrap();
         std::fs::remove_file(socket_path).unwrap();
@@ -11677,7 +12627,7 @@ mod tests {
         };
 
         let error =
-            rebind_restored_guest_network(Path::new("missing.sock"), &allocation).unwrap_err();
+            rebind_restored_guest_network(Path::new("missing.sock"), &allocation, &[]).unwrap_err();
 
         assert!(error.to_string().contains("parse restored guest IPv4"));
     }
@@ -11955,6 +12905,569 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A VMM control socket that answers every request with `respond` until
+    /// the test collects the requests it received, in arrival order.
+    struct ScriptedVmm {
+        stop: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<Vec<serde_json::Value>>>,
+    }
+
+    impl ScriptedVmm {
+        fn start(
+            socket_path: &Path,
+            mut respond: impl FnMut(&serde_json::Value) -> tarit_vmm_client::ApiResponse
+                + Send
+                + 'static,
+        ) -> Self {
+            let listener = std::os::unix::net::UnixListener::bind(socket_path)
+                .expect("bind scripted VMM socket");
+            listener
+                .set_nonblocking(true)
+                .expect("make scripted VMM socket nonblocking");
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                let mut requests = Vec::new();
+                while !server_stop.load(Ordering::Acquire) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => panic!("accept scripted VMM client: {error}"),
+                    };
+                    stream
+                        .set_nonblocking(false)
+                        .expect("make scripted VMM stream blocking");
+                    let mut length = [0_u8; 4];
+                    stream.read_exact(&mut length).expect("read request length");
+                    let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                    stream.read_exact(&mut body).expect("read request body");
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).expect("decode request");
+                    let response = serde_json::to_vec(&respond(&request)).expect("encode response");
+                    requests.push(request);
+                    stream
+                        .write_all(&(response.len() as u32).to_be_bytes())
+                        .expect("write response length");
+                    stream.write_all(&response).expect("write response body");
+                    stream.flush().expect("flush response");
+                }
+                requests
+            });
+            Self {
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn requests(mut self) -> Vec<serde_json::Value> {
+            self.stop.store(true, Ordering::Release);
+            self.server
+                .take()
+                .expect("scripted VMM server")
+                .join()
+                .expect("join scripted VMM server")
+        }
+    }
+
+    impl Drop for ScriptedVmm {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+        }
+    }
+
+    fn request_ops(requests: &[serde_json::Value]) -> Vec<&str> {
+        requests
+            .iter()
+            .map(|request| request["op"].as_str().expect("request op"))
+            .collect()
+    }
+
+    /// A supervisor with one running runtime whose VMM socket the test serves.
+    struct SnapshotFixture {
+        root: PathBuf,
+        supervisor: Arc<VmmSupervisor>,
+        id: Uuid,
+        socket_path: PathBuf,
+        /// Host directory the scripted VMM writes RAM scratch into, and the
+        /// same directory as the VMM names it.
+        scratch_host_dir: PathBuf,
+        scratch_vmm_dir: String,
+    }
+
+    impl SnapshotFixture {
+        fn new(name: &str, jailed: bool) -> Self {
+            let root = PathBuf::from(format!("target/taritd-{name}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut config = supervisor_config(&root);
+            if jailed {
+                // Leasing the test's own identity lets an unprivileged test
+                // own the jail's files exactly as a jailed VMM would.
+                config.vm_jail = Some(crate::config::VmJailConfig {
+                    base_dir: std::env::current_dir().unwrap().join(&root).join("jails"),
+                    uid_base: unsafe { libc::geteuid() },
+                    gid_base: unsafe { libc::getegid() },
+                    id_count: 1,
+                    profile: crate::config::SUPPORTED_VM_JAIL_PROFILE.into(),
+                    seccomp: true,
+                    pid_namespace: false,
+                    network_namespace: false,
+                });
+            }
+            let supervisor = Arc::new(VmmSupervisor::new(config));
+            let id = Uuid::new_v4();
+            let (scratch_host_dir, scratch_vmm_dir) = match &supervisor.jails {
+                Some(jails) => {
+                    let lease = jails.lease(id).unwrap();
+                    (lease.root.join("tmp"), "/tmp".to_string())
+                }
+                None => {
+                    let dir = root.join("vmm-tmp");
+                    let vmm_dir = dir.display().to_string();
+                    (dir, vmm_dir)
+                }
+            };
+            std::fs::create_dir_all(&scratch_host_dir).unwrap();
+            let socket_path = root.join("vmm.sock");
+            let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+            supervisor.running.lock().unwrap().insert(
+                id,
+                RunningVm::new(process.pid, socket_path.clone(), process, None),
+            );
+            Self {
+                root,
+                supervisor,
+                id,
+                socket_path,
+                scratch_host_dir,
+                scratch_vmm_dir,
+            }
+        }
+
+        fn snapshot_dir(&self) -> PathBuf {
+            self.supervisor.config.socket_dir.join("snapshots")
+        }
+
+        fn write_overlay(&self, contents: &[u8]) -> PathBuf {
+            let path = self.root.join("live.cow");
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            let mut file = options.open(&path).expect("create live disk upper");
+            file.write_all(contents).expect("write live disk upper");
+            file.sync_all().expect("sync live disk upper");
+            path
+        }
+
+        fn snapshot_dir_entries(&self) -> Vec<String> {
+            let mut names = std::fs::read_dir(self.snapshot_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        }
+
+        fn finish(self) {
+            let vm = self
+                .supervisor
+                .running
+                .lock()
+                .unwrap()
+                .remove(&self.id)
+                .expect("test runtime is still registered");
+            vm.process.kill_wait().unwrap();
+            if let Some(jails) = &self.supervisor.jails {
+                jails.release(self.id).unwrap();
+            }
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScriptedRam {
+        /// Write a private RAM scratch file and report it.
+        Written,
+        /// Report a RAM scratch path that does not exist.
+        Unclaimable,
+        /// Fail the snapshot request.
+        Failed,
+    }
+
+    const SCRIPTED_RAM: &[u8] = b"scripted RAM snapshot";
+
+    /// Contents of the disk uppers staged in the snapshot directory, as seen
+    /// by the VMM at each RAM snapshot request.
+    type StagedOverlays = Arc<Mutex<Vec<Vec<Vec<u8>>>>>;
+
+    fn staged_overlay_contents(snapshot_dir: &Path) -> Vec<Vec<u8>> {
+        let mut staged = std::fs::read_dir(snapshot_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(".stage-") && name.ends_with(".cow")
+            })
+            .map(|path| std::fs::read(path).unwrap())
+            .collect::<Vec<_>>();
+        staged.sort();
+        staged
+    }
+
+    fn scripted_snapshot_vmm(
+        fixture: &SnapshotFixture,
+        ram: ScriptedRam,
+    ) -> (ScriptedVmm, StagedOverlays) {
+        let staged = StagedOverlays::default();
+        let observed = Arc::clone(&staged);
+        let snapshot_dir = fixture.snapshot_dir();
+        let scratch_host_dir = fixture.scratch_host_dir.clone();
+        let scratch_vmm_dir = fixture.scratch_vmm_dir.clone();
+        let mut snapshots = 0;
+        let vmm = ScriptedVmm::start(&fixture.socket_path, move |request| {
+            match request["op"].as_str() {
+                Some("pause" | "resume" | "release_scratch") => tarit_vmm_client::ApiResponse::Ok,
+                Some("snapshot") => {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(staged_overlay_contents(&snapshot_dir));
+                    snapshots += 1;
+                    let name = format!("vmm-snap-{snapshots}.snap");
+                    match ram {
+                        ScriptedRam::Failed => tarit_vmm_client::ApiResponse::Err {
+                            msg: "scripted RAM snapshot failure".into(),
+                        },
+                        ScriptedRam::Unclaimable | ScriptedRam::Written => {
+                            if matches!(ram, ScriptedRam::Written) {
+                                let mut options = OpenOptions::new();
+                                options.write(true).create_new(true).mode(0o600);
+                                let mut file = options
+                                    .open(scratch_host_dir.join(&name))
+                                    .expect("create RAM scratch");
+                                file.write_all(SCRIPTED_RAM).expect("write RAM scratch");
+                            }
+                            tarit_vmm_client::ApiResponse::Snapshot {
+                                path: format!("{scratch_vmm_dir}/{name}"),
+                                overlay_path: None,
+                                volume_paths: Vec::new(),
+                                integrity_path: None,
+                                live_stats: None,
+                            }
+                        }
+                    }
+                }
+                other => panic!("unexpected VMM request {other:?}"),
+            }
+        });
+        (vmm, staged)
+    }
+
+    #[test]
+    fn checkpoint_base_is_tracked_per_runtime_and_shared_by_its_clones() {
+        let fixture = SnapshotFixture::new("checkpoint-base", false);
+        let supervisor = &fixture.supervisor;
+        assert_eq!(
+            supervisor.checkpoint_base(fixture.id),
+            None,
+            "a new runtime has no checkpoint base"
+        );
+
+        supervisor.set_checkpoint_base(fixture.id, Some("/snapshots/a.snap".into()));
+        assert_eq!(
+            supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/a.snap")
+        );
+
+        let unknown = Uuid::new_v4();
+        supervisor.set_checkpoint_base(unknown, Some("/snapshots/b.snap".into()));
+        assert_eq!(supervisor.checkpoint_base(unknown), None);
+        assert!(
+            !supervisor.running.lock().unwrap().contains_key(&unknown),
+            "recording a base must not register a runtime"
+        );
+
+        let clone = supervisor
+            .running
+            .lock()
+            .unwrap()
+            .get(&fixture.id)
+            .cloned()
+            .unwrap();
+        clone.set_checkpoint_base(Some("/snapshots/c.snap".into()));
+        assert_eq!(
+            supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/c.snap"),
+            "a cloned runtime entry must update the registered runtime's base"
+        );
+        supervisor.set_checkpoint_base(fixture.id, None);
+        assert_eq!(*clone.checkpoint_base.lock().unwrap(), None);
+        drop(clone);
+        fixture.finish();
+    }
+
+    #[test]
+    fn paused_snapshot_captures_disk_upper_before_ram_and_passes_checkpoint_base() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-order", false);
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/snapshots/restored-from.snap".into()));
+        let disk = b"disk upper at the checkpoint";
+        let overlay = fixture.write_overlay(disk);
+        let (vmm, staged) = scripted_snapshot_vmm(&fixture, ScriptedRam::Written);
+
+        let bundle = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, true, Some(overlay), 1)
+            .expect("snapshot bundle");
+        let requests = vmm.requests();
+
+        assert_eq!(
+            request_ops(&requests),
+            ["pause", "snapshot", "resume", "release_scratch"]
+        );
+        assert_eq!(
+            requests[1],
+            serde_json::json!({
+                "op": "snapshot",
+                "diff": false,
+                "live": false,
+                "capture_disks": false,
+                "base": "/snapshots/restored-from.snap",
+                "resume": true,
+            })
+        );
+        assert_eq!(
+            *staged.lock().unwrap(),
+            vec![vec![disk.to_vec()]],
+            "the disk upper must be staged before RAM is requested"
+        );
+        assert_eq!(std::fs::read(bundle.snapshot_path()).unwrap(), SCRIPTED_RAM);
+        assert_eq!(
+            std::fs::read(bundle.overlay_path().expect("bundle disk upper")).unwrap(),
+            disk
+        );
+        assert!(
+            !fixture.scratch_host_dir.join("vmm-snap-1.snap").exists(),
+            "released RAM scratch must be removed"
+        );
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some(bundle.snapshot_path()),
+            "an unjailed runtime's next base is the durable RAM snapshot"
+        );
+        drop(bundle);
+        fixture.finish();
+    }
+
+    #[test]
+    fn snapshot_of_paused_vm_leaves_it_paused_and_chains_checkpoint_bases() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-paused", false);
+        let (vmm, staged) = scripted_snapshot_vmm(&fixture, ScriptedRam::Written);
+
+        let first = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("first snapshot bundle");
+        let second = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("second snapshot bundle");
+        let requests = vmm.requests();
+
+        assert_eq!(
+            request_ops(&requests),
+            ["snapshot", "release_scratch", "snapshot", "release_scratch"],
+            "a VM the caller already paused is neither paused nor resumed"
+        );
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "op": "snapshot",
+                "diff": false,
+                "live": false,
+                "capture_disks": false,
+            }),
+            "without a recorded base and with resume=false both are omitted"
+        );
+        assert_eq!(
+            requests[2],
+            serde_json::json!({
+                "op": "snapshot",
+                "diff": false,
+                "live": false,
+                "capture_disks": false,
+                "base": first.snapshot_path(),
+            }),
+            "the next checkpoint uses the previous one as its base"
+        );
+        assert_eq!(*staged.lock().unwrap(), vec![Vec::<Vec<u8>>::new(); 2]);
+        assert_ne!(first.snapshot_path(), second.snapshot_path());
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some(second.snapshot_path())
+        );
+        drop(first);
+        drop(second);
+        fixture.finish();
+    }
+
+    #[test]
+    fn failed_ram_snapshot_discards_staged_disk_upper_and_resumes_vm() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-ram-failure", false);
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/snapshots/previous.snap".into()));
+        let disk = b"disk upper";
+        let overlay = fixture.write_overlay(disk);
+        let (vmm, staged) = scripted_snapshot_vmm(&fixture, ScriptedRam::Failed);
+
+        let error = match fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, true, Some(overlay), 1)
+        {
+            Ok(_) => panic!("a failed RAM snapshot must fail the bundle"),
+            Err(error) => error,
+        };
+        let requests = vmm.requests();
+
+        assert!(error.to_string().contains("snapshot RAM"), "{error}");
+        assert_eq!(request_ops(&requests), ["pause", "snapshot", "resume"]);
+        assert_eq!(requests[1]["base"], "/snapshots/previous.snap");
+        assert_eq!(requests[1]["resume"], true);
+        assert_eq!(*staged.lock().unwrap(), vec![vec![disk.to_vec()]]);
+        assert_eq!(
+            fixture.snapshot_dir_entries(),
+            Vec::<String>::new(),
+            "the staged disk upper must be discarded"
+        );
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/previous.snap"),
+            "a failed snapshot keeps the previous base"
+        );
+        fixture.finish();
+    }
+
+    #[test]
+    fn unclaimable_ram_snapshot_discards_staged_disk_upper_and_resumes_vm() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-ram-claim", false);
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/snapshots/previous.snap".into()));
+        let overlay = fixture.write_overlay(b"disk upper");
+        let (vmm, _) = scripted_snapshot_vmm(&fixture, ScriptedRam::Unclaimable);
+
+        let error = match fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, true, Some(overlay), 1)
+        {
+            Ok(_) => panic!("an unclaimable RAM snapshot must fail the bundle"),
+            Err(error) => error,
+        };
+        let requests = vmm.requests();
+
+        assert!(
+            error.to_string().contains("capture RAM snapshot ownership"),
+            "{error}"
+        );
+        assert_eq!(request_ops(&requests), ["pause", "snapshot", "resume"]);
+        assert_eq!(fixture.snapshot_dir_entries(), Vec::<String>::new());
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id).as_deref(),
+            Some("/snapshots/previous.snap")
+        );
+        fixture.finish();
+    }
+
+    #[test]
+    fn jailed_snapshot_uses_restore_base_then_clears_it() {
+        let fixture = SnapshotFixture::new("snapshot-bundle-jailed", true);
+        assert!(fixture.supervisor.jails.is_some());
+        fixture
+            .supervisor
+            .set_checkpoint_base(fixture.id, Some("/restore.snap".into()));
+        let (vmm, _) = scripted_snapshot_vmm(&fixture, ScriptedRam::Written);
+
+        let first = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("first jailed snapshot bundle");
+        assert_eq!(
+            fixture.supervisor.checkpoint_base(fixture.id),
+            None,
+            "a jailed VMM cannot see the durable snapshot, so no base is kept"
+        );
+        let second = fixture
+            .supervisor
+            .snapshot_bundle_vm(fixture.id, false, None, 1)
+            .expect("second jailed snapshot bundle");
+        let requests = vmm.requests();
+
+        assert_eq!(
+            request_ops(&requests),
+            ["snapshot", "release_scratch", "snapshot", "release_scratch"]
+        );
+        assert_eq!(requests[0]["base"], "/restore.snap");
+        assert!(requests[2].get("base").is_none(), "{}", requests[2]);
+        assert_eq!(std::fs::read(first.snapshot_path()).unwrap(), SCRIPTED_RAM);
+        assert!(
+            !fixture.scratch_host_dir.join("vmm-snap-1.snap").exists(),
+            "released RAM scratch inside the jail must be removed"
+        );
+        assert_eq!(fixture.supervisor.checkpoint_base(fixture.id), None);
+        drop(first);
+        drop(second);
+        fixture.finish();
+    }
+
+    #[test]
+    fn sparse_artifact_hashes_match_reading_every_chunk() {
+        let dir = PathBuf::from(format!("target/sparse-integrity-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chunk = 64 * 1024u64;
+        // Data, a long hole, data straddling a chunk edge, then a trailing
+        // hole that ends in a partial chunk.
+        let len = chunk * 40 + 1234;
+        let sparse_path = dir.join("sparse.bin");
+        let sparse = File::create(&sparse_path).unwrap();
+        sparse.set_len(len).unwrap();
+        sparse.write_all_at(&[0x11; 5000], 100).unwrap();
+        sparse
+            .write_all_at(&[0x22; 9000], chunk * 20 - 4000)
+            .unwrap();
+        let mut dense_bytes = vec![0u8; len as usize];
+        dense_bytes[100..5100].fill(0x11);
+        let edge = (chunk * 20 - 4000) as usize;
+        dense_bytes[edge..edge + 9000].fill(0x22);
+        let dense_path = dir.join("dense.bin");
+        std::fs::write(&dense_path, &dense_bytes).unwrap();
+
+        let kind = tarit_proto::ArtifactKind::Ram;
+        for start in [0, 4096] {
+            let range = len - start;
+            let from_sparse = hash_artifact_range(
+                &File::open(&sparse_path).unwrap(),
+                kind,
+                start,
+                range,
+                chunk,
+            )
+            .unwrap();
+            let expected: Vec<[u8; 32]> = dense_bytes[start as usize..]
+                .chunks(chunk as usize)
+                .map(|bytes| Sha256::digest(bytes).into())
+                .collect();
+            assert_eq!(from_sparse.chunk_hashes, expected, "start {start}");
+            let from_dense =
+                hash_artifact_range(&File::open(&dense_path).unwrap(), kind, start, range, chunk)
+                    .unwrap();
+            assert_eq!(from_dense.chunk_hashes, expected, "start {start}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn integrity_manifest_authenticates_snapshot_metadata_ram_and_disk_chunks() {
         let dir = PathBuf::from(format!("target/snapshot-integrity-{}", Uuid::new_v4()));
@@ -12056,8 +13569,10 @@ mod tests {
         std::fs::set_permissions(&overlay_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let ram_artifact = OwnedArtifact::capture(&ram_path).unwrap();
-        let generated =
+        let mut generated =
             snapshot_integrity_manifest(std::slice::from_ref(&ram_artifact), None).unwrap();
+        // The VMM records the chunks a restored guest needed; taritd keeps them.
+        generated.working_set = vec![1];
         TEST_RAM_INTEGRITY_HASH_PASSES.with(|passes| passes.set(0));
         std::fs::write(&sidecar_path, generated.encode().unwrap()).unwrap();
         std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -12078,6 +13593,14 @@ mod tests {
         assert!(adopted
             .artifact(tarit_proto::ArtifactKind::Overlay)
             .is_some());
+        assert_eq!(adopted.working_set, vec![1]);
+        let encoded = adopted.encode().unwrap();
+        assert_eq!(
+            tarit_proto::IntegrityManifest::decode(&encoded)
+                .unwrap()
+                .working_set,
+            vec![1]
+        );
 
         OpenOptions::new()
             .write(true)

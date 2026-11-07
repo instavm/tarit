@@ -12,6 +12,9 @@ pub enum ThreadKind {
     Block,
     Vsock,
 }
+/// `TUNSETOFFLOAD` (`_IOW('T', 208, unsigned int)`): the one TAP ioctl the
+/// network worker may issue, to apply the offloads its guest negotiated.
+pub const TUNSETOFFLOAD: u64 = 0x4004_54d0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeccompProfile {
@@ -120,6 +123,8 @@ impl SeccompProfile {
                 "gettid".into(),
                 "getpid".into(),
                 "clock_gettime".into(),
+                // Only TUNSETOFFLOAD; see rules_for_syscall.
+                "ioctl".into(),
             ],
         }
     }
@@ -136,6 +141,7 @@ impl SeccompProfile {
                 "read".into(),
                 "write".into(),
                 "pread64".into(),
+                "preadv".into(),
                 "pwrite64".into(),
                 "lseek".into(),
                 "fdatasync".into(),
@@ -188,6 +194,15 @@ impl SeccompProfile {
     }
 }
 
+/// Path-opening syscalls that confined threads must never complete, but that
+/// glibc issues lazily from inside malloc/free (for example `free()` reads
+/// /proc/sys/vm/overcommit_memory the first time any thread trims a non-main
+/// arena heap). Killing the thread there leaves allocator and device mutexes
+/// held forever and silently deadlocks the VM, so these fail with EACCES
+/// instead. glibc treats the failed open as "use the conservative default".
+#[cfg(target_os = "linux")]
+const PATH_OPEN_SYSCALLS: [i64; 3] = [libc::SYS_open, libc::SYS_openat, libc::SYS_openat2];
+
 #[cfg(target_os = "linux")]
 impl SeccompProfile {
     /// Install the seccomp filter for this profile.
@@ -196,6 +211,10 @@ impl SeccompProfile {
         use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
         use std::convert::TryInto;
 
+        let arch: seccompiler::TargetArch = std::env::consts::ARCH
+            .try_into()
+            .map_err(|e| format!("arch: {e:?}"))?;
+
         let mut rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
             std::collections::BTreeMap::new();
 
@@ -203,19 +222,35 @@ impl SeccompProfile {
             let nr = self.syscall_nr(name)?;
             rules.insert(nr, self.rules_for_syscall(name)?);
         }
+        // Let path opens through this allowlist only so the errno filter below
+        // decides them. The kernel applies the most restrictive verdict across
+        // stacked filters, and ERRNO outranks ALLOW, so they never succeed.
+        for nr in PATH_OPEN_SYSCALLS {
+            rules.entry(nr).or_default();
+        }
 
-        let filter: BpfProgram = SeccompFilter::new(
-            rules,
-            SeccompAction::KillThread,
-            SeccompAction::Allow,
-            std::env::consts::ARCH
+        let filter: BpfProgram =
+            SeccompFilter::new(rules, SeccompAction::KillThread, SeccompAction::Allow, arch)
+                .map_err(|e| format!("seccomp filter: {e}"))?
                 .try_into()
-                .map_err(|e| format!("arch: {e:?}"))?,
-        )
-        .map_err(|e| format!("seccomp filter: {e}"))?
-        .try_into()
-        .map_err(|e| format!("seccomp BPF: {e}"))?;
+                .map_err(|e| format!("seccomp BPF: {e}"))?;
 
+        let deny_paths: BpfProgram = SeccompFilter::new(
+            PATH_OPEN_SYSCALLS
+                .into_iter()
+                .map(|nr| (nr, Vec::new()))
+                .collect(),
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EACCES as u32),
+            arch,
+        )
+        .map_err(|e| format!("seccomp path filter: {e}"))?
+        .try_into()
+        .map_err(|e| format!("seccomp path BPF: {e}"))?;
+
+        // Install the errno filter first so there is no window in which the
+        // allowlist admits a path open on its own.
+        seccompiler::apply_filter(&deny_paths).map_err(|e| format!("seccomp path apply: {e}"))?;
         seccompiler::apply_filter(&filter).map_err(|e| format!("seccomp apply: {e}"))?;
 
         log::info!(
@@ -275,6 +310,16 @@ impl SeccompProfile {
                 SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0)
                     .map_err(|e| format!("socket protocol condition: {e}"))?,
             ],
+            // The network worker applies the offloads a guest negotiated to
+            // its TAP. Allow exactly TUNSETOFFLOAD, which only changes the
+            // offload flags of a TAP fd (and fails on any other fd).
+            (ThreadKind::Device, "ioctl") => vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                TUNSETOFFLOAD,
+            )
+            .map_err(|e| format!("ioctl condition: {e}"))?],
             // std's UnixStream::set_nonblocking issues ioctl(FIONBIO) on Linux;
             // the pump calls it for every lazily connected host stream. Allow
             // exactly that request and nothing else. The cast is kept because
@@ -318,6 +363,7 @@ impl SeccompProfile {
             "ppoll" => Ok(libc::SYS_ppoll),
             "eventfd2" => Ok(libc::SYS_eventfd2),
             "pread64" => Ok(libc::SYS_pread64),
+            "preadv" => Ok(libc::SYS_preadv),
             "pwrite64" => Ok(libc::SYS_pwrite64),
             "recvfrom" => Ok(libc::SYS_recvfrom),
             "sendto" => Ok(libc::SYS_sendto),
@@ -394,6 +440,7 @@ mod tests {
             "read",
             "write",
             "pread64",
+            "preadv",
             "pwrite64",
             "lseek",
             "fdatasync",
@@ -410,7 +457,8 @@ mod tests {
         assert_eq!(vsock.kind, ThreadKind::Vsock);
         assert!(!device.allow.contains(&"socket".to_string()));
         assert!(!device.allow.contains(&"connect".to_string()));
-        assert!(!device.allow.contains(&"ioctl".to_string()));
+        // The network worker may issue one ioctl, TUNSETOFFLOAD (below).
+        assert!(device.allow.contains(&"ioctl".to_string()));
         assert!(vsock.allow.contains(&"socket".to_string()));
         assert!(vsock.allow.contains(&"connect".to_string()));
         // set_nonblocking on lazily connected host streams needs ioctl(FIONBIO).
@@ -448,10 +496,81 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            SeccompProfile::device()
+                .rules_for_syscall("ioctl")
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(SeccompProfile::device()
             .rules_for_syscall("read")
             .unwrap()
             .is_empty());
+    }
+
+    /// Under the network worker's profile TUNSETOFFLOAD reaches the kernel:
+    /// on a non-TAP fd it fails with ENOTTY and the thread keeps running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_profile_allows_tunsetoffload() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` has room for the two descriptors pipe2 returns.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let errno = std::thread::spawn(move || {
+            SeccompProfile::device().install().expect("install profile");
+            // SAFETY: TUNSETOFFLOAD takes its flags by value; on a pipe the
+            // kernel rejects it without side effects.
+            let rc = unsafe { libc::ioctl(fds[0], TUNSETOFFLOAD as _, 0 as libc::c_ulong) };
+            assert_eq!(rc, -1);
+            std::io::Error::last_os_error().raw_os_error()
+        })
+        .join()
+        .expect("network worker profile must allow TUNSETOFFLOAD");
+        assert_eq!(errno, Some(libc::ENOTTY));
+        for fd in fds {
+            // SAFETY: both descriptors came from pipe2 above.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A confined thread that opens a path (as glibc does lazily inside
+    /// free()) must get EACCES and keep running, not be killed while it may
+    /// hold locks other threads need.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confined_threads_survive_path_opens_with_eacces() {
+        for profile in [
+            SeccompProfile::vcpu(),
+            SeccompProfile::device(),
+            SeccompProfile::block(),
+            SeccompProfile::vsock(),
+        ] {
+            let kind = profile.kind;
+            let result = std::thread::spawn(move || {
+                profile.install().expect("install profile");
+                let path = c"/proc/sys/vm/overcommit_memory";
+                // SAFETY: `path` is a valid NUL-terminated C string.
+                let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                let open_errno = std::io::Error::last_os_error().raw_os_error();
+                // SAFETY: as above; AT_FDCWD resolves relative to the cwd.
+                let fd_at = unsafe {
+                    libc::openat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                let openat_errno = std::io::Error::last_os_error().raw_os_error();
+                (fd, open_errno, fd_at, openat_errno)
+            })
+            .join()
+            .unwrap_or_else(|_| panic!("{kind:?} thread did not survive a path open"));
+            assert_eq!(result.0, -1, "{kind:?} open must fail");
+            assert_eq!(result.1, Some(libc::EACCES), "{kind:?} open errno");
+            assert_eq!(result.2, -1, "{kind:?} openat must fail");
+            assert_eq!(result.3, Some(libc::EACCES), "{kind:?} openat errno");
+        }
     }
 
     #[test]
