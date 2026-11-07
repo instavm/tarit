@@ -5363,6 +5363,7 @@ mod tests {
                     chunk_hashes: vec![sha2::Sha256::digest(memory).into()],
                 },
             ],
+            working_set: Vec::new(),
         };
         let mut integrity_options = std::fs::OpenOptions::new();
         integrity_options
@@ -6703,6 +6704,7 @@ mod tests {
                     chunk_hashes: vec![sha2::Sha256::digest(memory).into()],
                 },
             ],
+            working_set: Vec::new(),
         };
         let manifest_path = PathBuf::from(format!("{}.integrity", snapshot_path.display()));
         std::fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();

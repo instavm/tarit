@@ -1695,7 +1695,7 @@ impl VmmController {
             Ok(manifest)
         });
         remove_owned_scratch_file(&memory_stage);
-        let manifest = match write {
+        let mut manifest = match write {
             Ok(manifest) => manifest,
             Err(error) => {
                 replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
@@ -1706,6 +1706,17 @@ impl VmmController {
                 return Err(error);
             }
         };
+        // The working set is only a hint for restores of this snapshot; keep
+        // the chunks that exist in its RAM and never fail a snapshot over it.
+        let ram_chunks = manifest
+            .artifact(tarit_proto::ArtifactKind::Ram)
+            .map_or(0, |ram| ram.chunk_hashes.len());
+        manifest.working_set = output
+            .working_set
+            .iter()
+            .copied()
+            .filter(|&chunk| (chunk as usize) < ram_chunks)
+            .collect();
         if let Err(error) = persist_owned_output(&mut owned_live_path, &live_path) {
             replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
             remove_owned_scratch_file(&owned_live_path);
@@ -4859,6 +4870,7 @@ fn write_scratch_snapshot_file_from_memory_file(
                 chunk_hashes: memory_chunk_hashes,
             },
         ],
+        working_set: Vec::new(),
     })
 }
 
@@ -6023,6 +6035,7 @@ fn load_authenticated_memory_manifest(
     Ok(vmm_memory_backend::ChunkIntegrity {
         chunk_size: manifest.chunk_size as usize,
         chunk_hashes: memory.chunk_hashes.clone(),
+        prefetch: manifest.working_set,
     })
 }
 

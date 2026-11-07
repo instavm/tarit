@@ -3,12 +3,18 @@
 //! The manifest itself is authenticated by a SHA-256 digest stored in trusted
 //! control-plane metadata. RAM chunks are then verified only when UFFD faults
 //! them in, avoiding a size-proportional read on the restore critical path.
+//!
+//! Version 2 adds an optional working set: the RAM chunks the snapshotted
+//! guest touched after its own restore, which a restore of this snapshot
+//! loads ahead of demand. A manifest without one is still written as
+//! version 1, so older readers keep accepting it.
 
 use std::fmt;
 
 pub const INTEGRITY_CHUNK_SIZE: u32 = 64 * 1024;
 const MAGIC: &[u8; 4] = b"TIMF";
-const VERSION: u16 = 1;
+const VERSION_1: u16 = 1;
+const VERSION_2: u16 = 2;
 const HEADER_LEN: usize = 12;
 const ARTIFACT_HEADER_LEN: usize = 24;
 const HASH_LEN: usize = 32;
@@ -32,6 +38,10 @@ pub struct ArtifactIntegrity {
 pub struct IntegrityManifest {
     pub chunk_size: u32,
     pub artifacts: Vec<ArtifactIntegrity>,
+    /// Indices of RAM chunks to load ahead of demand on restore, ascending
+    /// and unique. Only a hint: every chunk is still verified against its
+    /// hash before the guest can see it.
+    pub working_set: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,9 +61,15 @@ impl IntegrityManifest {
         if self.artifacts.is_empty() || self.artifacts.len() > u16::MAX as usize {
             return Err(IntegrityManifestError("invalid artifact count".into()));
         }
+        let working_set = self.working_set_bitmap()?;
         let mut output = Vec::new();
         output.extend_from_slice(MAGIC);
-        output.extend_from_slice(&VERSION.to_le_bytes());
+        let version = if working_set.is_some() {
+            VERSION_2
+        } else {
+            VERSION_1
+        };
+        output.extend_from_slice(&version.to_le_bytes());
         output.extend_from_slice(&(self.artifacts.len() as u16).to_le_bytes());
         output.extend_from_slice(&self.chunk_size.to_le_bytes());
         for artifact in &self.artifacts {
@@ -73,7 +89,36 @@ impl IntegrityManifest {
                 output.extend_from_slice(hash);
             }
         }
+        if let Some((chunks, bitmap)) = working_set {
+            output.extend_from_slice(&(chunks as u64).to_le_bytes());
+            output.extend_from_slice(&bitmap);
+        }
         Ok(output)
+    }
+
+    /// The working set as (RAM chunk count, bitmap), or `None` when empty.
+    fn working_set_bitmap(&self) -> Result<Option<(usize, Vec<u8>)>, IntegrityManifestError> {
+        if self.working_set.is_empty() {
+            return Ok(None);
+        }
+        let chunks = self
+            .artifact(ArtifactKind::Ram)
+            .ok_or_else(|| IntegrityManifestError("working set without a RAM artifact".into()))?
+            .chunk_hashes
+            .len();
+        let mut bitmap = vec![0u8; chunks.div_ceil(8)];
+        let mut previous = None;
+        for &chunk in &self.working_set {
+            let index = chunk as usize;
+            if index >= chunks || previous.is_some_and(|previous| previous >= chunk) {
+                return Err(IntegrityManifestError(
+                    "working set must list ascending RAM chunk indices".into(),
+                ));
+            }
+            previous = Some(chunk);
+            bitmap[index / 8] |= 1 << (index % 8);
+        }
+        Ok(Some((chunks, bitmap)))
     }
 
     pub fn decode(input: &[u8]) -> Result<Self, IntegrityManifestError> {
@@ -83,7 +128,7 @@ impl IntegrityManifest {
             ));
         }
         let version = u16::from_le_bytes(input[4..6].try_into().expect("two-byte version"));
-        if version != VERSION {
+        if version != VERSION_1 && version != VERSION_2 {
             return Err(IntegrityManifestError(format!(
                 "unsupported integrity manifest version {version}"
             )));
@@ -147,6 +192,53 @@ impl IntegrityManifest {
             });
             cursor = hashes_end;
         }
+        let mut working_set = Vec::new();
+        if version == VERSION_2 {
+            let ram_chunks = artifacts
+                .iter()
+                .find(|artifact| artifact.kind == ArtifactKind::Ram)
+                .map_or(0, |artifact| artifact.chunk_hashes.len());
+            let count_end = cursor
+                .checked_add(8)
+                .ok_or_else(|| IntegrityManifestError("manifest offset overflow".into()))?;
+            let count = input
+                .get(cursor..count_end)
+                .ok_or_else(|| IntegrityManifestError("truncated working set".into()))?;
+            let count = u64::from_le_bytes(count.try_into().expect("eight-byte count"));
+            if count != ram_chunks as u64 || ram_chunks == 0 {
+                return Err(IntegrityManifestError(
+                    "working set does not match the RAM chunk count".into(),
+                ));
+            }
+            let bitmap_end = count_end
+                .checked_add(ram_chunks.div_ceil(8))
+                .ok_or_else(|| IntegrityManifestError("manifest offset overflow".into()))?;
+            let bitmap = input
+                .get(count_end..bitmap_end)
+                .ok_or_else(|| IntegrityManifestError("truncated working set".into()))?;
+            for (byte_index, byte) in bitmap.iter().enumerate() {
+                for bit in 0..8 {
+                    if byte & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let index = byte_index * 8 + bit;
+                    if index >= ram_chunks {
+                        return Err(IntegrityManifestError(
+                            "working set names a chunk past the end of RAM".into(),
+                        ));
+                    }
+                    working_set.push(u32::try_from(index).map_err(|_| {
+                        IntegrityManifestError("working set chunk index too large".into())
+                    })?);
+                }
+            }
+            if working_set.is_empty() {
+                return Err(IntegrityManifestError(
+                    "version 2 manifest with an empty working set".into(),
+                ));
+            }
+            cursor = bitmap_end;
+        }
         if cursor != input.len() {
             return Err(IntegrityManifestError(
                 "trailing integrity manifest data".into(),
@@ -175,6 +267,7 @@ impl IntegrityManifest {
         Ok(Self {
             chunk_size,
             artifacts,
+            working_set,
         })
     }
 
@@ -223,11 +316,61 @@ mod tests {
                     chunk_hashes: vec![[1; 32], [2; 32]],
                 },
             ],
+            working_set: Vec::new(),
         };
         let bytes = manifest.encode().unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), VERSION_1);
         assert_eq!(IntegrityManifest::decode(&bytes).unwrap(), manifest);
         let mut trailing = bytes;
         trailing.push(0);
         assert!(IntegrityManifest::decode(&trailing).is_err());
+    }
+
+    fn manifest_with_ram_chunks(chunks: usize, working_set: Vec<u32>) -> IntegrityManifest {
+        IntegrityManifest {
+            chunk_size: INTEGRITY_CHUNK_SIZE,
+            artifacts: vec![
+                ArtifactIntegrity {
+                    kind: ArtifactKind::SnapshotMetadata,
+                    len: 1,
+                    chunk_hashes: vec![[0; 32]],
+                },
+                ArtifactIntegrity {
+                    kind: ArtifactKind::Ram,
+                    len: u64::from(INTEGRITY_CHUNK_SIZE) * chunks as u64,
+                    chunk_hashes: vec![[7; 32]; chunks],
+                },
+            ],
+            working_set,
+        }
+    }
+
+    #[test]
+    fn working_set_round_trips_as_version_2() {
+        let manifest = manifest_with_ram_chunks(19, vec![0, 3, 8, 18]);
+        let bytes = manifest.encode().unwrap();
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), VERSION_2);
+        assert_eq!(IntegrityManifest::decode(&bytes).unwrap(), manifest);
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(IntegrityManifest::decode(&trailing).is_err());
+        let mut truncated = bytes;
+        truncated.pop();
+        assert!(IntegrityManifest::decode(&truncated).is_err());
+    }
+
+    #[test]
+    fn working_set_must_name_real_chunks_in_order() {
+        for bad in [vec![19], vec![4, 2], vec![5, 5]] {
+            assert!(manifest_with_ram_chunks(19, bad).encode().is_err());
+        }
+        // A padding bit past the last chunk is rejected on decode.
+        let mut bytes = manifest_with_ram_chunks(19, vec![1]).encode().unwrap();
+        *bytes.last_mut().unwrap() |= 0x80;
+        assert!(IntegrityManifest::decode(&bytes).is_err());
+        // So is a version 2 manifest whose working set is empty.
+        let last = bytes.len() - 3;
+        bytes[last..].fill(0);
+        assert!(IntegrityManifest::decode(&bytes).is_err());
     }
 }

@@ -56,6 +56,54 @@ pub struct LazyPageDiscard {
     snapshot_fence: std::sync::Arc<std::sync::RwLock<()>>,
     // The snapshot the handler serves missing pages from.
     source: LazySource,
+    // Chunks the guest has needed since restore, plus the working set it was
+    // restored with. A live snapshot of this guest records it as the next
+    // restore's working set.
+    touched: Option<TouchedChunks>,
+}
+
+/// One bit per integrity chunk, set by the fault handler.
+#[derive(Clone)]
+struct TouchedChunks {
+    bits: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>>,
+    chunks: usize,
+}
+
+impl TouchedChunks {
+    fn new(chunks: usize, initial: &[u32]) -> Self {
+        let bits = (0..chunks.div_ceil(64))
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect::<Vec<_>>();
+        let touched = Self {
+            bits: std::sync::Arc::new(bits),
+            chunks,
+        };
+        for &chunk in initial {
+            touched.mark(chunk as usize);
+        }
+        touched
+    }
+
+    fn mark(&self, chunk: usize) {
+        if chunk < self.chunks {
+            self.bits[chunk / 64].fetch_or(1 << (chunk % 64), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn indices(&self) -> Vec<u32> {
+        let mut indices = Vec::new();
+        for (word_index, word) in self.bits.iter().enumerate() {
+            let mut word = word.load(std::sync::atomic::Ordering::Relaxed);
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                if let Ok(index) = u32::try_from(word_index * 64 + bit) {
+                    indices.push(index);
+                }
+            }
+        }
+        indices
+    }
 }
 
 /// What [`LazyPageDiscard::clone_untouched`] did.
@@ -85,6 +133,15 @@ const UNTOUCHED_READ_CHUNK: usize = 2 * 1024 * 1024;
 impl LazyPageDiscard {
     pub fn snapshot_fence(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
         self.snapshot_fence.clone()
+    }
+
+    /// Integrity chunks this guest has needed since its restore, together
+    /// with the working set it was restored with, ascending. Empty for a
+    /// restore without an integrity manifest.
+    pub fn working_set(&self) -> Vec<u32> {
+        self.touched
+            .as_ref()
+            .map_or_else(Vec::new, TouchedChunks::indices)
     }
 
     /// The unit [`Self::read_untouched`] reads: one integrity chunk, or
@@ -374,6 +431,10 @@ impl LazyRestore {
 pub struct ChunkIntegrity {
     pub chunk_size: usize,
     pub chunk_hashes: Vec<[u8; 32]>,
+    /// Chunks to load before the guest asks for them, ascending: the working
+    /// set the snapshot recorded. The fault handler serves them only while no
+    /// fault is waiting, and verifies each one like a faulted chunk.
+    pub prefetch: Vec<u32>,
 }
 
 // SAFETY: `LazyRestore` owns the UFFD fd and mmap lifetime, and the raw mmap
@@ -619,7 +680,19 @@ pub fn start_lazy_restore_with_integrity(
                 integrity.chunk_hashes.len()
             )));
         }
+        if integrity
+            .prefetch
+            .iter()
+            .any(|&chunk| chunk as usize >= expected_chunks)
+        {
+            return Err(UffdRestoreError::Uffd(
+                "working set names a chunk past the end of guest memory".into(),
+            ));
+        }
     }
+    let touched = chunk_integrity
+        .as_ref()
+        .map(|integrity| TouchedChunks::new(integrity.chunk_hashes.len(), &integrity.prefetch));
 
     let snapshot_mmap_offset = snapshot_offset / page_size * page_size;
     let snapshot_offset_delta = snapshot_offset - snapshot_mmap_offset;
@@ -744,6 +817,7 @@ pub fn start_lazy_restore_with_integrity(
     let shutdown_clone = shutdown.clone();
     let handler_shutdown = shutdown.clone();
     let handler_discarded_pages = discarded_pages.clone();
+    let handler_touched = touched.clone();
     let handler_thread = match std::thread::Builder::new()
         .name("uffd-restore".into())
         .spawn(move || {
@@ -759,6 +833,7 @@ pub fn start_lazy_restore_with_integrity(
                     host_dirty,
                     chunk_integrity,
                     discarded_pages: handler_discarded_pages,
+                    touched: handler_touched,
                 });
             }));
             if !handler_shutdown.load(std::sync::atomic::Ordering::Acquire) {
@@ -812,6 +887,7 @@ pub fn start_lazy_restore_with_integrity(
                     .map(|integrity| Sha256::digest(vec![0u8; integrity.chunk_size]).into()),
                 integrity: source_integrity,
             },
+            touched,
         },
     })
 }
@@ -943,6 +1019,7 @@ struct FaultHandlerContext {
     host_dirty: Option<SoftwareDirtyBitmap>,
     chunk_integrity: Option<ChunkIntegrity>,
     discarded_pages: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    touched: Option<TouchedChunks>,
 }
 
 fn fault_handler_loop(context: FaultHandlerContext) {
@@ -958,9 +1035,35 @@ fn fault_handler_loop(context: FaultHandlerContext) {
         host_dirty,
         chunk_integrity,
         discarded_pages,
+        touched,
     } = context;
     let snapshot_ptr = snapshot_ptr as *const u8;
     let mut pending_faults = std::collections::VecDeque::<u64>::new();
+    // The recorded working set, loaded only while no fault is waiting: one
+    // chunk per pass, after draining every queued event, so a fault waits
+    // for at most one chunk and REMOVE ordering is the same as for faults.
+    let mut prefetch = chunk_integrity
+        .as_ref()
+        .map(|integrity| {
+            integrity
+                .prefetch
+                .iter()
+                .map(|&chunk| guest_base + chunk as usize * integrity.chunk_size)
+                .collect::<std::collections::VecDeque<_>>()
+        })
+        .unwrap_or_default();
+    let prefetch_total = prefetch.len();
+    // Chunks this handler has already mapped, so prefetch skips them without
+    // reading and hashing them again only to be refused with EEXIST.
+    let mut served_chunks = vec![
+        0u64;
+        chunk_integrity.as_ref().map_or(0, |integrity| integrity
+            .chunk_hashes
+            .len()
+            .div_ceil(64))
+    ];
+    let mut prefetched_chunks = 0usize;
+    let prefetch_started = std::time::Instant::now();
     // The manifest hash of an all-zero chunk. Memory the snapshotted guest
     // never wrote is such a chunk, and it is most of a freshly booted guest.
     let zero_chunk_hash: Option<[u8; 32]> = chunk_integrity
@@ -970,10 +1073,18 @@ fn fault_handler_loop(context: FaultHandlerContext) {
     // does); zero chunks are then copied like any other.
     let mut zeropage_supported = true;
 
+    let mut prefetch_reported = prefetch_total == 0;
     loop {
         // Check shutdown flag first.
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             break;
+        }
+        if !prefetch_reported && prefetch.is_empty() {
+            prefetch_reported = true;
+            log::info!(
+                "UFFD prefetch: loaded {prefetched_chunks} of {prefetch_total} working-set chunks in {:?}",
+                prefetch_started.elapsed()
+            );
         }
 
         // Drain every currently queued event before issuing UFFDIO_COPY. Linux
@@ -994,7 +1105,11 @@ fn fault_handler_loop(context: FaultHandlerContext) {
         ];
         // SAFETY: `fds` holds two initialized `pollfd`s; the kernel only
         // writes within them during the call.
-        let timeout_ms = if pending_faults.is_empty() { 500 } else { 0 };
+        let timeout_ms = if pending_faults.is_empty() && prefetch.is_empty() {
+            500
+        } else {
+            0
+        };
         let prc = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
         if fds[1].revents != 0 && shutdown.load(std::sync::atomic::Ordering::Acquire) {
             break;
@@ -1008,7 +1123,7 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             log::error!("userfaultfd poll failed: {error}");
             break;
         }
-        if prc == 0 && pending_faults.is_empty() {
+        if prc == 0 && pending_faults.is_empty() && prefetch.is_empty() {
             continue; // timeout — loop back, check shutdown
         }
         if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
@@ -1121,9 +1236,24 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             return;
         }
 
-        let Some(fault_addr) = pending_faults.pop_front() else {
-            continue;
+        let (fault_addr, prefetching) = match pending_faults.pop_front() {
+            Some(fault_addr) => (fault_addr, false),
+            None => match prefetch.pop_front() {
+                Some(chunk_addr) => (chunk_addr as u64, true),
+                None => continue,
+            },
         };
+        if prefetching {
+            let chunk = chunk_integrity.as_ref().map_or(0, |integrity| {
+                (fault_addr as usize - guest_base) / integrity.chunk_size
+            });
+            if served_chunks
+                .get(chunk / 64)
+                .is_some_and(|word| word & (1 << (chunk % 64)) != 0)
+            {
+                continue;
+            }
+        }
 
         // UFFDIO_COPY requires a page-aligned destination. Align the faulting
         // address down to its page, source the matching page from the snapshot
@@ -1194,6 +1324,7 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             resolved_offset = copy_offset;
             resolved_len = copy_len;
             if rc < 0
+                && !prefetching
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
                 && copy_len > PAGE_SIZE
             {
@@ -1211,7 +1342,11 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             {
                 log::warn!("UFFDIO_ZEROPAGE unavailable; copying zero chunks instead");
                 zeropage_supported = false;
-                pending_faults.push_back(fault_addr);
+                if prefetching {
+                    prefetch.push_front(fault_addr as usize);
+                } else {
+                    pending_faults.push_back(fault_addr);
+                }
                 continue;
             }
         } else {
@@ -1219,6 +1354,16 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             // hash those stable bytes, and only then hand that same buffer to the
             // kernel. This closes the mmap hash/copy TOCTOU and amortizes one
             // verification across every page prefetched by UFFDIO_COPY.
+            if prefetching {
+                // Loading a chunk the balloon gave back would take that memory
+                // again; the guest gets it (as zeros) only if it asks.
+                let first_page = copy_offset / PAGE_SIZE;
+                if (first_page..first_page + copy_len / PAGE_SIZE)
+                    .any(|page| discarded.get(page).copied().unwrap_or(false))
+                {
+                    continue;
+                }
+            }
             let mut owned_chunk = chunk_integrity.as_ref().map(|integrity| {
                 // SAFETY: the checked copy range is inside the read-only mapping.
                 let source =
@@ -1284,6 +1429,7 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             resolved_offset = copy_offset;
             resolved_len = copy_len;
             if rc < 0
+                && !prefetching
                 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
                 && copy_len > PAGE_SIZE
             {
@@ -1308,7 +1454,20 @@ fn fault_handler_loop(context: FaultHandlerContext) {
                 resolved_len = PAGE_SIZE;
             }
         }
-        if rc < 0 {
+        if rc < 0 && prefetching {
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                // Retry after the queued REMOVE is drained, as for a fault.
+                Some(libc::EAGAIN) => prefetch.push_front(fault_addr as usize),
+                // Already resident: the guest got there first.
+                Some(libc::EEXIST) => {}
+                // Nothing waits on a prefetch, so a failure only ends it.
+                _ => {
+                    log::warn!("UFFD prefetch stopped at 0x{fault_addr:x}: {error}");
+                    prefetch.clear();
+                }
+            }
+        } else if rc < 0 {
             let error = std::io::Error::last_os_error();
             match error.raw_os_error() {
                 // A REMOVE event raced the queue drain. Preserve the fault and
@@ -1333,6 +1492,20 @@ fn fault_handler_loop(context: FaultHandlerContext) {
         } else {
             if let Some(dirty) = host_dirty.as_ref() {
                 dirty.mark_range(resolved_offset as u64, resolved_len as u64);
+            }
+            if let Some(integrity) = chunk_integrity.as_ref() {
+                let chunk = resolved_offset / integrity.chunk_size;
+                if resolved_len == copy_len {
+                    if let Some(word) = served_chunks.get_mut(chunk / 64) {
+                        *word |= 1 << (chunk % 64);
+                    }
+                }
+                if let Some(touched) = touched.as_ref() {
+                    touched.mark(chunk);
+                }
+            }
+            if prefetching {
+                prefetched_chunks += 1;
             }
             pages_served.fetch_add(
                 (resolved_len / PAGE_SIZE) as u64,
@@ -1547,6 +1720,7 @@ mod tests {
             Some(ChunkIntegrity {
                 chunk_size: CHUNK,
                 chunk_hashes: hashes,
+                prefetch: Vec::new(),
             }),
         ) {
             Ok(lazy) => lazy,
@@ -1651,6 +1825,7 @@ mod tests {
             Some(ChunkIntegrity {
                 chunk_size: CHUNK,
                 chunk_hashes: hashes,
+                prefetch: Vec::new(),
             }),
         ) {
             Ok(lazy) => lazy,
@@ -1807,6 +1982,7 @@ mod tests {
             Some(ChunkIntegrity {
                 chunk_size: CHUNK,
                 chunk_hashes: hashes,
+                prefetch: Vec::new(),
             }),
         ) {
             Ok(lazy) => lazy,
@@ -1841,6 +2017,115 @@ mod tests {
             0xab
         );
         assert_eq!(unsafe { std::ptr::read_volatile(memory.add(2)) }, 0);
+
+        drop(lazy);
+        // SAFETY: `guest` is still mapped.
+        assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn working_set_chunks_load_before_the_guest_asks_and_touches_are_recorded() {
+        const PAGE: usize = 4096;
+        const CHUNK: usize = PAGE * 4;
+        const CHUNKS: usize = 5;
+        const LEN: usize = CHUNK * CHUNKS;
+        let path = std::env::temp_dir().join(format!(
+            "tarit-uffd-prefetch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let snapshot: Vec<u8> = (0..LEN).map(|i| (i / PAGE % 251 + 1) as u8).collect();
+        std::os::unix::fs::FileExt::write_all_at(&file, &snapshot, 0).unwrap();
+        let hashes = snapshot
+            .chunks(CHUNK)
+            .map(|chunk| Sha256::digest(chunk).into())
+            .collect();
+        // SAFETY: one private anonymous mapping, unmapped exactly once below.
+        let guest = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest, libc::MAP_FAILED);
+        let lazy = match start_lazy_restore_with_integrity(
+            guest.cast(),
+            LEN,
+            &file,
+            0,
+            LEN as u64,
+            None,
+            Some(ChunkIntegrity {
+                chunk_size: CHUNK,
+                chunk_hashes: hashes,
+                prefetch: vec![1, 3],
+            }),
+        ) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                // SAFETY: `guest` is the live mapping created above.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                std::fs::remove_file(path).unwrap();
+                return;
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
+        let resident = |chunk: usize| {
+            let mut vec = [0u8; CHUNK / PAGE];
+            // SAFETY: queries residency of pages inside the live mapping.
+            let rc = unsafe {
+                libc::mincore(
+                    guest.cast::<u8>().add(chunk * CHUNK).cast(),
+                    CHUNK,
+                    vec.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc, 0);
+            vec.iter().all(|page| page & 1 == 1)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lazy.pages_served.load(std::sync::atomic::Ordering::Relaxed)
+            < (2 * CHUNK / PAGE) as u64
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "working set never loaded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(resident(1) && resident(3), "working-set chunks are loaded");
+        assert!(
+            !resident(0) && !resident(2) && !resident(4),
+            "nothing else is"
+        );
+        let memory = guest.cast::<u8>();
+        // SAFETY: chunk 1 is resident and inside the mapping.
+        let loaded = unsafe { std::slice::from_raw_parts(memory.add(CHUNK), CHUNK) };
+        assert!(
+            loaded == &snapshot[CHUNK..2 * CHUNK],
+            "prefetched bytes are the snapshot's"
+        );
+
+        // The guest then touches chunk 4; the recorded set grows by it.
+        // SAFETY: inside the registered mapping; the handler resolves it.
+        let _ = unsafe { std::ptr::read_volatile(memory.add(4 * CHUNK + PAGE)) };
+        assert_eq!(lazy.page_discard().working_set(), vec![1, 3, 4]);
 
         drop(lazy);
         // SAFETY: `guest` is still mapped.
@@ -1894,6 +2179,7 @@ mod tests {
             Some(ChunkIntegrity {
                 chunk_size: LEN,
                 chunk_hashes: vec![hash],
+                prefetch: Vec::new(),
             }),
         ) {
             Ok(lazy) => lazy,

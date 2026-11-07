@@ -334,6 +334,10 @@ pub struct LiveSnapshotOutput {
     /// clears the bitmap it reports, so these must be replayed into the VM's
     /// host-dirty tracker or a later diff snapshot would silently omit them.
     pub consumed_dirty: DirtyBitmap,
+    /// RAM integrity chunks a lazily restored guest has needed since its
+    /// restore (with the working set it was restored with); empty otherwise.
+    /// Recorded in this snapshot's manifest so its restores load them early.
+    pub working_set: Vec<u32>,
 }
 
 /// Copy one contiguous half-open PFN run. Dirty bitmaps are ordered, so a
@@ -878,7 +882,13 @@ where
          {total_pages_copied} pages copied, {final_dirty_pages} residual, {downtime:?} downtime"
     );
 
+    // Read after the final stop: everything the guest needed up to the cut.
+    let working_set = mem
+        .lazy_page_discard()
+        .map(|lazy| lazy.working_set())
+        .unwrap_or_default();
     Ok(LiveSnapshotOutput {
+        working_set,
         result: LiveSnapshotResult {
             rounds,
             pages_copied: total_pages_copied,

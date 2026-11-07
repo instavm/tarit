@@ -12,6 +12,18 @@ versions may contain breaking changes.
 
 ### Added
 
+- Restores load the memory the guest is going to need before it asks. A
+  lazily restored VM records which RAM chunks it touches; a live snapshot
+  of it stores that working set in its integrity manifest, and a restore of
+  that snapshot copies those chunks in while the fault handler is idle.
+  Each chunk is still checked against its hash first, faults always go
+  first, and chunks the balloon gave back are skipped. On a 256 MiB guest
+  with a 24 MiB working set, restore-to-ready went from 35.9 to 27.0 ms and
+  a first command that reads the 24 MiB from 198 to 136 ms. A manifest with
+  a working set is format version 2, which older VMMs and taritd refuse:
+  snapshots taken by this version after a restore cannot be restored by an
+  older one. Manifests without a working set are still version 1.
+
 - `tarit-bench sustained`: creates sandboxes at a fixed rate for a fixed
   time (`--rate`, `--duration-secs`, `--hold-ms`, `--max-in-flight`) and
   reports the rate it reached and what it had to shed.

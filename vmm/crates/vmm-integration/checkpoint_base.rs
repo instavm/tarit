@@ -312,3 +312,112 @@ fn live_snapshot_after_lazy_restore_takes_untouched_ram_from_the_snapshot() {
     check(&again, "m.1 m.2 ram-ok");
     again.stop().ok();
 }
+
+/// Take a live snapshot and own its files; returns (snapshot, manifest).
+fn take_live(controller: &VmmController, files: &mut Files) -> (String, String) {
+    let result = controller
+        .live_snapshot(vmm_core::live_snapshot::LiveSnapshotConfig::default())
+        .expect("live snapshot");
+    for file in std::iter::once(&result.snapshot_path)
+        .chain(result.overlay_path.iter())
+        .chain(result.integrity_path.iter())
+    {
+        let identity = vmm_core::gc::OwnedScratchFile::identity_for(Path::new(file))
+            .expect("snapshot identity");
+        controller
+            .release_scratch(file, identity)
+            .expect("transfer snapshot ownership");
+        files.0.push(file.clone());
+    }
+    let manifest = result
+        .integrity_path
+        .expect("live snapshots carry a manifest");
+    (result.snapshot_path, manifest)
+}
+
+/// Restore lazily, every chunk checked against `manifest`.
+fn restore_verified(snapshot: &str, manifest: &str) -> Result<VmmController, String> {
+    use sha2::{Digest, Sha256};
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(std::fs::read(manifest).unwrap())
+    );
+    let controller = VmmController::new();
+    controller
+        .restore_with_resource_overrides(
+            snapshot,
+            None,
+            None,
+            None,
+            tarit_proto::RestoreMemoryPolicy::Lazy,
+            Some(tarit_proto::MemoryIntegrity {
+                manifest_path: manifest.to_string(),
+                manifest_sha256: digest,
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(controller)
+}
+
+fn working_set(manifest: &str) -> Vec<u32> {
+    tarit_proto::IntegrityManifest::decode(&std::fs::read(manifest).unwrap())
+        .expect("decode manifest")
+        .working_set
+}
+
+#[test]
+#[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
+fn a_restored_guests_working_set_is_recorded_and_loaded_on_the_next_restore() {
+    let _serial = serial();
+    let mut files = Files::default();
+    let source = VmmController::new();
+    source
+        .create_live(agent_vm_config(256))
+        .expect("boot live guest");
+    guest_stdout(&source, SEED);
+    mark(&source, 1);
+    let (first, first_manifest) = take_live(&source, &mut files);
+    source.stop().ok();
+    assert!(
+        working_set(&first_manifest).is_empty(),
+        "a cold-booted guest has no restore to learn from"
+    );
+
+    let restored = match restore_verified(&first, &first_manifest) {
+        Ok(controller) => controller,
+        Err(error) if error.contains("userfaultfd") => {
+            eprintln!("skipping: lazy (UFFD) restore unavailable here: {error}");
+            return;
+        }
+        Err(error) => panic!("verified lazy restore: {error}"),
+    };
+    // Reading the 24 MiB file faults its pages in, and they are recorded.
+    check(&restored, "m.1 ram-ok");
+    mark(&restored, 2);
+    let (second, second_manifest) = take_live(&restored, &mut files);
+    restored.stop().ok();
+    let learned = working_set(&second_manifest);
+    let chunk = u64::from(tarit_proto::INTEGRITY_CHUNK_SIZE);
+    assert!(
+        learned.len() as u64 * chunk >= 24 << 20,
+        "the working set covers what the guest read: {} chunks",
+        learned.len()
+    );
+
+    // The next restore loads that set without the guest asking for it.
+    let before = resident_bytes();
+    let again = restore_verified(&second, &second_manifest).expect("verified restore");
+    let wanted = learned.len() as u64 * chunk / 2;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while resident_bytes().saturating_sub(before) < wanted {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "working set not loaded: {} of {} bytes resident",
+            resident_bytes().saturating_sub(before),
+            learned.len() as u64 * chunk
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    check(&again, "m.1 m.2 ram-ok");
+    again.stop().ok();
+}

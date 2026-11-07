@@ -2210,6 +2210,7 @@ fn snapshot_integrity_manifest(
         ));
     }
     let chunk_size = u64::from(tarit_proto::INTEGRITY_CHUNK_SIZE);
+    let mut working_set = Vec::new();
     let mut manifest_artifacts = if let Some(precomputed) = precomputed {
         let metadata_chunks = memory_offset.div_ceil(chunk_size);
         let memory_chunks = memory_len.div_ceil(chunk_size);
@@ -2227,9 +2228,15 @@ fn snapshot_integrity_manifest(
             .metadata()
             .map_err(|error| OrchError::Internal(format!("stat live integrity sidecar: {error}")))?
             .len();
-        if actual_len != expected_len {
+        // A sidecar with a working set appends its chunk count and bitmap.
+        let with_working_set = memory_chunks
+            .div_ceil(8)
+            .checked_add(8)
+            .and_then(|extra| expected_len.checked_add(extra))
+            .ok_or_else(|| OrchError::Internal("live integrity size overflow".into()))?;
+        if actual_len != expected_len && actual_len != with_working_set {
             return Err(OrchError::BadRequest(format!(
-                "live integrity sidecar length mismatch: got {actual_len}, expected {expected_len}"
+                "live integrity sidecar length mismatch: got {actual_len}, expected {expected_len} or {with_working_set}"
             )));
         }
         let mut encoded = vec![
@@ -2285,6 +2292,7 @@ fn snapshot_integrity_manifest(
             ram_chunks = memory.chunk_hashes.len(),
             "adopted VMM live integrity sidecar without rereading RAM"
         );
+        working_set = manifest.working_set;
         manifest.artifacts
     } else {
         vec![
@@ -2321,6 +2329,7 @@ fn snapshot_integrity_manifest(
     Ok(tarit_proto::IntegrityManifest {
         chunk_size: tarit_proto::INTEGRITY_CHUNK_SIZE,
         artifacts: manifest_artifacts,
+        working_set,
     })
 }
 
@@ -13511,8 +13520,10 @@ mod tests {
         std::fs::set_permissions(&overlay_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let ram_artifact = OwnedArtifact::capture(&ram_path).unwrap();
-        let generated =
+        let mut generated =
             snapshot_integrity_manifest(std::slice::from_ref(&ram_artifact), None).unwrap();
+        // The VMM records the chunks a restored guest needed; taritd keeps them.
+        generated.working_set = vec![1];
         TEST_RAM_INTEGRITY_HASH_PASSES.with(|passes| passes.set(0));
         std::fs::write(&sidecar_path, generated.encode().unwrap()).unwrap();
         std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -13533,6 +13544,14 @@ mod tests {
         assert!(adopted
             .artifact(tarit_proto::ArtifactKind::Overlay)
             .is_some());
+        assert_eq!(adopted.working_set, vec![1]);
+        let encoded = adopted.encode().unwrap();
+        assert_eq!(
+            tarit_proto::IntegrityManifest::decode(&encoded)
+                .unwrap()
+                .working_set,
+            vec![1]
+        );
 
         OpenOptions::new()
             .write(true)
