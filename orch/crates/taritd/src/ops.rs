@@ -2234,37 +2234,46 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         Some(gate) => Some(gate.lock_owned().await),
         None => None,
     };
-    let _terminal_gate = state.terminal_transition_gate.lock().await;
-    match lifecycle_state(state, id)? {
-        Some(LifecycleState::Terminal { .. }) => {
-            finish_terminal_transition(state, id).await?;
-            if let Some(owner) = policy_owner.as_deref() {
-                state
-                    .store
-                    .lock()
-                    .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-                    .delete_egress_policy(owner, id)
-                    .map_err(crate::api::store_err)?;
+    {
+        let _terminal_gate = state.terminal_transition_gate.lock().await;
+        match lifecycle_state(state, id)? {
+            Some(LifecycleState::Terminal { .. }) => {
+                finish_terminal_transition(state, id).await?;
+                if let Some(owner) = policy_owner.as_deref() {
+                    state
+                        .store
+                        .lock()
+                        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+                        .delete_egress_policy(owner, id)
+                        .map_err(crate::api::store_err)?;
+                }
+                return Ok(());
             }
-            return Ok(());
+            Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
+            Some(
+                LifecycleState::Creating { .. }
+                | LifecycleState::Running { .. }
+                | LifecycleState::Reconciling { .. }
+                | LifecycleState::Abandoned { .. },
+            )
+            | None => {}
         }
-        Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
-        Some(
-            LifecycleState::Creating { .. }
-            | LifecycleState::Running { .. }
-            | LifecycleState::Reconciling { .. }
-            | LifecycleState::Abandoned { .. },
-        )
-        | None => {}
+        if vm_get(state, id).is_ok_and(|record| record.status == VmStatus::Stopped) {
+            // A caller that arrives after another DELETE completed may
+            // already have resolved the VM as local before waiting on its
+            // operation gate. Revalidate after the gate and expose the same
+            // terminal 404 as a request that arrived after completion;
+            // otherwise two racing deletes both claim the transition.
+            return Err(OrchError::NotFound(format!("vm {id} not found")));
+        }
     }
-    if vm_get(state, id).is_ok_and(|record| record.status == VmStatus::Stopped) {
-        // A caller that arrives after another DELETE completed may already
-        // have resolved the VM as local before waiting on its operation gate.
-        // Revalidate after the gate and expose the same terminal 404 as a
-        // request that arrived after completion; otherwise two racing deletes
-        // both claim to have performed the transition.
-        return Err(OrchError::NotFound(format!("vm {id} not found")));
-    }
+    // The VMM is torn down outside the host-wide terminal gate, so deletes of
+    // different VMs stop their VMMs in parallel. This VM's operation gate is
+    // still held, and its lifecycle is not Terminal yet, so neither a second
+    // DELETE nor the exit reconciler acts on it meanwhile; the teardown
+    // withdraws the runtime before signalling the VMM, so its exit is not
+    // reported as unexpected.
+    //
     // Bill the final runtime interval before teardown, while the VM record (and
     // its owning key) is still in the cache, then drop its watermark.
     crate::usage::meter_vm_final(state, id);
@@ -2273,6 +2282,7 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
     state.pty_registry.close_vm_sessions(id);
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
     start_terminal_transition(state, id, VmStatus::Stopped, true)?;
     finish_terminal_transition(state, id).await?;
     if let Some(owner) = policy_owner.as_deref() {

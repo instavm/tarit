@@ -12,6 +12,10 @@ versions may contain breaking changes.
 
 ### Added
 
+- `tarit-bench sustained`: creates sandboxes at a fixed rate for a fixed
+  time (`--rate`, `--duration-secs`, `--hold-ms`, `--max-in-flight`) and
+  reports the rate it reached and what it had to shed.
+
 - `sdk/computesdk`: a `@computesdk/tarit` provider for ComputeSDK.
 - `test/soak/api_soak.py`: keeps N sandboxes busy through the public API
   (commands, synced disk writes, checkpoint and restore, fork, pause,
@@ -160,6 +164,12 @@ versions may contain breaking changes.
   binaries to verify rolling snapshot-format upgrades.
 
 ### Fixed
+
+- Deletes on a host ran one at a time: each held the host-wide terminal
+  transition gate while its VMM was torn down. The teardown now runs outside
+  that gate, under the VM's own operation gate, and only the state checks
+  before it and the record transition after it take the host-wide gate. 40
+  concurrent deletes went from 39 to about 270 a second.
 
 - Deleting a VM could return 404 after it had been torn down: the periodic
   exit reconciler drove the same terminal transition the DELETE was driving,
