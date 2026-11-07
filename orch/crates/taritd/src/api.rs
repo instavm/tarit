@@ -1863,7 +1863,10 @@ async fn create_vm_after_quota(
             }
         }
 
-        if is_network_pool_exhausted(&last_overloaded) {
+        // Neither a full network pool nor a host shutting down frees a slot by
+        // waiting, and a create waiting out its deadline during shutdown would
+        // hold the HTTP drain open to its own timeout.
+        if is_network_pool_exhausted(&last_overloaded) || state.supervisor.is_shutting_down() {
             return Err(OrchError::Overloaded {
                 message: last_overloaded,
                 retry_after_secs: 1,
@@ -5226,6 +5229,37 @@ mod tests {
         assert_eq!(event.action, audit_action::CREATE);
         assert_eq!(event.outcome, audit_outcome::ERROR);
         assert!(writes.try_recv().is_err());
+        drop(rt);
+    }
+
+    #[test]
+    fn shutdown_ends_a_create_waiting_for_capacity() {
+        let (mut state, _writes) = test_state_with_audit();
+        state.config.admission_timeout_ms = 60_000;
+        for _ in 0..state.config.max_vms {
+            state.supervisor.reserve_existing_for_test(Uuid::new_v4());
+        }
+        let app = router(state.clone());
+        let rt = test_runtime();
+
+        let response = rt.block_on(async {
+            let create = tokio::spawn(request_json(
+                app,
+                "POST",
+                "/v1/vms",
+                "admin-key",
+                serde_json::json!({"memory_mib": 256, "vcpus": 1}),
+            ));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!create.is_finished(), "the create waits for a slot");
+            state.supervisor.begin_shutdown();
+            tokio::time::timeout(Duration::from_secs(5), create)
+                .await
+                .expect("shutdown must end the wait instead of the admission deadline")
+                .unwrap()
+        });
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         drop(rt);
     }
 
