@@ -38,8 +38,8 @@ Events are written to a node-local outbox first, then a background flusher
 pushes unsent rows to Postgres and marks them sent. This gives eventual
 consistency and survives a database outage: rows stay pending and are retried
 when the database returns (see the PostgreSQL outage test in `RESILIENCE.md`).
-Without a fleet database (single-host mode) events accumulate in the local
-outbox and the API endpoints are unavailable.
+Without a fleet database (single-host mode) events stay in the local outbox,
+which the API endpoints then read, and old rows are pruned by age.
 
 Re-sending a not-yet-acked batch is safe. `usage_events` has a
 `UNIQUE (vm_id, kind, window_end)` constraint and inserts use `ON CONFLICT DO
@@ -75,8 +75,9 @@ secret-free detail string. Audited actions: `create`, `delete`, `pause`,
 
 ## API
 
-Both endpoints require a fleet database. Admins see every key; a non-admin key
-sees only its own data.
+Both endpoints read the fleet database when one is configured. A single host
+without one (`TARIT_DATABASE_URL` unset) answers from its local outbox instead.
+Admins see every key; a non-admin key sees only its own data.
 
 `GET /v1/usage` aggregates usage per key over a time range.
 
@@ -122,9 +123,11 @@ Query parameters: `api_key_id` (admin only), `vm_id`, `limit` (default 100, max
 | --- | --- | --- |
 | `TARIT_USAGE_METER_INTERVAL_SECS` | `30` | How often the VM-runtime meter bills alive local VMs. |
 | `TARIT_USAGE_FLUSH_INTERVAL_SECS` | `10` | How often the flusher pushes local outboxes to Postgres. |
+| `TARIT_LOCAL_USAGE_RETENTION_DAYS` | `90` | Without a fleet database, how long local usage and audit rows are kept (`0` keeps them forever). |
 
-Attribution and the API need cluster mode (`TARIT_DATABASE_URL` set). The meter
-always runs; without a fleet the flusher is idle and events stay local.
+The meter always runs. With a fleet database, rows already flushed are pruned
+from the local outbox after a day. Without one, the outbox is the source of
+truth for the API and rows older than the retention are pruned hourly.
 
 ## Schema
 

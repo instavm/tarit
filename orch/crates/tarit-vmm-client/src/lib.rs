@@ -20,6 +20,11 @@ pub enum VmmError {
 
     #[error("vmm: {0}")]
     Api(String),
+
+    /// The VMM refused the request without changing the VM, because the host
+    /// was too busy to finish it in time; the same request can be sent again.
+    #[error("vmm busy: {0}")]
+    Busy(String),
 }
 
 fn read_api_frame(stream: &mut UnixStream) -> Result<Vec<u8>, VmmError> {
@@ -425,7 +430,10 @@ impl VmmClient {
 
     pub fn request_ok(&self, req: &ApiRequest) -> Result<ApiResponse, VmmError> {
         match self.request(req)? {
-            ApiResponse::Err { msg } => Err(VmmError::Api(msg)),
+            ApiResponse::Err { msg } => Err(match msg.strip_prefix(RETRYABLE_ERROR_PREFIX) {
+                Some(reason) => VmmError::Busy(reason.to_string()),
+                None => VmmError::Api(msg),
+            }),
             other => Ok(other),
         }
     }
@@ -479,13 +487,36 @@ impl VmmClient {
     /// Callers that need to transfer the artifact must capture its identity and
     /// explicitly call `release_scratch` only after they hold local ownership.
     pub fn snapshot_unreleased(&self, diff: bool) -> Result<String, VmmError> {
-        match self.request_ok(&ApiRequest::Snapshot { diff, live: false })? {
+        self.snapshot_unreleased_with(diff, None, false)
+    }
+
+    /// [`Self::snapshot_unreleased`] with the VMM's checkpoint options:
+    /// `base`, a VMM-visible full snapshot this VM last wrote or was restored
+    /// from, lets the VMM pause only for pages changed since (the result is a
+    /// full snapshot either way); `resume` resumes a VM the caller paused as
+    /// soon as RAM is captured.
+    pub fn snapshot_unreleased_with(
+        &self,
+        diff: bool,
+        base: Option<&str>,
+        resume: bool,
+    ) -> Result<String, VmmError> {
+        // The orchestrator manages disk uppers itself, so it asks for a
+        // memory-only snapshot and rejects any disk artifact.
+        match self.request_ok(&ApiRequest::Snapshot {
+            diff,
+            live: false,
+            capture_disks: false,
+            base: base.map(str::to_string),
+            resume,
+        })? {
             ApiResponse::Snapshot {
                 path,
                 overlay_path: None,
+                volume_paths,
                 integrity_path: None,
                 live_stats: None,
-            } => Ok(path),
+            } if volume_paths.is_empty() => Ok(path),
             ApiResponse::Snapshot {
                 integrity_path: Some(_),
                 ..
@@ -493,7 +524,6 @@ impl VmmClient {
                 "non-live snapshot unexpectedly returned a live artifact".into(),
             )),
             ApiResponse::Snapshot {
-                overlay_path: Some(_),
                 integrity_path: None,
                 ..
             } => Err(VmmError::Api(
@@ -519,12 +549,16 @@ impl VmmClient {
         match self.request_ok(&ApiRequest::Snapshot {
             diff: false,
             live: true,
+            capture_disks: false,
+            base: None,
+            resume: false,
         })? {
             ApiResponse::Snapshot {
                 path,
                 overlay_path,
                 integrity_path: Some(integrity_path),
                 live_stats: Some(live_stats),
+                ..
             } => Ok((path, overlay_path, integrity_path, live_stats)),
             ApiResponse::Snapshot {
                 integrity_path: None,
@@ -580,7 +614,7 @@ impl VmmClient {
             allowlist,
             allow_existing,
         })? {
-            ApiResponse::EgressUpdated { rules_applied } => Ok(rules_applied),
+            ApiResponse::EgressUpdated { rules_applied, .. } => Ok(rules_applied),
             other => Err(VmmError::Api(format!("unexpected response: {other:?}"))),
         }
     }
@@ -1102,5 +1136,164 @@ mod tests {
             }
             other => panic!("unexpected request: {other:?}"),
         }
+    }
+
+    fn memory_snapshot_response(path: &str) -> ApiResponse {
+        ApiResponse::Snapshot {
+            path: path.into(),
+            overlay_path: None,
+            volume_paths: Vec::new(),
+            integrity_path: None,
+            live_stats: None,
+        }
+    }
+
+    /// Serve one request on a fresh VMM socket and return the request's wire
+    /// form together with the client's result.
+    fn serve_one_snapshot<T>(
+        response: ApiResponse,
+        call: impl FnOnce(&VmmClient) -> T,
+    ) -> (serde_json::Value, T) {
+        let socket = socket_path();
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket.0).expect("bind test VMM socket");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_api_frame(&mut stream).expect("read request"))
+                    .expect("decode request");
+            let body = serde_json::to_vec(&response).expect("encode response");
+            write_api_frame(&mut stream, &body).expect("write response");
+            request
+        });
+        let result = call(&VmmClient::new(&socket.0).with_request_timeout(Duration::from_secs(5)));
+        (server.join().expect("join server"), result)
+    }
+
+    #[test]
+    fn snapshot_unreleased_with_sends_checkpoint_options_only_when_set() {
+        let cases = [
+            (
+                Some("/snapshots/base.snap"),
+                true,
+                serde_json::json!({
+                    "op": "snapshot",
+                    "diff": false,
+                    "live": false,
+                    "capture_disks": false,
+                    "base": "/snapshots/base.snap",
+                    "resume": true,
+                }),
+            ),
+            (
+                Some("/snapshots/base.snap"),
+                false,
+                serde_json::json!({
+                    "op": "snapshot",
+                    "diff": false,
+                    "live": false,
+                    "capture_disks": false,
+                    "base": "/snapshots/base.snap",
+                }),
+            ),
+            (
+                None,
+                true,
+                serde_json::json!({
+                    "op": "snapshot",
+                    "diff": false,
+                    "live": false,
+                    "capture_disks": false,
+                    "resume": true,
+                }),
+            ),
+            (
+                None,
+                false,
+                serde_json::json!({
+                    "op": "snapshot",
+                    "diff": false,
+                    "live": false,
+                    "capture_disks": false,
+                }),
+            ),
+        ];
+        for (base, resume, expected) in cases {
+            let (request, result) =
+                serve_one_snapshot(memory_snapshot_response("/tmp/vmm-snap-1.snap"), |client| {
+                    client.snapshot_unreleased_with(false, base, resume)
+                });
+            assert_eq!(request, expected, "base {base:?}, resume {resume}");
+            assert_eq!(
+                result.expect("memory-only snapshot"),
+                "/tmp/vmm-snap-1.snap"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_unreleased_sends_no_base_and_no_resume() {
+        for diff in [false, true] {
+            let (request, result) =
+                serve_one_snapshot(memory_snapshot_response("/tmp/vmm-snap-2.snap"), |client| {
+                    client.snapshot_unreleased(diff)
+                });
+            assert_eq!(
+                request,
+                serde_json::json!({
+                    "op": "snapshot",
+                    "diff": diff,
+                    "live": false,
+                    "capture_disks": false,
+                })
+            );
+            assert_eq!(
+                result.expect("memory-only snapshot"),
+                "/tmp/vmm-snap-2.snap"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_unreleased_with_rejects_a_disk_artifact() {
+        let (_, result) = serve_one_snapshot(
+            ApiResponse::Snapshot {
+                path: "/tmp/vmm-snap-3.snap".into(),
+                overlay_path: Some("/tmp/vmm-snap-3.cow".into()),
+                volume_paths: Vec::new(),
+                integrity_path: None,
+                live_stats: None,
+            },
+            |client| client.snapshot_unreleased_with(false, Some("/snapshots/base.snap"), true),
+        );
+        let error = result.expect_err("a memory-only request must not accept a disk artifact");
+        assert!(error.to_string().contains("disk artifact"), "{error}");
+    }
+
+    #[test]
+    fn a_retryable_vmm_error_is_reported_as_busy() {
+        let (_, result) = serve_one_snapshot(
+            ApiResponse::retryable_err("quiesce block I/O worker: timed out"),
+            |client| client.snapshot_unreleased_with(false, None, true),
+        );
+        assert!(matches!(
+            result,
+            Err(VmmError::Busy(ref reason)) if reason == "quiesce block I/O worker: timed out"
+        ));
+    }
+
+    #[test]
+    fn snapshot_unreleased_with_surfaces_a_vmm_error() {
+        let (request, result) = serve_one_snapshot(
+            ApiResponse::Err {
+                msg: "snapshot failed".into(),
+            },
+            |client| client.snapshot_unreleased_with(false, Some("/snapshots/base.snap"), true),
+        );
+        assert_eq!(request["base"], "/snapshots/base.snap");
+        assert!(matches!(
+            result,
+            Err(VmmError::Api(ref message)) if message == "snapshot failed"
+        ));
     }
 }

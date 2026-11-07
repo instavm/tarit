@@ -62,6 +62,48 @@ pub(crate) fn open_kvm() -> Result<kvm_ioctls::Kvm> {
 }
 
 /// A live KVM VM: the VM fd + the guest memory + the MMIO bus.
+/// `KVM_IRQFD`: `_IOW(KVMIO, 0x76, struct kvm_irqfd)`.
+// `libc::Ioctl` is c_ulong on glibc and c_int on musl.
+const KVM_IRQFD: libc::Ioctl = 0x4020_ae76 as libc::Ioctl;
+const _: () = assert!(std::mem::size_of::<kvm_bindings::kvm_irqfd>() == 0x20);
+
+/// An irqfd registration still running on its helper thread; see
+/// [`KvmVm::begin_irqfd_with_resample`]. Dropping it waits for the thread.
+pub struct PendingIrqfd {
+    gsi: u32,
+    handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+}
+
+impl PendingIrqfd {
+    /// Wait for the registration and report its result.
+    pub fn finish(&mut self) -> Result<()> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        let gsi = self.gsi;
+        match handle.join() {
+            Ok(Ok(())) => {
+                log::info!("irqfd+resample registered: gsi={gsi}");
+                Ok(())
+            }
+            Ok(Err(e)) => Err(VmmError::Kvm(format!(
+                "register_irqfd_with_resample({gsi}): {e}"
+            ))),
+            Err(_) => Err(VmmError::Kvm(format!(
+                "register_irqfd_with_resample({gsi}): registration thread panicked"
+            ))),
+        }
+    }
+}
+
+impl Drop for PendingIrqfd {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct KvmVm {
     pub vm_fd: VmFd,
     pub mem: GuestMemory,
@@ -70,6 +112,9 @@ pub struct KvmVm {
     pub template: CpuTemplate,
     /// GSI routing entries accumulated for KVM_SET_GSI_ROUTING.
     routing_entries: std::sync::Mutex<Vec<kvm_bindings::kvm_irq_routing_entry>>,
+    /// While set, [`Self::register_irqfd`] records its route without
+    /// installing the table; see [`Self::defer_gsi_routing`].
+    routing_deferred: std::sync::atomic::AtomicBool,
 }
 
 /// VM-level (not per-vCPU) KVM state captured for a faithful resume: the
@@ -204,6 +249,7 @@ impl KvmVm {
             slots,
             template,
             routing_entries: std::sync::Mutex::new(Vec::new()),
+            routing_deferred: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -272,12 +318,15 @@ impl KvmVm {
             .map_err(|e| VmmError::Memory(format!("read dirty log: {e}")))
     }
 
-    /// Register an ioeventfd for a MMIO address.
-    pub fn register_ioeventfd(&self, mmio_addr: u64, evt: &EventFd) -> Result<()> {
-        self.vm_fd
-            .register_ioevent(evt, &IoEventAddress::Mmio(mmio_addr), 0u32)
-            .map_err(|e| VmmError::Kvm(format!("register_ioevent(0x{mmio_addr:x}): {e}")))?;
-        log::debug!("ioeventfd registered: mmio=0x{mmio_addr:x}");
+    /// Route the guest's kicks of queues `0..queues` (the values it writes to
+    /// a virtio-mmio QUEUE_NOTIFY register at `mmio_addr`) to `evt`, so they
+    /// wake the device's I/O thread inside KVM instead of exiting to this
+    /// vCPU. KVM matches MMIO ioeventfds on the written value, so each queue
+    /// index needs its own registration.
+    pub fn register_queue_notify(&self, mmio_addr: u64, evt: &EventFd, queues: u32) -> Result<()> {
+        for queue in 0..queues {
+            self.register_ioeventfd_datamatch(mmio_addr, evt, queue)?;
+        }
         Ok(())
     }
 
@@ -315,6 +364,32 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Collect the GSI routes of the [`Self::register_irqfd`] calls that
+    /// follow and install them together at [`Self::commit_gsi_routing`].
+    /// Every KVM_SET_GSI_ROUTING waits out an SRCU grace period, so wiring a
+    /// VM's devices one route at a time cost boot and restore a grace period
+    /// per device. An irqfd registered before its route exists is re-pointed
+    /// by KVM when the routing table is installed.
+    pub fn defer_gsi_routing(&self) {
+        self.routing_deferred
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Install the routes collected since [`Self::defer_gsi_routing`].
+    pub fn commit_gsi_routing(&self) -> Result<()> {
+        if !self
+            .routing_deferred
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        let entries = self
+            .routing_entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.apply_gsi_routing(&entries)
+    }
+
     /// Register an existing EventFd as an irqfd for a GSI.
     /// Also adds a GSI routing entry routing the GSI to the in-kernel
     /// IOAPIC.
@@ -337,21 +412,32 @@ impl KvmVm {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         entries.push(entry);
-        self.apply_gsi_routing(&entries)?;
+        if !self
+            .routing_deferred
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.apply_gsi_routing(&entries)?;
+        }
         log::info!("irqfd+routing registered: gsi={gsi} → IOAPIC pin {gsi}");
         Ok(())
     }
 
-    /// Register a level-triggered irqfd and its guest-EOI resample event.
-    pub fn register_irqfd_with_resample(
+    /// Start registering a level-triggered irqfd and its guest-EOI resample
+    /// event.
+    ///
+    /// The GSI route is installed before this returns. The `KVM_IRQFD` call
+    /// itself runs on a helper thread because adding a resampler waits for an
+    /// SRCU grace period, several milliseconds that would otherwise sit on the
+    /// boot and restore path. The caller must [`PendingIrqfd::finish`] it
+    /// before publishing the VM; until then a signal on `evt` stays pending in
+    /// the eventfd and KVM injects it when the irqfd attaches.
+    pub fn begin_irqfd_with_resample(
         &self,
         evt: &EventFd,
         resample_evt: &EventFd,
         gsi: u32,
-    ) -> Result<()> {
-        self.vm_fd
-            .register_irqfd_with_resample(evt, resample_evt, gsi)
-            .map_err(|e| VmmError::Kvm(format!("register_irqfd_with_resample({gsi}): {e}")))?;
+    ) -> Result<PendingIrqfd> {
+        use std::os::fd::{AsRawFd, OwnedFd};
 
         let mut entry = kvm_bindings::kvm_irq_routing_entry {
             gsi,
@@ -360,14 +446,60 @@ impl KvmVm {
         };
         entry.u.irqchip.irqchip = kvm_bindings::KVM_IRQCHIP_IOAPIC;
         entry.u.irqchip.pin = gsi;
+        {
+            let mut entries = self
+                .routing_entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            entries.push(entry);
+            // Installs any deferred routes along with this one.
+            self.routing_deferred
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.apply_gsi_routing(&entries)?;
+        }
 
-        let mut entries = self
-            .routing_entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        entries.push(entry);
-        self.apply_gsi_routing(&entries)?;
-        Ok(())
+        let dup = |fd: i32, what: &str| -> Result<OwnedFd> {
+            // SAFETY: F_DUPFD_CLOEXEC returns a new descriptor that the
+            // returned OwnedFd owns exclusively.
+            let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+            if duplicate < 0 {
+                return Err(VmmError::Kvm(format!(
+                    "dup {what} for irqfd({gsi}): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            // SAFETY: `duplicate` is a fresh descriptor owned by nobody else.
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+        };
+        let vm = dup(self.vm_fd.as_raw_fd(), "VM fd")?;
+        let evt = dup(evt.as_raw_fd(), "irq eventfd")?;
+        let resample = dup(resample_evt.as_raw_fd(), "resample eventfd")?;
+        let handle = std::thread::Builder::new()
+            .name("kvm-irqfd".into())
+            .spawn(move || {
+                let irqfd = kvm_bindings::kvm_irqfd {
+                    fd: evt.as_raw_fd() as u32,
+                    resamplefd: resample.as_raw_fd() as u32,
+                    gsi,
+                    flags: kvm_bindings::KVM_IRQFD_FLAG_RESAMPLE,
+                    ..Default::default()
+                };
+                // SAFETY: `vm` is a KVM VM descriptor and the kernel reads
+                // exactly one kvm_irqfd from the pointer during the call. KVM
+                // takes its own references to both eventfds, so closing these
+                // duplicates afterwards does not detach the irqfd.
+                let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IRQFD, &irqfd) };
+                if ret == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+            .map_err(|e| VmmError::Kvm(format!("spawn irqfd({gsi}) registration: {e}")))?;
+        Ok(PendingIrqfd {
+            gsi,
+            handle: Some(handle),
+        })
     }
 
     /// Capture VM-level (not per-vCPU) state for a faithful resume: the

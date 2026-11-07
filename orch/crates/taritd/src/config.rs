@@ -9,6 +9,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// One warm-pool VM class: a (vcpus, memory) shape kept pre-booted and ready.
@@ -31,9 +32,37 @@ pub struct WarmClass {
     pub rootfs: Option<PathBuf>,
     /// Registered image reference (`name[:tag]`) to resolve before warm refill.
     pub image: Option<String>,
+    /// Command the golden VM runs before its snapshot, so every clone starts
+    /// with what it read in the page cache. Without one the golden runs
+    /// `true`, which warms the shell every command starts through.
+    pub prewarm: Option<String>,
 }
 
 impl WarmClass {
+    /// A restore class for VMs of this shape, as taritd adds for shapes that
+    /// creates ask for. Watermarks derive from `target`.
+    pub fn learned(
+        vcpus: u8,
+        memory_mib: u64,
+        rootfs: Option<PathBuf>,
+        target: usize,
+        prewarm: Option<String>,
+    ) -> Self {
+        let (hard_floor, low_watermark, high_watermark) = derive_watermarks(target);
+        Self {
+            vcpus,
+            memory_mib,
+            hard_floor,
+            low_watermark,
+            target,
+            high_watermark,
+            restore: true,
+            rootfs,
+            image: None,
+            prewarm,
+        }
+    }
+
     fn from_spec(spec: WarmClassSpec) -> Result<Self> {
         let (default_hard_floor, default_low_watermark, default_high_watermark) =
             derive_watermarks(spec.target);
@@ -47,6 +76,7 @@ impl WarmClass {
             restore: spec.restore,
             rootfs: spec.rootfs,
             image: spec.image,
+            prewarm: spec.prewarm,
         };
         class.validate_watermarks()?;
         class.validate_image_rootfs()?;
@@ -91,6 +121,26 @@ impl WarmClass {
             self.high_watermark,
         )
     }
+
+    /// How many VMs a replenisher round should start. A refill starts once
+    /// depth falls below the low watermark and continues across rounds until
+    /// the pool is back at target; `filling` carries that between rounds.
+    /// Rounds start a bounded number of VMs each, so without it a refill
+    /// stopped as soon as it crossed the low watermark.
+    pub fn refill_round(&self, depth: usize, filling: &mut bool) -> usize {
+        let target = self.target.min(self.high_watermark);
+        if depth < self.low_watermark {
+            *filling = true;
+        }
+        if depth >= target {
+            *filling = false;
+        }
+        if *filling {
+            target - depth
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,19 +176,46 @@ pub struct WarmPoolConfig {
     /// Optional low-priority cgroup for background refill VMM children.
     pub refill_cgroup: RefillCgroupConfig,
     pub classes: Vec<WarmClass>,
+    /// Classes taritd adds on its own for shapes that creates ask for.
+    pub learn: LearnedWarmConfig,
+}
+
+/// How taritd keeps warm VMs for images and shapes no configured class
+/// covers: each registered image, and each shape creates ask for, gets a
+/// golden snapshot and a pool of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedWarmConfig {
+    /// Most learned classes kept at once; 0 turns learning off.
+    pub max_classes: usize,
+    /// Warm VMs kept ready for each learned class.
+    pub target: usize,
+    /// A learned class nobody asks for this long is retired.
+    pub idle: Duration,
+}
+
+impl Default for LearnedWarmConfig {
+    fn default() -> Self {
+        Self {
+            max_classes: 4,
+            target: 8,
+            idle: Duration::from_secs(30 * 60),
+        }
+    }
 }
 
 impl Default for WarmPoolConfig {
     fn default() -> Self {
-        // Default mix: 100% one class of 1 vCPU / 256 MiB, 400% CPU overcommit.
+        // On by default: one class of 1 vCPU / 256 MiB clones restored from a
+        // golden snapshot, with 400% CPU overcommit.
         Self {
-            enabled: false,
+            enabled: true,
             cpu_overcommit: 4.0,
             replenish_concurrency: 4,
             refill_cgroup: RefillCgroupConfig::default(),
             classes: vec![WarmClassSpec::default_class()
                 .finish()
                 .expect("default warm-pool watermarks are valid")],
+            learn: LearnedWarmConfig::default(),
         }
     }
 }
@@ -363,6 +440,12 @@ struct WarmPoolFile {
     #[serde(default)]
     refill_cpu_weight: Option<u64>,
     #[serde(default)]
+    learn_classes: Option<usize>,
+    #[serde(default)]
+    learn_target: Option<usize>,
+    #[serde(default)]
+    learn_idle_secs: Option<u64>,
+    #[serde(default)]
     class: Vec<WarmClassFile>,
 }
 
@@ -383,6 +466,8 @@ struct WarmClassFile {
     rootfs: Option<String>,
     #[serde(default)]
     image: Option<String>,
+    #[serde(default)]
+    prewarm: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +481,7 @@ struct WarmClassSpec {
     restore: bool,
     rootfs: Option<PathBuf>,
     image: Option<String>,
+    prewarm: Option<String>,
 }
 
 impl WarmClassSpec {
@@ -407,9 +493,10 @@ impl WarmClassSpec {
             hard_floor: None,
             low_watermark: None,
             high_watermark: None,
-            restore: false,
+            restore: true,
             rootfs: None,
             image: None,
+            prewarm: None,
         }
     }
 
@@ -421,9 +508,10 @@ impl WarmClassSpec {
             hard_floor: file.hard_floor,
             low_watermark: file.low_watermark,
             high_watermark: file.high_watermark,
-            restore: file.restore.unwrap_or(false),
+            restore: file.restore.unwrap_or(true),
             rootfs: file.rootfs.as_ref().map(|s| expand_path(s)),
             image: file.image.clone(),
+            prewarm: file.prewarm.clone(),
         }
     }
 
@@ -439,16 +527,18 @@ struct WarmPoolDraft {
     replenish_concurrency: usize,
     refill_cgroup: RefillCgroupConfig,
     classes: Vec<WarmClassSpec>,
+    learn: LearnedWarmConfig,
 }
 
 impl Default for WarmPoolDraft {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             cpu_overcommit: 4.0,
             replenish_concurrency: 4,
             refill_cgroup: RefillCgroupConfig::default(),
             classes: vec![WarmClassSpec::default_class()],
+            learn: LearnedWarmConfig::default(),
         }
     }
 }
@@ -466,6 +556,7 @@ impl WarmPoolDraft {
             replenish_concurrency: self.replenish_concurrency,
             refill_cgroup: self.refill_cgroup,
             classes,
+            learn: self.learn,
         })
     }
 }
@@ -645,6 +736,10 @@ pub struct Config {
     /// Provision per-VM host networking (tap + /30 + NAT). Requires
     /// CAP_NET_ADMIN (run taritd as root). Off by default.
     pub enable_net: bool,
+    /// Resolvers given to networked guests (`TARIT_GUEST_DNS`), at boot and
+    /// whenever a restored or forked guest's network is repaired. Egress to
+    /// them still needs an allowlist entry like any other destination.
+    pub guest_dns: Vec<String>,
     /// Request read-only guest mount semantics (`ro` kernel cmdline). The host
     /// always opens the base image immutably and gives each VM a private CoW
     /// overlay, regardless of this setting. Env TARIT_ROOTFS_READONLY.
@@ -660,6 +755,12 @@ pub struct Config {
     pub api_requests_per_second: u64,
     pub api_request_timeout_ms: u64,
     pub api_max_body_bytes: usize,
+    /// Snapshots (and fork snapshots) captured at once on this host. Each
+    /// writes and syncs guest RAM; past this many the device is shared so
+    /// thinly that every one of them overruns its live pre-copy budget.
+    /// Env TARIT_MAX_CONCURRENT_SNAPSHOTS (default: half the host's CPUs,
+    /// at least 2).
+    pub max_concurrent_snapshots: usize,
     /// Parent cgroup v2 path under which taritd places a per-VM cgroup for each
     /// `vmm serve` child (memory + PID limits), e.g. `/sys/fs/cgroup/tarit`.
     /// When unset, no per-VM cgroup is applied (host must be cgroup v2 and
@@ -794,9 +895,12 @@ impl Config {
         let shared_block = parse_shared_block_config()?;
         let image_admission_policy = crate::image::ImageAdmissionPolicy::from_env()?;
 
-        let max_vms = env_positive_usize("TARIT_MAX_VMS", 32)?;
+        let max_vms_env = env_optional_positive_usize("TARIT_MAX_VMS")?;
         let max_vcpus_env = env_optional_positive_u64("TARIT_MAX_VCPUS")?;
-        let max_memory_mib = env_positive_u64("TARIT_MAX_MEMORY_MIB", 65_536)?;
+        // Without an explicit ceiling, place no more guest memory than the
+        // host has: a fixed default admitted 64 GiB on small hosts.
+        let max_memory_mib =
+            env_positive_u64("TARIT_MAX_MEMORY_MIB", host_memory_mib().unwrap_or(65_536))?;
         let database_url = env::var("TARIT_DATABASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
@@ -835,6 +939,10 @@ impl Config {
         )?;
 
         let enable_net = env_bool_checked("TARIT_ENABLE_NET", false)?;
+        let guest_dns = parse_guest_dns(std::env::var("TARIT_GUEST_DNS").ok().as_deref())?;
+        if !guest_dns.is_empty() && !enable_net {
+            bail!("TARIT_GUEST_DNS requires TARIT_ENABLE_NET=1");
+        }
 
         let rootfs_read_only = env_bool_checked("TARIT_ROOTFS_READONLY", false)?;
 
@@ -844,12 +952,18 @@ impl Config {
         let api_requests_per_second = env_positive_u64("TARIT_API_REQUESTS_PER_SECOND", 5_000)?;
         let api_request_timeout_ms = env_positive_u64("TARIT_API_REQUEST_TIMEOUT_MS", 180_000)?;
         let api_max_body_bytes = env_positive_usize("TARIT_API_MAX_BODY_BYTES", 1024 * 1024)?;
+        let max_concurrent_snapshots = env_positive_usize(
+            "TARIT_MAX_CONCURRENT_SNAPSHOTS",
+            std::thread::available_parallelism()
+                .map(|n| n.get() / 2)
+                .unwrap_or(1)
+                .max(2),
+        )?;
 
         let vm_cgroup_parent = env::var("TARIT_VM_CGROUP_PARENT")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let vm_jail = parse_vm_jail_config(max_vms)?;
         let vm_cgroup_pids_max = env_positive_u64("TARIT_VM_CGROUP_PIDS_MAX", 1024)?;
         let vm_io_quota = VmIoQuotaConfig {
             read_bps_max: env_optional_positive_u64("TARIT_VM_IO_READ_BPS_MAX")?,
@@ -874,19 +988,20 @@ impl Config {
         let admission_timeout_ms = env_positive_u64("TARIT_ADMISSION_TIMEOUT_MS", 60_000)?;
         let reap_on_shutdown = env_bool_checked("TARIT_REAP_ON_SHUTDOWN", true)?;
 
-        // CPU overcommit: when the warm pool is on and TARIT_MAX_VCPUS is not
-        // pinned, derive the vCPU ceiling from physical cores * overcommit so
-        // "400% overcommit" actually raises how many VMs we will place.
+        // CPU overcommit: unless TARIT_MAX_VCPUS is pinned, derive the vCPU
+        // ceiling from this host's cores * overcommit, so the default tracks
+        // the machine and "400% overcommit" raises how many VMs we place.
         let max_vcpus = max_vcpus_env.unwrap_or_else(|| {
-            if warm_pool.enabled {
-                let cores = std::thread::available_parallelism()
-                    .map(|n| n.get() as f64)
-                    .unwrap_or(1.0);
-                (cores * warm_pool.cpu_overcommit).ceil() as u64
-            } else {
-                64
-            }
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get() as f64)
+                .unwrap_or(1.0);
+            ((cores * warm_pool.cpu_overcommit).ceil() as u64).max(1)
         });
+        // Every VM takes at least one vCPU, so without an explicit cap the
+        // vCPU ceiling bounds the VM count too. A fixed 32 left large hosts
+        // mostly idle.
+        let max_vms = max_vms_env.unwrap_or_else(|| default_max_vms(max_vcpus));
+        let vm_jail = parse_vm_jail_config(max_vms)?;
 
         let region = env::var("TARIT_REGION").unwrap_or_else(|_| "local".into());
         let zone = env::var("TARIT_ZONE").unwrap_or_else(|_| region.clone());
@@ -981,12 +1096,14 @@ impl Config {
             rpc_addr,
             allow_insecure_peer_http,
             enable_net,
+            guest_dns,
             rootfs_read_only,
             metrics_expose_tenant_labels,
             api_max_in_flight,
             api_requests_per_second,
             api_request_timeout_ms,
             api_max_body_bytes,
+            max_concurrent_snapshots,
             vm_cgroup_parent,
             vm_jail,
             vm_cgroup_pids_max,
@@ -1042,12 +1159,14 @@ impl fmt::Debug for Config {
             .field("rpc_addr", &self.rpc_addr)
             .field("allow_insecure_peer_http", &self.allow_insecure_peer_http)
             .field("enable_net", &self.enable_net)
+            .field("guest_dns", &self.guest_dns)
             .field("rootfs_read_only", &self.rootfs_read_only)
             .field(
                 "metrics_expose_tenant_labels",
                 &self.metrics_expose_tenant_labels,
             )
             .field("api_max_in_flight", &self.api_max_in_flight)
+            .field("max_concurrent_snapshots", &self.max_concurrent_snapshots)
             .field("api_requests_per_second", &self.api_requests_per_second)
             .field("api_request_timeout_ms", &self.api_request_timeout_ms)
             .field("api_max_body_bytes", &self.api_max_body_bytes)
@@ -1291,6 +1410,30 @@ fn validate_rpc_addr(
         bail!("TARIT_PRODUCTION requires HTTPS peer RPC and forbids insecure peer HTTP");
     }
     Ok(())
+}
+
+/// Comma-separated IPv4 or IPv6 resolver addresses, at most three (what a
+/// guest's resolv.conf uses).
+fn parse_guest_dns(value: Option<&str>) -> Result<Vec<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let servers = value
+        .split(',')
+        .map(|server| {
+            let server = server.trim();
+            server
+                .parse::<std::net::IpAddr>()
+                .map(|address| address.to_string())
+                .map_err(|_| {
+                    anyhow::anyhow!("TARIT_GUEST_DNS entry {server:?} is not an IP address")
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if servers.len() > 3 {
+        bail!("TARIT_GUEST_DNS allows at most three resolvers");
+    }
+    Ok(servers)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1648,6 +1791,15 @@ fn warm_pool_draft_from_file(file_config: Option<&FileConfig>) -> WarmPoolDraft 
             if let Some(weight) = f.refill_cpu_weight {
                 draft.refill_cgroup.cpu_weight = normalize_cpu_weight(weight);
             }
+            if let Some(classes) = f.learn_classes {
+                draft.learn.max_classes = classes;
+            }
+            if let Some(target) = f.learn_target {
+                draft.learn.target = target;
+            }
+            if let Some(secs) = f.learn_idle_secs {
+                draft.learn.idle = Duration::from_secs(secs.max(1));
+            }
             if !f.class.is_empty() {
                 draft.classes = f.class.iter().map(WarmClassSpec::from_file).collect();
             }
@@ -1710,6 +1862,25 @@ fn apply_warm_pool_env(draft: &mut WarmPoolDraft) {
                 first.image = Some(image.trim().to_string());
             }
         }
+    }
+    if let Ok(command) = env::var("TARIT_WARM_POOL_PREWARM") {
+        if !command.trim().is_empty() {
+            if let Some(first) = draft.classes.first_mut() {
+                first.prewarm = Some(command.trim().to_string());
+            }
+        }
+    }
+    if let Some(classes) = env_usize("TARIT_WARM_POOL_LEARN_CLASSES") {
+        draft.learn.max_classes = classes;
+    }
+    if let Some(target) = env_usize("TARIT_WARM_POOL_LEARN_TARGET") {
+        draft.learn.target = target;
+    }
+    if let Some(secs) = env::var("TARIT_WARM_POOL_LEARN_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        draft.learn.idle = Duration::from_secs(secs.max(1));
     }
     if let Ok(path) = env::var("TARIT_REFILL_CGROUP") {
         draft.refill_cgroup.path = non_empty_path(&path);
@@ -1782,6 +1953,25 @@ fn env_bool_checked(key: &str, default: bool) -> Result<bool> {
         }),
         Err(_) => Ok(default),
     }
+}
+
+/// The VM slot count when TARIT_MAX_VMS is unset: one slot per schedulable
+/// vCPU, never fewer than the historical 32.
+fn default_max_vms(max_vcpus: u64) -> usize {
+    usize::try_from(max_vcpus).unwrap_or(usize::MAX).max(32)
+}
+
+/// Total host memory in MiB from /proc/meminfo, if readable.
+fn host_memory_mib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    (kib >= 1024).then_some(kib / 1024)
 }
 
 fn env_positive_u64(key: &str, default: u64) -> Result<u64> {
@@ -1991,6 +2181,15 @@ fn validate_watermark_pair(prefix: &str, high: Option<u64>, low: Option<u64>) ->
 fn env_positive_usize(key: &str, default: usize) -> Result<usize> {
     let value = env_positive_u64(key, default as u64)?;
     usize::try_from(value).with_context(|| format!("{key} exceeds this platform's size limit"))
+}
+
+fn env_optional_positive_usize(key: &str) -> Result<Option<usize>> {
+    env_optional_positive_u64(key)?
+        .map(|value| {
+            usize::try_from(value)
+                .with_context(|| format!("{key} exceeds this platform's size limit"))
+        })
+        .transpose()
 }
 
 fn env_usize(key: &str) -> Option<usize> {
@@ -2252,6 +2451,25 @@ mod tests {
     }
 
     #[test]
+    fn a_refill_continues_across_rounds_until_the_pool_is_at_target() {
+        let class = WarmClassSpec::default_class().finish().unwrap();
+        let mut filling = false;
+
+        assert_eq!(class.refill_round(6, &mut filling), 0, "not below low");
+        assert_eq!(class.refill_round(5, &mut filling), 3);
+        assert_eq!(
+            class.refill_round(7, &mut filling),
+            1,
+            "past low, not at target"
+        );
+        assert_eq!(class.refill_round(8, &mut filling), 0);
+        assert_eq!(class.refill_round(7, &mut filling), 0, "refill finished");
+        assert_eq!(class.refill_round(0, &mut filling), 8);
+        assert_eq!(class.refill_round(10, &mut filling), 0);
+        assert!(!filling);
+    }
+
+    #[test]
     fn warm_pool_config_parses_explicit_watermarks_and_refill_cgroup() {
         let file: FileConfig = toml::from_str(
             r#"
@@ -2271,6 +2489,7 @@ mod tests {
             high_watermark = 11
             restore = true
             rootfs = "target/taritd-config-test/rootfs.ext4"
+            prewarm = "node -e 0"
             "#,
         )
         .unwrap();
@@ -2293,6 +2512,7 @@ mod tests {
         assert_eq!(class.target, 8);
         assert_eq!(class.high_watermark, 11);
         assert!(class.restore);
+        assert_eq!(class.prewarm.as_deref(), Some("node -e 0"));
         assert_eq!(
             class.rootfs,
             Some(PathBuf::from("target/taritd-config-test/rootfs.ext4"))
@@ -2330,6 +2550,13 @@ mod tests {
         let error = parse_vm_jail_config(4).expect_err("partial jail config must fail");
         assert!(error.to_string().contains("TARIT_VM_JAIL_UID_BASE"));
         std::env::remove_var("TARIT_VM_JAIL_BASE");
+    }
+
+    #[test]
+    fn the_default_vm_cap_follows_the_vcpu_ceiling() {
+        assert_eq!(super::default_max_vms(8), 32);
+        assert_eq!(super::default_max_vms(48), 48);
+        assert_eq!(super::default_max_vms(512), 512);
     }
 
     #[test]

@@ -28,6 +28,7 @@
 #include <pty.h>
 #include <sys/mount.h>
 #include <sys/random.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #endif
@@ -462,6 +463,24 @@ static bool dev_filesystem_is_mounted(void) {
  * the pseudo-filesystems a normal init would, so /dev/urandom, /dev/null, /proc
  * etc. exist for the workload (node reads /dev/urandom at startup). Must run
  * before we open the serial device, since /dev/ttyS0 lives on devtmpfs. */
+/* As PID 1 nothing else brings up loopback, and sandboxed programs talk to
+ * their own local servers over 127.0.0.1. The kernel assigns 127.0.0.1/8 and
+ * ::1 when the interface comes up. */
+static void bring_up_loopback(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        return;
+    }
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    strncpy(request.ifr_name, "lo", IFNAMSIZ - 1);
+    if (ioctl(fd, SIOCGIFFLAGS, &request) == 0 && (request.ifr_flags & IFF_UP) == 0) {
+        request.ifr_flags = (short)(request.ifr_flags | IFF_UP | IFF_RUNNING);
+        (void)ioctl(fd, SIOCSIFFLAGS, &request);
+    }
+    close(fd);
+}
+
 static void setup_as_init(void) {
     mount_pseudo("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
     mount_pseudo("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL);
@@ -484,6 +503,7 @@ static void setup_as_init(void) {
     mount_pseudo("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
     mount_pseudo("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755");
     mount_pseudo("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777");
+    bring_up_loopback();
 
     /* Give children a usable PATH regardless of the image's shell profile. */
     if (getenv("PATH") == NULL) {
@@ -683,6 +703,92 @@ static int memory_online(const char *command) {
 }
 #endif
 
+#ifdef __linux__
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+
+/* Wait for the command to exit while watching the host connection. A command
+ * can close its output and keep running (`exec >/dev/null 2>&1; sleep 600`);
+ * the host must still be able to abandon it. Returns the exit code, or -1
+ * with *host_gone set once the host has dropped the connection. A pidfd
+ * wakes the wait the moment the child exits; without one (kernels before
+ * 5.3) the child is checked every 20 ms. */
+static int wait_for_child_or_host(pid_t pid, int host_fd, bool *host_gone) {
+    int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+    for (;;) {
+        int status;
+        pid_t reaped = waitpid(pid, &status, WNOHANG);
+        if (reaped == pid) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            return status_to_exit_code(status);
+        }
+        if (reaped < 0 && errno != EINTR) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            return 127;
+        }
+        struct pollfd pfds[2];
+        pfds[0].fd = host_fd;
+        pfds[0].events = POLLRDHUP;
+        pfds[0].revents = 0;
+        pfds[1].fd = pidfd;
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+        int prc = poll(pfds, pidfd >= 0 ? 2 : 1, pidfd >= 0 ? -1 : 20);
+        if (prc < 0 && errno != EINTR) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            return wait_for_child(pid);
+        }
+        if (prc > 0 && (pfds[0].revents & (POLLRDHUP | POLLHUP | POLLERR))) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            *host_gone = true;
+            return -1;
+        }
+    }
+}
+#endif
+
+/* Run a command in the exec child. Commands go through /bin/sh so pipes,
+ * redirects and quoting work. Images without a shell (distroless, scratch)
+ * still run plain commands: the line is split on spaces and tabs and
+ * executed directly from PATH. Returns only if nothing could be executed. */
+static void exec_command(const char *command) {
+    execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+    if (errno != ENOENT) {
+        return;
+    }
+    char *line = strdup(command);
+    if (line == NULL) {
+        return;
+    }
+    /* A line of n bytes holds at most n/2 + 1 words, so every argument fits:
+     * a command must never run with some of its arguments dropped. */
+    char **argv = calloc(strlen(line) / 2 + 2, sizeof(char *));
+    if (argv == NULL) {
+        free(line);
+        return;
+    }
+    size_t argc = 0;
+    for (char *save = NULL, *word = strtok_r(line, " \t", &save); word != NULL;
+         word = strtok_r(NULL, " \t", &save)) {
+        argv[argc++] = word;
+    }
+    argv[argc] = NULL;
+    if (argc > 0) {
+        execvp(argv[0], argv);
+    }
+    free(argv);
+    free(line);
+}
+
 static void run_command(int serial_fd, const char *command) {
     int pipefd[2];
     bool wrote_output = false;
@@ -741,7 +847,7 @@ static void run_command(int serial_fd, const char *command) {
             _exit(127);
         }
         close(pipefd[1]);
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        exec_command(command);
         _exit(127);
     }
 
@@ -968,6 +1074,9 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     }
 
     if (pid == 0) {
+        /* Own process group, so a command the host abandoned can be killed
+         * with everything it started in the foreground. */
+        (void)setpgid(0, 0);
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
         if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || dup2(stderr_pipe[1], STDERR_FILENO) < 0) {
@@ -975,27 +1084,39 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
         }
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        exec_command(command);
         _exit(127);
     }
 
+    (void)setpgid(pid, pid);
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
-    struct pollfd pfds[2];
+    /* Also watch the host connection. A host-side timeout drops it; without
+     * noticing, the agent would keep waiting on the command and every later
+     * exec (and a clone's entropy repair) would queue behind it. */
+    struct pollfd pfds[3];
     pfds[0].fd = stdout_pipe[0];
     pfds[0].events = POLLIN;
     pfds[0].revents = 0;
     pfds[1].fd = stderr_pipe[0];
     pfds[1].events = POLLIN;
     pfds[1].revents = 0;
+    pfds[2].fd = fd;
+    pfds[2].events = POLLRDHUP;
+    pfds[2].revents = 0;
+    bool host_gone = false;
 
-    while (pfds[0].fd >= 0 || pfds[1].fd >= 0) {
-        int prc = poll(pfds, 2, -1);
+    while (!host_gone && (pfds[0].fd >= 0 || pfds[1].fd >= 0)) {
+        int prc = poll(pfds, 3, -1);
         if (prc < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            break;
+        }
+        if (pfds[2].revents & (POLLRDHUP | POLLHUP | POLLERR)) {
+            host_gone = true;
             break;
         }
         for (size_t i = 0; i < 2; i++) {
@@ -1028,7 +1149,13 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     if (stderr_pipe[0] >= 0) {
         close(stderr_pipe[0]);
     }
-    (void)send_exec_exit(fd, request_id, wait_for_child(pid));
+    int exit_code = host_gone ? -1 : wait_for_child_or_host(pid, fd, &host_gone);
+    if (host_gone) {
+        (void)kill(-pid, SIGKILL);
+        (void)wait_for_child(pid);
+        return;
+    }
+    (void)send_exec_exit(fd, request_id, exit_code);
 }
 #endif
 
@@ -1147,6 +1274,62 @@ static int write_resolv_conf(char dns[][64], size_t dns_count) {
         return -1;
     }
     return close(fd);
+}
+
+/* Append `token` to dns[] when it is a literal IPv4 or IPv6 address. */
+static void add_boot_nameserver(char dns[][64], size_t *count, const char *token, size_t len) {
+    unsigned char addr[sizeof(struct in6_addr)];
+    char text[64];
+    if (*count >= 3 || len == 0 || len >= sizeof(text)) return;
+    memcpy(text, token, len);
+    text[len] = '\0';
+    if (inet_pton(AF_INET, text, addr) != 1 && inet_pton(AF_INET6, text, addr) != 1) return;
+    if (strcmp(text, "0.0.0.0") == 0) return;
+    memcpy(dns[(*count)++], text, len + 1);
+}
+
+/* Give a standalone guest a resolver at boot. `tarit.dns=ADDR[,ADDR]` on the
+ * kernel command line wins; otherwise use any nameservers the kernel learned
+ * from `ip=...:<dns0>:<dns1>` (published in /proc/net/pnp). An image that
+ * already ships a usable /etc/resolv.conf is left alone, and the orchestrator
+ * later rewrites it through the network repair when it provisions DNS. */
+static void configure_boot_dns(void) {
+    struct stat st;
+    if (stat("/etc/resolv.conf", &st) == 0 && st.st_size > 0) return;
+    char dns[3][64];
+    size_t count = 0;
+    char buf[4096];
+    int fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        buf[n > 0 ? n : 0] = '\0';
+        for (char *word = strtok(buf, " \n"); word != NULL; word = strtok(NULL, " \n")) {
+            if (strncmp(word, "tarit.dns=", 10) != 0) continue;
+            for (char *item = word + 10; *item != '\0';) {
+                size_t len = strcspn(item, ",");
+                add_boot_nameserver(dns, &count, item, len);
+                item += len + (item[len] == ',');
+            }
+        }
+    }
+    if (count == 0) {
+        FILE *pnp = fopen("/proc/net/pnp", "re");
+        char line[128];
+        while (pnp != NULL && fgets(line, sizeof(line), pnp) != NULL) {
+            if (strncmp(line, "nameserver ", 11) == 0) {
+                add_boot_nameserver(dns, &count, line + 11, strcspn(line + 11, " \n"));
+            }
+        }
+        if (pnp != NULL) fclose(pnp);
+    }
+    if (count == 0) return;
+    /* A dangling symlink (e.g. to systemd-resolved's stub) cannot be written
+     * through; replace it with a regular file. */
+    if (lstat("/etc/resolv.conf", &st) == 0 && S_ISLNK(st.st_mode)) {
+        (void)unlink("/etc/resolv.conf");
+    }
+    (void)write_resolv_conf(dns, count);
 }
 
 #ifdef __linux__
@@ -1879,6 +2062,13 @@ static void serve_pty_forever(void) {
 static void serve_vsock_forever(void) {
     char line[LINE_MAX_LEN];
     unsigned int reconnect_backoff_us = VSOCK_RECONNECT_BACKOFF_INITIAL_US;
+    /* Resolve the post-fork hook path once now, so its dentry (usually a
+     * negative one) is cached before any snapshot is taken. Each clone's
+     * repair then resolves it from memory instead of reading the root disk;
+     * the repair still opens the path for real, so a hook installed later
+     * runs as before. */
+    struct stat hook_st;
+    (void)lstat(POST_FORK_HOOK_PATH, &hook_st);
     for (;;) {
         int fd = vsock_connect_host();
         if (fd < 0) {
@@ -1942,6 +2132,7 @@ int main(void) {
     bool is_init = (getpid() == 1);
     if (is_init) {
         setup_as_init();
+        configure_boot_dns();
     }
 
 #ifdef __linux__
@@ -1975,6 +2166,16 @@ int main(void) {
     for (;;) {
         if (is_init) {
             reap_orphans();
+            /* Commands the host abandons leave orphans for init to reap, and
+             * commands mostly arrive over vsock, so wake at least once a
+             * second even while the serial line is idle. */
+            struct pollfd serial_pfd;
+            serial_pfd.fd = serial_fd;
+            serial_pfd.events = POLLIN;
+            serial_pfd.revents = 0;
+            if (poll(&serial_pfd, 1, 1000) == 0) {
+                continue;
+            }
         }
         int rc = read_line(serial_fd, line, sizeof(line), false);
         if (rc < 0) {

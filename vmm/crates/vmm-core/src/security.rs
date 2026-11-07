@@ -106,6 +106,7 @@ pub const VMM_SYSCALL_ALLOWLIST: &[&str] = &[
     "readv",
     "writev",
     "pread64",
+    "preadv",
     "pwrite64",
     // Thread sync
     "futex",

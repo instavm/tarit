@@ -12,6 +12,7 @@ from .create_pty_session_response_201 import CreatePtySessionResponse201
 from .create_share_request import CreateShareRequest
 from .create_ssh_key_body import CreateSshKeyBody
 from .create_vm_request import CreateVmRequest
+from .create_vm_request_egress import CreateVmRequestEgress
 from .create_volume_request import CreateVolumeRequest
 from .create_volume_request_provider import CreateVolumeRequestProvider
 from .egress_policy import EgressPolicy
@@ -42,6 +43,7 @@ from .set_vm_egress_policy_body import SetVmEgressPolicyBody
 from .share_record import ShareRecord
 from .share_token_response import ShareTokenResponse
 from .share_visibility import ShareVisibility
+from .snapshot import Snapshot
 from .snapshot_vm_body import SnapshotVmBody
 from .snapshot_vm_response_200 import SnapshotVmResponse200
 from .ssh_key_response import SshKeyResponse
@@ -72,6 +74,7 @@ __all__ = (
     "CreateShareRequest",
     "CreateSshKeyBody",
     "CreateVmRequest",
+    "CreateVmRequestEgress",
     "CreateVolumeRequest",
     "CreateVolumeRequestProvider",
     "EgressPolicy",
@@ -102,6 +105,7 @@ __all__ = (
     "ShareRecord",
     "ShareTokenResponse",
     "ShareVisibility",
+    "Snapshot",
     "SnapshotVmBody",
     "SnapshotVmResponse200",
     "SshKeyResponse",

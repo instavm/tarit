@@ -119,6 +119,41 @@ pub struct BootSetup {
     pub initramfs_size: u64,
 }
 
+/// The guest-physical range an ELF (`vmlinux`) kernel's loadable segments
+/// occupy, as `(start, end)`, or `None` for any other image or a header
+/// that cannot be read. Lets the VMM prepare that memory before loading.
+pub fn elf_load_extent<P: AsRef<Path>>(path: P) -> Option<(u64, u64)> {
+    const PT_LOAD: u32 = 1;
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header).ok()?;
+    // 64-bit little-endian ELF only, as the loader accepts.
+    if &header[..4] != ELF_MAGIC || header[4] != 2 || header[5] != 1 {
+        return None;
+    }
+    let u16_at = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    let u64_at = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    let phoff = u64_at(&header, 32);
+    let phentsize = usize::from(u16_at(&header, 54));
+    let phnum = usize::from(u16_at(&header, 56));
+    if phentsize < 56 || phnum == 0 || phnum > 64 {
+        return None;
+    }
+    let mut table = vec![0u8; phentsize * phnum];
+    file.seek(SeekFrom::Start(phoff)).ok()?;
+    file.read_exact(&mut table).ok()?;
+    let mut extent: Option<(u64, u64)> = None;
+    for entry in table.chunks_exact(phentsize) {
+        if u32::from_le_bytes(entry[..4].try_into().unwrap()) != PT_LOAD {
+            continue;
+        }
+        let start = u64_at(entry, 24); // p_paddr
+        let end = start.checked_add(u64_at(entry, 40))?; // p_memsz
+        extent = Some(extent.map_or((start, end), |(lo, hi)| (lo.min(start), hi.max(end))));
+    }
+    extent.filter(|(start, end)| end > start)
+}
+
 fn detect_kernel_image_type(file: &mut File) -> Result<KernelImageType> {
     file.seek(SeekFrom::Start(0))
         .map_err(|e| LoaderError::InvalidKernel(format!("seek kernel header: {e}")))?;
@@ -573,6 +608,48 @@ pub fn load_and_setup_boot<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 64-bit little-endian ELF header with the given program headers,
+    /// each `(p_type, p_paddr, p_memsz)`.
+    fn elf_with_segments(segments: &[(u32, u64, u64)]) -> Vec<u8> {
+        let mut image = vec![0u8; 64];
+        image[..4].copy_from_slice(ELF_MAGIC);
+        image[4] = 2; // ELFCLASS64
+        image[5] = 1; // little-endian
+        image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        image[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        image[56..58].copy_from_slice(&(segments.len() as u16).to_le_bytes());
+        for &(kind, paddr, memsz) in segments {
+            let mut entry = [0u8; 56];
+            entry[..4].copy_from_slice(&kind.to_le_bytes());
+            entry[24..32].copy_from_slice(&paddr.to_le_bytes());
+            entry[40..48].copy_from_slice(&memsz.to_le_bytes());
+            image.extend_from_slice(&entry);
+        }
+        image
+    }
+
+    #[test]
+    fn elf_load_extent_spans_the_loadable_segments() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tarit-elf-extent-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            elf_with_segments(&[
+                (1, 0x100_0000, 0xe9_4fcc),
+                (4, 0x10, 0x1000_0000), // PT_NOTE: ignored
+                (1, 0x214_2000, 0x2e_a000),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(elf_load_extent(&path), Some((0x100_0000, 0x242_c000)));
+        std::fs::write(&path, b"not an elf image at all").unwrap();
+        assert_eq!(elf_load_extent(&path), None);
+        std::fs::write(&path, elf_with_segments(&[(4, 0, 0x1000)])).unwrap();
+        assert_eq!(elf_load_extent(&path), None, "no loadable segment");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(elf_load_extent(&path), None, "missing file");
+    }
 
     /// Read a field from a packed struct safely (avoiding unaligned refs).
     /// `boot_params` and `boot_e820_entry` are `#[repr(C, packed)]`, so

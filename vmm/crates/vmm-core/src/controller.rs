@@ -43,6 +43,8 @@ pub struct RunningVm {
     pub memory_device: Option<Arc<vmm_devices::virtio::mem::VirtioMemMmio>>,
     pub memory_irq_resample: Option<LevelIrqResample>,
     pub balloon_device: Option<Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>>,
+    /// virtio-rng transport, kept so snapshots carry its queue state.
+    pub rng_device: Option<Arc<vmm_devices::virtio::rng_transport::VirtioRngMmio>>,
     /// Reasserts the balloon's level IRQ after guest EOI when another virtio
     /// cause arrived during the interrupt-service window.
     pub balloon_irq_resample: Option<LevelIrqResample>,
@@ -58,6 +60,9 @@ pub struct RunningVm {
     /// they are closed when the VM stops — create/stop cycles must not leak fds
     /// (a PaaS churns through many thousands of VMs per host).
     pub keep_alive_fds: Vec<vmm_sys_util::eventfd::EventFd>,
+    /// KVM dirty logging was enabled before any vCPU ran, so every guest
+    /// write since this VM started is tracked.
+    pub dirty_logging_from_start: bool,
 }
 
 /// A VM instance with its memory available for snapshot.
@@ -74,6 +79,18 @@ pub struct VmInstance {
     /// incremental diff). `None` until the first snapshot. Enables diff chains:
     /// each diff references its parent so restore can replay base + diffs.
     pub last_snapshot: Option<String>,
+    /// Header of the full snapshot whose moment the dirty log is counted from,
+    /// set only right after a full snapshot is written or restored. A caller
+    /// that hands back a file with exactly this header (see
+    /// [`VmmController::snapshot_with_options`]) gets a full snapshot whose
+    /// pause covers only the pages dirtied since. Cleared by anything else that
+    /// consumes the dirty log (diff and live snapshots, suspend).
+    pub base_identity: Option<[u8; 32]>,
+    /// The snapshot this VM was restored from, held open while it is still the
+    /// dirty log's reference, so a checkpoint can use it as its base without
+    /// the caller naming (or keeping) the file. Only lazy and mapped restores
+    /// hold it, since those keep the file open for the VM's life anyway.
+    pub restore_base: Option<Arc<std::fs::File>>,
     /// VMM-owned scratch files removed when this VM stops or is dropped.
     pub transient_files: VmTransientFiles,
     /// True once KVM dirty-page logging has been enabled for this VM (after the
@@ -87,6 +104,9 @@ pub struct VmInstance {
     pub lazy_restore: Option<vmm_memory_backend::LazyRestore>,
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub running: Option<RunningVm>,
+    /// Keeps the process's private runtime directory in place while this VM
+    /// exists. Declared last, so it is released after everything above.
+    pub runtime_dir: RuntimeDirUse,
 }
 
 impl Drop for VmInstance {
@@ -98,7 +118,32 @@ impl Drop for VmInstance {
             self.lazy_restore = None;
         }
         self.transient_files.cleanup();
-        cleanup_private_runtime_dir();
+    }
+}
+
+/// VMs in this process (built or being built) that keep files in its private
+/// runtime directory. The directory is removed when the last one goes, under
+/// the same lock that registers a new one, so one VM's teardown cannot remove
+/// it while another VM is staging a socket or file there.
+static RUNTIME_DIR_USERS: Mutex<usize> = Mutex::new(0);
+
+#[derive(Debug)]
+pub struct RuntimeDirUse(());
+
+impl RuntimeDirUse {
+    pub(crate) fn acquire() -> Self {
+        *RUNTIME_DIR_USERS.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Self(())
+    }
+}
+
+impl Drop for RuntimeDirUse {
+    fn drop(&mut self) {
+        let mut users = RUNTIME_DIR_USERS.lock().unwrap_or_else(|e| e.into_inner());
+        *users = users.saturating_sub(1);
+        if *users == 0 {
+            cleanup_private_runtime_dir();
+        }
     }
 }
 
@@ -296,6 +341,11 @@ impl OwnedOverlayGuard {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn adopt(&mut self, files: Vec<OwnedScratchFile>) {
+        self.files.extend(files);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     fn disarm(mut self) -> Vec<OwnedScratchFile> {
         self.armed = false;
         std::mem::take(&mut self.files)
@@ -318,6 +368,14 @@ impl Drop for OwnedOverlayGuard {
 }
 
 /// The VMM controller — owns at most one VM (1:1 process model).
+/// See [`VmmController::net_counters`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetCounters {
+    pub tx_packets: u64,
+    pub rx_packets: u64,
+    pub vcpu_kicks: u64,
+}
+
 pub struct VmmController {
     vm: Arc<Mutex<Option<VmInstance>>>,
     lifecycle: Mutex<Option<LifecycleOp>>,
@@ -495,6 +553,8 @@ impl VmmController {
                 state: VmState::Paused,
                 created_at: std::time::Instant::now(),
                 last_snapshot: None,
+                base_identity: None,
+                restore_base: None,
                 transient_files: VmTransientFiles::default(),
                 dirty_logging: false,
                 config,
@@ -503,6 +563,7 @@ impl VmmController {
                 mem_dump: None,
                 lazy_restore: None,
                 running: None,
+                runtime_dir: RuntimeDirUse::acquire(),
             });
         }
 
@@ -513,6 +574,8 @@ impl VmmController {
                 state: VmState::Created,
                 created_at: std::time::Instant::now(),
                 last_snapshot: None,
+                base_identity: None,
+                restore_base: None,
                 transient_files: VmTransientFiles::default(),
                 dirty_logging: false,
                 config,
@@ -523,6 +586,7 @@ impl VmmController {
                 lazy_restore: None,
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
                 running: None,
+                runtime_dir: RuntimeDirUse::acquire(),
             });
         }
 
@@ -590,7 +654,41 @@ impl VmmController {
     }
 
     pub fn snapshot(&self, diff: bool) -> Result<String> {
+        self.snapshot_with_disks(diff, false).map(|(path, _)| path)
+    }
+
+    /// Take a full or diff snapshot. With `capture_disks`, also capture every
+    /// writable disk in the same pause: a CoW overlay is copied as an overlay
+    /// template, a disk written directly is copied as a disk template. The
+    /// snapshot's saved config points at the captures, so it can be restored
+    /// later, or forked many times, with each VM's disks seeded from the state
+    /// that matches the memory image. Returns the snapshot path and the
+    /// captured disks; all are VMM-owned scratch files until released.
+    pub fn snapshot_with_disks(
+        &self,
+        diff: bool,
+        capture_disks: bool,
+    ) -> Result<(String, Vec<String>)> {
+        self.snapshot_with_options(diff, capture_disks, None, false)
+    }
+
+    /// [`Self::snapshot_with_disks`] with an optional `base`: a full snapshot
+    /// file the caller kept from this VM's previous checkpoint. When it is
+    /// exactly the snapshot the dirty log is counted from, a full snapshot
+    /// writes only the pages dirtied since during the pause and copies the
+    /// rest from `base` after the guest resumes. Any other `base` (or none)
+    /// takes an ordinary full snapshot; the result is the same file either way.
+    /// With `resume_paused`, a VM the caller paused is resumed as soon as RAM
+    /// is captured, so the copy from `base` runs while the guest does.
+    pub fn snapshot_with_options(
+        &self,
+        diff: bool,
+        capture_disks: bool,
+        base: Option<&str>,
+        resume_paused: bool,
+    ) -> Result<(String, Vec<String>)> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Snapshot)?;
+        let started = std::time::Instant::now();
         let mut slot = self.lock();
         let vm = slot
             .as_mut()
@@ -654,6 +752,24 @@ impl VmmController {
         let mut consumed_dirty = None;
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
         let consumed_dirty = None;
+        #[cfg_attr(
+            not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")),
+            allow(unused_mut)
+        )]
+        let mut captured_disks: Vec<OwnedScratchFile> = Vec::new();
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let _ = capture_disks;
+        // Set when the untouched pages of file-backed RAM are copied from
+        // their backing files after the guest resumes.
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let mut deferred_full: Option<DeferredFullSnapshot> = None;
+        // Whether this snapshot is an incremental diff (which moves the dirty
+        // log's reference point to a file that cannot serve as a base).
+        let mut wrote_diff = false;
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let _ = base;
+        let paused_at = started.elapsed();
+        let mut disks_at = paused_at;
         let snapshot_result = (|| -> Result<usize> {
             // Fold the vCPU state each thread captured during the pause above into
             // the stored state blob, so this snapshot is faithfully resumable (not
@@ -664,6 +780,34 @@ impl VmmController {
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             capture_live_state(vm)?;
 
+            // Capture every writable disk in the same pause as memory.
+            // Read-only volumes never change, and inherited (orchestrator
+            // persistent) volumes deliberately live outside snapshots.
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            let mut volume_rewrites: Vec<(usize, CapturedDisk)> = Vec::new();
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            if capture_disks && vm.running.is_some() {
+                for (index, volume) in vm.config.volumes.iter().enumerate() {
+                    if volume.read_only || volume.inherited_fd.is_some() {
+                        continue;
+                    }
+                    let (captured, kind) = match volume.overlay.as_deref() {
+                        Some(upper) => (
+                            capture_snapshot_overlay(Path::new(upper))?,
+                            CapturedDisk::Overlay as fn(String) -> CapturedDisk,
+                        ),
+                        None => (
+                            capture_snapshot_disk(Path::new(&volume.path))?,
+                            CapturedDisk::Disk as fn(String) -> CapturedDisk,
+                        ),
+                    };
+                    volume_rewrites
+                        .push((index, kind(captured.path().to_string_lossy().into_owned())));
+                    captured_disks.push(captured);
+                }
+            }
+
+            disks_at = started.elapsed();
             // Write guest memory. When `diff` is requested and we have a parent
             // snapshot + KVM dirty logging on, write an INCREMENTAL snapshot: only
             // the pages dirtied since the parent, plus a pointer to the parent so
@@ -690,11 +834,70 @@ impl VmmController {
                 unsafe { std::slice::from_raw_parts(mem_ptr, mem_bytes) }
             };
             let state_blob: Vec<u8> = vm.state_blob.clone().unwrap_or_default();
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            let state_blob = if volume_rewrites.is_empty() {
+                state_blob
+            } else {
+                with_snapshot_volumes(&state_blob, &volume_rewrites)?
+            };
 
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             let want_diff = diff && vm.last_snapshot.is_some() && vm.dirty_logging;
             #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
             let want_diff = false;
+
+            wrote_diff = want_diff;
+            // A caller-supplied base that is exactly the snapshot the dirty
+            // log counts from lets a full snapshot skip every clean page.
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            // Pages the guest has not dirtied since then equal the base, so they
+            // are never read here, even while a lazy (UFFD) restore is still
+            // filling them in.
+            let base_plan = if want_diff || !vm.dirty_logging {
+                None
+            } else if vm.base_identity.is_none() {
+                log::debug!("snapshot: no base (the dirty log has no full-snapshot reference)");
+                None
+            } else {
+                vm.base_identity.as_ref().and_then(|identity| {
+                    base.and_then(|path| open_snapshot_base(path, identity, mem_slice.len()))
+                        .or_else(|| {
+                            let file = Arc::clone(vm.restore_base.as_ref()?);
+                            check_snapshot_base(
+                                file,
+                                identity,
+                                mem_slice.len(),
+                                "restored snapshot",
+                            )
+                        })
+                })
+            };
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            if let (Some((base_file, base_mem_offset, base_mem_crc)), Some(running)) =
+                (base_plan, vm.running.as_ref())
+            {
+                let mut dirty = running.kvm_vm.read_dirty()?;
+                let kvm_pages = dirty.len();
+                if let Some(guest_mem) = vm.guest_mem.as_ref() {
+                    dirty.merge(&guest_mem.drain_host_dirty());
+                }
+                consumed_dirty = Some(dirty.clone());
+                log::debug!(
+                    "snapshot: {} pages dirty since the base ({kvm_pages} by the guest), \
+                     the rest copied after resume",
+                    dirty.len()
+                );
+                deferred_full = Some(write_snapshot_memory_from_base(
+                    owned_snapshot.file(),
+                    &state_blob,
+                    mem_slice,
+                    &dirty,
+                    base_file,
+                    base_mem_offset,
+                    base_mem_crc,
+                )?);
+                return Ok(mem_slice.len());
+            }
 
             if want_diff {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -724,7 +927,60 @@ impl VmmController {
                     Ok(0)
                 }
             } else {
-                write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)?;
+                // Untouched pages of anonymous guest RAM are zero, and those of
+                // file-backed (mapped restore) RAM still hold their backing
+                // file's bytes, so neither is read during the pause. Lazily
+                // (UFFD) restored RAM, or RAM whose pagemap cannot be read, is
+                // read in full.
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+                let populated = vm
+                    .lazy_restore
+                    .is_none()
+                    .then(|| populated_pages(mem_slice.as_ptr(), mem_slice.len()))
+                    .flatten();
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+                let populated: Option<Vec<bool>> = None;
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+                let file_ranges = vm
+                    .guest_mem
+                    .as_ref()
+                    .filter(|guest_mem| guest_mem.is_file_backed())
+                    .map(|guest_mem| guest_mem.file_backed_ranges());
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+                match (file_ranges, populated.as_deref()) {
+                    (Some(ranges), Some(populated)) => {
+                        deferred_full = Some(write_snapshot_memory_deferred(
+                            owned_snapshot.file(),
+                            &state_blob,
+                            mem_slice,
+                            populated,
+                            &ranges,
+                        )?);
+                    }
+                    // File-backed RAM without a pagemap must be read in full.
+                    (Some(_), None) => write_scratch_snapshot_file(
+                        &owned_snapshot,
+                        &state_blob,
+                        mem_slice,
+                        None,
+                        false,
+                    )?,
+                    (None, populated) => write_scratch_snapshot_file(
+                        &owned_snapshot,
+                        &state_blob,
+                        mem_slice,
+                        populated,
+                        false,
+                    )?,
+                }
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+                write_scratch_snapshot_file(
+                    &owned_snapshot,
+                    &state_blob,
+                    mem_slice,
+                    populated.as_deref(),
+                    false,
+                )?;
                 // Enable dirty logging (idempotent) + drain the initial bitmap so the
                 // next snapshot can diff against this full baseline.
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -738,7 +994,10 @@ impl VmmController {
                                         let host_dirty = guest_mem.drain_host_dirty();
                                         dirty.merge(&host_dirty);
                                     }
-                                    consumed_dirty = Some(dirty);
+                                    match consumed_dirty.as_mut() {
+                                        Some(consumed) => consumed.merge(&dirty),
+                                        None => consumed_dirty = Some(dirty),
+                                    }
                                 }
                             }
                             ok
@@ -753,6 +1012,7 @@ impl VmmController {
             }
         })();
 
+        let written_at = started.elapsed();
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let io_resume_result = if io_paused_here {
             resume_running_io(vm)
@@ -779,27 +1039,91 @@ impl VmmController {
             vm.state = state_before;
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        let snapshot_result = match resume_result {
-            Ok(()) => snapshot_result,
-            Err(error) => Err(error),
+        let snapshot_result = match (resume_result, snapshot_result) {
+            (Ok(()), Ok(mem_len)) if resume_paused && state_before == VmState::Paused => {
+                resume_paused_vm(vm).map(|()| mem_len)
+            }
+            (Ok(()), snapshot_result) => snapshot_result,
+            (Err(error), _) => Err(error),
         };
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let _ = resume_paused;
         let mem_len = match snapshot_result {
             Ok(mem_len) => mem_len,
             Err(error) => {
                 replay_consumed_dirty(vm, consumed_dirty.as_ref());
                 remove_owned_scratch_file(&owned_snapshot);
+                for disk in &captured_disks {
+                    remove_owned_scratch_file(disk);
+                }
                 return Err(error);
             }
         };
+        let resumed_at = started.elapsed();
+        // The guest is running again; finish a deferred snapshot from its
+        // immutable backing files before the file is published.
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        if let Some(pending) = deferred_full.take() {
+            let used_base = pending.verify_base.is_some();
+            if let Err(error) = finish_deferred_snapshot(owned_snapshot.file(), pending) {
+                replay_consumed_dirty(vm, consumed_dirty.as_ref());
+                // A base that failed (say, its CRC no longer matches) is not
+                // offered again: the next snapshot is an ordinary full one.
+                if used_base {
+                    vm.base_identity = None;
+                    vm.restore_base = None;
+                }
+                remove_owned_scratch_file(&owned_snapshot);
+                for disk in &captured_disks {
+                    remove_owned_scratch_file(disk);
+                }
+                return Err(error);
+            }
+        }
         if let Err(error) = persist_owned_output(&mut owned_snapshot, &path_buf) {
             replay_consumed_dirty(vm, consumed_dirty.as_ref());
             remove_owned_scratch_file(&owned_snapshot);
+            for disk in &captured_disks {
+                remove_owned_scratch_file(disk);
+            }
             return Err(error);
         }
         vm.last_snapshot = Some(path.clone());
+        // The dirty log now counts from this snapshot. Only a full snapshot
+        // can serve as a later base.
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        {
+            vm.restore_base = None;
+            vm.base_identity = if wrote_diff || !vm.dirty_logging {
+                None
+            } else {
+                full_snapshot_identity_of(owned_snapshot.file())
+            };
+        }
+        let _ = wrote_diff;
         vm.transient_files.add_snapshot(owned_snapshot);
-        log::info!("VM: snapshot saved to {path} ({mem_len} bytes mem, diff={diff})");
-        Ok(path)
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        let disk_paths = captured_disks
+            .into_iter()
+            .map(|disk| {
+                let disk_path = disk.path().to_string_lossy().into_owned();
+                vm.transient_files.add_live_snapshot_owned(disk);
+                disk_path
+            })
+            .collect::<Vec<_>>();
+        // Disk capture needs a running KVM VM, so other builds never fill it.
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        let disk_paths: Vec<String> = captured_disks.into_iter().map(|_| unreachable!()).collect();
+        log::info!(
+            "VM: snapshot saved to {path} ({mem_len} bytes mem, diff={diff}, {} disk(s) captured)",
+            disk_paths.len()
+        );
+        log::debug!(
+            "snapshot phases: paused {paused_at:?}, disks {disks_at:?}, memory {written_at:?}, \
+             resumed {resumed_at:?}, persisted {:?}",
+            started.elapsed()
+        );
+        Ok((path, disk_paths))
     }
 
     /// Transfer an exact, currently-owned scratch artifact to the caller.
@@ -821,6 +1145,8 @@ impl VmmController {
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     pub fn create_live(&self, config: VmConfig) -> Result<()> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Create)?;
+        // Taken before the first runtime file (the vsock socket) is staged.
+        let runtime_dir = RuntimeDirUse::acquire();
         use crate::vcpu_thread::VcpuThread;
         use vmm_loader::load;
         use vmm_memory_backend::GuestMemory;
@@ -845,6 +1171,18 @@ impl VmmController {
         } else {
             config.kernel.cmdline.clone()
         };
+        // Configure the guest's eth0 at boot from the NIC's guest_ip unless the
+        // caller (for example the orchestrator) already passes `ip=`.
+        if !cmdline
+            .split_whitespace()
+            .any(|word| word.starts_with("ip="))
+        {
+            if let Some(fragment) = config.net.first().and_then(guest_ip_boot_fragment) {
+                log::info!("net: configuring guest eth0 with {fragment}");
+                cmdline.push(' ');
+                cmdline.push_str(&fragment);
+            }
+        }
 
         // Auto-online plugged virtio-mem blocks unless the caller chose a
         // policy (e.g. `online_movable`, which makes later unplug reliable).
@@ -879,6 +1217,7 @@ impl VmmController {
             blk_io_evts,
             blk_mmio_bases,
             nets,
+            rng,
             rng_irq,
             vsock,
             balloon,
@@ -893,6 +1232,7 @@ impl VmmController {
                 kernel_path.display()
             )));
         }
+        back_kernel_with_huge_pages(&mem, &kernel_path);
         let loaded = load(
             &mem.inner,
             &kernel_path,
@@ -915,6 +1255,21 @@ impl VmmController {
         let template = crate::cpu_template::CpuTemplate::bare();
         let kvm_vm =
             crate::kvm::KvmVm::new_with_options(mem.clone(), devices, template, full_boot)?;
+        // Overlap the slow resampler registration with the rest of the wiring.
+        let balloon_irqfd = balloon
+            .as_ref()
+            .map(|wired| {
+                kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
+            })
+            .transpose()?;
+        let memory_irqfd = memory
+            .as_ref()
+            .map(|wired| {
+                kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
+            })
+            .transpose()?;
+        // Install the remaining devices' interrupt routes in one update.
+        kvm_vm.defer_gsi_routing();
 
         // Expose a fresh generation value from the first boot. The eventfd is
         // registered now and kept alive for the VM lifetime; it is triggered
@@ -936,7 +1291,7 @@ impl VmmController {
         {
             kvm_vm.register_ioeventfd_datamatch(mmio_base + 0x50, &io_evt, 0)?;
             use std::os::fd::AsRawFd;
-            let io_loop = vmm_devices::virtio::blk_io_loop::spawn_blk_io_loop(
+            let io_loop = vmm_devices::virtio::blk_io_loop::start_blk_io_loop(
                 Arc::clone(device),
                 io_evt.as_raw_fd(),
             )
@@ -972,10 +1327,10 @@ impl VmmController {
         ));
         irq_evts.push(serial_evt);
 
-        // virtio-net: register an irqfd + a TX-queue ioeventfd per device and
-        // spawn its host<->tap I/O loop. The guest's TX kick lands on the I/O
-        // thread instead of exiting the vCPU. NetIoLoop + Tap are kept alive
-        // in RunningVm and dropped (loop first) on stop.
+        // virtio-net: register an irqfd and the receive and transmit queue
+        // kicks per device, and spawn its host<->tap I/O loop. Both kicks land
+        // on the I/O thread instead of exiting the vCPU. NetIoLoop + Tap are
+        // kept alive in RunningVm and dropped (loop first) on stop.
         let mut net_io_loops = Vec::new();
         let mut net_devices = Vec::new();
         let mut taps = Vec::new();
@@ -989,13 +1344,13 @@ impl VmmController {
                 mmio_base,
             } = net;
             kvm_vm.register_irqfd(&irq_evt, irq)?;
-            kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt)?;
+            kvm_vm.register_queue_notify(mmio_base + 0x50, &io_evt, 2)?;
             let tap_fd = tap.fd;
             let kick_fd = {
                 use std::os::fd::AsRawFd;
                 io_evt.as_raw_fd()
             };
-            let io_loop = vmm_devices::virtio::net_io_loop::spawn_net_io_loop(
+            let io_loop = vmm_devices::virtio::net_io_loop::start_net_io_loop(
                 dev.clone(),
                 tap_fd,
                 kick_fd,
@@ -1017,18 +1372,14 @@ impl VmmController {
         }
 
         let memory_device = memory.as_ref().map(|wired| wired.device.clone());
-        let memory_irq_resample = match memory {
+        let mut memory_irq_resample = match memory {
             Some(wired) => {
-                kvm_vm.register_irqfd_with_resample(
-                    &wired.irq_evt,
-                    &wired.resample_evt,
-                    wired.irq,
-                )?;
                 let evt = wired
                     .irq_evt
                     .try_clone()
                     .map_err(|e| VmmError::Kvm(e.to_string()))?;
                 let loop_handle = LevelIrqResample::spawn(
+                    memory_irqfd,
                     move || wired.device.has_pending_interrupt(),
                     evt,
                     wired.resample_evt,
@@ -1039,14 +1390,10 @@ impl VmmController {
             None => None,
         };
         let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
-        let balloon_irq_resample = match balloon {
+        let mut balloon_irq_resample = match balloon {
             Some(wired) => {
-                kvm_vm.register_irqfd_with_resample(
-                    &wired.irq_evt,
-                    &wired.resample_evt,
-                    wired.irq,
-                )?;
                 let loop_handle = LevelIrqResample::spawn(
+                    balloon_irqfd,
                     move || wired.device.has_pending_interrupt(),
                     wired
                         .irq_evt
@@ -1065,7 +1412,7 @@ impl VmmController {
         // pump. A configured vsock device is an admitted control channel, so
         // worker or socket setup failure must fail creation rather than publish
         // a VM whose PTY/SSH/exec behavior differs from its configuration.
-        let (vsock_pump, vsock_exec, vsock_pty) = match vsock {
+        let (mut vsock_pump, vsock_exec, vsock_pty) = match vsock {
             Some(wv) => {
                 kvm_vm.register_irqfd(&wv.irq_evt, wv.irq)?;
                 irq_evts.push(wv.irq_evt);
@@ -1078,7 +1425,7 @@ impl VmmController {
                 use std::os::fd::AsRawFd;
                 let tx_kick_fd = wv.io_evt.as_raw_fd();
                 let device = wv.device;
-                let pump = vmm_devices::virtio::vsock_io_loop::spawn_vsock_pump(
+                let pump = vmm_devices::virtio::vsock_io_loop::start_vsock_pump(
                     device.clone(),
                     tx_kick_fd,
                 )
@@ -1110,6 +1457,10 @@ impl VmmController {
             None => (None, None, None),
         };
 
+        // The workers above started in parallel; each must have its sandbox
+        // in place before the guest runs.
+        wait_for_device_workers(&mut blk_io_loops, &mut net_io_loops, vsock_pump.as_mut())?;
+        kvm_vm.commit_gsi_routing()?;
         let vcpu = kvm_vm.create_vcpu(0)?;
         kvm_vm.setup_vcpu_for_bzimage_boot_full(&vcpu, &loaded, full_boot)?;
         let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
@@ -1130,6 +1481,13 @@ impl VmmController {
             log::info!("SMP: AP vCPU {id} created (UNINITIALIZED, awaiting SIPI)");
         }
 
+        for resample in [memory_irq_resample.as_mut(), balloon_irq_resample.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            resample.finish_registration()?;
+        }
+
         let state_blob = serialize_state_blob(
             loaded.entry,
             mem.size_bytes,
@@ -1142,6 +1500,8 @@ impl VmmController {
             state: VmState::Running,
             created_at: std::time::Instant::now(),
             last_snapshot: None,
+            base_identity: None,
+            restore_base: None,
             transient_files: VmTransientFiles::from_owned_overlays(overlay_guard.disarm()),
             dirty_logging: false,
             config,
@@ -1161,6 +1521,7 @@ impl VmmController {
                 memory_device,
                 memory_irq_resample,
                 balloon_device,
+                rng_device: Some(rng),
                 balloon_irq_resample,
                 taps,
                 vsock_pump,
@@ -1168,7 +1529,9 @@ impl VmmController {
                 vsock_pty,
                 // Own the irqfd EventFds so they're closed on stop (no fd leak).
                 keep_alive_fds: irq_evts,
+                dirty_logging_from_start: false,
             }),
+            runtime_dir,
         });
 
         log::info!("VM: created (live, full_boot={full_boot}) — vCPU executing in background");
@@ -1197,6 +1560,9 @@ impl VmmController {
                     "live snapshot requires a running VM".into(),
                 ));
             }
+            // A live snapshot consumes the dirty log.
+            vm.base_identity = None;
+            vm.restore_base = None;
             let mem = vm
                 .guest_mem
                 .clone()
@@ -1378,7 +1744,7 @@ impl VmmController {
             Ok(manifest)
         });
         remove_owned_scratch_file(&memory_stage);
-        let manifest = match write {
+        let mut manifest = match write {
             Ok(manifest) => manifest,
             Err(error) => {
                 replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
@@ -1389,6 +1755,17 @@ impl VmmController {
                 return Err(error);
             }
         };
+        // The working set is only a hint for restores of this snapshot; keep
+        // the chunks that exist in its RAM and never fail a snapshot over it.
+        let ram_chunks = manifest
+            .artifact(tarit_proto::ArtifactKind::Ram)
+            .map_or(0, |ram| ram.chunk_hashes.len());
+        manifest.working_set = output
+            .working_set
+            .iter()
+            .copied()
+            .filter(|&chunk| (chunk as usize) < ram_chunks)
+            .collect();
         if let Err(error) = persist_owned_output(&mut owned_live_path, &live_path) {
             replay_live_snapshot_dirty(self, generation, &output.consumed_dirty);
             remove_owned_scratch_file(&owned_live_path);
@@ -1637,9 +2014,11 @@ impl VmmController {
         use std::time::Instant;
 
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Restore)?;
+        let runtime_dir = RuntimeDirUse::acquire();
         let start = Instant::now();
         let restored =
             restore_snapshot_with_policy(snapshot_path, memory_policy, memory_integrity.as_ref())?;
+        let memory_loaded = start.elapsed();
         let RestoredSnapshot {
             mem,
             state_blob,
@@ -1736,11 +2115,13 @@ impl VmmController {
         };
         apply_restore_network_override(&mut config, net_override)?;
         apply_restore_volume_override(&mut config, volume_override)?;
-        let overlay_guard = match overlay.as_deref() {
+        relocate_moved_snapshot_disks(&mut config, snapshot_path);
+        let mut overlay_guard = match overlay.as_deref() {
             Some(target) => prepare_restore_overlay(&config, target)?,
             None => OwnedOverlayGuard::from_created(Vec::new()),
         };
         apply_restore_overlay(&mut config, overlay)?;
+        overlay_guard.adopt(privatize_template_volumes(&mut config)?);
         config.validate()?;
 
         // Keep the owned state blob aligned with the restored config. Future
@@ -1758,6 +2139,7 @@ impl VmmController {
         // thread resumed). A live snapshot must fail closed if reconstruction
         // fails; publishing a paused memory-only VM would hide incompatibility
         // and expose partially restored state.
+        let config_ready = start.elapsed();
         let (running, state) = match vcpu_full.as_ref() {
             Some(fs) => {
                 let restored = RestoredRuntimeState {
@@ -1772,6 +2154,7 @@ impl VmmController {
                     balloon: balloon_state.as_ref(),
                     memory: saved.virtio_mem.as_ref(),
                     target_memory_mib,
+                    rng: saved.rng.as_ref(),
                 };
                 let running = build_running_vm(mem.clone(), &config, restored, entry)?;
                 (Some(running), VmState::Running)
@@ -1784,26 +2167,54 @@ impl VmmController {
             None => (None, VmState::Paused),
         };
         let resumed = running.is_some();
+        let vm_built = start.elapsed();
+        // With every guest write tracked since restore, the snapshot restored
+        // here is the parent of the next diff snapshot: restore, run, and
+        // checkpoint again writes only the pages the run touched.
+        let dirty_logging = running
+            .as_ref()
+            .is_some_and(|running| running.dirty_logging_from_start);
+        let last_snapshot = dirty_logging.then(|| {
+            std::fs::canonicalize(snapshot_path)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| snapshot_path.to_string())
+        });
+        let restored_source = dirty_logging
+            .then(|| open_snapshot_input(Path::new(snapshot_path)).ok())
+            .flatten();
+        let base_identity = restored_source.as_ref().and_then(full_snapshot_identity_of);
+        let restore_base = restored_source
+            .filter(|_| base_identity.is_some() && (lazy_restore.is_some() || mem.is_file_backed()))
+            .map(Arc::new);
+        log::debug!(
+            "restore: dirty logging {dirty_logging}, base identity {}, holding source {}",
+            base_identity.is_some(),
+            restore_base.is_some()
+        );
 
         let mut slot = self.lock();
         *slot = Some(VmInstance {
             generation: next_vm_generation(),
             state,
             created_at: std::time::Instant::now(),
-            last_snapshot: None,
+            last_snapshot,
+            base_identity,
+            restore_base,
             transient_files: VmTransientFiles::from_owned_overlays(overlay_guard.disarm()),
-            dirty_logging: false,
+            dirty_logging,
             config,
             guest_mem: Some(mem),
             state_blob: Some(state_blob),
             mem_dump: None,
             lazy_restore,
             running,
+            runtime_dir,
         });
         drop(slot);
         if resumed {
-            if let Err(error) =
-                await_clone_repair_barrier(self).and_then(|()| await_memory_online(self))
+            if let Err(error) = await_clone_repair_barrier(self)
+                .and_then(|()| self.finish_irq_registration())
+                .and_then(|()| await_memory_online(self))
             {
                 // A clone whose kernel/userspace state was not repaired must
                 // never become externally usable. Taking the instance drops
@@ -1817,6 +2228,11 @@ impl VmmController {
             "VM restored in {:?} ({})",
             start.elapsed(),
             if resumed { "running" } else { "paused" }
+        );
+        log::debug!(
+            "restore phases: memory {memory_loaded:?}, config {config_ready:?}, \
+             vm built {vm_built:?}, guest repaired {:?}",
+            start.elapsed()
         );
         Ok(())
     }
@@ -1883,6 +2299,8 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        vm.base_identity = None;
+        vm.restore_base = None;
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         {
@@ -1953,18 +2371,11 @@ impl VmmController {
             )));
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        resume_running_io(vm)?;
-        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-        if let Err(error) = resume_running_vcpus(vm) {
-            let rollback = pause_running_io(vm).err();
-            return Err(match rollback {
-                Some(rollback) => VmmError::Device(format!(
-                    "resume vCPUs: {error}; failed to re-quiesce I/O workers: {rollback}"
-                )),
-                None => error,
-            });
+        resume_paused_vm(vm)?;
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        {
+            vm.state = VmState::Running;
         }
-        vm.state = VmState::Running;
         log::info!("VM resumed");
         Ok(())
     }
@@ -2140,6 +2551,29 @@ impl VmmController {
         _shell: Option<String>,
     ) -> Result<()> {
         Err(VmmError::Kvm("AttachPty needs Linux+KVM+boot".into()))
+    }
+
+    /// Packet counters of each virtio-net device, in configuration order.
+    /// `vcpu_kicks` counts queue notifications the guest's vCPU had to hand
+    /// to the VMM itself; with every queue's kick routed to the device's I/O
+    /// thread it stays zero.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn net_counters(&self) -> Vec<NetCounters> {
+        let slot = self.lock();
+        slot.as_ref()
+            .and_then(|vm| vm.running.as_ref())
+            .map(|running| {
+                running
+                    .net_devices
+                    .iter()
+                    .map(|dev| NetCounters {
+                        tx_packets: dev.tx_packets.load(std::sync::atomic::Ordering::Relaxed),
+                        rx_packets: dev.rx_packets.load(std::sync::atomic::Ordering::Relaxed),
+                        vcpu_kicks: dev.notify_count.load(std::sync::atomic::Ordering::Relaxed),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -2650,6 +3084,33 @@ fn await_memory_online(controller: &VmmController) -> Result<()> {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+impl VmmController {
+    /// Finish interrupt registrations a restore started in the background
+    /// (the balloon's and, for a hotplug-ready VM, virtio-mem's). The joins
+    /// happen outside the controller lock.
+    fn finish_irq_registration(&self) -> Result<()> {
+        let pending: Vec<crate::kvm::PendingIrqfd> = {
+            let mut slot = self.lock();
+            let Some(running) = slot.as_mut().and_then(|vm| vm.running.as_mut()) else {
+                return Ok(());
+            };
+            [
+                running.memory_irq_resample.as_mut(),
+                running.balloon_irq_resample.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|resample| resample.registration.take())
+            .collect()
+        };
+        for mut pending in pending {
+            pending.finish()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
     use std::fmt::Write as _;
     use std::time::{Duration, Instant};
@@ -2757,7 +3218,12 @@ fn await_clone_repair_barrier(controller: &VmmController) -> Result<()> {
         if Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // Wake the moment the restored agent reconnects instead of polling;
+        // the bound only lets the loop re-check that the VM still exists.
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250));
+        channel.wait_until_connected(wait);
     }
 
     Err(VmmError::Device(
@@ -2906,6 +3372,10 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
                         None => format!("quiesce block I/O worker: {error}"),
                     },
                     vcpus_may_resume: rollback.is_none(),
+                    // The block worker stays healthy when it misses the
+                    // budget (a slow backing request is still in flight);
+                    // network and vsock workers are failed instead.
+                    retryable: rollback.is_none() && error.kind() == std::io::ErrorKind::TimedOut,
                 });
             }
         }
@@ -2920,6 +3390,7 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
                         None => format!("quiesce network I/O worker: {error}"),
                     },
                     vcpus_may_resume: rollback.is_none(),
+                    retryable: false,
                 });
             }
         }
@@ -2934,6 +3405,7 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
                         None => format!("quiesce vsock worker: {error}"),
                     },
                     vcpus_may_resume: rollback.is_none(),
+                    retryable: false,
                 });
             }
         }
@@ -2967,6 +3439,7 @@ fn resume_running_io_workers(running: &RunningVm) -> Result<()> {
         Err(VmmError::IoQuiescence {
             message: format!("resume I/O workers: {}", failures.join("; ")),
             vcpus_may_resume: false,
+            retryable: false,
         })
     }
 }
@@ -2985,6 +3458,24 @@ fn resume_running_io(vm: &VmInstance) -> Result<()> {
     if let Some(running) = vm.running.as_ref() {
         set_running_io_paused(running, false)?;
     }
+    Ok(())
+}
+
+/// Resume a Paused or Suspended VM: I/O workers first, then vCPUs. On
+/// failure the I/O workers are parked again and the VM stays paused.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn resume_paused_vm(vm: &mut VmInstance) -> Result<()> {
+    resume_running_io(vm)?;
+    if let Err(error) = resume_running_vcpus(vm) {
+        let rollback = pause_running_io(vm).err();
+        return Err(match rollback {
+            Some(rollback) => VmmError::Device(format!(
+                "resume vCPUs: {error}; failed to re-quiesce I/O workers: {rollback}"
+            )),
+            None => error,
+        });
+    }
+    vm.state = VmState::Running;
     Ok(())
 }
 
@@ -3091,6 +3582,10 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Vec<u
     b.virtio_blk = virtio_blk;
     b.virtio_net = virtio_net;
     b.vsock = Some(vsock_state);
+    b.rng = running
+        .rng_device
+        .as_ref()
+        .map(|device| vmm_devices::persist::Persist::save(&**device));
     encode_state_blob(&b, Some(&balloon))
         .map_err(|error| VmmError::Snapshot(format!("serialize live device state: {error}")))
 }
@@ -3141,7 +3636,9 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         let host_dirty = guest_mem.host_dirty_tracker();
         let state_blob = vm.state_blob.clone().unwrap_or_default();
         let state_len = u64::try_from(state_blob.len())
-            .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+            .ok()
+            .and_then(page_aligned_state_len)
+            .ok_or_else(|| VmmError::Snapshot("state blob too large".into()))?;
         let mem_len_u64 = u64::try_from(mem_len)
             .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
         let layout = full_snapshot_layout_for_lengths(state_len, mem_len_u64)
@@ -3156,7 +3653,10 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
             // we unregister the previous UFFD below.
             unsafe { std::slice::from_raw_parts(mem_ptr.cast_const(), mem_len) }
         };
-        if let Err(e) = write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)
+        // No populated-page hint: reading every page here is what resolves
+        // outstanding lazy-restore faults (see above).
+        if let Err(e) =
+            write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, None, false)
         {
             remove_owned_scratch_file(&owned_snapshot);
             return Err(e);
@@ -3182,6 +3682,26 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         // active until the full memory image has been copied above. Drop it only now
         // so the same range can be registered on the suspend image.
         vm.lazy_restore = None;
+
+        // Swap guest RAM for a private mapping of the image just written. That
+        // releases every resident page at once, and resume faults pages back
+        // from the page cache in the kernel with no userspace fault handler.
+        match guest_mem.map_file_private(&file, layout.mem_offset) {
+            Ok(()) => {
+                guest_mem.clear_lazy_page_discard();
+                drop_file_cache(&file, layout.mem_offset, layout.mem_len);
+                vm.transient_files.set_suspend_snapshot(owned_snapshot);
+                vm.state = VmState::Suspended;
+                log::info!(
+                    "VM: suspend image mapped at {path} ({} bytes guest RAM released)",
+                    layout.mem_len
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                log::warn!("suspend: mapping the image failed ({error}); using UFFD");
+            }
+        }
 
         let lazy_restore = match vmm_memory_backend::start_lazy_restore_in_place(
             mem_ptr,
@@ -3452,6 +3972,21 @@ fn staged_owned_output(target: &Path) -> Result<OwnedScratchFile> {
     })
 }
 
+/// Publish VMM-private scratch that is removed when this process exits. It
+/// skips every fsync: after a host crash the VM it belongs to is gone too.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn publish_volatile_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<()> {
+    owned.rename_to_volatile(target).map_err(|error| {
+        VmmError::Snapshot(format!(
+            "publish scratch output {}: {error}",
+            target.display()
+        ))
+    })
+}
+
 fn persist_owned_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<()> {
     owned.file().sync_all().map_err(|error| {
         VmmError::Snapshot(format!(
@@ -3474,6 +4009,244 @@ fn persist_owned_output(owned: &mut OwnedScratchFile, target: &Path) -> Result<(
 /// bytes and defeat the live-fork latency contract.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn capture_live_overlay(source: &Path) -> Result<OwnedScratchFile> {
+    capture_overlay(source, true)
+}
+
+/// Capture the writable disk upper while the VM is paused for a regular full
+/// or diff snapshot, so the snapshot carries the disk state that matches its
+/// memory. Reflinks when the filesystem supports it, otherwise copies only the
+/// overlay's allocated extents, which costs the bytes the guest has written.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn capture_snapshot_overlay(source: &Path) -> Result<OwnedScratchFile> {
+    let captured = capture_overlay(source, false)?;
+    mark_disk_template(&captured);
+    Ok(captured)
+}
+
+/// How a writable volume was captured by a disk-capturing snapshot.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+enum CapturedDisk {
+    /// Copy of the volume's CoW upper; the lower image is unchanged.
+    Overlay(String),
+    /// Copy of a disk the guest wrote directly; it becomes the lower image.
+    Disk(String),
+}
+
+/// Capture a disk the guest writes directly (no CoW upper) while the VM is
+/// paused. The source is not VMM-owned, so it is only opened read-only. The
+/// copy goes beside it when that directory is private (so a reflink can
+/// apply), otherwise into the VMM's private runtime directory.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn capture_snapshot_disk(source: &Path) -> Result<OwnedScratchFile> {
+    use std::os::unix::fs::MetadataExt;
+
+    let private_parent = source
+        .parent()
+        .and_then(|dir| std::fs::metadata(dir).ok())
+        .is_some_and(|meta| meta.uid() == nix_uid() && meta.mode() & 0o077 == 0);
+    let dir = match source.parent() {
+        Some(parent) if private_parent => parent.to_path_buf(),
+        _ => private_runtime_dir()?,
+    };
+    let target = crate::gc::owned_overlay_path(&dir, 0);
+    let mut captured = staged_owned_output(&target)?;
+    let copied = (|| -> std::io::Result<()> {
+        let mut source_file = std::fs::File::open(source)?;
+        let mut target_file = captured.file().try_clone()?;
+        copy_restore_overlay(&mut source_file, &mut target_file)
+    })();
+    if let Err(error) = copied {
+        remove_owned_scratch_file(&captured);
+        return Err(VmmError::Snapshot(format!(
+            "capture disk {}: {error}",
+            source.display()
+        )));
+    }
+    if let Err(error) = persist_owned_output(&mut captured, &target) {
+        remove_owned_scratch_file(&captured);
+        return Err(error);
+    }
+    mark_disk_template(&captured);
+    Ok(captured)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn nix_uid() -> u32 {
+    // SAFETY: getuid has no preconditions.
+    unsafe { libc::getuid() }
+}
+
+/// Mark a captured disk as a template that restores must never write.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn mark_disk_template(captured: &OwnedScratchFile) {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: valid fd, NUL-terminated name, and a one-byte readable value.
+    let marked = unsafe {
+        libc::fsetxattr(
+            captured.file().as_raw_fd(),
+            DISK_TEMPLATE_XATTR.as_ptr(),
+            b"1".as_ptr().cast(),
+            1,
+            0,
+        )
+    };
+    if marked != 0 {
+        log::warn!(
+            "snapshot: cannot mark captured disk {} as a template: {}; \
+             restores must pass an explicit overlay target",
+            captured.path().display(),
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// xattr on a disk overlay captured by a snapshot. Such an overlay is the
+/// disk half of the snapshot and must never be written by a restored VM.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const DISK_TEMPLATE_XATTR: &std::ffi::CStr = c"user.tarit.disk-template";
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn is_disk_template(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut value = [0u8; 4];
+    // SAFETY: NUL-terminated path and name, writable buffer of stated length.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            DISK_TEMPLATE_XATTR.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    n == 1 && value[0] == b'1'
+}
+
+/// A snapshot and its captured disks may be moved together. When a recorded
+/// disk or overlay path no longer exists but a file of the same name sits
+/// beside the snapshot, use that one.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn relocate_moved_snapshot_disks(config: &mut VmConfig, snapshot_path: &str) {
+    let Some(dir) = Path::new(snapshot_path).parent() else {
+        return;
+    };
+    let beside = |recorded: &str| -> Option<String> {
+        let recorded = Path::new(recorded);
+        if recorded.exists() {
+            return None;
+        }
+        let sibling = dir.join(recorded.file_name()?);
+        sibling.is_file().then(|| {
+            log::info!("restore: using {} beside the snapshot", sibling.display());
+            sibling.to_string_lossy().into_owned()
+        })
+    };
+    for volume in &mut config.volumes {
+        if let Some(moved) = volume.overlay.as_deref().and_then(beside) {
+            volume.overlay = Some(moved);
+        }
+        if volume.inherited_fd.is_none() {
+            if let Some(moved) = beside(&volume.path) {
+                volume.path = moved;
+            }
+        }
+    }
+}
+
+/// Give every volume that would otherwise write a captured template its own
+/// private upper in the VMM's runtime directory (removed when the VM stops):
+/// a template overlay is copied, and a template disk gets an empty overlay
+/// over it as the read-only lower. Templates therefore never change, and any
+/// number of VMs can be restored or forked from one snapshot at once.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn privatize_template_volumes(config: &mut VmConfig) -> Result<Vec<OwnedScratchFile>> {
+    let mut created: Vec<OwnedScratchFile> = Vec::new();
+    let result = (|| -> Result<()> {
+        for (index, volume) in config.volumes.iter_mut().enumerate() {
+            let template_upper = volume
+                .overlay
+                .as_deref()
+                .filter(|upper| is_disk_template(Path::new(upper)))
+                .map(PathBuf::from);
+            let template_disk = volume.overlay.is_none()
+                && !volume.read_only
+                && volume.inherited_fd.is_none()
+                && is_disk_template(Path::new(&volume.path));
+            if template_upper.is_none() && !template_disk {
+                continue;
+            }
+            // The private upper lives in this VMM's runtime directory and is
+            // removed on exit, so it is published without fsyncs.
+            let target = crate::gc::owned_overlay_path(&private_runtime_dir()?, index);
+            let owned = match template_upper {
+                Some(upper) => seed_overlay(&upper, &target, false)?,
+                None => {
+                    let mut owned = staged_owned_output(&target)?;
+                    let initialized =
+                        owned
+                            .file()
+                            .try_clone()
+                            .map_err(Into::into)
+                            .and_then(|mut file| {
+                                vmm_devices::virtio::blk_backend::init_volatile_cow_overlay(
+                                    &mut file,
+                                    Path::new(&volume.path),
+                                )
+                            });
+                    if let Err(error) = initialized {
+                        remove_owned_scratch_file(&owned);
+                        return Err(VmmError::Device(format!(
+                            "initialize private overlay for {}: {error}",
+                            volume.path
+                        )));
+                    }
+                    publish_volatile_output(&mut owned, &target)?;
+                    owned
+                }
+            };
+            volume.overlay = Some(target.to_string_lossy().into_owned());
+            created.push(owned);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        for file in &created {
+            remove_owned_scratch_file(file);
+        }
+        return Err(error);
+    }
+    Ok(created)
+}
+
+/// Return `blob` with each captured volume pointing at its capture, keeping
+/// every other field and trailer.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn with_snapshot_volumes(blob: &[u8], rewrites: &[(usize, CapturedDisk)]) -> Result<Vec<u8>> {
+    let (mut decoded, balloon, _) = decode_state_blob(blob)
+        .ok_or_else(|| VmmError::Snapshot("decode snapshot state for disk capture".into()))?;
+    for (index, capture) in rewrites {
+        let volume = decoded
+            .volumes
+            .get_mut(*index)
+            .ok_or_else(|| VmmError::Snapshot(format!("snapshot state has no volume {index}")))?;
+        match capture {
+            CapturedDisk::Overlay(path) => volume.overlay = Some(path.clone()),
+            CapturedDisk::Disk(path) => {
+                volume.path = path.clone();
+                volume.overlay = None;
+            }
+        }
+    }
+    encode_state_blob(&decoded, balloon.as_ref())
+        .map_err(|error| VmmError::Snapshot(format!("encode snapshot state: {error}")))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn capture_overlay(source: &Path, require_reflink: bool) -> Result<OwnedScratchFile> {
     use std::os::fd::AsRawFd;
 
     const FICLONE: libc::Ioctl = 0x4004_9409;
@@ -3511,11 +4284,30 @@ fn capture_live_overlay(source: &Path) -> Result<OwnedScratchFile> {
     };
     if cloned != 0 {
         let error = std::io::Error::last_os_error();
-        remove_owned_scratch_file(&captured);
-        return Err(VmmError::Snapshot(format!(
-            "atomic live disk snapshot requires reflink/FICLONE for {}: {error}",
-            source.display()
-        )));
+        let unsupported = matches!(
+            error.raw_os_error(),
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) | Some(libc::EXDEV) | Some(libc::EINVAL)
+        );
+        let copied = if require_reflink || !unsupported {
+            Err(error)
+        } else {
+            (|| -> std::io::Result<()> {
+                let mut source_file = source_owned.file().try_clone()?;
+                let mut target_file = captured.file().try_clone()?;
+                copy_sparse_restore_overlay(&mut source_file, &mut target_file)
+            })()
+        };
+        if let Err(error) = copied {
+            remove_owned_scratch_file(&captured);
+            return Err(VmmError::Snapshot(if require_reflink {
+                format!(
+                    "atomic live disk snapshot requires reflink/FICLONE for {}: {error}",
+                    source.display()
+                )
+            } else {
+                format!("capture disk overlay {}: {error}", source.display())
+            }));
+        }
     }
     if let Err(error) = persist_owned_output(&mut captured, &target) {
         remove_owned_scratch_file(&captured);
@@ -3534,6 +4326,16 @@ fn unique_suspend_snapshot_path() -> Result<String> {
         .into_owned())
 }
 
+/// Stored state length, including zero padding, that starts the RAM image of a
+/// full snapshot on a page boundary. Page-aligned RAM can be mapped straight
+/// into a restored guest and reflinked; readers already accept the padding.
+fn page_aligned_state_len(state_len: u64) -> Option<u64> {
+    const RAM_ALIGNMENT: u64 = 4096;
+    let unaligned = FULL_SNAPSHOT_HEADER_LEN.checked_add(state_len)?;
+    let aligned = unaligned.checked_add(RAM_ALIGNMENT - 1)? / RAM_ALIGNMENT * RAM_ALIGNMENT;
+    Some(aligned - FULL_SNAPSHOT_HEADER_LEN)
+}
+
 #[cfg(any(
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
@@ -3547,6 +4349,53 @@ fn full_snapshot_layout_for_lengths(state_len: u64, mem_len: u64) -> Option<Full
         mem_offset,
         mem_len,
     })
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+/// The byte ranges of `file` below `len` that hold data, from
+/// `SEEK_DATA`/`SEEK_HOLE`; everything else reads as zero. A filesystem that
+/// does not report holes reports the whole file as data.
+fn file_data_extents(file: &std::fs::File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let mut extents = Vec::new();
+    let mut at = 0u64;
+    while at < len {
+        let offset = libc::off_t::try_from(at)
+            .map_err(|_| std::io::Error::other("file offset does not fit off_t"))?;
+        // SAFETY: lseek on an open fd reads no memory.
+        let data = unsafe { libc::lseek(fd, offset, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break; // only a hole remains
+            }
+            return Err(error);
+        }
+        // SAFETY: as above.
+        let hole = unsafe { libc::lseek(fd, data, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let (start, end) = (data as u64, (hole as u64).min(len));
+        if start >= len {
+            break;
+        }
+        extents.push((start, end));
+        at = end;
+    }
+    Ok(extents)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+/// Whether `[at, at + len)` overlaps any of the sorted `extents`.
+fn ranges_overlap(extents: &[(u64, u64)], at: u64, len: u64) -> bool {
+    let end = at + len;
+    let first = extents.partition_point(|&(_, extent_end)| extent_end <= at);
+    extents
+        .get(first)
+        .is_some_and(|&(extent_start, _)| extent_start < end)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -3769,6 +4618,14 @@ fn reject_golden_overlay_target(
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
 fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile> {
+    seed_overlay(source, target, true)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn seed_overlay(source: &Path, target: &Path, durable: bool) -> Result<OwnedScratchFile> {
     if source == target {
         return Err(VmmError::InvalidConfig(format!(
             "restore overlay must differ from golden overlay: {}",
@@ -3796,7 +4653,12 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
             target.display()
         )));
     }
-    if let Err(error) = persist_owned_output(&mut owned_target, target) {
+    let published = if durable {
+        persist_owned_output(&mut owned_target, target)
+    } else {
+        publish_volatile_output(&mut owned_target, target)
+    };
+    if let Err(error) = published {
         remove_owned_scratch_file(&owned_target);
         return Err(error);
     }
@@ -3807,6 +4669,8 @@ fn seed_restore_overlay(source: &Path, target: &Path) -> Result<OwnedScratchFile
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
 ))]
+/// Copy an overlay's contents. Durability is the caller's choice: a published
+/// copy is synced by `persist_owned_output`, VMM-private scratch is not.
 fn copy_restore_overlay(
     source: &mut std::fs::File,
     target: &mut std::fs::File,
@@ -3818,7 +4682,7 @@ fn copy_restore_overlay(
         const FICLONE: libc::Ioctl = 0x4004_9409;
         let cloned = unsafe { libc::ioctl(target.as_raw_fd(), FICLONE, source.as_raw_fd()) };
         if cloned == 0 {
-            return target.sync_all();
+            return Ok(());
         }
         let error = std::io::Error::last_os_error();
         if !matches!(
@@ -3849,7 +4713,7 @@ fn copy_dense_restore_overlay(
     source.seek(SeekFrom::Start(0))?;
     target.seek(SeekFrom::Start(0))?;
     std::io::copy(source, target)?;
-    target.sync_all()
+    Ok(())
 }
 
 #[cfg(any(
@@ -4016,9 +4880,10 @@ fn write_scratch_snapshot_file(
     owned_file: &OwnedScratchFile,
     state_blob: &[u8],
     mem_dump: &[u8],
+    populated: Option<&[bool]>,
     diff: bool,
 ) -> Result<()> {
-    write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, diff)
+    write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, populated, diff)
 }
 
 /// Assemble a full snapshot from a file-backed live pre-copy without ever
@@ -4033,7 +4898,7 @@ fn write_scratch_snapshot_file_from_memory_file(
     diff: bool,
 ) -> Result<tarit_proto::IntegrityManifest> {
     use sha2::{Digest as _, Sha256};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
 
     const MAGIC: &[u8; 4] = b"VMSN";
@@ -4130,17 +4995,16 @@ fn write_scratch_snapshot_file_from_memory_file(
         log::warn!(
             "live_snapshot: RAM range reflink unavailable ({error}); using streamed publication"
         );
-        output
-            .seek(SeekFrom::Start(mem_offset))
-            .map_err(|error| VmmError::Snapshot(format!("seek snapshot RAM: {error}")))?;
     }
 
-    let mut source = memory_file
-        .try_clone()
-        .map_err(|error| VmmError::Snapshot(format!("clone staged RAM: {error}")))?;
-    source
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| VmmError::Snapshot(format!("seek staged RAM: {error}")))?;
+    // The staged image is sparse: guest RAM that is zero was never written.
+    // Its holes need no reading, hashing or writing; their integrity hashes
+    // and CRC contribution are those of zeros.
+    let data_extents = file_data_extents(memory_file, mem_len)
+        .map_err(|error| VmmError::Snapshot(format!("map staged RAM extents: {error}")))?;
+    let zero_chunk_hash: [u8; 32] = Sha256::digest(vec![0u8; INTEGRITY_CHUNK_BYTES]).into();
+    let mut zero_chunk_crc = crc32fast::Hasher::new();
+    zero_chunk_crc.update(&vec![0u8; INTEGRITY_CHUNK_BYTES]);
     let mut hasher = crc32fast::Hasher::new();
     let mut memory_chunk_hashes = Vec::new();
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
@@ -4148,19 +5012,32 @@ fn write_scratch_snapshot_file_from_memory_file(
     let mut synced = 0u64;
     while copied < mem_len {
         let chunk = (mem_len - copied).min(buffer.len() as u64) as usize;
-        source
-            .read_exact(&mut buffer[..chunk])
-            .map_err(|error| VmmError::Snapshot(format!("read staged RAM: {error}")))?;
-        hasher.update(&buffer[..chunk]);
-        memory_chunk_hashes.extend(
-            buffer[..chunk]
-                .chunks(INTEGRITY_CHUNK_BYTES)
-                .map(|bytes| -> [u8; 32] { Sha256::digest(bytes).into() }),
-        );
+        for (index, at) in (copied..copied + chunk as u64)
+            .step_by(INTEGRITY_CHUNK_BYTES)
+            .enumerate()
+        {
+            let len = (copied + chunk as u64 - at).min(INTEGRITY_CHUNK_BYTES as u64);
+            let bytes = &mut buffer[index * INTEGRITY_CHUNK_BYTES..][..len as usize];
+            if len == INTEGRITY_CHUNK_BYTES as u64 && !ranges_overlap(&data_extents, at, len) {
+                bytes.fill(0);
+                hasher.combine(&zero_chunk_crc);
+                memory_chunk_hashes.push(zero_chunk_hash);
+                continue;
+            }
+            std::os::unix::fs::FileExt::read_exact_at(memory_file, bytes, at)
+                .map_err(|error| VmmError::Snapshot(format!("read staged RAM: {error}")))?;
+            hasher.update(bytes);
+            memory_chunk_hashes.push(Sha256::digest(&*bytes).into());
+        }
         if !reflinked {
-            output
-                .write_all(&buffer[..chunk])
-                .map_err(|error| VmmError::Snapshot(format!("stream snapshot RAM: {error}")))?;
+            // The memory range of the freshly sized output is a hole: zero
+            // pages stay holes, as they are in the staged image.
+            crate::live_snapshot::write_nonzero_pages(
+                &output,
+                &buffer[..chunk],
+                mem_offset + copied,
+            )
+            .map_err(|error| VmmError::Snapshot(format!("stream snapshot RAM: {error}")))?;
         }
         let chunk_u64 = chunk as u64;
         drop_file_cache(memory_file, copied, chunk_u64);
@@ -4216,6 +5093,7 @@ fn write_scratch_snapshot_file_from_memory_file(
                 chunk_hashes: memory_chunk_hashes,
             },
         ],
+        working_set: Vec::new(),
     })
 }
 
@@ -4262,47 +5140,543 @@ fn write_snapshot_file_with_mode(
     mode: SnapshotCreateMode,
 ) -> Result<()> {
     let file = open_snapshot_output(path, mode)?;
-    write_snapshot_to_file(&file, state_blob, mem_dump, diff)
+    write_snapshot_to_file(&file, state_blob, mem_dump, None, diff)
+}
+
+/// Header fields of a full (or legacy diff) VMSN snapshot.
+struct SnapshotWriteLayout {
+    state_len: u64,
+    padding: usize,
+    state_crc: u32,
+    flags: u16,
+    mem_len: u64,
+    mem_offset: u64,
+}
+
+impl SnapshotWriteLayout {
+    fn new(state_blob: &[u8], mem_len: usize, diff: bool) -> Result<Self> {
+        let unpadded_state_len = u64::try_from(state_blob.len())
+            .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+        let state_len = page_aligned_state_len(unpadded_state_len)
+            .ok_or_else(|| VmmError::Snapshot("snapshot memory offset overflow".into()))?;
+        let padding = (state_len - unpadded_state_len) as usize;
+        let mut state_hasher = crc32fast::Hasher::new();
+        state_hasher.update(state_blob);
+        state_hasher.update(&vec![0u8; padding]);
+        Ok(Self {
+            state_len,
+            padding,
+            state_crc: state_hasher.finalize(),
+            flags: if diff { 1 } else { 0 },
+            mem_len: u64::try_from(mem_len)
+                .map_err(|_| VmmError::Snapshot("memory image too large".into()))?,
+            mem_offset: FULL_SNAPSHOT_HEADER_LEN + state_len,
+        })
+    }
+
+    /// Write the header and state in front of memory that is already in
+    /// place, then fix the length and record the verified RAM CRC.
+    fn finish(&self, mut file: &std::fs::File, state_blob: &[u8], mem_crc: u32) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::FileExt;
+        const MAGIC: &[u8; 4] = b"VMSN";
+
+        let mut header = Vec::with_capacity(FULL_SNAPSHOT_HEADER_LEN as usize + state_blob.len());
+        header.extend_from_slice(MAGIC);
+        header.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        header.extend_from_slice(&self.flags.to_le_bytes());
+        header.extend_from_slice(&self.state_len.to_le_bytes());
+        header.extend_from_slice(&self.state_crc.to_le_bytes());
+        header.extend_from_slice(&self.mem_len.to_le_bytes());
+        header.extend_from_slice(&mem_crc.to_le_bytes());
+        header.extend_from_slice(state_blob);
+        header.extend_from_slice(&vec![0u8; self.padding]);
+        file.write_all_at(&header, 0)
+            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        file.set_len(self.mem_offset + self.mem_len)
+            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        file.flush()
+            .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        record_ram_verified(file, self.mem_offset, self.mem_len, mem_crc);
+        Ok(())
+    }
 }
 
 fn write_snapshot_to_file(
-    mut file: &std::fs::File,
+    file: &std::fs::File,
     state_blob: &[u8],
     mem_dump: &[u8],
+    populated: Option<&[bool]>,
     diff: bool,
 ) -> Result<()> {
-    use std::io::Write;
-    const MAGIC: &[u8; 4] = b"VMSN";
+    let layout = SnapshotWriteLayout::new(state_blob, mem_dump.len(), diff)?;
+    // Zero pages are left as holes, so start from an empty file. Memory goes
+    // first, in one pass that also computes its CRC (this runs while the
+    // guest is paused, so each byte of RAM is read once); the header that
+    // carries the CRC is written after it.
+    file.set_len(0)
+        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    let mem_crc = write_sparse_at_with_crc(file, layout.mem_offset, mem_dump, populated)
+        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    layout.finish(file, state_blob, mem_crc)
+}
 
-    let state_crc = crc32fast::hash(state_blob);
-    let mem_crc = crc32fast::hash(mem_dump);
-    let flags: u16 = if diff { 1 } else { 0 };
-    let state_len = u64::try_from(state_blob.len())
-        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
-    let mem_len = u64::try_from(mem_dump.len())
-        .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
+/// A full snapshot of file-backed guest RAM whose untouched pages are copied
+/// from their backing files after the guest resumes; see
+/// [`write_snapshot_memory_deferred`].
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+struct DeferredFullSnapshot {
+    state_blob: Vec<u8>,
+    layout: SnapshotWriteLayout,
+    /// (RAM offset, length, backing file, file offset), coalesced.
+    copies: Vec<(u64, u64, Arc<std::fs::File>, u64)>,
+    /// For a snapshot taken against a base: the base's memory image (file,
+    /// offset, length) and the CRC its header records. Checked before any of
+    /// its bytes are trusted.
+    verify_base: Option<(Arc<std::fs::File>, u64, u64, u32)>,
+}
 
-    file.write_all(MAGIC)
+/// First half of a full snapshot of file-backed (restored) guest RAM, run
+/// while the guest is paused.
+///
+/// A restored guest's RAM is a private mapping of its snapshot, so most pages
+/// were never touched and still hold the snapshot file's bytes. Reading them
+/// through the mapping would fault every one in during the pause. Instead,
+/// pages the kernel has populated (touched or swapped) are written from
+/// memory now; untouched pages inside a file-backed run are queued to be
+/// copied from that immutable file after the guest resumes; untouched
+/// anonymous pages (never restored, or discarded by the balloon) are zero and
+/// stay holes. [`finish_deferred_snapshot`] completes the file.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_snapshot_memory_deferred(
+    file: &std::fs::File,
+    state_blob: &[u8],
+    mem: &[u8],
+    populated: &[bool],
+    ranges: &[vmm_memory_backend::backend::FileBackedRange],
+) -> Result<DeferredFullSnapshot> {
+    use std::os::unix::fs::FileExt;
+
+    const PAGE: usize = 4096;
+    let layout = SnapshotWriteLayout::new(state_blob, mem.len(), false)?;
+    if !mem.len().is_multiple_of(PAGE) || populated.len() != mem.len() / PAGE {
+        return Err(VmmError::Snapshot(
+            "guest RAM is not a whole number of pages".into(),
+        ));
+    }
+    file.set_len(0)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&SNAPSHOT_VERSION.to_le_bytes())
+    let is_zero = |page: &[u8]| {
+        // SAFETY: reinterpreting initialised bytes as u64 words is sound;
+        // align_to returns only the correctly aligned middle part.
+        let (head, words, tail) = unsafe { page.align_to::<u64>() };
+        head.iter().all(|b| *b == 0)
+            && words.iter().all(|w| *w == 0)
+            && tail.iter().all(|b| *b == 0)
+    };
+    let mut copies: Vec<(u64, u64, Arc<std::fs::File>, u64)> = Vec::new();
+    let mut run: Option<usize> = None;
+    let mut range_index = 0usize;
+    let flush_run = |run: &mut Option<usize>, end: usize| -> std::io::Result<()> {
+        if let Some(first) = run.take() {
+            file.write_all_at(&mem[first..end], layout.mem_offset + first as u64)?;
+        }
+        Ok(())
+    };
+    for (page, &touched) in populated.iter().enumerate() {
+        let start = page * PAGE;
+        if touched {
+            if is_zero(&mem[start..start + PAGE]) {
+                flush_run(&mut run, start).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+            } else if run.is_none() {
+                run = Some(start);
+            }
+            continue;
+        }
+        flush_run(&mut run, start).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+        let at = start as u64;
+        while range_index < ranges.len()
+            && ranges[range_index].ram_offset + ranges[range_index].len <= at
+        {
+            range_index += 1;
+        }
+        let Some(range) = ranges.get(range_index).filter(|r| r.ram_offset <= at) else {
+            continue; // untouched anonymous page: zero
+        };
+        let file_at = range.file_offset + (at - range.ram_offset);
+        match copies.last_mut() {
+            Some((ram, len, source, source_at))
+                if *ram + *len == at
+                    && Arc::ptr_eq(source, &range.file)
+                    && *source_at + *len == file_at =>
+            {
+                *len += PAGE as u64;
+            }
+            _ => copies.push((at, PAGE as u64, Arc::clone(&range.file), file_at)),
+        }
+    }
+    flush_run(&mut run, mem.len()).map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    Ok(DeferredFullSnapshot {
+        state_blob: state_blob.to_vec(),
+        layout,
+        copies,
+        verify_base: None,
+    })
+}
+
+/// The 32-byte header of a full (non-diff) VMSN snapshot file, which names
+/// its exact contents: lengths plus the state and memory CRCs.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn full_snapshot_identity_of(file: &std::fs::File) -> Option<[u8; 32]> {
+    use std::os::unix::fs::FileExt;
+    let mut header = [0u8; 32];
+    file.read_exact_at(&mut header, 0).ok()?;
+    let flags = u16::from_le_bytes([header[6], header[7]]);
+    (&header[..4] == b"VMSN" && flags == 0).then_some(header)
+}
+
+/// Open `path` as the base for a full snapshot if it is exactly the snapshot
+/// identified by `identity` and its memory image is `mem_len` bytes. Returns
+/// the file and the offset of its memory image.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn open_snapshot_base(
+    path: &str,
+    identity: &[u8; 32],
+    mem_len: usize,
+) -> Option<(Arc<std::fs::File>, u64, u32)> {
+    match open_snapshot_input(Path::new(path)) {
+        Ok(file) => check_snapshot_base(Arc::new(file), identity, mem_len, path),
+        Err(error) => {
+            log::info!("snapshot base {path} cannot be opened ({error}); not using it");
+            None
+        }
+    }
+}
+
+/// [`open_snapshot_base`] for an open `file`, named `label` in logs.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn check_snapshot_base(
+    file: Arc<std::fs::File>,
+    identity: &[u8; 32],
+    mem_len: usize,
+    label: &str,
+) -> Option<(Arc<std::fs::File>, u64, u32)> {
+    let skip = |why: &str| {
+        log::info!("snapshot base {label} {why}; not using it");
+        None
+    };
+    if full_snapshot_identity_of(&file).as_ref() != Some(identity) {
+        return skip("is not this VM's last snapshot");
+    }
+    let state_len = u64::from_le_bytes(identity[8..16].try_into().ok()?);
+    let base_mem_len = u64::from_le_bytes(identity[20..28].try_into().ok()?);
+    let mem_crc = u32::from_le_bytes(identity[28..32].try_into().ok()?);
+    let mem_offset = FULL_SNAPSHOT_HEADER_LEN.checked_add(state_len)?;
+    let file_len = file.metadata().ok()?.len();
+    if base_mem_len != mem_len as u64 || mem_offset.checked_add(base_mem_len) != Some(file_len) {
+        return skip("does not have this VM's memory size");
+    }
+    Some((file, mem_offset, mem_crc))
+}
+
+/// First half of a full snapshot taken against `base`, the snapshot the dirty
+/// log counts from, run while the guest is paused: pages dirtied since are
+/// written from memory, every other page is queued to be copied from `base`
+/// after the guest resumes ([`finish_deferred_snapshot`]).
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_snapshot_memory_from_base(
+    file: &std::fs::File,
+    state_blob: &[u8],
+    mem: &[u8],
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+    base: Arc<std::fs::File>,
+    base_mem_offset: u64,
+    base_mem_crc: u32,
+) -> Result<DeferredFullSnapshot> {
+    use std::os::unix::fs::FileExt;
+
+    const PAGE: u64 = 4096;
+    let layout = SnapshotWriteLayout::new(state_blob, mem.len(), false)?;
+    file.set_len(0)
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&flags.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&state_len.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&state_crc.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&mem_len.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&mem_crc.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(state_blob)
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(mem_dump)
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.flush()
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    Ok(())
+    let is_zero = |bytes: &[u8]| bytes.iter().all(|b| *b == 0);
+    let mut copies: Vec<(u64, u64, Arc<std::fs::File>, u64)> = Vec::new();
+    let mut clean_from = 0u64;
+    let queue_clean =
+        |from: u64, to: u64, copies: &mut Vec<(u64, u64, Arc<std::fs::File>, u64)>| {
+            if to > from {
+                copies.push((from, to - from, Arc::clone(&base), base_mem_offset + from));
+            }
+        };
+    for (start, pages) in dirty_page_runs(dirty, mem.len()) {
+        let end = (start + u64::from(pages) * PAGE).min(mem.len() as u64);
+        queue_clean(clean_from, start, &mut copies);
+        // Write the dirty run page by page, leaving zero pages as holes.
+        let mut page = start;
+        while page < end {
+            let bytes = &mem[page as usize..(page + PAGE).min(end) as usize];
+            if !is_zero(bytes) {
+                file.write_all_at(bytes, layout.mem_offset + page)
+                    .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+            }
+            page += PAGE;
+        }
+        clean_from = end;
+    }
+    queue_clean(clean_from, mem.len() as u64, &mut copies);
+    Ok(DeferredFullSnapshot {
+        state_blob: state_blob.to_vec(),
+        layout,
+        copies,
+        verify_base: Some((
+            Arc::clone(&base),
+            base_mem_offset,
+            mem.len() as u64,
+            base_mem_crc,
+        )),
+    })
+}
+
+/// Second half of [`write_snapshot_memory_deferred`], run after the guest
+/// resumes: copy the queued runs from their backing files (their holes stay
+/// holes), hash the assembled memory image, and write the header.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn finish_deferred_snapshot(file: &std::fs::File, snapshot: DeferredFullSnapshot) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    const CHUNK: u64 = 1024 * 1024;
+    let io = |e: std::io::Error| VmmError::Snapshot(e.to_string());
+    let base = snapshot.layout.mem_offset;
+    let mut buffer = vec![0u8; CHUNK as usize];
+    if let Some((base_file, offset, len, expected)) = &snapshot.verify_base {
+        let actual = region_crc(base_file, *offset, *len, &mut buffer)?;
+        if actual != *expected {
+            return Err(VmmError::Snapshot(format!(
+                "snapshot base memory CRC is {actual:#010x}, its header records {expected:#010x}"
+            )));
+        }
+    }
+    for (ram, len, source, source_at) in &snapshot.copies {
+        let end = source_at + len;
+        let mut pos = *source_at;
+        while pos < end {
+            let Some(data) = seek_data(source, pos)
+                .map_err(io)?
+                .filter(|data| *data < end)
+            else {
+                break;
+            };
+            let hole = seek_hole(source, data).map_err(io)?.min(end);
+            let mut at = data;
+            while at < hole {
+                let n = (hole - at).min(CHUNK) as usize;
+                source.read_exact_at(&mut buffer[..n], at).map_err(io)?;
+                file.write_all_at(&buffer[..n], base + ram + (at - source_at))
+                    .map_err(io)?;
+                at += n as u64;
+            }
+            pos = hole;
+        }
+    }
+    // The memory region is assembled; hash it from the file.
+    let crc = region_crc(file, base, snapshot.layout.mem_len, &mut buffer)?;
+    snapshot.layout.finish(file, &snapshot.state_blob, crc)
+}
+
+/// CRC32 of `len` bytes of `file` from `offset`. Holes are zero pages and
+/// fold into the CRC without being read.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn region_crc(file: &std::fs::File, offset: u64, len: u64, buffer: &mut [u8]) -> Result<u32> {
+    use std::os::unix::fs::FileExt;
+
+    let io = |e: std::io::Error| VmmError::Snapshot(e.to_string());
+    let mut crc = crc32fast::Hasher::new();
+    let mut pos = 0u64;
+    while pos < len {
+        let data = seek_data(file, offset + pos)
+            .map_err(io)?
+            .map_or(len, |data| (data - offset).min(len));
+        let zero = data - pos;
+        if !zero.is_multiple_of(4096) {
+            return Err(VmmError::Snapshot(
+                "snapshot hole is not page aligned".into(),
+            ));
+        }
+        combine_zero_pages(&mut crc, (zero / 4096) as usize);
+        if data >= len {
+            break;
+        }
+        let hole = (seek_hole(file, offset + data).map_err(io)? - offset).min(len);
+        let mut at = data;
+        while at < hole {
+            let n = ((hole - at) as usize).min(buffer.len());
+            file.read_exact_at(&mut buffer[..n], offset + at)
+                .map_err(io)?;
+            crc.update(&buffer[..n]);
+            at += n as u64;
+        }
+        pos = hole;
+    }
+    Ok(crc.finalize())
+}
+
+/// `lseek(SEEK_DATA)`: the next offset at or after `offset` holding data, or
+/// `None` when only a hole remains.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn seek_data(file: &std::fs::File, offset: u64) -> std::io::Result<Option<u64>> {
+    use std::os::fd::AsRawFd;
+    let offset = i64::try_from(offset).map_err(|_| std::io::Error::other("offset overflow"))?;
+    // SAFETY: lseek on an open descriptor only moves its file offset; the
+    // reads above use positioned I/O and do not depend on it.
+    let data = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_DATA) };
+    if data >= 0 {
+        return Ok(Some(data as u64));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENXIO) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// `lseek(SEEK_HOLE)`: the next hole (or end of file) at or after `offset`.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn seek_hole(file: &std::fs::File, offset: u64) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    let offset = i64::try_from(offset).map_err(|_| std::io::Error::other("offset overflow"))?;
+    // SAFETY: as in `seek_data`.
+    let hole = unsafe { libc::lseek(file.as_raw_fd(), offset, libc::SEEK_HOLE) };
+    if hole >= 0 {
+        Ok(hole as u64)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Write `data` at `offset`, skipping 4 KiB pages that are entirely zero so
+/// they stay holes in a freshly truncated file, and return the CRC32 of all of
+/// `data`. Guest RAM is mostly untouched zero pages, so this cuts both the
+/// bytes written and the page cache a snapshot pins; holes read back as
+/// zeros, so the format is unchanged.
+///
+/// `populated` (one flag per whole page), when given, marks pages the kernel
+/// has never populated; those are zero without being read, which avoids
+/// faulting in every untouched page of a large guest. Runs of zero pages are
+/// folded into the CRC from precomputed zero-run CRCs, so only data pages are
+/// hashed byte by byte. The result equals hashing every byte.
+fn write_sparse_at_with_crc(
+    file: &std::fs::File,
+    offset: u64,
+    data: &[u8],
+    populated: Option<&[bool]>,
+) -> std::io::Result<u32> {
+    use std::os::unix::fs::FileExt;
+
+    const PAGE: usize = 4096;
+    let is_zero = |page: &[u8]| {
+        // SAFETY: reinterpreting initialised bytes as u64 words is sound;
+        // align_to returns only the correctly aligned middle part.
+        let (head, words, tail) = unsafe { page.align_to::<u64>() };
+        head.iter().all(|b| *b == 0)
+            && words.iter().all(|w| *w == 0)
+            && tail.iter().all(|b| *b == 0)
+    };
+    let mut crc = crc32fast::Hasher::new();
+    let mut zero_pages = 0usize;
+    // Start of the pending run of data pages, if any.
+    let mut run: Option<usize> = None;
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while start < data.len() {
+        let end = (start + PAGE).min(data.len());
+        let whole = end - start == PAGE;
+        let unpopulated = whole && populated.is_some_and(|flags| flags.get(index) == Some(&false));
+        let zero = unpopulated || is_zero(&data[start..end]);
+        if zero && whole {
+            zero_pages += 1;
+        } else {
+            combine_zero_pages(&mut crc, std::mem::take(&mut zero_pages));
+            crc.update(&data[start..end]);
+        }
+        match (zero, run) {
+            (true, Some(first)) => {
+                file.write_all_at(&data[first..start], offset + first as u64)?;
+                run = None;
+            }
+            (false, None) => run = Some(start),
+            _ => {}
+        }
+        start = end;
+        index += 1;
+    }
+    combine_zero_pages(&mut crc, zero_pages);
+    if let Some(first) = run {
+        file.write_all_at(&data[first..], offset + first as u64)?;
+    }
+    Ok(crc.finalize())
+}
+
+/// Extend `crc` with `pages` zero pages, using CRCs of power-of-two zero runs.
+fn combine_zero_pages(crc: &mut crc32fast::Hasher, pages: usize) {
+    static RUNS: std::sync::OnceLock<Vec<crc32fast::Hasher>> = std::sync::OnceLock::new();
+    if pages == 0 {
+        return;
+    }
+    // runs[k] hashes 2^k zero pages; 2^36 pages is 256 TiB.
+    const RUN_BITS: u32 = 36;
+    let runs = RUNS.get_or_init(|| {
+        let mut first = crc32fast::Hasher::new();
+        first.update(&[0u8; 4096]);
+        let mut runs = vec![first];
+        for _ in 1..RUN_BITS {
+            let mut doubled = runs.last().expect("non-empty").clone();
+            let last = runs.last().expect("non-empty").clone();
+            doubled.combine(&last);
+            runs.push(doubled);
+        }
+        runs
+    });
+    let mut remaining = pages;
+    while remaining >> RUN_BITS != 0 {
+        crc.combine(&runs[RUN_BITS as usize - 1]);
+        remaining -= 1usize << (RUN_BITS - 1);
+    }
+    for (bit, run) in runs.iter().enumerate().rev() {
+        if remaining & (1usize << bit) != 0 {
+            crc.combine(run);
+        }
+    }
+}
+
+/// Which pages of the host mapping `[addr, addr + len)` the kernel has
+/// populated (present in RAM or swapped out), from /proc/self/pagemap. In a
+/// private anonymous mapping every other page reads as zero. `None` when the
+/// map cannot be read, in which case every page must be read.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn populated_pages(addr: *const u8, len: usize) -> Option<Vec<bool>> {
+    use std::os::unix::fs::FileExt;
+
+    const PAGE: usize = 4096;
+    const PRESENT: u64 = 1 << 63;
+    const SWAPPED: u64 = 1 << 62;
+    if !(addr as usize).is_multiple_of(PAGE) {
+        return None;
+    }
+    let pages = len / PAGE;
+    let pagemap = std::fs::File::open("/proc/self/pagemap").ok()?;
+    let mut raw = vec![0u8; pages * 8];
+    pagemap
+        .read_exact_at(&mut raw, (addr as usize / PAGE * 8) as u64)
+        .ok()?;
+    Some(
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|entry| u64::from_le_bytes(*entry) & (PRESENT | SWAPPED) != 0)
+            .collect(),
+    )
 }
 
 /// Write an incremental (diff) snapshot: only the pages dirtied since the parent
@@ -4362,6 +5736,117 @@ fn write_diff_snapshot_to_file(
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
 ) -> Result<usize> {
     use std::io::Write;
+
+    let runs = dirty_page_runs(dirty, mem.len());
+    let mut index = Vec::with_capacity(runs.len() * DIFF_RUN_ENTRY_BYTES);
+    for &(offset, pages) in &runs {
+        index.extend_from_slice(&offset.to_le_bytes());
+        index.extend_from_slice(&pages.to_le_bytes());
+    }
+    let mut data_crc = crc32fast::Hasher::new();
+    let mut data_len = 0usize;
+    for &(offset, pages) in &runs {
+        let start = offset as usize;
+        let full_end = start + pages as usize * DIFF_PAGE_BYTES;
+        let end = full_end.min(mem.len());
+        data_crc.update(&mem[start..end]);
+        // The reader checks the padded run, so pad the CRC the same way.
+        data_crc.update(&vec![0u8; full_end - end]);
+        data_len += end - start;
+    }
+    let data_crc = data_crc.finalize();
+
+    let pbytes = parent.as_bytes();
+    let parent_len = u32::try_from(pbytes.len())
+        .map_err(|_| VmmError::Snapshot("parent path too long".into()))?;
+    let state_len = u64::try_from(state_blob.len())
+        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+    let run_count =
+        u32::try_from(runs.len()).map_err(|_| VmmError::Snapshot("too many diff runs".into()))?;
+
+    let mut header = Vec::with_capacity(64 + pbytes.len() + state_blob.len() + index.len());
+    header.extend_from_slice(ALIGNED_DIFF_MAGIC);
+    header.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    header.extend_from_slice(&parent_len.to_le_bytes());
+    header.extend_from_slice(pbytes);
+    header.extend_from_slice(&state_len.to_le_bytes());
+    header.extend_from_slice(&crc32fast::hash(state_blob).to_le_bytes());
+    header.extend_from_slice(state_blob);
+    header.extend_from_slice(&run_count.to_le_bytes());
+    header.extend_from_slice(&crc32fast::hash(&index).to_le_bytes());
+    header.extend_from_slice(&index);
+    header.extend_from_slice(&data_crc.to_le_bytes());
+    header.resize(header.len().next_multiple_of(DIFF_PAGE_BYTES), 0);
+
+    let mut wr = |b: &[u8]| -> Result<()> {
+        file.write_all(b)
+            .map_err(|e| VmmError::Snapshot(e.to_string()))
+    };
+    wr(&header)?;
+    for &(offset, pages) in &runs {
+        let start = offset as usize;
+        let end = start + pages as usize * DIFF_PAGE_BYTES;
+        if end <= mem.len() {
+            wr(&mem[start..end])?;
+        } else {
+            // A partial final page is zero-filled so the data stays aligned.
+            wr(&mem[start..])?;
+            wr(&vec![0u8; end - mem.len()])?;
+        }
+    }
+    file.flush()
+        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    let padded_len: u64 =
+        runs.iter().map(|&(_, pages)| u64::from(pages)).sum::<u64>() * DIFF_PAGE_BYTES as u64;
+    record_ram_verified(file, header.len() as u64, padded_len, data_crc);
+    Ok(data_len)
+}
+
+/// Coalesce dirty pages into sorted `(packed offset, page count)` runs.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn dirty_page_runs(
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+    mem_len: usize,
+) -> Vec<(u64, u32)> {
+    let mut pfns: Vec<u64> = dirty
+        .dirty_pfns()
+        .iter()
+        .copied()
+        .filter(|pfn| {
+            usize::try_from(*pfn)
+                .ok()
+                .and_then(|pfn| pfn.checked_mul(DIFF_PAGE_BYTES))
+                .is_some_and(|start| start < mem_len)
+        })
+        .collect();
+    pfns.sort_unstable();
+    pfns.dedup();
+    let mut runs: Vec<(u64, u32)> = Vec::new();
+    for pfn in pfns {
+        match runs.last_mut() {
+            Some((start, pages))
+                if *start / DIFF_PAGE_BYTES as u64 + u64::from(*pages) == pfn
+                    && *pages < MAX_DIFF_RUN_PAGES =>
+            {
+                *pages += 1;
+            }
+            _ => runs.push((pfn * DIFF_PAGE_BYTES as u64, 1)),
+        }
+    }
+    runs
+}
+
+/// The interleaved `VMSD` layout written before page-aligned diffs; kept so
+/// tests can prove such files still restore.
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_legacy_diff_snapshot_to_file(
+    mut file: &std::fs::File,
+    parent: &str,
+    state_blob: &[u8],
+    mem: &[u8],
+    dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+) -> Result<usize> {
+    use std::io::Write;
     use vmm_snapshot::diff::build_diff;
     const MAGIC: &[u8; 4] = b"VMSD";
 
@@ -4401,10 +5886,6 @@ fn write_diff_snapshot_to_file(
     Ok(total)
 }
 
-#[cfg(any(
-    test,
-    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
-))]
 const FULL_SNAPSHOT_HEADER_LEN: u64 = 32;
 #[cfg(any(
     test,
@@ -4429,6 +5910,21 @@ const MAX_DIFF_PAGE_BYTES: u64 = 1024 * 1024;
 const MAX_DIFF_PAGES: usize = 1 << 20;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const MAX_DIFF_CHAIN_DEPTH: usize = 1024;
+/// Magic of a page-aligned incremental snapshot: an index of coalesced dirty
+/// page runs followed by their pages on 4 KiB boundaries, so restore can map
+/// long runs straight from the file instead of copying them.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const ALIGNED_DIFF_MAGIC: &[u8; 4] = b"VMSA";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const DIFF_PAGE_BYTES: usize = 4096;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const DIFF_RUN_ENTRY_BYTES: usize = 12;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const MAX_DIFF_RUN_PAGES: u32 = 1 << 18;
+/// Runs at least this long are mapped from the diff file on restore; shorter
+/// runs are read into guest RAM, which is cheaper than a mapping per run.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const MAP_MIN_RUN_PAGES: usize = 16;
 #[cfg(any(
     test,
     all(target_arch = "x86_64", target_os = "linux", feature = "boot")
@@ -4762,6 +6258,7 @@ fn load_authenticated_memory_manifest(
     Ok(vmm_memory_backend::ChunkIntegrity {
         chunk_size: manifest.chunk_size as usize,
         chunk_hashes: memory.chunk_hashes.clone(),
+        prefetch: manifest.working_set,
     })
 }
 
@@ -4836,6 +6333,20 @@ fn eager_restore_snapshot(path: &str) -> Result<RestoredSnapshot> {
     })
 }
 
+/// Restore by mapping the chain's base RAM image privately and applying any
+/// diff pages on top. Cost is proportional to the diff pages, not guest RAM,
+/// and VMs restored from the same base share its untouched pages.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn mapped_restore_snapshot(path: &str) -> Result<RestoredSnapshot> {
+    let (mem, state_blob, snapshot_version) = load_snapshot_chain_with(path, RamLoad::Map)?;
+    Ok(RestoredSnapshot {
+        mem,
+        state_blob,
+        snapshot_version,
+        lazy_restore: None,
+    })
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn restore_snapshot_with_policy(
     path: &str,
@@ -4844,6 +6355,14 @@ fn restore_snapshot_with_policy(
 ) -> Result<RestoredSnapshot> {
     match memory_policy {
         tarit_proto::RestoreMemoryPolicy::Auto => {
+            if memory_integrity.is_none() {
+                match mapped_restore_snapshot(path) {
+                    Ok(restored) => return Ok(restored),
+                    Err(error) => {
+                        log::info!("restore: mapped restore unavailable ({error}); trying UFFD");
+                    }
+                }
+            }
             match try_lazy_restore_full_snapshot(path, memory_integrity) {
                 Ok(Some(restored)) => Ok(restored),
                 Ok(None) if memory_integrity.is_none() => {
@@ -4995,6 +6514,16 @@ enum SnapshotContent {
         version: u16,
         pages: Vec<(u64, Vec<u8>)>,
     },
+    /// Page-aligned diff: pages stay in `file` and are mapped or read on
+    /// restore. `runs` are `(packed offset, page count)` in data order.
+    AlignedDiff {
+        parent: PathBuf,
+        state: Vec<u8>,
+        version: u16,
+        file: std::fs::File,
+        data_offset: u64,
+        runs: Vec<(u64, u32)>,
+    },
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5040,13 +6569,29 @@ fn resolve_snapshot_parent(parent: &str, snapshot_root: &Path) -> Result<PathBuf
         return Err(VmmError::Snapshot("empty diff parent path".into()));
     }
     let parent_path = Path::new(parent);
-    let candidate = if parent_path.is_absolute() {
+    let mut candidate = if parent_path.is_absolute() {
         parent_path.to_path_buf()
     } else {
         snapshot_root.join(parent_path)
     };
+    // A chain released by the VMM is usually moved to its own directory; the
+    // recorded parent path then points at the old location. Accept the file
+    // of the same name beside the tip.
+    if !candidate.exists() {
+        if let Some(beside) = parent_path
+            .file_name()
+            .map(|name| snapshot_root.join(name))
+            .filter(|beside| beside.exists())
+        {
+            candidate = beside;
+        }
+    }
     let metadata = std::fs::symlink_metadata(&candidate).map_err(|e| {
-        VmmError::Snapshot(format!("stat diff parent {}: {e}", candidate.display()))
+        VmmError::Snapshot(format!(
+            "stat diff parent {}: {e}; keep every snapshot of a chain in one directory \
+             under the names the VMM gave them",
+            candidate.display()
+        ))
     })?;
     if !metadata.file_type().is_file() {
         return Err(VmmError::Snapshot(format!(
@@ -5070,7 +6615,178 @@ fn resolve_snapshot_parent(parent: &str, snapshot_root: &Path) -> Result<PathBuf
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
+/// How a full snapshot's RAM image becomes guest memory.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RamLoad {
+    /// Read every byte into fresh anonymous memory.
+    Copy,
+    /// Map the page-aligned image privately; fails for unaligned images.
+    Map,
+}
+
+/// xattr recording that a full snapshot's RAM image already matched its CRC.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const RAM_VERIFIED_XATTR: &std::ffi::CStr = c"user.tarit.ram-verified";
+
+/// Check a full snapshot's RAM CRC once per file version.
+///
+/// The first restore of a snapshot verifies the image (through a read-only
+/// mapping, which also warms the page cache for the restore) and records the
+/// file identity, layout and CRC in an xattr. Later restores of the same,
+/// unmodified file skip the scan, which is what keeps restore and fan-out cost
+/// independent of guest RAM size. Changing the file changes its mtime or
+/// inode, and copies to other hosts usually drop the xattr, so both are
+/// re-verified. This is corruption detection; authenticated snapshots use the
+/// chunk manifest path instead.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn verify_ram_crc_once(
+    file: &std::fs::File,
+    path_display: &str,
+    layout: &FullSnapshotLayout,
+    expected_crc: u32,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let key = ram_verified_key(file, layout.mem_offset, layout.mem_len, expected_crc)
+        .map_err(|e| VmmError::Snapshot(format!("stat {path_display}: {e}")))?;
+    let mut recorded = [0u8; 160];
+    // SAFETY: valid fd, NUL-terminated name, and a writable buffer of the
+    // stated length; fgetxattr writes at most that many bytes.
+    let n = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            RAM_VERIFIED_XATTR.as_ptr(),
+            recorded.as_mut_ptr().cast(),
+            recorded.len(),
+        )
+    };
+    if n > 0 && &recorded[..n as usize] == key.as_bytes() {
+        return Ok(());
+    }
+
+    let actual = crc32_mapped_range(file, path_display, layout.mem_offset, layout.mem_len)?;
+    if actual != expected_crc {
+        return Err(VmmError::Snapshot(format!(
+            "memory CRC mismatch in {path_display}: got {actual:#010x}, expected {expected_crc:#010x}"
+        )));
+    }
+    // SAFETY: valid fd, NUL-terminated name, and a readable value buffer of
+    // the stated length. Failure (read-only file, no xattr support) only
+    // means the next restore verifies again.
+    unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            RAM_VERIFIED_XATTR.as_ptr(),
+            key.as_ptr().cast(),
+            key.len(),
+            0,
+        )
+    };
+    Ok(())
+}
+
+/// Identity of one version of a snapshot file's RAM or page data: device,
+/// inode, length, mtime, layout and CRC.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn ram_verified_key(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+    crc: u32,
+) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(format!(
+        "v1:{}:{}:{}:{}.{}:{offset}:{len}:{crc:08x}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    ))
+}
+
+/// Record that a snapshot writer produced this exact file version from bytes
+/// it CRC'd itself, so restores (including many concurrent forks of a fresh
+/// snapshot) skip the one-time scan. Call after the last data write. Best
+/// effort: without xattr support the first restore verifies instead.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn record_ram_verified(file: &std::fs::File, offset: u64, len: u64, crc: u32) {
+    use std::os::fd::AsRawFd;
+
+    let Ok(key) = ram_verified_key(file, offset, len, crc) else {
+        return;
+    };
+    // SAFETY: valid fd, NUL-terminated name, readable value of stated length.
+    unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            RAM_VERIFIED_XATTR.as_ptr(),
+            key.as_ptr().cast(),
+            key.len(),
+            0,
+        )
+    };
+}
+
+/// CRC32 of a file range through a read-only mapping, without copying it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn crc32_mapped_range(
+    file: &std::fs::File,
+    path_display: &str,
+    offset: u64,
+    len: u64,
+) -> Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    if len == 0 {
+        return Ok(crc32fast::hash(&[]));
+    }
+    let map_offset = offset / 4096 * 4096;
+    let delta = usize::try_from(offset - map_offset)
+        .map_err(|_| VmmError::Snapshot("snapshot offset too large".into()))?;
+    let len = usize::try_from(len)
+        .map_err(|_| VmmError::Snapshot(format!("memory image too large in {path_display}")))?;
+    let map_len = len + delta;
+    let map_offset = libc::off_t::try_from(map_offset)
+        .map_err(|_| VmmError::Snapshot("snapshot offset too large".into()))?;
+    // SAFETY: read-only private mapping of a valid fd with a page-aligned
+    // offset; it is only read below and unmapped before returning.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            map_offset,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(VmmError::Snapshot(format!(
+            "map {path_display} for CRC: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `ptr..ptr+map_len` is the live read-only mapping created above.
+    unsafe { libc::madvise(ptr, map_len, libc::MADV_SEQUENTIAL) };
+    // SAFETY: as above; the file length was validated against the layout by
+    // parse_full_snapshot_header, so every byte is backed by the file.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(delta), len) };
+    let crc = crc32fast::hash(bytes);
+    // SAFETY: unmapping exactly the mapping created above.
+    unsafe { libc::munmap(ptr, map_len) };
+    Ok(crc)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn read_snapshot_with(
+    path: &Path,
+    snapshot_root: &Path,
+    ram_load: RamLoad,
+) -> Result<SnapshotContent> {
     use std::io::{Read, Seek, SeekFrom};
 
     let path_display = path.display().to_string();
@@ -5105,6 +6821,24 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
                 "state CRC mismatch in {path_display}: got {actual_state_crc:#010x}, expected {:#010x}",
                 header.state_crc
             )));
+        }
+        if ram_load == RamLoad::Map {
+            if !layout.mem_offset.is_multiple_of(4096) {
+                return Err(VmmError::Snapshot(format!(
+                    "RAM image in {path_display} is not page aligned"
+                )));
+            }
+            verify_ram_crc_once(&file, &path_display, &layout, header.mem_crc)?;
+            // The packed RAM image is the same for every layout; the state
+            // says whether it is a virtio-mem boot/aperture split.
+            let mem = allocate_snapshot_memory(layout.mem_len, &state)?;
+            mem.map_file_private(&file, layout.mem_offset)
+                .map_err(|e| VmmError::Memory(e.to_string()))?;
+            return Ok(SnapshotContent::Full {
+                mem,
+                state,
+                version: header.version,
+            });
         }
         let actual_mem_crc = crc32_file_range(
             &mut file,
@@ -5254,9 +6988,157 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
             version,
             pages,
         })
+    } else if &magic == ALIGNED_DIFF_MAGIC {
+        read_aligned_diff(file, file_len, &path_display, snapshot_root)
     } else {
         Err(VmmError::Snapshot(format!("bad magic in {path_display}")))
     }
+}
+
+/// Parse a page-aligned diff after its magic. The run index is CRC-checked
+/// and validated here; page data is CRC-checked once per file version.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn read_aligned_diff(
+    mut file: std::fs::File,
+    file_len: u64,
+    path_display: &str,
+    snapshot_root: &Path,
+) -> Result<SnapshotContent> {
+    use std::io::{Read, Seek};
+
+    let rd = |f: &mut std::fs::File, buf: &mut [u8], what: &str| -> Result<()> {
+        f.read_exact(buf)
+            .map_err(|e| VmmError::Snapshot(format!("{what} in {path_display}: {e}")))
+    };
+    let mut u16b = [0u8; 2];
+    let mut u32b = [0u8; 4];
+    let mut u64b = [0u8; 8];
+    rd(&mut file, &mut u16b, "read version")?;
+    let version = u16::from_le_bytes(u16b);
+    if !matches!(version, LEGACY_SNAPSHOT_VERSION | SNAPSHOT_VERSION) {
+        return Err(VmmError::Snapshot(format!(
+            "unsupported VMSA version {version} in {path_display}"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read parent_len")?;
+    let parent_len = u64::from(u32::from_le_bytes(u32b));
+    if parent_len > MAX_DIFF_PARENT_PATH_BYTES {
+        return Err(VmmError::Snapshot("parent path too long".into()));
+    }
+    let position = |f: &mut std::fs::File| f.stream_position().unwrap_or(file_len);
+    ensure_file_has_bytes(
+        file_len,
+        position(&mut file),
+        parent_len,
+        "parent path",
+        path_display,
+    )?;
+    let mut pbuf = vec![0u8; parent_len as usize];
+    rd(&mut file, &mut pbuf, "read parent")?;
+    let parent = std::str::from_utf8(&pbuf).map_err(|e| {
+        VmmError::Snapshot(format!("parent path is not UTF-8 in {path_display}: {e}"))
+    })?;
+    let parent = resolve_snapshot_parent(parent, snapshot_root)?;
+
+    rd(&mut file, &mut u64b, "read state_len")?;
+    let state_len = u64::from_le_bytes(u64b);
+    if state_len > MAX_SNAPSHOT_STATE_BYTES {
+        return Err(VmmError::Snapshot(format!(
+            "state blob too large in {path_display}: {state_len} bytes"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read state_crc")?;
+    let state_crc = u32::from_le_bytes(u32b);
+    ensure_file_has_bytes(
+        file_len,
+        position(&mut file),
+        state_len,
+        "state blob",
+        path_display,
+    )?;
+    let mut state = vec![0u8; state_len as usize];
+    rd(&mut file, &mut state, "read state")?;
+    let actual_state_crc = crc32fast::hash(&state);
+    if actual_state_crc != state_crc {
+        return Err(VmmError::Snapshot(format!(
+            "state CRC mismatch in {path_display}: got {actual_state_crc:#010x}, expected {state_crc:#010x}"
+        )));
+    }
+
+    rd(&mut file, &mut u32b, "read run count")?;
+    let run_count = u32::from_le_bytes(u32b) as usize;
+    if run_count > MAX_DIFF_PAGES {
+        return Err(VmmError::Snapshot(format!(
+            "too many diff runs in {path_display}: {run_count}"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read index_crc")?;
+    let index_crc = u32::from_le_bytes(u32b);
+    let index_len = (run_count * DIFF_RUN_ENTRY_BYTES) as u64;
+    ensure_file_has_bytes(
+        file_len,
+        position(&mut file),
+        index_len,
+        "run index",
+        path_display,
+    )?;
+    let mut index = vec![0u8; index_len as usize];
+    rd(&mut file, &mut index, "read run index")?;
+    if crc32fast::hash(&index) != index_crc {
+        return Err(VmmError::Snapshot(format!(
+            "run index CRC mismatch in {path_display}"
+        )));
+    }
+    rd(&mut file, &mut u32b, "read data_crc")?;
+    let data_crc = u32::from_le_bytes(u32b);
+
+    let mut runs = Vec::with_capacity(run_count);
+    let mut data_pages = 0u64;
+    let mut previous_end = 0u64;
+    for entry in index.as_chunks::<DIFF_RUN_ENTRY_BYTES>().0 {
+        let offset = u64::from_le_bytes(entry[..8].try_into().expect("8-byte offset"));
+        let pages = u32::from_le_bytes(entry[8..].try_into().expect("4-byte count"));
+        let end = u64::from(pages)
+            .checked_mul(DIFF_PAGE_BYTES as u64)
+            .and_then(|len| offset.checked_add(len))
+            .ok_or_else(|| VmmError::Snapshot("diff run overflow".into()))?;
+        if pages == 0
+            || pages > MAX_DIFF_RUN_PAGES
+            || !offset.is_multiple_of(DIFF_PAGE_BYTES as u64)
+            || offset < previous_end
+            || end > crate::config::MAX_MEMORY_BYTES
+        {
+            return Err(VmmError::Snapshot(format!(
+                "invalid diff run 0x{offset:x}+{pages} pages in {path_display}"
+            )));
+        }
+        previous_end = end;
+        data_pages += u64::from(pages);
+        runs.push((offset, pages));
+    }
+
+    let data_offset = position(&mut file).next_multiple_of(DIFF_PAGE_BYTES as u64);
+    let data_len = data_pages * DIFF_PAGE_BYTES as u64;
+    if data_offset.checked_add(data_len) != Some(file_len) {
+        return Err(VmmError::Snapshot(format!(
+            "diff data length mismatch in {path_display}: {data_pages} pages at {data_offset}, file is {file_len} bytes"
+        )));
+    }
+    let data_layout = FullSnapshotLayout {
+        state_offset: 0,
+        state_len: 0,
+        mem_offset: data_offset,
+        mem_len: data_len,
+    };
+    verify_ram_crc_once(&file, path_display, &data_layout, data_crc)?;
+    Ok(SnapshotContent::AlignedDiff {
+        parent,
+        state,
+        version,
+        file,
+        data_offset,
+        runs,
+    })
 }
 
 /// Reconstruct the guest memory + tip state for a snapshot that may be the tip
@@ -5266,11 +7148,27 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
 /// Iterative (not recursive) so a chain of hundreds of diffs can't overflow.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>, u16)> {
-    // Follow the chain tip→base, collecting each diff's (state, pages).
-    type DiffPages = Vec<(u64, Vec<u8>)>;
-    type DiffChain = Vec<(u16, Vec<u8>, DiffPages)>;
+    load_snapshot_chain_with(path, RamLoad::Copy)
+}
 
-    let mut diffs: DiffChain = Vec::new();
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn load_snapshot_chain_with(
+    path: &str,
+    ram_load: RamLoad,
+) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>, u16)> {
+    use std::os::unix::fs::FileExt as _;
+
+    enum ChainDiff {
+        Pages(Vec<(u64, Vec<u8>)>),
+        Aligned {
+            file: std::fs::File,
+            data_offset: u64,
+            runs: Vec<(u64, u32)>,
+        },
+    }
+
+    // Follow the chain tip→base, collecting each diff's state and pages.
+    let mut diffs: Vec<(u16, Vec<u8>, ChainDiff)> = Vec::new();
     let mut chain_page_bytes = 0u64;
     let (mut cur, snapshot_root) = canonical_snapshot_tip(path)?;
     let mut seen = std::collections::HashSet::new();
@@ -5281,7 +7179,7 @@ fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, V
         if !seen.insert(cur.clone()) {
             return Err(VmmError::Snapshot("snapshot chain cycle".into()));
         }
-        match read_snapshot(&cur, &snapshot_root)? {
+        match read_snapshot_with(&cur, &snapshot_root, ram_load)? {
             SnapshotContent::Full {
                 mem,
                 state,
@@ -5296,7 +7194,26 @@ fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, V
                 for (_, bytes) in &pages {
                     chain_page_bytes = validate_diff_payload_budget(chain_page_bytes, bytes.len())?;
                 }
-                diffs.push((version, state, pages));
+                diffs.push((version, state, ChainDiff::Pages(pages)));
+                cur = parent;
+            }
+            SnapshotContent::AlignedDiff {
+                parent,
+                state,
+                version,
+                file,
+                data_offset,
+                runs,
+            } => {
+                diffs.push((
+                    version,
+                    state,
+                    ChainDiff::Aligned {
+                        file,
+                        data_offset,
+                        runs,
+                    },
+                ));
                 cur = parent;
             }
         }
@@ -5306,20 +7223,78 @@ fn load_snapshot_chain(path: &str) -> Result<(vmm_memory_backend::GuestMemory, V
         .first()
         .map(|(version, state, _)| (*version, state.clone()))
         .unwrap_or((base_version, base_state));
-    // Apply diffs base→tip = reverse of the tip→base collection order.
+
+    // Resolve every page to its newest version: walk tip→base and skip pages
+    // a newer diff already supplied, so overwritten pages are never touched.
     let mem_bytes = usize::try_from(mem.size_bytes)
         .map_err(|_| VmmError::Memory("restored memory too large".into()))?;
     let mem_slice: &mut [u8] = {
-        // SAFETY: `mem` is owned here and sized `mem_bytes`; we only write in-range.
+        // SAFETY: `mem` is owned here and sized `mem_bytes`; we only write
+        // in-range. Mapping file ranges over it keeps the same addresses.
         unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_bytes) }
     };
-    for (_, _, pages) in diffs.iter().rev() {
-        for (gpa, bytes) in pages {
-            validate_diff_page_range(*gpa, bytes.len(), mem_bytes)?;
-            let start = usize::try_from(*gpa)
-                .map_err(|_| VmmError::Snapshot("diff page GPA too large".into()))?;
-            let end = start + bytes.len();
-            mem_slice[start..end].copy_from_slice(bytes);
+    let page_count = mem_bytes.div_ceil(DIFF_PAGE_BYTES);
+    let mut covered = vec![0u64; page_count.div_ceil(64)];
+    let is_covered = |covered: &[u64], page: usize| covered[page / 64] & (1 << (page % 64)) != 0;
+    let cover = |covered: &mut [u64], page: usize| covered[page / 64] |= 1 << (page % 64);
+
+    for (_, _, diff) in &diffs {
+        match diff {
+            ChainDiff::Pages(pages) => {
+                for (gpa, bytes) in pages {
+                    validate_diff_page_range(*gpa, bytes.len(), mem_bytes)?;
+                    let start = usize::try_from(*gpa)
+                        .map_err(|_| VmmError::Snapshot("diff page GPA too large".into()))?;
+                    for (index, chunk) in bytes.chunks(DIFF_PAGE_BYTES).enumerate() {
+                        let at = start + index * DIFF_PAGE_BYTES;
+                        let page = at / DIFF_PAGE_BYTES;
+                        if at.is_multiple_of(DIFF_PAGE_BYTES) && is_covered(&covered, page) {
+                            continue;
+                        }
+                        mem_slice[at..at + chunk.len()].copy_from_slice(chunk);
+                        if at.is_multiple_of(DIFF_PAGE_BYTES) && chunk.len() == DIFF_PAGE_BYTES {
+                            cover(&mut covered, page);
+                        }
+                    }
+                }
+            }
+            ChainDiff::Aligned {
+                file,
+                data_offset,
+                runs,
+            } => {
+                let mut data_page = 0u64;
+                for &(offset, pages) in runs {
+                    let run_len = pages as usize * DIFF_PAGE_BYTES;
+                    validate_diff_page_range(offset, run_len, mem_bytes)?;
+                    let first = offset as usize / DIFF_PAGE_BYTES;
+                    let mut k = 0usize;
+                    while k < pages as usize {
+                        if is_covered(&covered, first + k) {
+                            k += 1;
+                            continue;
+                        }
+                        let begin = k;
+                        while k < pages as usize && !is_covered(&covered, first + k) {
+                            cover(&mut covered, first + k);
+                            k += 1;
+                        }
+                        let ram_offset = ((first + begin) * DIFF_PAGE_BYTES) as u64;
+                        let file_offset =
+                            data_offset + (data_page + begin as u64) * DIFF_PAGE_BYTES as u64;
+                        let len = (k - begin) * DIFF_PAGE_BYTES;
+                        if ram_load == RamLoad::Map && k - begin >= MAP_MIN_RUN_PAGES {
+                            mem.map_file_range_private(file, file_offset, ram_offset, len as u64)
+                                .map_err(|e| VmmError::Memory(e.to_string()))?;
+                        } else {
+                            let at = ram_offset as usize;
+                            file.read_exact_at(&mut mem_slice[at..at + len], file_offset)
+                                .map_err(|e| VmmError::Snapshot(format!("read diff pages: {e}")))?;
+                        }
+                    }
+                    data_page += u64::from(pages);
+                }
+            }
         }
     }
     Ok((mem, tip_state, tip_version))
@@ -5384,6 +7359,12 @@ pub struct StateBlob {
     /// unchanged.
     #[serde(skip)]
     pub serial_runtime: Option<vmm_devices::serial::SerialRuntimeState>,
+    /// virtio-rng queue state, also in a framed trailer. Older snapshots have
+    /// none and restore a fresh device.
+    #[serde(skip)]
+    pub rng: Option<vmm_devices::virtio::rng_transport::VirtioRngMmioState>,
+    /// virtio-mem plug state of a hotplug-ready VM, also in a framed trailer
+    /// (after the rng one). Its presence selects the boot/aperture layout.
     #[serde(skip)]
     pub virtio_mem: Option<vmm_devices::virtio::mem::VirtioMemMmioState>,
 }
@@ -5471,6 +7452,10 @@ const BALLOON_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTBLN01";
 const COMPATIBILITY_TRAILER_MAGIC: &[u8; 8] = b"TRTCMP01";
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const SERIAL_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTSER01";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const RNG_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTRNG01";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const VIRTIO_MEM_STATE_TRAILER_MAGIC: &[u8; 8] = b"VMEM0001";
 #[cfg(all(
     target_arch = "x86_64",
     target_os = "linux",
@@ -5619,8 +7604,13 @@ fn decode_state_blob(
         blob.serial_runtime = Some(decoded);
         trailing = remaining;
     }
-    if trailing.starts_with(b"VMEM0001") {
-        let (decoded, remaining) = decode_trailer(trailing, b"VMEM0001")?;
+    if trailing.starts_with(RNG_STATE_TRAILER_MAGIC) {
+        let (decoded, remaining) = decode_trailer(trailing, RNG_STATE_TRAILER_MAGIC)?;
+        blob.rng = Some(decoded);
+        trailing = remaining;
+    }
+    if trailing.starts_with(VIRTIO_MEM_STATE_TRAILER_MAGIC) {
+        let (decoded, remaining) = decode_trailer(trailing, VIRTIO_MEM_STATE_TRAILER_MAGIC)?;
         blob.virtio_mem = Some(decoded);
         trailing = remaining;
     }
@@ -5658,10 +7648,18 @@ fn encode_state_blob(
         bytes.extend_from_slice(&payload_len.to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
+    if let Some(rng) = blob.rng.as_ref() {
+        let payload = postcard::to_allocvec(rng)?;
+        let payload_len =
+            u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
+        bytes.extend_from_slice(RNG_STATE_TRAILER_MAGIC);
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+    }
     if let Some(memory) = blob.virtio_mem.as_ref() {
         let payload = postcard::to_allocvec(memory)?;
         let len = u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
-        bytes.extend_from_slice(b"VMEM0001");
+        bytes.extend_from_slice(VIRTIO_MEM_STATE_TRAILER_MAGIC);
         bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
@@ -5780,7 +7778,18 @@ fn restore_virtio_net_states(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    for (dev, state) in devs.iter_mut().zip(decoded) {
+    for (index, (dev, state)) in devs.iter_mut().zip(decoded).enumerate() {
+        // A guest that negotiated offloads sends and expects frames with
+        // partial checksums and TSO; only a tap carrying a virtio-net header
+        // can pass them, so do not resume it on one that cannot.
+        let offloads =
+            state.guest_features & vmm_devices::virtio::net_transport::net_features::OFFLOADS;
+        if offloads != 0 && !dev.vnet_hdr() {
+            return Err(VmmError::Snapshot(format!(
+                "snapshot virtio-net {index} negotiated offloads {offloads:#x}, but its TAP was \
+                 opened without IFF_VNET_HDR"
+            )));
+        }
         vmm_devices::persist::Persist::restore(dev, state);
     }
     Ok(())
@@ -5803,6 +7812,91 @@ struct RestoredRuntimeState<'a> {
     balloon: Option<&'a vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
     memory: Option<&'a vmm_devices::virtio::mem::VirtioMemMmioState>,
     target_memory_mib: Option<u64>,
+    rng: Option<&'a vmm_devices::virtio::rng_transport::VirtioRngMmioState>,
+}
+
+/// Back the guest kernel's load range with transparent huge pages before it
+/// is loaded: the host allocates a few 2 MiB pages instead of thousands of
+/// 4 KiB ones (about 10 ms -> 4 ms for a 20 MiB kernel), and the guest's kernel
+/// is then mapped with huge pages, which shortens its boot as well. Only the
+/// kernel's own range is advised, so guest RAM density is unchanged.
+///
+/// Only when the host has plenty of free 2 MiB blocks: with few, a huge page
+/// fault compacts memory first and usually falls back to small pages anyway,
+/// which made a burst of 20 concurrent boots 40% slower on a fragmented host.
+/// `VMM_KERNEL_HUGEPAGES=0` turns it off entirely.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+pub fn back_kernel_with_huge_pages(
+    mem: &vmm_memory_backend::GuestMemory,
+    kernel: &std::path::Path,
+) {
+    // Free blocks wanted per 2 MiB page the kernel needs: room for a burst of
+    // VMs booting at once without draining the free lists into compaction.
+    const MARGIN: u64 = 16;
+    if std::env::var("VMM_KERNEL_HUGEPAGES").as_deref() == Ok("0") {
+        return;
+    }
+    let Some((start, end)) = vmm_loader::x86_64::elf_load_extent(kernel) else {
+        return;
+    };
+    let needed = (end - start).div_ceil(2 * 1024 * 1024);
+    let free = std::fs::read_to_string("/proc/buddyinfo")
+        .map(|info| free_huge_page_blocks(&info))
+        .unwrap_or(0);
+    let advised = free >= needed * MARGIN && mem.advise_huge_pages(start, end - start);
+    log::debug!(
+        "kernel range {start:#x}..{end:#x}: {needed} huge pages needed, {free} free, advised {advised}"
+    );
+}
+
+/// Free 2 MiB blocks across all zones in `/proc/buddyinfo` text (order 9 and
+/// larger; a free order-n block holds 2^(n-9) of them).
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn free_huge_page_blocks(buddyinfo: &str) -> u64 {
+    const HUGE_ORDER: usize = 9;
+    buddyinfo
+        .lines()
+        .flat_map(|line| {
+            line.split_whitespace()
+                .skip(4) // "Node 0, zone Normal"
+                .enumerate()
+                .filter(|(order, _)| *order >= HUGE_ORDER)
+                .filter_map(|(order, count)| {
+                    count
+                        .parse::<u64>()
+                        .ok()
+                        .map(|count| count << (order - HUGE_ORDER))
+                })
+        })
+        .sum()
+}
+
+/// Collect the startup reports of device workers started with `start_*`.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn wait_for_device_workers(
+    blk: &mut [vmm_devices::virtio::blk_io_loop::BlkIoLoop],
+    net: &mut [vmm_devices::virtio::net_io_loop::NetIoLoop],
+    vsock: Option<&mut vmm_devices::virtio::vsock_io_loop::VsockPump>,
+) -> Result<()> {
+    for (i, worker) in blk.iter_mut().enumerate() {
+        worker.wait_ready().map_err(|error| {
+            VmmError::Device(format!("start block I/O worker for volume {i}: {error}"))
+        })?;
+    }
+    for worker in net {
+        worker
+            .wait_ready()
+            .map_err(|error| VmmError::Device(format!("start network I/O worker: {error}")))?;
+    }
+    if let Some(worker) = vsock {
+        worker
+            .wait_ready()
+            .map_err(|error| VmmError::Device(format!("start vsock worker: {error}")))?;
+    }
+    Ok(())
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5829,6 +7923,7 @@ fn build_running_vm(
         blk_io_evts,
         blk_mmio_bases,
         nets,
+        mut rng,
         rng_irq,
         vsock,
         balloon,
@@ -5855,6 +7950,9 @@ fn build_running_vm(
         }
     }
     restore_virtio_blk_states(&mut blks, restored.virtio_blk)?;
+    if let Some(state) = restored.rng {
+        vmm_devices::persist::Persist::restore(&mut rng, state.clone());
+    }
     let mut net_devices: Vec<_> = nets.iter().map(|n| n.dev.clone()).collect();
     restore_virtio_net_states(&mut net_devices, restored.virtio_net)?;
     let mut balloon = balloon;
@@ -5865,6 +7963,35 @@ fn build_running_vm(
 
     let template = crate::cpu_template::CpuTemplate::bare();
     let kvm_vm = crate::kvm::KvmVm::new_with_options(mem, devices, template, full_boot)?;
+    // Install the devices' interrupt routes in one update (the balloon's
+    // resampler registration, which comes last, installs them).
+    kvm_vm.defer_gsi_routing();
+    // Keep handles to the balloon's eventfds for its irqfd registration,
+    // which starts once every other GSI route is in place (below).
+    let balloon_irqfd_fds = balloon
+        .as_ref()
+        .map(|wired| -> Result<_> {
+            let clone = |evt: &vmm_sys_util::eventfd::EventFd| {
+                evt.try_clone()
+                    .map_err(|error| VmmError::Kvm(format!("balloon irq clone: {error}")))
+            };
+            Ok((
+                clone(&wired.irq_evt)?,
+                clone(&wired.resample_evt)?,
+                wired.irq,
+            ))
+        })
+        .transpose()?;
+
+    // Track guest writes from the first restored instruction, so the next diff
+    // snapshot contains only what changed since the snapshot restored here.
+    let dirty_logging_from_start = match kvm_vm.enable_dirty_logging() {
+        Ok(()) => kvm_vm.read_dirty().is_ok(),
+        Err(error) => {
+            log::warn!("restore: dirty logging unavailable ({error}); next diff will be full");
+            false
+        }
+    };
 
     // Replace the snapshot's generation value before any restored vCPU can
     // execute. Old snapshots without the ACPI device were rejected above.
@@ -5891,7 +8018,7 @@ fn build_running_vm(
     {
         kvm_vm.register_ioeventfd_datamatch(mmio_base + 0x50, &io_evt, 0)?;
         use std::os::fd::AsRawFd;
-        let io_loop = vmm_devices::virtio::blk_io_loop::spawn_blk_io_loop(
+        let io_loop = vmm_devices::virtio::blk_io_loop::start_blk_io_loop(
             Arc::clone(device),
             io_evt.as_raw_fd(),
         )
@@ -5942,13 +8069,13 @@ fn build_running_vm(
             mmio_base,
         } = net;
         kvm_vm.register_irqfd(&irq_evt, irq)?;
-        kvm_vm.register_ioeventfd(mmio_base + 0x50, &io_evt)?;
+        kvm_vm.register_queue_notify(mmio_base + 0x50, &io_evt, 2)?;
         let tap_fd = tap.fd;
         let kick_fd = {
             use std::os::fd::AsRawFd;
             io_evt.as_raw_fd()
         };
-        let io_loop = vmm_devices::virtio::net_io_loop::spawn_net_io_loop(dev, tap_fd, kick_fd)
+        let io_loop = vmm_devices::virtio::net_io_loop::start_net_io_loop(dev, tap_fd, kick_fd)
             .map_err(|error| {
                 VmmError::Device(format!("spawn restored network I/O worker: {error}"))
             })?;
@@ -5966,14 +8093,28 @@ fn build_running_vm(
         irq_evts.push(evt);
     }
     let memory_device = memory.as_ref().map(|wired| wired.device.clone());
-    let memory_irq_resample = match memory {
+    let memory_irqfd_fds = memory
+        .as_ref()
+        .map(|wired| -> Result<_> {
+            let clone = |evt: &vmm_sys_util::eventfd::EventFd| {
+                evt.try_clone()
+                    .map_err(|error| VmmError::Kvm(format!("virtio-mem irq clone: {error}")))
+            };
+            Ok((
+                clone(&wired.irq_evt)?,
+                clone(&wired.resample_evt)?,
+                wired.irq,
+            ))
+        })
+        .transpose()?;
+    let mut memory_irq_resample = match memory {
         Some(wired) => {
-            kvm_vm.register_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)?;
             let evt = wired
                 .irq_evt
                 .try_clone()
                 .map_err(|e| VmmError::Kvm(e.to_string()))?;
             let loop_handle = LevelIrqResample::spawn(
+                None,
                 move || wired.device.has_pending_interrupt(),
                 evt,
                 wired.resample_evt,
@@ -5984,10 +8125,10 @@ fn build_running_vm(
         None => None,
     };
     let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
-    let balloon_irq_resample = match balloon {
+    let mut balloon_irq_resample = match balloon {
         Some(wired) => {
-            kvm_vm.register_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)?;
             let loop_handle = LevelIrqResample::spawn(
+                None,
                 move || wired.device.has_pending_interrupt(),
                 wired
                     .irq_evt
@@ -6003,7 +8144,7 @@ fn build_running_vm(
 
     // Wire the virtio-vsock exec channel (matching create_live), so a restored
     // VM re-establishes exec-over-vsock when the guest agent re-dials.
-    let (vsock_pump, vsock_exec, vsock_pty, vsock_reset) = match vsock {
+    let (mut vsock_pump, vsock_exec, vsock_pty, vsock_reset) = match vsock {
         Some(wv) => {
             kvm_vm.register_irqfd(&wv.irq_evt, wv.irq)?;
             irq_evts.push(wv.irq_evt);
@@ -6021,7 +8162,7 @@ fn build_running_vm(
                 (device.clone(), state.connections.clone())
             });
             let pump =
-                vmm_devices::virtio::vsock_io_loop::spawn_vsock_pump(device.clone(), tx_kick_fd)
+                vmm_devices::virtio::vsock_io_loop::start_vsock_pump(device.clone(), tx_kick_fd)
                     .map_err(|error| {
                         VmmError::Device(format!("spawn restored vsock worker: {error}"))
                     })?;
@@ -6051,6 +8192,24 @@ fn build_running_vm(
         None => (None, None, None, None),
     };
 
+    // The resampler registration waits out an SRCU grace period, and every
+    // GSI routing update waits for the same SRCU domain. Start it after the
+    // last route is installed so the two do not queue behind each other; it
+    // then overlaps vCPU startup and the guest's reconnect, and restore
+    // finishes it before reporting success.
+    for (fds, resample) in [
+        (memory_irqfd_fds, memory_irq_resample.as_mut()),
+        (balloon_irqfd_fds, balloon_irq_resample.as_mut()),
+    ] {
+        if let (Some((irq_evt, resample_evt, irq)), Some(resample)) = (fds, resample) {
+            resample.registration =
+                Some(kvm_vm.begin_irqfd_with_resample(&irq_evt, &resample_evt, irq)?);
+        }
+    }
+    // The workers above started in parallel; each must have its sandbox
+    // in place before the guest runs.
+    wait_for_device_workers(&mut blk_io_loops, &mut net_io_loops, vsock_pump.as_mut())?;
+    kvm_vm.commit_gsi_routing()?;
     let vcpu = kvm_vm.create_vcpu(0)?;
     // CPUID must be set on the fresh vCPU before the saved MSRs/state are
     // applied; the captured LAPIC already carries the LVT config, so we do not
@@ -6107,14 +8266,34 @@ fn build_running_vm(
     // stream down and the agent re-dials the host exec channel (the host side
     // already re-accepts the new connection). Done here, post-resume, so the RX
     // completion interrupt lands on a running vCPU instead of a paused LAPIC.
-    if let Some((dev, conns)) = vsock_reset {
+    if let Some((dev, conns)) = &vsock_reset {
         let resets = dev
-            .reset_restored_connections(&conns)
+            .reset_restored_connections(conns)
             .map_err(|error| VmmError::Device(format!("reset restored vsock streams: {error}")))?;
         if resets > 0 {
             log::info!("vsock restore: injected RST for {resets} restored stream(s)");
         }
     }
+
+    // A snapshot captures each vCPU (and its LAPIC) as it parks, before the
+    // I/O workers drain. A completion interrupt raised in between is in the
+    // device's status register and the used ring but in no saved LAPIC, so
+    // without a new one the guest waits on that I/O forever. Raise every
+    // still-pending device interrupt again now that the vCPUs run.
+    for blk in &blks {
+        blk.reassert_pending_interrupt();
+    }
+    for net in &net_devices {
+        net.reassert_pending_interrupt();
+    }
+    if let Some((dev, _)) = &vsock_reset {
+        dev.reassert_pending_interrupt();
+    }
+    if let Some(balloon) = &balloon_device {
+        balloon.reassert_pending_interrupt();
+    }
+    rng.reassert_pending_interrupt();
+    serial.reassert_pending_interrupt();
 
     Ok(RunningVm {
         kvm_vm,
@@ -6128,12 +8307,14 @@ fn build_running_vm(
         memory_device,
         memory_irq_resample,
         balloon_device,
+        rng_device: Some(rng),
         balloon_irq_resample,
         taps,
         vsock_pump,
         vsock_exec,
         vsock_pty,
         keep_alive_fds: irq_evts,
+        dirty_logging_from_start,
     })
 }
 
@@ -6159,6 +8340,7 @@ struct WiredDevices {
     blk_io_evts: Vec<vmm_sys_util::eventfd::EventFd>,
     blk_mmio_bases: Vec<u64>,
     nets: Vec<WiredNet>,
+    rng: Arc<vmm_devices::virtio::rng_transport::VirtioRngMmio>,
     /// virtio-rng completion irqfd (gsi, EventFd), registered by the caller.
     rng_irq: Option<(u32, vmm_sys_util::eventfd::EventFd)>,
     /// virtio-vsock exec device (pump + control-socket accept wired by caller).
@@ -6210,13 +8392,83 @@ struct WiredMemory {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 pub struct LevelIrqResample {
+    /// The irqfd registration, until it is finished.
+    registration: Option<crate::kvm::PendingIrqfd>,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the thread so teardown does not wait out its poll timeout.
+    wake: vmm_sys_util::eventfd::EventFd,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Kernel `ip=` fragment that configures the guest's eth0 at boot from a
+/// NIC's `guest_ip` (a plain address, as config validation requires). The
+/// gateway and netmask come from the host side of the TAP (the address the
+/// operator assigned to it, e.g. `172.16.0.1/24`); a TAP without an IPv4
+/// address gives a /24 and no gateway.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn guest_ip_boot_fragment(net: &crate::config::NetConfig) -> Option<String> {
+    let guest: std::net::Ipv4Addr = net.guest_ip.as_deref()?.parse().ok()?;
+    let tap = tap_ipv4(&net.tap);
+    let mask = tap
+        .map(|(_, mask)| mask)
+        .unwrap_or(std::net::Ipv4Addr::new(255, 255, 255, 0));
+    Some(format_ip_fragment(
+        guest,
+        tap.map(|(gateway, _)| gateway),
+        mask,
+    ))
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn format_ip_fragment(
+    guest: std::net::Ipv4Addr,
+    gateway: Option<std::net::Ipv4Addr>,
+    mask: std::net::Ipv4Addr,
+) -> String {
+    let gateway = gateway.map(|g| g.to_string()).unwrap_or_default();
+    format!("ip={guest}::{gateway}:{mask}::eth0:off")
+}
+
+/// IPv4 address and netmask assigned to a host interface, if any.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn tap_ipv4(name: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ {
+        return None;
+    }
+    // SAFETY: plain socket creation; the fd is closed below.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let query = |request: libc::c_ulong| -> Option<std::net::Ipv4Addr> {
+        // SAFETY: ifreq is plain old data; zeroed is a valid value.
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in ifr.ifr_name.iter_mut().zip(name.bytes()) {
+            *dst = src as libc::c_char;
+        }
+        // SAFETY: valid socket fd and a properly sized, NUL-terminated ifreq.
+        if unsafe { libc::ioctl(fd, request as _, &mut ifr) } != 0 {
+            return None;
+        }
+        // SAFETY: for SIOCGIFADDR/SIOCGIFNETMASK the kernel fills a sockaddr_in.
+        let sin = unsafe {
+            *(&ifr.ifr_ifru.ifru_addr as *const libc::sockaddr as *const libc::sockaddr_in)
+        };
+        Some(std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+    };
+    let result = query(libc::SIOCGIFADDR).zip(query(libc::SIOCGIFNETMASK));
+    // SAFETY: closing the fd opened above.
+    unsafe { libc::close(fd) };
+    result
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 impl LevelIrqResample {
     fn spawn(
+        registration: Option<crate::kvm::PendingIrqfd>,
         pending: impl Fn() -> bool + Send + 'static,
         irq_evt: vmm_sys_util::eventfd::EventFd,
         resample_evt: vmm_sys_util::eventfd::EventFd,
@@ -6226,19 +8478,31 @@ impl LevelIrqResample {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
+        let wake = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|error| VmmError::Kvm(format!("virtio IRQ resample wake: {error}")))?;
+        let wake_thread = wake
+            .try_clone()
+            .map_err(|error| VmmError::Kvm(format!("virtio IRQ resample wake: {error}")))?;
         let handle = std::thread::Builder::new()
             .name("virtio-level-irq-resample".into())
             .spawn(move || {
                 while !stop_thread.load(Ordering::Acquire) {
-                    let mut pollfd = libc::pollfd {
-                        fd: resample_evt.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // SAFETY: pollfd points to one initialized entry and the
-                    // thread owns the eventfd for its entire lifetime.
-                    let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
-                    if ready <= 0 {
+                    let mut pollfds = [
+                        libc::pollfd {
+                            fd: resample_evt.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: wake_thread.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: pollfds holds two initialized entries and the
+                    // thread owns both eventfds for its entire lifetime.
+                    let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, 100) };
+                    if ready <= 0 || pollfds[0].revents == 0 {
                         continue;
                     }
                     let _ = resample_evt.read();
@@ -6249,9 +8513,19 @@ impl LevelIrqResample {
             })
             .map_err(|error| VmmError::Kvm(format!("spawn virtio IRQ resample: {error}")))?;
         Ok(Self {
+            registration,
             stop,
+            wake,
             handle: Some(handle),
         })
+    }
+
+    /// Wait for the irqfd registration started alongside this loop.
+    fn finish_registration(&mut self) -> Result<()> {
+        match self.registration.as_mut() {
+            Some(pending) => pending.finish(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -6260,6 +8534,7 @@ impl Drop for LevelIrqResample {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.stop.store(true, Ordering::Release);
+        let _ = self.wake.write(1);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -6326,7 +8601,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         let dev = Arc::new(VirtioNetMmio::new(irq, mac));
         dev.set_guest_memory(gm.clone());
         dev.set_guest_dirty_tracker(host_dirty.clone());
-        dev.set_tap_fd(tap.fd);
+        dev.set_tap_fd(tap.fd, tap.vnet_hdr);
         let irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
             .map_err(|e| VmmError::Kvm(format!("EventFd: {e}")))?;
         let io_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
@@ -6359,7 +8634,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     let rng_slot = config.volumes.len() + config.net.len();
     let rng_irq_num = 5 + rng_slot as u32;
     let rng_mmio = MMIO_START + (rng_slot as u64) * 0x1000;
-    let rng_dev = VirtioRngMmio::new(rng_irq_num, VirtioRng::new());
+    let rng_dev = Arc::new(VirtioRngMmio::new(rng_irq_num, VirtioRng::new()));
     rng_dev.set_guest_memory(gm.clone());
     rng_dev.set_guest_dirty_tracker(host_dirty.clone());
     let rng_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
@@ -6369,7 +8644,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
             .try_clone()
             .map_err(|e| VmmError::Kvm(format!("EventFd clone: {e}")))?,
     );
-    devices.push((MmioRange::new(rng_mmio, 0x1000), Box::new(rng_dev)));
+    devices.push((MmioRange::new(rng_mmio, 0x1000), Box::new(rng_dev.clone())));
     acpi_devices.push((rng_mmio, 0x1000, rng_irq_num, true));
     log::info!("virtio-rng at mmio 0x{rng_mmio:x} irq {rng_irq_num}");
 
@@ -6481,6 +8756,7 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
         blk_io_evts,
         blk_mmio_bases,
         nets,
+        rng: rng_dev,
         rng_irq: Some((rng_irq_num, rng_evt)),
         vsock: Some(WiredVsock {
             device: vsock_dev,
@@ -6584,6 +8860,7 @@ fn serialize_state_blob(
         vsock: None,
         serial_runtime: None,
         virtio_mem: None,
+        rng: None,
     };
 
     encode_state_blob(&blob, None).unwrap_or_default()
@@ -6593,19 +8870,36 @@ fn serialize_state_blob(
 mod tests {
     use super::*;
 
+    #[test]
+    fn free_huge_page_blocks_counts_order_nine_and_up() {
+        let info = "Node 0, zone      DMA      2      1      0      0      0      0      0      0      1      2      2\n\
+                    Node 0, zone    DMA32   8196   4538   3208   2649   1798   1230    537    168     17      2      0\n\
+                    Node 0, zone   Normal  78576  37189  20208  13349   7715   4641   1790    675     70     16      3\n";
+        // order 9 + 2 x order 10: DMA 2 + 4, DMA32 2 + 0, Normal 16 + 6.
+        assert_eq!(free_huge_page_blocks(info), 30);
+        assert_eq!(free_huge_page_blocks(""), 0);
+    }
+
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     #[test]
     fn hotplug_snapshot_trailer_preserves_layout_and_validates_maximum() {
         let memory = vmm_memory_backend::GuestMemory::new_hotplug(512 << 20, 256 << 20).unwrap();
         let device = vmm_devices::virtio::mem::VirtioMemMmio::new(10, memory).unwrap();
         device.set_target_total_mib(512).unwrap();
+        let rng = vmm_devices::virtio::rng_transport::VirtioRngMmio::new(
+            7,
+            vmm_devices::virtio::rng::VirtioRng::new(),
+        );
         let blob = StateBlob {
             virtio_mem: Some(vmm_devices::persist::Persist::save(&device)),
+            rng: Some(vmm_devices::persist::Persist::save(&rng)),
             ..Default::default()
         };
         let encoded = encode_state_blob(&blob, None).unwrap();
         let (decoded, _, _) = decode_state_blob(&encoded).unwrap();
         assert_eq!(decoded.virtio_mem, blob.virtio_mem);
+        // Both trailers decode when present together (rng first).
+        assert_eq!(decoded.rng, blob.rng);
         assert!(validate_restored_runtime_shape(&blob, false, false, false, 0, 1).is_err());
         let restored = allocate_snapshot_memory(512 << 20, &encoded).unwrap();
         assert_eq!(restored.low_size_bytes, 256 << 20);
@@ -6688,6 +8982,8 @@ mod tests {
             generation: next_vm_generation(),
             created_at: std::time::Instant::now(),
             last_snapshot: None,
+            base_identity: None,
+            restore_base: None,
             transient_files: VmTransientFiles::default(),
             dirty_logging: false,
             config: cfg(),
@@ -6698,6 +8994,7 @@ mod tests {
             lazy_restore: None,
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             running: None,
+            runtime_dir: RuntimeDirUse::acquire(),
         });
         controller
     }
@@ -6728,6 +9025,572 @@ mod tests {
         .unwrap();
         assert_eq!(config.net[0].tap, "tap-new");
         assert_eq!(config.net[0].guest_ip.as_deref(), Some("10.0.0.3"));
+    }
+
+    // A regular snapshot's disk capture must work without reflink (sparse
+    // extent copy), leave the live upper untouched, and be marked as a
+    // template so restores never write it.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_overlay_capture_copies_extents_and_marks_a_template() {
+        use std::os::unix::fs::FileExt as _;
+        let dir = private_runtime_dir().unwrap();
+        let live = dir.join(format!("t-live-{}.cow", std::process::id()));
+        {
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(&live)
+                .unwrap();
+            file.set_len(64 << 20).unwrap();
+            file.write_all_at(&[0xAB; 4096], 4096).unwrap();
+            file.write_all_at(&[0xCD; 4096], 32 << 20).unwrap();
+        }
+        let captured = capture_snapshot_overlay(&live).unwrap();
+        let mut page = [0u8; 4096];
+        captured.file().read_exact_at(&mut page, 4096).unwrap();
+        assert_eq!(page, [0xAB; 4096]);
+        captured.file().read_exact_at(&mut page, 32 << 20).unwrap();
+        assert_eq!(page, [0xCD; 4096]);
+        captured.file().read_exact_at(&mut page, 16 << 20).unwrap();
+        assert_eq!(page, [0; 4096], "holes stay zero");
+        assert!(is_disk_template(captured.path()));
+        assert!(!is_disk_template(&live), "the live upper is not a template");
+
+        // A disk written directly is captured whole, from outside the VMM's
+        // private directories, and is also a template.
+        let shared = std::env::temp_dir().join(format!("t-direct-{}.img", std::process::id()));
+        {
+            let file = std::fs::File::create(&shared).unwrap();
+            file.set_len(8 << 20).unwrap();
+            file.write_all_at(&[0x5A; 4096], 1 << 20).unwrap();
+        }
+        let disk = capture_snapshot_disk(&shared).unwrap();
+        disk.file().read_exact_at(&mut page, 1 << 20).unwrap();
+        assert_eq!(page, [0x5A; 4096]);
+        assert!(is_disk_template(disk.path()));
+
+        // Restore gives every template volume a private upper and leaves
+        // plain overlays, read-only disks and the templates themselves alone.
+        let captured_path = captured.path().to_string_lossy().into_owned();
+        let disk_path = disk.path().to_string_lossy().into_owned();
+        let mut config = cfg();
+        config.volumes = vec![
+            VolumeConfig {
+                path: "/base/rootfs.ext4".into(),
+                read_only: false,
+                overlay: Some(captured_path.clone()),
+                inherited_fd: None,
+            },
+            VolumeConfig {
+                path: disk_path.clone(),
+                read_only: false,
+                overlay: None,
+                inherited_fd: None,
+            },
+            VolumeConfig {
+                path: "/base/data.ext4".into(),
+                read_only: false,
+                overlay: Some(live.to_string_lossy().into_owned()),
+                inherited_fd: None,
+            },
+            VolumeConfig {
+                path: disk_path.clone(),
+                read_only: true,
+                overlay: None,
+                inherited_fd: None,
+            },
+        ];
+        let private = privatize_template_volumes(&mut config).unwrap();
+        assert_eq!(private.len(), 2);
+        let seeded = config.volumes[0].overlay.clone().unwrap();
+        assert_ne!(seeded, captured_path);
+        let seeded_file = std::fs::File::open(&seeded).unwrap();
+        seeded_file.read_exact_at(&mut page, 4096).unwrap();
+        assert_eq!(page, [0xAB; 4096], "template upper is copied");
+        assert!(!is_disk_template(Path::new(&seeded)));
+        assert_eq!(
+            config.volumes[1].path, disk_path,
+            "template disk stays the lower"
+        );
+        let empty_upper = config.volumes[1].overlay.clone().unwrap();
+        assert!(
+            vmm_devices::virtio::blk_backend::BlkBackend::open_cow(
+                Path::new(&disk_path),
+                Path::new(&empty_upper),
+            )
+            .is_ok(),
+            "the template disk gets an initialized private upper"
+        );
+        assert_eq!(
+            config.volumes[2].overlay.as_deref(),
+            Some(live.to_str().unwrap()),
+            "a plain overlay is not a template"
+        );
+        assert!(
+            config.volumes[3].overlay.is_none(),
+            "read-only disks need no upper"
+        );
+
+        for file in private.iter().chain([&captured, &disk]) {
+            remove_owned_scratch_file(file);
+        }
+        let _ = std::fs::remove_file(&live);
+        let _ = std::fs::remove_file(&shared);
+    }
+
+    // The snapshot state must name the captured overlay while keeping every
+    // other field.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_state_points_at_the_captured_overlay() {
+        let blob = StateBlob {
+            mem_size: 1 << 20,
+            vcpus: 2,
+            volumes: vec![
+                VolumeConfig {
+                    path: "/base/rootfs.ext4".into(),
+                    read_only: false,
+                    overlay: Some("/live/rootfs.cow".into()),
+                    inherited_fd: None,
+                },
+                VolumeConfig {
+                    path: "/data.ext4".into(),
+                    read_only: true,
+                    overlay: None,
+                    inherited_fd: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let encoded = encode_state_blob(&blob, None).unwrap();
+        let rewritten = with_snapshot_volumes(
+            &encoded,
+            &[
+                (0, CapturedDisk::Overlay("/snap/captured.cow".into())),
+                (1, CapturedDisk::Disk("/snap/data.img".into())),
+            ],
+        )
+        .unwrap();
+        let (decoded, _, _) = decode_state_blob(&rewritten).unwrap();
+        assert_eq!(decoded.volumes[0].path, "/base/rootfs.ext4");
+        assert_eq!(
+            decoded.volumes[0].overlay.as_deref(),
+            Some("/snap/captured.cow")
+        );
+        assert_eq!(decoded.volumes[1].path, "/snap/data.img");
+        assert!(decoded.volumes[1].overlay.is_none());
+        assert_eq!((decoded.mem_size, decoded.vcpus), (1 << 20, 2));
+        assert!(
+            with_snapshot_volumes(&encoded, &[(5, CapturedDisk::Overlay("/x.cow".into()))])
+                .is_err()
+        );
+    }
+
+    // A snapshot moved together with its captured overlay still finds it.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn moved_snapshot_finds_its_overlay_beside_it() {
+        let dir = private_runtime_dir().unwrap();
+        let name = format!("t-moved-{}.cow", std::process::id());
+        let beside = dir.join(&name);
+        std::fs::write(&beside, b"").unwrap();
+        let mut config = cfg();
+        config.volumes = vec![VolumeConfig {
+            path: "/base/rootfs.ext4".into(),
+            read_only: false,
+            overlay: Some(format!("/gone/{name}")),
+            inherited_fd: None,
+        }];
+        let snapshot = dir.join("t-moved.snap");
+        relocate_moved_snapshot_disks(&mut config, snapshot.to_str().unwrap());
+        assert_eq!(
+            config.volumes[0].overlay.as_deref(),
+            Some(beside.to_str().unwrap())
+        );
+        let _ = std::fs::remove_file(&beside);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn unpopulated_anonymous_pages_are_written_as_zero_without_being_read() {
+        const PAGE: usize = 4096;
+        let pages = 512;
+        // SAFETY: a fresh private anonymous mapping owned by this test.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                pages * PAGE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED);
+        // SAFETY: the mapping above is pages * PAGE bytes and live until munmap.
+        let mem = unsafe { std::slice::from_raw_parts_mut(addr.cast::<u8>(), pages * PAGE) };
+        mem[3 * PAGE] = 1;
+        mem[300 * PAGE + 7] = 2;
+        mem[511 * PAGE..].fill(3);
+        // A touched-but-zero page is populated and must still be checked.
+        mem[100 * PAGE] = 5;
+        mem[100 * PAGE] = 0;
+
+        let populated = populated_pages(mem.as_ptr(), mem.len()).expect("pagemap");
+        assert!(populated[3] && populated[300] && populated[511] && populated[100]);
+        assert!(!populated[200], "never-touched pages are unpopulated");
+
+        let file = tempfile::tempfile().unwrap();
+        let crc = write_sparse_at_with_crc(&file, 0, mem, Some(&populated)).unwrap();
+        // Check before this test reads `mem` itself: reading would populate it.
+        let after = populated_pages(mem.as_ptr(), mem.len()).expect("pagemap");
+        assert!(
+            !after[200],
+            "the writer must not fault in unpopulated pages"
+        );
+        assert_eq!(crc, crc32fast::hash(mem));
+        file.set_len(mem.len() as u64).unwrap();
+        let mut back = vec![0u8; mem.len()];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut back, 0).unwrap();
+        assert_eq!(back, mem);
+        // SAFETY: unmapping exactly the mapping created above.
+        unsafe { libc::munmap(addr, pages * PAGE) };
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn deferred_snapshot_of_file_backed_ram_matches_a_full_read() {
+        use std::io::Write as _;
+        const PAGE: usize = 4096;
+        let pages = 256;
+
+        // A base image with data, zero pages and a hole, plus a newer run
+        // layered over part of it, as a chain restore maps them.
+        let mut base = tempfile::tempfile().unwrap();
+        let mut image = vec![0u8; pages * PAGE];
+        for page in 0..pages {
+            if page % 3 != 0 {
+                image[page * PAGE..(page + 1) * PAGE].fill((page % 251) as u8 + 1);
+            }
+        }
+        base.write_all(&image).unwrap();
+        base.set_len((pages * PAGE + PAGE) as u64).unwrap(); // trailing hole
+        let mut diff = tempfile::tempfile().unwrap();
+        diff.write_all(&vec![0xd1u8; 8 * PAGE]).unwrap();
+
+        let mem = vmm_memory_backend::GuestMemory::new((pages * PAGE) as u64).unwrap();
+        mem.map_file_private(&base, 0).unwrap();
+        mem.map_file_range_private(&diff, 0, (40 * PAGE) as u64, (8 * PAGE) as u64)
+            .unwrap();
+        // Guest writes, a guest write of zeros, and a balloon discard.
+        mem.write_phys((5 * PAGE) as u64, &[0xee; 100]).unwrap();
+        mem.write_phys((41 * PAGE) as u64, &[0x77; PAGE]).unwrap();
+        mem.write_phys((7 * PAGE) as u64, &[0u8; PAGE]).unwrap();
+        mem.discard_range((100 * PAGE) as u64, (10 * PAGE) as u64)
+            .unwrap();
+        mem.write_phys((105 * PAGE) as u64, &[0x55; 10]).unwrap();
+
+        // SAFETY: `mem` owns this mapping for the whole test.
+        let ram = unsafe { std::slice::from_raw_parts(mem.as_ptr(), pages * PAGE) };
+        let populated = populated_pages(ram.as_ptr(), ram.len()).expect("pagemap");
+        assert!(!populated[200], "page 200 untouched before the snapshot");
+        let state = b"state-blob".to_vec();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let pending = write_snapshot_memory_deferred(
+            out.as_file(),
+            &state,
+            ram,
+            &populated,
+            &mem.file_backed_ranges(),
+        )
+        .unwrap();
+        let after = populated_pages(ram.as_ptr(), ram.len()).expect("pagemap");
+        assert!(
+            !after[200],
+            "the paused half must not fault in untouched pages"
+        );
+        finish_deferred_snapshot(out.as_file(), pending).unwrap();
+
+        // Exactly what reading every byte of guest RAM would have written.
+        let expected = ram.to_vec();
+        let restored = eager_restore_snapshot(out.path().to_str().unwrap()).expect("restores");
+        // The reader returns the state with its page-alignment padding.
+        assert!(restored.state_blob.starts_with(&state));
+        assert!(restored.state_blob[state.len()..].iter().all(|b| *b == 0));
+        let mut back = vec![0u8; pages * PAGE];
+        restored.mem.read_phys(0, &mut back).unwrap();
+        assert_eq!(back, expected);
+        let mut header = [0u8; 32];
+        std::os::unix::fs::FileExt::read_exact_at(out.as_file(), &mut header, 0).unwrap();
+        let mem_crc = u32::from_le_bytes(header[28..32].try_into().unwrap());
+        assert_eq!(mem_crc, crc32fast::hash(&expected));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn restore_refuses_offloads_on_a_tap_without_a_vnet_header() {
+        use vmm_devices::bus::MmioDevice as _;
+        use vmm_devices::virtio::net_transport::{net_features, VirtioNetMmio};
+        let source = VirtioNetMmio::new(6, [0; 6]);
+        source.set_vnet_hdr(true);
+        source
+            .mmio_write(
+                vmm_devices::virtio::regs::reg::GUEST_FEATURES,
+                net_features::OFFLOADS as u64,
+                4,
+            )
+            .unwrap();
+        let state = postcard::to_allocvec(&vmm_devices::persist::Persist::save(&source)).unwrap();
+
+        let mut plain = vec![Arc::new(VirtioNetMmio::new(6, [0; 6]))];
+        let error =
+            restore_virtio_net_states(&mut plain, std::slice::from_ref(&state)).unwrap_err();
+        assert!(error.to_string().contains("IFF_VNET_HDR"), "{error}");
+
+        let with_header = Arc::new(VirtioNetMmio::new(6, [0; 6]));
+        with_header.set_vnet_hdr(true);
+        let mut devs = vec![with_header];
+        restore_virtio_net_states(&mut devs, &[state]).unwrap();
+        assert_eq!(devs[0].negotiated_offloads(), net_features::OFFLOADS);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn full_snapshot_identity(path: &Path) -> Option<[u8; 32]> {
+        full_snapshot_identity_of(&open_snapshot_input(path).ok()?)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn write_full_snapshot_for_test(path: &Path, state: &[u8], mem: &[u8]) {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let populated = vec![true; mem.len() / 4096];
+        let pending = write_snapshot_memory_deferred(&file, state, mem, &populated, &[]).unwrap();
+        finish_deferred_snapshot(&file, pending).unwrap();
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_from_base_is_identical_to_a_full_snapshot() {
+        use vmm_memory_backend::dirty::DirtyBitmap;
+        const PAGE: usize = 4096;
+        let pages = 256;
+        let mut mem = vec![0u8; pages * PAGE];
+        for page in 0..pages {
+            if page % 4 != 0 {
+                mem[page * PAGE..(page + 1) * PAGE].fill((page % 251) as u8 + 1);
+            }
+        }
+        let base = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(base.path(), b"base-state", &mem);
+        let identity = full_snapshot_identity(base.path()).expect("a full snapshot");
+
+        // Changes since the base: data in a zero page, a page zeroed, a run,
+        // the last page, and a page marked dirty but rewritten unchanged.
+        let mut dirty = DirtyBitmap::new();
+        for (page, byte) in [
+            (0, 0xa1u8),
+            (5, 0),
+            (10, 0xb2),
+            (11, 0xb3),
+            (12, 0xb4),
+            (255, 0xc5),
+        ] {
+            mem[page * PAGE..(page + 1) * PAGE].fill(byte);
+            dirty.mark((page * PAGE) as u64);
+        }
+        dirty.mark((20 * PAGE) as u64);
+
+        let (file, offset, crc) =
+            open_snapshot_base(base.path().to_str().unwrap(), &identity, mem.len())
+                .expect("the base matches");
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let pending = write_snapshot_memory_from_base(
+            out.as_file(),
+            b"new-state",
+            &mem,
+            &dirty,
+            file,
+            offset,
+            crc,
+        )
+        .unwrap();
+        finish_deferred_snapshot(out.as_file(), pending).unwrap();
+        let full = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(full.path(), b"new-state", &mem);
+        assert_eq!(
+            std::fs::read(out.path()).unwrap(),
+            std::fs::read(full.path()).unwrap(),
+            "same bytes as a full snapshot of the same memory"
+        );
+        let restored = eager_restore_snapshot(out.path().to_str().unwrap()).expect("restores");
+        let mut back = vec![0u8; mem.len()];
+        restored.mem.read_phys(0, &mut back).unwrap();
+        assert_eq!(back, mem);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_from_a_base_whose_memory_changed_fails() {
+        use std::os::unix::fs::FileExt;
+        let mem = vec![7u8; 16 * 4096];
+        let base = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(base.path(), b"state", &mem);
+        let identity = full_snapshot_identity(base.path()).unwrap();
+        let (file, offset, crc) =
+            open_snapshot_base(base.path().to_str().unwrap(), &identity, mem.len()).unwrap();
+        // The header still matches, but a clean page's bytes do not.
+        base.as_file()
+            .write_all_at(&[9u8; 4096], offset + 3 * 4096)
+            .unwrap();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let dirty = vmm_memory_backend::dirty::DirtyBitmap::new();
+        let pending = write_snapshot_memory_from_base(
+            out.as_file(),
+            b"state",
+            &mem,
+            &dirty,
+            file,
+            offset,
+            crc,
+        )
+        .unwrap();
+        let error = finish_deferred_snapshot(out.as_file(), pending).unwrap_err();
+        assert!(error.to_string().contains("CRC"), "{error}");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_base_must_be_the_exact_last_full_snapshot() {
+        let mem = vec![7u8; 16 * 4096];
+        let base = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(base.path(), b"state", &mem);
+        let path = base.path().to_str().unwrap();
+        let identity = full_snapshot_identity(base.path()).unwrap();
+        assert!(open_snapshot_base(path, &identity, mem.len()).is_some());
+
+        // A different snapshot, or one of another size, is not the base.
+        let other = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(other.path(), b"state", &vec![8u8; 16 * 4096]);
+        let other_identity = full_snapshot_identity(other.path()).unwrap();
+        assert!(open_snapshot_base(path, &other_identity, mem.len()).is_none());
+        assert!(open_snapshot_base(path, &identity, mem.len() + 4096).is_none());
+
+        // A truncated copy with the same header is not the base either.
+        let truncated = tempfile::NamedTempFile::new().unwrap();
+        std::fs::copy(base.path(), truncated.path()).unwrap();
+        let len = truncated.as_file().metadata().unwrap().len();
+        truncated.as_file().set_len(len - 4096).unwrap();
+        let truncated_path = truncated.path().to_str().unwrap();
+        assert!(open_snapshot_base(truncated_path, &identity, mem.len()).is_none());
+
+        // Diff snapshots (non-zero flags) never identify as a base.
+        let mut header = std::fs::read(base.path()).unwrap();
+        header[6] = 1;
+        std::fs::write(truncated.path(), &header).unwrap();
+        assert!(full_snapshot_identity(truncated.path()).is_none());
+    }
+
+    #[test]
+    fn sparse_writes_skip_zero_pages_and_read_back_exactly() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Data in the first page, a lone page, a byte mid-run and a partial
+        // last page: every run boundary the writer has.
+        let mut data = vec![0u8; 64 * 4096 + 100];
+        data[..10].fill(1);
+        data[4096..8192].fill(7);
+        data[40 * 4096 + 5] = 9;
+        data[64 * 4096 + 99] = 3;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(0).unwrap();
+        let crc = write_sparse_at_with_crc(&file, 8192, &data, None).unwrap();
+        assert_eq!(
+            crc,
+            crc32fast::hash(&data),
+            "CRC covers zero and data pages"
+        );
+        file.set_len(8192 + data.len() as u64).unwrap();
+        let mut back = vec![0u8; data.len()];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut back, 8192).unwrap();
+        assert_eq!(back, data);
+        let allocated = file.metadata().unwrap().blocks() * 512;
+        assert!(
+            allocated <= 4 * 4096,
+            "zero pages must stay holes: {allocated}"
+        );
+    }
+
+    // A chain written in one directory and moved to another under the same
+    // names still restores: the recorded parent path is stale.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn moved_diff_chain_finds_its_parent_beside_the_tip() {
+        use vmm_memory_backend::dirty::DirtyBitmap;
+        let pid = std::process::id();
+        let first = private_runtime_dir()
+            .unwrap()
+            .join(format!("t-chain-a-{pid}"));
+        let moved = private_runtime_dir()
+            .unwrap()
+            .join(format!("t-chain-b-{pid}"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&moved).unwrap();
+        let mib = usize::try_from(crate::config::MIB).expect("MiB fits usize");
+        let mem = vec![0x31u8; mib];
+        let base = first.join("base.snap");
+        write_snapshot_file(base.to_str().unwrap(), b"b", &mem, false).unwrap();
+        let mut next = mem.clone();
+        next[..4096].fill(0x42);
+        let mut dirty = DirtyBitmap::new();
+        dirty.mark(0);
+        let tip = first.join("tip.snap");
+        write_diff_snapshot_file(
+            tip.to_str().unwrap(),
+            base.to_str().unwrap(),
+            b"t",
+            &next,
+            &dirty,
+        )
+        .unwrap();
+        for name in ["base.snap", "tip.snap"] {
+            std::fs::rename(first.join(name), moved.join(name)).unwrap();
+        }
+        let (gm, state, _) =
+            load_snapshot_chain_with(moved.join("tip.snap").to_str().unwrap(), RamLoad::Map)
+                .unwrap();
+        assert_eq!(state, b"t");
+        let mut page = [0u8; 4096];
+        gm.read_phys(0, &mut page).unwrap();
+        assert_eq!(page, [0x42; 4096]);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&moved);
+    }
+
+    #[test]
+    fn guest_ip_fragment_matches_kernel_ip_syntax() {
+        use std::net::Ipv4Addr;
+        assert_eq!(
+            format_ip_fragment(
+                Ipv4Addr::new(172, 16, 0, 2),
+                Some(Ipv4Addr::new(172, 16, 0, 1)),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            "ip=172.16.0.2::172.16.0.1:255.255.255.0::eth0:off"
+        );
+        assert_eq!(
+            format_ip_fragment(
+                Ipv4Addr::new(10, 0, 0, 5),
+                None,
+                Ipv4Addr::new(255, 255, 255, 252)
+            ),
+            "ip=10.0.0.5:::255.255.255.252::eth0:off"
+        );
     }
 
     #[test]
@@ -7224,6 +10087,83 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     #[test]
+    fn a_sparse_staged_image_publishes_the_same_bytes_and_hashes_as_a_dense_one() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::FileExt;
+
+        let dir = private_runtime_dir().unwrap();
+        let nonce = format!(
+            "sparse-live-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source_path = dir.join(format!("{nonce}-memory.raw"));
+        let output_path = dir.join(format!("{nonce}-snapshot.snap"));
+        let source = OwnedScratchFile::create_new(&source_path).unwrap();
+        let output = OwnedScratchFile::create_new(&output_path).unwrap();
+        // 9 MiB plus a partial chunk: mostly holes, with data that starts and
+        // ends inside chunks and a non-zero tail.
+        let len = 9 * 1024 * 1024 + 4096 + 11;
+        let mut memory = vec![0u8; len];
+        for (at, size) in [
+            (100_000usize, 5000usize),
+            (4 * 1024 * 1024 + 7, 70_000),
+            (len - 3000, 3000),
+        ] {
+            for (index, byte) in memory[at..at + size].iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(13).wrapping_add(1);
+            }
+            source
+                .file()
+                .write_all_at(&memory[at..at + size], at as u64)
+                .unwrap();
+        }
+        source.file().set_len(len as u64).unwrap();
+
+        let manifest = write_scratch_snapshot_file_from_memory_file(
+            &output,
+            b"sparse state",
+            source.file(),
+            len as u64,
+            false,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&output_path).unwrap();
+        let padded_state_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mem_offset = 32 + padded_state_len;
+        assert_eq!(&bytes[mem_offset..], memory);
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            crc32fast::hash(&memory)
+        );
+        let ram = manifest.artifact(tarit_proto::ArtifactKind::Ram).unwrap();
+        let expected: Vec<[u8; 32]> = memory
+            .chunks(tarit_proto::INTEGRITY_CHUNK_SIZE as usize)
+            .map(|chunk| Sha256::digest(chunk).into())
+            .collect();
+        assert_eq!(ram.chunk_hashes, expected);
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn ranges_overlap_finds_data_around_a_range() {
+        let extents = [(10, 20), (40, 50)];
+        assert!(!super::ranges_overlap(&extents, 0, 10));
+        assert!(super::ranges_overlap(&extents, 0, 11));
+        assert!(!super::ranges_overlap(&extents, 20, 20));
+        assert!(super::ranges_overlap(&extents, 45, 100));
+        assert!(!super::ranges_overlap(&extents, 50, 100));
+        assert!(!super::ranges_overlap(&[], 0, 100));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
     fn streamed_live_memory_snapshot_preserves_layout_and_crc() {
         use std::io::Write;
 
@@ -7375,14 +10315,29 @@ mod tests {
             in_buffer: b"pending".to_vec(),
         };
         decoded.serial_runtime = Some(serial_runtime.clone());
+        let rng = vmm_devices::virtio::rng_transport::VirtioRngMmio::new(
+            7,
+            vmm_devices::virtio::rng::VirtioRng::new(),
+        );
+        let rng_state = vmm_devices::persist::Persist::save(&rng);
+        decoded.rng = Some(rng_state.clone());
         let mut encoded = encode_state_blob(&decoded, Some(&balloon_state)).unwrap();
         encoded.resize(4096, 0);
         let (decoded_with_trailer, decoded_balloon, decoded_compatibility) =
             decode_state_blob(&encoded).unwrap();
         assert_eq!(decoded_with_trailer.kernel_path, "kernel");
         assert_eq!(decoded_with_trailer.serial_runtime, Some(serial_runtime));
+        assert_eq!(decoded_with_trailer.rng, Some(rng_state.clone()));
         assert_eq!(decoded_balloon, Some(balloon_state));
         decoded_compatibility.unwrap().validate().unwrap();
+
+        // The rng trailer also stands alone (no balloon or serial before it).
+        let mut rng_only = decode_state_blob(&bytes).unwrap().0;
+        rng_only.rng = Some(rng_state.clone());
+        let encoded = encode_state_blob(&rng_only, None).unwrap();
+        let (decoded_rng_only, no_balloon, _) = decode_state_blob(&encoded).unwrap();
+        assert_eq!(decoded_rng_only.rng, Some(rng_state));
+        assert!(no_balloon.is_none() && decoded_rng_only.serial_runtime.is_none());
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -7502,6 +10457,122 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("count mismatch"));
+    }
+
+    // Mapped restore must reconstruct exactly what the copying loader does,
+    // keep the snapshot file untouched, and still reject a corrupted base.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn mapped_snapshot_chain_matches_copy_and_detects_corruption() {
+        use std::os::unix::fs::FileExt as _;
+        use vmm_memory_backend::dirty::DirtyBitmap;
+        let dir = private_runtime_dir().unwrap();
+        let pid = std::process::id();
+        let base = dir.join(format!("t-map-base-{pid}.snap"));
+        let d1 = dir.join(format!("t-map-d1-{pid}.snap"));
+        let (base_s, d1_s) = (base.to_str().unwrap(), d1.to_str().unwrap());
+
+        let mib = usize::try_from(crate::config::MIB).expect("MiB fits usize");
+        let mem: Vec<u8> = (0..mib).map(|i| (i / 4096) as u8).collect();
+        write_snapshot_file(base_s, b"basestate", &mem, false).unwrap();
+        let mut m1 = mem.clone();
+        m1[4096..8192].fill(0xBB);
+        let mut dirty1 = DirtyBitmap::new();
+        dirty1.mark(0x1000);
+        write_diff_snapshot_file(d1_s, base_s, b"state1", &m1, &dirty1).unwrap();
+
+        let (copied, copied_state, _) = load_snapshot_chain_with(d1_s, RamLoad::Copy).unwrap();
+        let (mapped, mapped_state, _) = load_snapshot_chain_with(d1_s, RamLoad::Map).unwrap();
+        assert!(mapped.is_file_backed());
+        assert_eq!(mapped_state, copied_state);
+        // SAFETY: both memories own `mib` bytes for the duration of the test.
+        let (a, b) = unsafe {
+            (
+                std::slice::from_raw_parts(copied.as_ptr(), mib),
+                std::slice::from_raw_parts(mapped.as_ptr(), mib),
+            )
+        };
+        assert_eq!(a, b, "mapped chain must match the copied chain");
+        assert_eq!(&b[4096..8192], &[0xBB; 4096][..]);
+
+        // Guest writes stay private; the base image on disk is unchanged.
+        mapped.write_phys(0, &[0xEE; 16]).unwrap();
+        drop(mapped);
+        let (again, _, _) = load_snapshot_chain_with(base_s, RamLoad::Map).unwrap();
+        // SAFETY: `again` owns `mib` bytes.
+        let again = unsafe { std::slice::from_raw_parts(again.as_ptr(), mib) };
+        assert_eq!(&again[..16], &mem[..16]);
+
+        // A corrupted copy of the base (new inode, no verification record)
+        // must fail its RAM CRC instead of being mapped.
+        let bad = dir.join(format!("t-map-bad-{pid}.snap"));
+        std::fs::copy(&base, &bad).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&bad).unwrap();
+        let len = file.metadata().unwrap().len();
+        file.write_all_at(&[0x5A], len - 1).unwrap();
+        drop(file);
+        let error = match load_snapshot_chain_with(bad.to_str().unwrap(), RamLoad::Map) {
+            Ok(_) => panic!("corrupted base must not map"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("memory CRC mismatch"), "{error}");
+
+        for path in [&base, &d1, &bad] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // A chain mixing a legacy interleaved diff with page-aligned diffs must
+    // resolve every page to its newest version in both load modes, with long
+    // runs mapped from the diff file and short ones read.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn mixed_legacy_and_aligned_diff_chain_resolves_newest_pages() {
+        use vmm_memory_backend::dirty::DirtyBitmap;
+        let dir = private_runtime_dir().unwrap();
+        let pid = std::process::id();
+        let name = |tag: &str| dir.join(format!("t-mix-{tag}-{pid}.snap"));
+        let (base, d1, d2) = (name("base"), name("d1"), name("d2"));
+        let s = |p: &std::path::PathBuf| p.to_str().unwrap().to_string();
+
+        let mib = usize::try_from(crate::config::MIB).expect("MiB fits usize");
+        let page = DIFF_PAGE_BYTES;
+        let mem = vec![0x10u8; mib];
+        write_snapshot_file(&s(&base), b"base", &mem, false).unwrap();
+
+        // Legacy diff: pages 1..=3 -> 0x21.
+        let mut m1 = mem.clone();
+        m1[page..4 * page].fill(0x21);
+        let mut dirty1 = DirtyBitmap::new();
+        for pfn in 1..=3 {
+            dirty1.mark(pfn * page as u64);
+        }
+        let file = open_snapshot_output(&s(&d1), SnapshotCreateMode::CreateNew).unwrap();
+        write_legacy_diff_snapshot_to_file(&file, &s(&base), b"one", &m1, &dirty1).unwrap();
+        drop(file);
+
+        // Aligned diff: page 2 (short run, read) and pages 32..64 (long run,
+        // mapped) -> 0x32; page 3 keeps the legacy diff's 0x21.
+        let mut m2 = m1.clone();
+        m2[2 * page..3 * page].fill(0x32);
+        m2[32 * page..64 * page].fill(0x32);
+        let mut dirty2 = DirtyBitmap::new();
+        dirty2.mark(2 * page as u64);
+        for pfn in 32..64 {
+            dirty2.mark(pfn * page as u64);
+        }
+        write_diff_snapshot_file(&s(&d2), &s(&d1), b"two", &m2, &dirty2).unwrap();
+
+        for mode in [RamLoad::Copy, RamLoad::Map] {
+            let (gm, state, _) = load_snapshot_chain_with(&s(&d2), mode).unwrap();
+            assert_eq!(state, b"two");
+            // SAFETY: `gm` owns `mib` bytes for the duration of the check.
+            let got = unsafe { std::slice::from_raw_parts(gm.as_ptr(), mib) };
+            assert!(got == &m2[..], "chain resolved wrong pages");
+        }
+        for path in [&base, &d1, &d2] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     // Incremental diff-chain round trip. Boot-gated because it uses the

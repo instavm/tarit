@@ -27,6 +27,10 @@ pub struct RunContext {
     pub max_p95_ms: Option<u64>,
     pub max_p99_ms: Option<u64>,
     pub min_success_percent: Option<f64>,
+    pub hold: Duration,
+    pub rate: f64,
+    pub duration: Duration,
+    pub max_in_flight: usize,
 }
 
 impl RunContext {
@@ -50,6 +54,10 @@ impl RunContext {
             max_p95_ms: args.max_p95_ms,
             max_p99_ms: args.max_p99_ms,
             min_success_percent: args.min_success_percent,
+            hold: Duration::from_millis(args.hold_ms),
+            rate: args.rate,
+            duration: Duration::from_secs(args.duration_secs),
+            max_in_flight: args.max_in_flight,
         }
     }
 }
@@ -170,6 +178,23 @@ impl ModeOutcome {
                     minimum
                 );
             }
+        }
+
+        // A tail gate needs enough samples to mean anything. Other modes are
+        // checked before they run; a sustained run's count is only known now.
+        let samples = self.iterations.len();
+        let sustained = self.mode == args::Mode::Sustained;
+        if sustained && ctx.max_p95_ms.is_some() && samples < 20 {
+            anyhow::bail!(
+                "{} produced {samples} samples; a p95 gate needs at least 20",
+                self.mode.as_str()
+            );
+        }
+        if sustained && ctx.max_p99_ms.is_some() && samples < 100 {
+            anyhow::bail!(
+                "{} produced {samples} samples; a p99 gate needs at least 100",
+                self.mode.as_str()
+            );
         }
 
         let Some(stats) = result.summary.tti_ms else {
@@ -307,6 +332,16 @@ impl Config {
                 max_p99_ms: ctx.max_p99_ms,
                 min_success_percent: ctx.min_success_percent,
             },
+            args::Mode::Sustained => Self {
+                iterations: None,
+                concurrency: Some(ctx.max_in_flight),
+                timeout_ms: ctx.timeout_ms,
+                startup_path: ctx.startup_path.as_str(),
+                max_median_ms: ctx.max_median_ms,
+                max_p95_ms: ctx.max_p95_ms,
+                max_p99_ms: ctx.max_p99_ms,
+                min_success_percent: ctx.min_success_percent,
+            },
             args::Mode::Staggered | args::Mode::Burst => Self {
                 iterations: None,
                 concurrency: Some(ctx.concurrency),
@@ -401,7 +436,24 @@ mod tests {
             max_p95_ms: Some(20),
             max_p99_ms: Some(20),
             min_success_percent: Some(100.0),
+            hold: Duration::ZERO,
+            rate: 1.0,
+            duration: Duration::from_secs(1),
+            max_in_flight: 1,
         }
+    }
+
+    #[test]
+    fn a_tail_gate_rejects_a_run_with_too_few_samples() {
+        let mut ctx = context();
+        ctx.max_p95_ms = None;
+        ctx.max_p99_ms = Some(1_000);
+        let outcome = ModeOutcome::new(
+            args::Mode::Sustained,
+            vec![IterationResult::success(5), IterationResult::success(6)],
+        );
+        let error = outcome.verify_performance(&ctx).unwrap_err().to_string();
+        assert!(error.contains("at least 100"), "{error}");
     }
 
     #[test]

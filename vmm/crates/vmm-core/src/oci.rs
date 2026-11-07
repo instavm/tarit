@@ -186,6 +186,37 @@ pub fn pull_and_convert_with_agent(
     // creating a build workspace.
     let limits = OciResourceLimits::for_disk_size(size_mb)?;
 
+    // A local container engine can export any image it can run, flattened
+    // and with its own registry credentials. Use it when asked to, or when a
+    // registry reference cannot be pulled because skopeo/umoci are missing.
+    if let Some((engine, name)) = engine_image_source(&image.reference) {
+        return convert_engine_image(
+            engine,
+            name,
+            output_path,
+            size_mb,
+            agent_path,
+            limits,
+            start,
+        );
+    }
+    if let Some(name) = image.reference.strip_prefix("docker://") {
+        if (which("skopeo").is_none() || which("umoci").is_none()) && image.auth_file.is_none() {
+            if let Some(engine) = ENGINES.iter().find(|engine| which(engine).is_some()) {
+                log::info!("oci: skopeo/umoci unavailable; exporting {name} through {engine}");
+                return convert_engine_image(
+                    engine,
+                    name,
+                    output_path,
+                    size_mb,
+                    agent_path,
+                    limits,
+                    start,
+                );
+            }
+        }
+    }
+
     // Check for required tools.
     check_tool("skopeo")?;
     check_tool("umoci")?;
@@ -279,6 +310,346 @@ pub fn pull_and_convert_with_agent(
         elapsed_ms,
         agent_init,
     })
+}
+
+/// Container engines whose `export` yields an image's flattened rootfs.
+const ENGINES: [&str; 2] = ["docker", "podman"];
+
+/// `docker-daemon:IMAGE` and `podman:IMAGE` select a local engine.
+fn engine_image_source(reference: &str) -> Option<(&'static str, &str)> {
+    if let Some(name) = reference.strip_prefix("docker-daemon:") {
+        return Some(("docker", name));
+    }
+    reference
+        .strip_prefix("podman:")
+        .map(|name| ("podman", name))
+}
+
+/// Owner, mode and type of one exported entry, applied to the ext4 image when
+/// the build runs without root and could not preserve them while unpacking.
+struct EntryMeta {
+    uid: u64,
+    gid: u64,
+    /// Full `st_mode`, including the file type bits.
+    mode: u32,
+    /// Device numbers for character and block devices.
+    device: Option<(u32, u32)>,
+}
+
+/// Build an ext4 image from an image a local container engine can export.
+fn convert_engine_image(
+    engine: &str,
+    name: &str,
+    output_path: &Path,
+    size_mb: u64,
+    agent_path: Option<&Path>,
+    limits: OciResourceLimits,
+    start: std::time::Instant,
+) -> Result<OciPullResult, OciError> {
+    if name.is_empty() || name.starts_with('-') {
+        return Err(OciError::InvalidLayout(format!(
+            "invalid image name {name:?}"
+        )));
+    }
+    check_tool(engine)?;
+    check_tool("mke2fs")?;
+    let rootless = !can_set_any_owner();
+    if rootless {
+        check_tool("debugfs")?;
+    }
+
+    let final_output = resolved_output_path(output_path)?;
+    let output_dir = final_output
+        .parent()
+        .expect("resolved output always has a parent");
+    let workspace = create_oci_workspace(output_dir)?;
+    let rootfs = workspace.path().join("rootfs");
+    std::fs::create_dir(&rootfs)?;
+    let staged_output = workspace.path().join("disk.ext4");
+
+    // `create` pulls the image when missing. The entrypoint is never run; it
+    // only lets images without a default command (distroless) be created.
+    log::info!("oci: exporting {name} through {engine}");
+    let mut create = Command::new(engine);
+    create.args(["create", "--entrypoint", "/tarit-export-only", name]);
+    let created = create.output().map_err(|e| OciError::CommandFailed {
+        cmd: format!("{engine} create"),
+        stderr: e.to_string(),
+    })?;
+    if !created.status.success() {
+        return Err(OciError::CommandFailed {
+            cmd: format!("{engine} create {name}"),
+            stderr: String::from_utf8_lossy(&created.stderr).trim().to_string(),
+        });
+    }
+    let container = String::from_utf8_lossy(&created.stdout).trim().to_string();
+    if container.is_empty() || !container.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(OciError::CommandFailed {
+            cmd: format!("{engine} create {name}"),
+            stderr: format!("unexpected container id {container:?}"),
+        });
+    }
+    struct RemoveContainer<'a>(&'a str, &'a str);
+    impl Drop for RemoveContainer<'_> {
+        fn drop(&mut self) {
+            let _ = Command::new(self.0).args(["rm", "-f", self.1]).output();
+        }
+    }
+    let _remove = RemoveContainer(engine, &container);
+
+    let mut export = Command::new(engine)
+        .args(["export", &container])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| OciError::CommandFailed {
+            cmd: format!("{engine} export"),
+            stderr: e.to_string(),
+        })?;
+    let stdout = export.stdout.take().expect("piped stdout");
+    let unpacked = unpack_export(stdout, &rootfs, limits, rootless);
+    let exported = export.wait_with_output()?;
+    let metadata = unpacked?;
+    if !exported.status.success() {
+        return Err(OciError::CommandFailed {
+            cmd: format!("{engine} export"),
+            stderr: String::from_utf8_lossy(&exported.stderr).trim().to_string(),
+        });
+    }
+
+    let agent_init = match agent_path {
+        Some(agent) => {
+            inject_agent_init(&rootfs, agent)?;
+            true
+        }
+        None => false,
+    };
+
+    log::info!("oci: creating ext4 disk image ({}MB)", size_mb);
+    let mut mke2fs = Command::new("mke2fs");
+    mke2fs
+        .args(["-q", "-t", "ext4", "-d"])
+        .arg(&rootfs)
+        .args(["-L", "rootfs", "-F"])
+        .arg(&staged_output)
+        .arg(format!("{size_mb}M"));
+    run_command(mke2fs, "mke2fs")?;
+    if rootless {
+        restore_image_ownership(&rootfs, &metadata, &staged_output, workspace.path())?;
+    }
+    publish_disk_image(&staged_output, &final_output)?;
+
+    let size_bytes = std::fs::metadata(&final_output)?.len();
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    log::info!(
+        "oci: {name} converted through {engine} — {size_bytes} bytes in {elapsed_ms}ms \
+         (agent_init={agent_init}, rootless={rootless})"
+    );
+    Ok(OciPullResult {
+        disk_image_path: output_path.to_string_lossy().to_string(),
+        size_bytes,
+        elapsed_ms,
+        agent_init,
+    })
+}
+
+/// Unpack an exported rootfs tar into `rootfs`, enforcing the same budgets as
+/// registry pulls. As root, ownership, modes and device nodes are kept. Without
+/// root they cannot be, so each entry's real owner, mode and device numbers are
+/// recorded for `restore_image_ownership`, and the staged copy is made
+/// readable and traversable by the build user.
+fn unpack_export<R: Read>(
+    reader: R,
+    rootfs: &Path,
+    limits: OciResourceLimits,
+    rootless: bool,
+) -> Result<HashMap<PathBuf, EntryMeta>, OciError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(!rootless);
+    archive.set_preserve_ownerships(!rootless);
+    archive.set_unpack_xattrs(!rootless);
+    archive.set_overwrite(true);
+    let mut metadata = HashMap::new();
+    let mut entries = 0u64;
+    let mut expanded = 0u64;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        entries += 1;
+        if entries > limits.max_entries {
+            return Err(OciError::ResourceLimit(format!(
+                "image has more than {} entries",
+                limits.max_entries
+            )));
+        }
+        let size = entry.header().size()?;
+        if size > limits.max_single_file_bytes {
+            return Err(OciError::ResourceLimit(format!("file of {size} bytes")));
+        }
+        expanded = expanded.saturating_add(size);
+        if expanded > limits.max_expanded_bytes {
+            return Err(OciError::ResourceLimit(format!(
+                "image expands past {} bytes",
+                limits.max_expanded_bytes
+            )));
+        }
+        let relative = entry.path()?.into_owned();
+        if relative.as_os_str().len() > limits.max_path_bytes {
+            return Err(OciError::ResourceLimit("path too long".into()));
+        }
+        let kind = entry.header().entry_type();
+        let mode = entry.header().mode()? & 0o7777;
+        let type_bits = match kind {
+            tar::EntryType::Directory => libc::S_IFDIR,
+            tar::EntryType::Symlink => libc::S_IFLNK,
+            tar::EntryType::Char => libc::S_IFCHR,
+            tar::EntryType::Block => libc::S_IFBLK,
+            tar::EntryType::Fifo => libc::S_IFIFO,
+            tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::Link => {
+                libc::S_IFREG
+            }
+            _ => continue,
+        };
+        let device = match kind {
+            tar::EntryType::Char | tar::EntryType::Block => Some((
+                entry.header().device_major()?.unwrap_or(0),
+                entry.header().device_minor()?.unwrap_or(0),
+            )),
+            _ => None,
+        };
+        let meta = EntryMeta {
+            uid: entry.header().uid()?,
+            gid: entry.header().gid()?,
+            mode: type_bits | mode,
+            device,
+        };
+        let special = matches!(
+            kind,
+            tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo
+        );
+        if rootless && special {
+            // Device nodes and FIFOs are created in the image by debugfs.
+            metadata.insert(relative, meta);
+            continue;
+        }
+        if !entry.unpack_in(rootfs)? {
+            return Err(OciError::UnsafePath(relative.display().to_string()));
+        }
+        if rootless && kind != tar::EntryType::Symlink && kind != tar::EntryType::Link {
+            let staged = rootfs.join(&relative);
+            let usable = if kind == tar::EntryType::Directory {
+                mode | 0o700
+            } else {
+                (mode | 0o600) & 0o777
+            };
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(usable))?;
+        }
+        if kind != tar::EntryType::Link {
+            metadata.insert(relative, meta);
+        }
+    }
+    Ok(metadata)
+}
+
+/// Apply every entry's recorded owner and mode (and create device nodes)
+/// inside the ext4 image with one debugfs pass. Files the build added, such
+/// as the exec agent, belong to root.
+fn restore_image_ownership(
+    rootfs: &Path,
+    metadata: &HashMap<PathBuf, EntryMeta>,
+    image: &Path,
+    workspace: &Path,
+) -> Result<(), OciError> {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::MetadataExt;
+
+    let quoted = |path: &Path| -> Option<String> {
+        let text = path.to_str()?;
+        (!text.contains(['"', '\n', '\\'])).then(|| format!("\"/{text}\""))
+    };
+    let mut script = String::from("sif / uid 0\nsif / gid 0\n");
+    let mut skipped = 0usize;
+    for (path, meta) in metadata {
+        let Some(name) = quoted(path) else {
+            skipped += 1;
+            continue;
+        };
+        if path.as_os_str().is_empty() || path == Path::new(".") {
+            let _ = writeln!(script, "sif / mode 0{:o}", meta.mode);
+            continue;
+        }
+        match (meta.mode & libc::S_IFMT, meta.device) {
+            (libc::S_IFCHR, Some((major, minor))) => {
+                let _ = writeln!(script, "mknod {name} c {major} {minor}");
+            }
+            (libc::S_IFBLK, Some((major, minor))) => {
+                let _ = writeln!(script, "mknod {name} b {major} {minor}");
+            }
+            (libc::S_IFIFO, _) => {
+                let _ = writeln!(script, "mknod {name} p");
+            }
+            _ => {}
+        }
+        let _ = writeln!(script, "sif {name} uid {}", meta.uid);
+        let _ = writeln!(script, "sif {name} gid {}", meta.gid);
+        if meta.mode & libc::S_IFMT != libc::S_IFLNK {
+            let _ = writeln!(script, "sif {name} mode 0{:o}", meta.mode);
+        }
+    }
+    // Anything else in the staged tree was added by this build.
+    let mut stack = vec![PathBuf::new()];
+    while let Some(dir) = stack.pop() {
+        for child in std::fs::read_dir(rootfs.join(&dir))? {
+            let child = child?;
+            let relative = dir.join(child.file_name());
+            let file_type = child.file_type()?;
+            if file_type.is_dir() {
+                stack.push(relative.clone());
+            }
+            if metadata.contains_key(&relative) {
+                continue;
+            }
+            let Some(name) = quoted(&relative) else {
+                skipped += 1;
+                continue;
+            };
+            let stat = std::fs::symlink_metadata(child.path())?;
+            if stat.uid() == 0 {
+                continue;
+            }
+            let _ = writeln!(script, "sif {name} uid 0\nsif {name} gid 0");
+        }
+    }
+    if skipped > 0 {
+        log::warn!("oci: {skipped} paths with quotes or newlines keep the build user's owner");
+    }
+    let script_path = workspace.join("ownership.debugfs");
+    std::fs::write(&script_path, script)?;
+    let mut debugfs = Command::new("debugfs");
+    debugfs.arg("-w").arg("-f").arg(&script_path).arg(image);
+    let output = debugfs.output().map_err(|e| OciError::CommandFailed {
+        cmd: "debugfs".into(),
+        stderr: e.to_string(),
+    })?;
+    // debugfs reports per-command failures on stderr but still exits 0.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let failures: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.starts_with("debugfs ") && !line.trim().is_empty())
+        .collect();
+    if !output.status.success() || !failures.is_empty() {
+        return Err(OciError::CommandFailed {
+            cmd: "debugfs ownership fix-up".into(),
+            stderr: failures
+                .iter()
+                .take(5)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    Ok(())
 }
 
 fn resolved_output_path(output_path: &Path) -> Result<PathBuf, OciError> {
@@ -1034,9 +1405,105 @@ fn run_command(mut cmd: Command, name: &str) -> Result<(), OciError> {
     Ok(())
 }
 
+/// Whether this process can give files any owner: root in a user namespace
+/// that maps every ID (the initial one, or a full mapping). Root in a user
+/// namespace that maps only its own IDs (as `unshare -Ur` does) cannot chown
+/// to an image's other owners, so it unpacks the rootless way and records
+/// them for the image instead.
+fn can_set_any_owner() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    let full = |path: &str| std::fs::read_to_string(path).is_ok_and(|map| maps_every_id(&map));
+    full("/proc/self/uid_map") && full("/proc/self/gid_map")
+}
+
+/// A `uid_map`/`gid_map` that maps IDs 0..2^32-1 onto themselves.
+fn maps_every_id(map: &str) -> bool {
+    let fields: Vec<&str> = map.split_whitespace().collect();
+    fields == ["0", "0", "4294967295"]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_references_select_a_local_engine() {
+        assert_eq!(
+            engine_image_source("docker-daemon:python:3.12-slim"),
+            Some(("docker", "python:3.12-slim"))
+        );
+        assert_eq!(
+            engine_image_source("podman:ghcr.io/o/i:t"),
+            Some(("podman", "ghcr.io/o/i:t"))
+        );
+        assert_eq!(engine_image_source("docker://alpine:3.20"), None);
+    }
+
+    #[test]
+    fn only_a_full_id_mapping_counts_as_able_to_set_any_owner() {
+        assert!(maps_every_id("         0          0 4294967295\n"));
+        assert!(
+            !maps_every_id("         0       1000          1\n"),
+            "unshare -Ur"
+        );
+        assert!(!maps_every_id("0 0 65536\n"));
+        assert!(!maps_every_id("0 0 4294967295\n1 2 3\n"));
+        assert!(!maps_every_id(""));
+    }
+
+    #[test]
+    fn rootless_unpack_records_real_metadata_and_stages_a_usable_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, mode: u32, data: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_uid(0);
+            header.set_gid(42);
+            header.set_size(data.len() as u64);
+            if kind == tar::EntryType::Char {
+                header.set_device_major(1).unwrap();
+                header.set_device_minor(3).unwrap();
+            }
+            builder.append_data(&mut header, path, data).unwrap();
+        };
+        add("ro", tar::EntryType::Directory, 0o555, b"");
+        add("ro/secret", tar::EntryType::Regular, 0o000, b"s3cret");
+        add("passwd", tar::EntryType::Regular, 0o4755, b"bin");
+        add("null", tar::EntryType::Char, 0o666, b"");
+        let tarball = builder.into_inner().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let limits = test_limits(1 << 20, 64);
+        let meta = unpack_export(&tarball[..], dir.path(), limits, true).unwrap();
+
+        let secret = &meta[Path::new("ro/secret")];
+        assert_eq!(
+            (secret.uid, secret.gid, secret.mode),
+            (0, 42, libc::S_IFREG)
+        );
+        assert_eq!(meta[Path::new("passwd")].mode, libc::S_IFREG | 0o4755);
+        assert_eq!(meta[Path::new("ro")].mode, libc::S_IFDIR | 0o555);
+        assert_eq!(meta[Path::new("null")].device, Some((1, 3)));
+        // The staged copy is readable by the build user and the device node
+        // is left for debugfs.
+        assert_eq!(
+            std::fs::read(dir.path().join("ro/secret")).unwrap(),
+            b"s3cret"
+        );
+        let staged = std::fs::metadata(dir.path().join("passwd")).unwrap();
+        assert_eq!(
+            staged.permissions().mode() & 0o7000,
+            0,
+            "no setuid on the host"
+        );
+        assert!(!dir.path().join("null").exists());
+    }
 
     fn test_limits(max_expanded_bytes: u64, max_entries: u64) -> OciResourceLimits {
         OciResourceLimits {

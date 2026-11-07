@@ -120,7 +120,7 @@ command -v e2fsck >/dev/null && sudo e2fsck -fy "$RUN_ROOTFS" >/dev/null 2>&1 ||
 
 case "$MODE" in
   restore) ENABLED=true; RESTORE_LINE="restore = true"; STARTUP_PATH=warm ;;
-  cold)    ENABLED=true; RESTORE_LINE=""; STARTUP_PATH=warm ;;
+  cold)    ENABLED=true; RESTORE_LINE="restore = false"; STARTUP_PATH=warm ;;
   direct)  ENABLED=false; RESTORE_LINE=""; STARTUP_PATH=cold ;;
   *) echo "MODE must be restore, cold, or direct" >&2; exit 2 ;;
 esac

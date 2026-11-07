@@ -168,17 +168,31 @@ impl OwnedScratchFile {
     /// Atomically publish this owned file at an unused `target`, updating the
     /// tracked path while retaining ownership of the same inode.
     pub fn rename_to(&mut self, target: impl Into<PathBuf>) -> io::Result<()> {
-        let target = target.into();
+        self.rename_inner(target.into(), true)
+    }
+
+    /// Like [`Self::rename_to`] but without syncing either directory. Only for
+    /// scratch that dies with this process, where a crash loses nothing that
+    /// a sync would have kept.
+    pub fn rename_to_volatile(&mut self, target: impl Into<PathBuf>) -> io::Result<()> {
+        self.rename_inner(target.into(), false)
+    }
+
+    fn rename_inner(&mut self, target: PathBuf, durable: bool) -> io::Result<()> {
         if self.path == target {
             return Ok(());
         }
-        if let Some(parent) = target.parent() {
-            sync_directory(parent)?;
+        if durable {
+            if let Some(parent) = target.parent() {
+                sync_directory(parent)?;
+            }
         }
         rename_noreplace(&self.path, &target)?;
         self.path = target;
-        if let Some(parent) = self.path.parent() {
-            sync_directory(parent)?;
+        if durable {
+            if let Some(parent) = self.path.parent() {
+                sync_directory(parent)?;
+            }
         }
 
         #[cfg(target_os = "linux")]

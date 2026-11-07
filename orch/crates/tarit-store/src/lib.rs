@@ -8,9 +8,9 @@ use tarit_types::{
     ArtifactKind, ArtifactRecord, ArtifactReplicaRecord, ArtifactReplicaStatus,
     ArtifactReplicationState, ArtifactStatus, AuditEvent, BranchRecord, EgressPolicyRecord,
     ExecutionRecord, ExecutionStatus, ForkOperationRecord, ForkOperationStatus, ShareRecord,
-    ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, VmRecord, VmRuntimeLayout, VmStartupPath,
-    VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord,
-    VolumeStatus, VolumeStorageClass,
+    ShareVisibility, SshKeyRecord, UsageEvent, UsageKind, UsageSummary, VmRecord, VmRuntimeLayout,
+    VmStartupPath, VmStatus, VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities,
+    VolumeRecord, VolumeStatus, VolumeStorageClass,
 };
 use uuid::Uuid;
 
@@ -54,6 +54,9 @@ pub struct ImageRecord {
     pub provenance_key_digest: Option<String>,
     pub provenance_verified_at: Option<DateTime<Utc>>,
     pub golden_snapshot_path: Option<String>,
+    /// Command a warm golden VM of this image runs before its snapshot, so
+    /// clones start with the image's runtime already read in.
+    pub prewarm: Option<String>,
 }
 
 /// Ownership record for a node-local snapshot file, so restore can verify that
@@ -151,10 +154,15 @@ impl Store {
         // the single shared connection sustain a 200-wide burst (create + exec +
         // 15ms status polling) without serializing on fsync.
         conn.busy_timeout(Duration::from_secs(5))?;
+        // A 64 MiB page cache (SQLite's default is 2 MiB) holds the working
+        // set of a host's records, so a create under memory pressure does not
+        // read pages back from disk while holding the store.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA cache_size = -65536;
+             PRAGMA temp_store = MEMORY;
              CREATE TABLE IF NOT EXISTS vms (
                id TEXT PRIMARY KEY NOT NULL,
                host_id TEXT NOT NULL,
@@ -238,6 +246,7 @@ impl Store {
                provenance_key_digest TEXT,
                provenance_verified_at TEXT,
                golden_snapshot_path TEXT,
+               prewarm TEXT,
                PRIMARY KEY (name, tag)
              );
              CREATE TABLE IF NOT EXISTS volumes (
@@ -416,6 +425,8 @@ impl Store {
              );
              CREATE INDEX IF NOT EXISTS usage_outbox_unsent ON usage_outbox(sent);
              CREATE INDEX IF NOT EXISTS audit_outbox_unsent ON audit_outbox(sent);
+             CREATE INDEX IF NOT EXISTS usage_outbox_window_end ON usage_outbox(window_end);
+             CREATE INDEX IF NOT EXISTS audit_outbox_created_at ON audit_outbox(created_at);
              CREATE INDEX IF NOT EXISTS shares_owner ON shares(owner_key, created_at DESC);
              CREATE INDEX IF NOT EXISTS shares_vm ON shares(vm_id);
              CREATE INDEX IF NOT EXISTS artifacts_owner_created
@@ -450,6 +461,14 @@ impl Store {
         ensure_column(&conn, "vms", "runtime_artifact_paths", "TEXT")?;
         ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
         ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
+        ensure_column(&conn, "images", "prewarm", "TEXT")?;
+        // Every create counts its tenant's active VMs; without this the count
+        // read the whole table, deleted VMs included, under the store lock.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS vms_owner_status ON vms(owner_key, status);
+             CREATE INDEX IF NOT EXISTS executions_vm_created ON executions(vm_id, created_at);
+             CREATE INDEX IF NOT EXISTS executions_updated ON executions(updated_at);",
+        )?;
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
         ensure_column(&conn, "snapshots", "kernel_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "rootfs_path", "TEXT")?;
@@ -466,6 +485,15 @@ impl Store {
             "vm_fork_operations",
             "target_boot_session_id",
             "TEXT",
+        )?;
+        // Retention pruning walks deleted VMs oldest first and checks that no
+        // lease still points at each one.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS vms_status_updated ON vms(status, updated_at);
+             CREATE INDEX IF NOT EXISTS snapshots_ephemeral_owner
+               ON snapshots(ephemeral_owner_vm_id) WHERE ephemeral_owner_vm_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS vm_fork_operations_updated
+               ON vm_fork_operations(status, updated_at);",
         )?;
         ensure_column(&conn, "images", "source_digest", "TEXT")?;
         ensure_column(&conn, "images", "rootfs_digest", "TEXT")?;
@@ -1726,20 +1754,23 @@ impl Store {
             tx.commit()?;
             return Ok(VmQuotaReservationOutcome::IdConflict);
         }
-        let active: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM (
-               SELECT id FROM vms
-                WHERE owner_key = ?1 AND status IN ('creating','running','paused','suspended')
-               UNION
-               SELECT id FROM vm_quota_reservations
-                WHERE owner_key = ?1 AND expires_at > ?2
-             )",
-            params![owner_key, now],
-            |row| row.get(0),
-        )?;
-        if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
-            tx.commit()?;
-            return Ok(VmQuotaReservationOutcome::QuotaExceeded);
+        // An unlimited tenant needs only the id fence below, not a count.
+        if max_vms != usize::MAX {
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM (
+                   SELECT id FROM vms
+                    WHERE owner_key = ?1 AND status IN ('creating','running','paused','suspended')
+                   UNION
+                   SELECT id FROM vm_quota_reservations
+                    WHERE owner_key = ?1 AND expires_at > ?2
+                 )",
+                params![owner_key, now],
+                |row| row.get(0),
+            )?;
+            if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
+                tx.commit()?;
+                return Ok(VmQuotaReservationOutcome::QuotaExceeded);
+            }
         }
         tx.execute(
             "INSERT INTO vm_quota_reservations (id, owner_key, expires_at)
@@ -2230,8 +2261,8 @@ impl Store {
             "INSERT INTO images (
                name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                rootfs_digest, agent_digest, provenance_key_digest, provenance_verified_at,
-               golden_snapshot_path
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+               golden_snapshot_path, prewarm
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(name, tag) DO UPDATE SET
                rootfs_path = excluded.rootfs_path,
                created_at = excluded.created_at,
@@ -2242,7 +2273,8 @@ impl Store {
                agent_digest = excluded.agent_digest,
                provenance_key_digest = excluded.provenance_key_digest,
                provenance_verified_at = excluded.provenance_verified_at,
-               golden_snapshot_path = excluded.golden_snapshot_path",
+               golden_snapshot_path = excluded.golden_snapshot_path,
+               prewarm = excluded.prewarm",
             params![
                 image.name,
                 image.tag,
@@ -2256,6 +2288,7 @@ impl Store {
                 image.provenance_key_digest,
                 image.provenance_verified_at.map(|time| time.to_rfc3339()),
                 image.golden_snapshot_path,
+                image.prewarm,
             ],
         )?;
         Ok(())
@@ -2266,7 +2299,7 @@ impl Store {
             .query_row(
                 "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                         rootfs_digest, agent_digest, provenance_key_digest,
-                        provenance_verified_at, golden_snapshot_path
+                        provenance_verified_at, golden_snapshot_path, prewarm
                  FROM images WHERE name = ?1 AND tag = ?2",
                 params![name, tag],
                 row_to_image,
@@ -2283,7 +2316,7 @@ impl Store {
             .query_row(
                 "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                         rootfs_digest, agent_digest, provenance_key_digest,
-                        provenance_verified_at, golden_snapshot_path
+                        provenance_verified_at, golden_snapshot_path, prewarm
                  FROM images WHERE rootfs_path = ?1",
                 params![rootfs_path],
                 row_to_image,
@@ -2300,7 +2333,7 @@ impl Store {
             .query_row(
                 "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                         rootfs_digest, agent_digest, provenance_key_digest,
-                        provenance_verified_at, golden_snapshot_path
+                        provenance_verified_at, golden_snapshot_path, prewarm
                  FROM images WHERE source_digest = ?1 ORDER BY created_at DESC LIMIT 1",
                 params![source_digest],
                 row_to_image,
@@ -2313,7 +2346,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                     rootfs_digest, agent_digest, provenance_key_digest,
-                    provenance_verified_at, golden_snapshot_path
+                    provenance_verified_at, golden_snapshot_path, prewarm
              FROM images ORDER BY name, tag",
         )?;
         let rows = stmt.query_map([], row_to_image)?;
@@ -2811,6 +2844,158 @@ impl Store {
         Ok(())
     }
 
+    /// Per-key usage totals over `[from, to)` from the local outbox, sent or
+    /// not. A single host without a fleet store keeps its events here, so this
+    /// is its source of truth. Timestamps are UTC RFC3339, so text order is
+    /// time order.
+    pub fn local_usage_summary(
+        &self,
+        api_key_id: Option<&str>,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<Vec<UsageSummary>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT api_key_id, owner_key,
+               COALESCE(SUM(CASE WHEN kind = 'vm_runtime' THEN seconds END), 0.0),
+               COALESCE(SUM(CASE WHEN kind = 'exec' THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = 'exec' THEN duration_ms END), 0)
+             FROM usage_outbox
+             WHERE window_end >= ?2 AND window_end < ?3
+               AND (?1 IS NULL OR api_key_id = ?1)
+             GROUP BY api_key_id, owner_key
+             ORDER BY api_key_id",
+        )?;
+        let rows = stmt.query_map(
+            params![api_key_id, from.to_rfc3339(), to.to_rfc3339()],
+            |row| {
+                Ok(UsageSummary {
+                    api_key_id: row.get(0)?,
+                    owner_key: row.get(1)?,
+                    vm_runtime_seconds: row.get(2)?,
+                    exec_count: row.get(3)?,
+                    exec_duration_ms: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Recent audit events from the local outbox, newest first.
+    pub fn list_local_audit(
+        &self,
+        api_key_id: Option<&str>,
+        vm_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<AuditEvent>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, api_key_id, owner_key, host_id, vm_id, action, outcome, detail, created_at
+             FROM audit_outbox
+             WHERE (?1 IS NULL OR api_key_id = ?1)
+               AND (?2 IS NULL OR vm_id = ?2)
+             ORDER BY created_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![api_key_id, vm_id.map(|id| id.to_string()), limit],
+            row_to_audit,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Drop every outbox row older than `older_than`, sent or not. Only for a
+    /// host with no fleet store, where nothing is ever marked sent.
+    pub fn prune_local_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
+        let older_than = older_than.to_rfc3339();
+        self.conn.execute(
+            "DELETE FROM usage_outbox WHERE created_at < ?1",
+            params![older_than],
+        )?;
+        self.conn.execute(
+            "DELETE FROM audit_outbox WHERE created_at < ?1",
+            params![older_than],
+        )?;
+        Ok(())
+    }
+
+    /// Delete up to `limit` finished executions last updated before
+    /// `older_than`, oldest first. Returns how many were deleted, so a caller
+    /// can prune a large backlog in short batches.
+    pub fn prune_finished_executions(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<usize, StoreError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM executions WHERE rowid IN (
+               SELECT rowid FROM executions
+                WHERE updated_at < ?1 AND status IN ('completed', 'failed')
+                ORDER BY updated_at LIMIT ?2
+             )",
+            params![
+                older_than.to_rfc3339(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Delete up to `limit` rows of deleted (`stopped`) VMs last updated
+    /// before `older_than`, oldest first, skipping any that a hibernation,
+    /// volume attachment, private snapshot lease or unfinished fork still
+    /// names. Until its row is gone a VM's id cannot be used again, so the
+    /// cutoff is also how long a client-chosen id stays reserved. Returns how
+    /// many rows were deleted.
+    pub fn prune_stopped_vms(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<usize, StoreError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM vms WHERE rowid IN (
+               SELECT v.rowid FROM vms v
+                WHERE v.status = 'stopped' AND v.updated_at < ?1
+                  AND NOT EXISTS (SELECT 1 FROM hibernations h WHERE h.vm_id = v.id)
+                  AND NOT EXISTS (SELECT 1 FROM vm_volume_attachments a WHERE a.vm_id = v.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM snapshots s WHERE s.ephemeral_owner_vm_id = v.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM vm_fork_operations f
+                     WHERE f.child_vm_id = v.id AND f.status <> 'committed')
+                ORDER BY v.updated_at LIMIT ?2
+             )",
+            params![
+                older_than.to_rfc3339(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Delete up to `limit` committed fork records last updated before
+    /// `older_than` whose child VM row is already gone. A replayed fork of
+    /// that child id is then treated as a new fork.
+    pub fn prune_committed_fork_operations(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<usize, StoreError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM vm_fork_operations WHERE rowid IN (
+               SELECT f.rowid FROM vm_fork_operations f
+                WHERE f.status = 'committed' AND f.updated_at < ?1
+                  AND NOT EXISTS (SELECT 1 FROM vms v WHERE v.id = f.child_vm_id)
+                ORDER BY f.updated_at LIMIT ?2
+             )",
+            params![
+                older_than.to_rfc3339(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn prune_sent_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
         let older_than = older_than.to_rfc3339();
         self.conn.execute(
@@ -3011,6 +3196,7 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> Result<ImageRecord, rusqlite::Error>
             .map(parse_ts)
             .transpose()?,
         golden_snapshot_path: row.get(11)?,
+        prewarm: row.get(12)?,
     })
 }
 
@@ -4014,6 +4200,117 @@ mod tests {
     }
 
     #[test]
+    fn stopped_vms_past_retention_are_pruned_unless_still_referenced() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(2);
+        let insert = |id: Uuid, status: VmStatus, updated_at: DateTime<Utc>| {
+            let vm = VmRecord {
+                status,
+                updated_at,
+                created_at: updated_at,
+                ..test_vm(id, "tenant-a")
+            };
+            store.insert_vm(&vm).unwrap();
+            vm.id
+        };
+        let expired = insert(Uuid::new_v4(), VmStatus::Stopped, old);
+        let recent = insert(
+            Uuid::new_v4(),
+            VmStatus::Stopped,
+            now - chrono::Duration::hours(1),
+        );
+        let running = insert(Uuid::new_v4(), VmStatus::Running, old);
+        // A fork that never committed still names its child.
+        let forking = Uuid::new_v4();
+        let operation = ForkOperationRecord {
+            child_vm_id: forking,
+            source_vm_id: running,
+            owner_key: "tenant-a".into(),
+            source_host_id: "host-a".into(),
+            target_host_id: "host-a".into(),
+            target_boot_session_id: None,
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: old,
+            updated_at: old,
+        };
+        let expiry = now + chrono::Duration::minutes(1);
+        store
+            .claim_fork_operation(&operation, usize::MAX, expiry)
+            .unwrap();
+        store.release_vm_quota("tenant-a", forking).unwrap();
+        insert(forking, VmStatus::Stopped, old);
+
+        let cutoff = now - chrono::Duration::days(1);
+        assert_eq!(store.prune_stopped_vms(cutoff, 10).unwrap(), 1);
+        assert!(matches!(store.get_vm(expired), Err(StoreError::NotFound)));
+        for kept in [recent, running, forking] {
+            store.get_vm(kept).unwrap();
+        }
+        assert_eq!(store.prune_stopped_vms(cutoff, 10).unwrap(), 0);
+        // Once the record is gone its id is free again.
+        assert_eq!(
+            store
+                .reserve_vm_quota("tenant-a", expired, usize::MAX, expiry)
+                .unwrap(),
+            VmQuotaReservationOutcome::Reserved
+        );
+    }
+
+    #[test]
+    fn committed_fork_records_are_pruned_only_after_their_child() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(2);
+        let child = VmRecord {
+            status: VmStatus::Stopped,
+            created_at: old,
+            updated_at: old,
+            ..test_vm(Uuid::new_v4(), "tenant-a")
+        };
+        let operation = ForkOperationRecord {
+            child_vm_id: child.id,
+            source_vm_id: Uuid::new_v4(),
+            owner_key: "tenant-a".into(),
+            source_host_id: "host-a".into(),
+            target_host_id: "host-a".into(),
+            target_boot_session_id: None,
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: old,
+            updated_at: old,
+        };
+        let expiry = now + chrono::Duration::minutes(1);
+        store
+            .claim_fork_operation(&operation, usize::MAX, expiry)
+            .unwrap();
+        store
+            .commit_fork_operation(
+                child.id,
+                operation.source_vm_id,
+                "tenant-a",
+                child.created_at,
+                old,
+            )
+            .unwrap();
+        store.release_vm_quota("tenant-a", child.id).unwrap();
+        store.insert_vm(&child).unwrap();
+
+        let cutoff = now - chrono::Duration::days(1);
+        assert_eq!(
+            store.prune_committed_fork_operations(cutoff, 10).unwrap(),
+            0
+        );
+        assert_eq!(store.prune_stopped_vms(cutoff, 10).unwrap(), 1);
+        assert_eq!(
+            store.prune_committed_fork_operations(cutoff, 10).unwrap(),
+            1
+        );
+        assert!(store.get_fork_operation(child.id).unwrap().is_none());
+    }
+
+    #[test]
     fn fork_operation_is_source_bound_recoverable_and_incarnation_fenced() {
         let store = Store::open(":memory:").unwrap();
         let now = Utc::now();
@@ -4123,7 +4420,7 @@ mod tests {
                 )
                 .unwrap(),
             VmQuotaReservationOutcome::IdConflict,
-            "a committed fork id must never be recycled into another VM incarnation"
+            "a committed fork id must not be recycled while its record is kept"
         );
     }
 
@@ -4144,6 +4441,7 @@ mod tests {
             provenance_key_digest: None,
             provenance_verified_at: None,
             golden_snapshot_path: Some("target/tarit-store-test/node__20.snap".into()),
+            prewarm: Some("node -e 0".into()),
         };
 
         store.upsert_image(&image).unwrap();
@@ -4153,6 +4451,7 @@ mod tests {
         let updated = ImageRecord {
             size_bytes: 84,
             golden_snapshot_path: None,
+            prewarm: None,
             ..image.clone()
         };
         store.upsert_image(&updated).unwrap();
@@ -4164,6 +4463,107 @@ mod tests {
             store.get_image("node", "20"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn finished_executions_past_retention_are_pruned_in_batches() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let record = |age_hours: i64, status: ExecutionStatus| {
+            let at = now - chrono::Duration::hours(age_hours);
+            let exec = ExecutionRecord {
+                id: Uuid::new_v4(),
+                vm_id: Uuid::new_v4(),
+                command: "true".into(),
+                timeout_ms: 1000,
+                status,
+                exit_code: Some(0),
+                stdout: Some("out".into()),
+                stderr: None,
+                duration_ms: Some(1),
+                error: None,
+                created_at: at,
+                updated_at: at,
+            };
+            store.insert_execution(&exec).unwrap();
+            exec.id
+        };
+        let old: Vec<Uuid> = (0..5)
+            .map(|_| record(48, ExecutionStatus::Completed))
+            .chain([record(48, ExecutionStatus::Failed)])
+            .collect();
+        let old_running = record(48, ExecutionStatus::Running);
+        let recent = record(1, ExecutionStatus::Completed);
+
+        let cutoff = now - chrono::Duration::hours(24);
+        assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 4);
+        assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 2);
+        assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 0);
+        for id in old {
+            assert!(matches!(store.get_execution(id), Err(StoreError::NotFound)));
+        }
+        assert!(
+            store.get_execution(old_running).is_ok(),
+            "a running execution stays"
+        );
+        assert!(
+            store.get_execution(recent).is_ok(),
+            "a recent execution stays"
+        );
+    }
+
+    #[test]
+    fn the_tenant_vm_count_reads_an_index_not_the_table() {
+        let store = Store::open(":memory:").unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM vms
+                  WHERE owner_key = 'tenant' AND status IN ('creating','running','paused','suspended')",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("vms_owner_status")),
+            "tenant count plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_table_from_before_prewarm_gains_the_column() {
+        let dir = std::env::temp_dir().join(format!("tarit-store-prewarm-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fleet.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE images (
+                   name TEXT NOT NULL, tag TEXT NOT NULL, rootfs_path TEXT NOT NULL,
+                   created_at TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                   source_ref TEXT NOT NULL, source_digest TEXT, rootfs_digest TEXT,
+                   agent_digest TEXT, provenance_key_digest TEXT,
+                   provenance_verified_at TEXT, golden_snapshot_path TEXT,
+                   PRIMARY KEY (name, tag));
+                 INSERT INTO images VALUES ('py', '1', '/images/py.ext4',
+                   '2026-11-01T00:00:00+00:00', 7, 'docker://python:3.12-slim',
+                   NULL, NULL, NULL, NULL, NULL, NULL);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.get_image("py", "1").unwrap().prewarm, None);
+        let mut image = store.get_image("py", "1").unwrap();
+        image.prewarm = Some("python3 -c pass".into());
+        store.upsert_image(&image).unwrap();
+        assert_eq!(
+            store.get_image("py", "1").unwrap().prewarm.as_deref(),
+            Some("python3 -c pass")
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -4507,6 +4907,91 @@ mod tests {
         store.mark_audit_sent(&[audit.id]).unwrap();
         assert!(store.list_unsent_usage(10).unwrap().is_empty());
         assert!(store.list_unsent_audit(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_outbox_serves_usage_and_audit_without_a_fleet() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let vm_id = Uuid::new_v4();
+        let usage = |key: &str, kind, seconds, duration_ms, at| UsageEvent {
+            id: Uuid::new_v4(),
+            api_key_id: key.into(),
+            owner_key: "owner".into(),
+            host_id: "host".into(),
+            vm_id,
+            kind,
+            seconds,
+            duration_ms,
+            window_start: at,
+            window_end: at,
+            created_at: at,
+        };
+        let old = now - chrono::Duration::days(40);
+        store
+            .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(10.0), None, now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(2.5), None, now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("a", UsageKind::Exec, None, Some(7), now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("b", UsageKind::Exec, None, Some(3), now))
+            .unwrap();
+        store
+            .enqueue_usage(&usage("a", UsageKind::VmRuntime, Some(99.0), None, old))
+            .unwrap();
+
+        let from = now - chrono::Duration::days(30);
+        let to = now + chrono::Duration::seconds(1);
+        let all = store.local_usage_summary(None, from, to).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].api_key_id, "a");
+        assert_eq!(all[0].vm_runtime_seconds, 12.5);
+        assert_eq!((all[0].exec_count, all[0].exec_duration_ms), (1, 7));
+        assert_eq!((all[1].vm_runtime_seconds, all[1].exec_count), (0.0, 1));
+        let only_b = store.local_usage_summary(Some("b"), from, to).unwrap();
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].api_key_id, "b");
+
+        let audit = |key: &str, vm: Option<Uuid>, action: &str, at| AuditEvent {
+            id: Uuid::new_v4(),
+            api_key_id: key.into(),
+            owner_key: "owner".into(),
+            host_id: "host".into(),
+            vm_id: vm,
+            action: action.into(),
+            outcome: "ok".into(),
+            detail: None,
+            created_at: at,
+        };
+        store
+            .enqueue_audit(&audit("a", Some(vm_id), "create", old))
+            .unwrap();
+        store
+            .enqueue_audit(&audit("a", Some(vm_id), "exec", now))
+            .unwrap();
+        store.enqueue_audit(&audit("b", None, "ssh", now)).unwrap();
+        let newest = store.list_local_audit(Some("a"), None, 10).unwrap();
+        assert_eq!(
+            newest.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(),
+            ["exec", "create"]
+        );
+        assert_eq!(
+            store.list_local_audit(None, Some(vm_id), 1).unwrap()[0].action,
+            "exec"
+        );
+
+        store
+            .prune_local_outbox(now - chrono::Duration::days(30))
+            .unwrap();
+        assert_eq!(store.list_local_audit(None, None, 10).unwrap().len(), 2);
+        let wide = store
+            .local_usage_summary(Some("a"), old - chrono::Duration::days(1), to)
+            .unwrap();
+        assert_eq!(wide[0].vm_runtime_seconds, 12.5);
     }
 
     #[test]

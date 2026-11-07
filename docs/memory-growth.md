@@ -115,7 +115,11 @@ Both answer:
   coordinated path as the balloon: discarded pages fault back as zeroes,
   never snapshot bytes, and the discard is excluded from snapshot readers by
   the snapshot fence. Discards mark pages host-dirty, so the next diff
-  snapshot records them as zeroed.
+  snapshot records them as zeroed. After a mapped (file-backed) restore the
+  discard replaces the range with fresh anonymous memory, so it reads as zeros
+  rather than the snapshot's bytes.
+- Full snapshots leave zero pages as holes, so unplugged blocks take no space
+  in the snapshot file.
 - KVM memslots for the whole aperture stay registered; an unplugged block
   costs no host RAM, only address space. The guest is not prevented from
   touching unplugged blocks (no `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`); a

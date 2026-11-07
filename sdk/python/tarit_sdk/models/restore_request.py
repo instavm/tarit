@@ -18,7 +18,8 @@ class RestoreRequest:
         snapshot_id (UUID): Opaque snapshot handle. Physical storage paths and host placement are never public.
         target_memory_mib (int | Unset): Grow guest-visible RAM to this total within the snapshot reserved maximum.
             Requires a live hotplug-ready snapshot; shrinking is rejected.
-        id (UUID | Unset): Optional id for the restored VM; generated when omitted.
+        id (UUID | Unset): Optional id for the restored VM; generated when omitted. Ids of deleted VMs stay reserved for
+            TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     """
 
     snapshot_id: UUID

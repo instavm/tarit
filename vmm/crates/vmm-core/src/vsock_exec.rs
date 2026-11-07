@@ -126,32 +126,13 @@ impl OwnedControlSocket {
         std::fs::remove_file(&self.path)?;
         Ok(true)
     }
-
-    fn remove_empty_private_parent(&self) {
-        let expected = std::env::temp_dir()
-            .join(".vmm-runtime")
-            .join(format!("vmm-{}", std::process::id()));
-        if self.path.parent() != Some(expected.as_path()) {
-            return;
-        }
-        if let Err(error) = std::fs::remove_dir(&expected) {
-            if !matches!(
-                error.kind(),
-                ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
-            ) {
-                log::warn!(
-                    "remove empty vsock runtime dir {}: {error}",
-                    expected.display()
-                );
-            }
-        }
-    }
 }
 
 impl Drop for OwnedControlSocket {
     fn drop(&mut self) {
         match self.remove() {
-            Ok(_) => self.remove_empty_private_parent(),
+            // The VM's runtime-directory guard removes the directory.
+            Ok(_) => {}
             Err(error) => {
                 log::warn!(
                     "remove vsock control socket {}: {error}",
@@ -170,6 +151,8 @@ pub struct VsockExecChannel {
     connected: Arc<Condvar>,
     stop: Arc<AtomicBool>,
     pump_wake: Option<EventFd>,
+    /// Wakes the accept thread so teardown does not wait out its poll timeout.
+    accept_wake: Option<EventFd>,
     handle: Mutex<Option<JoinHandle<()>>>,
     exec_gate: Mutex<()>,
     next_request_id: AtomicU64,
@@ -357,18 +340,30 @@ impl VsockExecChannel {
         let next_connection_id_t = Arc::clone(&next_connection_id);
 
         let listener_fd = listener.as_raw_fd();
+        let accept_wake = EventFd::new(libc::EFD_NONBLOCK)?;
+        let accept_wake_fd = accept_wake.as_raw_fd();
         let handle = std::thread::Builder::new()
             .name("vsock-exec-accept".into())
             .spawn(move || {
                 while !stop_t.load(Ordering::Relaxed) {
-                    let mut pfd = libc::pollfd {
-                        fd: listener_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // SAFETY: `pfd` points to one initialized pollfd and the
-                    // listener fd remains open for the lifetime of this thread.
-                    if unsafe { libc::poll(&mut pfd, 1, ACCEPT_POLL_TIMEOUT) } <= 0 {
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd: listener_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: accept_wake_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: `pfds` holds two initialized pollfds; the
+                    // listener and wake fds outlive this thread, which Drop
+                    // joins before either is closed.
+                    if unsafe { libc::poll(pfds.as_mut_ptr(), 2, ACCEPT_POLL_TIMEOUT) } <= 0
+                        || pfds[0].revents == 0
+                    {
                         continue;
                     }
                     match listener.accept() {
@@ -402,6 +397,7 @@ impl VsockExecChannel {
             connected,
             stop,
             pump_wake,
+            accept_wake: Some(accept_wake),
             handle: Mutex::new(Some(handle)),
             exec_gate: Mutex::new(()),
             next_request_id: AtomicU64::new(1),
@@ -427,7 +423,12 @@ impl VsockExecChannel {
         if self.initial_connect_waited.swap(true, Ordering::AcqRel) {
             return self.is_connected();
         }
+        self.wait_until_connected(timeout)
+    }
 
+    /// Block until the guest agent is connected or `timeout` passes, waking as
+    /// soon as the accept thread publishes a connection.
+    pub fn wait_until_connected(&self, timeout: Duration) -> bool {
         let guard = self.stream.lock().unwrap_or_else(|e| e.into_inner());
         let (guard, _) = self
             .connected
@@ -506,6 +507,9 @@ impl VsockExecChannel {
 impl Drop for VsockExecChannel {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(wake) = &self.accept_wake {
+            let _ = wake.write(1);
+        }
         if let Some(handle) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = handle.join();
         }
@@ -1081,6 +1085,7 @@ mod tests {
             connected: Arc::new(Condvar::new()),
             stop: Arc::new(AtomicBool::new(false)),
             pump_wake: None,
+            accept_wake: None,
             handle: Mutex::new(None),
             exec_gate: Mutex::new(()),
             next_request_id: AtomicU64::new(1),

@@ -76,7 +76,26 @@ const RSDP_ADDR: u64 = 0xe0000;
 const CPUID_1_ECX_VMX: u32 = 1 << 5;
 const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
 const CPUID_1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+// KVM_GET_SUPPORTED_CPUID does not set the hypervisor-present bit. Without it
+// Linux never probes the 0x4000_0000 KVM leaves, so it gets no kvmclock and
+// must calibrate the TSC itself. Intel hosts can fall back to CPUID 0x15;
+// AMD hosts cannot and the guest stalls in early boot.
+const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
 const CPUID_1_EDX_APIC: u32 = 1 << 9;
+/// IA32_APIC_BASE bit 10: the vCPU's local APIC runs in x2APIC mode.
+const APIC_BASE_X2APIC_ENABLE: u64 = 1 << 10;
+
+/// x2APIC is offered on bare-metal hosts only. It destabilized guests on
+/// nested-virtualization hosts (where the host itself reports a hypervisor),
+/// so it stays masked there; on bare metal it replaces trapped xAPIC MMIO
+/// accesses (one per interrupt, for the EOI) with much cheaper MSR writes.
+pub(crate) fn x2apic_offered() -> bool {
+    static OFFERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFFERED.get_or_init(|| {
+        let host = std::arch::x86_64::__cpuid(1);
+        host.ecx & CPUID_1_ECX_HYPERVISOR == 0
+    })
+}
 const CPUID_8000_0001_ECX_SVM: u32 = 1 << 2;
 
 // ============================================================
@@ -125,8 +144,11 @@ fn normalize_boot_cpuid(cpuid: &mut kvm_bindings::CpuId, apic_id: u8) {
             (1, 0) => {
                 entry.ebx = (entry.ebx & 0x00FF_FFFF) | ((apic_id as u32) << 24);
                 entry.edx |= CPUID_1_EDX_APIC;
-                entry.ecx |= CPUID_1_ECX_TSC_DEADLINE;
-                entry.ecx &= !(CPUID_1_ECX_X2APIC | CPUID_1_ECX_VMX);
+                entry.ecx |= CPUID_1_ECX_TSC_DEADLINE | CPUID_1_ECX_HYPERVISOR;
+                entry.ecx &= !CPUID_1_ECX_VMX;
+                if !x2apic_offered() {
+                    entry.ecx &= !CPUID_1_ECX_X2APIC;
+                }
             }
             (0x8000_0001, 0) => entry.ecx &= !CPUID_8000_0001_ECX_SVM,
             _ => {}
@@ -648,7 +670,8 @@ pub fn setup_vcpu_for_bzimage_boot(vcpu: &VcpuFd, loaded: &LoadedKernel) -> Resu
 ///
 /// deltas on leaf 1: the initial APIC id (EBX[31:24]) is set to `apic_id`, the
 /// APIC feature (EDX[9]) and TSC-Deadline (ECX[24]) are forced on, and x2APIC
-/// (ECX[21]) is masked because it destabilizes nested virt. Intel VMX
+/// (ECX[21]) is masked on hosts that themselves run under a hypervisor, where
+/// it destabilizes nested virt (see [`x2apic_offered`]). Intel VMX
 /// (leaf 1 ECX[5]) and AMD SVM (leaf 0x80000001 ECX[2]) are always masked so
 /// nested virtualization remains available to the worker but is unavailable
 /// inside customer sandboxes. The BSP uses id 0; each AP uses its vCPU id, so
@@ -733,7 +756,7 @@ pub(crate) fn setup_vcpu_for_bzimage_boot_full_with_template(
     let is_elf = loaded.entry >= 0x1000000;
 
     // Set CPUID for ALL boot modes via the shared helper (APIC id 0 for the
-    // BSP). Host CPUID passthrough with x2APIC masked + TSC-Deadline forced on;
+    // BSP). Host CPUID passthrough (x2APIC masked on nested hosts) + TSC-Deadline forced on;
     // see apply_boot_cpuid_with_template.
     apply_boot_cpuid_with_template(vcpu, 0, template)?;
 
@@ -948,7 +971,10 @@ mod tests {
         assert_eq!(leaf1.ebx >> 24, 3, "APIC id must remain normalized");
         assert_ne!(leaf1.edx & CPUID_1_EDX_APIC, 0);
         assert_ne!(leaf1.ecx & CPUID_1_ECX_TSC_DEADLINE, 0);
-        assert_eq!(leaf1.ecx & CPUID_1_ECX_X2APIC, 0);
+        assert_ne!(leaf1.ecx & CPUID_1_ECX_HYPERVISOR, 0);
+        if !x2apic_offered() {
+            assert_eq!(leaf1.ecx & CPUID_1_ECX_X2APIC, 0);
+        }
         assert_eq!(leaf1.ecx & CPUID_1_ECX_VMX, 0);
 
         let extended = cpuid
@@ -1202,6 +1228,14 @@ pub fn capture_vcpu_full_state(vcpu: &VcpuFd) -> Result<VcpuFullState> {
 
 /// Re-apply a captured vCPU state. Call after KVM_SET_CPUID2 on a fresh vCPU.
 pub fn restore_vcpu_full_state(vcpu: &VcpuFd, s: &VcpuFullState) -> Result<()> {
+    // A guest captured in x2APIC mode cannot run where x2APIC is masked.
+    if s.sregs.apic_base & APIC_BASE_X2APIC_ENABLE != 0 && !x2apic_offered() {
+        return Err(VmmError::Snapshot(
+            "snapshot was taken with the guest in x2APIC mode, which this host does not offer \
+             (it runs under a hypervisor)"
+                .into(),
+        ));
+    }
     // KVM restore order is significant:
     // - MP state depends on which vCPU KVM recognizes as the BSP.
     // - SET_SREGS restores APIC_BASE, so it must precede SET_LAPIC.

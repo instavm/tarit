@@ -30,10 +30,16 @@ pub(crate) async fn run(state: AppState, listener: TcpListener) -> Result<()> {
     let host_key = load_or_generate_host_key(&state.config.ssh_gateway_host_key_path)?;
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::PublicKey);
+    // No delay on rejection. Only public keys are accepted, so there is no
+    // secret to guess, and a key is only ever rejected after the client has
+    // signed with it, which proves it holds the private key: the answer tells
+    // nobody anything about keys they do not hold. A delay would only slow
+    // every login by one interval per unrelated key in the user's agent.
+    // russh still caps authentication attempts per connection.
     let config = Arc::new(server::Config {
         methods,
-        auth_rejection_time: std::time::Duration::from_secs(1),
-        auth_rejection_time_initial: Some(std::time::Duration::from_millis(0)),
+        auth_rejection_time: std::time::Duration::ZERO,
+        auth_rejection_time_initial: Some(std::time::Duration::ZERO),
         keys: vec![host_key],
         inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
         ..Default::default()
@@ -231,6 +237,21 @@ impl Drop for GatewayHandler {
 
 impl server::Handler for GatewayHandler {
     type Error = russh::Error;
+
+    /// Answer every offered key the same way. Whether a key is registered is
+    /// looked up only once the client has signed with it (`auth_publickey`),
+    /// so an offer, which needs no private key, cannot be used to find out
+    /// which public keys some tenant has registered.
+    async fn auth_publickey_offered(
+        &mut self,
+        user: &str,
+        _key: &PublicKey,
+    ) -> Result<server::Auth, Self::Error> {
+        if parse_target_vm_id(user).is_err() {
+            return Ok(server::Auth::reject());
+        }
+        Ok(server::Auth::Accept)
+    }
 
     async fn auth_publickey(
         &mut self,
@@ -745,6 +766,7 @@ mod tests {
 
     const ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g test@example";
     const ED25519_FINGERPRINT: &str = "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4";
+    const OTHER_ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJaoaaRVap6UfINs/dHmZf9oRJXKxV9wMwuOHBBDC9M other@example";
     #[test]
     fn parses_vm_id_username() {
         let vm_id = Uuid::new_v4();
@@ -987,6 +1009,63 @@ mod tests {
     }
 
     #[test]
+    fn offers_do_not_reveal_which_keys_are_registered() {
+        let state = test_state();
+        let registered = PublicKey::from_openssh(ED25519_KEY).unwrap();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert_ssh_key(&tarit_types::SshKeyRecord {
+                id: Uuid::new_v4(),
+                owner_key: "tenant-a".into(),
+                fingerprint: ED25519_FINGERPRINT.into(),
+                public_key: ED25519_KEY.into(),
+                key_type: "ssh-ed25519".into(),
+                created_at: Utc::now(),
+                is_active: true,
+            })
+            .unwrap();
+        let other = PublicKey::from_openssh(OTHER_ED25519_KEY).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut handler = GatewayHandler::new(state, None);
+        let vm = Uuid::new_v4().to_string();
+
+        let offered = |handler: &mut GatewayHandler, user: &str, key: &PublicKey| {
+            runtime
+                .block_on(handler.auth_publickey_offered(user, key))
+                .unwrap()
+        };
+        assert_eq!(
+            offered(&mut handler, &vm, &registered),
+            server::Auth::Accept
+        );
+        assert_eq!(
+            offered(&mut handler, &vm, &other),
+            server::Auth::Accept,
+            "an unregistered key gets the same answer as a registered one"
+        );
+        assert_ne!(
+            offered(&mut handler, "root", &registered),
+            server::Auth::Accept,
+            "the user must name a VM"
+        );
+        assert!(handler.auth.is_none(), "an offer authenticates nothing");
+
+        // Only a signed attempt is checked against the registry.
+        let signed = |handler: &mut GatewayHandler, key: &PublicKey| {
+            runtime.block_on(handler.auth_publickey(&vm, key)).unwrap()
+        };
+        assert_ne!(signed(&mut handler, &other), server::Auth::Accept);
+        assert!(handler.auth.is_none());
+        assert_eq!(signed(&mut handler, &registered), server::Auth::Accept);
+        assert!(handler.auth.is_some());
+    }
+
+    #[test]
     fn reports_host_key_parse_errors_without_algorithm_claims() {
         let dir = std::path::PathBuf::from("target")
             .join(format!("taritd-gateway-test-{}", Uuid::new_v4()));
@@ -1054,9 +1133,11 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,

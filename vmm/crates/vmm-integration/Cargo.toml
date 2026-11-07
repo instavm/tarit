@@ -24,6 +24,8 @@ libc.workspace = true
 tempfile = "3"
 env_logger = "0.10"
 crc32fast.workspace = true
+tarit-proto = { path = "../../../proto" }
+sha2.workspace = true
 
 [features]
 kvm = ["dep:kvm-ioctls", "dep:kvm-bindings", "dep:vmm-core", "dep:vmm-snapshot", "dep:postcard", "dep:vmm-migration", "vmm-core/kvm", "vmm-core/boot"]
@@ -44,6 +46,16 @@ path = "egress_denial.rs"
 [[test]]
 name = "memory_hotplug_live"
 path = "memory_hotplug_live.rs"
+required-features = ["kvm"]
+
+[[test]]
+name = "guest_network"
+path = "guest_network.rs"
+required-features = ["kvm"]
+
+[[test]]
+name = "checkpoint_base"
+path = "checkpoint_base.rs"
 required-features = ["kvm"]
 
 [[test]]

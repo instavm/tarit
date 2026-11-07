@@ -27,6 +27,7 @@ pub enum TapError {
 /// IFF_TAP | IFF_NO_PI flags for the TUN device.
 const IFF_TAP: u16 = 0x0002;
 const IFF_NO_PI: u16 = 0x1000;
+const IFF_VNET_HDR: u16 = 0x4000;
 
 /// TUNSETIFF ioctl request.
 const TUNSETIFF: libc::c_ulong = 0x400454ca;
@@ -34,13 +35,55 @@ const TUNSETIFF: libc::c_ulong = 0x400454ca;
 const TUNGETIFF: libc::c_ulong = 0x800454d2;
 /// TUNSETPERSIST ioctl request.
 const TUNSETPERSIST: libc::c_ulong = 0x400454cb;
+const TUNSETVNETHDRSZ: libc::c_ulong = 0x400454d8;
+/// `TUNSETOFFLOAD`, the only TAP ioctl the network worker's seccomp profile
+/// allows (see `vmm_jailer::seccomp`).
+pub const TUNSETOFFLOAD: libc::c_ulong = 0x400454d0;
+/// `TUNSETOFFLOAD` flags: the TAP may hand us (and accept) packets with a
+/// partial checksum, and TCP segments up to 64 KiB.
+pub const TUN_F_CSUM: u32 = 0x01;
+pub const TUN_F_TSO4: u32 = 0x02;
+pub const TUN_F_TSO6: u32 = 0x04;
+/// Size of the virtio-net header (`virtio_net_hdr_v1`) every frame carries
+/// on a TAP opened with `IFF_VNET_HDR`; the same layout the guest uses.
+pub const VNET_HDR_LEN: i32 = 12;
 
 /// A TAP device handle.
 #[derive(Debug)]
 pub struct Tap {
     pub fd: RawFd,
     pub name: String,
+    /// Frames on this fd carry a virtio-net header, so offloads (checksum,
+    /// TSO) can pass between the guest and the host stack.
+    pub vnet_hdr: bool,
     closed: AtomicBool,
+}
+
+/// Set the TAP's offloads to `flags` (`TUN_F_*`). Offloads must never exceed
+/// what the guest negotiated, or the TAP hands it packets it cannot parse.
+pub fn set_offload(fd: RawFd, flags: u32) -> std::io::Result<()> {
+    // SAFETY: TUNSETOFFLOAD takes its flags by value; an fd that is not a
+    // TAP fails with an error instead of acting.
+    let rc = unsafe { libc::ioctl(fd, TUNSETOFFLOAD as _, flags as libc::c_ulong) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Use the 12-byte v1 header and start with no offloads: a persistent TAP
+/// may still carry the offloads a previous VM negotiated.
+fn configure_vnet_hdr(fd: RawFd) -> Result<(), TapError> {
+    let size: libc::c_int = VNET_HDR_LEN;
+    // SAFETY: TUNSETVNETHDRSZ reads an int through the pointer, valid for
+    // the duration of the call.
+    if unsafe { libc::ioctl(fd, TUNSETVNETHDRSZ as _, &size) } < 0 {
+        return Err(TapError::Ioctl(format!(
+            "TUNSETVNETHDRSZ: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    set_offload(fd, 0).map_err(|error| TapError::Ioctl(format!("TUNSETOFFLOAD: {error}")))
 }
 
 /// The `ifreq` struct for TUNSETIFF.
@@ -100,11 +143,16 @@ impl Tap {
                 std::io::Error::last_os_error().to_string(),
             ));
         }
+        let vnet_hdr = ifr.flags & IFF_VNET_HDR != 0;
+        if vnet_hdr {
+            configure_vnet_hdr(owned.as_raw_fd())?;
+        }
         let fd = owned.into_raw_fd();
-        log::info!("using inherited TAP: {actual_name} (fd={fd})");
+        log::info!("using inherited TAP: {actual_name} (fd={fd}, vnet_hdr={vnet_hdr})");
         Ok(Self {
             fd,
             name: actual_name,
+            vnet_hdr,
             closed: AtomicBool::new(false),
         })
     }
@@ -126,7 +174,7 @@ impl Tap {
         // Build the ifreq struct.
         let mut ifr = Ifreq {
             name: [0u8; 16],
-            flags: IFF_TAP | IFF_NO_PI,
+            flags: IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
             _pad: [0u8; 22],
         };
         let name_bytes = name.as_bytes();
@@ -148,6 +196,14 @@ impl Tap {
                 "errno: {}",
                 std::io::Error::last_os_error()
             )));
+        }
+
+        if let Err(error) = configure_vnet_hdr(fd) {
+            // SAFETY: `fd` is owned by this error path, as above.
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(error);
         }
 
         // Read back the actual name (in case we passed "").
@@ -177,10 +233,11 @@ impl Tap {
             }
         }
 
-        log::info!("TAP created: {actual_name} (fd={fd})");
+        log::info!("TAP created: {actual_name} (fd={fd}, vnet_hdr=true)");
         Ok(Self {
             fd,
             name: actual_name,
+            vnet_hdr: true,
             closed: AtomicBool::new(false),
         })
     }

@@ -15,7 +15,7 @@ Single-host mode is selected by omitting `TARIT_DATABASE_URL`. Cluster mode is s
 
 ## Quickstart: single node
 
-Build `taritd` in this repository and the `vmm` binary from the sibling VMM repository:
+Build `taritd` and the `vmm` binary, both in this repository:
 
 ```sh
 cd /path/to/tarit/orch
@@ -142,8 +142,10 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 | DELETE | `/v1/vms/{id}` | Resolve owner, stop the VM, mark it stopped locally, clear fleet ownership. |
 | POST | `/v1/vms/{id}/pause` | Resolve owner and pause. |
 | POST | `/v1/vms/{id}/resume` | Resolve owner and resume. |
-| POST | `/v1/vms/{id}/snapshot` | Resolve owner and snapshot, returning `path` and `host_id`. |
-| POST | `/v1/restore` | Restore a node-local snapshot, optionally routed by `host_id`. |
+| POST | `/v1/vms/{id}/snapshot` | Resolve owner and snapshot, returning an opaque `snapshot_id`. |
+| GET | `/v1/snapshots` | List the tenant's snapshots on this node. |
+| DELETE | `/v1/snapshots/{id}` | Delete a snapshot no branch, hibernated VM, or fork still needs. |
+| POST | `/v1/restore` | Restore from a `snapshot_id`, routed to the node that holds it. |
 | POST | `/v1/execute` | Resolve owner and run a command synchronously, returning the finished record. |
 | POST | `/v1/execute_async` | Resolve owner and run a command asynchronously. |
 | GET | `/v1/executions/{id}` | Get an execution record stored on the API node that accepted it. |
@@ -153,8 +155,8 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 | POST | `/v1/vms/{id}/pty/sessions/{pty_id}/resize` | Update a PTY session's recorded dimensions. |
 | WS | `/v1/vms/{id}/pty/{pty_id}/connect?token=<connect_token>` | Bridge WebSocket PTY bytes to the owning local VMM stream. One connection is active per session; the session can reconnect after disconnect. |
 | GET | `/v1/cluster` | Admin-only cluster capacity and health summary. |
-| GET | `/v1/usage` | Per-key usage stats from the primary store (admin: all keys; user: own). |
-| GET | `/v1/audit` | Per-key audit trail from the primary store (admin: all keys; user: own). |
+| GET | `/v1/usage` | Per-key usage stats from the primary store or local outbox (admin: all keys; user: own). |
+| GET | `/v1/audit` | Per-key audit trail from the primary store or local outbox (admin: all keys; user: own). |
 
 Full request and response schemas are in [docs/API.md](docs/API.md).
 
@@ -184,7 +186,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `taritd ssh-key list` | List active SSH keys. |
 | `taritd ssh-key rm <key_id>` | Remove an SSH key. |
 | `taritd pty <id> [--shell <S>]` | Attach an interactive PTY over WebSocket. |
-| `taritd ssh <id> [--ssh-host <HOST>] [--ssh-port <PORT>] [extra ssh args...]` | Open the VM through the SSH gateway. Host and port default from `TARIT_SSH_GATEWAY_ADDR` (`127.0.0.1:2222`). |
+| `taritd ssh <id> [--ssh-host <HOST>] [--ssh-port <PORT>] [ssh options...] [command...]` | Open the VM through the SSH gateway. Host and port default from `TARIT_SSH_GATEWAY_ADDR` (`127.0.0.1:2222`). Options go before the destination; the first other word (or anything after `--`) is the remote command. With `-i`, only that key is offered. |
 
 ## Environment variable reference
 
@@ -201,7 +203,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_DB` | No | `~/.taritd/fleet.db` | Node-local SQLite database path. |
 | `TARIT_NET_STATE` | No | `<TARIT_DB>.net.json` | Persistent per-VM tap/IP slot map used when `TARIT_ENABLE_NET=true` so restarts reuse/free `/30` slots safely. |
 | `TARIT_IMAGES_DIR` | No | `~/.taritd/images` | Directory for registered immutable rootfs images built by `taritd image build`. |
-| `TARIT_MAX_VMS` | No | `32` | Max concurrent local VM slots, including warm pool reservations. |
+| `TARIT_MAX_VMS` | No | vCPU ceiling, at least `32` | Max concurrent local VM slots, including warm pool reservations. |
 | `TARIT_MAX_VCPUS` | No | `64`, or physical cores times `TARIT_CPU_OVERCOMMIT` when warm pool is enabled | Advertised local vCPU ceiling. |
 | `TARIT_MAX_MEMORY_MIB` | No | `65536` | Advertised local memory ceiling in MiB. |
 | `TARIT_PEER_SECRET` | Cluster: yes | random local-only value | Shared secret for `X-Peer-Secret`. Explicit values must be at least 32 characters and cannot use the development default. |
@@ -222,17 +224,21 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_ARTIFACT_GC_INTERVAL_SECS` | No | `30` | Disk-pressure refresh and owned-artifact sweep interval. |
 | `TARIT_ARTIFACT_GC_MIN_AGE_SECS` | No | `300` | Minimum age for collection of unreferenced Tarit-owned artifacts. |
 | `TARIT_CONFIG` | No | `~/.taritd/config.toml` | Optional TOML file for warm-pool configuration. Missing file is allowed. |
-| `TARIT_WARM_POOL` | No | `false` | Enable warm-pool replenishment. Accepts `1` or `true`. |
+| `TARIT_WARM_POOL` | No | `true` | Warm-pool replenishment. `1` or `true` keeps it on; any other value turns it off. |
 | `TARIT_WARM_POOL_TARGET` | No | `8` for the default class | Override target count for the first warm-pool class. If watermarks are unset, effective hard/low/high watermarks derive from this target. |
 | `TARIT_WARM_POOL_HARD_FLOOR` | No | derived from target | Override the emergency minimum for the first warm-pool class. Must be `<= low_watermark`. |
 | `TARIT_WARM_POOL_LOW_WATERMARK` | No | derived from target | Refill the first warm-pool class only after depth drops below this watermark. Must be `<= target`. |
 | `TARIT_WARM_POOL_HIGH_WATERMARK` | No | derived from target | Safety ceiling for the first warm-pool class. Must be `>= target`. |
-| `TARIT_WARM_POOL_RESTORE` | No | `false` for the default class | Use restore-from-golden replenishment for the first warm-pool class. Accepts `1` or `true`; use TOML for multiple classes. |
+| `TARIT_WARM_POOL_RESTORE` | No | `true` | Restore-from-golden replenishment for the first warm-pool class. Any value other than `1` or `true` refills by cold boot; use TOML for multiple classes. |
 | `TARIT_REFILL_CGROUP` | No | unset | Optional cgroup v2 directory for refill-spawned `vmm serve` children, e.g. `/sys/fs/cgroup/taritd-refill`. If unset or unavailable, refill continues without cgroup placement. |
 | `TARIT_REFILL_CPU_WEIGHT` | No | `10` | Low cgroup v2 `cpu.weight` assigned to the refill cgroup; live-created VMs keep the default cgroup weight. |
 | `TARIT_CPU_OVERCOMMIT` | No | `4.0` | Warm-pool CPU overcommit ratio. |
 | `TARIT_WARM_POOL_ROOTFS` | No | unset | Override rootfs for the first warm-pool class. |
 | `TARIT_WARM_POOL_IMAGE` | No | unset | Override rootfs for the first warm-pool class by registered image `name[:tag]`. |
+| `TARIT_WARM_POOL_LEARN_CLASSES` | No | `4` | Most warm classes learned for registered images and shapes in demand; `0` turns learning off. |
+| `TARIT_WARM_POOL_LEARN_TARGET` | No | `8` | Warm VMs kept ready per learned class. |
+| `TARIT_WARM_POOL_LEARN_IDLE_SECS` | No | `1800` | Retire a learned class after this long without a create. |
+| `TARIT_WARM_POOL_PREWARM` | No | unset | Command the first warm-pool class's golden VM runs before its snapshot, e.g. `node -e 0` for a Node image. |
 | `TARIT_REGION` | No | `local` | Topology label included in autoscaler decisions. |
 | `TARIT_ZONE` | No | same as `TARIT_REGION` | Topology label included in autoscaler decisions. |
 | `TARIT_CLOUD` | No | `onprem` | Topology label included in autoscaler decisions. |
@@ -259,8 +265,16 @@ export TARIT_SSH_GATEWAY=1
 export TARIT_SSH_GATEWAY_ADDR='0.0.0.0:2222'
 ./target/release/taritd
 
-ssh -p 2222 <vm_id>@<taritd-host>
+ssh -p 2222 -i ~/.ssh/tarit -o IdentitiesOnly=yes <vm_id>@<taritd-host>
 ```
+
+The gateway answers every offered key the same way and checks a key against
+the registry only after the client has signed with it, so which keys are
+registered cannot be probed without holding them. A wrong key is rejected
+without delay; a client that tries several agent keys first signs once with
+each. Offering only the registered key (`-i ... -o IdentitiesOnly=yes`) avoids
+that; `taritd ssh <id> -i KEY [ssh options] [command]` adds `IdentitiesOnly`
+for you.
 
 Optional warm-pool TOML shape:
 
@@ -286,14 +300,25 @@ high_watermark = 10
 restore = true
 rootfs = "/var/lib/taritd/rootfs.ext4"
 # or: image = "node20"
+# prewarm = "node -e 0"
 ```
 
 With `restore = true`, `taritd` cold-boots one ready golden VM for the class,
 takes a snapshot, tears down the builder, then refills that class by restoring
-clones from the golden. Each restored clone receives its own writable CoW
-overlay; `restore = false` keeps the bounded cold-boot refill path. Refill starts
+clones from the golden. Before its snapshot the golden runs `true`, so clones
+start with the guest shell in their page cache, or the class's `prewarm`
+command, which can do the same for an image's runtime; a failing command fails
+the golden. Each restored clone receives its own writable CoW overlay; `restore = false` keeps the bounded cold-boot refill path. Refill starts
 only below `low_watermark`, fills back to `target`, and uses the optional
 low-weight refill cgroup when `TARIT_REFILL_CGROUP`/`refill_cgroup` is set.
+
+Configured classes are not the only ones. taritd keeps a pool for each
+registered image (the newest few at startup, and any registered later), and
+learns any other shape creates ask for: the first such create boots cold, the
+following ones come from a pool built for it. A learned class that goes
+unused for `TARIT_WARM_POOL_LEARN_IDLE_SECS` is retired and its golden
+snapshot deleted. `GET /v1/warm-pool` lists learned classes with
+`"learned": true`.
 
 ## Image registry
 
@@ -303,8 +328,17 @@ rootfs under `TARIT_IMAGES_DIR`, and registers it in the node-local SQLite DB.
 Create requests can use `--image <name>[:tag]` (or JSON `image`) instead of a raw
 `rootfs_path`; warm-pool classes can set `image = "name[:tag]"`.
 
+An image can carry a prewarm command, which the golden VM of that image's
+warm pool runs before its snapshot. Sandboxes then start with the runtime
+already in their page cache: on the reference host the first `node -v` in a
+fresh `node:22` sandbox dropped from about 45 ms (22 MiB read from disk) to
+13 ms (no reads). Set it at build time with `--prewarm`, or later with
+`taritd image prewarm`; a running taritd rebuilds that image's golden within
+seconds.
+
 ```sh
-taritd image build --oci node:20-slim --name node20 --size 2048
+taritd image build --oci node:20-slim --name node20 --size 2048 --prewarm 'node -e 0'
+taritd image prewarm node20 'node -e 0'   # or with no command, to clear it
 taritd image ls
 taritd vm create --image node20 --vcpus 1 --memory-mib 256
 taritd image rm node20
