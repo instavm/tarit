@@ -6,7 +6,10 @@
 #
 # RUNNER_TOKEN is the registration token from the repository's Settings ->
 # Actions -> Runners -> New self-hosted runner. It expires an hour after it is
-# shown. Running the script again re-registers and restarts the runner.
+# shown. Running the script again keeps the existing registration and only
+# reinstalls the runner and its service (no token needed). To register again,
+# pass RUNNER_REMOVE_TOKEN (the runner's Remove button shows it) together with
+# a new RUNNER_TOKEN.
 #
 # What this does to the host:
 #   - creates the system user `tarit-ci` (home /var/lib/tarit-ci), in the kvm
@@ -39,7 +42,6 @@ CI_HOME=/var/lib/$CI_USER
 die() { echo "setup-kvm-runner: $*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo)"
-[ -n "${RUNNER_TOKEN:-}" ] || die "set RUNNER_TOKEN (Settings -> Actions -> Runners -> New self-hosted runner)"
 [ "$(uname -m)" = x86_64 ] || die "the KVM job runs on x86_64 only"
 [ -c /dev/kvm ] || die "/dev/kvm is missing"
 [ -r "$KERNEL" ] || die "guest kernel not found at $KERNEL (set KERNEL=)"
@@ -84,9 +86,19 @@ tar -xzf "$tarball" -C "$runner_dir"
 chown -R "$CI_USER:$CI_USER" "$runner_dir"
 "$runner_dir/bin/installdependencies.sh" >/dev/null
 
-sudo -u "$CI_USER" -H bash -c "cd '$runner_dir' && ./config.sh --unattended --replace \
-  --url '$REPO_URL' --token '$RUNNER_TOKEN' --name '$RUNNER_NAME' \
-  --labels self-hosted,linux,x64,kvm --work _work"
+# The runner refuses to configure itself twice, so an existing registration
+# is kept unless it is removed first with its removal token.
+if [ -f "$runner_dir/.runner" ] && [ -n "${RUNNER_REMOVE_TOKEN:-}" ]; then
+  sudo -u "$CI_USER" -H bash -c "cd '$runner_dir' && ./config.sh remove --token '$RUNNER_REMOVE_TOKEN'"
+fi
+if [ -f "$runner_dir/.runner" ]; then
+  echo "== keeping the existing runner registration"
+else
+  [ -n "${RUNNER_TOKEN:-}" ] || die "set RUNNER_TOKEN (Settings -> Actions -> Runners -> New self-hosted runner)"
+  sudo -u "$CI_USER" -H bash -c "cd '$runner_dir' && ./config.sh --unattended --replace \
+    --url '$REPO_URL' --token '$RUNNER_TOKEN' --name '$RUNNER_NAME' \
+    --labels self-hosted,linux,x64,kvm --work _work"
+fi
 
 echo "== service"
 (cd "$runner_dir" && ./svc.sh install "$CI_USER")
