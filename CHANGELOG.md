@@ -37,6 +37,12 @@ versions may contain breaking changes.
 
 ### Changed
 
+- Full snapshots (pause, suspend, and live) store unplugged virtio-mem blocks
+  and runs of zero pages of 64 KiB or more as file holes instead of writing
+  them. A 512 MiB boot / 4 GiB maximum VM no longer writes a dense 4 GiB file.
+  The VMSN format, length, and CRC are unchanged (holes read as zeros), so
+  older VMMs restore these snapshots. Eager restore reads only stored ranges,
+  leaving holes unallocated; CRC checks skip holes arithmetically.
 - vCPU threads are named `vcpu N` (N = vCPU id) so host tooling can find them,
   for example to place only vCPU threads in a cgroup v2 threaded child.
 - Live snapshots now pause, capture, and resume every configured vCPU through

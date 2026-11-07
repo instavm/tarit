@@ -464,12 +464,18 @@ fn dirty_rate_sample(bytes: u64, elapsed: Duration) -> u64 {
 ///
 /// `capture_state` runs while every vCPU is paused for the final stop, so the
 /// state blob it returns is coherent with the memory image.
+///
+/// `unplugged` returns the packed RAM ranges that hold no guest data (unplugged
+/// virtio-mem blocks). The bulk round leaves them, and long zero runs, as holes
+/// in `memory_file`, which must be new and empty (see [`crate::sparse_image`]).
+#[allow(clippy::too_many_arguments)]
 pub fn live_snapshot<F>(
     kvm_vm: &KvmVm,
     mem: &GuestMemory,
     vcpu_threads: &[&VcpuThread],
     config: &LiveSnapshotConfig,
     memory_file: &File,
+    unplugged: &dyn Fn() -> Vec<(u64, u64)>,
     quiesce_io: &dyn Fn(bool) -> Result<()>,
     capture_state: F,
 ) -> Result<LiveSnapshotOutput>
@@ -527,9 +533,14 @@ where
     );
     inject_live_snapshot_failure("dirty_logging")?;
 
-    // Step 2: bulk round — copy all of guest RAM while the guest runs. This is
-    // also the bandwidth sample that drives the convergence decision.
+    // Step 2: bulk round — copy guest RAM while the guest runs. This is also
+    // the bandwidth sample that drives the convergence decision, so it counts
+    // only the bytes actually written. Unplugged blocks and long zero runs stay
+    // holes. The unplugged list is read only now, after dirty logging is on:
+    // a block the guest plugs and writes from here on reaches the image
+    // through the dirty rounds like any other write.
     let bulk_start = Instant::now();
+    let holes = unplugged();
     let lazy_fence = mem.lazy_snapshot_fence();
     let _bulk_read_guard = lazy_fence.as_ref().map(|fence| {
         fence
@@ -537,10 +548,9 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     });
     // SAFETY: GuestMemory guarantees the mapping for `size_bytes`; the
-    // positioned write copies it immediately and retains no pointer.
+    // positioned writes copy it immediately and retain no pointer.
     let source = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem_size) };
-    memory_file
-        .write_all_at(source, 0)
+    let bulk = crate::sparse_image::write_image(memory_file, 0, source, &holes)
         .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?;
     drop(_bulk_read_guard);
     // Bulk writeback and cache eviction happen while the guest is running.
@@ -551,11 +561,12 @@ where
         .map_err(|error| VmmError::Snapshot(format!("sync bulk staged RAM: {error}")))?;
     drop_staged_cache(memory_file, mem.size_bytes);
     let bulk_elapsed = bulk_start.elapsed();
-    let mut total_pages_copied = mem.size_bytes / PAGE_SIZE;
+    let mut total_pages_copied = bulk.data_bytes.div_ceil(PAGE_SIZE);
     let mut copy_bandwidth_bps =
-        bandwidth_sample(mem.size_bytes, bulk_elapsed).unwrap_or(DEFAULT_COPY_BANDWIDTH_BPS);
+        bandwidth_sample(bulk.data_bytes, bulk_elapsed).unwrap_or(DEFAULT_COPY_BANDWIDTH_BPS);
     log::info!(
-        "live_snapshot: bulk copy of {} bytes in {bulk_elapsed:?} ({copy_bandwidth_bps} B/s)",
+        "live_snapshot: bulk copy of {} of {} bytes in {bulk_elapsed:?} ({copy_bandwidth_bps} B/s)",
+        bulk.data_bytes,
         mem.size_bytes
     );
     inject_live_snapshot_failure("bulk")?;

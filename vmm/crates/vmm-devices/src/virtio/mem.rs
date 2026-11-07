@@ -239,6 +239,27 @@ impl VirtioMemMmio {
         }
     }
 
+    /// Unplugged blocks as coalesced `(offset, len)` ranges of packed guest RAM
+    /// (the offsets of snapshot images and [`GuestMemory::as_ptr`]), in order.
+    /// The driver must not write unplugged memory (virtio v1.2 §5.15) and the
+    /// device discards it on unplug, so full snapshots store these ranges as
+    /// zeros without reading them.
+    pub fn unplugged_ranges(&self) -> Vec<(u64, u64)> {
+        let plugged = self.plugged.lock().unwrap_or_else(|p| p.into_inner());
+        let base = self.memory.low_size_bytes;
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for (index, _) in plugged.iter().enumerate().filter(|(_, p)| !**p) {
+            let start = base + index as u64 * BLOCK_SIZE;
+            match ranges.last_mut() {
+                Some((run_start, run_len)) if *run_start + *run_len == start => {
+                    *run_len += BLOCK_SIZE;
+                }
+                _ => ranges.push((start, BLOCK_SIZE)),
+            }
+        }
+        ranges
+    }
+
     /// Live resize of a running guest: set the requested hotplug size in
     /// bytes (excluding boot RAM). Growing and shrinking are both allowed;
     /// `0` asks the driver to unplug everything. The value must be a multiple
@@ -1114,6 +1135,36 @@ mod tests {
             irq.read().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn unplugged_ranges_are_coalesced_packed_offsets() {
+        let d = wide_dev(); // 2 blocks of boot RAM, 6-block aperture
+        let boot = d.memory.low_size_bytes;
+        assert_eq!(d.unplugged_ranges(), vec![(boot, 6 * BLOCK_SIZE)]);
+
+        d.set_requested_size(3 * BLOCK_SIZE).unwrap();
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(1), 2))), RESP_ACK);
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(5), 1))), RESP_ACK);
+        assert_eq!(
+            d.unplugged_ranges(),
+            vec![(boot, BLOCK_SIZE), (boot + 3 * BLOCK_SIZE, 2 * BLOCK_SIZE)]
+        );
+        // The packed offsets are where the blocks live in host memory.
+        assert_eq!(
+            d.memory.gpa_to_offset(block(3)),
+            Some(boot + 3 * BLOCK_SIZE)
+        );
+
+        assert_eq!(resp(d.request(&request(REQ_PLUG, block(0), 1))), RESP_NACK);
+        d.set_requested_size(6 * BLOCK_SIZE).unwrap();
+        for index in [0, 3, 4] {
+            assert_eq!(
+                resp(d.request(&request(REQ_PLUG, block(index), 1))),
+                RESP_ACK
+            );
+        }
+        assert!(d.unplugged_ranges().is_empty());
     }
 
     #[test]

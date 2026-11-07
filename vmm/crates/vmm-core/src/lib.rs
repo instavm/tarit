@@ -18,6 +18,7 @@ pub mod oci;
 pub mod pty_stream;
 pub mod restore_semantics;
 pub mod security;
+pub mod sparse_image;
 pub mod state;
 pub mod vcpu;
 pub mod volume;

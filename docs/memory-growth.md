@@ -42,8 +42,12 @@ network/overlay restrictions still apply). Python `CreateVmRequest` /
   guest's currently online RAM. Use guest `/proc/meminfo` to observe usable RAM.
 - The maximum backing is allocated at creation and the snapshot RAM extent spans
   that maximum, including unplugged blocks. A 2 GiB boot / 4 GiB maximum template
-  therefore has a 4 GiB RAM snapshot extent. This version offers no host-memory
-  overcommit or smaller snapshot format.
+  therefore has a 4 GiB RAM snapshot extent (file length). Full snapshots store
+  unplugged blocks, and runs of zero pages of 64 KiB or more, as file holes, so
+  on a filesystem with sparse files the extent occupies about what the guest
+  has written. The format and CRC are unchanged (holes read as zeros), so older
+  VMMs restore these files; copying one with a tool that does not keep holes
+  makes it dense again. This version offers no host-memory overcommit.
 - Boot RAM must be 128 MiB aligned, between 128 and 3328 MiB, and below the
   maximum. Maximum and requested total must also be 128 MiB aligned; the
   existing 65536 MiB ceiling applies. Targets below the saved requested total

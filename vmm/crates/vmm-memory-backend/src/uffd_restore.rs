@@ -1247,6 +1247,103 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Full snapshots leave unplugged and zero RAM as file holes. Lazy restore
+    /// must serve those holes as zero pages, with and without chunk
+    /// integrity, from an unaligned RAM offset like a VMSN header + state.
+    #[test]
+    fn lazy_restore_serves_snapshot_file_holes_as_zeros() {
+        use std::os::unix::fs::FileExt;
+
+        const PAGE: usize = 4096;
+        const PAGES: usize = 64;
+        const LEN: usize = PAGE * PAGES;
+        const RAM_OFFSET: u64 = 32 + 13;
+        let data_pages = [0usize, 5, 40];
+        let mut logical = vec![0u8; LEN];
+        for page in data_pages {
+            logical[page * PAGE..(page + 1) * PAGE].fill(page as u8 + 1);
+        }
+        for integrity in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "tarit-uffd-holes-{integrity}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.write_all_at(&[0xee; RAM_OFFSET as usize], 0).unwrap();
+            for page in data_pages {
+                file.write_all_at(
+                    &logical[page * PAGE..(page + 1) * PAGE],
+                    RAM_OFFSET + (page * PAGE) as u64,
+                )
+                .unwrap();
+            }
+            file.set_len(RAM_OFFSET + LEN as u64).unwrap();
+
+            // SAFETY: one private anonymous mapping, checked against
+            // MAP_FAILED and unmapped exactly once below.
+            let guest = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    LEN,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(guest, libc::MAP_FAILED);
+            let chunk_size = 4 * PAGE;
+            let chunk_integrity = integrity.then(|| ChunkIntegrity {
+                chunk_size,
+                chunk_hashes: logical
+                    .chunks(chunk_size)
+                    .map(|chunk| Sha256::digest(chunk).into())
+                    .collect(),
+            });
+            let lazy = match start_lazy_restore_with_integrity(
+                guest.cast(),
+                LEN,
+                &file,
+                RAM_OFFSET,
+                LEN as u64,
+                None,
+                chunk_integrity,
+            ) {
+                Ok(lazy) => lazy,
+                Err(UffdRestoreError::Userfaultfd(error))
+                    if matches!(error.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) =>
+                {
+                    eprintln!("userfaultfd unavailable ({error}); skipping");
+                    // SAFETY: `guest` is the live mapping created above.
+                    assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                    drop(file);
+                    std::fs::remove_file(path).unwrap();
+                    return;
+                }
+                Err(error) => panic!("start lazy restore: {error}"),
+            };
+            // SAFETY: `guest` stays mapped and UFFD-registered while read;
+            // every missing page is served by the handler.
+            let restored = unsafe { std::slice::from_raw_parts(guest.cast::<u8>(), LEN) };
+            assert!(restored == &logical[..], "integrity={integrity}");
+
+            drop(lazy);
+            // SAFETY: `guest` is the live mapping returned above.
+            assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
     #[test]
     fn uffdio_api_constant_matches_kernel() {
         // UFFDIO_API = _IOWR(0xAA, 0x3F, struct uffdio_api)

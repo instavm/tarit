@@ -724,7 +724,18 @@ impl VmmController {
                     Ok(0)
                 }
             } else {
-                write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)?;
+                // vCPUs are paused, so no plug/unplug can race this read.
+                #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+                let unplugged = unplugged_memory_ranges(vm.running.as_ref());
+                #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+                let unplugged = Vec::new();
+                write_scratch_snapshot_file(
+                    &owned_snapshot,
+                    &state_blob,
+                    mem_slice,
+                    false,
+                    &unplugged,
+                )?;
                 // Enable dirty logging (idempotent) + drain the initial bitmap so the
                 // next snapshot can diff against this full baseline.
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -1291,6 +1302,7 @@ impl VmmController {
             &vcpu_threads,
             &snapshot_config,
             memory_stage.file(),
+            &|| unplugged_memory_ranges(Some(&running)),
             &quiesce,
             || {
                 if let Some(source) = overlay_source.as_deref() {
@@ -3159,10 +3171,14 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
         let mem_slice = {
             // SAFETY: guest_mem owns this mmap for the lifetime of `vm`; the vCPUs are
             // paused, and this read also resolves any older lazy-restore faults before
-            // we unregister the previous UFFD below.
+            // we unregister the previous UFFD below. Unplugged virtio-mem ranges are not
+            // read: the image stores them as zeros.
             unsafe { std::slice::from_raw_parts(mem_ptr.cast_const(), mem_len) }
         };
-        if let Err(e) = write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false)
+        // vCPUs are paused, so no plug/unplug can race this read.
+        let unplugged = unplugged_memory_ranges(vm.running.as_ref());
+        if let Err(e) =
+            write_scratch_snapshot_file(&owned_snapshot, &state_blob, mem_slice, false, &unplugged)
         {
             remove_owned_scratch_file(&owned_snapshot);
             return Err(e);
@@ -4018,18 +4034,37 @@ pub(crate) fn write_snapshot_file(
     )
 }
 
+/// `unplugged` names packed RAM ranges stored as zeros without being read
+/// (see [`crate::sparse_image`]).
 fn write_scratch_snapshot_file(
     owned_file: &OwnedScratchFile,
     state_blob: &[u8],
     mem_dump: &[u8],
     diff: bool,
+    unplugged: &[(u64, u64)],
 ) -> Result<()> {
-    write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, diff)
+    write_snapshot_to_file(owned_file.file(), state_blob, mem_dump, diff, unplugged)
+}
+
+/// Packed RAM ranges of a running VM that hold no guest data: its unplugged
+/// virtio-mem blocks. Callers must have stopped the guest driver (vCPUs
+/// paused), or must tolerate staleness as live pre-copy does.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn unplugged_memory_ranges(running: Option<&RunningVm>) -> Vec<(u64, u64)> {
+    running
+        .and_then(|running| running.memory_device.as_ref())
+        .map(|device| device.unplugged_ranges())
+        .unwrap_or_default()
 }
 
 /// Assemble a full snapshot from a file-backed live pre-copy without ever
 /// allocating a second guest-RAM-sized buffer. The CRC field is patched before
 /// the private staged artifact is synced and atomically published.
+///
+/// The staged RAM may be sparse (see [`crate::sparse_image`]). Copy windows
+/// with no data are hashed arithmetically and never read; when streaming
+/// instead of reflinking, all-zero integrity chunks are not written, so the
+/// output stays sparse. CRC and chunk hashes cover every logical byte.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn write_scratch_snapshot_file_from_memory_file(
     owned_file: &OwnedScratchFile,
@@ -4039,8 +4074,9 @@ fn write_scratch_snapshot_file_from_memory_file(
     diff: bool,
 ) -> Result<tarit_proto::IntegrityManifest> {
     use sha2::{Digest as _, Sha256};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Seek, SeekFrom, Write};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
 
     const MAGIC: &[u8; 4] = b"VMSN";
     const MEM_CRC_OFFSET: u64 = 28;
@@ -4136,17 +4172,20 @@ fn write_scratch_snapshot_file_from_memory_file(
         log::warn!(
             "live_snapshot: RAM range reflink unavailable ({error}); using streamed publication"
         );
-        output
-            .seek(SeekFrom::Start(mem_offset))
-            .map_err(|error| VmmError::Snapshot(format!("seek snapshot RAM: {error}")))?;
     }
 
-    let mut source = memory_file
-        .try_clone()
-        .map_err(|error| VmmError::Snapshot(format!("clone staged RAM: {error}")))?;
-    source
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| VmmError::Snapshot(format!("seek staged RAM: {error}")))?;
+    let extents = crate::sparse_image::data_extents(memory_file, 0, mem_len)
+        .map_err(|error| VmmError::Snapshot(format!("map staged RAM: {error}")))?;
+    let mut next_extent = 0usize;
+    static ZERO_CHUNK: [u8; INTEGRITY_CHUNK_BYTES] = [0; INTEGRITY_CHUNK_BYTES];
+    let zero_chunk_hash: [u8; 32] = Sha256::digest(ZERO_CHUNK).into();
+    let chunk_hash = |bytes: &[u8]| -> [u8; 32] {
+        if bytes.len() == INTEGRITY_CHUNK_BYTES && crate::sparse_image::is_zero(bytes) {
+            zero_chunk_hash
+        } else {
+            Sha256::digest(bytes).into()
+        }
+    };
     let mut hasher = crc32fast::Hasher::new();
     let mut memory_chunk_hashes = Vec::new();
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
@@ -4154,19 +4193,51 @@ fn write_scratch_snapshot_file_from_memory_file(
     let mut synced = 0u64;
     while copied < mem_len {
         let chunk = (mem_len - copied).min(buffer.len() as u64) as usize;
-        source
-            .read_exact(&mut buffer[..chunk])
-            .map_err(|error| VmmError::Snapshot(format!("read staged RAM: {error}")))?;
-        hasher.update(&buffer[..chunk]);
-        memory_chunk_hashes.extend(
-            buffer[..chunk]
-                .chunks(INTEGRITY_CHUNK_BYTES)
-                .map(|bytes| -> [u8; 32] { Sha256::digest(bytes).into() }),
-        );
-        if !reflinked {
-            output
-                .write_all(&buffer[..chunk])
-                .map_err(|error| VmmError::Snapshot(format!("stream snapshot RAM: {error}")))?;
+        let window_end = copied + chunk as u64;
+        while extents
+            .get(next_extent)
+            .is_some_and(|(_, end)| *end <= copied)
+        {
+            next_extent += 1;
+        }
+        let window_has_data = extents
+            .get(next_extent)
+            .is_some_and(|(start, _)| *start < window_end);
+        if !window_has_data {
+            // A hole in the staged file: nothing to read or write, and every
+            // integrity chunk is zeros (only the last may be short).
+            crate::sparse_image::crc32_update_zeros(&mut hasher, chunk as u64);
+            let mut left = chunk;
+            while left > 0 {
+                let len = left.min(INTEGRITY_CHUNK_BYTES);
+                memory_chunk_hashes.push(if len == INTEGRITY_CHUNK_BYTES {
+                    zero_chunk_hash
+                } else {
+                    Sha256::digest(&ZERO_CHUNK[..len]).into()
+                });
+                left -= len;
+            }
+        } else {
+            memory_file
+                .read_exact_at(&mut buffer[..chunk], copied)
+                .map_err(|error| VmmError::Snapshot(format!("read staged RAM: {error}")))?;
+            hasher.update(&buffer[..chunk]);
+            memory_chunk_hashes.extend(
+                buffer[..chunk]
+                    .chunks(INTEGRITY_CHUNK_BYTES)
+                    .map(chunk_hash),
+            );
+            if !reflinked {
+                for (index, bytes) in buffer[..chunk].chunks(INTEGRITY_CHUNK_BYTES).enumerate() {
+                    if crate::sparse_image::is_zero(bytes) {
+                        continue; // already a hole in the sized output
+                    }
+                    let at = mem_offset + copied + (index * INTEGRITY_CHUNK_BYTES) as u64;
+                    output.write_all_at(bytes, at).map_err(|error| {
+                        VmmError::Snapshot(format!("stream snapshot RAM: {error}"))
+                    })?;
+                }
+            }
         }
         let chunk_u64 = chunk as u64;
         drop_file_cache(memory_file, copied, chunk_u64);
@@ -4268,46 +4339,61 @@ fn write_snapshot_file_with_mode(
     mode: SnapshotCreateMode,
 ) -> Result<()> {
     let file = open_snapshot_output(path, mode)?;
-    write_snapshot_to_file(&file, state_blob, mem_dump, diff)
+    write_snapshot_to_file(&file, state_blob, mem_dump, diff, &[])
 }
 
+/// Write a full (`VMSN`) snapshot. The RAM extent is stored sparsely: the
+/// `unplugged` ranges and long zero runs become holes, and the header CRC
+/// covers the extent with holes read as zeros, so the file is byte-for-byte
+/// the same snapshot to any reader (see [`crate::sparse_image`]).
 fn write_snapshot_to_file(
-    mut file: &std::fs::File,
+    file: &std::fs::File,
     state_blob: &[u8],
     mem_dump: &[u8],
     diff: bool,
+    unplugged: &[(u64, u64)],
 ) -> Result<()> {
-    use std::io::Write;
+    use std::os::unix::fs::FileExt;
     const MAGIC: &[u8; 4] = b"VMSN";
+    const MEM_CRC_OFFSET: u64 = 28;
 
     let state_crc = crc32fast::hash(state_blob);
-    let mem_crc = crc32fast::hash(mem_dump);
     let flags: u16 = if diff { 1 } else { 0 };
     let state_len = u64::try_from(state_blob.len())
         .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
     let mem_len = u64::try_from(mem_dump.len())
         .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
+    let mem_offset = 32u64
+        .checked_add(state_len)
+        .ok_or_else(|| VmmError::Snapshot("snapshot memory offset overflow".into()))?;
+    let file_len = mem_offset
+        .checked_add(mem_len)
+        .ok_or_else(|| VmmError::Snapshot("snapshot length overflow".into()))?;
 
-    file.write_all(MAGIC)
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&SNAPSHOT_VERSION.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&flags.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&state_len.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&state_crc.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&mem_len.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(&mem_crc.to_le_bytes())
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(state_blob)
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.write_all(mem_dump)
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
-    file.flush()
-        .map_err(|e| VmmError::Snapshot(e.to_string()))?;
+    // Holes must read as zeros, so start from an empty file.
+    file.set_len(0)
+        .map_err(|e| VmmError::Snapshot(format!("truncate snapshot output: {e}")))?;
+    let mut header = Vec::with_capacity(32);
+    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    header.extend_from_slice(&flags.to_le_bytes());
+    header.extend_from_slice(&state_len.to_le_bytes());
+    header.extend_from_slice(&state_crc.to_le_bytes());
+    header.extend_from_slice(&mem_len.to_le_bytes());
+    header.extend_from_slice(&0u32.to_le_bytes()); // mem_crc, patched below
+    file.write_all_at(&header, 0)
+        .and_then(|()| file.write_all_at(state_blob, 32))
+        .map_err(|e| VmmError::Snapshot(format!("write snapshot metadata: {e}")))?;
+    let image = crate::sparse_image::write_image(file, mem_offset, mem_dump, unplugged)
+        .map_err(|e| VmmError::Snapshot(format!("write snapshot memory: {e}")))?;
+    file.set_len(file_len)
+        .and_then(|()| file.write_all_at(&image.crc.to_le_bytes(), MEM_CRC_OFFSET))
+        .map_err(|e| VmmError::Snapshot(format!("finish snapshot: {e}")))?;
+    log::info!(
+        "snapshot: stored {} of {mem_len} RAM bytes ({} unplugged range(s) and zero runs left as holes)",
+        image.data_bytes,
+        unplugged.len()
+    );
     Ok(())
 }
 
@@ -4669,33 +4755,6 @@ fn snapshot_file_kind_from_header(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn crc32_file_range(
-    file: &mut std::fs::File,
-    path: &str,
-    offset: u64,
-    len: u64,
-    what: &str,
-) -> Result<u32> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| VmmError::Snapshot(format!("seek {what} in {path}: {e}")))?;
-    let mut hasher = crc32fast::Hasher::new();
-    let mut remaining = len;
-    let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let want = usize::try_from(remaining.min(buf.len() as u64))
-            .map_err(|_| VmmError::Snapshot(format!("{what} length too large in {path}")))?;
-        file.read_exact(&mut buf[..want])
-            .map_err(|e| VmmError::Snapshot(format!("read {what} in {path}: {e}")))?;
-        hasher.update(&buf[..want]);
-        remaining -= u64::try_from(want)
-            .map_err(|_| VmmError::Snapshot(format!("{what} length overflow in {path}")))?;
-    }
-    Ok(hasher.finalize())
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn load_authenticated_memory_manifest(
     anchor: &tarit_proto::MemoryIntegrity,
     header: &[u8; FULL_SNAPSHOT_REST_HEADER_LEN],
@@ -4951,7 +5010,8 @@ fn try_lazy_restore_full_snapshot(
         )?)
     } else {
         let actual_mem_crc =
-            crc32_file_range(&mut file, path, layout.mem_offset, layout.mem_len, "mem")?;
+            crate::sparse_image::crc32_range(&file, layout.mem_offset, layout.mem_len)
+                .map_err(|e| VmmError::Snapshot(format!("read mem in {path}: {e}")))?;
         if actual_mem_crc != header.mem_crc {
             return Err(VmmError::Snapshot(format!(
                 "memory CRC mismatch in {path}: got {actual_mem_crc:#010x}, expected {:#010x}",
@@ -5112,27 +5172,22 @@ fn read_snapshot(path: &Path, snapshot_root: &Path) -> Result<SnapshotContent> {
                 header.state_crc
             )));
         }
-        let actual_mem_crc = crc32_file_range(
-            &mut file,
-            &path_display,
-            layout.mem_offset,
-            layout.mem_len,
-            "mem",
-        )?;
+        let mem = allocate_snapshot_memory(layout.mem_len, &state)?;
+        let mem_slice: &mut [u8] = {
+            // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
+            unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_len) }
+        };
+        // One pass: load the stored ranges into the fresh (zero) memory, leave
+        // holes untouched so they stay unallocated, and verify the CRC of what
+        // was loaded. A mismatch drops `mem` before anything can run on it.
+        let actual_mem_crc = crate::sparse_image::read_into(&file, layout.mem_offset, mem_slice)
+            .map_err(|e| VmmError::Snapshot(format!("read mem in {path_display}: {e}")))?;
         if actual_mem_crc != header.mem_crc {
             return Err(VmmError::Snapshot(format!(
                 "memory CRC mismatch in {path_display}: got {actual_mem_crc:#010x}, expected {:#010x}",
                 header.mem_crc
             )));
         }
-        let mem = allocate_snapshot_memory(layout.mem_len, &state)?;
-        let mem_slice: &mut [u8] = {
-            // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
-            unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_len) }
-        };
-        file.seek(SeekFrom::Start(layout.mem_offset))
-            .map_err(|e| VmmError::Snapshot(format!("seek mem in {path_display}: {e}")))?;
-        rd(&mut file, mem_slice, "read mem")?;
         Ok(SnapshotContent::Full {
             mem,
             state,
@@ -7652,6 +7707,278 @@ mod tests {
 
         let _ = std::fs::remove_file(base_s);
         let _ = std::fs::remove_file(diff_s);
+    }
+
+    /// 64 MiB of guest RAM shaped like a virtio-mem VM: 2 MiB of boot data
+    /// with a short zero run, zeros, and a 32 MiB unplugged range that holds
+    /// junk a misbehaving guest wrote (a snapshot stores it as zeros).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn hotplug_shaped_memory() -> (Vec<u8>, Vec<(u64, u64)>, Vec<u8>) {
+        let mib = crate::config::MIB as usize;
+        let mut memory = vec![0u8; 64 * mib];
+        for (index, byte) in memory[..2 * mib].iter_mut().enumerate() {
+            *byte = (index % 249) as u8 + 1;
+        }
+        memory[3 * 4096..5 * 4096].fill(0);
+        memory[16 * mib..48 * mib].fill(0x6b);
+        let unplugged = vec![(16 * mib as u64, 32 * mib as u64)];
+        let mut logical = memory.clone();
+        logical[16 * mib..48 * mib].fill(0);
+        (memory, unplugged, logical)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn filesystem_stores_holes(dir: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let probe = dir.join(format!("hole-probe-{}", std::process::id()));
+        let file = std::fs::File::create(&probe).unwrap();
+        file.set_len(8 * crate::config::MIB).unwrap();
+        let sparse = file.metadata().unwrap().blocks() == 0;
+        let _ = std::fs::remove_file(probe);
+        sparse
+    }
+
+    /// Resident pages of `[ptr, ptr + len)` per mincore(2).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn resident_pages(ptr: *const u8, len: usize) -> usize {
+        let mut vec = vec![0u8; len.div_ceil(4096)];
+        // SAFETY: the caller passes a live, page-aligned mapping of `len`
+        // bytes; mincore writes one byte per page into `vec`.
+        let rc = unsafe { libc::mincore(ptr as *mut libc::c_void, len, vec.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+        vec.iter().filter(|page| **page & 1 != 0).count()
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn full_snapshot_leaves_unplugged_and_zero_ranges_as_holes() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (memory, unplugged, logical) = hotplug_shaped_memory();
+        let path = unique_runtime_file_path("sparse-full-test", "snap").unwrap();
+        let file =
+            open_snapshot_output(path.to_str().unwrap(), SnapshotCreateMode::CreateNew).unwrap();
+        let state = b"sparse state";
+        write_snapshot_to_file(&file, state, &memory, false, &unplugged).unwrap();
+        drop(file);
+
+        // Same VMSN v2 layout and CRC as a dense image of the logical bytes.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], b"VMSN");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), SNAPSHOT_VERSION);
+        let mem_offset = 32 + state.len();
+        assert_eq!(bytes.len(), mem_offset + memory.len());
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            crc32fast::hash(&logical)
+        );
+        assert!(
+            bytes[mem_offset..] == logical[..],
+            "holes must read as zeros"
+        );
+
+        let dir = path.parent().unwrap();
+        if filesystem_stores_holes(dir) {
+            let allocated = std::fs::metadata(&path).unwrap().blocks() * 512;
+            // 2 MiB of data; 62 MiB are unplugged or zero.
+            assert!(
+                allocated <= 3 * crate::config::MIB,
+                "full snapshot allocated {allocated} bytes for 2 MiB of data"
+            );
+        } else {
+            eprintln!("filesystem does not store holes; skipping allocation check");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn eager_restore_reads_holes_as_zeros_without_allocating_them() {
+        let (memory, unplugged, logical) = hotplug_shaped_memory();
+        let path = unique_runtime_file_path("sparse-eager-test", "snap").unwrap();
+        let file =
+            open_snapshot_output(path.to_str().unwrap(), SnapshotCreateMode::CreateNew).unwrap();
+        write_snapshot_to_file(&file, b"state", &memory, false, &unplugged).unwrap();
+        drop(file);
+
+        let (restored, state, version) = load_snapshot_chain(path.to_str().unwrap()).unwrap();
+        assert_eq!(state, b"state");
+        assert_eq!(version, SNAPSHOT_VERSION);
+        let len = usize::try_from(restored.size_bytes).unwrap();
+        assert_eq!(len, memory.len());
+        let mib = crate::config::MIB as usize;
+        if filesystem_stores_holes(path.parent().unwrap()) {
+            // SAFETY: `restored` owns `len` bytes; offset 16 MiB is inside it.
+            let unplugged_ptr = unsafe { restored.as_ptr().add(16 * mib) };
+            assert_eq!(
+                resident_pages(unplugged_ptr, 32 * mib),
+                0,
+                "eager restore must not populate holes"
+            );
+        }
+        // SAFETY: `restored` owns `len` bytes for the duration of this check.
+        let image = unsafe { std::slice::from_raw_parts(restored.as_ptr(), len) };
+        assert!(image == &logical[..]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn lazy_restore_of_a_sparse_snapshot_serves_holes_as_zeros() {
+        let (memory, unplugged, logical) = hotplug_shaped_memory();
+        let path = unique_runtime_file_path("sparse-lazy-test", "snap").unwrap();
+        let file =
+            open_snapshot_output(path.to_str().unwrap(), SnapshotCreateMode::CreateNew).unwrap();
+        write_snapshot_to_file(&file, b"state", &memory, false, &unplugged).unwrap();
+        drop(file);
+
+        let restored = match try_lazy_restore_full_snapshot(path.to_str().unwrap(), None) {
+            Ok(Some(restored)) => restored,
+            Ok(None) => panic!("a full snapshot is eligible for lazy restore"),
+            Err(error) if error.to_string().contains("UFFD") => {
+                eprintln!("userfaultfd unavailable here ({error}); skipping");
+                let _ = std::fs::remove_file(path);
+                return;
+            }
+            Err(error) => panic!("lazy restore failed: {error}"),
+        };
+        assert!(restored.lazy_restore.is_some());
+        let len = usize::try_from(restored.mem.size_bytes).unwrap();
+        // SAFETY: the restored mapping owns `len` bytes; faults are served by
+        // the UFFD handler from the snapshot file.
+        let image = unsafe { std::slice::from_raw_parts(restored.mem.as_ptr(), len) };
+        assert!(image == &logical[..]);
+        drop(restored);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn sparse_snapshot_integrity_checks_still_reject_corruption() {
+        use std::os::unix::fs::FileExt;
+
+        let (memory, unplugged, _) = hotplug_shaped_memory();
+        let mib = crate::config::MIB;
+        for (what, offset) in [("data", 100u64), ("hole", 20 * mib)] {
+            let path = unique_runtime_file_path("sparse-corrupt-test", "snap").unwrap();
+            let file = open_snapshot_output(path.to_str().unwrap(), SnapshotCreateMode::CreateNew)
+                .unwrap();
+            let state = b"state";
+            write_snapshot_to_file(&file, state, &memory, false, &unplugged).unwrap();
+            let at = 32 + state.len() as u64 + offset;
+            let mut byte = [0u8];
+            file.read_exact_at(&mut byte, at).unwrap();
+            file.write_all_at(&[byte[0] ^ 0x40], at).unwrap();
+            drop(file);
+
+            let eager = load_snapshot_chain(path.to_str().unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("eager restore accepted corrupt {what}"));
+            assert!(eager.to_string().contains("memory CRC mismatch"), "{eager}");
+            match try_lazy_restore_full_snapshot(path.to_str().unwrap(), None) {
+                Err(error) => assert!(
+                    error.to_string().contains("memory CRC mismatch"),
+                    "lazy restore of corrupt {what}: {error}"
+                ),
+                Ok(_) => panic!("lazy restore accepted corrupt {what}"),
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn dense_snapshots_from_older_vmms_still_restore() {
+        let (_, _, logical) = hotplug_shaped_memory();
+        let state = b"old state";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"VMSN");
+        bytes.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(state.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(state).to_le_bytes());
+        bytes.extend_from_slice(&(logical.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&logical).to_le_bytes());
+        bytes.extend_from_slice(state);
+        bytes.extend_from_slice(&logical);
+        let path = unique_runtime_file_path("dense-compat-test", "snap").unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (restored, restored_state, _) = load_snapshot_chain(path.to_str().unwrap()).unwrap();
+        assert_eq!(restored_state, state);
+        let len = usize::try_from(restored.size_bytes).unwrap();
+        // SAFETY: `restored` owns `len` bytes for the duration of this check.
+        let image = unsafe { std::slice::from_raw_parts(restored.as_ptr(), len) };
+        assert!(image == &logical[..]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn live_publication_keeps_staged_holes_and_hashes_them_as_zeros() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        let (memory, unplugged, logical) = hotplug_shaped_memory();
+        let dir = private_runtime_dir().unwrap();
+        let nonce = format!(
+            "sparse-live-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source = OwnedScratchFile::create_new(dir.join(format!("{nonce}-memory.raw"))).unwrap();
+        let output_path = dir.join(format!("{nonce}-snapshot.snap"));
+        let output = OwnedScratchFile::create_new(&output_path).unwrap();
+        // Stage like the live bulk round, then dirty one page inside the
+        // unplugged range (a guest that plugged and wrote it mid-copy).
+        source.file().set_len(memory.len() as u64).unwrap();
+        crate::sparse_image::write_image(source.file(), 0, &memory, &unplugged).unwrap();
+        let mut expected = logical.clone();
+        let dirty_at = 40 * crate::config::MIB as usize + 8192;
+        expected[dirty_at..dirty_at + 4096].fill(0x33);
+        source
+            .file()
+            .write_all_at(&expected[dirty_at..dirty_at + 4096], dirty_at as u64)
+            .unwrap();
+        let state = b"live state";
+
+        let manifest = write_scratch_snapshot_file_from_memory_file(
+            &output,
+            state,
+            source.file(),
+            memory.len() as u64,
+            false,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&output_path).unwrap();
+        let padded_state_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mem_offset = 32 + padded_state_len;
+        assert_eq!(
+            u32::from_le_bytes(bytes[28..32].try_into().unwrap()),
+            crc32fast::hash(&expected)
+        );
+        assert!(bytes[mem_offset..] == expected[..]);
+        let ram = manifest.artifact(tarit_proto::ArtifactKind::Ram).unwrap();
+        assert_eq!(ram.len, expected.len() as u64);
+        let chunks = expected.chunks(tarit_proto::INTEGRITY_CHUNK_SIZE as usize);
+        assert_eq!(ram.chunk_hashes.len(), chunks.len());
+        for (chunk, hash) in chunks.zip(&ram.chunk_hashes) {
+            assert_eq!(*hash, <[u8; 32]>::from(Sha256::digest(chunk)));
+        }
+        if filesystem_stores_holes(&dir) {
+            let allocated = std::fs::metadata(&output_path).unwrap().blocks() * 512;
+            assert!(
+                allocated <= 4 * crate::config::MIB,
+                "live snapshot allocated {allocated} bytes for ~2 MiB of data"
+            );
+        }
+
+        remove_owned_scratch_file(&source);
+        remove_owned_scratch_file(&output);
     }
 }
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
