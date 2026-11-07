@@ -15,7 +15,7 @@ Single-host mode is selected by omitting `TARIT_DATABASE_URL`. Cluster mode is s
 
 ## Quickstart: single node
 
-Build `taritd` in this repository and the `vmm` binary from the sibling VMM repository:
+Build `taritd` and the `vmm` binary, both in this repository:
 
 ```sh
 cd /path/to/tarit/orch
