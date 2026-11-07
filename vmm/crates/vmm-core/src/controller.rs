@@ -4147,6 +4147,7 @@ fn file_data_extents(file: &std::fs::File, len: u64) -> std::io::Result<Vec<(u64
     Ok(extents)
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 /// Whether `[at, at + len)` overlaps any of the sorted `extents`.
 fn ranges_overlap(extents: &[(u64, u64)], at: u64, len: u64) -> bool {
     let end = at + len;
@@ -4156,6 +4157,7 @@ fn ranges_overlap(extents: &[(u64, u64)], at: u64, len: u64) -> bool {
         .is_some_and(|&(extent_start, _)| extent_start < end)
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn drop_file_cache(file: &std::fs::File, offset: u64, len: u64) {
     use std::os::fd::AsRawFd;
 
@@ -9728,6 +9730,7 @@ mod tests {
         let _ = std::fs::remove_file(&output_path);
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     #[test]
     fn ranges_overlap_finds_data_around_a_range() {
         let extents = [(10, 20), (40, 50)];
