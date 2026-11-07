@@ -92,6 +92,8 @@ versions may contain breaking changes.
 
 ### Changed
 
+- vCPU threads are named `vcpu N` (N = vCPU id) so host tooling can find them,
+  for example to place only vCPU threads in a cgroup v2 threaded child.
 - A restore or fork child seeds and verifies its private disk upper while
   the network is provisioned and the VMM process starts, instead of after.
 
