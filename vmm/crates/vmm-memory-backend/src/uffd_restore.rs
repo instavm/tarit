@@ -168,8 +168,10 @@ impl LazyPageDiscard {
     /// blocks (a reflink) instead of writing them. Each chunk is first
     /// checked against the integrity manifest, as [`Self::read_untouched`]
     /// checks it, so a damaged chunk is an error rather than carried into
-    /// `dest` under a new hash. When nothing was cloned the caller writes
-    /// the bytes itself.
+    /// `dest` under a new hash. A chunk the manifest records as all zeros is
+    /// not cloned at all: its bytes are never read, so they stay a hole in
+    /// `dest`, which must still be one there (a freshly sized file is). When
+    /// nothing was cloned the caller writes the bytes itself.
     pub fn clone_untouched(
         &self,
         offset: usize,
@@ -213,6 +215,9 @@ impl LazyPageDiscard {
                 return Ok(CloneOutcome::NotThisRange);
             }
         }
+        // Runs of guest offsets to clone: everything without a manifest,
+        // otherwise each run of verified chunks between all-zero ones.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         if let Some(integrity) = self.source.integrity.as_ref() {
             let chunk = integrity.chunk_size;
             if !offset.is_multiple_of(chunk)
@@ -238,28 +243,38 @@ impl LazyPageDiscard {
                         "snapshot integrity failure at chunk {chunk_index}"
                     )));
                 }
+                match runs.last_mut() {
+                    Some((_, run_end)) if *run_end == at => *run_end = at + bytes.len(),
+                    _ => runs.push((at, at + bytes.len())),
+                }
+            }
+        } else {
+            runs.push((offset, end));
+        }
+        for (run_start, run_end) in runs {
+            let length = (run_end - run_start) as u64;
+            let range = FileCloneRange {
+                src_fd: i64::from(self.source.file.as_raw_fd()),
+                src_offset: self.source.offset + run_start as u64,
+                // The last chunk of RAM may be short; the clone still covers
+                // whole blocks, as RAM ends on one.
+                src_length: length.next_multiple_of(BLOCK),
+                dest_offset: dest_offset + (run_start - offset) as u64,
+            };
+            // SAFETY: `range` is a fully initialised file_clone_range that
+            // the kernel only reads; both descriptors are open.
+            let rc = unsafe {
+                libc::ioctl(
+                    dest.as_raw_fd(),
+                    FICLONERANGE,
+                    &range as *const FileCloneRange,
+                )
+            };
+            if rc != 0 {
+                return Ok(CloneOutcome::Unsupported);
             }
         }
-        let range = FileCloneRange {
-            src_fd: i64::from(self.source.file.as_raw_fd()),
-            src_offset,
-            src_length: len as u64,
-            dest_offset,
-        };
-        // SAFETY: `range` is a fully initialised file_clone_range that the
-        // kernel only reads; both descriptors are open.
-        let rc = unsafe {
-            libc::ioctl(
-                dest.as_raw_fd(),
-                FICLONERANGE,
-                &range as *const FileCloneRange,
-            )
-        };
-        Ok(if rc == 0 {
-            CloneOutcome::Cloned
-        } else {
-            CloneOutcome::Unsupported
-        })
+        Ok(CloneOutcome::Cloned)
     }
 
     pub fn discard(&self, offset: usize, len: usize) -> Result<(), UffdRestoreError> {
@@ -1657,6 +1672,9 @@ mod tests {
             .open(&dest_path)
             .unwrap();
         dest.set_len(LEN as u64).unwrap();
+        // Damage the raw bytes of chunk 0, which the manifest records as all
+        // zeros: they must not reach the clone, which serves zeros there.
+        std::os::unix::fs::FileExt::write_all_at(&file, &[0x99; 16], 100).unwrap();
 
         match source.clone_untouched(0, 2 * CHUNK, &dest, 0).unwrap() {
             CloneOutcome::Unsupported => {
@@ -1673,7 +1691,7 @@ mod tests {
         std::os::unix::fs::FileExt::read_exact_at(&dest, &mut cloned, 0).unwrap();
         assert!(
             cloned == snapshot[..2 * CHUNK],
-            "cloned bytes are the snapshot's"
+            "verified data is cloned and a zero chunk stays zero"
         );
 
         // A discarded page keeps its range from being cloned.
