@@ -158,6 +158,14 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Deleting a VM could return 404 after it had been torn down: the periodic
+  exit reconciler drove the same terminal transition the DELETE was driving,
+  without the gate the DELETE held, and both tried to retire the VM's fork
+  snapshot. The reconciler now takes the VM's operation gate and the
+  terminal gate, in DELETE's order, and finishes only what is still pending.
+  An 8-worker snapshot/restore/fork/delete stress went from 2 failures in
+  120 iterations to none in 200.
+
 - Creates slowed down as a host's history grew: every create counted its
   tenant's active VMs by reading the whole `vms` table, deleted VMs
   included, while holding the store. The count now uses an index on

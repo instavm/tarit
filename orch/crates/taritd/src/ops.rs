@@ -1042,7 +1042,12 @@ async fn finish_failed_boot(state: &AppState, id: Uuid) -> Result<(), OrchError>
     finish_terminal_transition(state, id).await
 }
 
-async fn retry_pending_lifecycle(state: &AppState) -> Vec<String> {
+/// Drive lifecycles a failed operation left part-way. `terminal_gate_held`
+/// says the caller already holds `terminal_transition_gate` (shutdown does);
+/// otherwise each terminal transition takes the VM's operation gate and then
+/// that gate, the order DELETE takes them in, so a transition a DELETE is
+/// still driving is never run twice at once.
+async fn retry_pending_lifecycle(state: &AppState, terminal_gate_held: bool) -> Vec<String> {
     let states = match state.lifecycle.lock() {
         Ok(lifecycle) => lifecycle
             .iter()
@@ -1054,7 +1059,24 @@ async fn retry_pending_lifecycle(state: &AppState) -> Vec<String> {
     for (id, lifecycle) in states {
         let result = match lifecycle {
             LifecycleState::Publishing { .. } => finish_publication(state, id).await,
-            LifecycleState::Terminal { .. } => finish_terminal_transition(state, id).await,
+            LifecycleState::Terminal { .. } if terminal_gate_held => {
+                finish_terminal_transition(state, id).await
+            }
+            LifecycleState::Terminal { .. } => {
+                let _operation = match state.supervisor.operation_gate(id) {
+                    Ok(gate) => Some(gate.lock_owned().await),
+                    Err(_) => None,
+                };
+                let _terminal_gate = state.terminal_transition_gate.lock().await;
+                match lifecycle_state(state, id) {
+                    Ok(Some(LifecycleState::Terminal { .. })) => {
+                        finish_terminal_transition(state, id).await
+                    }
+                    // Whoever held the gates finished it.
+                    Ok(_) => continue,
+                    Err(error) => Err(error),
+                }
+            }
             LifecycleState::Reconciling { .. } => {
                 let gate = match state.supervisor.operation_gate(id) {
                     Ok(gate) => gate,
@@ -2268,7 +2290,7 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
 /// Runtime cleanup and scheduler release have already happened synchronously;
 /// this converges durable/cache/fleet state without touching the dead process.
 pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<String> {
-    let mut failures = retry_pending_lifecycle(state).await;
+    let mut failures = retry_pending_lifecycle(state, false).await;
     let supervisor = Arc::clone(&state.supervisor);
     if let Err(error) = tokio::task::spawn_blocking(move || {
         supervisor.scan_for_exited_processes();
@@ -2319,7 +2341,7 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
             Err(error) => Some(format!("cancelled lifecycle wait join: {error}")),
         };
     let _terminal_gate = state.terminal_transition_gate.lock().await;
-    let mut failures = retry_pending_lifecycle(state).await;
+    let mut failures = retry_pending_lifecycle(state, true).await;
     failures.extend(owned_task_failure);
     let sup = Arc::clone(&state.supervisor);
     let outcome = tokio::task::spawn_blocking(move || sup.stop_all())
@@ -6085,6 +6107,42 @@ mod tests {
         assert_eq!(state.scheduler.local_capacity(1, 1).sandbox_count, 0);
         drop(runtime);
         drop(state);
+    }
+
+    #[test]
+    fn the_reconciler_waits_for_a_terminal_transition_a_delete_is_driving() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let record = terminal_record(&state, id, VmStatus::Stopped).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Terminal {
+                record,
+                phase: TerminalPhase::CommitCacheOnly,
+            },
+        )
+        .unwrap();
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            // A DELETE holds the terminal gate while it drives the transition.
+            let delete = state.terminal_transition_gate.clone().lock_owned().await;
+            let reconciler = {
+                let state = state.clone();
+                tokio::spawn(async move { retry_pending_lifecycle(&state, false).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(
+                !reconciler.is_finished(),
+                "the reconciler must not drive a transition another holder is driving"
+            );
+            // The DELETE finishes it, then releases the gate.
+            finish_terminal_transition(&state, id).await.unwrap();
+            drop(delete);
+            let failures = reconciler.await.unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+        });
+        assert!(lifecycle_state(&state, id).unwrap().is_none());
     }
 
     #[test]
