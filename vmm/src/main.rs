@@ -516,6 +516,22 @@ enum Cmd {
         target: Option<u64>,
     },
 
+    /// Get or set the live virtio-mem hotplug size (via the API).
+    ///
+    /// Sizes exclude boot RAM. Without --requested-mib, prints
+    /// total/block/plugged/requested/boot sizes.
+    #[command(name = "memory-hotplug", alias = "mem-hotplug")]
+    MemoryHotplug {
+        /// Requested hotplug MiB, excluding boot RAM (0 unplugs everything).
+        /// Must be a multiple of the block size and at most the aperture.
+        #[arg(long, value_name = "MIB")]
+        requested_mib: Option<u64>,
+
+        /// Wait up to this many milliseconds for the guest to plug/unplug.
+        #[arg(long, value_name = "MS", requires = "requested_mib")]
+        wait_ms: Option<u64>,
+    },
+
     /// Update egress policy on the running VM (via the API).
     #[command(alias = "egress")]
     UpdateEgress {
@@ -699,6 +715,19 @@ fn main() -> Result<()> {
             &target.map_or(vmm_api::types::ApiRequest::Balloon, |target_mib| {
                 vmm_api::types::ApiRequest::SetBalloon { target_mib }
             }),
+        ),
+        Cmd::MemoryHotplug {
+            requested_mib,
+            wait_ms,
+        } => api_request(
+            &cli.socket,
+            &requested_mib.map_or(
+                vmm_api::types::ApiRequest::MemoryHotplugStatus,
+                |requested_size_mib| vmm_api::types::ApiRequest::SetMemoryHotplug {
+                    requested_size_mib,
+                    wait_timeout_ms: wait_ms,
+                },
+            ),
         ),
         Cmd::UpdateEgress {
             allow,
@@ -1716,6 +1745,75 @@ mod tests {
             }
             _ => panic!("expected run command"),
         }
+    }
+
+    #[test]
+    fn cli_memory_hotplug_maps_to_status_and_set_requests() {
+        let cli = Cli::try_parse_from(["vmm", "memory-hotplug"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::MemoryHotplug {
+                requested_mib: None,
+                wait_ms: None
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "vmm",
+            "memory-hotplug",
+            "--requested-mib",
+            "0",
+            "--wait-ms",
+            "5000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::MemoryHotplug {
+                requested_mib: Some(0),
+                wait_ms: Some(5000)
+            }
+        ));
+        // A wait without a new size is meaningless.
+        assert!(Cli::try_parse_from(["vmm", "memory-hotplug", "--wait-ms", "5"]).is_err());
+    }
+
+    #[test]
+    fn memory_hotplug_request_round_trips_through_the_api_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("vmm.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let body = vmm_api::rpc::read_frame(&mut stream).unwrap();
+            let request: vmm_api::types::ApiRequest = serde_json::from_slice(&body).unwrap();
+            let response = serde_json::to_vec(&vmm_api::types::ApiResponse::MemoryHotplug(
+                vmm_api::types::MemoryHotplugStatus {
+                    total_size_mib: 7168,
+                    block_size_mib: 128,
+                    plugged_size_mib: 2048,
+                    requested_size_mib: 2048,
+                    boot_memory_mib: 1024,
+                },
+            ))
+            .unwrap();
+            vmm_api::rpc::write_frame(&mut stream, &response).unwrap();
+            request
+        });
+        api_request(
+            socket.to_str().unwrap(),
+            &vmm_api::types::ApiRequest::SetMemoryHotplug {
+                requested_size_mib: 2048,
+                wait_timeout_ms: Some(30_000),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            server.join().unwrap(),
+            vmm_api::types::ApiRequest::SetMemoryHotplug {
+                requested_size_mib: 2048,
+                wait_timeout_ms: Some(30_000)
+            }
+        ));
     }
 
     #[test]
