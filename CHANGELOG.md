@@ -60,6 +60,15 @@ versions may contain breaking changes.
 
 ### Changed
 
+- virtio-blk reads go straight into guest memory with one `preadv` per
+  request (per run of sectors, under a copy-on-write overlay) instead of
+  through a freshly zeroed bounce buffer: large reads from the host page
+  cache went from about 1.3 to 2-3 GB/s on the reference host. The block
+  worker's seccomp profile allows `preadv`.
+- An authenticated lazy restore serves a memory chunk its integrity
+  manifest records as all zeros with `UFFDIO_ZEROPAGE`, without reading or
+  hashing it; untouched guest memory is most of a freshly booted snapshot.
+
 - taritd keeps a warm pool by default (eight 1 vCPU / 256 MiB clones of a
   golden snapshot); `TARIT_WARM_POOL=0` turns it off. A golden that cannot
   be built is retried with backoff (1 s doubling to a minute) instead of on

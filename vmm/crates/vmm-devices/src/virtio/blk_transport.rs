@@ -509,6 +509,46 @@ impl VirtioBlkMmio {
         cursor
     }
 
+    /// Read a request's data straight into its guest buffers (every
+    /// writable descriptor but the trailing status byte). `None` when a
+    /// buffer is not plain guest memory; the caller then reads through a
+    /// bounce buffer.
+    fn read_into_guest(
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        backend: &mut BlkBackend,
+        header: &BlkReqHeader,
+        writable: &[(u64, u32)],
+    ) -> Option<u8> {
+        use vm_memory::GuestMemoryBackend;
+
+        let data = &writable[..writable.len().saturating_sub(1)];
+        let mut guards = Vec::with_capacity(data.len());
+        let mut iov = Vec::with_capacity(data.len());
+        for &(addr, len) in data {
+            for slice in mem.get_slices(GuestAddress(addr), len as usize) {
+                let slice = slice.ok()?;
+                let guard = slice.ptr_guard_mut();
+                iov.push(libc::iovec {
+                    iov_base: guard.as_ptr().cast(),
+                    iov_len: slice.len(),
+                });
+                guards.push(guard);
+            }
+        }
+        // SAFETY: each iovec is guest RAM from `mem`, which outlives the call,
+        // guarded by `guards`; the VMM does not otherwise touch a request's
+        // buffers until it is completed.
+        let st = unsafe { backend.service_read_into(header, &iov) };
+        drop(guards);
+        if let Some(dirty) = dirty {
+            for &(addr, len) in data {
+                dirty.mark_guest_range(addr, u64::from(len));
+            }
+        }
+        Some(st)
+    }
+
     fn write_status(
         mem: &GuestMemoryMmap,
         dirty: Option<&SoftwareDirtyBitmap>,
@@ -692,6 +732,10 @@ impl VirtioBlkMmio {
                         };
                         if data_len == 0 {
                             status::IO_ERR
+                        } else if let Some(st) =
+                            Self::read_into_guest(&mem, dirty.as_ref(), backend, &header, writable)
+                        {
+                            st
                         } else {
                             let mut data = vec![0u8; data_len];
                             let st = backend.service(&header, &mut data);

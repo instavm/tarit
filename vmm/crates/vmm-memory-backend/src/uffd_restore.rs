@@ -298,6 +298,7 @@ const UFFDIO: u8 = 0xAA;
 const UFFDIO_API: u32 = iowr(UFFDIO, 0x3F, std::mem::size_of::<UffdioApi>());
 const UFFDIO_REGISTER: u32 = iowr(UFFDIO, 0x00, std::mem::size_of::<UffdioRegister>());
 const UFFDIO_COPY: u32 = iowr(UFFDIO, 0x03, std::mem::size_of::<UffdioCopy>());
+const UFFDIO_ZEROPAGE: u32 = iowr(UFFDIO, 0x04, std::mem::size_of::<UffdioZeropage>());
 // Ask the kernel to report MADV_DONTNEED/MADV_REMOVE operations. A pending
 // REMOVE event makes UFFDIO_COPY return EAGAIN, so a production handler must
 // drain these events and retry deferred faults rather than losing the fault and
@@ -316,6 +317,29 @@ struct UffdioCopy {
     len: u64,
     mode: u64,
     copy: i64,
+}
+
+#[repr(C)]
+struct UffdioZeropage {
+    range: UffdioRange,
+    mode: u64,
+    zeropage: i64,
+}
+
+/// Map zeros into `len` bytes of registered, missing guest memory at `dst`.
+/// Returns the ioctl result; on failure `errno` holds the reason.
+fn uffd_zeropage(uffd_fd: libc::c_int, dst: u64, len: usize) -> libc::c_int {
+    let zeropage = UffdioZeropage {
+        range: UffdioRange {
+            start: dst,
+            len: len as u64,
+        },
+        mode: 0,
+        zeropage: 0,
+    };
+    // SAFETY: `zeropage` is a fully initialized ABI struct the kernel reads
+    // and whose `zeropage` field it writes back; it outlives the call.
+    unsafe { libc::ioctl(uffd_fd, UFFDIO_ZEROPAGE as _, &zeropage) }
 }
 
 #[repr(C)]
@@ -774,6 +798,14 @@ fn fault_handler_loop(context: FaultHandlerContext) {
     } = context;
     let snapshot_ptr = snapshot_ptr as *const u8;
     let mut pending_faults = std::collections::VecDeque::<u64>::new();
+    // The manifest hash of an all-zero chunk. Memory the snapshotted guest
+    // never wrote is such a chunk, and it is most of a freshly booted guest.
+    let zero_chunk_hash: Option<[u8; 32]> = chunk_integrity
+        .as_ref()
+        .map(|integrity| Sha256::digest(vec![0u8; integrity.chunk_size]).into());
+    // Cleared if the kernel refuses UFFDIO_ZEROPAGE for this memory (hugetlbfs
+    // does); zero chunks are then copied like any other.
+    let mut zeropage_supported = true;
 
     loop {
         // Check shutdown flag first.
@@ -970,97 +1002,137 @@ fn fault_handler_loop(context: FaultHandlerContext) {
             }
         };
 
-        // Authenticated restores copy the complete chunk into private memory,
-        // hash those stable bytes, and only then hand that same buffer to the
-        // kernel. This closes the mmap hash/copy TOCTOU and amortizes one
-        // verification across every page prefetched by UFFDIO_COPY.
-        let mut owned_chunk = chunk_integrity.as_ref().map(|integrity| {
-            // SAFETY: the checked copy range is inside the read-only mapping.
-            let source =
-                unsafe { std::slice::from_raw_parts(snapshot_ptr.add(copy_offset), copy_len) };
-            let bytes = source.to_vec();
-            let chunk_index = copy_offset / integrity.chunk_size;
-            if !chunk_sha256_matches(&bytes, &integrity.chunk_hashes[chunk_index]) {
-                eprintln!(
-                    "SECURITY: snapshot integrity failure at chunk {chunk_index} (offset 0x{copy_offset:x}); terminating VMM"
-                );
-                log::error!(
-                    "snapshot integrity failure at chunk {chunk_index} (offset 0x{copy_offset:x})"
-                );
-                // There is no safe byte sequence with which to resolve this
-                // fault. Terminate the compromised VMM rather than hang a vCPU
-                // or let unverified state execute.
-                // SAFETY: `_exit` terminates the current VMM process without
-                // running destructors; the orchestrator reconciles the exit.
-                unsafe { libc::_exit(78) }
-            }
-            bytes
-        });
-        let first_page = copy_offset / PAGE_SIZE;
-        let page_count = copy_len / PAGE_SIZE;
-        let has_discarded_page = (first_page..first_page + page_count)
-            .any(|page| discarded.get(page).copied().unwrap_or(false));
-        if has_discarded_page {
-            let bytes = owned_chunk.get_or_insert_with(|| {
-                // SAFETY: the checked copy range is inside the read-only
-                // snapshot mapping and is copied before the mapping can drop.
-                unsafe { std::slice::from_raw_parts(snapshot_ptr.add(copy_offset), copy_len) }
-                    .to_vec()
+        // A chunk the manifest records as all zeros needs neither a read nor
+        // a hash: zeros are exactly its authenticated content, which
+        // UFFDIO_ZEROPAGE maps without copying. A discard inside it changes
+        // nothing, since a discarded page reads as zero too.
+        let zero_chunk = zeropage_supported
+            && chunk_integrity.as_ref().is_some_and(|integrity| {
+                copy_len == integrity.chunk_size
+                    && zero_chunk_hash.as_ref()
+                        == Some(&integrity.chunk_hashes[copy_offset / integrity.chunk_size])
             });
-            for relative_page in 0..page_count {
-                if discarded
-                    .get(first_page + relative_page)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    let start = relative_page * PAGE_SIZE;
-                    bytes[start..start + PAGE_SIZE].fill(0);
+        let mut rc;
+        let mut resolved_offset;
+        let mut resolved_len;
+        if zero_chunk {
+            rc = uffd_zeropage(uffd_fd, dst, copy_len);
+            resolved_offset = copy_offset;
+            resolved_len = copy_len;
+            if rc < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+                && copy_len > PAGE_SIZE
+            {
+                // As below: part of the chunk is already resident, so resolve
+                // only the faulting page.
+                rc = uffd_zeropage(uffd_fd, (guest_base + page_offset) as u64, PAGE_SIZE);
+                resolved_offset = page_offset;
+                resolved_len = PAGE_SIZE;
+            }
+            if rc < 0
+                && matches!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EINVAL | libc::ENOTTY | libc::EOPNOTSUPP)
+                )
+            {
+                log::warn!("UFFDIO_ZEROPAGE unavailable; copying zero chunks instead");
+                zeropage_supported = false;
+                pending_faults.push_back(fault_addr);
+                continue;
+            }
+        } else {
+            // Authenticated restores copy the complete chunk into private memory,
+            // hash those stable bytes, and only then hand that same buffer to the
+            // kernel. This closes the mmap hash/copy TOCTOU and amortizes one
+            // verification across every page prefetched by UFFDIO_COPY.
+            let mut owned_chunk = chunk_integrity.as_ref().map(|integrity| {
+                // SAFETY: the checked copy range is inside the read-only mapping.
+                let source =
+                    unsafe { std::slice::from_raw_parts(snapshot_ptr.add(copy_offset), copy_len) };
+                let bytes = source.to_vec();
+                let chunk_index = copy_offset / integrity.chunk_size;
+                if !chunk_sha256_matches(&bytes, &integrity.chunk_hashes[chunk_index]) {
+                    eprintln!(
+                        "SECURITY: snapshot integrity failure at chunk {chunk_index} (offset 0x{copy_offset:x}); terminating VMM"
+                    );
+                    log::error!(
+                        "snapshot integrity failure at chunk {chunk_index} (offset 0x{copy_offset:x})"
+                    );
+                    // There is no safe byte sequence with which to resolve this
+                    // fault. Terminate the compromised VMM rather than hang a vCPU
+                    // or let unverified state execute.
+                    // SAFETY: `_exit` terminates the current VMM process without
+                    // running destructors; the orchestrator reconciles the exit.
+                    unsafe { libc::_exit(78) }
+                }
+                bytes
+            });
+            let first_page = copy_offset / PAGE_SIZE;
+            let page_count = copy_len / PAGE_SIZE;
+            let has_discarded_page = (first_page..first_page + page_count)
+                .any(|page| discarded.get(page).copied().unwrap_or(false));
+            if has_discarded_page {
+                let bytes = owned_chunk.get_or_insert_with(|| {
+                    // SAFETY: the checked copy range is inside the read-only
+                    // snapshot mapping and is copied before the mapping can drop.
+                    unsafe { std::slice::from_raw_parts(snapshot_ptr.add(copy_offset), copy_len) }
+                        .to_vec()
+                });
+                for relative_page in 0..page_count {
+                    if discarded
+                        .get(first_page + relative_page)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        let start = relative_page * PAGE_SIZE;
+                        bytes[start..start + PAGE_SIZE].fill(0);
+                    }
                 }
             }
-        }
-        // SAFETY: the checked copy range is inside the read-only mapping. For
-        // authenticated restores the owned Vec remains live through ioctl.
-        let src = owned_chunk.as_ref().map_or_else(
-            || unsafe { snapshot_ptr.add(copy_offset) },
-            |bytes| bytes.as_ptr(),
-        );
+            // SAFETY: the checked copy range is inside the read-only mapping. For
+            // authenticated restores the owned Vec remains live through ioctl.
+            let src = owned_chunk.as_ref().map_or_else(
+                || unsafe { snapshot_ptr.add(copy_offset) },
+                |bytes| bytes.as_ptr(),
+            );
 
-        let copy = UffdioCopy {
-            dst,
-            src: src as u64,
-            len: copy_len as u64,
-            mode: 0,
-            copy: 0,
-        };
-
-        // SAFETY: `copy` references a page-aligned destination inside the
-        // registered guest range and a page inside the read-only snapshot mmap.
-        let mut rc = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY as _, &copy) };
-        let mut resolved_offset = copy_offset;
-        let mut resolved_len = copy_len;
-        if rc < 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
-            && copy_len > PAGE_SIZE
-        {
-            // Chunk prefetch is an optimization, not an atomic replacement of
-            // mixed-residency memory. If any page in the chunk already exists,
-            // Linux rejects the whole UFFDIO_COPY with EEXIST and leaves the
-            // actual missing page blocked. The full chunk has already been
-            // authenticated above, so safely fall back to copying only the
-            // faulting page from those same verified bytes.
-            let fallback_src = unsafe { src.add(page_offset - copy_offset) };
-            let fallback = UffdioCopy {
-                dst: (guest_base + page_offset) as u64,
-                src: fallback_src as u64,
-                len: PAGE_SIZE as u64,
+            let copy = UffdioCopy {
+                dst,
+                src: src as u64,
+                len: copy_len as u64,
                 mode: 0,
                 copy: 0,
             };
-            // SAFETY: fallback covers exactly the page containing the checked
-            // fault address, and its source is within the verified chunk.
-            rc = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY as _, &fallback) };
-            resolved_offset = page_offset;
-            resolved_len = PAGE_SIZE;
+
+            // SAFETY: `copy` references a page-aligned destination inside the
+            // registered guest range and a page inside the read-only snapshot mmap.
+            rc = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY as _, &copy) };
+            resolved_offset = copy_offset;
+            resolved_len = copy_len;
+            if rc < 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+                && copy_len > PAGE_SIZE
+            {
+                // Chunk prefetch is an optimization, not an atomic replacement of
+                // mixed-residency memory. If any page in the chunk already exists,
+                // Linux rejects the whole UFFDIO_COPY with EEXIST and leaves the
+                // actual missing page blocked. The full chunk has already been
+                // authenticated above, so safely fall back to copying only the
+                // faulting page from those same verified bytes.
+                let fallback_src = unsafe { src.add(page_offset - copy_offset) };
+                let fallback = UffdioCopy {
+                    dst: (guest_base + page_offset) as u64,
+                    src: fallback_src as u64,
+                    len: PAGE_SIZE as u64,
+                    mode: 0,
+                    copy: 0,
+                };
+                // SAFETY: fallback covers exactly the page containing the checked
+                // fault address, and its source is within the verified chunk.
+                rc = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY as _, &fallback) };
+                resolved_offset = page_offset;
+                resolved_len = PAGE_SIZE;
+            }
         }
         if rc < 0 {
             let error = std::io::Error::last_os_error();
@@ -1336,6 +1408,99 @@ mod tests {
         std::os::unix::fs::FileExt::write_all_at(&file, &[0], (CHUNK + 5) as u64).unwrap();
         assert!(source.read_untouched(CHUNK, &mut out[..CHUNK]).is_err());
         assert!(source.read_untouched(0, &mut out[..CHUNK]).is_ok());
+
+        drop(lazy);
+        // SAFETY: `guest` is still mapped.
+        assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn authenticated_zero_chunks_are_served_as_zero_pages_beside_data_chunks() {
+        const PAGE: usize = 4096;
+        const CHUNK: usize = PAGE * 4;
+        const LEN: usize = CHUNK * 3;
+        let path = std::env::temp_dir().join(format!(
+            "tarit-uffd-zero-chunks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // Chunks 0 and 2 are holes, as a sparse snapshot of untouched guest
+        // memory stores them; chunk 1 holds data.
+        file.set_len(LEN as u64).unwrap();
+        let data: Vec<u8> = (0..CHUNK).map(|i| (i / PAGE + 7) as u8).collect();
+        std::os::unix::fs::FileExt::write_all_at(&file, &data, CHUNK as u64).unwrap();
+        let mut snapshot = vec![0u8; LEN];
+        snapshot[CHUNK..2 * CHUNK].copy_from_slice(&data);
+        let hashes = snapshot
+            .chunks(CHUNK)
+            .map(|chunk| Sha256::digest(chunk).into())
+            .collect();
+        // SAFETY: one private anonymous mapping, unmapped exactly once below.
+        let guest = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest, libc::MAP_FAILED);
+        let lazy = match start_lazy_restore_with_integrity(
+            guest.cast(),
+            LEN,
+            &file,
+            0,
+            LEN as u64,
+            None,
+            Some(ChunkIntegrity {
+                chunk_size: CHUNK,
+                chunk_hashes: hashes,
+            }),
+        ) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                // SAFETY: `guest` is the live mapping created above.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                std::fs::remove_file(path).unwrap();
+                return;
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
+        let memory = guest.cast::<u8>();
+        // Fault every chunk in from its middle, then read all of guest RAM.
+        for chunk in 0..3 {
+            // SAFETY: inside the registered mapping; the handler resolves it.
+            let _ = unsafe { std::ptr::read_volatile(memory.add(chunk * CHUNK + PAGE)) };
+        }
+        // SAFETY: the whole mapping is now resident and LEN bytes long.
+        let restored = unsafe { std::slice::from_raw_parts(memory, LEN) }.to_vec();
+        assert!(
+            restored == snapshot,
+            "zero chunks read as zero, data chunk intact"
+        );
+        // A write into a zero-page chunk gets a private page of its own.
+        // SAFETY: inside the mapping, which is writable.
+        unsafe { std::ptr::write_volatile(memory.add(2 * CHUNK + 3), 0xab) };
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(memory.add(2 * CHUNK + 3)) },
+            0xab
+        );
+        assert_eq!(unsafe { std::ptr::read_volatile(memory.add(2)) }, 0);
 
         drop(lazy);
         // SAFETY: `guest` is still mapped.

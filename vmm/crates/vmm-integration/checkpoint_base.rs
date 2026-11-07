@@ -30,6 +30,16 @@ impl Drop for Files {
 
 /// Take a snapshot that also captures the disk, so it restores after the
 /// source VM is gone, and take ownership of every file it wrote.
+/// One guest at a time: the live-snapshot test reads this process's resident
+/// memory, which a guest booting in a parallel test would inflate.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn take(controller: &VmmController, base: Option<&str>, resume: bool, files: &mut Files) -> String {
     let (path, disks) = controller
         .snapshot_with_options(false, true, base, resume)
@@ -87,6 +97,7 @@ fn restore(path: &str) -> VmmController {
 #[test]
 #[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn snapshot_from_a_base_matches_a_full_snapshot_and_restores() {
+    let _serial = serial();
     let mut files = Files::default();
     let controller = VmmController::new();
     let mut config = agent_vm_config(256);
@@ -138,6 +149,7 @@ fn snapshot_from_a_base_matches_a_full_snapshot_and_restores() {
 #[test]
 #[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn first_checkpoint_after_restore_uses_the_restored_file_even_once_deleted() {
+    let _serial = serial();
     let mut files = Files::default();
     let source = VmmController::new();
     source
@@ -176,6 +188,7 @@ fn first_checkpoint_after_restore_uses_the_restored_file_even_once_deleted() {
 #[test]
 #[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn checkpoint_after_lazy_restore_matches_a_full_snapshot() {
+    let _serial = serial();
     let mut files = Files::default();
     let source = VmmController::new();
     source
@@ -240,6 +253,7 @@ fn resident_bytes() -> u64 {
 #[test]
 #[ignore = "needs Linux+KVM + VMM_TEST_KERNEL/VMM_TEST_ROOTFS"]
 fn live_snapshot_after_lazy_restore_takes_untouched_ram_from_the_snapshot() {
+    let _serial = serial();
     let mut files = Files::default();
     let source = VmmController::new();
     source

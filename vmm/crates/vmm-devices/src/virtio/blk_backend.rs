@@ -239,6 +239,36 @@ impl CowOverlay {
         Ok(())
     }
 
+    /// [`Self::read_at`] into guest buffers: one preadv per run of sectors
+    /// that come from the same file.
+    fn read_vectored_at(&self, offset: u64, iov: &[libc::iovec]) -> Result<(), BlkBackendError> {
+        let len = iov_total(iov);
+        let mut segments = BlockSegments::new(offset, len).peekable();
+        while let Some(first) = segments.next() {
+            let dirty = self.is_dirty(first.block);
+            let start = first.buffer_offset;
+            let mut end = start + first.len;
+            while let Some(next) = segments.peek() {
+                if self.is_dirty(next.block) != dirty {
+                    break;
+                }
+                end = next.buffer_offset + next.len;
+                segments.next();
+            }
+            let device_offset = offset
+                .checked_add(start as u64)
+                .ok_or_else(|| BlkBackendError::Validation("read offset overflows".into()))?;
+            let run = iov_range(iov, start, end);
+            if dirty {
+                let source = self.overlay_offset(device_offset)?;
+                preadv_exact(self.overlay.as_raw_fd(), &run, source)?;
+            } else {
+                preadv_exact(self.base.as_raw_fd(), &run, device_offset)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Copy up the base bytes of a partially written edge sector that is not
     /// in the overlay yet, then write the whole request with one pwrite and
     /// record the newly dirty sectors with one bitmap write. Data reaches the
@@ -630,6 +660,18 @@ impl BlkBackend {
     }
 
     #[cfg(feature = "test-failpoints")]
+    fn test_service_delay(&self) -> Option<DelayedServiceGuard> {
+        if self.service_delay.is_zero() {
+            return None;
+        }
+        self.delayed_services
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let guard = DelayedServiceGuard(std::sync::Arc::clone(&self.delayed_services));
+        std::thread::sleep(self.service_delay);
+        Some(guard)
+    }
+
+    #[cfg(feature = "test-failpoints")]
     pub(crate) fn test_delayed_services_counter(
         &self,
     ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
@@ -644,15 +686,7 @@ impl BlkBackend {
     /// Returns the status byte to write back to the guest's status descriptor.
     pub fn service(&mut self, header: &BlkReqHeader, data: &mut [u8]) -> u8 {
         #[cfg(feature = "test-failpoints")]
-        let _delay_guard = if self.service_delay.is_zero() {
-            None
-        } else {
-            self.delayed_services
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let guard = DelayedServiceGuard(std::sync::Arc::clone(&self.delayed_services));
-            std::thread::sleep(self.service_delay);
-            Some(guard)
-        };
+        let _delay_guard = self.test_service_delay();
 
         // Validate the request.
         let (op, offset, force_unit_access) = match self.validate_service_req(header, data.len()) {
@@ -701,6 +735,42 @@ impl BlkBackend {
                 status::UNSUPP
             }
         }
+    }
+
+    /// Service a read (`IN`) request straight into guest memory, with the
+    /// validation and status of [`Self::service`]. `iov` lists the request's
+    /// data buffers in order; it saves the bounce buffer and its copy, and
+    /// reads a request in one syscall however the guest scattered it.
+    ///
+    /// # Safety
+    ///
+    /// Every iovec must describe writable memory that stays mapped, and that
+    /// nothing in this process reads or writes, for the duration of the call.
+    pub unsafe fn service_read_into(&mut self, header: &BlkReqHeader, iov: &[libc::iovec]) -> u8 {
+        #[cfg(feature = "test-failpoints")]
+        let _delay_guard = self.test_service_delay();
+        if header.req_type & !VIRTIO_BLK_T_BARRIER != req_type::IN {
+            log::warn!("blk: vectored service of a non-read request");
+            return status::IO_ERR;
+        }
+        let offset = match self.validate_service_req(header, iov_total(iov)) {
+            Ok((_, offset, _)) => offset,
+            Err(e) => {
+                log::warn!("blk: validation failed: {e}");
+                return status::IO_ERR;
+            }
+        };
+        let result = match &self.storage {
+            BackendStorage::Raw(file) => {
+                preadv_exact(file.as_raw_fd(), iov, offset).map_err(BlkBackendError::from)
+            }
+            BackendStorage::Cow(cow) => cow.read_vectored_at(offset, iov),
+        };
+        if let Err(e) = result {
+            log::warn!("blk: read failed: {e}");
+            return status::IO_ERR;
+        }
+        status::OK
     }
 
     /// Get the raw fd (for epoll-based I/O).
@@ -870,6 +940,75 @@ fn validate_unused_bitmap_bits(bitmap: &[u8], blocks: u64) -> Result<(), BlkBack
         return Err(BlkBackendError::Validation(
             "overlay bitmap has bits beyond base length".into(),
         ));
+    }
+    Ok(())
+}
+
+fn iov_total(iov: &[libc::iovec]) -> usize {
+    iov.iter().map(|v| v.iov_len).sum()
+}
+
+/// The part of `iov` covering bytes `start..end` of the whole list.
+fn iov_range(iov: &[libc::iovec], start: usize, end: usize) -> Vec<libc::iovec> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for v in iov {
+        let (lo, hi) = (at, at + v.iov_len);
+        at = hi;
+        if hi <= start || lo >= end {
+            continue;
+        }
+        let from = start.max(lo) - lo;
+        let to = end.min(hi) - lo;
+        out.push(libc::iovec {
+            // SAFETY: `from` is within this iovec, so the pointer stays in it.
+            iov_base: unsafe { v.iov_base.cast::<u8>().add(from) }.cast(),
+            iov_len: to - from,
+        });
+    }
+    out
+}
+
+/// Fill every byte of `iov` from `fd` at `offset`, retrying short reads; a
+/// read past the end of the file is an error, as for `read_exact`.
+fn preadv_exact(fd: std::os::fd::RawFd, iov: &[libc::iovec], offset: u64) -> std::io::Result<()> {
+    let mut iov = iov.to_vec();
+    iov.retain(|v| v.iov_len > 0);
+    let mut first = 0usize;
+    let mut offset = offset;
+    while first < iov.len() {
+        let count = (iov.len() - first).min(libc::UIO_MAXIOV as usize);
+        let file_offset = libc::off_t::try_from(offset).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflows")
+        })?;
+        // SAFETY: the iovecs describe caller-owned writable memory (see
+        // `service_read_into`) and `count` stays within the list.
+        let n =
+            unsafe { libc::preadv(fd, iov[first..].as_ptr(), count as libc::c_int, file_offset) };
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        let mut done = n as usize;
+        offset += done as u64;
+        while done > 0 {
+            let v = &mut iov[first];
+            if done >= v.iov_len {
+                done -= v.iov_len;
+                first += 1;
+            } else {
+                // SAFETY: `done` is within this iovec.
+                v.iov_base = unsafe { v.iov_base.cast::<u8>().add(done) }.cast();
+                v.iov_len -= done;
+                done = 0;
+            }
+        }
     }
     Ok(())
 }
@@ -1116,6 +1255,74 @@ mod tests {
             service_read(&mut backend, 2, SECTOR_SIZE_USIZE),
             [0x30; 512]
         );
+    }
+
+    #[test]
+    fn reads_into_scattered_buffers_match_the_bounce_path() {
+        let dir = private_tempdir();
+        let base = dir.path().join("base.img");
+        let overlay = dir.path().join("vm.overlay");
+        let pattern: Vec<u8> = (0..16u8).map(|i| 0x10 + i).collect();
+        write_block_pattern(&base, &pattern);
+        let mut backend = BlkBackend::open_cow(&base, &overlay).unwrap();
+        // Overlay runs inside the range, so the read alternates files.
+        service_write(&mut backend, 3, &[0xA1; 2 * SECTOR_SIZE_USIZE]);
+        service_write(&mut backend, 9, &[0xB2; SECTOR_SIZE_USIZE]);
+
+        let expected = service_read(&mut backend, 1, 12 * SECTOR_SIZE_USIZE);
+        // Buffers of uneven sizes that cut across sector boundaries.
+        let sizes = [700usize, 1, 2047, 512, 1500, 1384];
+        assert_eq!(sizes.iter().sum::<usize>(), 12 * SECTOR_SIZE_USIZE);
+        let mut buffers: Vec<Vec<u8>> = sizes.iter().map(|&n| vec![0xEE; n]).collect();
+        let iov: Vec<libc::iovec> = buffers
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr().cast(),
+                iov_len: b.len(),
+            })
+            .collect();
+        // SAFETY: the iovecs cover `buffers`, untouched until the call returns.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::IN, 1), &iov) };
+        assert_eq!(status, status::OK);
+        assert_eq!(buffers.concat(), expected);
+
+        // Past the end of the device is refused like the bounce path.
+        let mut tail = vec![0u8; 2 * SECTOR_SIZE_USIZE];
+        let iov = [libc::iovec {
+            iov_base: tail.as_mut_ptr().cast(),
+            iov_len: tail.len(),
+        }];
+        // SAFETY: as above.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::IN, 15), &iov) };
+        assert_eq!(status, status::IO_ERR);
+        // And a write is never serviced through the read path.
+        // SAFETY: as above.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::OUT, 0), &iov) };
+        assert_eq!(status, status::IO_ERR);
+    }
+
+    #[test]
+    fn raw_reads_into_buffers_cover_many_iovecs() {
+        let dir = private_tempdir();
+        let path = dir.path().join("raw.img");
+        let pattern: Vec<u8> = (0..64u8).collect();
+        write_block_pattern(&path, &pattern);
+        let mut backend = BlkBackend::open(&path, true).unwrap();
+        let expected = service_read(&mut backend, 0, 64 * SECTOR_SIZE_USIZE);
+        // More iovecs than one preadv takes at a time.
+        let mut buffers = vec![[0u8; 8]; 64 * SECTOR_SIZE_USIZE / 8];
+        let iov: Vec<libc::iovec> = buffers
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr().cast(),
+                iov_len: b.len(),
+            })
+            .collect();
+        assert!(iov.len() > libc::UIO_MAXIOV as usize);
+        // SAFETY: the iovecs cover `buffers`, untouched until the call returns.
+        let status = unsafe { backend.service_read_into(&hdr(req_type::IN, 0), &iov) };
+        assert_eq!(status, status::OK);
+        assert_eq!(buffers.concat(), expected);
     }
 
     #[test]
