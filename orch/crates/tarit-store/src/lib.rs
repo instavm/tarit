@@ -486,6 +486,15 @@ impl Store {
             "target_boot_session_id",
             "TEXT",
         )?;
+        // Retention pruning walks deleted VMs oldest first and checks that no
+        // lease still points at each one.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS vms_status_updated ON vms(status, updated_at);
+             CREATE INDEX IF NOT EXISTS snapshots_ephemeral_owner
+               ON snapshots(ephemeral_owner_vm_id) WHERE ephemeral_owner_vm_id IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS vm_fork_operations_updated
+               ON vm_fork_operations(status, updated_at);",
+        )?;
         ensure_column(&conn, "images", "source_digest", "TEXT")?;
         ensure_column(&conn, "images", "rootfs_digest", "TEXT")?;
         ensure_column(&conn, "images", "agent_digest", "TEXT")?;
@@ -2932,6 +2941,61 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Delete up to `limit` rows of deleted (`stopped`) VMs last updated
+    /// before `older_than`, oldest first, skipping any that a hibernation,
+    /// volume attachment, private snapshot lease or unfinished fork still
+    /// names. Until its row is gone a VM's id cannot be used again, so the
+    /// cutoff is also how long a client-chosen id stays reserved. Returns how
+    /// many rows were deleted.
+    pub fn prune_stopped_vms(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<usize, StoreError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM vms WHERE rowid IN (
+               SELECT v.rowid FROM vms v
+                WHERE v.status = 'stopped' AND v.updated_at < ?1
+                  AND NOT EXISTS (SELECT 1 FROM hibernations h WHERE h.vm_id = v.id)
+                  AND NOT EXISTS (SELECT 1 FROM vm_volume_attachments a WHERE a.vm_id = v.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM snapshots s WHERE s.ephemeral_owner_vm_id = v.id)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM vm_fork_operations f
+                     WHERE f.child_vm_id = v.id AND f.status <> 'committed')
+                ORDER BY v.updated_at LIMIT ?2
+             )",
+            params![
+                older_than.to_rfc3339(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Delete up to `limit` committed fork records last updated before
+    /// `older_than` whose child VM row is already gone. A replayed fork of
+    /// that child id is then treated as a new fork.
+    pub fn prune_committed_fork_operations(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<usize, StoreError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM vm_fork_operations WHERE rowid IN (
+               SELECT f.rowid FROM vm_fork_operations f
+                WHERE f.status = 'committed' AND f.updated_at < ?1
+                  AND NOT EXISTS (SELECT 1 FROM vms v WHERE v.id = f.child_vm_id)
+                ORDER BY f.updated_at LIMIT ?2
+             )",
+            params![
+                older_than.to_rfc3339(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn prune_sent_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
         let older_than = older_than.to_rfc3339();
         self.conn.execute(
@@ -4136,6 +4200,117 @@ mod tests {
     }
 
     #[test]
+    fn stopped_vms_past_retention_are_pruned_unless_still_referenced() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(2);
+        let insert = |id: Uuid, status: VmStatus, updated_at: DateTime<Utc>| {
+            let vm = VmRecord {
+                status,
+                updated_at,
+                created_at: updated_at,
+                ..test_vm(id, "tenant-a")
+            };
+            store.insert_vm(&vm).unwrap();
+            vm.id
+        };
+        let expired = insert(Uuid::new_v4(), VmStatus::Stopped, old);
+        let recent = insert(
+            Uuid::new_v4(),
+            VmStatus::Stopped,
+            now - chrono::Duration::hours(1),
+        );
+        let running = insert(Uuid::new_v4(), VmStatus::Running, old);
+        // A fork that never committed still names its child.
+        let forking = Uuid::new_v4();
+        let operation = ForkOperationRecord {
+            child_vm_id: forking,
+            source_vm_id: running,
+            owner_key: "tenant-a".into(),
+            source_host_id: "host-a".into(),
+            target_host_id: "host-a".into(),
+            target_boot_session_id: None,
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: old,
+            updated_at: old,
+        };
+        let expiry = now + chrono::Duration::minutes(1);
+        store
+            .claim_fork_operation(&operation, usize::MAX, expiry)
+            .unwrap();
+        store.release_vm_quota("tenant-a", forking).unwrap();
+        insert(forking, VmStatus::Stopped, old);
+
+        let cutoff = now - chrono::Duration::days(1);
+        assert_eq!(store.prune_stopped_vms(cutoff, 10).unwrap(), 1);
+        assert!(matches!(store.get_vm(expired), Err(StoreError::NotFound)));
+        for kept in [recent, running, forking] {
+            store.get_vm(kept).unwrap();
+        }
+        assert_eq!(store.prune_stopped_vms(cutoff, 10).unwrap(), 0);
+        // Once the record is gone its id is free again.
+        assert_eq!(
+            store
+                .reserve_vm_quota("tenant-a", expired, usize::MAX, expiry)
+                .unwrap(),
+            VmQuotaReservationOutcome::Reserved
+        );
+    }
+
+    #[test]
+    fn committed_fork_records_are_pruned_only_after_their_child() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(2);
+        let child = VmRecord {
+            status: VmStatus::Stopped,
+            created_at: old,
+            updated_at: old,
+            ..test_vm(Uuid::new_v4(), "tenant-a")
+        };
+        let operation = ForkOperationRecord {
+            child_vm_id: child.id,
+            source_vm_id: Uuid::new_v4(),
+            owner_key: "tenant-a".into(),
+            source_host_id: "host-a".into(),
+            target_host_id: "host-a".into(),
+            target_boot_session_id: None,
+            status: ForkOperationStatus::Preparing,
+            child_created_at: None,
+            created_at: old,
+            updated_at: old,
+        };
+        let expiry = now + chrono::Duration::minutes(1);
+        store
+            .claim_fork_operation(&operation, usize::MAX, expiry)
+            .unwrap();
+        store
+            .commit_fork_operation(
+                child.id,
+                operation.source_vm_id,
+                "tenant-a",
+                child.created_at,
+                old,
+            )
+            .unwrap();
+        store.release_vm_quota("tenant-a", child.id).unwrap();
+        store.insert_vm(&child).unwrap();
+
+        let cutoff = now - chrono::Duration::days(1);
+        assert_eq!(
+            store.prune_committed_fork_operations(cutoff, 10).unwrap(),
+            0
+        );
+        assert_eq!(store.prune_stopped_vms(cutoff, 10).unwrap(), 1);
+        assert_eq!(
+            store.prune_committed_fork_operations(cutoff, 10).unwrap(),
+            1
+        );
+        assert!(store.get_fork_operation(child.id).unwrap().is_none());
+    }
+
+    #[test]
     fn fork_operation_is_source_bound_recoverable_and_incarnation_fenced() {
         let store = Store::open(":memory:").unwrap();
         let now = Utc::now();
@@ -4245,7 +4420,7 @@ mod tests {
                 )
                 .unwrap(),
             VmQuotaReservationOutcome::IdConflict,
-            "a committed fork id must never be recycled into another VM incarnation"
+            "a committed fork id must not be recycled while its record is kept"
         );
     }
 

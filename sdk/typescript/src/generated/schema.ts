@@ -906,7 +906,10 @@ export interface components {
         };
         /** @description All fields optional; defaults come from node configuration. Persistent block attachments are explicit, ordered after the root disk, exact-host constrained for local_block, and remain external across snapshot/hibernate operations. */
         CreateVmRequest: {
-            /** Format: uuid */
+            /**
+             * Format: uuid
+             * @description Optional VM id; generated when omitted. A create with the id of an existing VM is refused with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
+             */
             id?: string;
             /** @default 256 */
             memory_mib: number;
@@ -998,21 +1001,21 @@ export interface components {
             snapshot_id: string;
             /**
              * Format: uuid
-             * @description Optional id for the restored VM; generated when omitted.
+             * @description Optional id for the restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
              */
             id?: string;
         };
         RestoreBranchRequest: {
             /**
              * Format: uuid
-             * @description Optional id for the isolated restored VM; generated when omitted.
+             * @description Optional id for the isolated restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
              */
             id?: string;
         };
         ForkVmRequest: {
             /**
              * Format: uuid
-             * @description Optional child VM id; generated when omitted.
+             * @description Optional child VM id; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
              */
             id?: string;
         };

@@ -22,7 +22,8 @@ class CreateVmRequest:
     the root disk, exact-host constrained for local_block, and remain external across snapshot/hibernate operations.
 
         Attributes:
-            id (UUID | Unset):
+            id (UUID | Unset): Optional VM id; generated when omitted. A create with the id of an existing VM is refused
+                with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
             memory_mib (int | Unset):  Default: 256.
             vcpus (int | Unset):  Default: 1.
             kernel_path (str | Unset):

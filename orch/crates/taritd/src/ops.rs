@@ -6363,6 +6363,38 @@ mod tests {
         )
     }
 
+    #[test]
+    fn deleted_vms_leave_the_cache_after_the_grace_unless_still_in_a_lifecycle() {
+        let (state, _) = test_state_with_durable_writer();
+        let running = insert_running_vm(&state);
+        let old = Utc::now() - chrono::Duration::minutes(10);
+        let stop = |id: Uuid, updated_at: chrono::DateTime<Utc>| {
+            let mut cache = state.vm_cache.write().unwrap();
+            let vm = cache.get_mut(&id).unwrap();
+            vm.status = VmStatus::Stopped;
+            vm.updated_at = updated_at;
+        };
+        let expired = insert_running_vm(&state);
+        stop(expired, old);
+        let recent = insert_running_vm(&state);
+        stop(recent, Utc::now());
+        let terminating = insert_running_vm(&state);
+        stop(terminating, old);
+        let record = vm_get(&state, terminating).unwrap();
+        state
+            .lifecycle
+            .lock()
+            .unwrap()
+            .insert(terminating, LifecycleState::Running { record });
+
+        let grace = std::time::Duration::from_secs(300);
+        assert_eq!(crate::usage::evict_stopped_vms_from_cache(&state, grace), 1);
+        assert!(vm_get(&state, expired).is_err());
+        for kept in [running, recent, terminating] {
+            vm_get(&state, kept).unwrap();
+        }
+    }
+
     fn insert_running_vm(state: &AppState) -> Uuid {
         let id = Uuid::new_v4();
         let now = Utc::now();

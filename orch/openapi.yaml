@@ -134,6 +134,7 @@ components:
         id:
           type: string
           format: uuid
+          description: Optional VM id; generated when omitted. A create with the id of an existing VM is refused with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
         memory_mib:
           type: integer
           default: 256
@@ -296,7 +297,7 @@ components:
         id:
           type: string
           format: uuid
-          description: Optional id for the restored VM; generated when omitted.
+          description: Optional id for the restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     RestoreBranchRequest:
       type: object
       additionalProperties: false
@@ -304,7 +305,7 @@ components:
         id:
           type: string
           format: uuid
-          description: Optional id for the isolated restored VM; generated when omitted.
+          description: Optional id for the isolated restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     ForkVmRequest:
       type: object
       additionalProperties: false
@@ -312,7 +313,7 @@ components:
         id:
           type: string
           format: uuid
-          description: Optional child VM id; generated when omitted.
+          description: Optional child VM id; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     ForkExecutionPath:
       type: string
       enum: [local, cross_node]

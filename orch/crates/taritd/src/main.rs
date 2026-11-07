@@ -487,7 +487,13 @@ async fn run_server(
         Arc::new(RwLock::new(HashMap::new()));
     {
         let mut c = vm_cache.write().unwrap();
-        for vm in &persisted_vms {
+        let now = chrono::Utc::now();
+        // Deleted VMs past the cache grace are only kept on disk (see
+        // usage::evict_stopped_vms_from_cache).
+        for vm in persisted_vms
+            .iter()
+            .filter(|vm| !usage::stopped_vm_is_evictable(vm, now, usage::STOPPED_VM_CACHE_GRACE))
+        {
             c.insert(vm.id, vm.clone());
         }
     }
@@ -700,11 +706,16 @@ async fn run_server(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
+    let stopped_vm_retention_hours = std::env::var("TARIT_STOPPED_VM_RETENTION_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
     let outbox_flusher = usage::spawn_outbox_flusher(
         state.clone(),
         flush_secs,
         local_retention_days,
         execution_retention_hours,
+        stopped_vm_retention_hours,
         shutdown_rx.clone(),
     );
     let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());

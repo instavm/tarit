@@ -78,6 +78,14 @@ versions may contain breaking changes.
 - A restore or fork child seeds and verifies its private disk upper while
   the network is provisioned and the VMM process starts, instead of after.
 
+- Records of deleted VMs are deleted after
+  `TARIT_STOPPED_VM_RETENTION_HOURS` (default 24; 0 keeps them), together
+  with the fork records of children that are gone. Every deleted VM used to
+  stay in SQLite and in taritd's in-memory cache forever, and every scan of
+  that cache (metering, artifact GC) grew with it; deleted VMs now leave the
+  cache five minutes after deletion. A client-chosen VM or fork id is
+  reserved for as long as the record is kept, instead of forever.
+
 - Finished command records, with their captured output, are deleted after
   `TARIT_EXECUTION_RETENTION_HOURS` (default 24; 0 keeps them). Every
   `/v1/execute` stored one, so a busy host's database grew without bound.
