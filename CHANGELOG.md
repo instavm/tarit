@@ -12,6 +12,11 @@ versions may contain breaking changes.
 
 ### Added
 
+- Experimental: the VMM API can resize a running virtio-mem VM.
+  `memory_hotplug_status` reports aperture, block, plugged and requested sizes;
+  `set_memory_hotplug` grows or shrinks the requested hotplug size (0 unplugs
+  all) with an optional bounded wait. Unplugged blocks are discarded so host
+  RSS drops. See `docs/memory-growth.md`.
 - Generated Python and TypeScript clients now cover the public OpenAPI contract.
   Their handwritten layers provide API-key setup, typed failures,
   deadline-bounded execution polling, stable-child-id live-fork retries, and

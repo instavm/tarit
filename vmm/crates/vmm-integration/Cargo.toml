@@ -42,6 +42,11 @@ name = "egress_denial"
 path = "egress_denial.rs"
 
 [[test]]
+name = "memory_hotplug_live"
+path = "memory_hotplug_live.rs"
+required-features = ["kvm"]
+
+[[test]]
 name = "lifecycle_e2e"
 path = "lifecycle_e2e.rs"
 required-features = ["kvm"]

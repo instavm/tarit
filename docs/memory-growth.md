@@ -2,7 +2,9 @@
 
 Experimental; requires Linux x86-64/KVM and a new guest kernel/agent/template.
 The hardware acceptance gate below must pass before deployment. This feature
-is opt-in and does not convert old snapshots or add live shrinking.
+is opt-in and does not convert old snapshots. Restore-time growth is
+grow-only; a running VM can additionally be grown and shrunk through the VMM
+API (see "Live resize of a running VM").
 
 Create a VM with **2 GiB boot RAM and a 4 GiB maximum reservation**:
 
@@ -51,13 +53,79 @@ network/overlay restrictions still apply). Python `CreateVmRequest` /
   and DMA dirty tracking account for this split, including lazy restore and
   suspend/re-arm. Authenticated lazy restore still verifies chunk hashes.
 - A hotplug template cannot claim an ordinary warm-pool VM. Configurable warm
-  classes and live resize endpoints are outside this first version.
+  classes and taritd/orchestrator live-resize endpoints are outside this
+  version; the VMM socket API below is the only live-resize surface.
 - The VMM maps the entire private reserved aperture, including unplugged blocks;
   it does not advertise `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`. The reservation and
   existing process cgroup remain the isolation limit for a hostile guest.
 - Custom guests must include virtio-mem and the updated Tarit agent. Memory-only
   fast-boot snapshots do not support expansion. Rebuild templates; no manual
   `/sys/.../probe` or legacy snapshot conversion is attempted.
+
+## Live resize of a running VM
+
+The VMM API (`vmm serve` socket) exposes two ops for a VM created with
+`memory.boot_size_mib`. All sizes are MiB and **exclude boot RAM**, the same
+convention as Firecracker's `requested_size_mib`:
+
+```json
+{"op":"memory_hotplug_status"}
+{"op":"set_memory_hotplug","requested_size_mib":2048}
+{"op":"set_memory_hotplug","requested_size_mib":0,"wait_timeout_ms":30000}
+```
+
+Both answer:
+
+```json
+{"status":"memory_hotplug","total_size_mib":7168,"block_size_mib":128,
+ "plugged_size_mib":2048,"requested_size_mib":2048,"boot_memory_mib":1024}
+```
+
+- `total_size_mib` is the hotplug aperture (`memory.size_mib - boot_size_mib`).
+  Guest-visible RAM is `boot_memory_mib + plugged_size_mib`; the reservation
+  is `boot_memory_mib + total_size_mib`. Admission that wants to count what
+  the guest may hold should use `boot + max(plugged, requested)`.
+- `requested_size_mib` may grow or shrink at any time and `0` asks the guest
+  to unplug everything. It must be a multiple of `block_size_mib` (128) and at
+  most `total_size_mib`; anything else fails without changing state. Setting
+  it raises the device's config-change interrupt; re-sending the current
+  value re-kicks a driver that is backing off after a failed unplug.
+- Without `wait_timeout_ms` the call returns as soon as the guest has been
+  notified. With it, the call returns once the device's plugged size equals
+  the request, or fails after the deadline (at most 60000 ms) with the
+  current plugged/requested sizes in the message. A timed-out request stays
+  applied; poll `memory_hotplug_status`. Waiting requires the VM to be
+  running. The VMM serves one control request at a time, so a wait holds the
+  socket for its duration.
+- "Plugged" is the device's view: Linux plugs a block, then adds and (with
+  `memhp_default_state=online*`) onlines it, so the last block can appear in
+  `/proc/meminfo` a moment after the call returns. On shrink Linux offlines
+  and removes memory first and only then unplugs it, so a smaller plugged
+  size means the guest has already given that memory up.
+- The VMM appends `memhp_default_state=online` unless the kernel cmdline
+  already sets `memhp_default_state`. Plain `online` places hotplugged memory
+  in ZONE_NORMAL, where unmovable kernel allocations can block unplug (plugged
+  then stays above requested and Linux retries with backoff). Use
+  `memhp_default_state=online_movable` when reliable shrink matters more than
+  letting the kernel allocate from hotplugged memory. Shrinking also needs
+  room in the remaining RAM for the data that must be migrated.
+- Every unplugged block (UNPLUG, or UNPLUG_ALL from a re-probing driver after
+  a guest reboot/kexec) is discarded with `MADV_DONTNEED`, so the VMM's RSS
+  drops. Under lazy (UFFD) restore the discard goes through the same
+  coordinated path as the balloon: discarded pages fault back as zeroes,
+  never snapshot bytes, and the discard is excluded from snapshot readers by
+  the snapshot fence. Discards mark pages host-dirty, so the next diff
+  snapshot records them as zeroed.
+- KVM memslots for the whole aperture stay registered; an unplugged block
+  costs no host RAM, only address space. The guest is not prevented from
+  touching unplugged blocks (no `VIRTIO_MEM_F_UNPLUGGED_INACCESSIBLE`); a
+  guest that does so only re-consumes RAM inside its own reservation.
+- Snapshots taken mid-resize keep the exact bitmap and request. Restoring one
+  taken mid-shrink (plugged above requested) is accepted, and restore
+  readiness now requires plugged >= requested rather than equality.
+
+CLI equivalents: `vmm --socket S memory-hotplug` (status) and
+`vmm --socket S memory-hotplug --requested-mib 2048 [--wait-ms 30000]`.
 
 ## Build and rollout
 
