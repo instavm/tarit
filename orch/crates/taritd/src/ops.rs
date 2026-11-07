@@ -267,9 +267,11 @@ fn commit_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError>
     Ok(())
 }
 
-/// The writer stops at the shutdown signal, but terminal transitions in the
-/// drain/sweep window must still land durably.
-async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
+/// Commit a VM record through the store writer. The writer stops at the
+/// shutdown signal, but publications and terminal transitions in the
+/// drain/sweep window must still land durably, so a record the writer can no
+/// longer take is written directly.
+async fn persist_vm_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
     #[cfg(test)]
     if take_lifecycle_fault(state, LifecycleFault::SQLite) {
         return Err(OrchError::Internal("injected SQLite failure".into()));
@@ -304,24 +306,6 @@ async fn persist_stopped_record(state: &AppState, record: VmRecord) -> Result<()
             direct_insert(&record)
         }
     }
-}
-
-async fn persist_running_record(state: &AppState, record: VmRecord) -> Result<(), OrchError> {
-    #[cfg(test)]
-    if take_lifecycle_fault(state, LifecycleFault::SQLite) {
-        return Err(OrchError::Internal("injected SQLite failure".into()));
-    }
-    let (completion, persisted) = tokio::sync::oneshot::channel();
-    state
-        .store_tx
-        .send(StoreWrite::VmDurable(record, completion))
-        .await
-        .map_err(|_| {
-            OrchError::Internal("store writer unavailable during boot publication".into())
-        })?;
-    persisted.await.map_err(|_| {
-        OrchError::Internal("store writer dropped boot publication confirmation".into())
-    })?
 }
 
 async fn claim_lifecycle_ownership(state: &AppState, record: &VmRecord) -> Result<(), OrchError> {
@@ -453,7 +437,7 @@ async fn register_creating_record(state: &AppState, record: VmRecord) -> Result<
         },
     )?;
     commit_vm_record(state, record.clone())?;
-    persist_running_record(state, record.clone()).await?;
+    persist_vm_record(state, record.clone()).await?;
     set_lifecycle_state(
         state,
         id,
@@ -543,7 +527,7 @@ async fn update_creating_record(state: &AppState, mut record: VmRecord) -> Resul
             .ok_or_else(|| OrchError::Internal(format!("VM {id} revision exhausted")))?;
     }
     commit_vm_record(state, record.clone())?;
-    persist_running_record(state, record.clone()).await?;
+    persist_vm_record(state, record.clone()).await?;
     claim_lifecycle_ownership(state, &record).await?;
     set_lifecycle_state(
         state,
@@ -595,7 +579,7 @@ async fn publish_running_record(
     .map_err(PublicationFailure)?;
     #[cfg(test)]
     wait_lifecycle_pause(state, LifecyclePause::SQLite).await;
-    persist_running_record(state, record.clone())
+    persist_vm_record(state, record.clone())
         .await
         .map_err(PublicationFailure)?;
     set_lifecycle_state(
@@ -641,7 +625,7 @@ async fn finish_publication(state: &AppState, id: Uuid) -> Result<(), OrchError>
                 )?;
             }
             PublicationPhase::FleetUpdated => {
-                persist_running_record(state, record.clone()).await?;
+                persist_vm_record(state, record.clone()).await?;
                 set_lifecycle_state(
                     state,
                     id,
@@ -703,7 +687,7 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
         };
         match phase {
             TerminalPhase::PersistRecordAndRelease | TerminalPhase::PersistRecordOnly => {
-                persist_stopped_record(state, record.clone()).await?;
+                persist_vm_record(state, record.clone()).await?;
                 set_lifecycle_state(
                     state,
                     id,
@@ -5409,7 +5393,7 @@ mod tests {
         record.status = VmStatus::Stopped;
 
         test_runtime()
-            .block_on(persist_stopped_record(&state, record))
+            .block_on(persist_vm_record(&state, record))
             .expect("a stopped record must persist after the store writer stops");
 
         let persisted = state.store.lock().unwrap().get_vm(id).unwrap();
@@ -5711,6 +5695,88 @@ mod tests {
         });
         drop(runtime);
         drop(state);
+    }
+
+    #[test]
+    fn a_publication_after_the_store_writer_stopped_still_commits() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        let mut record = vm_get(&state, id).unwrap();
+        record.revision += 1;
+        record.status = VmStatus::Running;
+
+        test_runtime()
+            .block_on(persist_vm_record(&state, record.clone()))
+            .expect("a shutdown-window publication lands directly");
+
+        let stored = state.store.lock().unwrap().get_vm(id).unwrap();
+        assert_eq!(stored.revision, record.revision);
+    }
+
+    #[test]
+    fn concurrent_warm_claims_publish_together_and_take_different_vms() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let warm_cfg = VmSpawnConfig {
+            memory_mib: 256,
+            vcpus: 1,
+            kernel_path: PathBuf::from("kernel"),
+            rootfs_path: Some(PathBuf::from("rootfs")),
+            cmdline: "console=ttyS0".into(),
+            read_only: false,
+            egress_allowlist: Vec::new(),
+            egress_allow_existing: false,
+            data_volumes: Vec::new(),
+        };
+        const CLAIMS: usize = 4;
+        for _ in 0..CLAIMS {
+            state
+                .supervisor
+                .seed_warm_for_test(Uuid::new_v4(), warm_cfg.clone())
+                .unwrap();
+        }
+        // Every publication waits until all of them are in flight, so the
+        // claims finish only if none waits for another's durable publication.
+        let all_publishing = Arc::new(tokio::sync::Barrier::new(CLAIMS));
+
+        let claimed = test_runtime().block_on(async {
+            let claims = (0..CLAIMS).map(|_| {
+                let state = state.clone();
+                let warm_cfg = warm_cfg.clone();
+                let all_publishing = Arc::clone(&all_publishing);
+                async move {
+                    let task = Arc::new(OwnedTaskControl::new());
+                    state
+                        .supervisor
+                        .take_warm_with_publication(
+                            &warm_cfg,
+                            &task,
+                            |_| async { Ok(()) },
+                            move |id, _, _| async move {
+                                all_publishing.wait().await;
+                                Ok(id)
+                            },
+                        )
+                        .await
+                }
+            });
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                futures_util::future::join_all(claims),
+            )
+            .await
+            .expect("claims serialized behind one another")
+        });
+
+        let ids: std::collections::HashSet<Uuid> = claimed
+            .into_iter()
+            .map(|outcome| match outcome.unwrap() {
+                WarmClaimOutcome::Published(id) => id,
+                _ => panic!("every claim takes a warm VM"),
+            })
+            .collect();
+        assert_eq!(ids.len(), CLAIMS, "no VM claimed twice");
+        assert_eq!(state.supervisor.warm_count(&warm_cfg), 0);
     }
 
     #[test]

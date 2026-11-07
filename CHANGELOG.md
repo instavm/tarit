@@ -54,6 +54,10 @@ versions may contain breaking changes.
 
 ### Changed
 
+- VM boots, publications and warm-pool claims on a host no longer run one at
+  a time: they hold the supervisor's lifecycle gate shared, and only
+  shutdown, stops, exit reconciliation and re-adoption hold it exclusively.
+  Concurrent claims each take a different warm VM.
 - virtio-net offers checksum and segmentation offloads, mergeable receive
   buffers, EVENT_IDX, and 1024-entry queues, receives straight into guest
   buffers, and waits for receive buffers instead of dropping frames. Both
@@ -105,6 +109,14 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- taritd shuts down cleanly in about 2 s during a burst of creates; it took
+  the 30 s HTTP drain timeout and sometimes exited with an error. Creates
+  waiting for capacity kept waiting out their admission deadline after
+  shutdown began, and a VM published while shutting down failed because the
+  store writer had stopped, leaving a lifecycle the shutdown sweep could not
+  reap. Such publications now land durably like terminal transitions do.
+- A warm-pool golden VM stays paused while its disk is copied; it kept running
+  after its RAM snapshot, so the copy could change underneath and fail.
 - The warm pool now serves API creates. The API gave every create an id
   before the pool was consulted, and the pool only serves creates without one,
   so every create cold-booted. Creates naming an image are served by a class

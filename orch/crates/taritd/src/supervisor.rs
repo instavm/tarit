@@ -2877,6 +2877,22 @@ struct WarmVm {
     spec: VmSpawnConfig,
 }
 
+/// A warm VM selected by one claim. Dropping it, however the claim ends,
+/// makes the VM selectable again if it is still parked.
+struct WarmClaim<'a> {
+    claims: &'a Mutex<HashSet<Uuid>>,
+    id: Uuid,
+}
+
+impl Drop for WarmClaim<'_> {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpawnPurpose {
     Live,
@@ -2975,13 +2991,20 @@ pub struct VmmSupervisor {
     artifact_owners: Mutex<HashSet<Uuid>>,
     network_leases: Mutex<HashMap<Uuid, NetworkLeaseState>>,
     booting: Mutex<HashMap<Uuid, BootingVm>>,
-    /// Serializes VMM spawn registration with shutdown's boot cancellation sweep.
+    /// Orders VMM spawn registration and lifecycle publication against
+    /// shutdown's boot cancellation sweep, VM stops, exit reconciliation and
+    /// re-adoption. Boots, publications and warm claims hold it shared, so
+    /// they proceed in parallel, each touching only its own VM's entries; the
+    /// others hold it exclusively and so never interleave with any of them.
     ///
     /// Lifecycle publication orders locks as `boot_gate` -> `running`/`warm` ->
     /// `booting`. It is async because Running publication intentionally holds it
     /// through fleet and durable-store acknowledgement, never while holding a
     /// synchronous supervisor lock.
-    boot_gate: AsyncMutex<()>,
+    boot_gate: tokio::sync::RwLock<()>,
+    /// Warm VMs a claim has selected and not yet finished with, so that
+    /// concurrent claims select different VMs.
+    warm_claims: Mutex<HashSet<Uuid>>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
     /// Async lifecycle/refill workers are owned here rather than by the API or
@@ -3189,7 +3212,8 @@ impl VmmSupervisor {
             artifact_owners: Mutex::new(artifact_owners),
             network_leases: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
-            boot_gate: AsyncMutex::new(()),
+            boot_gate: tokio::sync::RwLock::new(()),
+            warm_claims: Mutex::new(HashSet::new()),
             warm: Mutex::new(VecDeque::new()),
             owned_tasks: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -3650,7 +3674,7 @@ impl VmmSupervisor {
         // obtain the gate, preventing a late pause/resume result from replacing
         // the terminal error state.
         let _operation = operation_gate.blocking_lock();
-        let gate = self.boot_gate.blocking_lock();
+        let gate = self.boot_gate.blocking_write();
         let location = self
             .running
             .lock()
@@ -4195,7 +4219,7 @@ impl VmmSupervisor {
             SpawnPurpose::Live => "VM create or restore",
             SpawnPurpose::Refill => "warm-pool refill",
         })?;
-        let _gate = self.boot_gate.lock().await;
+        let _gate = self.boot_gate.read().await;
         if self.is_shutting_down() {
             return Err(self.shutdown_error());
         }
@@ -4213,6 +4237,8 @@ impl VmmSupervisor {
 
         let control = Arc::new(BootControl::new(purpose));
         let socket_path = self.socket_path_for(id);
+        // The ownership registration is atomic, so of two concurrent boots of
+        // one id only one gets past it.
         self.register_artifact_owner(id)?;
         let registered = self
             .booting
@@ -4552,7 +4578,7 @@ impl VmmSupervisor {
     /// The lifecycle owner performs the durable Error/Stopped transition and
     /// releases its reservation afterwards, so this only removes the boot entry.
     pub(crate) async fn abort_unstarted_boot(&self, ticket: &BootTicket) {
-        let _gate = self.boot_gate.lock().await;
+        let _gate = self.boot_gate.read().await;
         let is_current = self
             .booting
             .lock()
@@ -4776,7 +4802,7 @@ impl VmmSupervisor {
         let BootedVm { id, vm, control } = booted;
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
-        let gate = self.boot_gate.lock().await;
+        let gate = self.boot_gate.read().await;
         let boot_is_current = match self.booting.lock() {
             Ok(booting) => {
                 boot_can_publish(&control, self.is_shutting_down())
@@ -4853,7 +4879,7 @@ impl VmmSupervisor {
         spec: VmSpawnConfig,
     ) -> Result<(), OrchError> {
         let BootedVm { id, vm, control } = booted;
-        let gate = self.boot_gate.lock().await;
+        let gate = self.boot_gate.read().await;
         let mut warm = match self.warm.lock() {
             Ok(warm) => warm,
             Err(_) => {
@@ -5034,7 +5060,7 @@ impl VmmSupervisor {
         let socket_path = runtime.host_socket.clone();
         let _ = std::fs::remove_file(&socket_path);
         let cgroup_args = self.cgroup_args(id, ticket.shape, runtime)?;
-        let boot_gate = self.boot_gate.blocking_lock();
+        let boot_gate = self.boot_gate.blocking_read();
         let can_start = !self.is_shutting_down()
             && !ticket.control.is_cancelled()
             && self
@@ -6060,20 +6086,32 @@ impl VmmSupervisor {
         F: FnOnce(Uuid, u32, PathBuf) -> Fut + Send,
         Fut: std::future::Future<Output = Result<T, PublicationFailure>> + Send,
     {
-        let _gate = self.boot_gate.lock().await;
+        let _gate = self.boot_gate.read().await;
         if self.is_shutting_down() || task.is_cancelled() {
             return Ok(WarmClaimOutcome::NoMatch);
         }
-        let candidate_id = {
+        let claim = {
             let warm = self
                 .warm
                 .lock()
                 .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
-            let Some(warm_vm) = warm.iter().find(|warm_vm| &warm_vm.spec == want) else {
+            let mut claims = self
+                .warm_claims
+                .lock()
+                .map_err(|_| OrchError::Internal("warm claim lock poisoned".into()))?;
+            let Some(warm_vm) = warm
+                .iter()
+                .find(|warm_vm| &warm_vm.spec == want && !claims.contains(&warm_vm.id))
+            else {
                 return Ok(WarmClaimOutcome::NoMatch);
             };
-            warm_vm.id
+            claims.insert(warm_vm.id);
+            WarmClaim {
+                claims: &self.warm_claims,
+                id: warm_vm.id,
+            }
         };
+        let candidate_id = claim.id;
         self.bind_owned_task(candidate_id, task)?;
         if let Err(error) = register_lifecycle(candidate_id).await {
             return Ok(WarmClaimOutcome::PreRuntimeFailure(error));
@@ -6743,7 +6781,7 @@ impl VmmSupervisor {
         };
         let vm = RunningVm::new(pid, socket_path, process, net);
         {
-            let gate = self.boot_gate.lock().await;
+            let gate = self.boot_gate.write().await;
             if let Err(error) = self.scheduler.reserve_existing(
                 record.id,
                 ResourceShape::new(record.vcpus, record.memory_mib),
@@ -6983,7 +7021,7 @@ impl VmmSupervisor {
 
     pub fn stop_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let booting = {
-            let _gate = self.boot_gate.blocking_lock();
+            let _gate = self.boot_gate.blocking_write();
             let booting_vm = self
                 .booting
                 .lock()
@@ -7004,7 +7042,7 @@ impl VmmSupervisor {
         // Remove from the running map under the lifecycle gate, then do slow
         // teardown without any lock held.
         let running = {
-            let _gate = self.boot_gate.blocking_lock();
+            let _gate = self.boot_gate.blocking_write();
             let mut guard = self
                 .running
                 .lock()
@@ -7013,7 +7051,7 @@ impl VmmSupervisor {
         };
         let Some(running) = running else {
             let warm = {
-                let _gate = self.boot_gate.blocking_lock();
+                let _gate = self.boot_gate.blocking_write();
                 let mut warm = self
                     .warm
                     .lock()
@@ -7671,7 +7709,7 @@ impl VmmSupervisor {
 
     pub(crate) fn stop_all(&self) -> Result<ShutdownSummary, Box<ShutdownFailure>> {
         let (booting, owned_tasks) = {
-            let _gate = self.boot_gate.blocking_lock();
+            let _gate = self.boot_gate.blocking_write();
             // This is the linearization point with user lifecycle publication:
             // after it, no boot can enter its durable Running publication.
             self.shutting_down.store(true, Ordering::SeqCst);
