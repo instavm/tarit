@@ -118,6 +118,42 @@ This workflow requires a registered runner labeled `self-hosted`, `linux`, `x64`
 Privileged KVM jobs run only from the protected `main` ref; pull-request code is
 not executed on the persistent privileged runner.
 
+## Evidence from a single development host (2026-11-07)
+
+These results come from one AMD Ryzen 5 5600G host (6 cores, 15 GiB, XFS
+with reflink for VM files), without root, while unrelated CPU-heavy jobs
+kept the load between 5 and 20. They show the code works under load. They
+are not the dedicated-runner gates above, and their timings are not
+benchmarks.
+
+- KVM integration suite, release build, every test that does not need root:
+  612 passed. Not run: the four tests that create TAP devices or network
+  namespaces (they need root; `scripts/run-readiness-gates.sh` runs them).
+  `live_snapshot_captures_device_dma` failed once when run in parallel with
+  the rest, because its pre-copy converged in two rounds instead of three.
+  It passed 4 of 4 alone. The two timing gates
+  (`cold_boot_benchmark_100`, `perf_gates_comprehensive`) fail at this load.
+- taritd unit and integration tests: 452 passed. Store tests: 26 passed.
+- `test/soak/api_soak.py` (6 sandboxes, 2 minutes, `node:22`): 1,709
+  operations, none failed, no data-check failures. 576 VMs were created
+  and none were left behind. No warnings in taritd's log.
+- ComputeSDK burst benchmark (100 `node:22` sandboxes at once) against a
+  taritd with no pool or capacity settings: 100/100 succeeded on each of
+  two runs, all from the warm pool. On this host only 48 VMs fit at once,
+  so most of the remaining latency is creates waiting for capacity.
+- Warm-pool creates: 1.2 ms each, one at a time, and about 1,300 a second
+  eight at a time, with 3,000 past VMs in the store.
+
+Still to run on this host: a 100-sandbox, 30-minute soak and the root-only
+gates (`sudo scripts/run-readiness-gates.sh`). Still to run anywhere: soaks
+at thousands of VMs on a large host.
+
+Known scaling gap: deleted VMs stay in the `vms` table as `stopped` rows
+forever. Their ids also keep a client from re-creating a deleted VM under
+the same id. Pruning them needs a tombstone design that keeps that
+guarantee, so it is not done yet. At thousands of creates a second the
+table grows by millions of rows a day.
+
 ## Stop-ship items
 
 The earlier peer-mTLS/session-fencing, opaque authenticated artifact,
