@@ -376,8 +376,8 @@ exec agent at `/usr/sbin/vmm-agent` so the VM can service `exec` requests.
 | `net` | no | Network device list. Defaults to `[]` |
 | `net[].tap` | yes | Host TAP name |
 | `net[].guest_mac` | no | Guest MAC, or `null` |
-| `net[].guest_ip` | no | Guest IP, or `null` |
-| `net[].port_forwards` | no | Port forward list. Defaults to `[]` |
+| `net[].guest_ip` | no | Guest IPv4 address (no prefix), or `null`. Unless the kernel command line already has `ip=`, the VMM configures the guest's eth0 at boot with this address, using the TAP's host address and netmask as gateway and netmask |
+| `net[].port_forwards` | no | Port forward list. Defaults to `[]`. Recorded for the orchestrator, which installs the DNAT rules; a VMM run on its own does not forward ports |
 | `net[].port_forwards[].host_port` | yes | Host port |
 | `net[].port_forwards[].guest_port` | yes | Guest port |
 | `net[].port_forwards[].proto` | no | Protocol. Defaults to `tcp` |
@@ -476,7 +476,7 @@ All responses are JSON objects with a `status` field:
 | `restored` | none | `restore` |
 | `exec` | `exit_code`, `stdout`, `stderr`, `duration_ms` | `exec` |
 | `guest_network_repaired` | none | `repair_guest_network` |
-| `egress_updated` | `rules_applied` | `update_egress` |
+| `egress_updated` | `rules_applied`, `enforced` | `update_egress` |
 | `vm_status` | `state`, `uptime_ms`, `vcpus`, `mem_mib`, `volumes`, `nets`, `kernel`, `vcpu_alive` | `status` |
 | `err` | `msg` | Any non-PTY request |
 
@@ -485,7 +485,7 @@ All responses are JSON objects with a `status` field:
 { "status": "snapshot", "path": "/tmp/vmm-vm-1.snap" }
 { "status": "restored" }
 { "status": "exec", "exit_code": 0, "stdout": "hello\n", "stderr": "", "duration_ms": 15 }
-{ "status": "egress_updated", "rules_applied": 2 }
+{ "status": "egress_updated", "rules_applied": 2, "enforced": true }
 { "status": "vm_status", "state": "running", "uptime_ms": 1234, "vcpus": 1, "mem_mib": 256, "volumes": 1, "nets": 1, "kernel": "../guest-assets/vmlinux", "vcpu_alive": true }
 { "status": "err", "msg": "VM not found" }
 ```

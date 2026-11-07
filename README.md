@@ -1,50 +1,57 @@
 # Tarit
 
-**A KVM microVM platform for AI agents and isolated execution.**
+Tarit runs untrusted code in KVM microVMs. It is built for AI agents and
+other workloads that create many short-lived sandboxes, run commands in
+them, checkpoint and restore them, and fork them.
 
-Tarit is a microVM platform for secure, fast, ephemeral
-sandboxes, built for AI agent workloads. It boots a real hardware-virtualized VM
-in milliseconds, runs a task inside it, and tears it down. Each sandbox has a
-guest kernel rather than sharing the host kernel; production containment also
-depends on the host-side controls described in [SECURITY.md](SECURITY.md).
-Jailed orchestrated VMMs support dedicated PID and process network namespaces;
-the host-owned TAP queue is passed by descriptor so host routing and traffic
-policy remain outside the VMM namespace.
+It has two parts, developed together in this repository:
 
-It has two parts, developed together in this monorepo:
+- **`vmm/`**: the Tarit VMM, a microVM monitor built on
+  [rust-vmm](https://github.com/rust-vmm) crates. One process runs one VM.
+  It works on its own or under any orchestrator.
+- **`orch/`**: `taritd`, which runs VMs on one host or across a fleet:
+  placement, warm pools, networking, snapshots, SSH/PTY access, usage
+  records and an audit trail.
 
-- **`vmm/`** - the Tarit VMM, a minimal [rust-vmm](https://github.com/rust-vmm)
-  based microVM monitor (the hypervisor layer). One process runs one microVM.
-  Usable on its own or under any orchestrator.
-- **`orch/`** - `taritd`, a multi-node orchestrator and PaaS control plane that
-  launches and manages microVMs across a fleet, with placement, warm pools,
-  networking, snapshots, SSH/PTY access, per-key usage stats, and an audit trail.
+They talk over a Unix socket protocol whose types live in **`proto/`**
+(`tarit-proto`), so another control plane can drive the VMM with the same
+types.
 
-They talk over a Unix-domain-socket protocol whose types live in one shared,
-dependency-light crate, **`proto/`** (`tarit-proto`). That crate is the wire
-contract, so you can drive the VMM from `taritd` or from your own control plane
-without hand-copying types.
+## What it does
 
-## Why microVMs
-
-- **Hardware virtualization.** Each sandbox is a KVM guest with its own kernel,
-  not a shared-kernel container. Host confinement, resource limits, networking,
-  and the VMM device boundary remain part of the security model.
-- **Fast and cheap.** Minimal device model (MMIO virtio only, no PCI, no BIOS),
-  demand-paged guest RAM, and snapshot/restore for sub-second starts.
-- **Ephemeral by design.** Create, run, discard. Snapshots and copy-on-write
-  overlays make many identical sandboxes cheap to spin up.
-- **Built for agents.** vsock-based exec and interactive PTY, per-key usage
-  metering and audit, and an orchestrator tuned for bursty create/exec/destroy.
+- **Isolation.** Each sandbox is a KVM guest with its own kernel. The VMM
+  runs each thread under its own seccomp profile. With taritd's VM jail
+  configured, each VMM also gets its own uid, PID namespace, network
+  namespace and cgroup. See [SECURITY.md](SECURITY.md) for what this does
+  and does not cover.
+- **Fast creates.** taritd keeps warm pools of VMs restored from a golden
+  snapshot, one for each registered image and for each VM shape in use, so
+  most creates return in a few milliseconds. An image can carry a command
+  its golden runs first, so the first command in a sandbox finds its
+  runtime already in memory.
+- **Checkpoints.** A snapshot captures memory, device state and the
+  writable disk. A checkpoint after the first pauses the guest only for
+  memory changed since the previous one, and still restores on its own.
+  Live snapshots keep the guest running until a short final stop.
+- **Fork.** A running VM can be forked. Children share its memory until
+  they write to it, and on a reflink filesystem its disk too.
+- **Images.** Any OCI or Docker image can become a VM root filesystem,
+  without root (`taritd image build`, `vmm pull`).
+- **Network.** With taritd's networking on, each VM gets its own TAP and
+  address, and outbound traffic is denied unless allowed.
+- **Access.** Commands run over vsock; there are also PTYs, an SSH
+  gateway and HTTP port shares.
 
 ## Performance evidence
 
-Latency depends on the host kernel, CPU, storage, guest image, workload, and
-commit. Run `vmm/ci/perf-gates.sh` for the VMM lifecycle gates and
-`test/bench.sh` for end-to-end time-to-interactive measurements. A published
-result should include the commit, host and guest configuration, artifact
-identities, iteration count, percentile method, and raw report; unversioned
-headline numbers are not treated as release evidence.
+Latency depends on the host kernel, CPU, storage, guest image, workload and
+commit. `vmm/ci/perf-gates.sh` measures VMM lifecycle latency,
+`test/bench.sh` measures end-to-end time to first command, `test/compare/`
+runs the same workloads against Firecracker, and `test/soak/api_soak.py`
+holds many sandboxes busy and checks what they hold. A published result
+should name the commit, the host and guest configuration, the artifacts,
+the iteration count and percentile method, and include the raw report.
+Numbers without those are not release evidence.
 
 ## Architecture at a glance
 
@@ -121,7 +128,7 @@ sudo vmm --socket /tmp/vm.sock snapshot --diff       # incremental (dirty pages 
 sudo vmm --socket /tmp/vm.sock snapshot --live       # live: guest keeps running
 sudo vmm --socket /tmp/vm.sock suspend               # release resident guest RAM
 sudo vmm --socket /tmp/vm.sock resume
-sudo vmm restore --snapshot /path/to.snap            # restore into a new VMM process
+sudo vmm --socket /tmp/vm2.sock restore --snapshot /path/to.snap  # restore in a new VMM process that serves its API
 ```
 
 Tarit also does **live snapshots** (`snapshot --live`): pre-copy rounds run
@@ -195,7 +202,7 @@ tested, and consumed on its own. Both depend on `proto/` for the wire types.
 
 - Host: x86_64 Linux with KVM. Development also works on macOS for building and
   cross-checking; running microVMs needs KVM.
-- Not yet implemented: aarch64 guests, virtio-balloon.
+- Not yet implemented: aarch64 guests.
 
 ## Self-hosting
 

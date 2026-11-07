@@ -47,11 +47,11 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
-| `TARIT_MAX_VMS` | usize | `32` | Maximum concurrent local VM slots, including warm VMs. |
-| `TARIT_MAX_VCPUS` | u64 | `64` when warm pool is disabled; otherwise `ceil(available_parallelism * cpu_overcommit)` | Local vCPU placement ceiling. If set, it overrides the derived warm-pool ceiling. |
-| `TARIT_MAX_MEMORY_MIB` | u64 | `65536` | Local memory placement ceiling in MiB. |
+| `TARIT_MAX_VMS` | usize | the vCPU ceiling, at least `32` | Maximum concurrent local VM slots, including warm VMs. Every VM takes at least one vCPU, so the default is the effective `TARIT_MAX_VCPUS`. |
+| `TARIT_MAX_VCPUS` | u64 | `ceil(available_parallelism * TARIT_CPU_OVERCOMMIT)` | Local vCPU placement ceiling. If set, it overrides the derived ceiling. |
+| `TARIT_MAX_MEMORY_MIB` | u64 | host `MemTotal` in MiB (`65536` if `/proc/meminfo` is unreadable) | Local memory placement ceiling in MiB. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | u64 | `60000` | Time a create operation may wait for capacity before admission gives up. |
-| `TARIT_CPU_OVERCOMMIT` | f64 | `4.0` | Warm-pool CPU overcommit ratio. Also affects derived `TARIT_MAX_VCPUS` when the warm pool is enabled and `TARIT_MAX_VCPUS` is unset. |
+| `TARIT_CPU_OVERCOMMIT` | f64 | `4.0` | CPU overcommit ratio for the warm pool and for the derived `TARIT_MAX_VCPUS` when it is unset. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS` | positive usize | `1024` | Node-wide active guest PTY limit, shared by WebSocket PTYs and SSH gateway channels. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_TENANT` | positive usize | `128` | Active guest PTY limit for one authenticated tenant. Must be less than the node-wide limit so one tenant cannot consume every slot. |
 | `TARIT_PTY_MAX_ACTIVE_CONNECTIONS_PER_VM` | positive usize | `16` | Active guest PTY limit for one VM. Must not exceed the per-tenant limit. |
@@ -60,18 +60,23 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
-| `TARIT_WARM_POOL` | bool | `false` | Enable warm-pool replenishment. For this variable, only `1` or `true` enables it. |
+| `TARIT_WARM_POOL` | bool | `true` | Warm-pool replenishment. For this variable, only `1` or `true` enables it; any other value turns the pool off. |
 | `TARIT_WARM_POOL_TARGET` | usize | `8` for the default class | Override the first warm-pool class target. |
 | `TARIT_WARM_POOL_ROOTFS` | path | unset | Override the first warm-pool class rootfs when non-empty. `~/` is expanded. |
 | `TARIT_WARM_POOL_IMAGE` | string | unset | Override the first warm-pool class image reference when non-empty after trimming. |
-| `TARIT_WARM_POOL_RESTORE` | bool | `false` | Use restore-from-golden replenishment for the first class. For this variable, only `1` or `true` enables it. |
+| `TARIT_WARM_POOL_RESTORE` | bool | `true` | Restore-from-golden replenishment for the first class. For this variable, only `1` or `true` enables it; any other value refills by cold boot. |
 | `TARIT_WARM_POOL_LOW_WATERMARK` | usize | derived from target | Override the first class low watermark. Refill starts when depth is below this value. |
 | `TARIT_WARM_POOL_HIGH_WATERMARK` | usize | derived from target | Override the first class high watermark. Refill does not intentionally grow past this ceiling. |
 | `TARIT_WARM_POOL_HARD_FLOOR` | usize | derived from target | Override the first class emergency minimum. |
+| `TARIT_WARM_POOL_LEARN_CLASSES` | usize | `4` | Most warm classes taritd adds on its own for registered images and for shapes creates ask for. `0` turns learning off. |
+| `TARIT_WARM_POOL_LEARN_TARGET` | usize | `8` | Warm VMs kept ready for each learned class. |
+| `TARIT_WARM_POOL_LEARN_IDLE_SECS` | u64 | `1800` | A learned class nobody creates from for this long is retired: its idle warm VMs stop and its golden snapshot is deleted. |
 | `TARIT_REFILL_CGROUP` | path | unset | Optional cgroup v2 path for refill-spawned VMM children. Empty string clears the path. `~/` is expanded. |
 | `TARIT_REFILL_CPU_WEIGHT` | u64 | `10` | cgroup v2 `cpu.weight` for refill children. Values are clamped to `1..=10000`. |
 
-The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = false`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
+Learned classes: when the pool is on, taritd also keeps warm VMs for shapes no configured class covers. At startup the newest registered images (up to `TARIT_WARM_POOL_LEARN_CLASSES`) each get a class at the default 1 vCPU / 256 MiB shape, and so does each image registered while taritd runs. A create for any other shape a restore class can reproduce exactly (an image or rootfs, vCPUs and memory, with no custom kernel, command line, volumes, or egress) is served cold and teaches taritd that shape; later creates for it are served from its pool. Past the limit, the class asked for least recently is dropped. The TOML keys are `learn_classes`, `learn_target`, and `learn_idle_secs` under `[warm_pool]`.
+
+The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = true`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
 
 ## VMM jail
 
@@ -157,6 +162,7 @@ The `TARIT_CONFIG` TOML schema does not define an `[autoscale]` table. Configure
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `TARIT_ENABLE_NET` | bool | `false` | Enable per-VM tap devices, `/30` addressing, and NAT. Requires host networking privileges. |
+| `TARIT_GUEST_DNS` | comma-separated IPs (at most 3) | unset | Resolvers written to networked guests' `/etc/resolv.conf` at boot and whenever a restored or forked guest's network is repaired. Requires `TARIT_ENABLE_NET=1`. Egress to them still needs an allowlist entry. |
 | `TARIT_NET_STATE` | path | next to `TARIT_DB` with `.net.json` appended to the DB file name | Persistent per-VM tap/IP slot state. With the default DB, this is `~/.taritd/fleet.db.net.json`. `~/` is expanded when set. |
 
 ## Access / SSH gateway
@@ -219,14 +225,18 @@ plane; do not send it `/v1/*`, `/internal/v1/*`, or control-plane credentials.
 
 ## Usage stats and audit trail
 
-See [USAGE-AND-AUDIT.md](USAGE-AND-AUDIT.md). Attribution and the query APIs need
-cluster mode (`TARIT_DATABASE_URL` set); the meter always runs and buffers to
-the local outbox otherwise.
+See [USAGE-AND-AUDIT.md](USAGE-AND-AUDIT.md). The meter always runs. With
+`TARIT_DATABASE_URL` set, events flush to PostgreSQL; without it, the query APIs
+answer from the local outbox.
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
 | `TARIT_USAGE_METER_INTERVAL_SECS` | u64 | `30` | How often the VM-runtime meter bills alive local VMs. |
 | `TARIT_USAGE_FLUSH_INTERVAL_SECS` | u64 | `10` | How often the flusher pushes local usage/audit outboxes to PostgreSQL. |
+| `TARIT_LOCAL_USAGE_RETENTION_DAYS` | u64 | `90` | Without a fleet database, days of local usage/audit rows to keep (`0` keeps them forever). |
+| `TARIT_EXECUTION_RETENTION_HOURS` | u64 | `24` | Hours a finished command's record and captured output stay readable through `GET /v1/executions/{id}` (`0` keeps them forever). Pruned hourly in small batches. |
+| `TARIT_STOPPED_VM_RETENTION_HOURS` | u64 | `24` | Hours the record of a deleted VM is kept (`0` keeps them forever). While it is kept, its id, and the child id of a fork that produced it, cannot be used for a new VM; after it, a create or fork that reuses the id makes a new VM. Records still named by a hibernation, volume attachment, private snapshot or unfinished fork are kept. Pruned hourly in small batches. Deleted VMs leave taritd's in-memory cache five minutes after deletion regardless. |
+| `TARIT_MAX_CONCURRENT_SNAPSHOTS` | usize | half the CPUs, at least 2 | Snapshot and fork captures that run at once on this host; more wait their turn. Each capture writes and syncs guest RAM. With no limit, a burst of captures shares the disk so thinly that they all overrun the live pre-copy budget and pause their guests for longer. |
 
 ## TOML config reference
 
@@ -254,7 +264,7 @@ target = 8                     # usize, required
 hard_floor = 4                 # optional usize, derived when omitted
 low_watermark = 6              # optional usize, derived when omitted
 high_watermark = 10            # optional usize, derived when omitted
-restore = true                 # optional bool, default false
+restore = true                 # optional bool, default true
 image = "node20"               # optional registered image name[:tag]
 # rootfs = "/var/lib/taritd/rootfs.ext4" # optional path; do not set with image
 

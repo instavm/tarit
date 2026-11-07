@@ -74,6 +74,23 @@ pub struct Args {
     /// Fail the run when the successful-iteration percentage is lower.
     #[arg(long)]
     pub min_success_percent: Option<f64>,
+
+    /// Sustained mode: sandboxes created per second.
+    #[arg(long, default_value_t = 100.0)]
+    pub rate: f64,
+
+    /// Sustained mode: how long to keep creating, in seconds.
+    #[arg(long, default_value_t = 60)]
+    pub duration_secs: u64,
+
+    /// How long each sandbox lives after its command before it is deleted.
+    #[arg(long, default_value_t = 0)]
+    pub hold_ms: u64,
+
+    /// Sustained mode: most sandboxes alive at once; a create due while this
+    /// many are alive is skipped and counted as shed.
+    #[arg(long, default_value_t = 10_000)]
+    pub max_in_flight: usize,
 }
 
 impl Args {
@@ -86,6 +103,16 @@ impl Args {
         }
         if self.timeout_ms == 0 {
             anyhow::bail!("--timeout-ms must be greater than zero");
+        }
+        if self.mode == Mode::Sustained
+            && (!self.rate.is_finite()
+                || self.rate <= 0.0
+                || self.duration_secs == 0
+                || self.max_in_flight == 0)
+        {
+            anyhow::bail!(
+                "sustained mode needs a positive --rate, --duration-secs and --max-in-flight"
+            );
         }
         let has_gate = self.max_median_ms.is_some()
             || self.max_p95_ms.is_some()
@@ -113,6 +140,8 @@ impl Args {
             Mode::Sequential => std::slice::from_ref(&self.iterations),
             Mode::Staggered | Mode::Burst => std::slice::from_ref(&self.concurrency),
             Mode::All => &[self.iterations, self.concurrency],
+            // Known only once the run ends; verify_performance checks it.
+            Mode::Sustained => &[],
         };
         if self.max_p95_ms.is_some() && sample_counts.iter().any(|count| *count < 20) {
             anyhow::bail!("a p95 gate requires at least 20 samples per selected mode");
@@ -150,6 +179,8 @@ pub enum Mode {
     Sequential,
     Staggered,
     Burst,
+    /// Create at a fixed rate for a fixed time; not part of `all`.
+    Sustained,
     All,
 }
 
@@ -159,6 +190,7 @@ impl Mode {
             Self::Sequential => "sequential",
             Self::Staggered => "staggered",
             Self::Burst => "burst",
+            Self::Sustained => "sustained",
             Self::All => "all",
         }
     }

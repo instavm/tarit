@@ -9,6 +9,7 @@ pub mod state;
 pub use api::{
     ApiRequest, ApiResponse, GuestNetworkRepair, LiveSnapshotStats, LiveSnapshotTermination,
     MemoryIntegrity, RestoreMemoryPolicy, ScratchIdentity, VmSpec, MAX_API_FRAME_LEN,
+    RETRYABLE_ERROR_PREFIX,
 };
 pub use config::{
     KernelConfig, MemoryConfig, NetConfig, PortForwardConfig, VcpuConfig, VmConfig, VolumeConfig,

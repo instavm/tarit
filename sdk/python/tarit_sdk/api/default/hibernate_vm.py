@@ -47,6 +47,10 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         response_409 = cast(Any, None)
         return response_409
 
+    if response.status_code == 429:
+        response_429 = cast(Any, None)
+        return response_429
+
     if response.status_code == 503:
         response_503 = cast(Any, None)
         return response_503

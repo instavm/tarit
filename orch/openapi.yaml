@@ -134,6 +134,7 @@ components:
         id:
           type: string
           format: uuid
+          description: Optional VM id; generated when omitted. A create with the id of an existing VM is refused with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
         memory_mib:
           type: integer
           default: 256
@@ -154,6 +155,18 @@ components:
           uniqueItems: true
           items:
             $ref: "#/components/schemas/VmVolumeAttachmentRequest"
+        egress:
+          type: object
+          description: Egress policy applied as the VM is created, in the same form as PATCH /v1/egress/vm/{id}. Without one, a networked VM can reach nothing. Invalid policies are rejected before anything is created; if the policy cannot be applied, the VM is removed and the create fails.
+          required: [allowlist]
+          properties:
+            allowlist:
+              type: array
+              items:
+                type: string
+            allow_existing:
+              type: boolean
+              default: false
     VmVolumeAttachmentRequest:
       type: object
       additionalProperties: false
@@ -227,6 +240,29 @@ components:
         updated_at:
           type: string
           format: date-time
+    Snapshot:
+      type: object
+      additionalProperties: false
+      required: [snapshot_id, source_vm_id, created_at]
+      properties:
+        snapshot_id:
+          type: string
+          format: uuid
+        source_vm_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        size_bytes:
+          type: integer
+          format: uint64
+        memory_mib:
+          type: integer
+          format: uint64
+        vcpus:
+          type: integer
+          minimum: 1
     CreateVolumeRequest:
       type: object
       additionalProperties: false
@@ -261,7 +297,7 @@ components:
         id:
           type: string
           format: uuid
-          description: Optional id for the restored VM; generated when omitted.
+          description: Optional id for the restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     RestoreBranchRequest:
       type: object
       additionalProperties: false
@@ -269,7 +305,7 @@ components:
         id:
           type: string
           format: uuid
-          description: Optional id for the isolated restored VM; generated when omitted.
+          description: Optional id for the isolated restored VM; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     ForkVmRequest:
       type: object
       additionalProperties: false
@@ -277,7 +313,7 @@ components:
         id:
           type: string
           format: uuid
-          description: Optional child VM id; generated when omitted.
+          description: Optional child VM id; generated when omitted. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     ForkExecutionPath:
       type: string
       enum: [local, cross_node]
@@ -462,7 +498,7 @@ components:
           format: uuid
         action:
           type: string
-          enum: [create, delete, pause, suspend, resume, snapshot, fork, hibernate, create_branch, update_branch, delete_branch, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token, create_volume, delete_volume, set_balloon]
+          enum: [create, delete, pause, suspend, resume, snapshot, delete_snapshot, fork, hibernate, create_branch, update_branch, delete_branch, restore, exec, attach_pty, ssh_attempt, update_egress, create_share, update_share, revoke_share, issue_share_token, create_volume, delete_volume, set_balloon]
         outcome:
           type: string
           enum: [attempt, ok, denied, error]
@@ -1161,6 +1197,8 @@ paths:
           description: VM not found
         "409":
           description: Invalid lifecycle transition
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
   /v1/vms/{id}/resume:
     post:
       operationId: resumeVm
@@ -1219,6 +1257,8 @@ paths:
           description: VM not found
         "409":
           description: Invalid lifecycle transition
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
   /v1/vms/{id}/hibernate:
     post:
       operationId: hibernateVm
@@ -1246,6 +1286,8 @@ paths:
           description: VM not found
         "409":
           description: VM is not running
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
         "503":
           description: Remote hibernation is unavailable until fenced peer lifecycle routing is enabled
   /v1/vms/{id}/snapshot:
@@ -1270,7 +1312,7 @@ paths:
                 diff:
                   type: boolean
                   default: false
-                  description: Must be false. Incremental orchestrator snapshots are disabled until durable parent-chain relocation is available.
+                  description: Accepted for compatibility. Every snapshot is standalone; capture pauses the guest only for pages changed since the snapshot it was restored from or last wrote, whenever the VMM can use that snapshot as a base.
       responses:
         "200":
           description: Opaque snapshot handle
@@ -1289,10 +1331,10 @@ paths:
           description: VM belongs to a different tenant
         "404":
           description: VM not found
-        "422":
-          description: Incremental snapshots are disabled; retry with `diff=false`.
         "409":
           description: VM lifecycle state does not support snapshots
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
   /v1/vms/{id}/fork:
     post:
       operationId: forkVm
@@ -1333,9 +1375,50 @@ paths:
         "409":
           description: Source is not running or the requested child id already exists
         "429":
-          description: Host capacity is unavailable
+          description: Host capacity is unavailable, or the source VM's storage was too busy to pause in time. Retry after the Retry-After header
         "503":
           description: A source peer/session, durable fleet, verified artifact replica, or configured replication policy is unavailable
+  /v1/snapshots:
+    get:
+      operationId: listSnapshots
+      summary: List the tenant's snapshots on this node
+      description: Oldest first. Fork-owned snapshots and hibernation wake images are managed by their VM and are not listed.
+      responses:
+        "200":
+          description: Tenant snapshots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Snapshot"
+        "401":
+          description: Missing or invalid API key
+  /v1/snapshots/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      operationId: deleteSnapshot
+      summary: Delete a snapshot nothing still needs
+      description: Removes the snapshot's metadata and files. Refused while a branch head references it, a hibernated VM would wake from it, or a fork owns it.
+      responses:
+        "204":
+          description: Snapshot deleted
+        "401":
+          description: Missing or invalid API key
+        "404":
+          description: Snapshot absent or belongs to another tenant
+        "409":
+          description: Snapshot is still referenced
+        "422":
+          description: Snapshot is held by another node
+        "503":
+          description: Fleet store unavailable
   /v1/restore:
     post:
       operationId: restoreVm
@@ -2170,7 +2253,7 @@ paths:
     get:
       operationId: getUsage
       summary: Aggregated usage stats per API key
-      description: Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
+      description: Raw metering (VM runtime seconds, exec counts and durations) from the primary store, or from the node's local outbox when no fleet database (TARIT_DATABASE_URL) is configured. Admins see every key, optionally filtered by api_key_id; a non-admin key sees only its own.
       parameters:
         - name: from
           in: query
@@ -2204,12 +2287,12 @@ paths:
         "401":
           description: Missing or invalid API key
         "500":
-          description: No fleet database configured, or store failure
+          description: Store failure
   /v1/audit:
     get:
       operationId: listAuditEvents
       summary: Recent audit trail
-      description: Audited actions from the primary store, newest first; requires a fleet database (TARIT_DATABASE_URL). Admins see every key; a non-admin key sees only its own actions.
+      description: Audited actions from the primary store (or the node's local outbox without a fleet database), newest first. Admins see every key; a non-admin key sees only its own actions.
       parameters:
         - name: api_key_id
           in: query
@@ -2243,4 +2326,4 @@ paths:
         "401":
           description: Missing or invalid API key
         "500":
-          description: No fleet database configured, or store failure
+          description: Store failure

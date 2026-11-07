@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     if cli.runs_server() {
         init_tracing();
+        raise_open_file_limit();
         let preflight_taps = net::startup_preflight().context(
             "contain pre-existing Tarit TAPs before configuration, database, image, or VM discovery",
         )?;
@@ -96,6 +97,30 @@ async fn main() -> anyhow::Result<()> {
         run_server(config, preflight_taps, pty_limits).await
     } else {
         cli::run_client(cli).await
+    }
+}
+
+/// Lift the soft open-file limit to the hard limit. taritd holds several
+/// descriptors per VM (control and agent sockets, pidfds, TAP queues), and
+/// the usual soft default of 1,024 runs out a few hundred VMs in.
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read or write the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "reading the open-file limit failed");
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        return;
+    }
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), previous, "raising the open-file limit failed");
     }
 }
 
@@ -462,7 +487,13 @@ async fn run_server(
         Arc::new(RwLock::new(HashMap::new()));
     {
         let mut c = vm_cache.write().unwrap();
-        for vm in &persisted_vms {
+        let now = chrono::Utc::now();
+        // Deleted VMs past the cache grace are only kept on disk (see
+        // usage::evict_stopped_vms_from_cache).
+        for vm in persisted_vms
+            .iter()
+            .filter(|vm| !usage::stopped_vm_is_evictable(vm, now, usage::STOPPED_VM_CACHE_GRACE))
+        {
             c.insert(vm.id, vm.clone());
         }
     }
@@ -647,10 +678,17 @@ async fn run_server(
         Arc::clone(&scheduler),
         shutdown_rx.clone(),
     );
+    // It only records classes; the replenisher does the VM work.
+    let _image_seeder = warmpool::spawn_image_seeder(
+        Arc::clone(&supervisor),
+        config.clone(),
+        Arc::clone(&state.store),
+        shutdown_rx.clone(),
+    );
 
     // Usage metering (VM runtime seconds) plus write-behind flush of usage and
-    // audit events to the primary store. The meter always runs; the flusher is a
-    // no-op without a fleet (single-host keeps events in the local outbox).
+    // audit events to the primary store. The meter always runs. Without a fleet
+    // the local outbox is the source of truth and is pruned by age.
     let meter_secs = std::env::var("TARIT_USAGE_METER_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -660,10 +698,29 @@ async fn run_server(
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
     let usage_meter = usage::spawn_usage_meter(state.clone(), meter_secs, shutdown_rx.clone());
-    let outbox_flusher =
-        usage::spawn_outbox_flusher(state.clone(), flush_secs, shutdown_rx.clone());
+    let local_retention_days = std::env::var("TARIT_LOCAL_USAGE_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+    let execution_retention_hours = std::env::var("TARIT_EXECUTION_RETENTION_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let stopped_vm_retention_hours = std::env::var("TARIT_STOPPED_VM_RETENTION_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let outbox_flusher = usage::spawn_outbox_flusher(
+        state.clone(),
+        flush_secs,
+        local_retention_days,
+        execution_retention_hours,
+        stopped_vm_retention_hours,
+        shutdown_rx.clone(),
+    );
     let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());
     let artifact_gc = spawn_artifact_gc(state.clone(), shutdown_rx.clone());
+    prewarm_file_digests(&state);
     let artifact_repair = spawn_artifact_repair(state.clone(), shutdown_rx.clone());
 
     let shutdown_signal_task = spawn_shutdown_signal(shutdown.clone(), shutdown_rx.clone());
@@ -776,6 +833,30 @@ fn artifact_references(
         snapshot_paths,
         runtime_paths,
     }
+}
+
+/// Hash the configured kernel and every registered image once in the
+/// background, so the first create or snapshot after a restart does not wait
+/// on a full-image digest. The digests are recomputed (not trusted) if a file
+/// changes; this only warms the cache.
+fn prewarm_file_digests(state: &AppState) {
+    let mut paths = vec![state.config.kernel.clone()];
+    if let Ok(store) = state.store.lock() {
+        if let Ok(images) = store.list_images() {
+            paths.extend(
+                images
+                    .into_iter()
+                    .map(|image| std::path::PathBuf::from(image.rootfs_path)),
+            );
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        for path in paths {
+            if let Err(error) = image::sha256_regular_file(&path) {
+                tracing::debug!(path = %path.display(), %error, "digest prewarm skipped");
+            }
+        }
+    });
 }
 
 fn spawn_artifact_gc(
@@ -2687,9 +2768,11 @@ mod tests {
             rpc_addr: "http://127.0.0.1:0".into(),
             allow_insecure_peer_http: true,
             enable_net: false,
+            guest_dns: Vec::new(),
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,

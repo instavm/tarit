@@ -2547,6 +2547,13 @@ fn consume_nft_tokens(tokens: &[String], index: &mut usize, expected: &[String])
     true
 }
 
+/// Whether `listing` is exactly `table netdev <table> { }`: no chains, no
+/// rules, nothing that could carry anyone's policy.
+fn is_empty_netdev_table(listing: &str, table: &str) -> bool {
+    nft_listing_tokens(listing)
+        .is_some_and(|tokens| tokens == ["table", "netdev", table, "{", "}"].map(String::from))
+}
+
 fn ingress_table_belongs_to_alloc(listing: &str, alloc: &NetAlloc) -> bool {
     let Some(tokens) = nft_listing_tokens(listing) else {
         return false;
@@ -2608,7 +2615,15 @@ fn delete_ingress_table_for_alloc(alloc: &NetAlloc) -> Result<usize, OrchError> 
         return Ok(0);
     }
     let listing = command_stdout("nft", &["-a", "list", "table", "netdev", &table])?;
-    if !ingress_table_belongs_to_alloc(&listing, alloc) {
+    // Teardown removes the TAP first, and the kernel drops a netdev base chain
+    // together with its device, leaving this slot's table empty. An empty
+    // table under the slot's reserved name, once the TAP is gone, holds no
+    // policy at all and is the remains of this allocation.
+    let emptied_with_tap =
+        is_empty_netdev_table(&listing, &table) && strict_tap_is_absent(&alloc.tap)?;
+    if !emptied_with_tap && !ingress_table_belongs_to_alloc(&listing, alloc) {
+        tracing::warn!(%table, vm = %alloc.vm_id, tap = %alloc.tap, %listing,
+            "ingress table does not match the managed policy; leaving it in place");
         return Err(OrchError::Internal(format!(
             "net: refusing to delete ingress table {table}: it is not the exact managed policy for VM {} on {}",
             alloc.vm_id, alloc.tap
@@ -6382,6 +6397,37 @@ esac
         misordered.swap(3, 4);
         let misordered = misordered.join("\n");
         assert!(validate_taritd_security_chain(NFT_FWD_CHAIN, &misordered).is_err());
+    }
+
+    #[test]
+    fn managed_ingress_table_accepts_nft_1_0_listing_with_table_handles() {
+        let alloc = NetAlloc::for_idx(0);
+        let listing = format!(
+            "table netdev taritd_ingress_0 {{ # handle 3\n\tchain ingress {{ # handle 1\n\t\ttype filter hook ingress device \"insta0\" priority filter; policy drop;\n\t\tether type arp accept comment \"{c}\" # handle 2\n\t\tether type ip accept comment \"{c}\" # handle 3\n\t}}\n}}\n",
+            c = ingress_comment(&alloc)
+        );
+        assert!(ingress_table_belongs_to_alloc(&listing, &alloc));
+    }
+
+    #[test]
+    fn only_a_completely_empty_slot_table_counts_as_emptied() {
+        // What nft 1.0 lists once the kernel dropped the chain with its TAP.
+        assert!(is_empty_netdev_table(
+            "table netdev taritd_ingress_0 { # handle 3\n}\n",
+            "taritd_ingress_0"
+        ));
+        assert!(!is_empty_netdev_table(
+            "table netdev taritd_ingress_0 { # handle 3\n}\n",
+            "taritd_ingress_1"
+        ));
+        assert!(!is_empty_netdev_table(
+            "table netdev taritd_ingress_0 {\n\tchain operator {\n\t}\n}\n",
+            "taritd_ingress_0"
+        ));
+        assert!(!is_empty_netdev_table(
+            "table netdev taritd_ingress_0 {\n\tset blocked { type ipv4_addr; }\n}\n",
+            "taritd_ingress_0"
+        ));
     }
 
     #[test]

@@ -163,34 +163,44 @@ fn clear_control_timeouts(stream: &UnixStream) -> std::io::Result<()> {
     stream.set_write_timeout(None)
 }
 
+/// Report a controller error, marking the ones that left the VM unchanged
+/// so the orchestrator can ask its caller to retry instead of failing hard.
+fn error_response(error: vmm_core::error::VmmError) -> ApiResponse {
+    if error.is_retryable() {
+        ApiResponse::retryable_err(error)
+    } else {
+        ApiResponse::Err {
+            msg: error.to_string(),
+        }
+    }
+}
+
 /// Dispatch a single `ApiRequest` using the VMM controller.
 pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
     match req {
         ApiRequest::Create(spec) => match controller.create_live(spec.config) {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Pause => match controller.pause() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Suspend => match controller.suspend() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Resume => match controller.resume() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
-        ApiRequest::Snapshot { diff, live } => {
+        ApiRequest::Snapshot {
+            diff,
+            live,
+            capture_disks,
+            base,
+            resume,
+        } => {
             let result = if live && diff {
                 Err(vmm_core::error::VmmError::Snapshot(
                     "live diff snapshots are not supported".into(),
@@ -234,6 +244,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                             (
                                 result.snapshot_path,
                                 result.overlay_path,
+                                Vec::new(),
                                 result.integrity_path,
                                 Some(live_stats),
                             )
@@ -247,27 +258,26 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 }
             } else {
                 controller
-                    .snapshot(diff)
-                    .map(|path| (path, None, None, None))
+                    .snapshot_with_options(diff, capture_disks, base.as_deref(), resume)
+                    .map(|(path, volume_paths)| (path, None, volume_paths, None, None))
             };
             match result {
-                Ok((path, overlay_path, integrity_path, live_stats)) => ApiResponse::Snapshot {
-                    path,
-                    overlay_path,
-                    integrity_path,
-                    live_stats,
-                },
-                Err(e) => ApiResponse::Err {
-                    msg: format!("{e}"),
-                },
+                Ok((path, overlay_path, volume_paths, integrity_path, live_stats)) => {
+                    ApiResponse::Snapshot {
+                        path,
+                        overlay_path,
+                        volume_paths,
+                        integrity_path,
+                        live_stats,
+                    }
+                }
+                Err(e) => error_response(e),
             }
         }
         ApiRequest::ReleaseScratch { path, identity } => {
             match controller.release_scratch(&path, identity) {
                 Ok(()) => ApiResponse::Ok,
-                Err(e) => ApiResponse::Err {
-                    msg: format!("{e}"),
-                },
+                Err(e) => error_response(e),
             }
         }
         ApiRequest::Restore {
@@ -286,23 +296,17 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             memory_integrity,
         ) {
             Ok(()) => ApiResponse::Restored,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::RepairGuestNetwork { network } => {
             match controller.repair_guest_network(network) {
                 Ok(()) => ApiResponse::GuestNetworkRepaired,
-                Err(e) => ApiResponse::Err {
-                    msg: format!("{e}"),
-                },
+                Err(e) => error_response(e),
             }
         }
         ApiRequest::Stop => match controller.stop() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Exec {
             command,
@@ -314,9 +318,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 stderr,
                 duration_ms,
             },
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::AttachPty { .. } => ApiResponse::Err {
             msg: "AttachPty is a streaming request".into(),
@@ -350,6 +352,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                         log::info!("egress: applied {} rules via nft", result.rules_applied);
                         ApiResponse::EgressUpdated {
                             rules_applied: result.rules_applied,
+                            enforced: true,
                         }
                     }
                     Err(e) => {
@@ -361,13 +364,15 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 }
             } else {
                 let result = compile_egress_update(&update);
-                log::info!(
-                    "egress: compiled {} rules → {} nft commands (enforcement off: no netns, not applied)",
-                    result.rules_applied,
-                    result.nft_commands.len()
+                log::warn!(
+                    "egress: validated {} rules but did NOT enforce them: this VMM is not \
+                     confined to a per-VM network namespace (serve --jail --netns), so the \
+                     guest's traffic is unrestricted unless the caller enforces the policy",
+                    result.rules_applied
                 );
                 ApiResponse::EgressUpdated {
                     rules_applied: result.rules_applied,
+                    enforced: false,
                 }
             }
         }
@@ -387,9 +392,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         },
         ApiRequest::Status => match controller.status() {
             Ok(status) => ApiResponse::Status(status),
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
     }
 }
@@ -889,10 +892,58 @@ mod tests {
             ApiRequest::Snapshot {
                 diff: false,
                 live: true,
+                capture_disks: false,
+                base: None,
+                resume: false,
             },
             &controller,
         );
         assert!(matches!(resp, ApiResponse::Err { .. }));
+    }
+
+    #[test]
+    fn dispatch_snapshot_with_base_and_resume_without_vm_returns_no_vm_err() {
+        let controller = VmmController::new();
+        let req: ApiRequest = serde_json::from_str(
+            r#"{"op":"snapshot","diff":false,"capture_disks":true,"base":"/snapshots/prev.snap","resume":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &req,
+            ApiRequest::Snapshot { base: Some(b), resume: true, .. } if b == "/snapshots/prev.snap"
+        ));
+        match dispatch(req, &controller) {
+            ApiResponse::Err { msg } => {
+                assert!(msg.contains("no VM"), "unexpected error: {msg}");
+                assert!(!msg.contains("bad request"), "unexpected error: {msg}");
+            }
+            other => panic!("expected no-VM error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_snapshot_base_and_resume_do_not_change_no_vm_error() {
+        let snapshot = |base: Option<String>, resume: bool| {
+            let controller = VmmController::new();
+            match dispatch(
+                ApiRequest::Snapshot {
+                    diff: false,
+                    live: false,
+                    capture_disks: false,
+                    base,
+                    resume,
+                },
+                &controller,
+            ) {
+                ApiResponse::Err { msg } => msg,
+                other => panic!("expected no-VM error, got {other:?}"),
+            }
+        };
+        let plain = snapshot(None, false);
+        assert!(plain.contains("no VM"), "unexpected error: {plain}");
+        assert_eq!(snapshot(Some("/b.snap".into()), false), plain);
+        assert_eq!(snapshot(None, true), plain);
+        assert_eq!(snapshot(Some("/b.snap".into()), true), plain);
     }
 
     #[test]
@@ -995,9 +1046,7 @@ mod tests {
         }
         assert!(controller.status().is_ok());
 
-        let sock = std::env::current_dir()
-            .unwrap()
-            .join(format!(".vmm-teardown-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!(".vmm-teardown-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         assert!(sock.exists());
@@ -1043,9 +1092,7 @@ mod tests {
 
     #[test]
     fn harden_socket_permissions_sets_socket_mode_0600() {
-        let sock = std::env::current_dir()
-            .unwrap()
-            .join(format!(".vmm-api-perms-{}.sock", std::process::id()));
+        let sock = std::env::temp_dir().join(format!(".vmm-api-perms-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
 

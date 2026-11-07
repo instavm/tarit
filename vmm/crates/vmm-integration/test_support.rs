@@ -53,9 +53,10 @@ pub fn agent_vm_config(memory_mib: u64) -> VmConfig {
     VmConfig {
         kernel: KernelConfig {
             path: kernel_path().to_string_lossy().into_owned(),
-            cmdline: "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 reboot=k panic=1 \
-                pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr root=/dev/vda rw \
-                init=/usr/sbin/vmm-agent"
+            // Same console settings as taritd's default command line.
+            cmdline: "earlycon=uart8250,io,0x3f8,115200n8 console=ttyS0 quiet loglevel=4 \
+                reboot=k panic=1 pci=off i8042.noaux random.trust_cpu=on nowatchdog nokaslr \
+                root=/dev/vda rw init=/usr/sbin/vmm-agent"
                 .into(),
             initramfs: None,
         },

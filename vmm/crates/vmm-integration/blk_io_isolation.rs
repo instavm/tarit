@@ -182,6 +182,10 @@ fn storage_quiescence_timeout_fails_snapshot_and_resumes_source() {
         "unexpected snapshot failure: {error}"
     );
     assert!(
+        error.is_retryable(),
+        "a healthy busy block worker must be reported as retryable: {error}"
+    );
+    assert!(
         (Duration::from_millis(4_800)..Duration::from_secs(6)).contains(&snapshot_elapsed),
         "block-worker timeout was not bounded at five seconds: {snapshot_elapsed:?}"
     );

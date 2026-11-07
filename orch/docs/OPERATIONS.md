@@ -209,10 +209,12 @@ reference.
 
 ## Warm pool operations
 
-Enable the warm pool with environment overrides:
+The warm pool is on by default: eight 1 vCPU / 256 MiB VMs on the default
+rootfs, refilled by restoring clones of one golden snapshot. Set
+`TARIT_WARM_POOL=0` to turn it off. To size or point it elsewhere with
+environment overrides:
 
 ```sh
-export TARIT_WARM_POOL=true
 export TARIT_WARM_POOL_TARGET=8
 export TARIT_CPU_OVERCOMMIT=4.0
 export TARIT_WARM_POOL_ROOTFS='/var/lib/taritd/rootfs.ext4'
@@ -238,7 +240,7 @@ rootfs = "/var/lib/taritd/rootfs.ext4"
 
 Operational behavior:
 
-- Warm VMs reserve scheduler slots, so assigned plus warm VMs do not exceed `TARIT_MAX_VMS`.
+- Warm VMs reserve scheduler slots, so assigned plus warm VMs do not exceed `TARIT_MAX_VMS`. A create that finds the host full stops an idle warm VM of another class and takes its slot, and refills wait while any create is waiting for capacity.
 - Shutdown and user-boot publication share a boot gate. The global order is
   `terminal transition gate` → `boot gate` → `running`/`warm` → `booting`;
   shutdown releases the boot gate before its separate `running` → `warm`

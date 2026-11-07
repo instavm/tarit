@@ -32,10 +32,20 @@ pub struct VsockPump {
     pause_ack: Arc<AtomicBool>,
     wake_evt: EventFd,
     handle: Option<JoinHandle<()>>,
+    startup: Option<super::worker_startup::PendingStartup>,
     pub device: Arc<VirtioVsockMmio>,
 }
 
 impl VsockPump {
+    /// Wait for a worker from [`start_vsock_pump`] to report that its
+    /// sandbox is installed. Required before the guest runs.
+    pub fn wait_ready(&mut self) -> io::Result<()> {
+        match self.startup.take() {
+            Some(startup) => startup.wait(&mut self.handle),
+            None => Ok(()),
+        }
+    }
+
     pub fn wake_evt(&self) -> io::Result<EventFd> {
         self.wake_evt.try_clone()
     }
@@ -145,6 +155,14 @@ impl Drop for VsockPump {
 /// QUEUE_NOTIFY register (datamatch=1), so guest kicks wake this thread instead
 /// of trapping into the vCPU thread.
 pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::Result<VsockPump> {
+    let mut worker = start_vsock_pump(device, tx_kick_fd)?;
+    worker.wait_ready()?;
+    Ok(worker)
+}
+
+/// [`spawn_vsock_pump`] without waiting for the worker's startup report;
+/// call [`VsockPump::wait_ready`] before the guest runs.
+pub fn start_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::Result<VsockPump> {
     // SAFETY: F_GETFD inspects the descriptor without retaining it. The caller
     // owns the descriptor for the lifetime of the returned worker.
     if unsafe { libc::fcntl(tx_kick_fd, libc::F_GETFD) } < 0 {
@@ -191,26 +209,16 @@ pub fn spawn_vsock_pump(device: Arc<VirtioVsockMmio>, tx_kick_fd: RawFd) -> io::
             }
         })?;
 
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = handle.join();
-            return Err(error);
-        }
-        Err(error) => {
-            let _ = handle.join();
-            return Err(io::Error::other(format!(
-                "vsock worker exited during startup: {error}"
-            )));
-        }
-    }
-
     Ok(VsockPump {
         stop,
         pause_req,
         pause_ack,
         wake_evt,
         handle: Some(handle),
+        startup: Some(super::worker_startup::PendingStartup::new(
+            ready_rx,
+            "vsock worker",
+        )),
         device,
     })
 }

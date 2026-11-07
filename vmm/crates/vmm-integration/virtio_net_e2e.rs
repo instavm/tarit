@@ -161,7 +161,7 @@ fn net_tap_lifecycle() {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap());
     let device = Arc::new(VirtioNetMmio::new(7, MAC));
     device.set_guest_memory(mem.clone());
-    device.set_tap_fd(tap.fd);
+    device.set_tap_fd(tap.fd, tap.vnet_hdr);
     let irq = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
     device.set_irq_evt(irq);
     let kick = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
@@ -189,7 +189,7 @@ fn net_egress_through_real_tap() {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap());
     let device = Arc::new(VirtioNetMmio::new(7, MAC));
     device.set_guest_memory(mem.clone());
-    device.set_tap_fd(tap.fd);
+    device.set_tap_fd(tap.fd, tap.vnet_hdr);
     let irq = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
     device.set_irq_evt(irq);
     let kick = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
@@ -272,7 +272,7 @@ fn net_ingress_through_real_tap() {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap());
     let device = Arc::new(VirtioNetMmio::new(7, MAC));
     device.set_guest_memory(mem.clone());
-    device.set_tap_fd(tap.fd);
+    device.set_tap_fd(tap.fd, tap.vnet_hdr);
     let irq = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
     device.set_irq_evt(irq);
     let kick = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();

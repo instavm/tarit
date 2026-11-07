@@ -24,12 +24,21 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// VIRTIO_F_VERSION_1 (bit 32) is required for virtio-mmio v2 devices.
 /// VIRTIO_BLK_F_FLUSH (bit 9) enables flush support.
 ///
-/// We deliberately do NOT advertise VIRTIO_RING_F_EVENT_IDX (bit 29): our
-/// virtqueue processor uses simple avail/used-index notification and does not
-/// implement the used_event/avail_event suppression that EVENT_IDX requires.
-/// Advertising it made the guest complete exactly one request and then stall,
-/// because its notification bookkeeping diverged from ours.
-const BLK_FEATURES_LOW: u32 = 1 << 9; // FLUSH
+/// VIRTIO_RING_F_EVENT_IDX (bit 29): the queue processor honours the driver's
+/// used_event and publishes avail_event (re-checking the ring after it), so
+/// the guest interrupts and kicks only when the other side asks. (Offering it
+/// before the processor wrote avail_event left the guest waiting for
+/// permission to kick after its first request.)
+/// VIRTIO_BLK_F_SIZE_MAX (bit 1) caps every data segment at the virtqueue's
+/// per-descriptor limit. Without it Linux sends one segment per request of
+/// any size, and a segment over that limit was rejected and never completed,
+/// hanging the guest's I/O under large sequential writes.
+const BLK_FEATURES_LOW: u32 = (1 << 9) | VIRTIO_BLK_F_SIZE_MAX | VIRTIO_RING_F_EVENT_IDX; // FLUSH + SIZE_MAX + EVENT_IDX
+const VIRTIO_RING_F_EVENT_IDX: u32 = 1 << 29;
+const VIRTIO_BLK_F_SIZE_MAX: u32 = 1 << 1;
+/// VIRTIO_BLK_F_RO (bit 5): offered only for a read-only backend, so the guest
+/// marks the disk read-only instead of discovering it through write errors.
+const VIRTIO_BLK_F_RO: u32 = 1 << 5;
 const BLK_FEATURES_HIGH: u32 = 1; // bit 32 = VIRTIO_F_VERSION_1
 
 /// virtio interrupt status bits.
@@ -364,6 +373,23 @@ impl VirtioBlkMmio {
         *self.lock_state(&self.irq_evt, "irq_evt") = Some(evt);
     }
 
+    /// Fire the interrupt again if one is still unacknowledged. A restore
+    /// brings back this status register but not the interrupt itself: one
+    /// raised just before the snapshot captured the vCPUs exists nowhere
+    /// else, and the guest would wait for it forever. The guest reads the
+    /// status before acting, so a repeated interrupt is harmless.
+    pub fn reassert_pending_interrupt(&self) {
+        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
+            if let Some(evt) = guard.as_ref() {
+                let _ = evt.write(1);
+            }
+        }
+    }
+
     /// Signal an interrupt to the guest.
     #[cfg(target_os = "linux")]
     fn trigger_interrupt(&self) -> MmioWriteResult {
@@ -483,6 +509,46 @@ impl VirtioBlkMmio {
         cursor
     }
 
+    /// Read a request's data straight into its guest buffers (every
+    /// writable descriptor but the trailing status byte). `None` when a
+    /// buffer is not plain guest memory; the caller then reads through a
+    /// bounce buffer.
+    fn read_into_guest(
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        backend: &mut BlkBackend,
+        header: &BlkReqHeader,
+        writable: &[(u64, u32)],
+    ) -> Option<u8> {
+        use vm_memory::GuestMemoryBackend;
+
+        let data = &writable[..writable.len().saturating_sub(1)];
+        let mut guards = Vec::with_capacity(data.len());
+        let mut iov = Vec::with_capacity(data.len());
+        for &(addr, len) in data {
+            for slice in mem.get_slices(GuestAddress(addr), len as usize) {
+                let slice = slice.ok()?;
+                let guard = slice.ptr_guard_mut();
+                iov.push(libc::iovec {
+                    iov_base: guard.as_ptr().cast(),
+                    iov_len: slice.len(),
+                });
+                guards.push(guard);
+            }
+        }
+        // SAFETY: each iovec is guest RAM from `mem`, which outlives the call,
+        // guarded by `guards`; the VMM does not otherwise touch a request's
+        // buffers until it is completed.
+        let st = unsafe { backend.service_read_into(header, &iov) };
+        drop(guards);
+        if let Some(dirty) = dirty {
+            for &(addr, len) in data {
+                dirty.mark_guest_range(addr, u64::from(len));
+            }
+        }
+        Some(st)
+    }
+
     fn write_status(
         mem: &GuestMemoryMmap,
         dirty: Option<&SoftwareDirtyBitmap>,
@@ -554,6 +620,10 @@ impl VirtioBlkMmio {
         } else {
             proc_guard.as_mut().unwrap().update_config(config);
         }
+        let event_idx =
+            self.guest_features_low.load(Ordering::Relaxed) & VIRTIO_RING_F_EVENT_IDX != 0;
+        proc_guard.as_mut().unwrap().set_event_idx(event_idx);
+        let old_used = proc_guard.as_ref().unwrap().last_used_idx();
 
         let mut backend_guard = self.try_lock_state(&self.backend, "backend")?;
         if backend_guard.is_none() {
@@ -662,6 +732,10 @@ impl VirtioBlkMmio {
                         };
                         if data_len == 0 {
                             status::IO_ERR
+                        } else if let Some(st) =
+                            Self::read_into_guest(&mem, dirty.as_ref(), backend, &header, writable)
+                        {
+                            st
                         } else {
                             let mut data = vec![0u8; data_len];
                             let st = backend.service(&header, &mut data);
@@ -692,7 +766,13 @@ impl VirtioBlkMmio {
         // If we processed any requests, signal an interrupt to the guest.
         if _count > 0 {
             log::debug!("BLK process_queue: processed {_count} request(s)");
-            self.trigger_interrupt()?;
+            if proc_guard
+                .as_ref()
+                .unwrap()
+                .needs_notification(&mem, old_used)
+            {
+                self.trigger_interrupt()?;
+            }
         }
         if processing_failed || self.is_failed() {
             Err(MmioError::Device)
@@ -789,7 +869,14 @@ impl MmioDevice for VirtioBlkMmio {
                 // Page 0 = bits 0-31 (EVENT_IDX, FLUSH, etc.)
                 // Page 1 = bits 32-63 (VIRTIO_F_VERSION_1)
                 match self.host_features_sel.load(Ordering::Relaxed) {
-                    0 => BLK_FEATURES_LOW,
+                    0 => {
+                        let backend = self.lock_state(&self.backend, "backend");
+                        if backend.as_ref().is_some_and(|b| b.read_only) {
+                            BLK_FEATURES_LOW | VIRTIO_BLK_F_RO
+                        } else {
+                            BLK_FEATURES_LOW
+                        }
+                    }
                     1 => BLK_FEATURES_HIGH,
                     _ => 0,
                 }
@@ -819,13 +906,14 @@ impl MmioDevice for VirtioBlkMmio {
                 let backend = self.lock_state(&self.backend, "backend");
                 match &*backend {
                     Some(b) => {
-                        let cap_bytes = b.sectors.to_le_bytes();
-                        let blk_size: u32 = 512;
-                        let size_bytes = blk_size.to_le_bytes();
-                        // Build the config space: [capacity u64][blk_size u32]
+                        // virtio-blk config space (virtio 1.x §5.2.4):
+                        // [capacity u64][size_max u32]. Fields for features
+                        // we do not offer (seg_max, geometry, blk_size, ...)
+                        // read as zero.
                         let mut cfg = [0u8; 12];
-                        cfg[..8].copy_from_slice(&cap_bytes);
-                        cfg[8..12].copy_from_slice(&size_bytes);
+                        cfg[..8].copy_from_slice(&b.sectors.to_le_bytes());
+                        cfg[8..12]
+                            .copy_from_slice(&crate::virtio::vqueue::MAX_DESC_LEN.to_le_bytes());
                         // Return the requested 4-byte window.
                         let end = (cfg_off + 4).min(cfg.len());
                         if cfg_off < end {
@@ -1329,6 +1417,39 @@ mod tests {
     }
 
     #[test]
+    fn size_max_matches_the_descriptor_limit_at_its_spec_offset() {
+        let (backend, path) = new_test_backend("blk-size-max");
+        let dev = VirtioBlkMmio::new(5, backend);
+        dev.mmio_write(reg::HOST_FEATURES_SEL, 0, 4).unwrap();
+        let features = dev.mmio_read(reg::HOST_FEATURES, 4).unwrap();
+        assert_ne!(features & u64::from(VIRTIO_BLK_F_SIZE_MAX), 0);
+        assert_eq!(
+            dev.mmio_read(reg::CONFIG + 8, 4).unwrap(),
+            u64::from(crate::virtio::vqueue::MAX_DESC_LEN)
+        );
+        // 4096-byte test disk = 8 sectors.
+        assert_eq!(dev.mmio_read(reg::CONFIG, 4).unwrap(), 8);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_only_backends_offer_the_ro_feature() {
+        let (backend, path) = new_test_backend("blk-ro-feature");
+        drop(backend);
+        let host_features_low = |read_only| {
+            let dev = VirtioBlkMmio::new(5, BlkBackend::open(&path, read_only).unwrap());
+            dev.mmio_write(reg::HOST_FEATURES_SEL, 0, 4).unwrap();
+            dev.mmio_read(reg::HOST_FEATURES, 4).unwrap()
+        };
+        assert_eq!(host_features_low(false), u64::from(BLK_FEATURES_LOW));
+        assert_eq!(
+            host_features_low(true),
+            u64::from(BLK_FEATURES_LOW | VIRTIO_BLK_F_RO)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn persist_round_trips_queue_processor_indices() {
         let (backend, path) = new_test_backend("blk-persist-processor");
         let mem = new_test_mem();
@@ -1418,5 +1539,36 @@ mod tests {
             restored.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(),
             state.interrupt_status as u64
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_pending_interrupt_is_raised_again() {
+        // A completion the guest has not acknowledged survives in the saved
+        // status register only.
+        let source = VirtioBlkMmio::new_stub(5, 2);
+        source
+            .interrupt_status
+            .store(VIRTIO_MMIO_INT_VRING, Ordering::SeqCst);
+        let state = source.try_save().expect("save");
+
+        let mut restored = VirtioBlkMmio::new_stub(5, 2);
+        let evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).expect("evt");
+        restored.set_irq_evt(evt.try_clone().expect("clone evt"));
+        restored.restore(state);
+        assert!(evt.read().is_err(), "restore alone raises nothing");
+        restored.reassert_pending_interrupt();
+        assert_eq!(evt.read().expect("interrupt raised"), 1);
+        assert_eq!(
+            restored.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(),
+            u64::from(VIRTIO_MMIO_INT_VRING)
+        );
+
+        // Once the guest acknowledges it, nothing is raised again.
+        restored
+            .mmio_write(reg::INTERRUPT_ACK, u64::from(VIRTIO_MMIO_INT_VRING), 4)
+            .unwrap();
+        restored.reassert_pending_interrupt();
+        assert!(evt.read().is_err());
     }
 }

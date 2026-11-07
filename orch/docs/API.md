@@ -248,7 +248,8 @@ Request:
   "kernel_path": "optional admin-only kernel override",
   "image": "optional registered image name[:tag]",
   "rootfs_path": "optional admin-only rootfs override, empty string means no rootfs",
-  "cmdline": "optional kernel command line override"
+  "cmdline": "optional kernel command line override",
+  "egress": { "allowlist": ["0.0.0.0/0:443/tcp", "10.0.0.2/32:53/udp"], "allow_existing": false }
 }
 ```
 
@@ -263,6 +264,11 @@ Defaults from `tarit-types` and `Config`:
 | `image` | unset; when present it resolves through the node-local image registry and cannot be combined with `rootfs_path` |
 | `rootfs_path` | `TARIT_ROOTFS`; admin-only override; empty string disables rootfs |
 | `cmdline` | default virtio block kernel cmdline when rootfs exists, otherwise `console=ttyS0 panic=1` |
+| `egress` | unset. With `TARIT_ENABLE_NET=1` a VM can reach nothing until it has an egress policy; set one here (same form as `PATCH /v1/egress/vm/{id}`) to create the VM with it. An invalid policy is rejected with `400` before anything is created, and if it cannot be applied the new VM is removed and the create fails. |
+
+A fork inherits its source's egress policy. Networked guests get the resolvers
+in `TARIT_GUEST_DNS`; allow them in the egress policy (for example
+`<resolver>/32:53/udp`) for name resolution to work.
 
 Response `201`: `VmRecord`.
 
@@ -464,9 +470,14 @@ unavailable).
 ### `POST /v1/vms/{id}/snapshot`
 
 Resolve the owner and publish an authenticated snapshot behind an opaque UUID.
-Host paths, physical host identity, and artifact locators remain private. Only
-full snapshots are accepted. `diff: true` returns `422` before contacting the
-VMM because durable parent-chain relocation is not implemented yet.
+Host paths, physical host identity, and artifact locators remain private.
+
+Every snapshot is a standalone full snapshot: it can be restored, forked or
+deleted without any other snapshot. Capture is incremental anyway. After the
+VM was restored or woken from a snapshot, or after its last snapshot on a node
+without VM jails, the guest is paused only to write the memory pages it changed
+since then; the rest is copied from that earlier snapshot after the guest
+resumes. `diff: true` is accepted and behaves the same way.
 
 Request:
 
@@ -485,7 +496,42 @@ Response `200`:
 ```
 
 Status codes: `200`, `401`, `403`, `404`, `409` (the lifecycle state does not
-support snapshots), `422` (`diff` is true), `500`.
+support snapshots), `500`.
+
+### `GET /v1/snapshots`
+
+List the caller's snapshots held by this node, oldest first. Snapshots owned
+by a fork or used as a hibernated VM's wake image are managed by that VM and
+are not listed.
+
+Response `200`:
+
+```json
+[
+  {
+    "snapshot_id": "uuid",
+    "source_vm_id": "uuid",
+    "created_at": "2026-11-06T07:52:00Z",
+    "size_bytes": 41943040,
+    "memory_mib": 256,
+    "vcpus": 1
+  }
+]
+```
+
+Status codes: `200`, `401`.
+
+### `DELETE /v1/snapshots/{id}`
+
+Delete a snapshot and its files. Snapshots are kept until deleted, so a client
+that checkpoints often should delete the ones it no longer needs; otherwise
+the node eventually reaches disk pressure and refuses new snapshots with `429`.
+A snapshot that a branch head references, a hibernated VM would wake from, or
+a fork owns is refused. Delete the branch first to release a branch head.
+
+Status codes: `204`, `401`, `404` (unknown, or another tenant's), `409`
+(still referenced), `422` (held by another node), `503` (fleet store
+unavailable).
 
 ### `POST /v1/restore`
 
@@ -644,7 +690,7 @@ Status codes: `200`, `401`, `403`, `500`.
 
 ### `GET /v1/usage`
 
-Aggregated per-key usage stats from the primary store. Requires a fleet database. Admins see every key; a non-admin key sees only its own. Query parameters: `from`, `to` (RFC3339; default last 30 days), and `api_key_id` (admin only).
+Aggregated per-key usage stats from the primary store, or from the node's local outbox when no fleet database is configured. Admins see every key; a non-admin key sees only its own. Query parameters: `from`, `to` (RFC3339; default last 30 days), and `api_key_id` (admin only).
 
 ```json
 [
@@ -652,11 +698,11 @@ Aggregated per-key usage stats from the primary store. Requires a fleet database
 ]
 ```
 
-Status codes: `200`, `401`, `500` (500 if no fleet database is configured).
+Status codes: `200`, `401`, `500`.
 
 ### `GET /v1/audit`
 
-Recent audit trail, newest first. Requires a fleet database. Admins see every key; a non-admin key sees only its own. Query parameters: `api_key_id` (admin only), `vm_id`, `limit` (default 100, max 1000).
+Recent audit trail, newest first, from the primary store or, without a fleet database, the node's local outbox. Admins see every key; a non-admin key sees only its own. Query parameters: `api_key_id` (admin only), `vm_id`, `limit` (default 100, max 1000).
 
 ```json
 [

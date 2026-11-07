@@ -17,7 +17,8 @@ class RestoreRequest:
     """
     Attributes:
         snapshot_id (UUID): Opaque snapshot handle. Physical storage paths and host placement are never public.
-        id (UUID | Unset): Optional id for the restored VM; generated when omitted.
+        id (UUID | Unset): Optional id for the restored VM; generated when omitted. Ids of deleted VMs stay reserved for
+            TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
     """
 
     snapshot_id: UUID

@@ -1,0 +1,30 @@
+{
+  "name": "@computesdk/tarit",
+  "version": "0.1.0",
+  "description": "Tarit microVM sandboxes for ComputeSDK",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/instavm/tarit.git",
+    "directory": "sdk/computesdk"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --sourcemap",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@computesdk/provider": "^2.1.22",
+    "computesdk": "^4.1.16"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

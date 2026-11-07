@@ -9,6 +9,7 @@ from attrs import define as _attrs_define
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.create_vm_request_egress import CreateVmRequestEgress
     from ..models.vm_volume_attachment_request import VmVolumeAttachmentRequest
 
 
@@ -21,7 +22,8 @@ class CreateVmRequest:
     the root disk, exact-host constrained for local_block, and remain external across snapshot/hibernate operations.
 
         Attributes:
-            id (UUID | Unset):
+            id (UUID | Unset): Optional VM id; generated when omitted. A create with the id of an existing VM is refused
+                with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
             memory_mib (int | Unset):  Default: 256.
             vcpus (int | Unset):  Default: 1.
             kernel_path (str | Unset):
@@ -29,6 +31,9 @@ class CreateVmRequest:
             rootfs_path (str | Unset):
             cmdline (str | Unset):
             volumes (list[VmVolumeAttachmentRequest] | Unset):
+            egress (CreateVmRequestEgress | Unset): Egress policy applied as the VM is created, in the same form as PATCH
+                /v1/egress/vm/{id}. Without one, a networked VM can reach nothing. Invalid policies are rejected before anything
+                is created; if the policy cannot be applied, the VM is removed and the create fails.
     """
 
     id: UUID | Unset = UNSET
@@ -39,6 +44,7 @@ class CreateVmRequest:
     rootfs_path: str | Unset = UNSET
     cmdline: str | Unset = UNSET
     volumes: list[VmVolumeAttachmentRequest] | Unset = UNSET
+    egress: CreateVmRequestEgress | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         id: str | Unset = UNSET
@@ -64,6 +70,10 @@ class CreateVmRequest:
                 volumes_item = volumes_item_data.to_dict()
                 volumes.append(volumes_item)
 
+        egress: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.egress, Unset):
+            egress = self.egress.to_dict()
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -83,11 +93,14 @@ class CreateVmRequest:
             field_dict["cmdline"] = cmdline
         if volumes is not UNSET:
             field_dict["volumes"] = volumes
+        if egress is not UNSET:
+            field_dict["egress"] = egress
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.create_vm_request_egress import CreateVmRequestEgress  # noqa: PLC0415
         from ..models.vm_volume_attachment_request import VmVolumeAttachmentRequest  # noqa: PLC0415
 
         d = dict(src_dict)
@@ -119,6 +132,13 @@ class CreateVmRequest:
 
                 volumes.append(volumes_item)
 
+        _egress = d.pop("egress", UNSET)
+        egress: CreateVmRequestEgress | Unset
+        if isinstance(_egress, Unset):
+            egress = UNSET
+        else:
+            egress = CreateVmRequestEgress.from_dict(_egress)
+
         create_vm_request = cls(
             id=id,
             memory_mib=memory_mib,
@@ -128,6 +148,7 @@ class CreateVmRequest:
             rootfs_path=rootfs_path,
             cmdline=cmdline,
             volumes=volumes,
+            egress=egress,
         )
 
         return create_vm_request
