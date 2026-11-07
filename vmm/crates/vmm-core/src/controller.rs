@@ -846,7 +846,13 @@ impl VmmController {
             config.kernel.cmdline.clone()
         };
 
-        if config.memory.boot_size_mib.is_some() {
+        // Auto-online plugged virtio-mem blocks unless the caller chose a
+        // policy (e.g. `online_movable`, which makes later unplug reliable).
+        if config.memory.boot_size_mib.is_some()
+            && !cmdline
+                .split_whitespace()
+                .any(|arg| arg.starts_with("memhp_default_state="))
+        {
             cmdline.push_str(" memhp_default_state=online");
         }
         // Running VMs always need an in-kernel IRQCHIP + PIT. Without it KVM has
@@ -2021,6 +2027,70 @@ impl VmmController {
         ))
     }
 
+    /// Live virtio-mem sizes of a hotplug-ready VM.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn memory_hotplug_status(&self) -> Result<tarit_proto::MemoryHotplugStatus> {
+        let (device, _) = self.memory_hotplug_device()?;
+        Ok(crate::memory_hotplug::status(&device))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn memory_hotplug_status(&self) -> Result<tarit_proto::MemoryHotplugStatus> {
+        Err(VmmError::Device("virtio-mem needs Linux+KVM+boot".into()))
+    }
+
+    /// Set the requested hotplug size (MiB, excluding boot RAM) of a live VM;
+    /// see [`crate::memory_hotplug::set_requested`]. The controller lock is
+    /// released before any wait, so vCPU MMIO and other readers proceed.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn set_memory_hotplug(
+        &self,
+        requested_size_mib: u64,
+        wait_timeout_ms: Option<u64>,
+    ) -> Result<tarit_proto::MemoryHotplugStatus> {
+        let (device, state) = self.memory_hotplug_device()?;
+        if wait_timeout_ms.is_some() && state != VmState::Running {
+            return Err(VmmError::InvalidConfig(format!(
+                "waiting for the guest requires a running VM (state: {state:?})"
+            )));
+        }
+        crate::memory_hotplug::set_requested(
+            &device,
+            requested_size_mib,
+            wait_timeout_ms.map(std::time::Duration::from_millis),
+        )
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn set_memory_hotplug(
+        &self,
+        _requested_size_mib: u64,
+        _wait_timeout_ms: Option<u64>,
+    ) -> Result<tarit_proto::MemoryHotplugStatus> {
+        Err(VmmError::Device("virtio-mem needs Linux+KVM+boot".into()))
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn memory_hotplug_device(
+        &self,
+    ) -> Result<(Arc<vmm_devices::virtio::mem::VirtioMemMmio>, VmState)> {
+        let slot = self.lock();
+        let vm = slot
+            .as_ref()
+            .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        let device = vm
+            .running
+            .as_ref()
+            .and_then(|running| running.memory_device.clone())
+            .ok_or_else(|| {
+                VmmError::InvalidConfig(
+                    "VM has no active virtio-mem device (create it with memory.boot_size_mib)"
+                        .into(),
+                )
+            })?;
+        Ok((device, vm.state))
+    }
+
     pub fn balloon_state(&self) -> Result<(u32, u32)> {
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         {
@@ -2560,7 +2630,9 @@ fn await_memory_online(controller: &VmmController) -> Result<()> {
     let command = format!("VMM_MEMORY_ONLINE_V1:{region}:{requested}");
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        if device.plugged_total_mib() == device.target_total_mib() && channel.is_connected() {
+        // At least the requested RAM: a snapshot taken mid-shrink restores
+        // with plugged > requested and the guest keeps unplugging.
+        if device.plugged_total_mib() >= device.target_total_mib() && channel.is_connected() {
             let timeout = deadline
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_secs(2));

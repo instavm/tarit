@@ -387,6 +387,21 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 msg: error.to_string(),
             },
         },
+        ApiRequest::MemoryHotplugStatus => match controller.memory_hotplug_status() {
+            Ok(status) => ApiResponse::MemoryHotplug(status),
+            Err(error) => ApiResponse::Err {
+                msg: error.to_string(),
+            },
+        },
+        ApiRequest::SetMemoryHotplug {
+            requested_size_mib,
+            wait_timeout_ms,
+        } => match controller.set_memory_hotplug(requested_size_mib, wait_timeout_ms) {
+            Ok(status) => ApiResponse::MemoryHotplug(status),
+            Err(error) => ApiResponse::Err {
+                msg: error.to_string(),
+            },
+        },
         ApiRequest::Status => match controller.status() {
             Ok(status) => ApiResponse::Status(status),
             Err(e) => ApiResponse::Err {
@@ -921,6 +936,23 @@ mod tests {
             response,
             ApiResponse::Exec { stdout, .. } if stdout.starts_with("[output truncated]")
         ));
+    }
+
+    #[test]
+    fn dispatch_memory_hotplug_without_vm_returns_err() {
+        let controller = VmmController::new();
+        for request in [
+            ApiRequest::MemoryHotplugStatus,
+            ApiRequest::SetMemoryHotplug {
+                requested_size_mib: 128,
+                wait_timeout_ms: Some(1_000),
+            },
+        ] {
+            assert!(matches!(
+                dispatch(request, &controller),
+                ApiResponse::Err { .. }
+            ));
+        }
     }
 
     #[test]
