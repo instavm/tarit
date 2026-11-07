@@ -140,10 +140,15 @@ class Loop:
             raise Failure("%s: guest sees %s, expected %s" % (label, got, want))
         self.log("%-34s ok (%s)" % (label, " ".join(got)))
 
-    def restore(self, snapshot, label, markers):
+    def restore(self, snapshot, label, markers, keep=True):
         vm = expect("POST", "/v1/restore", {"snapshot_id": snapshot}, codes=(200, 201))["id"]
         self.vms.append(vm)
         self.verify(vm, label, markers)
+        if not keep:
+            # Only checked, never used again: free its slot so a loop holds
+            # at most four VMs at once.
+            expect("DELETE", "/v1/vms/" + vm, codes=(204,))
+            self.vms.remove(vm)
         return vm
 
     def run(self):
@@ -171,8 +176,8 @@ class Loop:
         self.mark(r2)
         s4, m4 = self.snapshot(r2, "s4 after restore (base s2)")
         r4 = self.restore(s4, "restore s4", m4)
-        self.restore(s3, "restore s3", m3)
-        self.restore(sp, "restore paused snapshot", m3)
+        self.restore(s3, "restore s3", m3, keep=False)
+        self.restore(sp, "restore paused snapshot", m3, keep=False)
 
         # Hibernate deletes nothing visible; wake consumes the wake image.
         expect("POST", "/v1/vms/%s/hibernate" % r4, {})
@@ -181,12 +186,12 @@ class Loop:
         self.verify(r4, "after wake", m4)
         self.mark(r4)
         s5, m5 = self.snapshot(r4, "s5 after wake (base wake image)")
-        self.restore(s5, "restore s5", m5)
+        self.restore(s5, "restore s5", m5, keep=False)
 
         # s2 is standalone: deleting the snapshot it was taken against is fine.
         expect("DELETE", "/v1/snapshots/" + s1, codes=(204,))
         self.snapshots.remove(s1)
-        self.restore(s2, "restore s2 after deleting s1", m2)
+        self.restore(s2, "restore s2 after deleting s1", m2, keep=False)
 
     def cleanup(self):
         for vm in self.vms:

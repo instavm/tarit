@@ -46,7 +46,8 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Each loop holds at most three VMs at once.
+# Each loop holds at most four 2-vCPU VMs at once: the source, two restores
+# it keeps working with, and one restore that is checked and deleted.
 TARIT_API_KEY="$KEY" \
 TARIT_LISTEN="127.0.0.1:$PORT" \
 TARIT_RPC_ADDR="$BASE_URL" \
@@ -60,9 +61,9 @@ TARIT_SOCKET_DIR="$DIR/sockets" \
 TARIT_DB="$DIR/fleet.db" \
 TARIT_CONFIG="$DIR/none.toml" \
 TARIT_WARM_POOL=0 \
-TARIT_MAX_VMS=$((PARALLEL * 3 + 2)) \
-TARIT_MAX_VCPUS=$((PARALLEL * 6 + 4)) \
-TARIT_MAX_MEMORY_MIB=$((PARALLEL * 3 * 512 + 1024)) \
+TARIT_MAX_VMS=$((PARALLEL * 4 + 2)) \
+TARIT_MAX_VCPUS=$((PARALLEL * 8 + 4)) \
+TARIT_MAX_MEMORY_MIB=$((PARALLEL * 4 * 512 + 1024)) \
 TARIT_REAP_ON_SHUTDOWN=true \
 TARIT_PRODUCTION=0 \
 RUST_LOG=taritd=info \
