@@ -154,6 +154,14 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Creates slowed down as a host's history grew: every create counted its
+  tenant's active VMs by reading the whole `vms` table, deleted VMs
+  included, while holding the store. The count now uses an index on
+  `(owner_key, status)` and is skipped for tenants without a quota, and the
+  store keeps a 64 MiB page cache instead of SQLite's 2 MiB. With about
+  3,000 past VMs, a warm-pool create went from about 3 ms to 1.2 ms, and
+  eight at a time from about 340 to 1,300 per second on the reference host.
+
 - Stopping a lazily restored VM (every fork child, and restores through
   taritd) waited up to half a second for its page-fault handler to notice:
   the handler only checked for shutdown between 500 ms polls. Shutdown now

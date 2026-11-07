@@ -154,10 +154,15 @@ impl Store {
         // the single shared connection sustain a 200-wide burst (create + exec +
         // 15ms status polling) without serializing on fsync.
         conn.busy_timeout(Duration::from_secs(5))?;
+        // A 64 MiB page cache (SQLite's default is 2 MiB) holds the working
+        // set of a host's records, so a create under memory pressure does not
+        // read pages back from disk while holding the store.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA cache_size = -65536;
+             PRAGMA temp_store = MEMORY;
              CREATE TABLE IF NOT EXISTS vms (
                id TEXT PRIMARY KEY NOT NULL,
                host_id TEXT NOT NULL,
@@ -457,6 +462,12 @@ impl Store {
         ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
         ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
         ensure_column(&conn, "images", "prewarm", "TEXT")?;
+        // Every create counts its tenant's active VMs; without this the count
+        // read the whole table, deleted VMs included, under the store lock.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS vms_owner_status ON vms(owner_key, status)",
+            [],
+        )?;
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
         ensure_column(&conn, "snapshots", "kernel_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "rootfs_path", "TEXT")?;
@@ -1733,20 +1744,23 @@ impl Store {
             tx.commit()?;
             return Ok(VmQuotaReservationOutcome::IdConflict);
         }
-        let active: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM (
-               SELECT id FROM vms
-                WHERE owner_key = ?1 AND status IN ('creating','running','paused','suspended')
-               UNION
-               SELECT id FROM vm_quota_reservations
-                WHERE owner_key = ?1 AND expires_at > ?2
-             )",
-            params![owner_key, now],
-            |row| row.get(0),
-        )?;
-        if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
-            tx.commit()?;
-            return Ok(VmQuotaReservationOutcome::QuotaExceeded);
+        // An unlimited tenant needs only the id fence below, not a count.
+        if max_vms != usize::MAX {
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM (
+                   SELECT id FROM vms
+                    WHERE owner_key = ?1 AND status IN ('creating','running','paused','suspended')
+                   UNION
+                   SELECT id FROM vm_quota_reservations
+                    WHERE owner_key = ?1 AND expires_at > ?2
+                 )",
+                params![owner_key, now],
+                |row| row.get(0),
+            )?;
+            if active >= i64::try_from(max_vms).unwrap_or(i64::MAX) {
+                tx.commit()?;
+                return Ok(VmQuotaReservationOutcome::QuotaExceeded);
+            }
         }
         tx.execute(
             "INSERT INTO vm_quota_reservations (id, owner_key, expires_at)
@@ -4251,6 +4265,26 @@ mod tests {
             store.get_image("node", "20"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn the_tenant_vm_count_reads_an_index_not_the_table() {
+        let store = Store::open(":memory:").unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM vms
+                  WHERE owner_key = 'tenant' AND status IN ('creating','running','paused','suspended')",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("vms_owner_status")),
+            "tenant count plan: {plan:?}"
+        );
     }
 
     #[test]
