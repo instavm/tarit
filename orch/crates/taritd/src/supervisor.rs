@@ -2877,6 +2877,14 @@ struct WarmVm {
     spec: VmSpawnConfig,
 }
 
+/// A warm class added for a shape creates asked for (see
+/// [`VmmSupervisor::learn_warm_class`]).
+#[derive(Debug, Clone)]
+struct LearnedClass {
+    class: WarmClass,
+    last_demand: Instant,
+}
+
 /// Prefix of the error a boot gets when the host has no capacity for it.
 pub(crate) const HOST_CAPACITY_EXHAUSTED: &str = "host resource capacity exhausted";
 
@@ -3035,8 +3043,12 @@ pub struct VmmSupervisor {
     scheduler: Arc<Scheduler>,
     golden_artifacts: Mutex<Vec<OwnedArtifact>>,
     /// Ready golden snapshot of each restore warm class, by the class's
-    /// spawn configuration. Its files live until shutdown.
+    /// spawn configuration. Its files live until the class is retired or
+    /// taritd shuts down.
     goldens: Mutex<HashMap<VmSpawnConfig, GoldenBundle>>,
+    /// Warm classes taritd added on its own for VM shapes that creates ask
+    /// for, with when each was last asked for.
+    learned: Mutex<HashMap<VmSpawnConfig, LearnedClass>>,
     in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
     unexpected_exits: Mutex<VecDeque<UnexpectedVmmExit>>,
     net: Option<NetProvisioner>,
@@ -3241,6 +3253,7 @@ impl VmmSupervisor {
             scheduler,
             golden_artifacts: Mutex::new(Vec::new()),
             goldens: Mutex::new(HashMap::new()),
+            learned: Mutex::new(HashMap::new()),
             in_progress_artifacts: Arc::new(Mutex::new(HashSet::new())),
             unexpected_exits: Mutex::new(VecDeque::new()),
             net,
@@ -4601,13 +4614,28 @@ impl VmmSupervisor {
     /// waiting create's own class has none of those, or it would have claimed
     /// one. Returns whether a VM was stopped and its capacity released.
     pub(crate) fn reclaim_idle_warm(&self) -> bool {
+        self.reclaim_idle_warm_where(|_| true)
+    }
+
+    /// Whether any parked warm VM's spawn configuration fails `keep`.
+    pub(crate) fn has_warm_outside(&self, keep: impl Fn(&VmSpawnConfig) -> bool) -> bool {
+        self.warm
+            .lock()
+            .map(|warm| warm.iter().any(|vm| !keep(&vm.spec)))
+            .unwrap_or(false)
+    }
+
+    /// Stop one unclaimed warm VM whose spawn configuration `select` accepts.
+    pub(crate) fn reclaim_idle_warm_where(&self, select: impl Fn(&VmSpawnConfig) -> bool) -> bool {
         let gate = self.boot_gate.blocking_write();
         if self.is_shutting_down() {
             return false;
         }
         let taken = self.warm.lock().ok().and_then(|mut warm| {
             let claims = self.warm_claims.lock().ok()?;
-            let index = warm.iter().position(|vm| !claims.contains(&vm.id))?;
+            let index = warm
+                .iter()
+                .position(|vm| !claims.contains(&vm.id) && select(&vm.spec))?;
             warm.remove(index)
         });
         drop(gate);
@@ -4618,7 +4646,7 @@ impl VmmSupervisor {
         match self.teardown_vm(warm_vm.id, &warm_vm.vm) {
             Ok(()) => {
                 self.release_reservation_after_cleanup(warm_vm.id);
-                tracing::info!(vm = %warm_vm.id, "stopped an idle warm VM for a waiting create");
+                tracing::info!(vm = %warm_vm.id, "stopped an idle warm VM");
                 true
             }
             Err(error) => {
@@ -6243,6 +6271,142 @@ impl VmmSupervisor {
     /// The ready golden snapshot for a warm class's spawn configuration.
     pub(crate) fn golden(&self, spec: &VmSpawnConfig) -> Option<GoldenBundle> {
         self.goldens.lock().ok()?.get(spec).cloned()
+    }
+
+    /// Drop the golden snapshots of classes `keep` rejects and delete their
+    /// files. Clones already restored from one keep their own open mappings
+    /// and disk copies, so removing the files does not disturb them.
+    pub(crate) fn retain_goldens(&self, keep: impl Fn(&VmSpawnConfig) -> bool) {
+        let retired = match self.goldens.lock() {
+            Ok(mut goldens) => {
+                let retired = goldens
+                    .iter()
+                    .filter(|(spec, _)| !keep(spec))
+                    .map(|(spec, bundle)| (spec.clone(), bundle.clone()))
+                    .collect::<Vec<_>>();
+                for (spec, _) in &retired {
+                    goldens.remove(spec);
+                }
+                retired
+            }
+            Err(_) => return,
+        };
+        if retired.is_empty() {
+            return;
+        }
+        let paths = retired
+            .iter()
+            .flat_map(|(_, bundle)| {
+                std::iter::once(PathBuf::from(bundle.snapshot_path()))
+                    .chain(bundle.overlay_path().map(PathBuf::from))
+            })
+            .collect::<HashSet<_>>();
+        let artifacts = {
+            let mut registered = self.golden_artifacts.lock().unwrap_or_else(|poisoned| {
+                tracing::error!("golden artifact lock poisoned while retiring goldens");
+                poisoned.into_inner()
+            });
+            let (taken, kept) = registered
+                .drain(..)
+                .partition::<Vec<_>, _>(|artifact| paths.contains(artifact.path()));
+            *registered = kept;
+            taken
+        };
+        for (spec, _) in &retired {
+            tracing::info!(
+                vcpus = spec.vcpus,
+                memory_mib = spec.memory_mib,
+                rootfs = ?spec.rootfs_path.as_ref(),
+                "retired warm golden snapshot"
+            );
+        }
+        cleanup_golden_artifacts(artifacts);
+    }
+
+    /// Add a warm class for a shape that creates ask for and no configured
+    /// class serves, or note fresh demand for one already added. At most
+    /// `limit` learned classes are kept; adding one past that forgets the one
+    /// asked for least recently. Returns whether `spec` is now learned.
+    pub(crate) fn learn_warm_class(
+        &self,
+        spec: VmSpawnConfig,
+        class: WarmClass,
+        limit: usize,
+    ) -> bool {
+        let Ok(mut learned) = self.learned.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if let Some(entry) = learned.get_mut(&spec) {
+            entry.last_demand = now;
+            return true;
+        }
+        if limit == 0 {
+            return false;
+        }
+        while learned.len() >= limit {
+            let Some(oldest) = learned
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_demand)
+                .map(|(spec, _)| spec.clone())
+            else {
+                break;
+            };
+            learned.remove(&oldest);
+        }
+        tracing::info!(
+            vcpus = spec.vcpus,
+            memory_mib = spec.memory_mib,
+            rootfs = ?spec.rootfs_path.as_ref(),
+            target = class.target,
+            "learned a warm class for a shape in demand"
+        );
+        learned.insert(
+            spec,
+            LearnedClass {
+                class,
+                last_demand: now,
+            },
+        );
+        true
+    }
+
+    /// Forget learned classes nobody asked for in `idle`, then return the
+    /// classes that remain.
+    pub(crate) fn learned_warm_classes(&self, idle: Duration) -> Vec<WarmClass> {
+        let Ok(mut learned) = self.learned.lock() else {
+            return Vec::new();
+        };
+        learned.retain(|spec, entry| {
+            let keep = entry.last_demand.elapsed() < idle;
+            if !keep {
+                tracing::info!(
+                    vcpus = spec.vcpus,
+                    memory_mib = spec.memory_mib,
+                    rootfs = ?spec.rootfs_path.as_ref(),
+                    "forgot an idle learned warm class"
+                );
+            }
+            keep
+        });
+        learned.values().map(|entry| entry.class.clone()).collect()
+    }
+
+    /// The learned classes as they stand, without retiring idle ones.
+    pub(crate) fn learned_classes_snapshot(&self) -> Vec<WarmClass> {
+        self.learned
+            .lock()
+            .map(|learned| learned.values().map(|entry| entry.class.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The learned class whose VMs `spec` describes, if any.
+    pub(crate) fn learned_warm_class(&self, spec: &VmSpawnConfig) -> Option<WarmClass> {
+        self.learned
+            .lock()
+            .ok()?
+            .get(spec)
+            .map(|entry| entry.class.clone())
     }
 
     fn remember_golden_artifacts(
@@ -11752,6 +11916,76 @@ mod tests {
         supervisor.warm_claims.lock().unwrap().remove(&claimed);
         assert!(supervisor.reclaim_idle_warm());
         assert_eq!(supervisor.warm_count(&spec), 0);
+    }
+
+    #[test]
+    fn learned_classes_keep_the_most_recently_demanded_and_expire_when_idle() {
+        let supervisor = test_supervisor();
+        let spec = |name: &str| spawn_config(false, Some(PathBuf::from(format!("/images/{name}"))));
+        let class = |name: &str| {
+            WarmClass::learned(1, 256, Some(PathBuf::from(format!("/images/{name}"))), 4)
+        };
+        assert!(supervisor.learn_warm_class(spec("a"), class("a"), 2));
+        assert!(supervisor.learn_warm_class(spec("b"), class("b"), 2));
+        // Fresh demand for a makes b the least recently asked for.
+        assert!(supervisor.learn_warm_class(spec("a"), class("a"), 2));
+        assert!(supervisor.learn_warm_class(spec("c"), class("c"), 2));
+        assert!(supervisor.learned_warm_class(&spec("a")).is_some());
+        assert!(supervisor.learned_warm_class(&spec("b")).is_none());
+        assert!(supervisor.learned_warm_class(&spec("c")).is_some());
+        assert!(!supervisor.learn_warm_class(spec("d"), class("d"), 0));
+
+        assert_eq!(
+            supervisor
+                .learned_warm_classes(Duration::from_secs(60))
+                .len(),
+            2
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(supervisor
+            .learned_warm_classes(Duration::from_millis(10))
+            .is_empty());
+        assert!(supervisor.learned_classes_snapshot().is_empty());
+    }
+
+    #[test]
+    fn retiring_a_golden_deletes_only_its_own_files() {
+        let supervisor = test_supervisor();
+        let dir = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/retire-goldens-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bundles = Vec::new();
+        for name in ["kept", "retired"] {
+            let snapshot = dir.join(format!("{name}.snap"));
+            let overlay = dir.join(format!("{name}.cow"));
+            std::fs::write(&snapshot, b"memory").unwrap();
+            std::fs::write(&overlay, b"disk").unwrap();
+            let mut artifacts = vec![
+                OwnedArtifact::capture(&snapshot).unwrap(),
+                OwnedArtifact::capture(&overlay).unwrap(),
+            ];
+            supervisor.remember_golden_artifacts(&mut artifacts, &[]);
+            let spec = spawn_config(false, Some(PathBuf::from(format!("/images/{name}"))));
+            supervisor.publish_golden(
+                spec.clone(),
+                GoldenBundle {
+                    snapshot_path: snapshot.display().to_string(),
+                    overlay_path: Some(overlay.display().to_string()),
+                },
+            );
+            bundles.push((spec, snapshot, overlay));
+        }
+        let (kept, retired) = (&bundles[0], &bundles[1]);
+
+        supervisor.retain_goldens(|spec| spec == &kept.0);
+
+        assert!(supervisor.golden(&kept.0).is_some());
+        assert!(supervisor.golden(&retired.0).is_none());
+        assert!(kept.1.exists() && kept.2.exists());
+        assert!(!retired.1.exists() && !retired.2.exists());
+        assert_eq!(supervisor.golden_artifacts.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -20,6 +20,12 @@ versions may contain breaking changes.
   checkpoint restores on its own; snapshots of VMs on storage without reflink
   use a paused, extent-copied capture.
 - Snapshot list and delete endpoints.
+- The warm pool learns: each registered image (the newest four at startup,
+  then any registered later) gets a golden snapshot and a pool of its own,
+  and so does any other shape creates ask for after its first cold boot.
+  Classes unused for 30 minutes are retired and their snapshots deleted.
+  Tuned with `TARIT_WARM_POOL_LEARN_CLASSES`, `_LEARN_TARGET` and
+  `_LEARN_IDLE_SECS`; `GET /v1/warm-pool` and the depth metric include them.
 - Warm-pool classes take a `prewarm` command (`TARIT_WARM_POOL_PREWARM`) that
   the golden VM runs before its snapshot, so clones start with an image's
   runtime in their page cache.

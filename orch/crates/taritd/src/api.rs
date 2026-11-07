@@ -4104,15 +4104,19 @@ async fn warm_pool_status(
     Extension(identity): Extension<ApiIdentity>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&identity)?;
+    let learned = state.supervisor.learned_classes_snapshot();
     let classes = state
         .config
         .warm_pool
         .classes
         .iter()
-        .map(|class| {
+        .map(|class| (class, false))
+        .chain(learned.iter().map(|class| (class, true)))
+        .map(|(class, learned)| {
             let spawn = VmSpawnConfig::from_warm_class(&state.config, class);
             let depth = state.supervisor.warm_count(&spawn);
             serde_json::json!({
+                "learned": learned,
                 "vcpus": class.vcpus,
                 "memory_mib": class.memory_mib,
                 "hard_floor": class.hard_floor,
@@ -4135,7 +4139,13 @@ async fn warm_pool_status(
         "enabled": state.config.warm_pool.enabled,
         "cpu_overcommit": state.config.warm_pool.cpu_overcommit,
         "replenish_concurrency": state.config.warm_pool.replenish_concurrency,
-        "total_target": state.config.warm_pool.total_target(),
+        "total_target": state.config.warm_pool.total_target()
+            + learned.iter().map(|class| class.target).sum::<usize>(),
+        "learn": {
+            "max_classes": state.config.warm_pool.learn.max_classes,
+            "target": state.config.warm_pool.learn.target,
+            "idle_secs": state.config.warm_pool.learn.idle.as_secs(),
+        },
         "disk_pressure": {
             "active": disk_pressure.pressured,
             "used_bytes": disk_pressure.used_bytes,

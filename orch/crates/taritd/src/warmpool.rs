@@ -8,15 +8,17 @@
 //! and create() falls back to a cold start, so the pool is a best-effort
 //! accelerator, never a correctness dependency.
 
-use crate::config::Config;
+use crate::config::{Config, WarmClass};
 use crate::scheduler::Scheduler;
-use crate::supervisor::{GoldenBundle, VmSpawnConfig, VmmSupervisor};
-use std::collections::HashMap;
+use crate::supervisor::{VmSpawnConfig, VmmSupervisor};
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 use std::time::Duration;
+use tarit_store::Store;
+use tarit_types::CreateVmRequest;
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -110,6 +112,101 @@ impl Replenisher {
     }
 }
 
+/// The class taritd would learn for VMs of `spec`: none when learning is off,
+/// a configured class already covers the shape, or a restore class cannot
+/// reproduce it exactly (so a learned VM is always interchangeable with the
+/// cold boot the create would otherwise get).
+pub(crate) fn learnable_class(config: &Config, spec: &VmSpawnConfig) -> Option<WarmClass> {
+    let learn = &config.warm_pool.learn;
+    if !config.warm_pool.enabled || learn.max_classes == 0 || learn.target == 0 {
+        return None;
+    }
+    if config
+        .warm_pool
+        .classes
+        .iter()
+        .any(|class| VmSpawnConfig::from_warm_class(config, class) == *spec)
+    {
+        return None;
+    }
+    let class = WarmClass::learned(
+        spec.vcpus,
+        spec.memory_mib,
+        spec.rootfs_path.clone(),
+        learn.target,
+    );
+    (VmSpawnConfig::from_warm_class(config, &class) == *spec).then_some(class)
+}
+
+/// How often the image seeder looks for newly registered images.
+const IMAGE_SEED_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Learn a warm class for registered images, at the default VM shape: the
+/// newest `learn.max_classes` when taritd starts, then each image registered
+/// while it runs, so the first burst against an image is already served
+/// from the pool. A seeded class nobody uses is retired like any other.
+pub(crate) fn spawn_image_seeder(
+    sup: Arc<VmmSupervisor>,
+    config: Config,
+    store: Arc<std::sync::Mutex<Store>>,
+    mut shutdown_rx: watch::Receiver<Option<&'static str>>,
+) -> Option<JoinHandle<()>> {
+    let max_classes = config.warm_pool.learn.max_classes;
+    if !config.warm_pool.enabled || max_classes == 0 || config.warm_pool.learn.target == 0 {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let mut seen = HashSet::<(String, String, String)>::new();
+        let mut startup = true;
+        loop {
+            let images = match store.lock() {
+                Ok(store) => store.list_images().unwrap_or_else(|error| {
+                    tracing::warn!(%error, "listing images for the warm pool failed");
+                    Vec::new()
+                }),
+                Err(_) => Vec::new(),
+            };
+            let mut fresh = images
+                .into_iter()
+                .filter(|image| {
+                    seen.insert((
+                        image.name.clone(),
+                        image.tag.clone(),
+                        image.rootfs_path.clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            if std::mem::take(&mut startup) {
+                fresh.sort_by_key(|image| std::cmp::Reverse(image.created_at));
+                fresh.truncate(max_classes);
+            }
+            for image in fresh {
+                if crate::image::verify_admitted_image(&image, &config.image_admission_policy)
+                    .is_err()
+                {
+                    continue;
+                }
+                // What `{"image": "<name:tag>"}` resolves to.
+                let request: CreateVmRequest = match serde_json::from_value(
+                    serde_json::json!({ "rootfs_path": image.rootfs_path }),
+                ) {
+                    Ok(request) => request,
+                    Err(_) => continue,
+                };
+                let spec = VmSpawnConfig::from_defaults(&config, &request);
+                if let Some(class) = learnable_class(&config, &spec) {
+                    tracing::info!(image = %format!("{}:{}", image.name, image.tag), "warming a registered image");
+                    sup.learn_warm_class(spec, class, max_classes);
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(IMAGE_SEED_INTERVAL) => {}
+                _ = wait_for_shutdown(&mut shutdown_rx) => break,
+            }
+        }
+    }))
+}
+
 /// Spawn the background replenishment loop. No-op unless the pool is enabled.
 pub(crate) fn spawn_replenisher(
     sup: Arc<VmmSupervisor>,
@@ -120,20 +217,16 @@ pub(crate) fn spawn_replenisher(
     if !config.warm_pool.enabled {
         return None;
     }
-    let classes = config.warm_pool.classes.clone();
+    let configured = config.warm_pool.classes.clone();
     let conc = config.warm_pool.replenish_concurrency.max(1);
     tracing::info!(
         total_target = config.warm_pool.total_target(),
-        classes = classes.len(),
+        classes = configured.len(),
+        learn_classes = config.warm_pool.learn.max_classes,
         cpu_overcommit = config.warm_pool.cpu_overcommit,
         max_vcpus = config.max_vcpus,
         "warm pool enabled"
     );
-
-    let golden_snapshots = Arc::new(tokio::sync::Mutex::new(HashMap::<
-        VmSpawnConfig,
-        GoldenBundle,
-    >::new()));
 
     // A golden that cannot be built (missing rootfs, unregistered image, full
     // disk) is retried with backoff instead of on every 150 ms round.
@@ -145,7 +238,7 @@ pub(crate) fn spawn_replenisher(
     let worker_children = Arc::clone(&children);
     Some(Replenisher {
         handle: tokio::spawn(async move {
-            let mut filling = vec![false; classes.len()];
+            let mut filling = HashMap::<VmSpawnConfig, bool>::new();
             'replenish: loop {
                 worker_children.reap_finished().await;
                 if worker_cancelled.load(Ordering::Acquire) || shutdown_pending(&shutdown_rx) {
@@ -188,15 +281,40 @@ pub(crate) fn spawn_replenisher(
                     }
                     continue;
                 }
+                let mut classes = configured.clone();
+                classes.extend(sup.learned_warm_classes(config.warm_pool.learn.idle));
+                let active = classes
+                    .iter()
+                    .map(|class| VmSpawnConfig::from_warm_class(&config, class))
+                    .collect::<HashSet<_>>();
+                filling.retain(|spec, _| active.contains(spec));
+                // Retire what belonged to classes that are gone: their idle
+                // warm VMs and golden snapshots.
+                if sup.has_warm_outside(|spec| active.contains(spec)) {
+                    let sup = Arc::clone(&sup);
+                    let active = active.clone();
+                    let _ = await_blocking(
+                        worker_children
+                            .spawn(move || {
+                                while sup.reclaim_idle_warm_where(|spec| !active.contains(spec)) {}
+                            })
+                            .await,
+                        &worker_cancelled,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                }
+                sup.retain_goldens(|spec| active.contains(spec));
                 let mut did_work = false;
-                for (index, class) in classes.iter().enumerate() {
+                for class in &classes {
+                    let key = VmSpawnConfig::from_warm_class(&config, class);
                     if worker_cancelled.load(Ordering::Acquire) || shutdown_pending(&shutdown_rx) {
                         worker_cancelled.store(true, Ordering::Release);
                         break 'replenish;
                     }
                     let have = {
                         let sup = Arc::clone(&sup);
-                        let key = VmSpawnConfig::from_warm_class(&config, class);
+                        let key = key.clone();
                         await_blocking(
                             worker_children.spawn(move || sup.warm_count(&key)).await,
                             &worker_cancelled,
@@ -208,16 +326,14 @@ pub(crate) fn spawn_replenisher(
                     if worker_cancelled.load(Ordering::Acquire) {
                         break 'replenish;
                     }
-                    let need = class.refill_round(have, &mut filling[index]);
+                    let need = class.refill_round(have, filling.entry(key.clone()).or_default());
                     if need == 0 {
                         continue;
                     }
                     if class.restore {
-                        let key = VmSpawnConfig::from_warm_class(&config, class);
                         let golden_bundle = {
-                            let mut golden = golden_snapshots.lock().await;
-                            if let Some(path) = golden.get(&key).cloned() {
-                                Some(path)
+                            if let Some(bundle) = sup.golden(&key) {
+                                Some(bundle)
                             } else if golden_backoff
                                 .get(&key)
                                 .is_some_and(|backoff| !backoff.due())
@@ -260,12 +376,11 @@ pub(crate) fn spawn_replenisher(
                                             "warm golden snapshot created"
                                         );
                                         golden_backoff.remove(&key);
-                                        sup.publish_golden(key.clone(), bundle.clone());
-                                        golden.insert(key, bundle);
+                                        sup.publish_golden(key.clone(), bundle);
                                     }
                                     Ok(Err(e)) => {
                                         let retry_in =
-                                            golden_backoff.entry(key).or_default().failed();
+                                            golden_backoff.entry(key.clone()).or_default().failed();
                                         tracing::warn!(
                                             retry_in_secs = retry_in.as_secs(),
                                             "warm golden create failed: {e}"
@@ -273,7 +388,7 @@ pub(crate) fn spawn_replenisher(
                                     }
                                     Err(e) => {
                                         let retry_in =
-                                            golden_backoff.entry(key).or_default().failed();
+                                            golden_backoff.entry(key.clone()).or_default().failed();
                                         tracing::warn!(
                                             retry_in_secs = retry_in.as_secs(),
                                             "warm golden task failed: {e}"
@@ -288,7 +403,7 @@ pub(crate) fn spawn_replenisher(
                         };
                         let have = {
                             let sup = Arc::clone(&sup);
-                            let key = VmSpawnConfig::from_warm_class(&config, class);
+                            let key = key.clone();
                             await_blocking(
                                 worker_children.spawn(move || sup.warm_count(&key)).await,
                                 &worker_cancelled,
@@ -300,7 +415,8 @@ pub(crate) fn spawn_replenisher(
                         if worker_cancelled.load(Ordering::Acquire) {
                             break 'replenish;
                         }
-                        let need = class.refill_round(have, &mut filling[index]);
+                        let need =
+                            class.refill_round(have, filling.entry(key.clone()).or_default());
                         if need == 0 {
                             continue;
                         }

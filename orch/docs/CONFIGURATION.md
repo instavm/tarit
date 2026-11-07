@@ -68,8 +68,13 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 | `TARIT_WARM_POOL_LOW_WATERMARK` | usize | derived from target | Override the first class low watermark. Refill starts when depth is below this value. |
 | `TARIT_WARM_POOL_HIGH_WATERMARK` | usize | derived from target | Override the first class high watermark. Refill does not intentionally grow past this ceiling. |
 | `TARIT_WARM_POOL_HARD_FLOOR` | usize | derived from target | Override the first class emergency minimum. |
+| `TARIT_WARM_POOL_LEARN_CLASSES` | usize | `4` | Most warm classes taritd adds on its own for registered images and for shapes creates ask for. `0` turns learning off. |
+| `TARIT_WARM_POOL_LEARN_TARGET` | usize | `8` | Warm VMs kept ready for each learned class. |
+| `TARIT_WARM_POOL_LEARN_IDLE_SECS` | u64 | `1800` | A learned class nobody creates from for this long is retired: its idle warm VMs stop and its golden snapshot is deleted. |
 | `TARIT_REFILL_CGROUP` | path | unset | Optional cgroup v2 path for refill-spawned VMM children. Empty string clears the path. `~/` is expanded. |
 | `TARIT_REFILL_CPU_WEIGHT` | u64 | `10` | cgroup v2 `cpu.weight` for refill children. Values are clamped to `1..=10000`. |
+
+Learned classes: when the pool is on, taritd also keeps warm VMs for shapes no configured class covers. At startup the newest registered images (up to `TARIT_WARM_POOL_LEARN_CLASSES`) each get a class at the default 1 vCPU / 256 MiB shape, and so does each image registered while taritd runs. A create for any other shape a restore class can reproduce exactly (an image or rootfs, vCPUs and memory, with no custom kernel, command line, volumes, or egress) is served cold and teaches taritd that shape; later creates for it are served from its pool. Past the limit, the class asked for least recently is dropped. The TOML keys are `learn_classes`, `learn_target`, and `learn_idle_secs` under `[warm_pool]`.
 
 The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = true`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
 

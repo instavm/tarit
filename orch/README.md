@@ -235,6 +235,9 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_CPU_OVERCOMMIT` | No | `4.0` | Warm-pool CPU overcommit ratio. |
 | `TARIT_WARM_POOL_ROOTFS` | No | unset | Override rootfs for the first warm-pool class. |
 | `TARIT_WARM_POOL_IMAGE` | No | unset | Override rootfs for the first warm-pool class by registered image `name[:tag]`. |
+| `TARIT_WARM_POOL_LEARN_CLASSES` | No | `4` | Most warm classes learned for registered images and shapes in demand; `0` turns learning off. |
+| `TARIT_WARM_POOL_LEARN_TARGET` | No | `8` | Warm VMs kept ready per learned class. |
+| `TARIT_WARM_POOL_LEARN_IDLE_SECS` | No | `1800` | Retire a learned class after this long without a create. |
 | `TARIT_WARM_POOL_PREWARM` | No | unset | Command the first warm-pool class's golden VM runs before its snapshot, e.g. `node -e 0` for a Node image. |
 | `TARIT_REGION` | No | `local` | Topology label included in autoscaler decisions. |
 | `TARIT_ZONE` | No | same as `TARIT_REGION` | Topology label included in autoscaler decisions. |
@@ -306,6 +309,14 @@ command, which can do the same for an image's runtime; a failing command fails
 the golden. Each restored clone receives its own writable CoW overlay; `restore = false` keeps the bounded cold-boot refill path. Refill starts
 only below `low_watermark`, fills back to `target`, and uses the optional
 low-weight refill cgroup when `TARIT_REFILL_CGROUP`/`refill_cgroup` is set.
+
+Configured classes are not the only ones. taritd keeps a pool for each
+registered image (the newest few at startup, and any registered later), and
+learns any other shape creates ask for: the first such create boots cold, the
+following ones come from a pool built for it. A learned class that goes
+unused for `TARIT_WARM_POOL_LEARN_IDLE_SECS` is retired and its golden
+snapshot deleted. `GET /v1/warm-pool` lists learned classes with
+`"learned": true`.
 
 ## Image registry
 

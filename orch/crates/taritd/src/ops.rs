@@ -1304,6 +1304,18 @@ fn warm_pool_spawn_config(
     )
 }
 
+/// Keep warm VMs for the shape of a pool-eligible create that no configured
+/// class covers, or note fresh demand for one already learned.
+fn learn_warm_class(state: &AppState, spec: &VmSpawnConfig) {
+    if let Some(class) = crate::warmpool::learnable_class(&state.config, spec) {
+        state.supervisor.learn_warm_class(
+            spec.clone(),
+            class,
+            state.config.warm_pool.learn.max_classes,
+        );
+    }
+}
+
 /// How many golden clones a create restores on demand before cold-booting.
 const ON_DEMAND_WARM_RESTORES: usize = 3;
 
@@ -1311,16 +1323,23 @@ const ON_DEMAND_WARM_RESTORES: usize = 3;
 /// VMs `spec` describes into the pool. Returns false when no such class has a
 /// ready golden or the restore failed.
 async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> bool {
-    let Some(class) = state.config.warm_pool.classes.iter().find(|class| {
-        class.restore && VmSpawnConfig::from_warm_class(&state.config, class) == *spec
-    }) else {
+    let Some(class) = state
+        .config
+        .warm_pool
+        .classes
+        .iter()
+        .find(|class| {
+            class.restore && VmSpawnConfig::from_warm_class(&state.config, class) == *spec
+        })
+        .cloned()
+        .or_else(|| state.supervisor.learned_warm_class(spec))
+    else {
         return false;
     };
     let Some(bundle) = state.supervisor.golden(spec) else {
         return false;
     };
     let supervisor = Arc::clone(&state.supervisor);
-    let class = class.clone();
     let restored = tokio::task::spawn_blocking(move || {
         tokio::runtime::Handle::current().block_on(supervisor.spawn_warm_restore(class, bundle))
     })
@@ -1354,6 +1373,7 @@ async fn create_local_owned(
     let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
 
     if let Some(warm_cfg) = warm_pool_spawn_config(state, req)? {
+        learn_warm_class(state, &warm_cfg);
         // A create that finds the pool empty restores a clone of the class's
         // golden into it and claims again, so a burst larger than the pool
         // is served at restore speed. A concurrent create may claim that
@@ -6111,6 +6131,34 @@ mod tests {
             .block_on(cluster::resolve_owner(&state, id))
             .expect("a registered Creating record must be routable for DELETE");
         assert!(matches!(owner, cluster::Owner::Local));
+    }
+
+    #[test]
+    fn only_shapes_a_restore_class_reproduces_are_learned() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let mut config = state.config.clone();
+        config.warm_pool.enabled = true;
+        let request = |body: serde_json::Value| {
+            let request: tarit_types::CreateVmRequest = serde_json::from_value(body).unwrap();
+            VmSpawnConfig::from_defaults(&config, &request)
+        };
+        let image = request(serde_json::json!({ "rootfs_path": "/images/node.ext4" }));
+        let class =
+            crate::warmpool::learnable_class(&config, &image).expect("an image at default shape");
+        assert_eq!((class.vcpus, class.memory_mib), (1, 256));
+        assert!(class.restore);
+
+        // The configured default class already covers the default rootfs.
+        assert!(
+            crate::warmpool::learnable_class(&config, &request(serde_json::json!({}))).is_none()
+        );
+        // A custom kernel command line is not something a warm class reproduces.
+        let custom =
+            request(serde_json::json!({ "rootfs_path": "/images/node.ext4", "cmdline": "quiet" }));
+        assert!(crate::warmpool::learnable_class(&config, &custom).is_none());
+
+        config.warm_pool.learn.max_classes = 0;
+        assert!(crate::warmpool::learnable_class(&config, &image).is_none());
     }
 
     fn test_state_with_durable_writer() -> (AppState, tokio::sync::mpsc::Receiver<StoreWrite>) {

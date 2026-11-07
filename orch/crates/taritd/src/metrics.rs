@@ -384,7 +384,7 @@ pub fn render_metrics(state: &AppState) -> String {
         &mut out,
         "taritd_warm_pool_depth",
         "gauge",
-        "Idle warm-pool VMs currently parked per configured class.",
+        "Idle warm-pool VMs currently parked per class, configured or learned.",
     );
     for (class, depth) in warm_pool_depths(state) {
         let _ = writeln!(
@@ -686,7 +686,8 @@ fn tenant_vm_counts(state: &AppState) -> Vec<(String, usize)> {
 
 fn warm_pool_depths(state: &AppState) -> Vec<(String, usize)> {
     let mut classes = BTreeMap::new();
-    for class in &state.config.warm_pool.classes {
+    let learned = state.supervisor.learned_classes_snapshot();
+    for class in state.config.warm_pool.classes.iter().chain(&learned) {
         let spawn = crate::supervisor::VmSpawnConfig::from_warm_class(&state.config, class);
         classes.insert(warm_pool_class_label(&spawn), spawn);
     }

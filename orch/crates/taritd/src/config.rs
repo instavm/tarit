@@ -9,6 +9,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// One warm-pool VM class: a (vcpus, memory) shape kept pre-booted and ready.
@@ -38,6 +39,24 @@ pub struct WarmClass {
 }
 
 impl WarmClass {
+    /// A restore class for VMs of this shape, as taritd adds for shapes that
+    /// creates ask for. Watermarks derive from `target`.
+    pub fn learned(vcpus: u8, memory_mib: u64, rootfs: Option<PathBuf>, target: usize) -> Self {
+        let (hard_floor, low_watermark, high_watermark) = derive_watermarks(target);
+        Self {
+            vcpus,
+            memory_mib,
+            hard_floor,
+            low_watermark,
+            target,
+            high_watermark,
+            restore: true,
+            rootfs,
+            image: None,
+            prewarm: None,
+        }
+    }
+
     fn from_spec(spec: WarmClassSpec) -> Result<Self> {
         let (default_hard_floor, default_low_watermark, default_high_watermark) =
             derive_watermarks(spec.target);
@@ -151,6 +170,31 @@ pub struct WarmPoolConfig {
     /// Optional low-priority cgroup for background refill VMM children.
     pub refill_cgroup: RefillCgroupConfig,
     pub classes: Vec<WarmClass>,
+    /// Classes taritd adds on its own for shapes that creates ask for.
+    pub learn: LearnedWarmConfig,
+}
+
+/// How taritd keeps warm VMs for images and shapes no configured class
+/// covers: each registered image, and each shape creates ask for, gets a
+/// golden snapshot and a pool of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedWarmConfig {
+    /// Most learned classes kept at once; 0 turns learning off.
+    pub max_classes: usize,
+    /// Warm VMs kept ready for each learned class.
+    pub target: usize,
+    /// A learned class nobody asks for this long is retired.
+    pub idle: Duration,
+}
+
+impl Default for LearnedWarmConfig {
+    fn default() -> Self {
+        Self {
+            max_classes: 4,
+            target: 8,
+            idle: Duration::from_secs(30 * 60),
+        }
+    }
 }
 
 impl Default for WarmPoolConfig {
@@ -165,6 +209,7 @@ impl Default for WarmPoolConfig {
             classes: vec![WarmClassSpec::default_class()
                 .finish()
                 .expect("default warm-pool watermarks are valid")],
+            learn: LearnedWarmConfig::default(),
         }
     }
 }
@@ -389,6 +434,12 @@ struct WarmPoolFile {
     #[serde(default)]
     refill_cpu_weight: Option<u64>,
     #[serde(default)]
+    learn_classes: Option<usize>,
+    #[serde(default)]
+    learn_target: Option<usize>,
+    #[serde(default)]
+    learn_idle_secs: Option<u64>,
+    #[serde(default)]
     class: Vec<WarmClassFile>,
 }
 
@@ -470,6 +521,7 @@ struct WarmPoolDraft {
     replenish_concurrency: usize,
     refill_cgroup: RefillCgroupConfig,
     classes: Vec<WarmClassSpec>,
+    learn: LearnedWarmConfig,
 }
 
 impl Default for WarmPoolDraft {
@@ -480,6 +532,7 @@ impl Default for WarmPoolDraft {
             replenish_concurrency: 4,
             refill_cgroup: RefillCgroupConfig::default(),
             classes: vec![WarmClassSpec::default_class()],
+            learn: LearnedWarmConfig::default(),
         }
     }
 }
@@ -497,6 +550,7 @@ impl WarmPoolDraft {
             replenish_concurrency: self.replenish_concurrency,
             refill_cgroup: self.refill_cgroup,
             classes,
+            learn: self.learn,
         })
     }
 }
@@ -1716,6 +1770,15 @@ fn warm_pool_draft_from_file(file_config: Option<&FileConfig>) -> WarmPoolDraft 
             if let Some(weight) = f.refill_cpu_weight {
                 draft.refill_cgroup.cpu_weight = normalize_cpu_weight(weight);
             }
+            if let Some(classes) = f.learn_classes {
+                draft.learn.max_classes = classes;
+            }
+            if let Some(target) = f.learn_target {
+                draft.learn.target = target;
+            }
+            if let Some(secs) = f.learn_idle_secs {
+                draft.learn.idle = Duration::from_secs(secs.max(1));
+            }
             if !f.class.is_empty() {
                 draft.classes = f.class.iter().map(WarmClassSpec::from_file).collect();
             }
@@ -1785,6 +1848,18 @@ fn apply_warm_pool_env(draft: &mut WarmPoolDraft) {
                 first.prewarm = Some(command.trim().to_string());
             }
         }
+    }
+    if let Some(classes) = env_usize("TARIT_WARM_POOL_LEARN_CLASSES") {
+        draft.learn.max_classes = classes;
+    }
+    if let Some(target) = env_usize("TARIT_WARM_POOL_LEARN_TARGET") {
+        draft.learn.target = target;
+    }
+    if let Some(secs) = env::var("TARIT_WARM_POOL_LEARN_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        draft.learn.idle = Duration::from_secs(secs.max(1));
     }
     if let Ok(path) = env::var("TARIT_REFILL_CGROUP") {
         draft.refill_cgroup.path = non_empty_path(&path);

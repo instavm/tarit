@@ -672,6 +672,13 @@ async fn run_server(
         Arc::clone(&scheduler),
         shutdown_rx.clone(),
     );
+    // It only records classes; the replenisher does the VM work.
+    let _image_seeder = warmpool::spawn_image_seeder(
+        Arc::clone(&supervisor),
+        config.clone(),
+        Arc::clone(&state.store),
+        shutdown_rx.clone(),
+    );
 
     // Usage metering (VM runtime seconds) plus write-behind flush of usage and
     // audit events to the primary store. The meter always runs. Without a fleet
