@@ -419,6 +419,7 @@ fn write_lazy_restored_pages(
     mem: &GuestMemory,
     source: &[u8],
     lazy: &vmm_memory_backend::uffd_restore::LazyPageDiscard,
+    cloning_time: &mut Duration,
 ) -> Result<u64> {
     let page = PAGE_SIZE as usize;
     let populated = mem
@@ -447,10 +448,12 @@ fn write_lazy_restored_pages(
             }
             if run_end > start {
                 use vmm_memory_backend::uffd_restore::CloneOutcome;
-                match lazy
+                let clone_started = Instant::now();
+                let outcome = lazy
                     .clone_untouched(start, run_end - start, dest, start as u64)
-                    .map_err(|error| VmmError::Snapshot(format!("clone restored RAM: {error}")))?
-                {
+                    .map_err(|error| VmmError::Snapshot(format!("clone restored RAM: {error}")))?;
+                *cloning_time += clone_started.elapsed();
+                match outcome {
                     CloneOutcome::Cloned => {
                         start = run_end;
                         continue;
@@ -656,8 +659,11 @@ where
     let source = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem_size) };
     // A page that is zero now and written later is in the dirty log, so a
     // later round or the final stop copies it.
+    let mut cloning_time = Duration::ZERO;
     let bulk_written = match mem.lazy_page_discard() {
-        Some(lazy) => write_lazy_restored_pages(memory_file, mem, source, &lazy)?,
+        Some(lazy) => {
+            write_lazy_restored_pages(memory_file, mem, source, &lazy, &mut cloning_time)?
+        }
         None => write_nonzero_pages(memory_file, source, 0)
             .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?,
     };
@@ -672,9 +678,12 @@ where
     let bulk_elapsed = bulk_start.elapsed();
     let mut total_pages_copied = bulk_written / PAGE_SIZE;
     // Measured on the bytes written: skipped zero pages cost a scan, not a
-    // write, and would overstate how fast dirty pages can be copied.
+    // write, and would overstate how fast dirty pages can be copied. Memory
+    // shared from the restore snapshot is neither, so its time is left out
+    // too; counted, it would understate the rate and end pre-copy early.
     let mut copy_bandwidth_bps =
-        bandwidth_sample(bulk_written, bulk_elapsed).unwrap_or(DEFAULT_COPY_BANDWIDTH_BPS);
+        bandwidth_sample(bulk_written, bulk_elapsed.saturating_sub(cloning_time))
+            .unwrap_or(DEFAULT_COPY_BANDWIDTH_BPS);
     log::info!(
         "live_snapshot: bulk copy of {bulk_written} of {} bytes in {bulk_elapsed:?} ({copy_bandwidth_bps} B/s)",
         mem.size_bytes
