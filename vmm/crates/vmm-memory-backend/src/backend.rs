@@ -326,7 +326,8 @@ mod tests {
         assert_eq!(m.gpa_to_offset(boot), None);
         assert_eq!(m.gpa_to_offset(MMIO_GAP_START), None);
         assert_eq!(m.gpa_to_offset(MMIO_GAP_END + 4096), Some(boot + 4096));
-        m.host_dirty_tracker().mark_guest_range(MMIO_GAP_END + 4095, 2);
+        m.host_dirty_tracker()
+            .mark_guest_range(MMIO_GAP_END + 4095, 2);
         let dirty = m.drain_host_dirty();
         assert_eq!(dirty.len(), 2);
         assert!(dirty.contains(boot));
