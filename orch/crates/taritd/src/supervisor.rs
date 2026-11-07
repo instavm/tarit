@@ -5846,9 +5846,14 @@ impl VmmSupervisor {
                 }
             };
         let socket_path = booted.vm.socket_path.clone();
+        // The golden stays paused from here until it is torn down, so its
+        // disk upper cannot change between the RAM snapshot and the copy.
         let snapshot_vmm_path = match tokio::task::spawn_blocking(move || {
-            VmmClient::new(&socket_path)
-                .with_request_timeout(LIFECYCLE_OP_TIMEOUT)
+            let client = VmmClient::new(&socket_path).with_request_timeout(LIFECYCLE_OP_TIMEOUT);
+            client
+                .pause()
+                .map_err(|error| OrchError::Vmm(format!("pause golden: {error}")))?;
+            client
                 .snapshot_unreleased(false)
                 .map_err(|error| OrchError::Vmm(format!("snapshot golden: {error}")))
         })
