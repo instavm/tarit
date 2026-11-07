@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
             Mode::Sequential => run_sequential(client.clone(), &ctx).await,
             Mode::Staggered => run_staggered(client.clone(), &ctx).await,
             Mode::Burst => run_burst(client.clone(), &ctx).await,
+            Mode::Sustained => run_sustained(client.clone(), &ctx).await,
             Mode::All => unreachable!("all is expanded before execution"),
         };
         let gate_result = outcome.verify_performance(&ctx);
@@ -131,6 +132,52 @@ async fn run_staggered(client: SharedClient, ctx: &RunContext) -> ModeOutcome {
         .print_summary(&ctx.provider)
 }
 
+/// Start a sandbox every 1/rate seconds for the run's duration, each living
+/// `hold` after its command, with at most `max_in_flight` alive at once.
+async fn run_sustained(client: SharedClient, ctx: &RunContext) -> ModeOutcome {
+    let started = Instant::now();
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(ctx.max_in_flight));
+    let mut ticks = tokio::time::interval(std::time::Duration::from_secs_f64(1.0 / ctx.rate));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    let mut handles = Vec::new();
+    let mut shed = 0usize;
+    while started.elapsed() < ctx.duration {
+        ticks.tick().await;
+        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+            shed += 1;
+            continue;
+        };
+        let client = client.clone();
+        let ctx = ctx.clone();
+        handles.push(tokio::spawn(async move {
+            let result = run_iteration(client, &ctx).await;
+            drop(permit);
+            result
+        }));
+    }
+    let launched = handles.len();
+    let mut iterations = Vec::with_capacity(launched);
+    for handle in handles {
+        iterations.push(
+            handle
+                .await
+                .unwrap_or_else(|_| IterationResult::failure("task join failed".to_string())),
+        );
+    }
+    let wall = started.elapsed();
+    println!(
+        "sustained: target {:.0}/s for {:?}; launched {launched} ({:.0}/s), shed {shed} at {} in flight",
+        ctx.rate,
+        ctx.duration,
+        launched as f64 / ctx.duration.as_secs_f64(),
+        ctx.max_in_flight
+    );
+    ModeOutcome::new(Mode::Sustained, iterations)
+        .with_concurrency(ctx.max_in_flight)
+        .with_wall_clock(wall)
+        .print_summary(&ctx.provider)
+}
+
 async fn run_iteration(client: SharedClient, ctx: &RunContext) -> IterationResult {
     match iteration_inner(client, ctx).await {
         Ok(tti_ms) => IterationResult::success(tti_ms),
@@ -176,9 +223,13 @@ async fn iteration_inner(client: SharedClient, ctx: &RunContext) -> Result<u64> 
         .await??;
         match execution.status.as_str() {
             "completed" if execution.exit_code == Some(0) => {
-                Ok(u64::try_from(started.elapsed().as_millis())
+                let tti_ms = u64::try_from(started.elapsed().as_millis())
                     .unwrap_or(u64::MAX)
-                    .max(1))
+                    .max(1);
+                if !ctx.hold.is_zero() {
+                    tokio::time::sleep(ctx.hold).await;
+                }
+                Ok(tti_ms)
             }
             "completed" => anyhow::bail!(
                 "execution {} completed with exit code {:?}",
