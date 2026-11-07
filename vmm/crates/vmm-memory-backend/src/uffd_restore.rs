@@ -35,6 +35,9 @@ pub struct LazyRestore {
     handler_thread: Option<std::thread::JoinHandle<()>>,
     pages_served: std::sync::Arc<std::sync::atomic::AtomicU64>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Written on drop so the handler sees `shutdown` at once rather than
+    /// at the end of its poll timeout.
+    wake_fd: Option<OwnedFd>,
     page_discard: LazyPageDiscard,
 }
 
@@ -248,20 +251,26 @@ unsafe impl Sync for LazyRestore {}
 
 impl Drop for LazyRestore {
     fn drop(&mut self) {
-        // Signal the handler thread to shut down.
+        // Signal the handler thread to shut down, and wake it.
         self.shutdown
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        // Join the handler thread before closing the uffd. The handler only
-        // holds the raw fd number, so closing first would let another thread
-        // reuse that number while the handler can still read or ioctl it. The
-        // fd is nonblocking and the handler polls with a timeout, so it
-        // observes the shutdown flag within one poll interval.
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(wake) = self.wake_fd.as_ref() {
+            let one = 1u64.to_ne_bytes();
+            // SAFETY: writes 8 bytes from a live buffer to an eventfd we own.
+            unsafe { libc::write(wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+        }
+        // Join the handler thread before closing the uffd or the wake fd. The
+        // handler only holds the raw fd numbers, so closing first would let
+        // another thread reuse a number while the handler can still read or
+        // ioctl it. Without the wake (it failed), the handler still observes
+        // the shutdown flag within one poll interval.
         if let Some(handle) = self.handler_thread.take() {
             let _ = handle.join();
         }
         if let Some(uffd_fd) = self.uffd_fd.take() {
             drop(uffd_fd);
         }
+        drop(self.wake_fd.take());
         // Unmap the snapshot.
         if !self.snapshot_mmap.is_null() && self.snapshot_mmap_len > 0 {
             // SAFETY: `snapshot_mmap` was returned by `mmap` with exactly
@@ -575,6 +584,17 @@ pub fn start_lazy_restore_with_integrity(
 
     // 5. Spawn the fault-handler thread.
     let uffd_fd_raw = uffd_fd.as_raw_fd();
+    // SAFETY: eventfd takes no pointers; a non-negative result is a new fd
+    // that this function owns.
+    let wake_raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if wake_raw < 0 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: the mapping is live and not yet owned by a `LazyRestore`.
+        unsafe { libc::munmap(snapshot_mmap, snapshot_mmap_len) };
+        return Err(UffdRestoreError::Io(error));
+    }
+    // SAFETY: `wake_raw` is a fresh fd nothing else owns.
+    let wake_fd = unsafe { OwnedFd::from_raw_fd(wake_raw) };
     // SAFETY: `snapshot_offset_delta <= snapshot_mmap_len` by construction and
     // the resulting pointer stays within the live read-only mapping.
     let snapshot_ptr = unsafe { (snapshot_mmap as *const u8).add(snapshot_offset_delta_usize) };
@@ -594,6 +614,7 @@ pub fn start_lazy_restore_with_integrity(
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 fault_handler_loop(FaultHandlerContext {
                     uffd_fd_raw,
+                    wake_fd_raw: wake_raw,
                     snapshot_ptr: snapshot_ptr_val,
                     snapshot_len: snapshot_len_clone,
                     guest_base: guest_base_val,
@@ -641,6 +662,7 @@ pub fn start_lazy_restore_with_integrity(
         handler_thread: Some(handler_thread),
         pages_served,
         shutdown,
+        wake_fd: Some(wake_fd),
         page_discard: LazyPageDiscard {
             guest_base: guest_mem_ptr as usize,
             guest_len: guest_mem_len,
@@ -773,6 +795,7 @@ pub fn madvise_dontneed(
 
 struct FaultHandlerContext {
     uffd_fd_raw: RawFd,
+    wake_fd_raw: RawFd,
     snapshot_ptr: usize,
     snapshot_len: usize,
     guest_base: usize,
@@ -787,6 +810,7 @@ fn fault_handler_loop(context: FaultHandlerContext) {
     const PAGE_SIZE: usize = 4096;
     let FaultHandlerContext {
         uffd_fd_raw: uffd_fd,
+        wake_fd_raw: wake_fd,
         snapshot_ptr,
         snapshot_len,
         guest_base,
@@ -809,7 +833,7 @@ fn fault_handler_loop(context: FaultHandlerContext) {
 
     loop {
         // Check shutdown flag first.
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             break;
         }
 
@@ -817,15 +841,26 @@ fn fault_handler_loop(context: FaultHandlerContext) {
         // returns EAGAIN from all UFFD ioctls while a REMOVE event is pending;
         // servicing a pagefault before draining the causally related REMOVE is
         // therefore both incorrect and capable of hanging the faulting thread.
-        let mut pfd = libc::pollfd {
-            fd: uffd_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `pfd` points to one initialized `pollfd`; the kernel only
-        // writes within that single element during the call.
+        let mut fds = [
+            libc::pollfd {
+                fd: uffd_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `fds` holds two initialized `pollfd`s; the kernel only
+        // writes within them during the call.
         let timeout_ms = if pending_faults.is_empty() { 500 } else { 0 };
-        let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let prc = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+        if fds[1].revents != 0 && shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        let pfd = fds[0];
         if prc < 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EINTR) {
@@ -1413,6 +1448,47 @@ mod tests {
         // SAFETY: `guest` is still mapped.
         assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn dropping_a_lazy_restore_does_not_wait_out_the_handler_poll() {
+        const LEN: usize = 4096 * 4;
+        let file = tempfile::tempfile().expect("create snapshot file");
+        file.set_len(LEN as u64).expect("size snapshot file");
+        // SAFETY: one private anonymous mapping, unmapped exactly once below.
+        let guest = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(guest, libc::MAP_FAILED);
+        let lazy = match start_lazy_restore(guest.cast(), LEN, &file, 0, LEN as u64, None) {
+            Ok(lazy) => lazy,
+            Err(UffdRestoreError::Userfaultfd(error))
+                if error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                // SAFETY: `guest` is the live mapping created above.
+                assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
+                return;
+            }
+            Err(error) => panic!("start lazy restore: {error}"),
+        };
+        // Let the handler settle into its 500 ms poll.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        drop(lazy);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "stopping a lazily restored VM waited {:?} for its fault handler",
+            started.elapsed()
+        );
+        // SAFETY: `guest` is still mapped.
+        assert_eq!(unsafe { libc::munmap(guest, LEN) }, 0);
     }
 
     #[test]

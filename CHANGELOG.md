@@ -138,6 +138,12 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Stopping a lazily restored VM (every fork child, and restores through
+  taritd) waited up to half a second for its page-fault handler to notice:
+  the handler only checked for shutdown between 500 ms polls. Shutdown now
+  wakes it through an eventfd; deleting a fork child went from 506 ms to
+  about 30 ms.
+
 - A burst of creates could fail one with 409 "already has a supervisor-owned
   lifecycle task": a create claimed a warm VM that an on-demand restore had
   just published but whose restore task had not finished. Claims and idle
