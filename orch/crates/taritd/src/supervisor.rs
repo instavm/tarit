@@ -3155,6 +3155,8 @@ pub struct VmmSupervisor {
     /// for, with when each was last asked for.
     learned: Mutex<HashMap<VmSpawnConfig, LearnedClass>>,
     in_progress_artifacts: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Bounds snapshot captures running at once (TARIT_MAX_CONCURRENT_SNAPSHOTS).
+    snapshot_permits: Arc<tokio::sync::Semaphore>,
     unexpected_exits: Mutex<VecDeque<UnexpectedVmmExit>>,
     net: Option<NetProvisioner>,
     jails: Option<JailManager>,
@@ -3340,6 +3342,9 @@ impl VmmSupervisor {
         } else {
             None
         };
+        let snapshot_permits = Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_snapshots.max(1),
+        ));
         Ok(Self {
             config,
             running: Mutex::new(HashMap::new()),
@@ -3360,6 +3365,7 @@ impl VmmSupervisor {
             goldens: Mutex::new(HashMap::new()),
             learned: Mutex::new(HashMap::new()),
             in_progress_artifacts: Arc::new(Mutex::new(HashSet::new())),
+            snapshot_permits,
             unexpected_exits: Mutex::new(VecDeque::new()),
             net,
             jails,
@@ -4112,6 +4118,18 @@ impl VmmSupervisor {
 
     pub(crate) fn refresh_disk_pressure(&self) -> Result<DiskPressureSnapshot, OrchError> {
         self.disk_pressure.refresh()
+    }
+
+    /// Wait for a turn to capture a snapshot. Held until the snapshot's
+    /// files are durable, so writes and syncs of different VMs' snapshots do
+    /// not all share the device at once.
+    pub(crate) async fn snapshot_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, OrchError> {
+        Arc::clone(&self.snapshot_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| OrchError::Unavailable("snapshot capture is shut down".into()))
     }
 
     pub(crate) fn disk_sweep_interval(&self) -> Duration {
@@ -9836,6 +9854,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
@@ -10276,6 +10295,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,

@@ -174,6 +174,13 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- A burst of snapshots or forks on one host all wrote and synced guest RAM
+  at once. On a 40-VM soak with a saturated disk, 40% of live snapshots ran
+  past their 30-second pre-copy budget, which makes the final pause copy
+  more, and the slowest guest pause reached 8 seconds. Captures now take
+  turns, `TARIT_MAX_CONCURRENT_SNAPSHOTS` at a time (default: half the CPUs,
+  at least 2).
+
 - Pause, suspend, snapshot, hibernate and fork answered 500 when a block
   device's backing write was still in flight after the five-second pause
   budget, which happens on a host short of disk bandwidth. The VMM already

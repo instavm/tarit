@@ -3069,8 +3069,17 @@ async fn snapshot_local_locked(
         .and_then(|layout| layout.overlay_path.as_ref())
         .map(PathBuf::from);
     let memory_mib = vm.memory_mib;
+    let queued = std::time::Instant::now();
+    let permit = state.supervisor.snapshot_permit().await?;
+    let queued = queued.elapsed();
+    if queued >= std::time::Duration::from_secs(1) {
+        tracing::info!(%id, queued_ms = queued.as_millis() as u64, "snapshot waited for a capture slot");
+    }
     let sup = Arc::clone(&state.supervisor);
     let bundle = tokio::task::spawn_blocking(move || {
+        // Released when the bundle's files are durable, even if this request
+        // is abandoned while the capture runs.
+        let _permit = permit;
         if !running {
             return sup.snapshot_bundle_vm(id, false, overlay_path, memory_mib);
         }
@@ -6298,6 +6307,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,
@@ -6361,6 +6371,30 @@ mod tests {
             },
             store_rx,
         )
+    }
+
+    #[test]
+    fn snapshot_captures_beyond_the_host_limit_wait_for_a_slot() {
+        let (state, _) = test_state_with_durable_writer();
+        assert_eq!(state.config.max_concurrent_snapshots, 2);
+        test_runtime().block_on(async {
+            let first = state.supervisor.snapshot_permit().await.unwrap();
+            let _second = state.supervisor.snapshot_permit().await.unwrap();
+            let third = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                state.supervisor.snapshot_permit(),
+            )
+            .await;
+            assert!(third.is_err(), "a third capture must wait for a slot");
+            drop(first);
+            let _admitted = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                state.supervisor.snapshot_permit(),
+            )
+            .await
+            .expect("a freed slot admits the waiting capture")
+            .unwrap();
+        });
     }
 
     #[test]

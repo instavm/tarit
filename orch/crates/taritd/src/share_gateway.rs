@@ -3662,6 +3662,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
             api_max_body_bytes: 1024 * 1024,

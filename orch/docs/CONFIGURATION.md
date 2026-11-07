@@ -236,6 +236,7 @@ answer from the local outbox.
 | `TARIT_LOCAL_USAGE_RETENTION_DAYS` | u64 | `90` | Without a fleet database, days of local usage/audit rows to keep (`0` keeps them forever). |
 | `TARIT_EXECUTION_RETENTION_HOURS` | u64 | `24` | Hours a finished command's record and captured output stay readable through `GET /v1/executions/{id}` (`0` keeps them forever). Pruned hourly in small batches. |
 | `TARIT_STOPPED_VM_RETENTION_HOURS` | u64 | `24` | Hours the record of a deleted VM is kept (`0` keeps them forever). While it is kept, its id, and the child id of a fork that produced it, cannot be used for a new VM; after it, a create or fork that reuses the id makes a new VM. Records still named by a hibernation, volume attachment, private snapshot or unfinished fork are kept. Pruned hourly in small batches. Deleted VMs leave taritd's in-memory cache five minutes after deletion regardless. |
+| `TARIT_MAX_CONCURRENT_SNAPSHOTS` | usize | half the CPUs, at least 2 | Snapshot and fork captures that run at once on this host; more wait their turn. Each capture writes and syncs guest RAM. With no limit, a burst of captures shares the disk so thinly that they all overrun the live pre-copy budget and pause their guests for longer. |
 
 ## TOML config reference
 

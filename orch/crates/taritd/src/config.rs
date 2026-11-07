@@ -755,6 +755,12 @@ pub struct Config {
     pub api_requests_per_second: u64,
     pub api_request_timeout_ms: u64,
     pub api_max_body_bytes: usize,
+    /// Snapshots (and fork snapshots) captured at once on this host. Each
+    /// writes and syncs guest RAM; past this many the device is shared so
+    /// thinly that every one of them overruns its live pre-copy budget.
+    /// Env TARIT_MAX_CONCURRENT_SNAPSHOTS (default: half the host's CPUs,
+    /// at least 2).
+    pub max_concurrent_snapshots: usize,
     /// Parent cgroup v2 path under which taritd places a per-VM cgroup for each
     /// `vmm serve` child (memory + PID limits), e.g. `/sys/fs/cgroup/tarit`.
     /// When unset, no per-VM cgroup is applied (host must be cgroup v2 and
@@ -946,6 +952,13 @@ impl Config {
         let api_requests_per_second = env_positive_u64("TARIT_API_REQUESTS_PER_SECOND", 5_000)?;
         let api_request_timeout_ms = env_positive_u64("TARIT_API_REQUEST_TIMEOUT_MS", 180_000)?;
         let api_max_body_bytes = env_positive_usize("TARIT_API_MAX_BODY_BYTES", 1024 * 1024)?;
+        let max_concurrent_snapshots = env_positive_usize(
+            "TARIT_MAX_CONCURRENT_SNAPSHOTS",
+            std::thread::available_parallelism()
+                .map(|n| n.get() / 2)
+                .unwrap_or(1)
+                .max(2),
+        )?;
 
         let vm_cgroup_parent = env::var("TARIT_VM_CGROUP_PARENT")
             .ok()
@@ -1090,6 +1103,7 @@ impl Config {
             api_requests_per_second,
             api_request_timeout_ms,
             api_max_body_bytes,
+            max_concurrent_snapshots,
             vm_cgroup_parent,
             vm_jail,
             vm_cgroup_pids_max,
@@ -1152,6 +1166,7 @@ impl fmt::Debug for Config {
                 &self.metrics_expose_tenant_labels,
             )
             .field("api_max_in_flight", &self.api_max_in_flight)
+            .field("max_concurrent_snapshots", &self.max_concurrent_snapshots)
             .field("api_requests_per_second", &self.api_requests_per_second)
             .field("api_request_timeout_ms", &self.api_request_timeout_ms)
             .field("api_max_body_bytes", &self.api_max_body_bytes)
