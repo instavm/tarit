@@ -28,6 +28,7 @@
 #include <pty.h>
 #include <sys/mount.h>
 #include <sys/random.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #endif
@@ -670,6 +671,59 @@ static int wait_for_child(pid_t pid) {
     }
 }
 
+#ifdef __linux__
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+
+/* Wait for the command to exit while watching the host connection. A command
+ * can close its output and keep running (`exec >/dev/null 2>&1; sleep 600`);
+ * the host must still be able to abandon it. Returns the exit code, or -1
+ * with *host_gone set once the host has dropped the connection. A pidfd
+ * wakes the wait the moment the child exits; without one (kernels before
+ * 5.3) the child is checked every 20 ms. */
+static int wait_for_child_or_host(pid_t pid, int host_fd, bool *host_gone) {
+    int pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
+    for (;;) {
+        int status;
+        pid_t reaped = waitpid(pid, &status, WNOHANG);
+        if (reaped == pid) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            return status_to_exit_code(status);
+        }
+        if (reaped < 0 && errno != EINTR) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            return 127;
+        }
+        struct pollfd pfds[2];
+        pfds[0].fd = host_fd;
+        pfds[0].events = POLLRDHUP;
+        pfds[0].revents = 0;
+        pfds[1].fd = pidfd;
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+        int prc = poll(pfds, pidfd >= 0 ? 2 : 1, pidfd >= 0 ? -1 : 20);
+        if (prc < 0 && errno != EINTR) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            return wait_for_child(pid);
+        }
+        if (prc > 0 && (pfds[0].revents & (POLLRDHUP | POLLHUP | POLLERR))) {
+            if (pidfd >= 0) {
+                close(pidfd);
+            }
+            *host_gone = true;
+            return -1;
+        }
+    }
+}
+#endif
+
 /* Run a command in the exec child. Commands go through /bin/sh so pipes,
  * redirects and quoting work. Images without a shell (distroless, scratch)
  * still run plain commands: the line is split on spaces and tabs and
@@ -683,10 +737,15 @@ static void exec_command(const char *command) {
     if (line == NULL) {
         return;
     }
-    char *argv[64];
+    /* A line of n bytes holds at most n/2 + 1 words, so every argument fits:
+     * a command must never run with some of its arguments dropped. */
+    char **argv = calloc(strlen(line) / 2 + 2, sizeof(char *));
+    if (argv == NULL) {
+        free(line);
+        return;
+    }
     size_t argc = 0;
-    for (char *save = NULL, *word = strtok_r(line, " \t", &save);
-         word != NULL && argc < sizeof(argv) / sizeof(argv[0]) - 1;
+    for (char *save = NULL, *word = strtok_r(line, " \t", &save); word != NULL;
          word = strtok_r(NULL, " \t", &save)) {
         argv[argc++] = word;
     }
@@ -694,6 +753,7 @@ static void exec_command(const char *command) {
     if (argc > 0) {
         execvp(argv[0], argv);
     }
+    free(argv);
     free(line);
 }
 
@@ -1044,12 +1104,13 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
     if (stderr_pipe[0] >= 0) {
         close(stderr_pipe[0]);
     }
+    int exit_code = host_gone ? -1 : wait_for_child_or_host(pid, fd, &host_gone);
     if (host_gone) {
         (void)kill(-pid, SIGKILL);
         (void)wait_for_child(pid);
         return;
     }
-    (void)send_exec_exit(fd, request_id, wait_for_child(pid));
+    (void)send_exec_exit(fd, request_id, exit_code);
 }
 #endif
 
@@ -2060,6 +2121,16 @@ int main(void) {
     for (;;) {
         if (is_init) {
             reap_orphans();
+            /* Commands the host abandons leave orphans for init to reap, and
+             * commands mostly arrive over vsock, so wake at least once a
+             * second even while the serial line is idle. */
+            struct pollfd serial_pfd;
+            serial_pfd.fd = serial_fd;
+            serial_pfd.events = POLLIN;
+            serial_pfd.revents = 0;
+            if (poll(&serial_pfd, 1, 1000) == 0) {
+                continue;
+            }
         }
         int rc = read_line(serial_fd, line, sizeof(line), false);
         if (rc < 0) {

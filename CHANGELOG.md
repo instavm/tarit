@@ -166,6 +166,13 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Guest agent: a command that closed its output and kept running (`exec
+  >/dev/null 2>&1; sleep 600`) stopped the agent from noticing the host give
+  up on it, so every later command queued behind it; the agent now watches
+  the host until the command exits and kills its process group if the host
+  leaves. Shell-less images no longer drop arguments past the 63rd, and the
+  agent running as init reaps abandoned commands' orphans within a second.
+
 - Deletes on a host ran one at a time: each held the host-wide terminal
   transition gate while its VMM was torn down. The teardown now runs outside
   that gate, under the VM's own operation gate, and only the state checks
