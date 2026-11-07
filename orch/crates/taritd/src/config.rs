@@ -155,9 +155,10 @@ pub struct WarmPoolConfig {
 
 impl Default for WarmPoolConfig {
     fn default() -> Self {
-        // Default mix: 100% one class of 1 vCPU / 256 MiB, 400% CPU overcommit.
+        // On by default: one class of 1 vCPU / 256 MiB clones restored from a
+        // golden snapshot, with 400% CPU overcommit.
         Self {
-            enabled: false,
+            enabled: true,
             cpu_overcommit: 4.0,
             replenish_concurrency: 4,
             refill_cgroup: RefillCgroupConfig::default(),
@@ -435,7 +436,7 @@ impl WarmClassSpec {
             hard_floor: None,
             low_watermark: None,
             high_watermark: None,
-            restore: false,
+            restore: true,
             rootfs: None,
             image: None,
             prewarm: None,
@@ -450,7 +451,7 @@ impl WarmClassSpec {
             hard_floor: file.hard_floor,
             low_watermark: file.low_watermark,
             high_watermark: file.high_watermark,
-            restore: file.restore.unwrap_or(false),
+            restore: file.restore.unwrap_or(true),
             rootfs: file.rootfs.as_ref().map(|s| expand_path(s)),
             image: file.image.clone(),
             prewarm: file.prewarm.clone(),
@@ -474,7 +475,7 @@ struct WarmPoolDraft {
 impl Default for WarmPoolDraft {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             cpu_overcommit: 4.0,
             replenish_concurrency: 4,
             refill_cgroup: RefillCgroupConfig::default(),
@@ -828,7 +829,7 @@ impl Config {
         let shared_block = parse_shared_block_config()?;
         let image_admission_policy = crate::image::ImageAdmissionPolicy::from_env()?;
 
-        let max_vms = env_positive_usize("TARIT_MAX_VMS", 32)?;
+        let max_vms_env = env_optional_positive_usize("TARIT_MAX_VMS")?;
         let max_vcpus_env = env_optional_positive_u64("TARIT_MAX_VCPUS")?;
         // Without an explicit ceiling, place no more guest memory than the
         // host has: a fixed default admitted 64 GiB on small hosts.
@@ -890,7 +891,6 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let vm_jail = parse_vm_jail_config(max_vms)?;
         let vm_cgroup_pids_max = env_positive_u64("TARIT_VM_CGROUP_PIDS_MAX", 1024)?;
         let vm_io_quota = VmIoQuotaConfig {
             read_bps_max: env_optional_positive_u64("TARIT_VM_IO_READ_BPS_MAX")?,
@@ -924,6 +924,11 @@ impl Config {
                 .unwrap_or(1.0);
             ((cores * warm_pool.cpu_overcommit).ceil() as u64).max(1)
         });
+        // Every VM takes at least one vCPU, so without an explicit cap the
+        // vCPU ceiling bounds the VM count too. A fixed 32 left large hosts
+        // mostly idle.
+        let max_vms = max_vms_env.unwrap_or_else(|| default_max_vms(max_vcpus));
+        let vm_jail = parse_vm_jail_config(max_vms)?;
 
         let region = env::var("TARIT_REGION").unwrap_or_else(|_| "local".into());
         let zone = env::var("TARIT_ZONE").unwrap_or_else(|_| region.clone());
@@ -1854,6 +1859,12 @@ fn env_bool_checked(key: &str, default: bool) -> Result<bool> {
     }
 }
 
+/// The VM slot count when TARIT_MAX_VMS is unset: one slot per schedulable
+/// vCPU, never fewer than the historical 32.
+fn default_max_vms(max_vcpus: u64) -> usize {
+    usize::try_from(max_vcpus).unwrap_or(usize::MAX).max(32)
+}
+
 /// Total host memory in MiB from /proc/meminfo, if readable.
 fn host_memory_mib() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -2074,6 +2085,15 @@ fn validate_watermark_pair(prefix: &str, high: Option<u64>, low: Option<u64>) ->
 fn env_positive_usize(key: &str, default: usize) -> Result<usize> {
     let value = env_positive_u64(key, default as u64)?;
     usize::try_from(value).with_context(|| format!("{key} exceeds this platform's size limit"))
+}
+
+fn env_optional_positive_usize(key: &str) -> Result<Option<usize>> {
+    env_optional_positive_u64(key)?
+        .map(|value| {
+            usize::try_from(value)
+                .with_context(|| format!("{key} exceeds this platform's size limit"))
+        })
+        .transpose()
 }
 
 fn env_usize(key: &str) -> Option<usize> {
@@ -2434,6 +2454,13 @@ mod tests {
         let error = parse_vm_jail_config(4).expect_err("partial jail config must fail");
         assert!(error.to_string().contains("TARIT_VM_JAIL_UID_BASE"));
         std::env::remove_var("TARIT_VM_JAIL_BASE");
+    }
+
+    #[test]
+    fn the_default_vm_cap_follows_the_vcpu_ceiling() {
+        assert_eq!(super::default_max_vms(8), 32);
+        assert_eq!(super::default_max_vms(48), 48);
+        assert_eq!(super::default_max_vms(512), 512);
     }
 
     #[test]

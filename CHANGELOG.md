@@ -54,6 +54,16 @@ versions may contain breaking changes.
 
 ### Changed
 
+- taritd keeps a warm pool by default (eight 1 vCPU / 256 MiB clones of a
+  golden snapshot); `TARIT_WARM_POOL=0` turns it off. A golden that cannot
+  be built is retried with backoff (1 s doubling to a minute) instead of on
+  every refill round.
+- `TARIT_MAX_VMS` defaults to the host's vCPU ceiling (at least 32) instead
+  of a fixed 32, and taritd raises its open-file limit to the hard limit.
+- A create that finds the host full stops an idle warm VM of a class it
+  cannot use and takes its capacity; warm refills wait while any create is
+  waiting for capacity.
+
 - VM boots, publications and warm-pool claims on a host no longer run one at
   a time: they hold the supervisor's lifecycle gate shared, and only
   shutdown, stops, exit reconciliation and re-adoption hold it exclusively.

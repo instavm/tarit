@@ -47,7 +47,7 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
-| `TARIT_MAX_VMS` | usize | `32` | Maximum concurrent local VM slots, including warm VMs. |
+| `TARIT_MAX_VMS` | usize | the vCPU ceiling, at least `32` | Maximum concurrent local VM slots, including warm VMs. Every VM takes at least one vCPU, so the default is the effective `TARIT_MAX_VCPUS`. |
 | `TARIT_MAX_VCPUS` | u64 | `ceil(available_parallelism * TARIT_CPU_OVERCOMMIT)` | Local vCPU placement ceiling. If set, it overrides the derived ceiling. |
 | `TARIT_MAX_MEMORY_MIB` | u64 | host `MemTotal` in MiB (`65536` if `/proc/meminfo` is unreadable) | Local memory placement ceiling in MiB. |
 | `TARIT_ADMISSION_TIMEOUT_MS` | u64 | `60000` | Time a create operation may wait for capacity before admission gives up. |
@@ -60,18 +60,18 @@ Boolean environment variables accept `1`, `true`, `yes`, or `on` for true and `0
 
 | Variable | Type | Default | Description |
 | --- | --- | --- | --- |
-| `TARIT_WARM_POOL` | bool | `false` | Enable warm-pool replenishment. For this variable, only `1` or `true` enables it. |
+| `TARIT_WARM_POOL` | bool | `true` | Warm-pool replenishment. For this variable, only `1` or `true` enables it; any other value turns the pool off. |
 | `TARIT_WARM_POOL_TARGET` | usize | `8` for the default class | Override the first warm-pool class target. |
 | `TARIT_WARM_POOL_ROOTFS` | path | unset | Override the first warm-pool class rootfs when non-empty. `~/` is expanded. |
 | `TARIT_WARM_POOL_IMAGE` | string | unset | Override the first warm-pool class image reference when non-empty after trimming. |
-| `TARIT_WARM_POOL_RESTORE` | bool | `false` | Use restore-from-golden replenishment for the first class. For this variable, only `1` or `true` enables it. |
+| `TARIT_WARM_POOL_RESTORE` | bool | `true` | Restore-from-golden replenishment for the first class. For this variable, only `1` or `true` enables it; any other value refills by cold boot. |
 | `TARIT_WARM_POOL_LOW_WATERMARK` | usize | derived from target | Override the first class low watermark. Refill starts when depth is below this value. |
 | `TARIT_WARM_POOL_HIGH_WATERMARK` | usize | derived from target | Override the first class high watermark. Refill does not intentionally grow past this ceiling. |
 | `TARIT_WARM_POOL_HARD_FLOOR` | usize | derived from target | Override the first class emergency minimum. |
 | `TARIT_REFILL_CGROUP` | path | unset | Optional cgroup v2 path for refill-spawned VMM children. Empty string clears the path. `~/` is expanded. |
 | `TARIT_REFILL_CPU_WEIGHT` | u64 | `10` | cgroup v2 `cpu.weight` for refill children. Values are clamped to `1..=10000`. |
 
-The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = false`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
+The default warm class is `vcpus = 1`, `memory_mib = 256`, `target = 8`, and `restore = true`. Watermarks derive from the target as follows: if target is `0`, all three watermarks are `0`; otherwise `buffer = max(target / 4, 1)`, `low_watermark = max(target - buffer, 1)`, `hard_floor = low_watermark.saturating_sub(buffer)`, and `high_watermark = target + buffer`. For the default target `8`, this gives hard floor `4`, low watermark `6`, and high watermark `10`.
 
 ## VMM jail
 
@@ -256,7 +256,7 @@ target = 8                     # usize, required
 hard_floor = 4                 # optional usize, derived when omitted
 low_watermark = 6              # optional usize, derived when omitted
 high_watermark = 10            # optional usize, derived when omitted
-restore = true                 # optional bool, default false
+restore = true                 # optional bool, default true
 image = "node20"               # optional registered image name[:tag]
 # rootfs = "/var/lib/taritd/rootfs.ext4" # optional path; do not set with image
 

@@ -203,7 +203,7 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_DB` | No | `~/.taritd/fleet.db` | Node-local SQLite database path. |
 | `TARIT_NET_STATE` | No | `<TARIT_DB>.net.json` | Persistent per-VM tap/IP slot map used when `TARIT_ENABLE_NET=true` so restarts reuse/free `/30` slots safely. |
 | `TARIT_IMAGES_DIR` | No | `~/.taritd/images` | Directory for registered immutable rootfs images built by `taritd image build`. |
-| `TARIT_MAX_VMS` | No | `32` | Max concurrent local VM slots, including warm pool reservations. |
+| `TARIT_MAX_VMS` | No | vCPU ceiling, at least `32` | Max concurrent local VM slots, including warm pool reservations. |
 | `TARIT_MAX_VCPUS` | No | `64`, or physical cores times `TARIT_CPU_OVERCOMMIT` when warm pool is enabled | Advertised local vCPU ceiling. |
 | `TARIT_MAX_MEMORY_MIB` | No | `65536` | Advertised local memory ceiling in MiB. |
 | `TARIT_PEER_SECRET` | Cluster: yes | random local-only value | Shared secret for `X-Peer-Secret`. Explicit values must be at least 32 characters and cannot use the development default. |
@@ -224,12 +224,12 @@ The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_
 | `TARIT_ARTIFACT_GC_INTERVAL_SECS` | No | `30` | Disk-pressure refresh and owned-artifact sweep interval. |
 | `TARIT_ARTIFACT_GC_MIN_AGE_SECS` | No | `300` | Minimum age for collection of unreferenced Tarit-owned artifacts. |
 | `TARIT_CONFIG` | No | `~/.taritd/config.toml` | Optional TOML file for warm-pool configuration. Missing file is allowed. |
-| `TARIT_WARM_POOL` | No | `false` | Enable warm-pool replenishment. Accepts `1` or `true`. |
+| `TARIT_WARM_POOL` | No | `true` | Warm-pool replenishment. `1` or `true` keeps it on; any other value turns it off. |
 | `TARIT_WARM_POOL_TARGET` | No | `8` for the default class | Override target count for the first warm-pool class. If watermarks are unset, effective hard/low/high watermarks derive from this target. |
 | `TARIT_WARM_POOL_HARD_FLOOR` | No | derived from target | Override the emergency minimum for the first warm-pool class. Must be `<= low_watermark`. |
 | `TARIT_WARM_POOL_LOW_WATERMARK` | No | derived from target | Refill the first warm-pool class only after depth drops below this watermark. Must be `<= target`. |
 | `TARIT_WARM_POOL_HIGH_WATERMARK` | No | derived from target | Safety ceiling for the first warm-pool class. Must be `>= target`. |
-| `TARIT_WARM_POOL_RESTORE` | No | `false` for the default class | Use restore-from-golden replenishment for the first warm-pool class. Accepts `1` or `true`; use TOML for multiple classes. |
+| `TARIT_WARM_POOL_RESTORE` | No | `true` | Restore-from-golden replenishment for the first warm-pool class. Any value other than `1` or `true` refills by cold boot; use TOML for multiple classes. |
 | `TARIT_REFILL_CGROUP` | No | unset | Optional cgroup v2 directory for refill-spawned `vmm serve` children, e.g. `/sys/fs/cgroup/taritd-refill`. If unset or unavailable, refill continues without cgroup placement. |
 | `TARIT_REFILL_CPU_WEIGHT` | No | `10` | Low cgroup v2 `cpu.weight` assigned to the refill cgroup; live-created VMs keep the default cgroup weight. |
 | `TARIT_CPU_OVERCOMMIT` | No | `4.0` | Warm-pool CPU overcommit ratio. |

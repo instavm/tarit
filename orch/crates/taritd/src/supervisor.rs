@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Condvar, Mutex, RwLock, RwLockReadGuard,
 };
 use std::time::{Duration, Instant};
@@ -2877,6 +2877,20 @@ struct WarmVm {
     spec: VmSpawnConfig,
 }
 
+/// Prefix of the error a boot gets when the host has no capacity for it.
+pub(crate) const HOST_CAPACITY_EXHAUSTED: &str = "host resource capacity exhausted";
+
+/// A create counted in [`VmmSupervisor::wait_for_capacity`].
+pub(crate) struct CapacityWaiter<'a> {
+    waiters: &'a AtomicUsize,
+}
+
+impl Drop for CapacityWaiter<'_> {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A warm VM selected by one claim. Dropping it, however the claim ends,
 /// makes the VM selectable again if it is still parked.
 struct WarmClaim<'a> {
@@ -3007,6 +3021,9 @@ pub struct VmmSupervisor {
     warm_claims: Mutex<HashSet<Uuid>>,
     /// Pre-booted, unassigned VMs kept ready by the warm-pool replenisher.
     warm: Mutex<VecDeque<WarmVm>>,
+    /// Creates waiting for host capacity. While any wait, warm refills defer
+    /// to them instead of taking the capacity they are waiting for.
+    capacity_waiters: AtomicUsize,
     /// Async lifecycle/refill workers are owned here rather than by the API or
     /// replenisher future that awaits their result. Shutdown can therefore mark,
     /// enumerate, and wait every worker before tearing resources down.
@@ -3215,6 +3232,7 @@ impl VmmSupervisor {
             boot_gate: tokio::sync::RwLock::new(()),
             warm_claims: Mutex::new(HashSet::new()),
             warm: Mutex::new(VecDeque::new()),
+            capacity_waiters: AtomicUsize::new(0),
             owned_tasks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             spawn_attachment_pause: Mutex::new(None),
@@ -4276,7 +4294,7 @@ impl VmmSupervisor {
                 ReservationError::VmLimit
                 | ReservationError::VcpuLimit
                 | ReservationError::MemoryLimit => OrchError::Overloaded {
-                    message: format!("host resource capacity exhausted: {error:?}"),
+                    message: format!("{HOST_CAPACITY_EXHAUSTED}: {error:?}"),
                     retry_after_secs: 1,
                 },
             });
@@ -4563,6 +4581,52 @@ impl VmmSupervisor {
             },
         );
         Ok(control)
+    }
+
+    /// Whether any create is waiting for host capacity right now.
+    pub(crate) fn creates_waiting_for_capacity(&self) -> bool {
+        self.capacity_waiters.load(Ordering::Acquire) > 0
+    }
+
+    /// Count a create as waiting for host capacity until the guard drops.
+    pub(crate) fn wait_for_capacity(&self) -> CapacityWaiter<'_> {
+        self.capacity_waiters.fetch_add(1, Ordering::AcqRel);
+        CapacityWaiter {
+            waiters: &self.capacity_waiters,
+        }
+    }
+
+    /// Stop one idle warm VM so that a create which found the host full can
+    /// take its capacity. Only VMs no claim has selected are eligible; a
+    /// waiting create's own class has none of those, or it would have claimed
+    /// one. Returns whether a VM was stopped and its capacity released.
+    pub(crate) fn reclaim_idle_warm(&self) -> bool {
+        let gate = self.boot_gate.blocking_write();
+        if self.is_shutting_down() {
+            return false;
+        }
+        let taken = self.warm.lock().ok().and_then(|mut warm| {
+            let claims = self.warm_claims.lock().ok()?;
+            let index = warm.iter().position(|vm| !claims.contains(&vm.id))?;
+            warm.remove(index)
+        });
+        drop(gate);
+        let Some(warm_vm) = taken else {
+            return false;
+        };
+        let _ = VmmClient::new(&warm_vm.vm.socket_path).stop();
+        match self.teardown_vm(warm_vm.id, &warm_vm.vm) {
+            Ok(()) => {
+                self.release_reservation_after_cleanup(warm_vm.id);
+                tracing::info!(vm = %warm_vm.id, "stopped an idle warm VM for a waiting create");
+                true
+            }
+            Err(error) => {
+                // The VMM may still be alive, so its capacity stays reserved.
+                tracing::error!(vm = %warm_vm.id, %error, "idle warm VM teardown incomplete");
+                false
+            }
+        }
     }
 
     fn release_reservation_after_cleanup(&self, id: Uuid) {
@@ -11646,6 +11710,60 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, WarmClaimOutcome::NoMatch));
         assert_eq!(supervisor.warm_count(&first), 1);
+    }
+
+    #[test]
+    fn a_waiting_create_reclaims_an_idle_warm_vm_but_never_a_claimed_one() {
+        let supervisor = test_supervisor();
+        let spec = spawn_config(false, Some(PathBuf::from("/images/a.ext4")));
+        let mut ids = Vec::new();
+        for name in ["idle", "claimed"] {
+            let id = Uuid::new_v4();
+            supervisor
+                .scheduler
+                .try_reserve(id, ResourceShape::new(1, 1))
+                .unwrap();
+            let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+            supervisor.warm.lock().unwrap().push_back(WarmVm {
+                id,
+                vm: RunningVm::new(
+                    process.pid,
+                    PathBuf::from(format!("target/taritd-supervisor-test/reclaim-{name}-{id}")),
+                    process,
+                    None,
+                ),
+                spec: spec.clone(),
+            });
+            ids.push(id);
+        }
+        let (idle, claimed) = (ids[0], ids[1]);
+        // Selected first in queue order, so the claim must be what spares it.
+        supervisor.warm.lock().unwrap().swap(0, 1);
+        supervisor.warm_claims.lock().unwrap().insert(claimed);
+
+        assert!(supervisor.reclaim_idle_warm());
+        assert!(!supervisor.scheduler.is_reserved(idle));
+        assert!(supervisor.scheduler.is_reserved(claimed));
+        assert_eq!(supervisor.warm_count(&spec), 1);
+
+        assert!(!supervisor.reclaim_idle_warm(), "only a claimed VM is left");
+        assert_eq!(supervisor.warm_count(&spec), 1);
+
+        supervisor.warm_claims.lock().unwrap().remove(&claimed);
+        assert!(supervisor.reclaim_idle_warm());
+        assert_eq!(supervisor.warm_count(&spec), 0);
+    }
+
+    #[test]
+    fn capacity_waiters_are_counted_while_their_guards_live() {
+        let supervisor = test_supervisor();
+        assert!(!supervisor.creates_waiting_for_capacity());
+        let first = supervisor.wait_for_capacity();
+        let second = supervisor.wait_for_capacity();
+        drop(first);
+        assert!(supervisor.creates_waiting_for_capacity());
+        drop(second);
+        assert!(!supervisor.creates_waiting_for_capacity());
     }
 
     #[test]

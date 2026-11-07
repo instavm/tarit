@@ -135,6 +135,10 @@ pub(crate) fn spawn_replenisher(
         GoldenBundle,
     >::new()));
 
+    // A golden that cannot be built (missing rootfs, unregistered image, full
+    // disk) is retried with backoff instead of on every 150 ms round.
+    let mut golden_backoff = HashMap::<VmSpawnConfig, GoldenBackoff>::new();
+
     let cancelled = Arc::new(AtomicBool::new(false));
     let children = Arc::new(BlockingChildren::default());
     let worker_cancelled = Arc::clone(&cancelled);
@@ -172,6 +176,18 @@ pub(crate) fn spawn_replenisher(
                         continue;
                     }
                 }
+                // Creates waiting for capacity come first; refilling now would
+                // take the slots they wait for.
+                if sup.creates_waiting_for_capacity() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                        _ = wait_for_shutdown(&mut shutdown_rx) => {
+                            worker_cancelled.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 let mut did_work = false;
                 for (index, class) in classes.iter().enumerate() {
                     if worker_cancelled.load(Ordering::Acquire) || shutdown_pending(&shutdown_rx) {
@@ -202,6 +218,11 @@ pub(crate) fn spawn_replenisher(
                             let mut golden = golden_snapshots.lock().await;
                             if let Some(path) = golden.get(&key).cloned() {
                                 Some(path)
+                            } else if golden_backoff
+                                .get(&key)
+                                .is_some_and(|backoff| !backoff.due())
+                            {
+                                None
                             } else {
                                 let golden_sup = Arc::clone(&sup);
                                 let class = class.clone();
@@ -238,14 +259,25 @@ pub(crate) fn spawn_replenisher(
                                             overlay_path = ?bundle.overlay_path(),
                                             "warm golden snapshot created"
                                         );
+                                        golden_backoff.remove(&key);
                                         sup.publish_golden(key.clone(), bundle.clone());
                                         golden.insert(key, bundle);
                                     }
                                     Ok(Err(e)) => {
-                                        tracing::warn!("warm golden create failed: {e}");
+                                        let retry_in =
+                                            golden_backoff.entry(key).or_default().failed();
+                                        tracing::warn!(
+                                            retry_in_secs = retry_in.as_secs(),
+                                            "warm golden create failed: {e}"
+                                        );
                                     }
                                     Err(e) => {
-                                        tracing::warn!("warm golden task failed: {e}");
+                                        let retry_in =
+                                            golden_backoff.entry(key).or_default().failed();
+                                        tracing::warn!(
+                                            retry_in_secs = retry_in.as_secs(),
+                                            "warm golden task failed: {e}"
+                                        );
                                     }
                                 }
                                 None
@@ -361,6 +393,33 @@ pub(crate) fn spawn_replenisher(
     })
 }
 
+const GOLDEN_RETRY_FIRST: Duration = Duration::from_secs(1);
+const GOLDEN_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// When a class whose golden failed to build may try again: one second after
+/// the first failure, doubling up to a minute.
+#[derive(Default)]
+struct GoldenBackoff {
+    delay: Option<Duration>,
+    next_attempt: Option<std::time::Instant>,
+}
+
+impl GoldenBackoff {
+    fn due(&self) -> bool {
+        self.next_attempt
+            .is_none_or(|at| std::time::Instant::now() >= at)
+    }
+
+    fn failed(&mut self) -> Duration {
+        let delay = self.delay.map_or(GOLDEN_RETRY_FIRST, |delay| {
+            (delay * 2).min(GOLDEN_RETRY_MAX)
+        });
+        self.delay = Some(delay);
+        self.next_attempt = Some(std::time::Instant::now() + delay);
+        delay
+    }
+}
+
 async fn await_blocking<T>(
     mut result: oneshot::Receiver<T>,
     cancelled: &AtomicBool,
@@ -429,6 +488,16 @@ mod tests {
     };
     use std::time::Duration;
     use tokio::sync::{oneshot, watch};
+
+    #[test]
+    fn a_failing_golden_backs_off_up_to_a_minute() {
+        let mut backoff = super::GoldenBackoff::default();
+        assert!(backoff.due());
+        assert_eq!(backoff.failed(), Duration::from_secs(1));
+        assert!(!backoff.due());
+        let delays: Vec<u64> = (0..8).map(|_| backoff.failed().as_secs()).collect();
+        assert_eq!(delays, [2, 4, 8, 16, 32, 60, 60, 60]);
+    }
 
     #[tokio::test]
     async fn shutdown_waits_for_cooperatively_cancelled_blocking_work() {

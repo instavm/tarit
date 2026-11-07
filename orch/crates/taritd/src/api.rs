@@ -1840,6 +1840,7 @@ async fn create_vm_after_quota(
     // admission timeout do we return 429 + Retry-After. As long as one node in
     // the fleet can take the VM, the request succeeds.
     let deadline = Instant::now() + Duration::from_millis(state.config.admission_timeout_ms);
+    let mut capacity_wait = None;
     loop {
         let last_overloaded = match ops::create_local(state, &req).await {
             Ok(record) => return Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record)))),
@@ -1872,6 +1873,19 @@ async fn create_vm_after_quota(
                 retry_after_secs: 1,
             }
             .into());
+        }
+
+        // Idle warm VMs of classes this create cannot use hold capacity that
+        // nobody is using: stop one and try again at once.
+        if last_overloaded.contains(crate::supervisor::HOST_CAPACITY_EXHAUSTED) {
+            capacity_wait.get_or_insert_with(|| state.supervisor.wait_for_capacity());
+            let supervisor = Arc::clone(&state.supervisor);
+            if tokio::task::spawn_blocking(move || supervisor.reclaim_idle_warm())
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
         }
 
         if Instant::now() >= deadline {

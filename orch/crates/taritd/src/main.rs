@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     if cli.runs_server() {
         init_tracing();
+        raise_open_file_limit();
         let preflight_taps = net::startup_preflight().context(
             "contain pre-existing Tarit TAPs before configuration, database, image, or VM discovery",
         )?;
@@ -96,6 +97,30 @@ async fn main() -> anyhow::Result<()> {
         run_server(config, preflight_taps, pty_limits).await
     } else {
         cli::run_client(cli).await
+    }
+}
+
+/// Lift the soft open-file limit to the hard limit. taritd holds several
+/// descriptors per VM (control and agent sockets, pidfds, TAP queues), and
+/// the usual soft default of 1,024 runs out a few hundred VMs in.
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read or write the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "reading the open-file limit failed");
+        return;
+    }
+    if limit.rlim_cur >= limit.rlim_max {
+        return;
+    }
+    let previous = limit.rlim_cur;
+    limit.rlim_cur = limit.rlim_max;
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), previous, "raising the open-file limit failed");
     }
 }
 
