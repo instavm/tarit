@@ -12,7 +12,8 @@ use crate::virtio::blk::{req_type, status, BlkReqHeader};
 use crate::virtio::blk_backend::BlkBackend;
 use crate::virtio::regs::{reg, MAGIC};
 use crate::virtio::vqueue::{
-    is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState, MAX_QUEUE_SIZE,
+    is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState, MAX_CHAIN_BYTES,
+    MAX_DESC_LEN, MAX_QUEUE_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -23,14 +24,57 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// virtio-blk feature bits we advertise (a deliberately minimal set).
 /// VIRTIO_F_VERSION_1 (bit 32) is required for virtio-mmio v2 devices.
 /// VIRTIO_BLK_F_FLUSH (bit 9) enables flush support.
+/// VIRTIO_BLK_F_SIZE_MAX (bit 1) and VIRTIO_BLK_F_SEG_MAX (bit 2) tell the
+/// driver the request shape the virtqueue accepts ([`BLK_SIZE_MAX`],
+/// [`BLK_SEG_MAX`]). Without them a driver assumes no segment size limit:
+/// Linux then built single-segment requests of up to 1.25 MiB, which the
+/// virtqueue's 1 MiB descriptor bound refused, and the guest hung on I/O.
 ///
 /// We deliberately do NOT advertise VIRTIO_RING_F_EVENT_IDX (bit 29): our
 /// virtqueue processor uses simple avail/used-index notification and does not
 /// implement the used_event/avail_event suppression that EVENT_IDX requires.
 /// Advertising it made the guest complete exactly one request and then stall,
 /// because its notification bookkeeping diverged from ours.
-const BLK_FEATURES_LOW: u32 = 1 << 9; // FLUSH
+const BLK_FEATURES_LOW: u32 = VIRTIO_BLK_F_SIZE_MAX | VIRTIO_BLK_F_SEG_MAX | VIRTIO_BLK_F_FLUSH;
 const BLK_FEATURES_HIGH: u32 = 1; // bit 32 = VIRTIO_F_VERSION_1
+
+const VIRTIO_BLK_F_SIZE_MAX: u32 = 1 << 1;
+const VIRTIO_BLK_F_SEG_MAX: u32 = 1 << 2;
+const VIRTIO_BLK_F_FLUSH: u32 = 1 << 9;
+
+/// Largest data segment (`size_max`): the virtqueue's per-descriptor bound.
+pub const BLK_SIZE_MAX: u32 = MAX_DESC_LEN;
+
+/// Request bytes that are not data: the 16-byte header and the status byte.
+const BLK_REQUEST_OVERHEAD: usize = BlkReqHeader::SIZE + 1;
+
+/// Most data segments per request (`seg_max`): the largest count for which a
+/// request of `seg_max` segments of [`BLK_SIZE_MAX`] bytes, plus header and
+/// status, stays within the virtqueue's chain byte bound, and whose
+/// descriptors (`seg_max` + 2) fit the queue.
+pub const BLK_SEG_MAX: u32 = {
+    let by_bytes = (MAX_CHAIN_BYTES - BLK_REQUEST_OVERHEAD) / BLK_SIZE_MAX as usize;
+    let by_queue = MAX_QUEUE_SIZE as usize - 2;
+    (if by_bytes < by_queue {
+        by_bytes
+    } else {
+        by_queue
+    }) as u32
+};
+const _: () = assert!(BLK_SEG_MAX >= 1);
+
+/// Device config layout prefix (virtio 1.x §5.2.4): `capacity` (le64, sectors)
+/// at 0, `size_max` (le32) at 8, `seg_max` (le32) at 12. Later fields belong to
+/// features we do not offer and read as zero.
+const BLK_CONFIG_LEN: usize = 16;
+
+fn blk_config_space(capacity_sectors: u64) -> [u8; BLK_CONFIG_LEN] {
+    let mut cfg = [0u8; BLK_CONFIG_LEN];
+    cfg[..8].copy_from_slice(&capacity_sectors.to_le_bytes());
+    cfg[8..12].copy_from_slice(&BLK_SIZE_MAX.to_le_bytes());
+    cfg[12..16].copy_from_slice(&BLK_SEG_MAX.to_le_bytes());
+    cfg
+}
 
 /// virtio interrupt status bits.
 const VIRTIO_MMIO_INT_VRING: u32 = 0x01;
@@ -564,11 +608,31 @@ impl VirtioBlkMmio {
 
         // Process available requests until the queue is drained or the limiter
         // asks us to defer the next descriptor chain.
-        let _count = proc_guard
-            .as_mut()
-            .unwrap()
-            .process_queue_descriptors_dirty(&mem, dirty.as_ref(), |readable, writable| {
+        let _count = proc_guard.as_mut().unwrap().process_queue_chains_dirty(
+            &mem,
+            dirty.as_ref(),
+            |chain| {
+                let (readable, writable) = (chain.readable, chain.writable);
                 let used_len = (readable.len() + writable.len()) as u32;
+                if chain.over_limit {
+                    // Larger than size_max/seg_max allow: a driver that ignored
+                    // the advertised limits. Fail it without touching its data
+                    // buffers, but complete it so the request does not hang.
+                    match self.rate_limit_allows(0) {
+                        Ok(true) => {}
+                        Ok(false) => return None,
+                        Err(_) => {
+                            processing_failed = true;
+                            return None;
+                        }
+                    }
+                    return Some(Self::write_status(
+                        &mem,
+                        dirty.as_ref(),
+                        writable,
+                        status::IO_ERR,
+                    ));
+                }
                 let readable = match Self::read_descs(&mem, readable) {
                     Some(data) => data,
                     None => {
@@ -687,7 +751,8 @@ impl VirtioBlkMmio {
 
                 Self::write_status(&mem, dirty.as_ref(), writable, st);
                 Some(used_len)
-            });
+            },
+        );
 
         // If we processed any requests, signal an interrupt to the guest.
         if _count > 0 {
@@ -811,21 +876,14 @@ impl MmioDevice for VirtioBlkMmio {
             reg::STATUS => self.status.load(Ordering::Relaxed),
             reg::INTERRUPT_STATUS => self.interrupt_status.load(Ordering::SeqCst),
             reg::CONFIG_GENERATION => 0,
-            // Device-specific config space (offset 0x100+).
-            // virtio-blk config: u64 capacity (sectors) at offset 0,
-            // u32 blk_size at offset 8 (optional).
+            // Device-specific config space (offset 0x100+), see
+            // `blk_config_space`.
             off if off >= reg::CONFIG => {
                 let cfg_off = (off - reg::CONFIG) as usize;
                 let backend = self.lock_state(&self.backend, "backend");
                 match &*backend {
                     Some(b) => {
-                        let cap_bytes = b.sectors.to_le_bytes();
-                        let blk_size: u32 = 512;
-                        let size_bytes = blk_size.to_le_bytes();
-                        // Build the config space: [capacity u64][blk_size u32]
-                        let mut cfg = [0u8; 12];
-                        cfg[..8].copy_from_slice(&cap_bytes);
-                        cfg[8..12].copy_from_slice(&size_bytes);
+                        let cfg = blk_config_space(b.sectors);
                         // Return the requested 4-byte window.
                         let end = (cfg_off + 4).min(cfg.len());
                         if cfg_off < end {
@@ -1418,5 +1476,172 @@ mod tests {
             restored.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(),
             state.interrupt_status as u64
         );
+    }
+
+    /// Lay out one request as `header -> data segments -> status` at
+    /// descriptor 0 and publish it as the next available entry.
+    fn setup_blk_request(
+        mem: &GuestMemoryMmap,
+        header: BlkReqHeader,
+        data_segments: &[(u64, u32)],
+        data_writable: bool,
+    ) -> u64 {
+        const STATUS_ADDR: u64 = TEST_STATUS_BASE;
+        mem.write_obj(0u16, GuestAddress(TEST_USED)).unwrap();
+        mem.write_obj(0u16, GuestAddress(TEST_USED + 2)).unwrap();
+        mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(TEST_AVAIL))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 4)).unwrap();
+        mem.write_obj(header, GuestAddress(TEST_HEADER_BASE))
+            .unwrap();
+        let mut descs = vec![Descriptor {
+            addr: TEST_HEADER_BASE,
+            len: BlkReqHeader::SIZE as u32,
+            flags: desc_flags::NEXT,
+            next: 1,
+        }];
+        for &(addr, len) in data_segments {
+            let next = descs.len() as u16 + 1;
+            descs.push(Descriptor {
+                addr,
+                len,
+                flags: desc_flags::NEXT | if data_writable { desc_flags::WRITE } else { 0 },
+                next,
+            });
+        }
+        descs.push(Descriptor {
+            addr: STATUS_ADDR,
+            len: 1,
+            flags: desc_flags::WRITE,
+            next: 0,
+        });
+        for (i, desc) in descs.iter().enumerate() {
+            mem.write_obj(
+                *desc,
+                GuestAddress(TEST_DESC + i as u64 * std::mem::size_of::<Descriptor>() as u64),
+            )
+            .unwrap();
+        }
+        mem.write_obj(0xffu8, GuestAddress(STATUS_ADDR)).unwrap();
+        STATUS_ADDR
+    }
+
+    fn read_config_u32(dev: &VirtioBlkMmio, offset: u64) -> u32 {
+        dev.mmio_read(reg::CONFIG + offset, 4).unwrap() as u32
+    }
+
+    #[test]
+    fn advertises_segment_limits_the_virtqueue_accepts() {
+        let (backend, path) = new_test_backend("blk-config-limits");
+        let dev = VirtioBlkMmio::new(5, backend);
+
+        dev.mmio_write(reg::HOST_FEATURES_SEL, 0, 4).unwrap();
+        let features = dev.mmio_read(reg::HOST_FEATURES, 4).unwrap() as u32;
+        assert_ne!(features & (1 << 1), 0, "VIRTIO_BLK_F_SIZE_MAX");
+        assert_ne!(features & (1 << 2), 0, "VIRTIO_BLK_F_SEG_MAX");
+        assert_ne!(features & (1 << 9), 0, "VIRTIO_BLK_F_FLUSH");
+        assert_eq!(features & (1 << 29), 0, "EVENT_IDX stays off");
+
+        // capacity (le64) at 0, size_max at 8, seg_max at 12.
+        assert_eq!(read_config_u32(&dev, 0), 4096 / 512);
+        assert_eq!(read_config_u32(&dev, 4), 0);
+        let size_max = read_config_u32(&dev, 8);
+        let seg_max = read_config_u32(&dev, 12);
+        assert_eq!(size_max, MAX_DESC_LEN);
+        assert_eq!(seg_max, BLK_SEG_MAX);
+        assert!(seg_max >= 1);
+        // The largest request a driver may build within these limits fits the
+        // chain byte bound and the queue, so the device never refuses it.
+        let largest_request = seg_max as usize * size_max as usize + BlkReqHeader::SIZE + 1;
+        assert!(largest_request <= MAX_CHAIN_BYTES);
+        assert!(seg_max as usize + 2 <= MAX_QUEUE_SIZE as usize);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn request_at_advertised_limits_is_served() {
+        let path = test_disk_path("blk-at-limits");
+        let disk: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i / 4096) as u8).collect();
+        std::fs::write(&path, &disk).unwrap();
+        let backend = BlkBackend::open(&path, false).unwrap();
+        let mem =
+            Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 16 * 1024 * 1024)]).unwrap());
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+
+        let segments: Vec<(u64, u32)> = (0..u64::from(BLK_SEG_MAX))
+            .map(|i| (0x40_0000 + i * u64::from(BLK_SIZE_MAX), BLK_SIZE_MAX))
+            .collect();
+        let header = BlkReqHeader {
+            req_type: req_type::IN,
+            reserved: 0,
+            sector: 0,
+        };
+        let status_addr = setup_blk_request(&mem, header, &segments, true);
+        dev.process_queue(0).unwrap();
+
+        assert_eq!(used_idx(&mem), 1);
+        let status: u8 = mem.read_obj(GuestAddress(status_addr)).unwrap();
+        assert_eq!(status, status::OK);
+        let total = BLK_SEG_MAX as usize * BLK_SIZE_MAX as usize;
+        let mut read_back = vec![0u8; total];
+        mem.read_slice(&mut read_back, GuestAddress(0x40_0000))
+            .unwrap();
+        assert_eq!(read_back, disk[..total]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn over_limit_request_completes_with_io_error() {
+        // The staging failure: Linux 6.1 sent one 1220608-byte data descriptor
+        // when the device did not advertise size_max. A driver that ignores the
+        // limits must get an error completion, not a dropped request.
+        let (backend, path) = new_test_backend("blk-over-limit");
+        let mem =
+            Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 16 * 1024 * 1024)]).unwrap());
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+
+        const DATA: u64 = 0x40_0000;
+        const STAGING_DESC_LEN: u32 = 1_220_608;
+        const { assert!(STAGING_DESC_LEN > BLK_SIZE_MAX) };
+        mem.write_slice(&vec![0x5a; STAGING_DESC_LEN as usize], GuestAddress(DATA))
+            .unwrap();
+        let header = BlkReqHeader {
+            req_type: req_type::IN,
+            reserved: 0,
+            sector: 0,
+        };
+        let status_addr = setup_blk_request(&mem, header, &[(DATA, STAGING_DESC_LEN)], true);
+        dev.process_queue(0).unwrap();
+
+        assert_eq!(used_idx(&mem), 1, "over-limit request must be completed");
+        let status: u8 = mem.read_obj(GuestAddress(status_addr)).unwrap();
+        assert_eq!(status, status::IO_ERR);
+        let used: crate::virtio::vqueue::UsedElem =
+            mem.read_obj(GuestAddress(TEST_USED + 4)).unwrap();
+        assert_eq!((used.id, used.len), (0, 1));
+        let mut data = vec![0u8; STAGING_DESC_LEN as usize];
+        mem.read_slice(&mut data, GuestAddress(DATA)).unwrap();
+        assert!(data.iter().all(|b| *b == 0x5a), "data buffer untouched");
+
+        // Too many segments within size_max also exceeds the chain bound.
+        let segments: Vec<(u64, u32)> = (0..u64::from(BLK_SEG_MAX) + 1)
+            .map(|i| (DATA + i * u64::from(BLK_SIZE_MAX), BLK_SIZE_MAX))
+            .collect();
+        let header = BlkReqHeader {
+            req_type: req_type::OUT,
+            reserved: 0,
+            sector: 0,
+        };
+        // Reset the transport's ring cursor along with the rings.
+        dev.mmio_write(reg::STATUS, 0, 4).unwrap();
+        configure_test_blk_queue(&dev, mem.clone());
+        let status_addr = setup_blk_request(&mem, header, &segments, false);
+        dev.process_queue(0).unwrap();
+        assert_eq!(used_idx(&mem), 1);
+        let status: u8 = mem.read_obj(GuestAddress(status_addr)).unwrap();
+        assert_eq!(status, status::IO_ERR);
+        std::fs::remove_file(path).unwrap();
     }
 }

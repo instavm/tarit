@@ -13,12 +13,16 @@ use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 /// Maximum virtio-mmio queue size this VMM offers to guests.
 pub const MAX_QUEUE_SIZE: u16 = 256;
 
-/// Maximum per-descriptor length (1 MiB). Descriptors exceeding this are
-/// rejected to prevent guest-driven OOM allocation attacks.
-const MAX_DESC_LEN: u32 = 1024 * 1024;
+/// Maximum per-descriptor length (1 MiB). Devices never read or write the
+/// buffers of a chain with a longer descriptor, so a guest cannot make the
+/// host allocate guest-chosen amounts. Such a chain is still completed (see
+/// [`Chain::over_limit`]); devices that can carry large requests advertise
+/// this bound to the driver (virtio-blk `size_max`).
+pub const MAX_DESC_LEN: u32 = 1024 * 1024;
 
 /// Maximum total bytes across all descriptors in a single chain (4 MiB).
-const MAX_CHAIN_BYTES: usize = 4 * 1024 * 1024;
+/// Enforced like [`MAX_DESC_LEN`].
+pub const MAX_CHAIN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Validate a guest-selected QUEUE_NUM against the device-advertised cap.
 pub fn is_valid_queue_size(size: u16, max_size: u16) -> bool {
@@ -197,6 +201,23 @@ struct DescriptorChain {
     readable: Vec<(u64, u32)>,
     writable: Vec<(u64, u32)>,
     len: u32,
+    /// See [`Chain::over_limit`].
+    over_limit: bool,
+}
+
+/// One available descriptor chain, as offered to a device handler.
+pub struct Chain<'a> {
+    /// Device-readable buffers in chain order, as guest-physical `(addr, len)`.
+    pub readable: &'a [(u64, u32)],
+    /// Device-writable buffers in chain order, as guest-physical `(addr, len)`.
+    pub writable: &'a [(u64, u32)],
+    /// The chain is well formed and every buffer lies in guest memory, but a
+    /// descriptor is longer than [`MAX_DESC_LEN`] or the chain carries more
+    /// than [`MAX_CHAIN_BYTES`]. The handler must not read or write its data
+    /// buffers. It must still complete the chain (normally with a
+    /// device-specific error): a driver waits for every chain it posts, so a
+    /// chain that never reaches the used ring hangs it.
+    pub over_limit: bool,
 }
 
 /// A virtqueue processor. Walks the avail ring, processes descriptor chains,
@@ -340,6 +361,10 @@ impl VirtQueueProcessor {
         checked_guest_addr(self.config.used_ring_addr, 2, "used ring idx address")
     }
 
+    /// Walk the chain at `head_desc_idx`. `None` means the chain is malformed
+    /// and is dropped. A well-formed chain that exceeds [`MAX_DESC_LEN`] or
+    /// [`MAX_CHAIN_BYTES`] is still walked to its end, so its buffers (and a
+    /// device status byte) are known, and is returned with `over_limit` set.
     fn walk_descriptor_chain(
         &self,
         mem: &GuestMemoryMmap,
@@ -357,8 +382,10 @@ impl VirtQueueProcessor {
         let mut readable = Vec::new();
         let mut writable = Vec::new();
         let mut visited = vec![false; self.config.size as usize];
-        let mut chain_bytes = 0usize;
+        // At most 2^16 descriptors of at most 2^32 bytes each: cannot overflow.
+        let mut chain_bytes = 0u64;
         let mut chain_len = 0usize;
+        let mut over_limit = false;
 
         loop {
             if desc_idx >= self.config.size {
@@ -395,29 +422,21 @@ impl VirtQueueProcessor {
                 log::warn!("vqueue: indirect descriptors are not negotiated — rejecting chain");
                 return None;
             }
-            if desc.len > MAX_DESC_LEN {
+            if desc.len > MAX_DESC_LEN && !over_limit {
                 log::warn!(
-                    "vqueue: desc.len {} exceeds max {} — rejecting chain",
+                    "vqueue: desc.len {} exceeds max {} — completing chain unprocessed",
                     desc.len,
                     MAX_DESC_LEN
                 );
-                return None;
+                over_limit = true;
             }
-
-            let next_chain_bytes = match chain_bytes.checked_add(desc.len as usize) {
-                Some(v) => v,
-                None => {
-                    log::warn!("vqueue: descriptor chain byte count overflow — rejecting chain");
-                    return None;
-                }
-            };
-            if next_chain_bytes > MAX_CHAIN_BYTES {
+            chain_bytes += u64::from(desc.len);
+            if chain_bytes > MAX_CHAIN_BYTES as u64 && !over_limit {
                 log::warn!(
-                    "vqueue: chain total {next_chain_bytes} exceeds max {MAX_CHAIN_BYTES} — rejecting"
+                    "vqueue: chain total {chain_bytes} exceeds max {MAX_CHAIN_BYTES} — completing chain unprocessed"
                 );
-                return None;
+                over_limit = true;
             }
-            chain_bytes = next_chain_bytes;
 
             if !guest_range_is_valid(mem, desc.addr, desc.len as u64, "descriptor buffer") {
                 return None;
@@ -440,11 +459,35 @@ impl VirtQueueProcessor {
             readable,
             writable,
             len: chain_len as u32,
+            over_limit,
         })
     }
 
     fn reject_available_chain(&mut self) {
         self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+    }
+
+    /// Return the chain at `head_desc_idx` to the driver with `len` bytes
+    /// written and consume its avail entry. `false` if the used ring entry
+    /// address is not computable; nothing is consumed then.
+    fn complete_chain(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        head_desc_idx: u16,
+        len: u32,
+    ) -> bool {
+        let Some(used_entry_addr) = self.used_entry_addr() else {
+            return false;
+        };
+        let used_elem = UsedElem {
+            id: head_desc_idx as u32,
+            len,
+        };
+        let _ = write_obj_mem(mem, dirty, used_elem, used_entry_addr);
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+        true
     }
 
     /// Process all available requests on the queue. Returns the number
@@ -513,6 +556,14 @@ impl VirtQueueProcessor {
                     continue;
                 }
             };
+            if chain.over_limit {
+                // Never buffer an over-limit chain; hand it back untouched.
+                if !self.complete_chain(mem, dirty, head_desc_idx, 0) {
+                    break;
+                }
+                processed += 1;
+                continue;
+            }
 
             // For virtio-blk: readable[0] = request header, readable[1..] = data (for write)
             //                  writable[0..-1] = data (for read), writable[-1] = status byte.
@@ -591,18 +642,9 @@ impl VirtQueueProcessor {
 
             // Update the used ring. Layout: `{ flags: u16, idx: u16, ring[] }`,
             // so the ring entries start at base + 4 (after flags + idx).
-            let used_elem = UsedElem {
-                id: head_desc_idx as u32,
-                len: chain.len,
-            };
-            let used_entry_addr = match self.used_entry_addr() {
-                Some(addr) => addr,
-                None => break,
-            };
-            let _ = write_obj_mem(mem, dirty, used_elem, used_entry_addr);
-            self.last_used_idx = self.last_used_idx.wrapping_add(1);
-
-            self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+            if !self.complete_chain(mem, dirty, head_desc_idx, chain.len) {
+                break;
+            }
             processed += 1;
         }
 
@@ -645,6 +687,10 @@ impl VirtQueueProcessor {
     /// call retries the same chain. Use this on RX when no packet is
     /// available yet — the descriptor must stay in-flight for the next
     /// inbound frame.
+    ///
+    /// Over-limit chains (see [`Chain::over_limit`]) never reach `handler`;
+    /// they are returned to the driver with `UsedElem.len = 0`. Devices that
+    /// must report an error status for them use [`Self::process_queue_chains_dirty`].
     pub fn process_queue_descriptors<F>(&mut self, mem: &GuestMemoryMmap, handler: F) -> usize
     where
         F: FnMut(&[(u64, u32)], &[(u64, u32)]) -> Option<u32>,
@@ -660,6 +706,29 @@ impl VirtQueueProcessor {
     ) -> usize
     where
         F: FnMut(&[(u64, u32)], &[(u64, u32)]) -> Option<u32>,
+    {
+        self.process_queue_chains_dirty(mem, dirty, |chain| {
+            if chain.over_limit {
+                Some(0)
+            } else {
+                handler(chain.readable, chain.writable)
+            }
+        })
+    }
+
+    /// Like [`Self::process_queue_descriptors_dirty`], but every well-formed
+    /// chain reaches `handler`, including over-limit ones, so the device can
+    /// complete them with its own error status. The return value has the same
+    /// meaning: `Some(used_len)` completes the chain, `None` leaves it (and
+    /// every later chain) in flight until the next call.
+    pub fn process_queue_chains_dirty<F>(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        mut handler: F,
+    ) -> usize
+    where
+        F: FnMut(Chain<'_>) -> Option<u32>,
     {
         if !self.queue_is_usable(mem, "process_queue_descriptors") {
             return 0;
@@ -690,22 +759,18 @@ impl VirtQueueProcessor {
                 }
             };
 
-            let used_len = match handler(&chain.readable, &chain.writable) {
+            let used_len = match handler(Chain {
+                readable: &chain.readable,
+                writable: &chain.writable,
+                over_limit: chain.over_limit,
+            }) {
                 Some(n) => n,
                 None => break, // leave chain in-flight, try again next call
             };
 
-            let used_elem = UsedElem {
-                id: head_desc_idx as u32,
-                len: used_len,
-            };
-            let used_entry_addr = match self.used_entry_addr() {
-                Some(addr) => addr,
-                None => break,
-            };
-            let _ = write_obj_mem(mem, dirty, used_elem, used_entry_addr);
-            self.last_used_idx = self.last_used_idx.wrapping_add(1);
-            self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
+            if !self.complete_chain(mem, dirty, head_desc_idx, used_len) {
+                break;
+            }
             processed += 1;
         }
 
@@ -926,13 +991,31 @@ mod tests {
         assert_eq!(p.used_idx(), 0);
     }
 
+    /// Like [`setup_queue_env`], but with 8 MiB of guest memory so buffers
+    /// larger than [`MAX_DESC_LEN`] still lie inside it.
+    fn setup_large_queue_env() -> (GuestMemoryMmap, u64, u64, u64) {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8 * 1024 * 1024)]).unwrap();
+        let (desc_table_addr, avail_ring_addr, used_ring_addr) = (0x10000, 0x20000, 0x30000);
+        let _ = mem.write_obj(
+            AvailRing { flags: 0, idx: 1 },
+            GuestAddress(avail_ring_addr),
+        );
+        let _ = mem.write_obj(0u16, GuestAddress(avail_ring_addr + 4));
+        (mem, desc_table_addr, avail_ring_addr, used_ring_addr)
+    }
+
+    fn read_used_elem(mem: &GuestMemoryMmap, used: u64, slot: u64) -> UsedElem {
+        mem.read_obj(GuestAddress(used + 4 + slot * 8)).unwrap()
+    }
+
     #[test]
-    fn oversized_desc_len_is_rejected() {
-        // A descriptor with len > MAX_DESC_LEN must be rejected.
-        let (mem, desc_table, avail, used) = setup_queue_env();
+    fn oversized_desc_len_is_completed_without_reaching_handler() {
+        // A descriptor with len > MAX_DESC_LEN is never buffered, but the chain
+        // must come back on the used ring: dropping it hangs the driver.
+        let (mem, desc_table, avail, used) = setup_large_queue_env();
 
         let desc = Descriptor {
-            addr: 0x1000,
+            addr: 0x10_0000,
             len: MAX_DESC_LEN + 1, // just over the cap
             flags: 0,              // readable
             next: 0,
@@ -948,7 +1031,145 @@ mod tests {
         });
 
         let count = p.process_queue(&mem, |_, _| {
-            panic!("oversized descriptor must be rejected before handler");
+            panic!("oversized descriptor must not be buffered for the handler");
+        });
+        assert_eq!(count, 1);
+        assert_eq!(p.avail_idx(), 1);
+        assert_eq!(p.used_idx(), 1);
+        let published: u16 = mem.read_obj(GuestAddress(used + 2)).unwrap();
+        assert_eq!(published, 1, "used.idx must be published");
+        let elem = read_used_elem(&mem, used, 0);
+        assert_eq!((elem.id, elem.len), (0, 0));
+    }
+
+    #[test]
+    fn chain_total_bytes_cap_completes_chain_without_reaching_handler() {
+        // Five descriptors of MAX_DESC_LEN = 5 MiB total > the 4 MiB chain cap.
+        let (mem, desc_table, avail, used) = setup_large_queue_env();
+        for i in 0..5u16 {
+            let desc = Descriptor {
+                addr: 0x10_0000,
+                len: MAX_DESC_LEN,
+                flags: if i < 4 { desc_flags::NEXT } else { 0 },
+                next: if i < 4 { i + 1 } else { 0 },
+            };
+            let _ = mem.write_obj(desc, GuestAddress(desc_table + i as u64 * 16));
+        }
+
+        let mut p = VirtQueueProcessor::new(QueueConfig {
+            size: 8,
+            desc_table_addr: desc_table,
+            avail_ring_addr: avail,
+            used_ring_addr: used,
+            ready: true,
+        });
+
+        let count = p.process_queue_descriptors(&mem, |_, _| {
+            panic!("over-large descriptor chain must not reach the handler");
+        });
+        assert_eq!(count, 1);
+        assert_eq!(p.avail_idx(), 1);
+        assert_eq!(p.used_idx(), 1);
+        let published: u16 = mem.read_obj(GuestAddress(used + 2)).unwrap();
+        assert_eq!(published, 1);
+        let elem = read_used_elem(&mem, used, 0);
+        assert_eq!((elem.id, elem.len), (0, 0));
+    }
+
+    #[test]
+    fn chain_api_flags_over_limit_chain_with_its_buffers() {
+        // header (readable) -> 1 MiB + 4 KiB data (writable) -> status (writable).
+        let (mem, desc_table, avail, used) = setup_large_queue_env();
+        let descs = [
+            Descriptor {
+                addr: 0x4_0000,
+                len: 16,
+                flags: desc_flags::NEXT,
+                next: 1,
+            },
+            Descriptor {
+                addr: 0x10_0000,
+                len: MAX_DESC_LEN + 4096,
+                flags: desc_flags::WRITE | desc_flags::NEXT,
+                next: 2,
+            },
+            Descriptor {
+                addr: 0x5_0000,
+                len: 1,
+                flags: desc_flags::WRITE,
+                next: 0,
+            },
+        ];
+        for (i, desc) in descs.iter().enumerate() {
+            let _ = mem.write_obj(*desc, GuestAddress(desc_table + i as u64 * 16));
+        }
+
+        let mut p = VirtQueueProcessor::new(QueueConfig {
+            size: 8,
+            desc_table_addr: desc_table,
+            avail_ring_addr: avail,
+            used_ring_addr: used,
+            ready: true,
+        });
+        let mut seen = Vec::new();
+        let count = p.process_queue_chains_dirty(&mem, None, |chain| {
+            seen.push((
+                chain.over_limit,
+                chain.readable.to_vec(),
+                chain.writable.to_vec(),
+            ));
+            Some(1)
+        });
+        assert_eq!(count, 1);
+        assert_eq!(
+            seen,
+            vec![(
+                true,
+                vec![(0x4_0000, 16)],
+                vec![(0x10_0000, MAX_DESC_LEN + 4096), (0x5_0000, 1)]
+            )]
+        );
+        let elem = read_used_elem(&mem, used, 0);
+        assert_eq!((elem.id, elem.len), (0, 1));
+
+        // A chain within the limits is not flagged.
+        let _ = mem.write_obj(
+            Descriptor {
+                addr: 0x10_0000,
+                len: MAX_DESC_LEN,
+                flags: desc_flags::WRITE | desc_flags::NEXT,
+                next: 2,
+            },
+            GuestAddress(desc_table + 16),
+        );
+        let _ = mem.write_obj(AvailRing { flags: 0, idx: 2 }, GuestAddress(avail));
+        let _ = mem.write_obj(0u16, GuestAddress(avail + 6));
+        let count = p.process_queue_chains_dirty(&mem, None, |chain| {
+            assert!(!chain.over_limit);
+            Some(0)
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn over_limit_chain_outside_guest_memory_is_still_rejected() {
+        let (mem, desc_table, avail, used) = setup_large_queue_env();
+        let desc = Descriptor {
+            addr: 0x7f_0000,
+            len: MAX_DESC_LEN + 1, // over the cap AND past the 8 MiB region
+            flags: 0,
+            next: 0,
+        };
+        let _ = mem.write_obj(desc, GuestAddress(desc_table));
+        let mut p = VirtQueueProcessor::new(QueueConfig {
+            size: 8,
+            desc_table_addr: desc_table,
+            avail_ring_addr: avail,
+            used_ring_addr: used,
+            ready: true,
+        });
+        let count = p.process_queue_chains_dirty(&mem, None, |_| {
+            panic!("malformed chain must not reach the handler");
         });
         assert_eq!(count, 0);
         assert_eq!(p.avail_idx(), 1);
@@ -1107,39 +1328,6 @@ mod tests {
             0
         });
         assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn chain_total_bytes_cap_enforced() {
-        // A chain of descriptors whose total bytes exceed MAX_CHAIN_BYTES must
-        // be rejected.
-        let (mem, desc_table, avail, used) = setup_queue_env();
-
-        // Chain of 5 descriptors, each MAX_DESC_LEN (1 MiB) = 5 MiB total > 4 MiB cap.
-        for i in 0..5u16 {
-            let desc = Descriptor {
-                addr: 0x1000,
-                len: MAX_DESC_LEN,
-                flags: if i < 4 { desc_flags::NEXT } else { 0 },
-                next: if i < 4 { i + 1 } else { 0 },
-            };
-            let _ = mem.write_obj(desc, GuestAddress(desc_table + i as u64 * 16));
-        }
-
-        let mut p = VirtQueueProcessor::new(QueueConfig {
-            size: 8,
-            desc_table_addr: desc_table,
-            avail_ring_addr: avail,
-            used_ring_addr: used,
-            ready: true,
-        });
-
-        let count = p.process_queue(&mem, |_, _| {
-            panic!("over-large descriptor chain must be rejected before handler");
-        });
-        assert_eq!(count, 0);
-        assert_eq!(p.avail_idx(), 1);
-        assert_eq!(p.used_idx(), 0);
     }
 
     #[test]

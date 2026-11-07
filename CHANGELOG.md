@@ -67,6 +67,13 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- virtio-blk now advertises `VIRTIO_BLK_F_SIZE_MAX` (1 MiB) and
+  `VIRTIO_BLK_F_SEG_MAX` (3), the request shape its virtqueue accepts. Without
+  them a Linux guest could send one data descriptor of up to 1.25 MiB, which
+  the queue dropped (1.16 MiB seen), and boot hung on that read. A descriptor
+  chain over the queue's size bounds is no longer dropped silently: virtio-blk
+  completes it with `VIRTIO_BLK_S_IOERR`, and other devices return it with no
+  bytes written.
 - Pause, suspend, and snapshot now require block, network, and vsock workers to
   acknowledge quiescence before capturing state or releasing guest RAM. Resume
   waits for every worker to leave its parked state before restarting vCPUs, so
