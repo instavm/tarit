@@ -143,13 +143,21 @@ benchmarks.
   so most of the remaining latency is creates waiting for capacity.
 - Warm-pool creates: 1.2 ms each, one at a time, and about 1,300 a second
   eight at a time, with 3,000 past VMs in the store.
+- Full sandbox lifecycle with `tarit-bench sustained` (create, run `true`,
+  live 0.5 s, delete): 100 a second for 20 s with 2,001/2,001 succeeding
+  (8 ms median, 70 ms p99). At a 200-a-second target it held 166 a second
+  under a cap of 120 live sandboxes. All 6,312 creates came from the warm
+  pool.
+- 40 concurrent deletes: about 270 a second.
+- An 8-worker snapshot, restore, fork and delete stress: 200/200 with no
+  warnings in taritd's log.
 
 Still to run on this host: a 100-sandbox, 30-minute soak and the root-only
 gates (`sudo scripts/run-readiness-gates.sh`). Still to run anywhere: soaks
 at thousands of VMs on a large host.
 
-Known scaling gap: deleted VMs stay in the `vms` table as `stopped` rows
-forever. Their ids also keep a client from re-creating a deleted VM under
+Known scaling gap: deleted VMs stay in the `vms` table, and in taritd's
+in-memory record cache, as `stopped` rows forever. Their ids also keep a client from re-creating a deleted VM under
 the same id. Pruning them needs a tombstone design that keeps that
 guarantee, so it is not done yet. At thousands of creates a second the
 table grows by millions of rows a day.
