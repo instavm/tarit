@@ -12,6 +12,13 @@ versions may contain breaking changes.
 
 ### Added
 
+- `sdk/computesdk`: a `@computesdk/tarit` provider for ComputeSDK.
+- `test/soak/api_soak.py`: keeps N sandboxes busy through the public API
+  (commands, synced disk writes, checkpoint and restore, fork, pause,
+  recycle), checks the data each holds, and fails on errors or leftovers.
+- `scripts/setup-kvm-runner.sh` provisions the self-hosted runner the KVM
+  workflow needs; `scripts/run-readiness-gates.sh` runs that workflow's
+  gates, the e2e suite and a bounded soak on a host and keeps the logs.
 - Incremental checkpoints through taritd: snapshots accept `diff=true`, and
   every checkpoint after the first (or after a restore or wake) pauses the
   guest only for pages changed since the previous one, while still producing
