@@ -71,6 +71,10 @@ versions may contain breaking changes.
 
 ### Changed
 
+- Finished command records, with their captured output, are deleted after
+  `TARIT_EXECUTION_RETENTION_HOURS` (default 24; 0 keeps them). Every
+  `/v1/execute` stored one, so a busy host's database grew without bound.
+
 - Live snapshots of lazily restored VMs (every checkpoint after a restore,
   and every fork) do much less I/O. Untouched memory the restore snapshot
   records as all zeros is neither read nor hashed; on a reflink filesystem

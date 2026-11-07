@@ -696,10 +696,15 @@ async fn run_server(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(90);
+    let execution_retention_hours = std::env::var("TARIT_EXECUTION_RETENTION_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
     let outbox_flusher = usage::spawn_outbox_flusher(
         state.clone(),
         flush_secs,
         local_retention_days,
+        execution_retention_hours,
         shutdown_rx.clone(),
     );
     let vm_exit_reconciler = spawn_vm_exit_reconciler(state.clone(), shutdown_rx.clone());

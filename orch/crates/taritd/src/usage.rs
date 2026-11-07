@@ -196,6 +196,7 @@ pub fn spawn_outbox_flusher(
     state: AppState,
     interval_secs: u64,
     local_retention_days: u64,
+    execution_retention_hours: u64,
     mut shutdown_rx: watch::Receiver<Option<&'static str>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let fleet = state.fleet.clone();
@@ -215,6 +216,7 @@ pub fn spawn_outbox_flusher(
             if last_prune.is_none_or(|at| at.elapsed() >= PRUNE_INTERVAL) {
                 last_prune = Some(std::time::Instant::now());
                 prune_outbox(&state, fleet.is_some(), local_retention_days);
+                prune_executions(&state, execution_retention_hours).await;
             }
         }
     }))
@@ -240,6 +242,49 @@ fn prune_outbox(state: &AppState, has_fleet: bool, local_retention_days: u64) {
     };
     if let Err(error) = result {
         tracing::warn!(%error, "usage/audit outbox prune failed");
+    }
+}
+
+/// Rows deleted per store lock while pruning executions.
+const EXECUTION_PRUNE_BATCH: usize = 2_000;
+
+/// Drop finished executions (and their captured output) older than
+/// `retention_hours`; 0 keeps them forever. Runs in short batches so creates
+/// and commands are not held off the store behind one large delete.
+async fn prune_executions(state: &AppState, retention_hours: u64) {
+    if retention_hours == 0 {
+        return;
+    }
+    let hours = i64::try_from(retention_hours).unwrap_or(i64::MAX);
+    let cutoff = chrono::Duration::try_hours(hours)
+        .and_then(|age| Utc::now().checked_sub_signed(age))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let mut total = 0usize;
+    loop {
+        let deleted = match state.store.lock() {
+            Ok(store) => store.prune_finished_executions(cutoff, EXECUTION_PRUNE_BATCH),
+            Err(_) => return,
+        };
+        match deleted {
+            Ok(deleted) => {
+                total += deleted;
+                if deleted < EXECUTION_PRUNE_BATCH {
+                    break;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "execution record prune failed");
+                return;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    if total > 0 {
+        tracing::info!(
+            deleted = total,
+            retention_hours,
+            "pruned finished executions"
+        );
     }
 }
 

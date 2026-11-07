@@ -464,9 +464,10 @@ impl Store {
         ensure_column(&conn, "images", "prewarm", "TEXT")?;
         // Every create counts its tenant's active VMs; without this the count
         // read the whole table, deleted VMs included, under the store lock.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS vms_owner_status ON vms(owner_key, status)",
-            [],
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS vms_owner_status ON vms(owner_key, status);
+             CREATE INDEX IF NOT EXISTS executions_vm_created ON executions(vm_id, created_at);
+             CREATE INDEX IF NOT EXISTS executions_updated ON executions(updated_at);",
         )?;
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
         ensure_column(&conn, "snapshots", "kernel_path", "TEXT")?;
@@ -2909,6 +2910,28 @@ impl Store {
         Ok(())
     }
 
+    /// Delete up to `limit` finished executions last updated before
+    /// `older_than`, oldest first. Returns how many were deleted, so a caller
+    /// can prune a large backlog in short batches.
+    pub fn prune_finished_executions(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<usize, StoreError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM executions WHERE rowid IN (
+               SELECT rowid FROM executions
+                WHERE updated_at < ?1 AND status IN ('completed', 'failed')
+                ORDER BY updated_at LIMIT ?2
+             )",
+            params![
+                older_than.to_rfc3339(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn prune_sent_outbox(&self, older_than: DateTime<Utc>) -> Result<(), StoreError> {
         let older_than = older_than.to_rfc3339();
         self.conn.execute(
@@ -4265,6 +4288,53 @@ mod tests {
             store.get_image("node", "20"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn finished_executions_past_retention_are_pruned_in_batches() {
+        let store = Store::open(":memory:").unwrap();
+        let now = Utc::now();
+        let record = |age_hours: i64, status: ExecutionStatus| {
+            let at = now - chrono::Duration::hours(age_hours);
+            let exec = ExecutionRecord {
+                id: Uuid::new_v4(),
+                vm_id: Uuid::new_v4(),
+                command: "true".into(),
+                timeout_ms: 1000,
+                status,
+                exit_code: Some(0),
+                stdout: Some("out".into()),
+                stderr: None,
+                duration_ms: Some(1),
+                error: None,
+                created_at: at,
+                updated_at: at,
+            };
+            store.insert_execution(&exec).unwrap();
+            exec.id
+        };
+        let old: Vec<Uuid> = (0..5)
+            .map(|_| record(48, ExecutionStatus::Completed))
+            .chain([record(48, ExecutionStatus::Failed)])
+            .collect();
+        let old_running = record(48, ExecutionStatus::Running);
+        let recent = record(1, ExecutionStatus::Completed);
+
+        let cutoff = now - chrono::Duration::hours(24);
+        assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 4);
+        assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 2);
+        assert_eq!(store.prune_finished_executions(cutoff, 4).unwrap(), 0);
+        for id in old {
+            assert!(matches!(store.get_execution(id), Err(StoreError::NotFound)));
+        }
+        assert!(
+            store.get_execution(old_running).is_ok(),
+            "a running execution stays"
+        );
+        assert!(
+            store.get_execution(recent).is_ok(),
+            "a recent execution stays"
+        );
     }
 
     #[test]

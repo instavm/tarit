@@ -234,6 +234,7 @@ answer from the local outbox.
 | `TARIT_USAGE_METER_INTERVAL_SECS` | u64 | `30` | How often the VM-runtime meter bills alive local VMs. |
 | `TARIT_USAGE_FLUSH_INTERVAL_SECS` | u64 | `10` | How often the flusher pushes local usage/audit outboxes to PostgreSQL. |
 | `TARIT_LOCAL_USAGE_RETENTION_DAYS` | u64 | `90` | Without a fleet database, days of local usage/audit rows to keep (`0` keeps them forever). |
+| `TARIT_EXECUTION_RETENTION_HOURS` | u64 | `24` | Hours a finished command's record and captured output stay readable through `GET /v1/executions/{id}` (`0` keeps them forever). Pruned hourly in small batches. |
 
 ## TOML config reference
 
