@@ -152,6 +152,8 @@ pub struct BuildImageOptions {
     pub db_path: PathBuf,
     pub images_dir: PathBuf,
     pub admission_policy: ImageAdmissionPolicy,
+    /// Stored with the image for its warm pool (see `ImageRecord::prewarm`).
+    pub prewarm: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -275,6 +277,7 @@ fn build_image_inner(
             .as_ref()
             .map(|_| Utc::now()),
         golden_snapshot_path: None,
+        prewarm: opts.prewarm.clone(),
     };
     store.upsert_image(&image).context("register image")?;
     Ok(image)
@@ -999,6 +1002,7 @@ mod tests {
             provenance_key_digest: None,
             provenance_verified_at: None,
             golden_snapshot_path: None,
+            prewarm: None,
         }
     }
 
@@ -1103,6 +1107,7 @@ mod tests {
             provenance_key_digest: Some(sha256_regular_file(&trusted_key).unwrap()),
             provenance_verified_at: Some(Utc::now()),
             golden_snapshot_path: None,
+            prewarm: None,
         };
         let signed_policy = ImageAdmissionPolicy {
             require_signature: true,

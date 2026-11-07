@@ -41,7 +41,13 @@ pub struct WarmClass {
 impl WarmClass {
     /// A restore class for VMs of this shape, as taritd adds for shapes that
     /// creates ask for. Watermarks derive from `target`.
-    pub fn learned(vcpus: u8, memory_mib: u64, rootfs: Option<PathBuf>, target: usize) -> Self {
+    pub fn learned(
+        vcpus: u8,
+        memory_mib: u64,
+        rootfs: Option<PathBuf>,
+        target: usize,
+        prewarm: Option<String>,
+    ) -> Self {
         let (hard_floor, low_watermark, high_watermark) = derive_watermarks(target);
         Self {
             vcpus,
@@ -53,7 +59,7 @@ impl WarmClass {
             restore: true,
             rootfs,
             image: None,
-            prewarm: None,
+            prewarm,
         }
     }
 

@@ -1307,7 +1307,19 @@ fn warm_pool_spawn_config(
 /// Keep warm VMs for the shape of a pool-eligible create that no configured
 /// class covers, or note fresh demand for one already learned.
 fn learn_warm_class(state: &AppState, spec: &VmSpawnConfig) {
-    if let Some(class) = crate::warmpool::learnable_class(&state.config, spec) {
+    if state.supervisor.note_learned_demand(spec) {
+        return;
+    }
+    // A registered image's own prewarm command, if it has one.
+    let prewarm = spec.rootfs_path.as_ref().and_then(|path| {
+        let store = state.store.lock().ok()?;
+        store
+            .get_image_by_rootfs_path(&path.display().to_string())
+            .ok()
+            .flatten()
+            .and_then(|image| image.prewarm)
+    });
+    if let Some(class) = crate::warmpool::learnable_class(&state.config, spec, prewarm) {
         state.supervisor.learn_warm_class(
             spec.clone(),
             class,
@@ -3709,6 +3721,7 @@ pub async fn localize_branch_artifact(
                 provenance_key_digest: descriptor.provenance_key_digest.clone(),
                 provenance_verified_at: descriptor.provenance_verified_at,
                 golden_snapshot_path: None,
+                prewarm: None,
             };
             if let Err(error) =
                 image::verify_admitted_image(&image_record, &state.config.image_admission_policy)
@@ -4611,6 +4624,7 @@ mod tests {
                 provenance_key_digest: None,
                 provenance_verified_at: None,
                 golden_snapshot_path: None,
+                prewarm: None,
             })
             .unwrap();
         let snapshot = tarit_store::SnapshotRecord {
@@ -5487,6 +5501,7 @@ mod tests {
                 provenance_key_digest: None,
                 provenance_verified_at: None,
                 golden_snapshot_path: None,
+                prewarm: None,
             })
             .unwrap();
         let request = |image: Option<&str>| CreateVmRequest {
@@ -6143,22 +6158,23 @@ mod tests {
             VmSpawnConfig::from_defaults(&config, &request)
         };
         let image = request(serde_json::json!({ "rootfs_path": "/images/node.ext4" }));
-        let class =
-            crate::warmpool::learnable_class(&config, &image).expect("an image at default shape");
+        let class = crate::warmpool::learnable_class(&config, &image, None)
+            .expect("an image at default shape");
         assert_eq!((class.vcpus, class.memory_mib), (1, 256));
         assert!(class.restore);
 
         // The configured default class already covers the default rootfs.
         assert!(
-            crate::warmpool::learnable_class(&config, &request(serde_json::json!({}))).is_none()
+            crate::warmpool::learnable_class(&config, &request(serde_json::json!({})), None)
+                .is_none()
         );
         // A custom kernel command line is not something a warm class reproduces.
         let custom =
             request(serde_json::json!({ "rootfs_path": "/images/node.ext4", "cmdline": "quiet" }));
-        assert!(crate::warmpool::learnable_class(&config, &custom).is_none());
+        assert!(crate::warmpool::learnable_class(&config, &custom, None).is_none());
 
         config.warm_pool.learn.max_classes = 0;
-        assert!(crate::warmpool::learnable_class(&config, &image).is_none());
+        assert!(crate::warmpool::learnable_class(&config, &image, None).is_none());
     }
 
     fn test_state_with_durable_writer() -> (AppState, tokio::sync::mpsc::Receiver<StoreWrite>) {

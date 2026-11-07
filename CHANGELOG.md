@@ -20,6 +20,10 @@ versions may contain breaking changes.
   checkpoint restores on its own; snapshots of VMs on storage without reflink
   use a paused, extent-copied capture.
 - Snapshot list and delete endpoints.
+- Images carry an optional prewarm command (`taritd image build --prewarm`,
+  `taritd image prewarm`) that the golden VM of the image's warm pool runs
+  before its snapshot; changing it on a running taritd rebuilds that
+  golden. Stored in a new `prewarm` column of the images table.
 - The warm pool learns: each registered image (the newest four at startup,
   then any registered later) gets a golden snapshot and a pool of its own,
   and so does any other shape creates ask for after its first cold boot.

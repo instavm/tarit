@@ -116,7 +116,11 @@ impl Replenisher {
 /// a configured class already covers the shape, or a restore class cannot
 /// reproduce it exactly (so a learned VM is always interchangeable with the
 /// cold boot the create would otherwise get).
-pub(crate) fn learnable_class(config: &Config, spec: &VmSpawnConfig) -> Option<WarmClass> {
+pub(crate) fn learnable_class(
+    config: &Config,
+    spec: &VmSpawnConfig,
+    prewarm: Option<String>,
+) -> Option<WarmClass> {
     let learn = &config.warm_pool.learn;
     if !config.warm_pool.enabled || learn.max_classes == 0 || learn.target == 0 {
         return None;
@@ -134,6 +138,7 @@ pub(crate) fn learnable_class(config: &Config, spec: &VmSpawnConfig) -> Option<W
         spec.memory_mib,
         spec.rootfs_path.clone(),
         learn.target,
+        prewarm,
     );
     (VmSpawnConfig::from_warm_class(config, &class) == *spec).then_some(class)
 }
@@ -156,7 +161,9 @@ pub(crate) fn spawn_image_seeder(
         return None;
     }
     Some(tokio::spawn(async move {
-        let mut seen = HashSet::<(String, String, String)>::new();
+        // An image whose prewarm changes counts as new, so its class picks
+        // the command up.
+        let mut seen = HashSet::<(String, String, String, Option<String>)>::new();
         let mut startup = true;
         loop {
             let images = match store.lock() {
@@ -173,6 +180,7 @@ pub(crate) fn spawn_image_seeder(
                         image.name.clone(),
                         image.tag.clone(),
                         image.rootfs_path.clone(),
+                        image.prewarm.clone(),
                     ))
                 })
                 .collect::<Vec<_>>();
@@ -194,9 +202,11 @@ pub(crate) fn spawn_image_seeder(
                     Err(_) => continue,
                 };
                 let spec = VmSpawnConfig::from_defaults(&config, &request);
-                if let Some(class) = learnable_class(&config, &spec) {
+                if let Some(class) = learnable_class(&config, &spec, image.prewarm.clone()) {
                     tracing::info!(image = %format!("{}:{}", image.name, image.tag), "warming a registered image");
-                    sup.learn_warm_class(spec, class, max_classes);
+                    if !sup.set_learned_prewarm(&spec, image.prewarm.clone()) {
+                        sup.learn_warm_class(spec, class, max_classes);
+                    }
                 }
             }
             tokio::select! {

@@ -105,6 +105,19 @@ pub enum ImageCommand {
     Verify(ImageRemoveArgs),
     #[command(about = "Remove unreferenced images older than a threshold")]
     Gc(ImageGcArgs),
+    #[command(
+        about = "Set or clear the command an image's warm golden VM runs before its snapshot"
+    )]
+    Prewarm(ImagePrewarmArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ImagePrewarmArgs {
+    #[arg(value_name = "NAME[:TAG]")]
+    name: String,
+    /// The command, e.g. `node -e 0`; omit it to clear the image's prewarm.
+    #[arg(value_name = "COMMAND")]
+    command: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -116,6 +129,10 @@ pub struct ImageBuildArgs {
     /// Output filesystem size in MiB. This also determines OCI unpack limits.
     #[arg(long, default_value_t = 1024, value_name = "MIB")]
     size: u64,
+    /// Command the image's warm golden VM runs before its snapshot, e.g.
+    /// `node -e 0`, so sandboxes start with the runtime already read in.
+    #[arg(long, value_name = "COMMAND")]
+    prewarm: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -428,7 +445,32 @@ fn image(command: ImageCommand, json_output: bool) -> Result<()> {
         ImageCommand::Remove(args) => image_remove(args, json_output),
         ImageCommand::Verify(args) => image_verify(args, json_output),
         ImageCommand::Gc(args) => image_gc(args, json_output),
+        ImageCommand::Prewarm(args) => image_prewarm(args, json_output),
     }
+}
+
+fn image_prewarm(args: ImagePrewarmArgs, json_output: bool) -> Result<()> {
+    let config = crate::image::LocalImageConfig::from_env()?;
+    let image_ref = crate::image::parse_image_ref(&args.name)?;
+    let store = tarit_store::Store::open(&config.db_path)
+        .with_context(|| format!("open {}", config.db_path.display()))?;
+    let mut image = store
+        .get_image(&image_ref.name, &image_ref.tag)
+        .with_context(|| format!("image {}", image_ref.label()))?;
+    image.prewarm = args
+        .command
+        .map(|command| command.trim().to_string())
+        .filter(|command| !command.is_empty());
+    store.upsert_image(&image).context("update image")?;
+    if json_output {
+        println!("{}", image_json(&image));
+    } else {
+        match &image.prewarm {
+            Some(command) => println!("{}:{} prewarm: {command}", image.name, image.tag),
+            None => println!("{}:{} prewarm cleared", image.name, image.tag),
+        }
+    }
+    Ok(())
 }
 
 fn image_verify(args: ImageRemoveArgs, json_output: bool) -> Result<()> {
@@ -463,6 +505,10 @@ fn image_build(args: ImageBuildArgs, json_output: bool) -> Result<()> {
         db_path: config.db_path,
         images_dir: config.images_dir,
         admission_policy: config.admission_policy,
+        prewarm: args
+            .prewarm
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty()),
     })?;
     if json_output {
         println!("{}", image_json(&image));
@@ -939,6 +985,7 @@ fn image_json(image: &tarit_store::ImageRecord) -> Value {
         "provenance_key_digest": image.provenance_key_digest,
         "provenance_verified_at": image.provenance_verified_at,
         "golden_snapshot_path": image.golden_snapshot_path,
+        "prewarm": image.prewarm,
     })
 }
 

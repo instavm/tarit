@@ -54,6 +54,9 @@ pub struct ImageRecord {
     pub provenance_key_digest: Option<String>,
     pub provenance_verified_at: Option<DateTime<Utc>>,
     pub golden_snapshot_path: Option<String>,
+    /// Command a warm golden VM of this image runs before its snapshot, so
+    /// clones start with the image's runtime already read in.
+    pub prewarm: Option<String>,
 }
 
 /// Ownership record for a node-local snapshot file, so restore can verify that
@@ -238,6 +241,7 @@ impl Store {
                provenance_key_digest TEXT,
                provenance_verified_at TEXT,
                golden_snapshot_path TEXT,
+               prewarm TEXT,
                PRIMARY KEY (name, tag)
              );
              CREATE TABLE IF NOT EXISTS volumes (
@@ -452,6 +456,7 @@ impl Store {
         ensure_column(&conn, "vms", "runtime_artifact_paths", "TEXT")?;
         ensure_column(&conn, "snapshots", "memory_mib", "INTEGER")?;
         ensure_column(&conn, "snapshots", "overlay_path", "TEXT")?;
+        ensure_column(&conn, "images", "prewarm", "TEXT")?;
         ensure_column(&conn, "snapshots", "vcpus", "INTEGER")?;
         ensure_column(&conn, "snapshots", "kernel_path", "TEXT")?;
         ensure_column(&conn, "snapshots", "rootfs_path", "TEXT")?;
@@ -2232,8 +2237,8 @@ impl Store {
             "INSERT INTO images (
                name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                rootfs_digest, agent_digest, provenance_key_digest, provenance_verified_at,
-               golden_snapshot_path
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+               golden_snapshot_path, prewarm
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(name, tag) DO UPDATE SET
                rootfs_path = excluded.rootfs_path,
                created_at = excluded.created_at,
@@ -2244,7 +2249,8 @@ impl Store {
                agent_digest = excluded.agent_digest,
                provenance_key_digest = excluded.provenance_key_digest,
                provenance_verified_at = excluded.provenance_verified_at,
-               golden_snapshot_path = excluded.golden_snapshot_path",
+               golden_snapshot_path = excluded.golden_snapshot_path,
+               prewarm = excluded.prewarm",
             params![
                 image.name,
                 image.tag,
@@ -2258,6 +2264,7 @@ impl Store {
                 image.provenance_key_digest,
                 image.provenance_verified_at.map(|time| time.to_rfc3339()),
                 image.golden_snapshot_path,
+                image.prewarm,
             ],
         )?;
         Ok(())
@@ -2268,7 +2275,7 @@ impl Store {
             .query_row(
                 "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                         rootfs_digest, agent_digest, provenance_key_digest,
-                        provenance_verified_at, golden_snapshot_path
+                        provenance_verified_at, golden_snapshot_path, prewarm
                  FROM images WHERE name = ?1 AND tag = ?2",
                 params![name, tag],
                 row_to_image,
@@ -2285,7 +2292,7 @@ impl Store {
             .query_row(
                 "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                         rootfs_digest, agent_digest, provenance_key_digest,
-                        provenance_verified_at, golden_snapshot_path
+                        provenance_verified_at, golden_snapshot_path, prewarm
                  FROM images WHERE rootfs_path = ?1",
                 params![rootfs_path],
                 row_to_image,
@@ -2302,7 +2309,7 @@ impl Store {
             .query_row(
                 "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                         rootfs_digest, agent_digest, provenance_key_digest,
-                        provenance_verified_at, golden_snapshot_path
+                        provenance_verified_at, golden_snapshot_path, prewarm
                  FROM images WHERE source_digest = ?1 ORDER BY created_at DESC LIMIT 1",
                 params![source_digest],
                 row_to_image,
@@ -2315,7 +2322,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT name, tag, rootfs_path, created_at, size_bytes, source_ref, source_digest,
                     rootfs_digest, agent_digest, provenance_key_digest,
-                    provenance_verified_at, golden_snapshot_path
+                    provenance_verified_at, golden_snapshot_path, prewarm
              FROM images ORDER BY name, tag",
         )?;
         let rows = stmt.query_map([], row_to_image)?;
@@ -3088,6 +3095,7 @@ fn row_to_image(row: &rusqlite::Row<'_>) -> Result<ImageRecord, rusqlite::Error>
             .map(parse_ts)
             .transpose()?,
         golden_snapshot_path: row.get(11)?,
+        prewarm: row.get(12)?,
     })
 }
 
@@ -4221,6 +4229,7 @@ mod tests {
             provenance_key_digest: None,
             provenance_verified_at: None,
             golden_snapshot_path: Some("target/tarit-store-test/node__20.snap".into()),
+            prewarm: Some("node -e 0".into()),
         };
 
         store.upsert_image(&image).unwrap();
@@ -4230,6 +4239,7 @@ mod tests {
         let updated = ImageRecord {
             size_bytes: 84,
             golden_snapshot_path: None,
+            prewarm: None,
             ..image.clone()
         };
         store.upsert_image(&updated).unwrap();
@@ -4241,6 +4251,40 @@ mod tests {
             store.get_image("node", "20"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn an_image_table_from_before_prewarm_gains_the_column() {
+        let dir = std::env::temp_dir().join(format!("tarit-store-prewarm-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fleet.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE images (
+                   name TEXT NOT NULL, tag TEXT NOT NULL, rootfs_path TEXT NOT NULL,
+                   created_at TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                   source_ref TEXT NOT NULL, source_digest TEXT, rootfs_digest TEXT,
+                   agent_digest TEXT, provenance_key_digest TEXT,
+                   provenance_verified_at TEXT, golden_snapshot_path TEXT,
+                   PRIMARY KEY (name, tag));
+                 INSERT INTO images VALUES ('py', '1', '/images/py.ext4',
+                   '2026-11-01T00:00:00+00:00', 7, 'docker://python:3.12-slim',
+                   NULL, NULL, NULL, NULL, NULL, NULL);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.get_image("py", "1").unwrap().prewarm, None);
+        let mut image = store.get_image("py", "1").unwrap();
+        image.prewarm = Some("python3 -c pass".into());
+        store.upsert_image(&image).unwrap();
+        assert_eq!(
+            store.get_image("py", "1").unwrap().prewarm.as_deref(),
+            Some("python3 -c pass")
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -326,8 +326,17 @@ rootfs under `TARIT_IMAGES_DIR`, and registers it in the node-local SQLite DB.
 Create requests can use `--image <name>[:tag]` (or JSON `image`) instead of a raw
 `rootfs_path`; warm-pool classes can set `image = "name[:tag]"`.
 
+An image can carry a prewarm command, which the golden VM of that image's
+warm pool runs before its snapshot. Sandboxes then start with the runtime
+already in their page cache: on the reference host the first `node -v` in a
+fresh `node:22` sandbox dropped from about 45 ms (22 MiB read from disk) to
+13 ms (no reads). Set it at build time with `--prewarm`, or later with
+`taritd image prewarm`; a running taritd rebuilds that image's golden within
+seconds.
+
 ```sh
-taritd image build --oci node:20-slim --name node20 --size 2048
+taritd image build --oci node:20-slim --name node20 --size 2048 --prewarm 'node -e 0'
+taritd image prewarm node20 'node -e 0'   # or with no command, to clear it
 taritd image ls
 taritd vm create --image node20 --vcpus 1 --memory-mib 256
 taritd image rm node20

@@ -6371,6 +6371,44 @@ impl VmmSupervisor {
         true
     }
 
+    /// Give a learned class a new prewarm command. Its golden snapshot is
+    /// retired so the next one runs the command; warm VMs already restored
+    /// stay usable. Returns whether `spec` is a learned class.
+    pub(crate) fn set_learned_prewarm(
+        &self,
+        spec: &VmSpawnConfig,
+        prewarm: Option<String>,
+    ) -> bool {
+        let changed = {
+            let Ok(mut learned) = self.learned.lock() else {
+                return false;
+            };
+            let Some(entry) = learned.get_mut(spec) else {
+                return false;
+            };
+            let changed = entry.class.prewarm != prewarm;
+            entry.class.prewarm = prewarm;
+            changed
+        };
+        if changed {
+            self.retain_goldens(|golden| golden != spec);
+        }
+        true
+    }
+
+    /// Note a create for `spec` if it is a learned class, keeping the class
+    /// alive. Returns whether it is one.
+    pub(crate) fn note_learned_demand(&self, spec: &VmSpawnConfig) -> bool {
+        let Ok(mut learned) = self.learned.lock() else {
+            return false;
+        };
+        let Some(entry) = learned.get_mut(spec) else {
+            return false;
+        };
+        entry.last_demand = Instant::now();
+        true
+    }
+
     /// Forget learned classes nobody asked for in `idle`, then return the
     /// classes that remain.
     pub(crate) fn learned_warm_classes(&self, idle: Duration) -> Vec<WarmClass> {
@@ -11923,7 +11961,13 @@ mod tests {
         let supervisor = test_supervisor();
         let spec = |name: &str| spawn_config(false, Some(PathBuf::from(format!("/images/{name}"))));
         let class = |name: &str| {
-            WarmClass::learned(1, 256, Some(PathBuf::from(format!("/images/{name}"))), 4)
+            WarmClass::learned(
+                1,
+                256,
+                Some(PathBuf::from(format!("/images/{name}"))),
+                4,
+                None,
+            )
         };
         assert!(supervisor.learn_warm_class(spec("a"), class("a"), 2));
         assert!(supervisor.learn_warm_class(spec("b"), class("b"), 2));
@@ -11946,6 +11990,38 @@ mod tests {
             .learned_warm_classes(Duration::from_millis(10))
             .is_empty());
         assert!(supervisor.learned_classes_snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_new_prewarm_for_a_learned_class_retires_its_golden() {
+        let supervisor = test_supervisor();
+        let spec = spawn_config(false, Some(PathBuf::from("/images/node")));
+        let other = spawn_config(false, Some(PathBuf::from("/images/py")));
+        let class = WarmClass::learned(1, 256, Some(PathBuf::from("/images/node")), 4, None);
+        assert!(!supervisor.set_learned_prewarm(&spec, Some("node -e 0".into())));
+        assert!(supervisor.learn_warm_class(spec.clone(), class, 4));
+        let bundle = |name: &str| GoldenBundle {
+            snapshot_path: format!("target/never-created/{name}.snap"),
+            overlay_path: None,
+        };
+        supervisor.publish_golden(spec.clone(), bundle("node"));
+        supervisor.publish_golden(other.clone(), bundle("py"));
+
+        // The same command keeps the golden.
+        assert!(supervisor.set_learned_prewarm(&spec, None));
+        assert!(supervisor.golden(&spec).is_some());
+
+        assert!(supervisor.set_learned_prewarm(&spec, Some("node -e 0".into())));
+        assert!(supervisor.golden(&spec).is_none());
+        assert!(supervisor.golden(&other).is_some());
+        assert_eq!(
+            supervisor
+                .learned_warm_class(&spec)
+                .unwrap()
+                .prewarm
+                .as_deref(),
+            Some("node -e 0")
+        );
     }
 
     #[test]
