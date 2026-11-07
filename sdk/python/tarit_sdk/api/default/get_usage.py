@@ -89,9 +89,9 @@ def sync_detailed(
 ) -> Response[Any | list[UsageSummary]]:
     """Aggregated usage stats per API key
 
-     Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a
-    fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-
-    admin key sees only its own.
+     Raw metering (VM runtime seconds, exec counts and durations) from the primary store, or from the
+    node's local outbox when no fleet database (TARIT_DATABASE_URL) is configured. Admins see every key,
+    optionally filtered by api_key_id; a non-admin key sees only its own.
 
     Args:
         from_ (datetime.datetime | Unset):
@@ -128,9 +128,9 @@ def sync(
 ) -> Any | list[UsageSummary] | None:
     """Aggregated usage stats per API key
 
-     Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a
-    fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-
-    admin key sees only its own.
+     Raw metering (VM runtime seconds, exec counts and durations) from the primary store, or from the
+    node's local outbox when no fleet database (TARIT_DATABASE_URL) is configured. Admins see every key,
+    optionally filtered by api_key_id; a non-admin key sees only its own.
 
     Args:
         from_ (datetime.datetime | Unset):
@@ -162,9 +162,9 @@ async def asyncio_detailed(
 ) -> Response[Any | list[UsageSummary]]:
     """Aggregated usage stats per API key
 
-     Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a
-    fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-
-    admin key sees only its own.
+     Raw metering (VM runtime seconds, exec counts and durations) from the primary store, or from the
+    node's local outbox when no fleet database (TARIT_DATABASE_URL) is configured. Admins see every key,
+    optionally filtered by api_key_id; a non-admin key sees only its own.
 
     Args:
         from_ (datetime.datetime | Unset):
@@ -199,9 +199,9 @@ async def asyncio(
 ) -> Any | list[UsageSummary] | None:
     """Aggregated usage stats per API key
 
-     Raw metering (VM runtime seconds, exec counts and durations) from the primary store; requires a
-    fleet database (TARIT_DATABASE_URL). Admins see every key, optionally filtered by api_key_id; a non-
-    admin key sees only its own.
+     Raw metering (VM runtime seconds, exec counts and durations) from the primary store, or from the
+    node's local outbox when no fleet database (TARIT_DATABASE_URL) is configured. Admins see every key,
+    optionally filtered by api_key_id; a non-admin key sees only its own.
 
     Args:
         from_ (datetime.datetime | Unset):
