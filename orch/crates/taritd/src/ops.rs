@@ -1331,10 +1331,20 @@ fn learn_warm_class(state: &AppState, spec: &VmSpawnConfig) {
 /// How many golden clones a create restores on demand before cold-booting.
 const ON_DEMAND_WARM_RESTORES: usize = 3;
 
+/// What an on-demand restore into the warm pool came to.
+enum OnDemandRestore {
+    /// A clone is in the pool; claim again.
+    Restored,
+    /// The host is full. Waiting for capacity and restoring then beats a
+    /// cold boot, which needs the same capacity and starts slower.
+    AtCapacity(OrchError),
+    /// No restore class or golden for the shape, or the restore failed.
+    Unavailable,
+}
+
 /// Restore one clone of the golden snapshot of the restore warm class whose
-/// VMs `spec` describes into the pool. Returns false when no such class has a
-/// ready golden or the restore failed.
-async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> bool {
+/// VMs `spec` describes into the pool.
+async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> OnDemandRestore {
     let Some(class) = state
         .config
         .warm_pool
@@ -1346,10 +1356,10 @@ async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> bool 
         .cloned()
         .or_else(|| state.supervisor.learned_warm_class(spec))
     else {
-        return false;
+        return OnDemandRestore::Unavailable;
     };
     let Some(bundle) = state.supervisor.golden(spec) else {
-        return false;
+        return OnDemandRestore::Unavailable;
     };
     let supervisor = Arc::clone(&state.supervisor);
     let restored = tokio::task::spawn_blocking(move || {
@@ -1357,20 +1367,23 @@ async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> bool 
     })
     .await;
     match restored {
-        Ok(Ok(())) => true,
-        // A full host is expected during a burst; the create waits for
-        // capacity like any other.
-        Ok(Err(error @ OrchError::Overloaded { .. })) => {
-            tracing::debug!(%error, "on-demand warm restore deferred");
-            false
+        Ok(Ok(())) => OnDemandRestore::Restored,
+        Ok(Err(OrchError::Overloaded {
+            message,
+            retry_after_secs,
+        })) if message.contains(crate::supervisor::HOST_CAPACITY_EXHAUSTED) => {
+            OnDemandRestore::AtCapacity(OrchError::Overloaded {
+                message,
+                retry_after_secs,
+            })
         }
         Ok(Err(error)) => {
             tracing::warn!(%error, "on-demand warm restore failed");
-            false
+            OnDemandRestore::Unavailable
         }
         Err(error) => {
             tracing::warn!(%error, "on-demand warm restore task failed");
-            false
+            OnDemandRestore::Unavailable
         }
     }
 }
@@ -1461,12 +1474,17 @@ async fn create_local_owned(
                     return Ok(record);
                 }
                 WarmClaimOutcome::NoMatch => {
-                    if restores < ON_DEMAND_WARM_RESTORES
-                        && !task.is_cancelled()
-                        && restore_warm_on_demand(state, &warm_cfg).await
-                    {
-                        restores += 1;
-                        continue;
+                    if restores < ON_DEMAND_WARM_RESTORES && !task.is_cancelled() {
+                        match restore_warm_on_demand(state, &warm_cfg).await {
+                            OnDemandRestore::Restored => {
+                                restores += 1;
+                                continue;
+                            }
+                            // Nothing is registered for this create yet, so
+                            // the admission loop can retry it from scratch.
+                            OnDemandRestore::AtCapacity(error) => return Err(error),
+                            OnDemandRestore::Unavailable => {}
+                        }
                     }
                     break;
                 }

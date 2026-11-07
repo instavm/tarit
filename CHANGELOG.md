@@ -138,6 +138,14 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- A burst of creates could fail one with 409 "already has a supervisor-owned
+  lifecycle task": a create claimed a warm VM that an on-demand restore had
+  just published but whose restore task had not finished. Claims and idle
+  reclaim now skip such a VM until its task ends.
+- A create whose on-demand restore found the host full fell back to a cold
+  boot, which needs the same capacity and starts slower and without the
+  class's prewarm; it now waits for capacity and restores.
+
 - taritd shuts down cleanly in about 2 s during a burst of creates; it took
   the 30 s HTTP drain timeout and sometimes exited with an error. Creates
   waiting for capacity kept waiting out their admission deadline after

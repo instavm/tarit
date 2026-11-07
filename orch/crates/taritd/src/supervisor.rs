@@ -4633,9 +4633,10 @@ impl VmmSupervisor {
         }
         let taken = self.warm.lock().ok().and_then(|mut warm| {
             let claims = self.warm_claims.lock().ok()?;
-            let index = warm
-                .iter()
-                .position(|vm| !claims.contains(&vm.id) && select(&vm.spec))?;
+            let restoring = self.owned_tasks.lock().ok()?;
+            let index = warm.iter().position(|vm| {
+                !claims.contains(&vm.id) && !restoring.contains_key(&vm.id) && select(&vm.spec)
+            })?;
             warm.remove(index)
         });
         drop(gate);
@@ -6191,12 +6192,21 @@ impl VmmSupervisor {
                 .warm_claims
                 .lock()
                 .map_err(|_| OrchError::Internal("warm claim lock poisoned".into()))?;
-            let Some(warm_vm) = warm
-                .iter()
-                .find(|warm_vm| &warm_vm.spec == want && !claims.contains(&warm_vm.id))
-            else {
+            // A VM whose own restore task has published it but not finished
+            // yet still holds that task under its id; a claim taking the id
+            // over now would conflict with it, so wait for the next VM.
+            let restoring = self
+                .owned_tasks
+                .lock()
+                .map_err(|_| OrchError::Internal("owned task lock poisoned".into()))?;
+            let Some(warm_vm) = warm.iter().find(|warm_vm| {
+                &warm_vm.spec == want
+                    && !claims.contains(&warm_vm.id)
+                    && !restoring.contains_key(&warm_vm.id)
+            }) else {
                 return Ok(WarmClaimOutcome::NoMatch);
             };
+            drop(restoring);
             claims.insert(warm_vm.id);
             WarmClaim {
                 claims: &self.warm_claims,
@@ -12062,6 +12072,43 @@ mod tests {
         assert!(!retired.1.exists() && !retired.2.exists());
         assert_eq!(supervisor.golden_artifacts.lock().unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_warm_vm_still_held_by_its_restore_task_is_not_claimed_yet() {
+        let supervisor = test_supervisor();
+        let spec = spawn_config(false, Some(PathBuf::from("/images/a.ext4")));
+        let id = Uuid::new_v4();
+        let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        supervisor.warm.lock().unwrap().push_back(WarmVm {
+            id,
+            vm: RunningVm::new(
+                process.pid,
+                PathBuf::from("restoring-warm.sock"),
+                process,
+                None,
+            ),
+            spec: spec.clone(),
+        });
+        // The restore that published this VM has not finished its task.
+        let restore = supervisor
+            .begin_owned_task(id, SpawnPurpose::Refill)
+            .unwrap();
+        let claim = || {
+            let task = OwnedTaskControl::new();
+            test_runtime().block_on(supervisor.take_warm_with_publication(
+                &spec,
+                &task,
+                |_| async { Ok(()) },
+                |_, _, _| async { Ok::<(), PublicationFailure>(()) },
+            ))
+        };
+        assert!(matches!(claim(), Ok(WarmClaimOutcome::NoMatch)));
+        assert!(!supervisor.reclaim_idle_warm());
+        assert_eq!(supervisor.warm_count(&spec), 1);
+
+        supervisor.finish_owned_task(&restore, Ok(()));
+        assert!(!matches!(claim(), Ok(WarmClaimOutcome::NoMatch)));
     }
 
     #[test]
