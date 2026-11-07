@@ -115,6 +115,10 @@ impl DirtyBitmap {
 #[derive(Debug, Clone, Default)]
 pub struct SoftwareDirtyBitmap {
     dirty: Arc<Mutex<DirtyBitmap>>,
+    /// `(low_ram_bytes, total_ram_bytes)` of the guest memory this tracker
+    /// belongs to. `None` means the conventional split at [`MMIO_GAP_START`]
+    /// with no upper bound.
+    guest_layout: Option<(u64, u64)>,
 }
 
 impl SoftwareDirtyBitmap {
@@ -122,20 +126,34 @@ impl SoftwareDirtyBitmap {
         Self::default()
     }
 
-    pub fn mark(&self, gpa: u64) {
-        self.dirty.lock().unwrap().mark(gpa);
+    /// Clone sharing the same bitmap but translating guest addresses for a
+    /// memory whose low RAM ends at `low` (packed high RAM follows it) and
+    /// whose packed size is `total`. Used for virtio-mem layouts where boot
+    /// RAM ends below [`MMIO_GAP_START`].
+    pub fn with_guest_layout(&self, low: u64, total: u64) -> Self {
+        Self {
+            dirty: self.dirty.clone(),
+            guest_layout: Some((low, total.max(low))),
+        }
     }
 
-    pub fn mark_range(&self, gpa: u64, len: u64) {
+    /// Mark one packed offset dirty.
+    pub fn mark(&self, offset: u64) {
+        self.dirty.lock().unwrap().mark(offset);
+    }
+
+    /// Mark a packed snapshot byte range dirty.
+    pub fn mark_range(&self, offset: u64, len: u64) {
         if len == 0 {
             return;
         }
-        self.dirty.lock().unwrap().mark_range(gpa, len);
+        self.dirty.lock().unwrap().mark_range(offset, len);
     }
 
     /// Mark a guest physical byte range dirty. RAM above the MMIO aperture is
     /// packed directly after low RAM, so the range is split at the aperture;
     /// for every RAM-backed GPA this matches `GuestMemory::gpa_to_offset`.
+    /// Bytes that are not RAM-backed in the tracker's layout are ignored.
     pub fn mark_guest_range(&self, gpa: u64, len: u64) {
         let Some(end) = gpa.checked_add(len) else {
             return;
@@ -143,13 +161,20 @@ impl SoftwareDirtyBitmap {
         if len == 0 {
             return;
         }
+        let (low, high_end) = match self.guest_layout {
+            Some((low, total)) => (low, MMIO_GAP_END.saturating_add(total - low)),
+            None => (MMIO_GAP_START, u64::MAX),
+        };
         let mut dirty = self.dirty.lock().unwrap();
-        if gpa < MMIO_GAP_START {
-            dirty.mark_range(gpa, end.min(MMIO_GAP_START) - gpa);
+        if gpa < low {
+            dirty.mark_range(gpa, end.min(low) - gpa);
         }
-        if end > MMIO_GAP_END {
+        let high_stop = end.min(high_end);
+        if high_stop > MMIO_GAP_END {
             let start = gpa.max(MMIO_GAP_END);
-            dirty.mark_range(MMIO_GAP_START + (start - MMIO_GAP_END), end - start);
+            if high_stop > start {
+                dirty.mark_range(low + (start - MMIO_GAP_END), high_stop - start);
+            }
         }
     }
 

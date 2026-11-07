@@ -24,6 +24,8 @@ class CreateVmRequest:
         Attributes:
             id (UUID | Unset): Optional VM id; generated when omitted. A create with the id of an existing VM is refused
                 with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
+            boot_memory_mib (int | Unset): Fixed boot RAM for new virtio-mem templates. memory_mib is the fully reserved
+                maximum and must be larger and 128-MiB aligned.
             memory_mib (int | Unset):  Default: 256.
             vcpus (int | Unset):  Default: 1.
             kernel_path (str | Unset):
@@ -37,6 +39,7 @@ class CreateVmRequest:
     """
 
     id: UUID | Unset = UNSET
+    boot_memory_mib: int | Unset = UNSET
     memory_mib: int | Unset = 256
     vcpus: int | Unset = 1
     kernel_path: str | Unset = UNSET
@@ -50,6 +53,8 @@ class CreateVmRequest:
         id: str | Unset = UNSET
         if not isinstance(self.id, Unset):
             id = str(self.id)
+
+        boot_memory_mib = self.boot_memory_mib
 
         memory_mib = self.memory_mib
 
@@ -79,6 +84,8 @@ class CreateVmRequest:
         field_dict.update({})
         if id is not UNSET:
             field_dict["id"] = id
+        if boot_memory_mib is not UNSET:
+            field_dict["boot_memory_mib"] = boot_memory_mib
         if memory_mib is not UNSET:
             field_dict["memory_mib"] = memory_mib
         if vcpus is not UNSET:
@@ -111,6 +118,8 @@ class CreateVmRequest:
         else:
             id = UUID(_id)
 
+        boot_memory_mib = d.pop("boot_memory_mib", UNSET)
+
         memory_mib = d.pop("memory_mib", UNSET)
 
         vcpus = d.pop("vcpus", UNSET)
@@ -141,6 +150,7 @@ class CreateVmRequest:
 
         create_vm_request = cls(
             id=id,
+            boot_memory_mib=boot_memory_mib,
             memory_mib=memory_mib,
             vcpus=vcpus,
             kernel_path=kernel_path,

@@ -32,3 +32,5 @@ pub use rng_transport::VirtioRngMmio;
 pub use transport::VirtioMmio;
 pub use vqueue::{Descriptor, QueueConfig, UsedElem, VirtQueueProcessor};
 pub use vsock::VirtioVsockMmio;
+
+pub mod mem;

@@ -180,6 +180,20 @@ Rules are `cidr:port/proto` or bare `cidr`. `allow_existing` defaults to `false`
 { "op": "status" }
 ```
 
+### `memory_hotplug_status` / `set_memory_hotplug`
+
+For VMs created with `memory.boot_size_mib` (virtio-mem). Sizes are MiB and
+exclude boot RAM. Grow or shrink (`0` unplugs everything) a running guest;
+`wait_timeout_ms` (optional, at most 60000) waits until the guest's plugged
+size equals the request. Both reply with `status: "memory_hotplug"` and
+`total_size_mib`, `block_size_mib`, `plugged_size_mib`, `requested_size_mib`,
+`boot_memory_mib`. Semantics: `docs/memory-growth.md` at the repository root.
+
+```json
+{ "op": "memory_hotplug_status" }
+{ "op": "set_memory_hotplug", "requested_size_mib": 2048, "wait_timeout_ms": 30000 }
+```
+
 ## Response JSON
 
 All non-PTY responses are internally tagged with a `status` field:

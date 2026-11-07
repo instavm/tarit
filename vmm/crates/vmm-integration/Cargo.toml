@@ -44,6 +44,11 @@ name = "egress_denial"
 path = "egress_denial.rs"
 
 [[test]]
+name = "memory_hotplug_live"
+path = "memory_hotplug_live.rs"
+required-features = ["kvm"]
+
+[[test]]
 name = "guest_network"
 path = "guest_network.rs"
 required-features = ["kvm"]
