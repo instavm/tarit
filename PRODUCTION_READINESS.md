@@ -113,7 +113,7 @@ and security analysis. The protected-main KVM workflow additionally:
 - runs strict VMM cold, snapshot-restore, and suspend/resume performance gates
   and uploads the measurements.
 
-This workflow requires a registered runner labeled `self-hosted`, `linux`, `x64`, and `kvm`; until one is provisioned, the hardware gates remain pending.
+This workflow requires a registered runner labeled `self-hosted`, `linux`, `x64`, and `kvm`; until one is provisioned, the hardware gates remain pending. `scripts/setup-kvm-runner.sh` provisions one: it creates a dedicated `tarit-ci` user with passwordless sudo (the KVM steps need root), installs a pinned, checksum-verified Actions runner as a service, and stages the guest kernel and rootfs where the workflow reads them.
 
 Privileged KVM jobs run only from the protected `main` ref; pull-request code is
 not executed on the persistent privileged runner.
