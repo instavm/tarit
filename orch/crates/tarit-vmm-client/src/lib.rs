@@ -20,6 +20,11 @@ pub enum VmmError {
 
     #[error("vmm: {0}")]
     Api(String),
+
+    /// The VMM refused the request without changing the VM, because the host
+    /// was too busy to finish it in time; the same request can be sent again.
+    #[error("vmm busy: {0}")]
+    Busy(String),
 }
 
 fn read_api_frame(stream: &mut UnixStream) -> Result<Vec<u8>, VmmError> {
@@ -425,7 +430,10 @@ impl VmmClient {
 
     pub fn request_ok(&self, req: &ApiRequest) -> Result<ApiResponse, VmmError> {
         match self.request(req)? {
-            ApiResponse::Err { msg } => Err(VmmError::Api(msg)),
+            ApiResponse::Err { msg } => Err(match msg.strip_prefix(RETRYABLE_ERROR_PREFIX) {
+                Some(reason) => VmmError::Busy(reason.to_string()),
+                None => VmmError::Api(msg),
+            }),
             other => Ok(other),
         }
     }
@@ -1232,6 +1240,18 @@ mod tests {
         );
         let error = result.expect_err("a memory-only request must not accept a disk artifact");
         assert!(error.to_string().contains("disk artifact"), "{error}");
+    }
+
+    #[test]
+    fn a_retryable_vmm_error_is_reported_as_busy() {
+        let (_, result) = serve_one_snapshot(
+            ApiResponse::retryable_err("quiesce block I/O worker: timed out"),
+            |client| client.snapshot_unreleased_with(false, None, true),
+        );
+        assert!(matches!(
+            result,
+            Err(VmmError::Busy(ref reason)) if reason == "quiesce block I/O worker: timed out"
+        ));
     }
 
     #[test]

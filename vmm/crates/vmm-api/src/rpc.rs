@@ -163,32 +163,36 @@ fn clear_control_timeouts(stream: &UnixStream) -> std::io::Result<()> {
     stream.set_write_timeout(None)
 }
 
+/// Report a controller error, marking the ones that left the VM unchanged
+/// so the orchestrator can ask its caller to retry instead of failing hard.
+fn error_response(error: vmm_core::error::VmmError) -> ApiResponse {
+    if error.is_retryable() {
+        ApiResponse::retryable_err(error)
+    } else {
+        ApiResponse::Err {
+            msg: error.to_string(),
+        }
+    }
+}
+
 /// Dispatch a single `ApiRequest` using the VMM controller.
 pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
     match req {
         ApiRequest::Create(spec) => match controller.create_live(spec.config) {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Pause => match controller.pause() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Suspend => match controller.suspend() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Resume => match controller.resume() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Snapshot {
             diff,
@@ -267,17 +271,13 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                         live_stats,
                     }
                 }
-                Err(e) => ApiResponse::Err {
-                    msg: format!("{e}"),
-                },
+                Err(e) => error_response(e),
             }
         }
         ApiRequest::ReleaseScratch { path, identity } => {
             match controller.release_scratch(&path, identity) {
                 Ok(()) => ApiResponse::Ok,
-                Err(e) => ApiResponse::Err {
-                    msg: format!("{e}"),
-                },
+                Err(e) => error_response(e),
             }
         }
         ApiRequest::Restore {
@@ -296,23 +296,17 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             memory_integrity,
         ) {
             Ok(()) => ApiResponse::Restored,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::RepairGuestNetwork { network } => {
             match controller.repair_guest_network(network) {
                 Ok(()) => ApiResponse::GuestNetworkRepaired,
-                Err(e) => ApiResponse::Err {
-                    msg: format!("{e}"),
-                },
+                Err(e) => error_response(e),
             }
         }
         ApiRequest::Stop => match controller.stop() {
             Ok(()) => ApiResponse::Ok,
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::Exec {
             command,
@@ -324,9 +318,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                 stderr,
                 duration_ms,
             },
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
         ApiRequest::AttachPty { .. } => ApiResponse::Err {
             msg: "AttachPty is a streaming request".into(),
@@ -400,9 +392,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         },
         ApiRequest::Status => match controller.status() {
             Ok(status) => ApiResponse::Status(status),
-            Err(e) => ApiResponse::Err {
-                msg: format!("{e}"),
-            },
+            Err(e) => error_response(e),
         },
     }
 }

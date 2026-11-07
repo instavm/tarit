@@ -1196,6 +1196,8 @@ paths:
           description: VM not found
         "409":
           description: Invalid lifecycle transition
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
   /v1/vms/{id}/resume:
     post:
       operationId: resumeVm
@@ -1254,6 +1256,8 @@ paths:
           description: VM not found
         "409":
           description: Invalid lifecycle transition
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
   /v1/vms/{id}/hibernate:
     post:
       operationId: hibernateVm
@@ -1281,6 +1285,8 @@ paths:
           description: VM not found
         "409":
           description: VM is not running
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
         "503":
           description: Remote hibernation is unavailable until fenced peer lifecycle routing is enabled
   /v1/vms/{id}/snapshot:
@@ -1326,6 +1332,8 @@ paths:
           description: VM not found
         "409":
           description: VM lifecycle state does not support snapshots
+        "429":
+          description: The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header
   /v1/vms/{id}/fork:
     post:
       operationId: forkVm
@@ -1366,7 +1374,7 @@ paths:
         "409":
           description: Source is not running or the requested child id already exists
         "429":
-          description: Host capacity is unavailable
+          description: Host capacity is unavailable, or the source VM's storage was too busy to pause in time. Retry after the Retry-After header
         "503":
           description: A source peer/session, durable fleet, verified artifact replica, or configured replication policy is unavailable
   /v1/snapshots:

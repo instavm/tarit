@@ -3142,6 +3142,10 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
                         None => format!("quiesce block I/O worker: {error}"),
                     },
                     vcpus_may_resume: rollback.is_none(),
+                    // The block worker stays healthy when it misses the
+                    // budget (a slow backing request is still in flight);
+                    // network and vsock workers are failed instead.
+                    retryable: rollback.is_none() && error.kind() == std::io::ErrorKind::TimedOut,
                 });
             }
         }
@@ -3156,6 +3160,7 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
                         None => format!("quiesce network I/O worker: {error}"),
                     },
                     vcpus_may_resume: rollback.is_none(),
+                    retryable: false,
                 });
             }
         }
@@ -3170,6 +3175,7 @@ fn set_running_io_paused(running: &RunningVm, paused: bool) -> Result<()> {
                         None => format!("quiesce vsock worker: {error}"),
                     },
                     vcpus_may_resume: rollback.is_none(),
+                    retryable: false,
                 });
             }
         }
@@ -3203,6 +3209,7 @@ fn resume_running_io_workers(running: &RunningVm) -> Result<()> {
         Err(VmmError::IoQuiescence {
             message: format!("resume I/O workers: {}", failures.join("; ")),
             vcpus_may_resume: false,
+            retryable: false,
         })
     }
 }

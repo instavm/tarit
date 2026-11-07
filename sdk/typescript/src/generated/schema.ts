@@ -2205,6 +2205,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     resumeVm: {
@@ -2319,6 +2326,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     hibernateVm: {
@@ -2364,6 +2378,13 @@ export interface operations {
             };
             /** @description VM is not running */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2439,6 +2460,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description The VM's storage was too busy to pause in time; the VM is unchanged. Retry after the Retry-After header */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     forkVm: {
@@ -2502,7 +2530,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description Host capacity is unavailable */
+            /** @description Host capacity is unavailable, or the source VM's storage was too busy to pause in time. Retry after the Retry-After header */
             429: {
                 headers: {
                     [name: string]: unknown;

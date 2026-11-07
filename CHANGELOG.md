@@ -166,6 +166,13 @@ versions may contain breaking changes.
 
 ### Fixed
 
+- Pause, suspend, snapshot, hibernate and fork answered 500 when a block
+  device's backing write was still in flight after the five-second pause
+  budget, which happens on a host short of disk bandwidth. The VMM already
+  released the guest unchanged in that case; it now says so, and taritd
+  answers 429 with `Retry-After: 2` instead. Network and vsock workers that
+  miss the budget are still failed and still answer 500.
+
 - Guest agent: a command that closed its output and kept running (`exec
   >/dev/null 2>&1; sleep 600`) stopped the agent from noticing the host give
   up on it, so every later command queued behind it; the agent now watches

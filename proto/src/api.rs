@@ -232,6 +232,21 @@ pub enum ApiResponse {
     },
 }
 
+/// Start of an [`ApiResponse::Err`] message for a request that failed
+/// without changing the VM and can be sent again later, for example a
+/// snapshot whose block I/O did not settle in time on an overloaded host.
+/// Older peers see it as part of an ordinary error message.
+pub const RETRYABLE_ERROR_PREFIX: &str = "retryable: ";
+
+impl ApiResponse {
+    /// An error the caller may retry; see [`RETRYABLE_ERROR_PREFIX`].
+    pub fn retryable_err(msg: impl std::fmt::Display) -> Self {
+        Self::Err {
+            msg: format!("{RETRYABLE_ERROR_PREFIX}{msg}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

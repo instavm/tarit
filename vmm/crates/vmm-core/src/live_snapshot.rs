@@ -913,6 +913,7 @@ mod tests {
                 Err(VmmError::IoQuiescence {
                     message: "worker did not resume".into(),
                     vcpus_may_resume: false,
+                    retryable: false,
                 })
             } else {
                 Ok(())

@@ -7463,14 +7463,16 @@ impl VmmSupervisor {
 
     pub fn pause_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let client = self.lifecycle_client_for(id)?;
-        client.pause().map_err(|e| OrchError::Vmm(e.to_string()))
+        client
+            .pause()
+            .map_err(|error| vmm_call_error("pause", error))
     }
 
     pub fn suspend_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let client = self.lifecycle_client_for(id)?;
         client
             .suspend()
-            .map_err(|error| OrchError::Vmm(error.to_string()))
+            .map_err(|error| vmm_call_error("suspend", error))
     }
 
     pub fn resume_vm(&self, id: Uuid) -> Result<(), OrchError> {
@@ -7661,7 +7663,7 @@ impl VmmSupervisor {
             // into taritd's durable namespace happens after that.
             client
                 .pause()
-                .map_err(|error| OrchError::Vmm(format!("pause for snapshot: {error}")))?;
+                .map_err(|error| vmm_call_error("pause for snapshot", error))?;
         }
 
         // Capture the disk upper first: the VMM resumes the guest once RAM is
@@ -7702,7 +7704,7 @@ impl VmmSupervisor {
                     return Err(compensate_snapshot_pause(
                         &client,
                         resume_after,
-                        OrchError::Vmm(format!("snapshot RAM: {error}")),
+                        vmm_call_error("snapshot RAM", error),
                     ));
                 }
             };
@@ -7838,7 +7840,7 @@ impl VmmSupervisor {
             live_stats,
         ) = client
             .live_snapshot_unreleased()
-            .map_err(|error| OrchError::Vmm(format!("atomic live snapshot: {error}")))?;
+            .map_err(|error| vmm_call_error("atomic live snapshot", error))?;
         if scratch_overlay_vmm_path.is_some() != expects_overlay {
             return Err(OrchError::Vmm(format!(
                 "atomic live snapshot disk mismatch: expected overlay={expects_overlay}, VMM returned overlay={}",
@@ -8717,6 +8719,25 @@ fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std
     destination.set_len(source_len)
 }
 
+/// Seconds a caller is asked to wait after the VMM reported it was too busy.
+const VMM_BUSY_RETRY_AFTER_SECS: u64 = 2;
+
+/// Map a failed VMM call. A refusal that left the VM unchanged (block I/O
+/// that did not settle within the pause budget on a loaded host) becomes a
+/// retryable overload rather than an internal error.
+fn vmm_call_error(operation: &str, error: tarit_vmm_client::VmmError) -> OrchError {
+    match error {
+        tarit_vmm_client::VmmError::Busy(reason) => {
+            tracing::warn!(operation, %reason, "VMM refused a busy request; caller may retry");
+            OrchError::Overloaded {
+                message: format!("{operation}: the VM's storage is busy, retry later"),
+                retry_after_secs: VMM_BUSY_RETRY_AFTER_SECS,
+            }
+        }
+        other => OrchError::Vmm(format!("{operation}: {other}")),
+    }
+}
+
 fn compensate_snapshot_pause(
     client: &VmmClient,
     resume_after: bool,
@@ -9530,6 +9551,23 @@ mod tests {
     use tarit_volume::BlockVolumeProvider;
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn a_busy_vmm_becomes_a_retryable_overload_not_an_internal_error() {
+        let busy = vmm_call_error(
+            "pause for snapshot",
+            tarit_vmm_client::VmmError::Busy("block I/O worker quiescence timed out".into()),
+        );
+        assert_eq!(busy.http_status(), 429);
+        assert_eq!(busy.retry_after_secs(), Some(VMM_BUSY_RETRY_AFTER_SECS));
+        assert!(!busy.to_string().contains("quiescence"), "{busy}");
+
+        let failed = vmm_call_error(
+            "pause for snapshot",
+            tarit_vmm_client::VmmError::Api("vsock worker quiescence timed out".into()),
+        );
+        assert_eq!(failed.http_status(), 500);
+    }
+
     #[test]
     fn tap_descriptor_becomes_inheritable_only_in_the_vmm_child() {
         let mut pipe_fds = [-1; 2];
