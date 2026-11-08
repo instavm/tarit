@@ -61,3 +61,6 @@ and `create` commands offer that install when `--kernel` is omitted.
 - Running guests requires x86_64 Linux with KVM. macOS is useful for development and non-KVM checks only.
 - aarch64 guest boot is not implemented.
 - The API is local UDS framing, not REST or HTTP.
+- A block read or write can transfer at most 256 MiB per request. This covers the advertised 256-descriptor queue with 1 MiB segments and also permits large requests from restored drivers without `SIZE_MAX`. Larger requests complete with an I/O error before any payload transfer.
+
+Rootless OCI conversion preserves ownership for names containing quotes, backslashes, control characters, and non-UTF-8 bytes without interpreting filenames as commands. Non-UTF-8 regular files require a staging filesystem that supports those names; macOS APFS rejects them.

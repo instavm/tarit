@@ -46,12 +46,15 @@ class TaritApiError(Exception):
 
 
 class TaritDeadlineExceeded(TimeoutError):
-    """The client stopped waiting; a fork may still exist at ``child_id``."""
+    """Waiting stopped; known execution/child IDs allow later reconciliation."""
 
-    def __init__(self, message: str, *, child_id: UUID | None = None) -> None:
+    def __init__(self, message: str, *, child_id: UUID | None = None, execution_id: UUID | None = None) -> None:
         self.child_id = child_id
+        self.execution_id = execution_id
         if child_id is not None:
             message = f"{message}; fork may have completed as child {child_id}"
+        if execution_id is not None:
+            message = f"{message}; execution ID {execution_id}"
         super().__init__(message)
 
 
@@ -401,7 +404,9 @@ class TaritClient:
             raise TaritPtyConnectionError("PTY WebSocket connection failed") from error
         return PtyConnection(self, vm_id, session.pty_id, websocket)
 
-    def _request(self, deadline: float, operation: str, **kwargs: Any) -> httpx.Response:
+    def _request(
+        self, deadline: float, operation: str, *, check_response_deadline: bool = True, **kwargs: Any
+    ) -> httpx.Response:
         client = self.raw.get_httpx_client()
         timeout = _request_timeout(client.timeout, _remaining(deadline, operation))
         try:
@@ -409,7 +414,8 @@ class TaritClient:
         except httpx.TimeoutException:
             _remaining(deadline, operation)
             raise
-        _remaining(deadline, operation)
+        if check_response_deadline:
+            _remaining(deadline, operation)
         return response
 
     def fork(
@@ -455,16 +461,31 @@ class TaritClient:
         """Submit and poll an execution within one deadline, including submission."""
         deadline = _deadline(max(timeout_ms / 1000 + 5, 5) if deadline_seconds is None else deadline_seconds)
         _validate_poll_interval(poll_interval)
-        response = self._request(
-            deadline,
-            "execute command",
-            **execute_async_api._get_kwargs(body=ExecuteRequest(vm_id=vm_id, command=command, timeout_ms=timeout_ms)),
-        )
-        record = _parsed(
-            execute_async_api._build_response(client=self.raw, response=response), ExecutionRecord, "execute command"
-        )
-        _remaining(deadline, "execute command")
-        return self._wait_execution(record.id, deadline, poll_interval)
+        execution_id = None
+        try:
+            response = self._request(
+                deadline,
+                "execute command",
+                # Decode an already received submission before rejecting a late
+                # response, so its server-issued ID remains available to callers.
+                check_response_deadline=False,
+                **execute_async_api._get_kwargs(
+                    body=ExecuteRequest(vm_id=vm_id, command=command, timeout_ms=timeout_ms)
+                ),
+            )
+            record = _parsed(
+                execute_async_api._build_response(client=self.raw, response=response),
+                ExecutionRecord,
+                "execute command",
+            )
+            execution_id = record.id
+            _remaining(deadline, "execute command")
+            return self._wait_execution(execution_id, deadline, poll_interval)
+        except TaritDeadlineExceeded as error:
+            message = "execute command exceeded its deadline"
+            if execution_id is None:
+                message += "; execution ID unavailable; submission may have been accepted"
+            raise TaritDeadlineExceeded(message, execution_id=execution_id) from error
 
     def wait_execution(
         self,
@@ -479,15 +500,22 @@ class TaritClient:
 
     def _wait_execution(self, execution_id: UUID, deadline: float, poll_interval: float) -> ExecutionRecord:
         operation = f"execution {execution_id}"
-        while True:
-            response = self._request(deadline, operation, **get_execution_api._get_kwargs(execution_id))
-            record = _parsed(
-                get_execution_api._build_response(client=self.raw, response=response), ExecutionRecord, "get execution"
-            )
-            _remaining(deadline, operation)
-            if record.status in TERMINAL_EXECUTION_STATUS:
-                return record
-            time.sleep(min(poll_interval, _remaining(deadline, operation)))
+        try:
+            while True:
+                response = self._request(deadline, operation, **get_execution_api._get_kwargs(execution_id))
+                record = _parsed(
+                    get_execution_api._build_response(client=self.raw, response=response),
+                    ExecutionRecord,
+                    "get execution",
+                )
+                _remaining(deadline, operation)
+                if record.status in TERMINAL_EXECUTION_STATUS:
+                    return record
+                time.sleep(min(poll_interval, _remaining(deadline, operation)))
+        except TaritDeadlineExceeded as error:
+            raise TaritDeadlineExceeded(
+                "waiting for execution exceeded its deadline", execution_id=execution_id
+            ) from error
 
 
 class AsyncTaritClient:
@@ -580,7 +608,9 @@ class AsyncTaritClient:
             raise TaritPtyConnectionError("PTY WebSocket connection failed") from error
         return AsyncPtyConnection(self, vm_id, session.pty_id, websocket)
 
-    async def _request(self, deadline: float, operation: str, **kwargs: Any) -> httpx.Response:
+    async def _request(
+        self, deadline: float, operation: str, *, check_response_deadline: bool = True, **kwargs: Any
+    ) -> httpx.Response:
         client = self.raw.get_async_httpx_client()
         remaining = _remaining(deadline, operation)
         timeout = _request_timeout(client.timeout, remaining)
@@ -592,7 +622,8 @@ class AsyncTaritClient:
         except httpx.TimeoutException:
             _remaining(deadline, operation)
             raise
-        _remaining(deadline, operation)
+        if check_response_deadline:
+            _remaining(deadline, operation)
         return response
 
     async def fork(
@@ -636,16 +667,29 @@ class AsyncTaritClient:
     ) -> ExecutionRecord:
         deadline = _deadline(max(timeout_ms / 1000 + 5, 5) if deadline_seconds is None else deadline_seconds)
         _validate_poll_interval(poll_interval)
-        response = await self._request(
-            deadline,
-            "execute command",
-            **execute_async_api._get_kwargs(body=ExecuteRequest(vm_id=vm_id, command=command, timeout_ms=timeout_ms)),
-        )
-        record = _parsed(
-            execute_async_api._build_response(client=self.raw, response=response), ExecutionRecord, "execute command"
-        )
-        _remaining(deadline, "execute command")
-        return await self._wait_execution(record.id, deadline, poll_interval)
+        execution_id = None
+        try:
+            response = await self._request(
+                deadline,
+                "execute command",
+                check_response_deadline=False,
+                **execute_async_api._get_kwargs(
+                    body=ExecuteRequest(vm_id=vm_id, command=command, timeout_ms=timeout_ms)
+                ),
+            )
+            record = _parsed(
+                execute_async_api._build_response(client=self.raw, response=response),
+                ExecutionRecord,
+                "execute command",
+            )
+            execution_id = record.id
+            _remaining(deadline, "execute command")
+            return await self._wait_execution(execution_id, deadline, poll_interval)
+        except TaritDeadlineExceeded as error:
+            message = "execute command exceeded its deadline"
+            if execution_id is None:
+                message += "; execution ID unavailable; submission may have been accepted"
+            raise TaritDeadlineExceeded(message, execution_id=execution_id) from error
 
     async def wait_execution(
         self,
@@ -660,12 +704,19 @@ class AsyncTaritClient:
 
     async def _wait_execution(self, execution_id: UUID, deadline: float, poll_interval: float) -> ExecutionRecord:
         operation = f"execution {execution_id}"
-        while True:
-            response = await self._request(deadline, operation, **get_execution_api._get_kwargs(execution_id))
-            record = _parsed(
-                get_execution_api._build_response(client=self.raw, response=response), ExecutionRecord, "get execution"
-            )
-            _remaining(deadline, operation)
-            if record.status in TERMINAL_EXECUTION_STATUS:
-                return record
-            await asyncio.sleep(min(poll_interval, _remaining(deadline, operation)))
+        try:
+            while True:
+                response = await self._request(deadline, operation, **get_execution_api._get_kwargs(execution_id))
+                record = _parsed(
+                    get_execution_api._build_response(client=self.raw, response=response),
+                    ExecutionRecord,
+                    "get execution",
+                )
+                _remaining(deadline, operation)
+                if record.status in TERMINAL_EXECUTION_STATUS:
+                    return record
+                await asyncio.sleep(min(poll_interval, _remaining(deadline, operation)))
+        except TaritDeadlineExceeded as error:
+            raise TaritDeadlineExceeded(
+                "waiting for execution exceeded its deadline", execution_id=execution_id
+            ) from error

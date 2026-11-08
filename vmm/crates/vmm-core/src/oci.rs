@@ -370,16 +370,33 @@ fn export_relative_path(path: &Path) -> Result<PathBuf, OciError> {
     Ok(relative)
 }
 
-fn debugfs_path(path: &Path) -> Result<String, OciError> {
-    let text = path
-        .to_str()
-        .ok_or_else(|| OciError::UnsafePath("image ownership requires UTF-8 paths".into()))?;
-    if text.contains(['"', '\\']) || text.chars().any(char::is_control) {
-        return Err(OciError::UnsafePath(format!(
-            "path cannot be represented safely in debugfs: {path:?}"
-        )));
+/// libss quotes tokens by doubling `"`; backslashes are ordinary bytes.
+/// Keep paths as bytes: neither Unix nor ext4 requires UTF-8 filenames.
+/// See e2fsprogs lib/ss/parse.c. Requests containing CR/LF must use `-R`,
+/// because debugfs's command-file reader truncates at either byte.
+fn debugfs_path(path: &Path) -> Result<Vec<u8>, OciError> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return Err(OciError::UnsafePath("filename contains NUL".into()));
     }
-    Ok(format!("\"/{text}\""))
+    let mut quoted = Vec::with_capacity(bytes.len() + 3);
+    quoted.extend_from_slice(b"\"/");
+    for &byte in bytes {
+        quoted.push(byte);
+        if byte == b'"' {
+            quoted.push(byte);
+        }
+    }
+    quoted.push(b'"');
+    Ok(quoted)
+}
+
+fn debugfs_request(operation: &str, path: &[u8], arguments: &str) -> Vec<u8> {
+    let mut request = operation.as_bytes().to_vec();
+    request.push(b' ');
+    request.extend_from_slice(path);
+    request.extend_from_slice(arguments.as_bytes());
+    request
 }
 
 /// Build an ext4 image from an image a local container engine can export.
@@ -545,9 +562,6 @@ fn unpack_export<R: Read>(
             return Err(OciError::ResourceLimit("path too long".into()));
         }
         let relative = export_relative_path(&relative)?;
-        if rootless {
-            debugfs_path(&relative)?;
-        }
         let kind = entry.header().entry_type();
         if relative.as_os_str().is_empty() && kind != tar::EntryType::Directory {
             return Err(OciError::UnsafePath("non-directory archive root".into()));
@@ -618,29 +632,72 @@ fn unpack_export<R: Read>(
     Ok(metadata)
 }
 
-/// Apply every entry's recorded owner and mode (and create device nodes)
-/// inside the ext4 image with one debugfs pass. Files the build added, such
-/// as the exec agent, belong to root.
+/// Apply recorded ownership and modes inside ext4. Ordinary requests are
+/// batched; requests with embedded line endings or long names are passed as
+/// one byte-preserving `-R` argument, never interpreted by a shell.
 fn restore_image_ownership(
     rootfs: &Path,
     metadata: &ExportMetadata,
     image: &Path,
     workspace: &Path,
 ) -> Result<(), OciError> {
-    let script = image_ownership_script(rootfs, metadata)?;
+    let requests = image_ownership_commands(rootfs, metadata)?;
     let script_path = workspace.join("ownership.debugfs");
-    std::fs::write(&script_path, script)?;
-    let mut debugfs = Command::new("debugfs");
-    debugfs.arg("-w").arg("-f").arg(&script_path).arg(image);
-    let output = debugfs.output().map_err(|e| OciError::CommandFailed {
+    let mut batch = Vec::new();
+    for request in requests {
+        // debugfs uses fgets(BUFSIZ); Darwin's buffer is only 1024 bytes.
+        // Leave room for both the newline and terminating NUL. -R avoids
+        // both that limit and the command-file reader's CR/LF truncation.
+        if request.len() <= 1022 && !request.contains(&b'\n') && !request.contains(&b'\r') {
+            if batch.len() + request.len() + 1 > 1024 * 1024 {
+                run_debugfs_batch(image, &script_path, &mut batch)?;
+            }
+            batch.extend_from_slice(&request);
+            batch.push(b'\n');
+        } else {
+            run_debugfs_batch(image, &script_path, &mut batch)?;
+            let mut command = Command::new("debugfs");
+            command
+                .args(["-w", "-R"])
+                .arg(std::ffi::OsStr::from_bytes(&request))
+                .arg(image);
+            run_debugfs(command)?;
+        }
+    }
+    run_debugfs_batch(image, &script_path, &mut batch)
+}
+
+fn run_debugfs_batch(
+    image: &Path,
+    script_path: &Path,
+    batch: &mut Vec<u8>,
+) -> Result<(), OciError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    std::fs::write(script_path, &*batch)?;
+    let mut command = Command::new("debugfs");
+    command.args(["-w", "-f"]).arg(script_path).arg(image);
+    run_debugfs(command)?;
+    batch.clear();
+    Ok(())
+}
+
+fn run_debugfs(mut command: Command) -> Result<(), OciError> {
+    let output = command.output().map_err(|e| OciError::CommandFailed {
         cmd: "debugfs".into(),
         stderr: e.to_string(),
     })?;
-    // debugfs reports per-command failures on stderr but still exits 0.
+    // Per-command failures can leave exit status zero. Ignore only the first
+    // version banner, not subsequent diagnostics containing filename bytes.
     let stderr = String::from_utf8_lossy(&output.stderr);
     let failures: Vec<&str> = stderr
         .lines()
-        .filter(|line| !line.starts_with("debugfs ") && !line.trim().is_empty())
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (!(line.trim().is_empty() || (index == 0 && line.starts_with("debugfs "))))
+                .then_some(line)
+        })
         .collect();
     if !output.status.success() || !failures.is_empty() {
         return Err(OciError::CommandFailed {
@@ -656,9 +713,10 @@ fn restore_image_ownership(
     Ok(())
 }
 
-fn image_ownership_script(rootfs: &Path, metadata: &ExportMetadata) -> Result<String, OciError> {
-    use std::fmt::Write as _;
-
+fn image_ownership_commands(
+    rootfs: &Path,
+    metadata: &ExportMetadata,
+) -> Result<Vec<Vec<u8>>, OciError> {
     // Only identities still reachable at an exported path retain image
     // metadata. A file injected by the build must not inherit an old entry's
     // owner just because its pathname (or a recycled inode number) matches.
@@ -672,12 +730,16 @@ fn image_ownership_script(rootfs: &Path, metadata: &ExportMetadata) -> Result<St
                 .map(|_| *expected)
         })
         .collect();
-    let mut script = String::from("sif / uid 0\nsif / gid 0\n");
+    let mut requests = vec![b"sif / uid 0".to_vec(), b"sif / gid 0".to_vec()];
     let mut seen = HashSet::new();
+    let mut staged_paths = HashSet::new();
+    let mut staged_directories = HashSet::new();
     let mut stack = vec![PathBuf::new()];
     while let Some(relative) = stack.pop() {
         let stat = std::fs::symlink_metadata(rootfs.join(&relative))?;
+        staged_paths.insert(relative.clone());
         if stat.is_dir() {
+            staged_directories.insert(relative.clone());
             let mut children = std::fs::read_dir(rootfs.join(&relative))?
                 .map(|child| child.map(|child| relative.join(child.file_name())))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -695,39 +757,87 @@ fn image_ownership_script(rootfs: &Path, metadata: &ExportMetadata) -> Result<St
             .flatten();
         if relative.as_os_str().is_empty() {
             if let Some(meta) = meta {
-                let _ = writeln!(script, "sif / mode 0{:o}", meta.mode);
+                requests.push(format!("sif / mode 0{:o}", meta.mode).into_bytes());
             }
             continue;
         }
         if let Some(meta) = meta {
-            let _ = writeln!(script, "sif {name} uid {}", meta.uid);
-            let _ = writeln!(script, "sif {name} gid {}", meta.gid);
-            if meta.mode & image_mode(libc::S_IFMT) != image_mode(libc::S_IFLNK) {
-                let _ = writeln!(script, "sif {name} mode 0{:o}", meta.mode);
-            }
+            requests.push(debugfs_request("sif", &name, &format!(" uid {}", meta.uid)));
+            requests.push(debugfs_request("sif", &name, &format!(" gid {}", meta.gid)));
+            // sif resolves the final inode without following a symlink.
+            requests.push(debugfs_request(
+                "sif",
+                &name,
+                &format!(" mode 0{:o}", meta.mode),
+            ));
         } else {
-            let _ = writeln!(script, "sif {name} uid 0\nsif {name} gid 0");
+            requests.push(debugfs_request("sif", &name, " uid 0"));
+            requests.push(debugfs_request("sif", &name, " gid 0"));
         }
     }
-    for (path, meta) in &metadata.special {
-        let name = debugfs_path(path)?;
-        match (meta.mode & image_mode(libc::S_IFMT), meta.device) {
-            (kind, Some((major, minor))) if kind == image_mode(libc::S_IFCHR) => {
-                let _ = writeln!(script, "mknod {name} c {major} {minor}");
+    if !metadata.special.is_empty() {
+        // Validate every destination before returning any commands. debugfs
+        // ln treats an existing directory as its destination directory; sif
+        // would then corrupt that directory by changing its inode type.
+        // mke2fs creates lost+found even when it is absent from staging.
+        // Require a real staged parent, so image symlink resolution cannot
+        // reach a different destination (e.g. link -> /, link/lost+found).
+        // Use the byte paths from the non-following walk: querying a raw-byte
+        // special leaf on APFS can fail even though ext4 supports that name.
+        for path in metadata.special.keys() {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            if path == Path::new("lost+found")
+                || staged_paths.contains(path)
+                || !staged_directories.contains(parent)
+            {
+                return Err(OciError::UnsafePath(format!(
+                    "special inode destination must be absent with a real staged parent, and cannot replace lost+found: {path:?}"
+                )));
             }
-            (kind, Some((major, minor))) if kind == image_mode(libc::S_IFBLK) => {
-                let _ = writeln!(script, "mknod {name} b {major} {minor}");
-            }
-            (kind, _) if kind == image_mode(libc::S_IFIFO) => {
-                let _ = writeln!(script, "mknod {name} p");
-            }
-            _ => {}
         }
-        let _ = writeln!(script, "sif {name} uid {}", meta.uid);
-        let _ = writeln!(script, "sif {name} gid {}", meta.gid);
-        let _ = writeln!(script, "sif {name} mode 0{:o}", meta.mode);
+        // debugfs mknod takes a basename, not a pathname. Allocate in the root
+        // under a collision-free temporary name, link to the final byte path,
+        // then remove the temporary entry. debugfs ln/unlink do not adjust
+        // link counts, leaving the new inode's count correctly equal to one.
+        let mut index = 0;
+        let temporary = loop {
+            let candidate = PathBuf::from(format!(".tarit-oci-node-{index}"));
+            if !staged_paths.contains(&candidate) && !metadata.special.contains_key(&candidate) {
+                break candidate;
+            }
+            index += 1;
+        };
+        let source = debugfs_path(&temporary)?;
+        let basename = temporary.to_str().expect("generated ASCII basename");
+        let mut special: Vec<_> = metadata.special.iter().collect();
+        special.sort_by_key(|(path, _)| *path);
+        for (path, meta) in special {
+            let name = debugfs_path(path)?;
+            let kind = match (meta.mode & image_mode(libc::S_IFMT), meta.device) {
+                (kind, Some((major, minor))) if kind == image_mode(libc::S_IFCHR) => {
+                    format!("c {major} {minor}")
+                }
+                (kind, Some((major, minor))) if kind == image_mode(libc::S_IFBLK) => {
+                    format!("b {major} {minor}")
+                }
+                (kind, _) if kind == image_mode(libc::S_IFIFO) => "p".into(),
+                _ => return Err(OciError::InvalidLayout("unsupported special inode".into())),
+            };
+            requests.push(format!("mknod {basename} {kind}").into_bytes());
+            let mut link = debugfs_request("ln", &source, " ");
+            link.extend_from_slice(&name);
+            requests.push(link);
+            requests.push(debugfs_request("unlink", &source, ""));
+            requests.push(debugfs_request("sif", &name, &format!(" uid {}", meta.uid)));
+            requests.push(debugfs_request("sif", &name, &format!(" gid {}", meta.gid)));
+            requests.push(debugfs_request(
+                "sif",
+                &name,
+                &format!(" mode 0{:o}", meta.mode),
+            ));
+        }
     }
-    Ok(script)
+    Ok(requests)
 }
 
 fn resolved_output_path(output_path: &Path) -> Result<PathBuf, OciError> {
@@ -1677,27 +1787,355 @@ mod tests {
         assert!(!script.contains("uid 2000"));
     }
 
+    // Keep the human-readable assertions above focused on inode ownership.
+    fn image_ownership_script(
+        rootfs: &Path,
+        metadata: &ExportMetadata,
+    ) -> Result<String, OciError> {
+        let commands = image_ownership_commands(rootfs, metadata)?;
+        let mut script = commands.join(&b'\n');
+        script.push(b'\n');
+        Ok(String::from_utf8(script).unwrap())
+    }
+
     #[test]
-    fn rootless_ownership_rejects_unrepresentable_paths() {
-        use std::os::unix::ffi::OsStrExt;
-        for name in ["quote\"name", "line\nname", "slash\\name", "line\rname"] {
-            assert!(matches!(
-                debugfs_path(Path::new(name)),
-                Err(OciError::UnsafePath(_))
-            ));
-        }
-        assert!(debugfs_path(Path::new(std::ffi::OsStr::from_bytes(b"bad-\xff"))).is_err());
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("bad\"name"), b"data").unwrap();
-        assert!(matches!(
-            image_ownership_script(dir.path(), &ExportMetadata::default()),
-            Err(OciError::UnsafePath(_))
+    fn debugfs_paths_preserve_unusual_bytes_without_ending_the_token() {
+        let path = Path::new(std::ffi::OsStr::from_bytes(
+            b"quote\" slash\\ line\n\r\t\x01-\xff",
         ));
+        assert_eq!(
+            debugfs_path(path).unwrap(),
+            b"\"/quote\"\" slash\\ line\n\r\t\x01-\xff\""
+        );
+        assert!(debugfs_path(Path::new(std::ffi::OsStr::from_bytes(b"bad\0name"))).is_err());
         assert_eq!(
             export_relative_path(Path::new("/./a//b")).unwrap(),
             Path::new("a/b")
         );
         assert!(export_relative_path(Path::new("a/../b")).is_err());
+    }
+
+    #[test]
+    fn rootless_special_collisions_fail_before_mutating_the_image() {
+        for (original, destination) in [
+            (Some(tar::EntryType::Directory), "node"),
+            (Some(tar::EntryType::Regular), "node"),
+            (Some(tar::EntryType::Symlink), "node"),
+            (None, "lost+found"),
+            (Some(tar::EntryType::Symlink), "node/lost+found"),
+            (Some(tar::EntryType::Regular), "node/child"),
+            (None, "missing/child"),
+        ] {
+            for special in [tar::EntryType::Char, tar::EntryType::Fifo] {
+                let workspace = tempfile::tempdir().unwrap();
+                let rootfs = workspace.path().join("rootfs");
+                std::fs::create_dir(&rootfs).unwrap();
+                let mut builder = tar::Builder::new(Vec::new());
+                let entries = original
+                    .into_iter()
+                    .map(|kind| (kind, "node"))
+                    .chain(std::iter::once((special, destination)));
+                for (kind, path) in entries {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(kind);
+                    header.set_uid(1000);
+                    header.set_gid(1001);
+                    header.set_mode(0o755);
+                    if kind == tar::EntryType::Symlink {
+                        // Cover both a dangling final symlink and an image
+                        // absolute parent alias to mke2fs's lost+found.
+                        let target = if destination == "node" {
+                            "missing-target"
+                        } else {
+                            "/"
+                        };
+                        header.set_link_name(target).unwrap();
+                    }
+                    if kind == tar::EntryType::Char {
+                        header.set_device_major(1).unwrap();
+                        header.set_device_minor(3).unwrap();
+                    }
+                    let data = if kind == tar::EntryType::Regular {
+                        &b"old file"[..]
+                    } else {
+                        &b""[..]
+                    };
+                    header.set_size(data.len() as u64);
+                    builder.append_data(&mut header, path, data).unwrap();
+                }
+                let tarball = builder.into_inner().unwrap();
+                let metadata =
+                    unpack_export(&tarball[..], &rootfs, test_limits(1 << 20, 64), true).unwrap();
+                assert_eq!(
+                    std::fs::symlink_metadata(rootfs.join("node")).is_ok(),
+                    original.is_some()
+                );
+                let image = workspace.path().join("unpublished.ext4");
+                let unchanged = b"image has not been opened or modified";
+                std::fs::write(&image, unchanged).unwrap();
+                let error = restore_image_ownership(&rootfs, &metadata, &image, workspace.path())
+                    .unwrap_err();
+                assert!(
+                    matches!(error, OciError::UnsafePath(ref message)
+                    if message.contains("special inode destination must be absent")),
+                    "{original:?} -> {special:?} at {destination}: {error}"
+                );
+                assert_eq!(std::fs::read(&image).unwrap(), unchanged);
+                assert!(!workspace.path().join("ownership.debugfs").exists());
+            }
+        }
+    }
+
+    /// Runs in required Linux CI with real e2fsprogs. Developers without the
+    /// tools can run the pure unit tests; the required flag forbids a skip.
+    #[test]
+    fn rootless_ext4_preserves_unusual_names_owners_and_special_inodes() {
+        let available = ["mke2fs", "debugfs", "e2fsck"]
+            .iter()
+            .all(|tool| which(tool).is_some());
+        if !available {
+            assert_ne!(
+                std::env::var("TARIT_REQUIRE_E2FSPROGS").as_deref(),
+                Ok("1"),
+                "TARIT_REQUIRE_E2FSPROGS=1 requires mke2fs, debugfs and e2fsck on PATH"
+            );
+            eprintln!("skipping ext4 integration test: e2fsprogs unavailable");
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let rootfs = workspace.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let directory = Path::new("odd\"\\\n\r\t\x01");
+        let target = directory.join("target\"\n");
+        let alias = directory.join("alias\\\n");
+        let injected = directory.join("injected\"\n");
+        let symlink = directory.join("symlink\"\n");
+        let special = [
+            (
+                directory.join("null\"\n"),
+                tar::EntryType::Char,
+                "character special",
+            ),
+            (
+                directory.join("disk\\\r"),
+                tar::EntryType::Block,
+                "block special",
+            ),
+            (directory.join("fifo\t"), tar::EntryType::Fifo, "FIFO"),
+            (
+                PathBuf::from(std::ffi::OsStr::from_bytes(b"raw-\xff")),
+                tar::EntryType::Char,
+                "character special",
+            ),
+            (
+                PathBuf::from(".tarit-oci-node-1"),
+                tar::EntryType::Char,
+                "character special",
+            ),
+        ];
+        // Doubling quotes makes this exceed debugfs's 1024-byte Darwin line
+        // buffer while the host path remains short enough for APFS.
+        let mut long_path = PathBuf::new();
+        for _ in 0..4 {
+            long_path.push("\"".repeat(150));
+        }
+        long_path.push("leaf");
+        let ordinary = [
+            (PathBuf::from("aaa"), 501, 502),
+            (PathBuf::from("paired\"name"), 503, 504),
+            (PathBuf::from("pairedname"), 505, 506),
+            (PathBuf::from("back\\slash\t\x01"), 507, 508),
+            // If this ever enters a line-oriented script unquoted, it would
+            // change the already-restored aaa inode instead of this file.
+            (PathBuf::from("attack\"\nsif /aaa uid 123\n#"), 509, 510),
+            (long_path, 511, 512),
+        ];
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &Path,
+                       kind: tar::EntryType,
+                       owner: (u64, u64),
+                       mode: u32,
+                       link: Option<&Path>| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_uid(owner.0);
+            header.set_gid(owner.1);
+            header.set_mode(mode);
+            if let Some(link) = link {
+                header.set_link_name(link).unwrap();
+            }
+            if kind == tar::EntryType::Char || kind == tar::EntryType::Block {
+                header.set_device_major(1).unwrap();
+                header.set_device_minor(3).unwrap();
+            }
+            let data = if kind == tar::EntryType::Regular {
+                &b"data"[..]
+            } else {
+                &b""[..]
+            };
+            header.set_size(data.len() as u64);
+            builder.append_data(&mut header, path, data).unwrap();
+        };
+        add(
+            directory,
+            tar::EntryType::Directory,
+            (600, 601),
+            0o751,
+            None,
+        );
+        for (path, uid, gid) in &ordinary {
+            add(path, tar::EntryType::Regular, (*uid, *gid), 0o640, None);
+        }
+        add(&target, tar::EntryType::Regular, (0, 42), 0o4755, None);
+        add(
+            &alias,
+            tar::EntryType::Link,
+            (999, 999),
+            0o777,
+            Some(&target),
+        );
+        add(&target, tar::EntryType::Regular, (2000, 2001), 0o600, None);
+        add(
+            &injected,
+            tar::EntryType::Regular,
+            (3000, 3001),
+            0o600,
+            None,
+        );
+        add(
+            &symlink,
+            tar::EntryType::Symlink,
+            (61000, 61001),
+            0o777,
+            Some(Path::new(target.file_name().unwrap())),
+        );
+        // Reserve the first temporary-name candidate with an exported file.
+        add(
+            Path::new(".tarit-oci-node-0"),
+            tar::EntryType::Regular,
+            (700, 701),
+            0o640,
+            None,
+        );
+        for (path, kind, _) in &special {
+            add(path, *kind, (800, 801), 0o660, None);
+        }
+        // APFS rejects invalid UTF-8 before mke2fs; Linux staging filesystems
+        // support these byte names. Special nodes above test raw bytes on both.
+        #[cfg(target_os = "linux")]
+        let raw_file = PathBuf::from(std::ffi::OsStr::from_bytes(b"raw-dir-\xff/regular-\xfe"));
+        #[cfg(target_os = "linux")]
+        add(&raw_file, tar::EntryType::Regular, (900, 901), 0o640, None);
+        let tarball = builder.into_inner().unwrap();
+        let mut limits = test_limits(1 << 20, 64);
+        limits.max_path_bytes = 4096;
+        let metadata = unpack_export(&tarball[..], &rootfs, limits, true).unwrap();
+        let replacement = workspace.path().join("new-agent");
+        std::fs::write(&replacement, b"agent").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::rename(&replacement, rootfs.join(&injected)).unwrap();
+        let image = workspace.path().join("disk.ext4");
+        let output = Command::new("mke2fs")
+            .args(["-q", "-t", "ext4", "-d"])
+            .arg(&rootfs)
+            .arg("-F")
+            .arg(&image)
+            .arg("16M")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        restore_image_ownership(&rootfs, &metadata, &image, workspace.path()).unwrap();
+
+        let stat = |path: &Path| -> String {
+            let request = debugfs_request("stat", &debugfs_path(path).unwrap(), "");
+            let output = Command::new("debugfs")
+                .arg("-R")
+                .arg(std::ffi::OsStr::from_bytes(&request))
+                .arg(&image)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr).lines().count(),
+                1,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let check = |path: &Path, uid: u64, gid: u64, mode: u32, kind: &str| -> u64 {
+            let output = stat(path);
+            let words: Vec<_> = output.split_whitespace().collect();
+            let value = |key: &str| words[words.iter().position(|word| *word == key).unwrap() + 1];
+            assert_eq!(
+                value("User:").parse::<u64>().unwrap(),
+                uid,
+                "{path:?}: {output}"
+            );
+            assert_eq!(
+                value("Group:").parse::<u64>().unwrap(),
+                gid,
+                "{path:?}: {output}"
+            );
+            assert_eq!(
+                u32::from_str_radix(value("Mode:"), 8).unwrap(),
+                mode,
+                "{path:?}: {output}"
+            );
+            assert!(
+                output
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains(&format!("Type: {kind}")),
+                "{path:?}: {output}"
+            );
+            value("Inode:").parse().unwrap()
+        };
+        check(Path::new(""), 0, 0, 0o755, "directory");
+        check(directory, 600, 601, 0o751, "directory");
+        for (path, uid, gid) in &ordinary {
+            check(path, *uid, *gid, 0o640, "regular");
+        }
+        let alias_inode = check(&alias, 0, 42, 0o4755, "regular");
+        let target_inode = check(&target, 2000, 2001, 0o600, "regular");
+        assert_ne!(
+            alias_inode, target_inode,
+            "replacement must not change the old hardlink's owner"
+        );
+        check(&injected, 0, 0, 0o644, "regular");
+        check(&symlink, 61000, 61001, 0o777, "symlink");
+        check(Path::new(".tarit-oci-node-0"), 700, 701, 0o640, "regular");
+        for (path, kind, type_name) in &special {
+            check(path, 800, 801, 0o660, type_name);
+            let output = stat(path);
+            assert!(output.contains("Links: 1"), "{output}");
+            if *kind != tar::EntryType::Fifo {
+                assert!(
+                    output.contains("Device major/minor number: 01:03"),
+                    "{output}"
+                );
+            }
+        }
+        #[cfg(target_os = "linux")]
+        check(&raw_file, 900, 901, 0o640, "regular");
+        let output = Command::new("e2fsck")
+            .args(["-fn"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn test_limits(max_expanded_bytes: u64, max_entries: u64) -> OciResourceLimits {
