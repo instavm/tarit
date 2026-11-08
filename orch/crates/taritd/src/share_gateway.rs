@@ -1116,6 +1116,10 @@ fn local_target(
     state: &AppState,
     share: &ShareRecord,
 ) -> Result<(UpstreamTarget, NetworkLease), GatewayError> {
+    let vm = crate::ops::get_local(state, share.vm_id).map_err(|_| GatewayError::NotFound)?;
+    if vm.owner_key.as_deref() != Some(share.owner_key.as_str()) {
+        return Err(GatewayError::NotFound);
+    }
     let lease = state
         .supervisor
         .acquire_network_lease(share.vm_id)

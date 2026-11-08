@@ -982,7 +982,9 @@ async fn internal_stop(
     identity: Option<Extension<ApiIdentity>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
+    let identity = require_peer_identity(identity.as_ref().map(|value| &value.0))?;
+    let vm = ops::get_local_for_delete(&state, id)?;
+    ensure_vm_access(identity, &vm)?;
     ops::stop_local(&state, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1138,6 +1140,59 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tarit_types::VmStatus;
+
+    #[test]
+    fn peer_delete_retries_pending_hibernation_without_bypassing_tenant_identity() {
+        let state = crate::api::tests::test_state();
+        let id = Uuid::new_v4();
+        crate::api::tests::insert_vm(&state, id, "tenant-a", VmStatus::Running);
+        let mut record = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
+        record.status = VmStatus::Hibernated;
+        record.revision += 1;
+        state
+            .lifecycle
+            .lock()
+            .unwrap()
+            .insert(id, crate::api::LifecycleState::Hibernating { record });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let foreign = state.config.api_keys.resolve("tenant-b-key").unwrap();
+        let owner = state.config.api_keys.resolve("tenant-a-key").unwrap();
+        let missing_identity =
+            runtime.block_on(internal_stop(State(state.clone()), None, Path(id)));
+        assert_eq!(
+            missing_identity.err().unwrap().into_response().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let denied = runtime.block_on(internal_stop(
+            State(state.clone()),
+            Some(Extension(foreign)),
+            Path(id),
+        ));
+        assert_eq!(
+            denied.err().unwrap().into_response().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(matches!(
+            state.lifecycle.lock().unwrap().get(&id),
+            Some(crate::api::LifecycleState::Hibernating { .. })
+        ));
+        let deleted = runtime
+            .block_on(internal_stop(
+                State(state.clone()),
+                Some(Extension(owner)),
+                Path(id),
+            ))
+            .map_err(|error| error.0)
+            .unwrap();
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.store.lock().unwrap().get_vm(id).unwrap().status,
+            VmStatus::Stopped
+        );
+    }
 
     #[test]
     fn artifact_export_opens_only_private_regular_nonsymlink_files() {

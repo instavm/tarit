@@ -1665,6 +1665,7 @@ impl PostgresFleet {
                 &[&vm.id],
             )
             .await?;
+        let owns_current = current.is_some();
         if let Some(current) = current {
             if current.get::<_, String>(0) != vm.host_id
                 || current.get::<_, DateTime<Utc>>(1) != vm.created_at
@@ -1701,6 +1702,16 @@ impl PostgresFleet {
                 ));
             }
             delete_unreferenced_artifact_chain_tx(&tx, &owner_key, artifact_id).await?;
+        }
+        // Shares must not survive the ownership row that reserves this UUID.
+        // Locking that row also fences concurrent checked share publication.
+        if owns_current {
+            tx.execute(
+                "UPDATE fleet_shares SET revoked_at = $2, updated_at = $2
+                 WHERE vm_id = $1 AND revoked_at IS NULL",
+                &[&vm.id, &Utc::now().to_rfc3339()],
+            )
+            .await?;
         }
         tx.execute(
             "DELETE FROM fleet_vms WHERE id = $1 AND created_at = $2",
@@ -2573,6 +2584,54 @@ impl PostgresFleet {
         Ok(())
     }
 
+    pub async fn insert_share_for_vm(
+        &self,
+        share: &ShareRecord,
+        vm: &VmRecord,
+    ) -> Result<(), FleetError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let vm = normalize_vm_timestamps_for_postgres(vm);
+        let current = tx
+            .query_opt(
+                "SELECT id FROM fleet_vms
+             WHERE id = $1 AND created_at = $2 AND owner_key = $3 AND status = 'running'
+             FOR UPDATE",
+                &[&share.vm_id, &vm.created_at, &share.owner_key],
+            )
+            .await?;
+        if vm.id != share.vm_id || current.is_none() {
+            return Err(FleetError::Conflict(
+                "share target VM changed or is not running".into(),
+            ));
+        }
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let created_at = share.created_at.to_rfc3339();
+        let updated_at = share.updated_at.to_rfc3339();
+        tx.execute(
+            "INSERT INTO fleet_shares (
+                   id, slug, owner_key, vm_id, guest_port, visibility, token_version, revoked_at,
+                   created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            &[
+                &share.id,
+                &share.slug,
+                &share.owner_key,
+                &share.vm_id,
+                &(i32::from(share.guest_port)),
+                &share_visibility_as_str(share.visibility),
+                &u64_to_sql_i64(share.token_version)?,
+                &revoked_at,
+                &created_at,
+                &updated_at,
+            ],
+        )
+        .await
+        .map_err(fleet_error_from_postgres)?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn insert_share(&self, share: &ShareRecord) -> Result<(), FleetError> {
         let client = self.pool.get().await?;
         let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
@@ -2673,6 +2732,59 @@ impl PostgresFleet {
     /// Update an active share only when it still has the version read by the
     /// caller. This protects token rotation and terminal revocation from
     /// concurrent writers across taritd nodes.
+    pub async fn update_share_for_vm_if_current(
+        &self,
+        share: &ShareRecord,
+        expected_token_version: u64,
+        vm: &VmRecord,
+    ) -> Result<(), FleetError> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let vm = normalize_vm_timestamps_for_postgres(vm);
+        let current = tx
+            .query_opt(
+                "SELECT id FROM fleet_vms
+             WHERE id = $1 AND created_at = $2 AND owner_key = $3 AND status = 'running'
+             FOR UPDATE",
+                &[&share.vm_id, &vm.created_at, &share.owner_key],
+            )
+            .await?;
+        if vm.id != share.vm_id || current.is_none() {
+            return Err(FleetError::Conflict(
+                "share target VM changed or is not running".into(),
+            ));
+        }
+        let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
+        let updated_at = share.updated_at.to_rfc3339();
+        let updated = tx
+            .execute(
+                "UPDATE fleet_shares SET
+                   slug = $2, vm_id = $3, guest_port = $4, visibility = $5, token_version = $6,
+                   revoked_at = $7, updated_at = $8
+                  WHERE id = $1 AND token_version = $9 AND revoked_at IS NULL",
+                &[
+                    &share.id,
+                    &share.slug,
+                    &share.vm_id,
+                    &(i32::from(share.guest_port)),
+                    &share_visibility_as_str(share.visibility),
+                    &u64_to_sql_i64(share.token_version)?,
+                    &revoked_at,
+                    &updated_at,
+                    &u64_to_sql_i64(expected_token_version)?,
+                ],
+            )
+            .await
+            .map_err(fleet_error_from_postgres)?;
+        if updated == 0 {
+            return Err(FleetError::Conflict(
+                "share was modified or revoked concurrently".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn update_share_if_current(
         &self,
         share: &ShareRecord,
@@ -4861,6 +4973,80 @@ mod tests {
         std::mem::drop(fleet.list_shares(&share.owner_key));
         std::mem::drop(fleet.update_share(share));
         std::mem::drop(fleet.update_share_if_current(share, share.token_version));
+    }
+
+    #[tokio::test]
+    async fn deleting_vm_revokes_shares_and_fences_stale_publication_when_database_is_configured(
+    ) -> Result<(), FleetError> {
+        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        if database_url.is_empty() {
+            return Ok(());
+        }
+        let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let suffix = Uuid::new_v4();
+        let mut vm = test_vm(suffix, "share-lifetime-test", &format!("tenant-{suffix}"));
+        vm.status = VmStatus::Running;
+        let share = ShareRecord {
+            vm_id: vm.id,
+            revoked_at: None,
+            ..test_share(
+                format!("lifetime-{suffix}"),
+                vm.owner_key.as_deref().unwrap(),
+            )
+        };
+        let late = ShareRecord {
+            id: Uuid::new_v4(),
+            slug: format!("late-{suffix}"),
+            ..share.clone()
+        };
+        let result = async {
+            fleet.upsert_vm(&vm).await?;
+            fleet.insert_share_for_vm(&share, &vm).await?;
+            fleet.delete_vm(&vm).await?;
+            assert!(fleet
+                .get_share(share.id)
+                .await?
+                .unwrap()
+                .revoked_at
+                .is_some());
+            let mut replacement = vm.clone();
+            replacement.created_at += chrono::Duration::seconds(1);
+            fleet.upsert_vm(&replacement).await?;
+            assert!(matches!(
+                fleet.insert_share_for_vm(&late, &vm).await,
+                Err(FleetError::Conflict(_))
+            ));
+            fleet.insert_share_for_vm(&late, &replacement).await?;
+            assert!(matches!(
+                fleet
+                    .update_share_for_vm_if_current(&share, share.token_version, &replacement)
+                    .await,
+                Err(FleetError::Conflict(_))
+            ));
+            fleet.delete_vm(&replacement).await?;
+            assert!(fleet
+                .get_share(late.id)
+                .await?
+                .unwrap()
+                .revoked_at
+                .is_some());
+            Ok::<(), FleetError>(())
+        }
+        .await;
+        let client = fleet.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM fleet_shares WHERE id = $1 OR id = $2",
+                &[&share.id, &late.id],
+            )
+            .await?;
+        client
+            .execute("DELETE FROM fleet_vms WHERE id = $1", &[&vm.id])
+            .await?;
+        result
     }
 
     #[tokio::test]
