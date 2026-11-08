@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/tarit-types", "crates/tarit-vmm-client", "crates/tarit-store", "crates/tarit-fleet", "crates/tarit-volume", "crates/taritd", "crates/tarit-bench"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.95"
 license = "AGPL-3.0-or-later"

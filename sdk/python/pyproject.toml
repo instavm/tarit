@@ -1,6 +1,6 @@
 [project]
 name = "tarit-sdk"
-version = "0.1.2"
+version = "0.2.0"
 description = "A client library for accessing Tarit Orchestrator API"
 authors = []
 requires-python = ">=3.11"

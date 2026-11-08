@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[3]
 class ReleaseMetadataTests(unittest.TestCase):
     def test_repository_versions_match(self) -> None:
         versions = collect_versions(ROOT)
-        self.assertEqual(validate_versions(versions, "v0.1.2"), "0.1.2")
+        self.assertEqual(validate_versions(versions, "v0.2.0"), "0.2.0")
 
     def test_mismatched_component_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "versions disagree"):
