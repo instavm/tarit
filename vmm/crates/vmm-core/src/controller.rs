@@ -5456,7 +5456,9 @@ fn finish_deferred_snapshot(file: &std::fs::File, snapshot: DeferredFullSnapshot
     let base = snapshot.layout.mem_offset;
     let mut buffer = vec![0u8; CHUNK as usize];
     if let Some((base_file, offset, len, expected)) = &snapshot.verify_base {
-        let actual = region_crc(base_file, *offset, *len, &mut buffer)?;
+        let actual = region_crc(base_file, *offset, *len, &mut buffer)
+            .map_err(io)?
+            .crc;
         if actual != *expected {
             return Err(VmmError::Snapshot(format!(
                 "snapshot base memory CRC is {actual:#010x}, its header records {expected:#010x}"
@@ -5486,50 +5488,132 @@ fn finish_deferred_snapshot(file: &std::fs::File, snapshot: DeferredFullSnapshot
         }
     }
     // The memory region is assembled; hash it from the file.
-    let crc = region_crc(file, base, snapshot.layout.mem_len, &mut buffer)?;
+    let crc = region_crc(file, base, snapshot.layout.mem_len, &mut buffer)
+        .map_err(io)?
+        .crc;
     snapshot.layout.finish(file, &snapshot.state_blob, crc)
 }
 
-/// CRC32 of `len` bytes of `file` from `offset`. Holes are zero pages and
-/// fold into the CRC without being read.
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn region_crc(file: &std::fs::File, offset: u64, len: u64, buffer: &mut [u8]) -> Result<u32> {
+/// CRC32 of a file region, and how many of its bytes were read.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegionCrc {
+    crc: u32,
+    /// Bytes read from data extents; the rest of the region is holes.
+    data_bytes: u64,
+}
+
+/// CRC32 of `len` bytes of `file` from `offset`. Holes read as zeros, so they
+/// fold into the CRC without being read and the cost follows the data, not
+/// `len`; the result equals hashing every byte. Holes may start and end at
+/// any byte, and the region past the end of the file counts as one (callers
+/// that need the file to cover the region check its length). Where the
+/// filesystem reports no hole map, every byte is read.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn region_crc(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+    buffer: &mut [u8],
+) -> std::io::Result<RegionCrc> {
     use std::os::unix::fs::FileExt;
 
-    let io = |e: std::io::Error| VmmError::Snapshot(e.to_string());
+    // Reading scattered extents one at a time leaves a cold disk idle between
+    // them, so extents are found and their reads started this far ahead.
+    const READ_AHEAD_BYTES: u64 = 64 * 1024 * 1024;
+
+    let mut ahead = std::collections::VecDeque::new();
+    let mut ahead_bytes = 0u64;
+    let mut scanned = 0u64;
     let mut crc = crc32fast::Hasher::new();
+    let mut data_bytes = 0u64;
     let mut pos = 0u64;
-    while pos < len {
-        let data = seek_data(file, offset + pos)
-            .map_err(io)?
-            .map_or(len, |data| (data - offset).min(len));
-        let zero = data - pos;
-        if !zero.is_multiple_of(4096) {
-            return Err(VmmError::Snapshot(
-                "snapshot hole is not page aligned".into(),
-            ));
+    loop {
+        while scanned < len && ahead_bytes < READ_AHEAD_BYTES {
+            let Some((start, end)) = next_data_extent(file, offset, scanned, len)? else {
+                scanned = len;
+                break;
+            };
+            read_ahead(file, offset + start, (end - start).min(READ_AHEAD_BYTES));
+            ahead.push_back((start, end));
+            ahead_bytes += end - start;
+            scanned = end;
         }
-        combine_zero_pages(&mut crc, (zero / 4096) as usize);
-        if data >= len {
+        let Some((start, end)) = ahead.pop_front() else {
             break;
-        }
-        let hole = (seek_hole(file, offset + data).map_err(io)? - offset).min(len);
-        let mut at = data;
-        while at < hole {
-            let n = ((hole - at) as usize).min(buffer.len());
-            file.read_exact_at(&mut buffer[..n], offset + at)
-                .map_err(io)?;
+        };
+        ahead_bytes -= end - start;
+        combine_zeros(&mut crc, start - pos);
+        let mut at = start;
+        while at < end {
+            let n = ((end - at) as usize).min(buffer.len());
+            file.read_exact_at(&mut buffer[..n], offset + at)?;
             crc.update(&buffer[..n]);
             at += n as u64;
         }
-        pos = hole;
+        data_bytes += end - start;
+        pos = end;
     }
-    Ok(crc.finalize())
+    combine_zeros(&mut crc, len - pos);
+    Ok(RegionCrc {
+        crc: crc.finalize(),
+        data_bytes,
+    })
+}
+
+/// The next data extent of `file[offset..offset + len]` at or after `from`,
+/// relative to `offset`, or `None` when only holes remain. Without a hole map
+/// the rest is one extent; reading it then reports any real I/O error.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn next_data_extent(
+    file: &std::fs::File,
+    offset: u64,
+    from: u64,
+    len: u64,
+) -> std::io::Result<Option<(u64, u64)>> {
+    let start = match seek_data(file, offset + from).unwrap_or(Some(offset + from)) {
+        Some(data) if data - offset < len => data - offset,
+        _ => return Ok(None),
+    };
+    let end = seek_hole(file, offset + start).map_or(len, |hole| (hole - offset).min(len));
+    if end <= start {
+        return Err(std::io::Error::other(
+            "file changed while computing its CRC",
+        ));
+    }
+    Ok(Some((start, end)))
+}
+
+/// Start reading `len` bytes of `file` at `offset` into the page cache
+/// without waiting for them. A hint: failure only costs speed.
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn read_ahead(file: &std::fs::File, offset: u64, len: u64) {
+    use std::os::fd::AsRawFd;
+
+    if let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) {
+        // SAFETY: posix_fadvise on an open fd reads no memory.
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED) };
+    }
 }
 
 /// `lseek(SEEK_DATA)`: the next offset at or after `offset` holding data, or
 /// `None` when only a hole remains.
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn seek_data(file: &std::fs::File, offset: u64) -> std::io::Result<Option<u64>> {
     use std::os::fd::AsRawFd;
     let offset = i64::try_from(offset).map_err(|_| std::io::Error::other("offset overflow"))?;
@@ -5548,7 +5632,10 @@ fn seek_data(file: &std::fs::File, offset: u64) -> std::io::Result<Option<u64>> 
 }
 
 /// `lseek(SEEK_HOLE)`: the next hole (or end of file) at or after `offset`.
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[cfg(any(
+    all(test, target_os = "linux"),
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
 fn seek_hole(file: &std::fs::File, offset: u64) -> std::io::Result<u64> {
     use std::os::fd::AsRawFd;
     let offset = i64::try_from(offset).map_err(|_| std::io::Error::other("offset overflow"))?;
@@ -5622,6 +5709,18 @@ fn write_sparse_at_with_crc(
         file.write_all_at(&data[first..], offset + first as u64)?;
     }
     Ok(crc.finalize())
+}
+
+/// Extend `crc` with `bytes` zero bytes: whole pages from the zero-run CRCs,
+/// then the remainder hashed directly. Zeros commute, so the order is free.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn combine_zeros(crc: &mut crc32fast::Hasher, bytes: u64) {
+    const PAGE: u64 = 4096;
+    combine_zero_pages(crc, (bytes / PAGE) as usize);
+    crc.update(&[0u8; PAGE as usize][..(bytes % PAGE) as usize]);
 }
 
 /// Extend `crc` with `pages` zero pages, using CRCs of power-of-two zero runs.
@@ -6165,33 +6264,6 @@ fn snapshot_file_kind_from_header(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn crc32_file_range(
-    file: &mut std::fs::File,
-    path: &str,
-    offset: u64,
-    len: u64,
-    what: &str,
-) -> Result<u32> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| VmmError::Snapshot(format!("seek {what} in {path}: {e}")))?;
-    let mut hasher = crc32fast::Hasher::new();
-    let mut remaining = len;
-    let mut buf = [0u8; 64 * 1024];
-    while remaining > 0 {
-        let want = usize::try_from(remaining.min(buf.len() as u64))
-            .map_err(|_| VmmError::Snapshot(format!("{what} length too large in {path}")))?;
-        file.read_exact(&mut buf[..want])
-            .map_err(|e| VmmError::Snapshot(format!("read {what} in {path}: {e}")))?;
-        hasher.update(&buf[..want]);
-        remaining -= u64::try_from(want)
-            .map_err(|_| VmmError::Snapshot(format!("{what} length overflow in {path}")))?;
-    }
-    Ok(hasher.finalize())
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn load_authenticated_memory_manifest(
     anchor: &tarit_proto::MemoryIntegrity,
     header: &[u8; FULL_SNAPSHOT_REST_HEADER_LEN],
@@ -6469,14 +6541,7 @@ fn try_lazy_restore_full_snapshot(
             layout.mem_len,
         )?)
     } else {
-        let actual_mem_crc =
-            crc32_file_range(&mut file, path, layout.mem_offset, layout.mem_len, "mem")?;
-        if actual_mem_crc != header.mem_crc {
-            return Err(VmmError::Snapshot(format!(
-                "memory CRC mismatch in {path}: got {actual_mem_crc:#010x}, expected {:#010x}",
-                header.mem_crc
-            )));
-        }
+        verify_ram_crc(&file, path, &layout, header.mem_crc)?;
         None
     };
 
@@ -6637,13 +6702,15 @@ const RAM_VERIFIED_XATTR: &std::ffi::CStr = c"user.tarit.ram-verified";
 
 /// Check a full snapshot's RAM CRC once per file version.
 ///
-/// The first restore of a snapshot verifies the image (through a read-only
-/// mapping, which also warms the page cache for the restore) and records the
+/// The first restore of a snapshot verifies the image (reading only its data
+/// extents, which also warms the page cache for the restore) and records the
 /// file identity, layout and CRC in an xattr. Later restores of the same,
 /// unmodified file skip the scan, which is what keeps restore and fan-out cost
 /// independent of guest RAM size. Changing the file changes its mtime or
 /// inode, and copies to other hosts usually drop the xattr, so both are
-/// re-verified. This is corruption detection; authenticated snapshots use the
+/// re-verified. A restore that cannot write the file (a read-only bind mount
+/// in a jail) cannot record it; `vmm snapshot-verify --record` records it from
+/// outside. This is corruption detection; authenticated snapshots use the
 /// chunk manifest path instead.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn verify_ram_crc_once(
@@ -6671,25 +6738,36 @@ fn verify_ram_crc_once(
         return Ok(());
     }
 
-    let actual = crc32_mapped_range(file, path_display, layout.mem_offset, layout.mem_len)?;
-    if actual != expected_crc {
+    verify_ram_crc(file, path_display, layout, expected_crc)?;
+    // Failure (read-only file, no xattr support) only means the next restore
+    // verifies again.
+    let _ = set_ram_verified(file, &key);
+    Ok(())
+}
+
+/// Check a RAM image against its CRC, reading only its data extents. Returns
+/// how many bytes were read.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn verify_ram_crc(
+    file: &std::fs::File,
+    path_display: &str,
+    layout: &FullSnapshotLayout,
+    expected_crc: u32,
+) -> Result<u64> {
+    let actual = region_crc(
+        file,
+        layout.mem_offset,
+        layout.mem_len,
+        &mut vec![0u8; 1024 * 1024],
+    )
+    .map_err(|e| VmmError::Snapshot(format!("read mem in {path_display}: {e}")))?;
+    if actual.crc != expected_crc {
         return Err(VmmError::Snapshot(format!(
-            "memory CRC mismatch in {path_display}: got {actual:#010x}, expected {expected_crc:#010x}"
+            "memory CRC mismatch in {path_display}: got {:#010x}, expected {expected_crc:#010x}",
+            actual.crc
         )));
     }
-    // SAFETY: valid fd, NUL-terminated name, and a readable value buffer of
-    // the stated length. Failure (read-only file, no xattr support) only
-    // means the next restore verifies again.
-    unsafe {
-        libc::fsetxattr(
-            file.as_raw_fd(),
-            RAM_VERIFIED_XATTR.as_ptr(),
-            key.as_ptr().cast(),
-            key.len(),
-            0,
-        )
-    };
-    Ok(())
+    Ok(actual.data_bytes)
 }
 
 /// Identity of one version of a snapshot file's RAM or page data: device,
@@ -6714,19 +6792,13 @@ fn ram_verified_key(
     ))
 }
 
-/// Record that a snapshot writer produced this exact file version from bytes
-/// it CRC'd itself, so restores (including many concurrent forks of a fresh
-/// snapshot) skip the one-time scan. Call after the last data write. Best
-/// effort: without xattr support the first restore verifies instead.
+/// Set the verified-RAM xattr to `key`.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn record_ram_verified(file: &std::fs::File, offset: u64, len: u64, crc: u32) {
+fn set_ram_verified(file: &std::fs::File, key: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
-    let Ok(key) = ram_verified_key(file, offset, len, crc) else {
-        return;
-    };
     // SAFETY: valid fd, NUL-terminated name, readable value of stated length.
-    unsafe {
+    let rc = unsafe {
         libc::fsetxattr(
             file.as_raw_fd(),
             RAM_VERIFIED_XATTR.as_ptr(),
@@ -6735,56 +6807,119 @@ fn record_ram_verified(file: &std::fs::File, offset: u64, len: u64, crc: u32) {
             0,
         )
     };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
-/// CRC32 of a file range through a read-only mapping, without copying it.
+/// Record that a snapshot writer produced this exact file version from bytes
+/// it CRC'd itself, so restores (including many concurrent forks of a fresh
+/// snapshot) skip the one-time scan. Call after the last data write. Best
+/// effort: without xattr support the first restore verifies instead.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn crc32_mapped_range(
-    file: &std::fs::File,
-    path_display: &str,
-    offset: u64,
-    len: u64,
-) -> Result<u32> {
-    use std::os::fd::AsRawFd;
-
-    if len == 0 {
-        return Ok(crc32fast::hash(&[]));
+fn record_ram_verified(file: &std::fs::File, offset: u64, len: u64, crc: u32) {
+    if let Ok(key) = ram_verified_key(file, offset, len, crc) {
+        let _ = set_ram_verified(file, &key);
     }
-    let map_offset = offset / 4096 * 4096;
-    let delta = usize::try_from(offset - map_offset)
-        .map_err(|_| VmmError::Snapshot("snapshot offset too large".into()))?;
-    let len = usize::try_from(len)
-        .map_err(|_| VmmError::Snapshot(format!("memory image too large in {path_display}")))?;
-    let map_len = len + delta;
-    let map_offset = libc::off_t::try_from(map_offset)
-        .map_err(|_| VmmError::Snapshot("snapshot offset too large".into()))?;
-    // SAFETY: read-only private mapping of a valid fd with a page-aligned
-    // offset; it is only read below and unmapped before returning.
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            map_len,
-            libc::PROT_READ,
-            libc::MAP_PRIVATE,
-            file.as_raw_fd(),
-            map_offset,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
+}
+
+/// What [`verify_full_snapshot`] checked.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotVerification {
+    /// Length of the RAM image.
+    pub mem_len: u64,
+    /// RAM bytes read; the rest of the image is holes, which read as zeros.
+    pub data_bytes: u64,
+    /// Whether the file is now marked verified for restores.
+    pub recorded: bool,
+}
+
+/// Verify a full (VMSN) snapshot file as a restore does: header, state CRC
+/// and RAM CRC. The RAM check reads only the image's data extents.
+///
+/// With `record`, also mark this version of the file verified, under the key
+/// restores check, so a later mapped restore of it skips the RAM scan even
+/// where it cannot write the file (a read-only bind mount in a jail). That
+/// needs write access to the file; failing to record is an error. Nothing is
+/// recorded unless every check passes.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+pub fn verify_full_snapshot(path: &Path, record: bool) -> Result<SnapshotVerification> {
+    use std::io::Read;
+
+    let path_display = path.display().to_string();
+    let mut file = open_snapshot_input(path)?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| VmmError::Snapshot(format!("stat {path_display}: {e}")))?
+        .len();
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)
+        .map_err(|e| VmmError::Snapshot(format!("read magic in {path_display}: {e}")))?;
+    if &magic != b"VMSN" {
         return Err(VmmError::Snapshot(format!(
-            "map {path_display} for CRC: {}",
-            std::io::Error::last_os_error()
+            "{path_display} is not a full (VMSN) snapshot; only full snapshots can be verified"
         )));
     }
-    // SAFETY: `ptr..ptr+map_len` is the live read-only mapping created above.
-    unsafe { libc::madvise(ptr, map_len, libc::MADV_SEQUENTIAL) };
-    // SAFETY: as above; the file length was validated against the layout by
-    // parse_full_snapshot_header, so every byte is backed by the file.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>().add(delta), len) };
-    let crc = crc32fast::hash(bytes);
-    // SAFETY: unmapping exactly the mapping created above.
-    unsafe { libc::munmap(ptr, map_len) };
-    Ok(crc)
+    let (header, _) = read_full_snapshot_state(&mut file, file_len, &path_display)?;
+    let layout = header.layout;
+    if record && !layout.mem_offset.is_multiple_of(4096) {
+        return Err(VmmError::Snapshot(format!(
+            "RAM image in {path_display} is not page aligned, so restores never map it; \
+             nothing to record"
+        )));
+    }
+    // Keyed before the scan: if the file changes meanwhile, its mtime no
+    // longer matches and restores verify it again.
+    let key = ram_verified_key(&file, layout.mem_offset, layout.mem_len, header.mem_crc)
+        .map_err(|e| VmmError::Snapshot(format!("stat {path_display}: {e}")))?;
+    let data_bytes = verify_ram_crc(&file, &path_display, &layout, header.mem_crc)?;
+    if record {
+        set_ram_verified(&file, &key).map_err(|e| {
+            VmmError::Snapshot(format!(
+                "record {} on {path_display}: {e}",
+                RAM_VERIFIED_XATTR.to_string_lossy()
+            ))
+        })?;
+    }
+    Ok(SnapshotVerification {
+        mem_len: layout.mem_len,
+        data_bytes,
+        recorded: record,
+    })
+}
+
+/// Read a full snapshot's header (after its magic) and its state blob, and
+/// check the state CRC.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn read_full_snapshot_state(
+    file: &mut std::fs::File,
+    file_len: u64,
+    path_display: &str,
+) -> Result<(FullSnapshotHeader, Vec<u8>)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut hdr = [0u8; FULL_SNAPSHOT_REST_HEADER_LEN];
+    file.read_exact(&mut hdr)
+        .map_err(|e| VmmError::Snapshot(format!("read header in {path_display}: {e}")))?;
+    let header = parse_full_snapshot_header(&hdr, file_len, path_display)?;
+    let state_len = usize::try_from(header.layout.state_len)
+        .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
+    let mut state = vec![0u8; state_len];
+    file.seek(SeekFrom::Start(header.layout.state_offset))
+        .map_err(|e| VmmError::Snapshot(format!("seek state in {path_display}: {e}")))?;
+    file.read_exact(&mut state)
+        .map_err(|e| VmmError::Snapshot(format!("read state in {path_display}: {e}")))?;
+    let actual_state_crc = crc32fast::hash(&state);
+    if actual_state_crc != header.state_crc {
+        return Err(VmmError::Snapshot(format!(
+            "state CRC mismatch in {path_display}: got {actual_state_crc:#010x}, expected {:#010x}",
+            header.state_crc
+        )));
+    }
+    Ok((header, state))
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -6809,25 +6944,10 @@ fn read_snapshot_with(
     rd(&mut file, &mut magic, "read magic")?;
 
     if &magic == b"VMSN" {
-        let mut hdr = [0u8; FULL_SNAPSHOT_REST_HEADER_LEN];
-        rd(&mut file, &mut hdr, "read header")?;
-        let header = parse_full_snapshot_header(&hdr, file_len, &path_display)?;
+        let (header, state) = read_full_snapshot_state(&mut file, file_len, &path_display)?;
         let layout = header.layout;
-        let state_len = usize::try_from(layout.state_len)
-            .map_err(|_| VmmError::Snapshot("state blob too large".into()))?;
         let mem_len = usize::try_from(layout.mem_len)
             .map_err(|_| VmmError::Snapshot("memory image too large".into()))?;
-        let mut state = vec![0u8; state_len];
-        file.seek(SeekFrom::Start(layout.state_offset))
-            .map_err(|e| VmmError::Snapshot(format!("seek state in {path_display}: {e}")))?;
-        rd(&mut file, &mut state, "read state")?;
-        let actual_state_crc = crc32fast::hash(&state);
-        if actual_state_crc != header.state_crc {
-            return Err(VmmError::Snapshot(format!(
-                "state CRC mismatch in {path_display}: got {actual_state_crc:#010x}, expected {:#010x}",
-                header.state_crc
-            )));
-        }
         if ram_load == RamLoad::Map {
             if !layout.mem_offset.is_multiple_of(4096) {
                 return Err(VmmError::Snapshot(format!(
@@ -6846,19 +6966,7 @@ fn read_snapshot_with(
                 version: header.version,
             });
         }
-        let actual_mem_crc = crc32_file_range(
-            &mut file,
-            &path_display,
-            layout.mem_offset,
-            layout.mem_len,
-            "mem",
-        )?;
-        if actual_mem_crc != header.mem_crc {
-            return Err(VmmError::Snapshot(format!(
-                "memory CRC mismatch in {path_display}: got {actual_mem_crc:#010x}, expected {:#010x}",
-                header.mem_crc
-            )));
-        }
+        verify_ram_crc(&file, &path_display, &layout, header.mem_crc)?;
         let mem = allocate_snapshot_memory(layout.mem_len, &state)?;
         let mem_slice: &mut [u8] = {
             // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
@@ -9506,6 +9614,257 @@ mod tests {
         header[6] = 1;
         std::fs::write(truncated.path(), &header).unwrap();
         assert!(full_snapshot_identity(truncated.path()).is_none());
+    }
+
+    #[test]
+    fn zero_runs_fold_into_a_crc_as_if_hashed() {
+        let mut prefix = vec![0u8; 4097];
+        for (index, byte) in prefix.iter_mut().enumerate() {
+            *byte = (index % 251) as u8 + 1;
+        }
+        for prefix_len in [0, 1, 3, 4096, 4097] {
+            for zeros in [
+                0u64,
+                1,
+                7,
+                4095,
+                4096,
+                4097,
+                8191,
+                3 * 4096 + 17,
+                (1 << 20) + 3,
+                5 << 20,
+            ] {
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(&prefix[..prefix_len]);
+                combine_zeros(&mut crc, zeros);
+                crc.update(b"tail");
+                let mut bytes = prefix[..prefix_len].to_vec();
+                bytes.resize(prefix_len + zeros as usize, 0);
+                bytes.extend_from_slice(b"tail");
+                assert_eq!(
+                    crc.finalize(),
+                    crc32fast::hash(&bytes),
+                    "{prefix_len}-byte prefix, {zeros} zeros"
+                );
+            }
+        }
+    }
+
+    /// `region_crc` of every window equals hashing the bytes read back.
+    #[cfg(target_os = "linux")]
+    fn assert_region_crcs_match_reads(file: &std::fs::File, windows: &[(u64, u64)]) {
+        let bytes = {
+            let mut bytes = vec![0u8; file.metadata().unwrap().len() as usize];
+            std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0).unwrap();
+            bytes
+        };
+        for &(offset, len) in windows {
+            let expected = crc32fast::hash(&bytes[offset as usize..][..len as usize]);
+            // A small buffer splits data extents across reads.
+            for buffer_len in [1000, 1 << 20] {
+                let region = region_crc(file, offset, len, &mut vec![0u8; buffer_len]).unwrap();
+                assert_eq!(
+                    region.crc, expected,
+                    "window {offset}+{len}, {buffer_len}-byte buffer"
+                );
+                assert!(region.data_bytes <= len, "window {offset}+{len}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn region_crc_of_a_sparse_file_reads_only_data_and_equals_a_full_read() {
+        use std::os::unix::fs::FileExt;
+
+        const LEN: u64 = 64 * 4096 + 1000;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(LEN).unwrap();
+        // A hole first; data mid-page, over whole pages, across a page
+        // boundary and in the last bytes of the file.
+        file.write_all_at(&[0x11; 100], 5000).unwrap();
+        file.write_all_at(&[0x22; 2 * 4096], 8 * 4096).unwrap();
+        file.write_all_at(&[0x33; 6], 20 * 4096 - 3).unwrap();
+        file.write_all_at(&[0x44; 7], LEN - 7).unwrap();
+
+        let whole = region_crc(&file, 0, LEN, &mut vec![0u8; 1 << 20]).unwrap();
+        assert!(
+            whole.data_bytes <= 8 * 4096,
+            "holes must not be read: read {} of {LEN} bytes",
+            whole.data_bytes
+        );
+        assert_region_crcs_match_reads(
+            &file,
+            &[
+                (0, LEN),
+                (1, LEN - 1),
+                (4095, 10_000),
+                (4097, 9 * 4096),
+                (5050, 40),
+                (10 * 4096, 5 * 4096),
+                (11 * 4096 + 5, 3000),
+                (20 * 4096 - 1, 2),
+                (LEN - 100, 100),
+                (LEN - 7, 7),
+                (LEN - 3, 0),
+                (0, 0),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn region_crc_of_fully_sparse_and_fully_written_files() {
+        use std::os::unix::fs::FileExt;
+
+        let len = 3 * 1024 * 1024 + 5;
+        let sparse = tempfile::tempfile().unwrap();
+        sparse.set_len(len).unwrap();
+        let region = region_crc(&sparse, 0, len, &mut vec![0u8; 1 << 20]).unwrap();
+        assert_eq!(region.crc, crc32fast::hash(&vec![0u8; len as usize]));
+        assert_eq!(region.data_bytes, 0, "a hole is not read");
+        assert_region_crcs_match_reads(&sparse, &[(0, len), (4097, len - 4097), (7, 4096)]);
+
+        let mut bytes = vec![0u8; 3 * 4096 + 77];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index % 253) as u8;
+        }
+        let dense = tempfile::tempfile().unwrap();
+        dense.write_all_at(&bytes, 0).unwrap();
+        let region = region_crc(&dense, 0, bytes.len() as u64, &mut vec![0u8; 1000]).unwrap();
+        assert_eq!(region.crc, crc32fast::hash(&bytes));
+        assert_eq!(region.data_bytes, bytes.len() as u64);
+        assert_region_crcs_match_reads(&dense, &[(1, 5000), (4096, 4096 + 77)]);
+
+        // Past the end of the file counts as a hole: the snapshot writer
+        // hashes trailing zero pages before it extends the file over them.
+        let mut padded = bytes.clone();
+        padded.resize(bytes.len() + 9000, 0);
+        let region = region_crc(&dense, 0, padded.len() as u64, &mut vec![0u8; 4096]).unwrap();
+        assert_eq!(region.crc, crc32fast::hash(&padded));
+    }
+
+    /// The verified-RAM xattr of `path`, if set.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn ram_verified_xattr(path: &Path) -> Option<Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut value = [0u8; 160];
+        // SAFETY: NUL-terminated path and name, and a writable buffer of the
+        // stated length.
+        let n = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                RAM_VERIFIED_XATTR.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        (n >= 0).then(|| value[..n as usize].to_vec())
+    }
+
+    /// A sparse 2 MiB-RAM full snapshot with no verified-RAM xattr, and its
+    /// header.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn unverified_full_snapshot() -> (tempfile::NamedTempFile, FullSnapshotHeader) {
+        use std::io::Read;
+
+        let mut mem = vec![0u8; 2 << 20];
+        mem[5 * 4096..7 * 4096].fill(0x5a);
+        mem[300 * 4096 + 17] = 1;
+        let snapshot = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(snapshot.path(), b"verify-state", &mem);
+        let path = std::ffi::CString::new(snapshot.path().to_str().unwrap()).unwrap();
+        // SAFETY: NUL-terminated path and name.
+        unsafe { libc::removexattr(path.as_ptr(), RAM_VERIFIED_XATTR.as_ptr()) };
+        assert_eq!(ram_verified_xattr(snapshot.path()), None);
+
+        let mut file = open_snapshot_input(snapshot.path()).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        file.read_exact(&mut [0u8; 4]).unwrap();
+        let (header, _) = read_full_snapshot_state(&mut file, file_len, "test").unwrap();
+        (snapshot, header)
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_verify_records_the_key_restores_honour() {
+        use std::os::unix::fs::FileExt;
+
+        let (snapshot, header) = unverified_full_snapshot();
+        let layout = header.layout;
+        let checked = verify_full_snapshot(snapshot.path(), false).unwrap();
+        assert_eq!(checked.mem_len, 2 << 20);
+        assert!(!checked.recorded);
+        assert!(
+            checked.data_bytes < layout.mem_len / 4,
+            "RAM holes must not be read: read {} bytes",
+            checked.data_bytes
+        );
+        assert_eq!(ram_verified_xattr(snapshot.path()), None, "not recorded");
+
+        let recorded = verify_full_snapshot(snapshot.path(), true).unwrap();
+        assert!(recorded.recorded);
+        let file = open_snapshot_input(snapshot.path()).unwrap();
+        let key =
+            ram_verified_key(&file, layout.mem_offset, layout.mem_len, header.mem_crc).unwrap();
+        assert_eq!(
+            ram_verified_xattr(snapshot.path()).as_deref(),
+            Some(key.as_bytes())
+        );
+
+        // Corrupt a RAM byte but keep the file's identity (inode, size,
+        // mtime). A restore trusts the record and skips the scan; that is
+        // how it skips scanning a snapshot it may only read.
+        let modified = file.metadata().unwrap().modified().unwrap();
+        snapshot
+            .as_file()
+            .write_all_at(&[0xff], layout.mem_offset + 5 * 4096)
+            .unwrap();
+        snapshot
+            .as_file()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        verify_ram_crc_once(&file, "test", &layout, header.mem_crc)
+            .expect("a recorded file version skips the scan");
+        // snapshot-verify always scans.
+        let error = verify_full_snapshot(snapshot.path(), false).unwrap_err();
+        assert!(error.to_string().contains("memory CRC mismatch"), "{error}");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn snapshot_verify_rejects_damage_and_records_nothing() {
+        use std::os::unix::fs::FileExt;
+
+        let (snapshot, header) = unverified_full_snapshot();
+        snapshot
+            .as_file()
+            .write_all_at(&[0xff], header.layout.mem_offset + 300 * 4096)
+            .unwrap();
+        let error = verify_full_snapshot(snapshot.path(), true).unwrap_err();
+        assert!(error.to_string().contains("memory CRC mismatch"), "{error}");
+        assert_eq!(ram_verified_xattr(snapshot.path()), None);
+
+        let (snapshot, header) = unverified_full_snapshot();
+        snapshot
+            .as_file()
+            .write_all_at(b"X", header.layout.state_offset)
+            .unwrap();
+        let error = verify_full_snapshot(snapshot.path(), true).unwrap_err();
+        assert!(error.to_string().contains("state CRC mismatch"), "{error}");
+        assert_eq!(ram_verified_xattr(snapshot.path()), None);
+
+        let diff = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(diff.path(), b"VMSD\x02\x00").unwrap();
+        let error = verify_full_snapshot(diff.path(), true).unwrap_err();
+        assert!(
+            error.to_string().contains("not a full (VMSN) snapshot"),
+            "{error}"
+        );
+        assert_eq!(ram_verified_xattr(diff.path()), None);
     }
 
     #[test]
