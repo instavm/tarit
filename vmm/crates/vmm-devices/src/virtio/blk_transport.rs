@@ -379,13 +379,15 @@ impl VirtioBlkMmio {
     /// else, and the guest would wait for it forever. The guest reads the
     /// status before acting, so a repeated interrupt is harmless.
     pub fn reassert_pending_interrupt(&self) {
-        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
-            return;
-        }
         #[cfg(target_os = "linux")]
-        if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
-            if let Some(evt) = guard.as_ref() {
-                let _ = evt.write(1);
+        {
+            if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
+                if let Some(evt) = guard.as_ref() {
+                    let _ = evt.write(1);
+                }
             }
         }
     }
@@ -434,26 +436,37 @@ impl VirtioBlkMmio {
         )
     }
 
-    fn read_descs(mem: &GuestMemoryMmap, descs: &[(u64, u32)]) -> Option<Vec<u8>> {
-        let total_len = descs
-            .iter()
-            .try_fold(0usize, |acc, (_, len)| acc.checked_add(*len as usize))?;
-        let mut data = Vec::with_capacity(total_len);
+    /// Copy only the fixed header, even if the guest combines it with a
+    /// multi-megabyte data buffer or splits it across readable descriptors.
+    fn read_header(mem: &GuestMemoryMmap, descs: &[(u64, u32)]) -> Option<BlkReqHeader> {
+        let mut header = [0u8; BlkReqHeader::SIZE];
+        let mut copied = 0;
         for &(addr, len) in descs {
-            if len == 0 {
+            let take = (len as usize).min(header.len() - copied);
+            if take == 0 {
                 continue;
             }
-            let off = data.len();
-            let end = off.checked_add(len as usize)?;
-            data.resize(end, 0);
-            if mem
-                .read_slice(&mut data[off..end], GuestAddress(addr))
-                .is_err()
-            {
-                return None;
+            mem.read_slice(&mut header[copied..copied + take], GuestAddress(addr))
+                .ok()?;
+            copied += take;
+            if copied == header.len() {
+                return BlkReqHeader::from_bytes(&header);
             }
         }
-        Some(data)
+        None
+    }
+
+    /// The bounded descriptor metadata for an OUT payload, excluding its header.
+    fn readable_data(descs: &[(u64, u32)]) -> Vec<(u64, u32)> {
+        let mut skip = BlkReqHeader::SIZE as u32;
+        descs
+            .iter()
+            .filter_map(|&(addr, len)| {
+                let skipped = skip.min(len);
+                skip -= skipped;
+                (len > skipped).then_some((addr + u64::from(skipped), len - skipped))
+            })
+            .collect()
     }
 
     fn writable_data_len(writable: &[(u64, u32)]) -> Option<usize> {
@@ -509,25 +522,28 @@ impl VirtioBlkMmio {
         cursor
     }
 
-    /// Read a request's data straight into its guest buffers (every
-    /// writable descriptor but the trailing status byte). `None` when a
-    /// buffer is not plain guest memory; the caller then reads through a
-    /// bounce buffer.
-    fn read_into_guest(
+    /// Transfer data directly between validated guest ranges and the backend.
+    /// Vector metadata is bounded by the queue's descriptor count times the
+    /// trusted memory-region count; payload bytes are never allocated or copied.
+    fn service_guest_data(
         mem: &GuestMemoryMmap,
         dirty: Option<&SoftwareDirtyBitmap>,
         backend: &mut BlkBackend,
         header: &BlkReqHeader,
-        writable: &[(u64, u32)],
+        data: &[(u64, u32)],
+        write: bool,
     ) -> Option<u8> {
         use vm_memory::GuestMemoryBackend;
 
-        let data = &writable[..writable.len().saturating_sub(1)];
+        let max_iov = data.len().checked_mul(mem.num_regions())?;
         let mut guards = Vec::with_capacity(data.len());
         let mut iov = Vec::with_capacity(data.len());
         for &(addr, len) in data {
             for slice in mem.get_slices(GuestAddress(addr), len as usize) {
                 let slice = slice.ok()?;
+                if iov.len() == max_iov {
+                    return None;
+                }
                 let guard = slice.ptr_guard_mut();
                 iov.push(libc::iovec {
                     iov_base: guard.as_ptr().cast(),
@@ -536,14 +552,22 @@ impl VirtioBlkMmio {
                 guards.push(guard);
             }
         }
-        // SAFETY: each iovec is guest RAM from `mem`, which outlives the call,
-        // guarded by `guards`; the VMM does not otherwise touch a request's
-        // buffers until it is completed.
-        let st = unsafe { backend.service_read_into(header, &iov) };
+        // SAFETY: these raw pointers cover validated guest RAM from `mem`,
+        // kept mapped by the guards. No Rust references to guest data are
+        // created; the backend completes I/O before the used ring is published.
+        let st = unsafe {
+            if write {
+                backend.service_write_from(header, &iov)
+            } else {
+                backend.service_read_into(header, &iov)
+            }
+        };
         drop(guards);
-        if let Some(dirty) = dirty {
-            for &(addr, len) in data {
-                dirty.mark_guest_range(addr, u64::from(len));
+        if !write {
+            if let Some(dirty) = dirty {
+                for &(addr, len) in data {
+                    dirty.mark_guest_range(addr, u64::from(len));
+                }
             }
         }
         Some(st)
@@ -639,10 +663,32 @@ impl VirtioBlkMmio {
             dirty.as_ref(),
             |chain| {
                 let (readable, writable) = (chain.readable, chain.writable);
-                if chain.over_limit {
-                    // Restored drivers may predate SIZE_MAX negotiation.
-                    // Complete their oversized I/O without reading/allocating
-                    // its payload so the request cannot hang indefinitely.
+                let header = Self::read_header(&mem, readable);
+                let readable_len = readable
+                    .iter()
+                    .try_fold(0usize, |total, (_, len)| total.checked_add(*len as usize));
+                let request_bytes = header
+                    .as_ref()
+                    .and_then(|header| Self::request_bytes(header, readable_len?, writable));
+                let negotiated_size_max =
+                    self.guest_features_low.load(Ordering::Relaxed) & VIRTIO_BLK_F_SIZE_MAX != 0;
+                let invalid_size = negotiated_size_max
+                    && readable
+                        .iter()
+                        .chain(writable)
+                        .any(|&(_, len)| len > crate::virtio::vqueue::MAX_DESC_LEN);
+                let streamable = header
+                    .as_ref()
+                    .is_some_and(|header| matches!(header.req_type, req_type::IN | req_type::OUT));
+                let invalid_used_len = header
+                    .as_ref()
+                    .is_some_and(|header| header.req_type == req_type::IN)
+                    && request_bytes.is_some_and(|len| len >= u64::from(u32::MAX));
+                if request_bytes.is_none()
+                    || invalid_size
+                    || invalid_used_len
+                    || (chain.over_limit && !streamable)
+                {
                     match self.rate_limit_allows(0) {
                         Ok(true) => {}
                         Ok(false) => return None,
@@ -658,80 +704,8 @@ impl VirtioBlkMmio {
                         status::IO_ERR,
                     ));
                 }
-                let used_len = (readable.len() + writable.len()) as u32;
-                let readable = match Self::read_descs(&mem, readable) {
-                    Some(data) => data,
-                    None => {
-                        match self.rate_limit_allows(0) {
-                            Ok(true) => {}
-                            Ok(false) => return None,
-                            Err(_) => {
-                                processing_failed = true;
-                                return None;
-                            }
-                        }
-                        Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
-                        return Some(used_len);
-                    }
-                };
-
-                // Parse the virtio-blk request header from the first readable descriptor.
-                if readable.len() < 16 {
-                    match self.rate_limit_allows(0) {
-                        Ok(true) => {}
-                        Ok(false) => return None,
-                        Err(_) => {
-                            processing_failed = true;
-                            return None;
-                        }
-                    }
-                    Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
-                    return Some(used_len);
-                }
-
-                let header = match BlkReqHeader::from_bytes(&readable[..16]) {
-                    Some(h) => {
-                        log::debug!(
-                            "handler: req_type={} sector={} readable.len()={}",
-                            h.req_type,
-                            h.sector,
-                            readable.len()
-                        );
-                        h
-                    }
-                    None => {
-                        log::warn!(
-                            "handler: failed to parse header, readable.len()={}",
-                            readable.len()
-                        );
-                        match self.rate_limit_allows(0) {
-                            Ok(true) => {}
-                            Ok(false) => return None,
-                            Err(_) => {
-                                processing_failed = true;
-                                return None;
-                            }
-                        }
-                        Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
-                        return Some(used_len);
-                    }
-                };
-
-                let request_bytes = match Self::request_bytes(&header, readable.len(), writable) {
-                    Some(bytes) => bytes,
-                    None => {
-                        match self.rate_limit_allows(0) {
-                            Ok(true) => {}
-                            Ok(false) => return None,
-                            Err(_) => {
-                                processing_failed = true;
-                                return None;
-                            }
-                        }
-                        Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
-                        return Some(used_len);
-                    }
-                };
+                let header = header.unwrap();
+                let request_bytes = request_bytes.unwrap();
                 match self.rate_limit_allows(request_bytes) {
                     Ok(true) => {}
                     Ok(false) => return None,
@@ -744,43 +718,53 @@ impl VirtioBlkMmio {
                 // For IN (read): the writable buffer is the data buffer + status byte.
                 // For OUT (write): the readable data after the header is the data.
                 // For FLUSH: no data, just status.
+                let mut data_written = 0;
                 let st = match header.req_type {
                     req_type::IN => {
-                        let Some(data_len) = Self::writable_data_len(writable) else {
-                            Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR);
-                            return Some(used_len);
-                        };
-                        if data_len == 0 {
+                        if request_bytes == 0 {
                             status::IO_ERR
-                        } else if let Some(st) =
-                            Self::read_into_guest(&mem, dirty.as_ref(), backend, &header, writable)
-                        {
-                            st
                         } else {
-                            let mut data = vec![0u8; data_len];
-                            let st = backend.service(&header, &mut data);
-                            log::debug!("IN: service returned status={st}");
-                            Self::write_writable_data(&mem, dirty.as_ref(), writable, &data);
+                            let data = &writable[..writable.len().saturating_sub(1)];
+                            let st = Self::service_guest_data(
+                                &mem,
+                                dirty.as_ref(),
+                                backend,
+                                &header,
+                                data,
+                                false,
+                            )
+                            .unwrap_or(status::IO_ERR);
+                            if st == status::OK {
+                                data_written = request_bytes as u32;
+                            }
                             st
                         }
                     }
                     req_type::OUT => {
-                        let data = &readable[16..];
-                        let mut data_mut = data.to_vec();
-                        backend.service(&header, &mut data_mut)
+                        let data = Self::readable_data(readable);
+                        Self::service_guest_data(
+                            &mem,
+                            dirty.as_ref(),
+                            backend,
+                            &header,
+                            &data,
+                            true,
+                        )
+                        .unwrap_or(status::IO_ERR)
                     }
                     req_type::FLUSH => backend.service(&header, &mut []),
                     req_type::GET_ID => {
                         let mut id_buf = [0u8; 20];
                         let st = backend.service(&header, &mut id_buf);
-                        Self::write_writable_data(&mem, dirty.as_ref(), writable, &id_buf);
+                        data_written =
+                            Self::write_writable_data(&mem, dirty.as_ref(), writable, &id_buf)
+                                as u32;
                         st
                     }
                     _ => status::UNSUPP,
                 };
 
-                Self::write_status(&mem, dirty.as_ref(), writable, st);
-                Some(used_len)
+                Some(data_written + Self::write_status(&mem, dirty.as_ref(), writable, st))
             },
         );
 
@@ -1454,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_legacy_large_io_completes_without_touching_payloads() {
+    fn restored_legacy_large_io_transfers_payload_and_charges_full_request() {
         use crate::virtio::vqueue::{UsedElem, MAX_DESC_LEN};
 
         const DATA: u64 = 0x20_0000;
@@ -1463,7 +1447,19 @@ mod tests {
         for (segments, segment_len) in [(1u16, 1_220_608u32), (4, MAX_DESC_LEN)] {
             for request in [req_type::IN, req_type::OUT] {
                 for event_idx in [false, true] {
-                    let (backend, path) = new_test_backend("blk-legacy-large-io");
+                    let payload_len = segments as usize * segment_len as usize;
+                    let expected: Vec<u8> = (0..payload_len).map(|i| (i / 4096) as u8).collect();
+                    let (_, path) = new_test_backend("blk-legacy-large-io");
+                    std::fs::write(
+                        &path,
+                        if request == req_type::IN {
+                            expected.clone()
+                        } else {
+                            vec![0x33; payload_len]
+                        },
+                    )
+                    .unwrap();
+                    let backend = BlkBackend::open(&path, false).unwrap();
                     let mem = Arc::new(
                         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8 * 1024 * 1024)])
                             .unwrap(),
@@ -1497,7 +1493,11 @@ mod tests {
                     let dirty = SoftwareDirtyBitmap::new();
                     restored.set_guest_dirty_tracker(dirty.clone());
                     let clock = Arc::new(ManualClock::new(0));
-                    restored.set_rate_limiter(RateLimiter::new_with_clock(1, 4096, clock.clone()));
+                    restored.set_rate_limiter(RateLimiter::new_with_clock(
+                        1,
+                        payload_len as u64 / 2,
+                        clock.clone(),
+                    ));
 
                     mem.write_obj(
                         BlkReqHeader {
@@ -1508,7 +1508,11 @@ mod tests {
                         GuestAddress(TEST_HEADER_BASE),
                     )
                     .unwrap();
-                    let data = vec![0x5a; segments as usize * segment_len as usize];
+                    let data = if request == req_type::OUT {
+                        expected.clone()
+                    } else {
+                        vec![0x5a; payload_len]
+                    };
                     mem.write_slice(&data, GuestAddress(DATA)).unwrap();
                     let mut descriptors = vec![Descriptor {
                         addr: TEST_HEADER_BASE,
@@ -1546,28 +1550,47 @@ mod tests {
                     mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 4)).unwrap();
 
                     restored.process_queue(0).unwrap();
-                    assert_eq!(used_idx(&mem), 1, "oversized I/O must complete");
+                    assert_eq!(used_idx(&mem), 1, "legacy I/O must complete");
                     assert_eq!(
                         mem.read_obj::<u8>(GuestAddress(TEST_STATUS_BASE)).unwrap(),
-                        status::IO_ERR
+                        status::OK
                     );
                     let used: UsedElem = mem.read_obj(GuestAddress(TEST_USED + 4)).unwrap();
-                    assert_eq!((used.id, used.len), (0, 1));
+                    assert_eq!(
+                        (used.id, used.len),
+                        (
+                            0,
+                            if request == req_type::IN {
+                                payload_len as u32 + 1
+                            } else {
+                                1
+                            }
+                        )
+                    );
                     assert_ne!(restored.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(), 0);
-                    let mut after = vec![0; data.len()];
+                    let mut after = vec![0; payload_len];
                     mem.read_slice(&mut after, GuestAddress(DATA)).unwrap();
-                    assert_eq!(after, data, "error completion must not change payloads");
+                    assert_eq!(
+                        after, expected,
+                        "guest payload must match the completed I/O"
+                    );
+                    assert_eq!(std::fs::read(&path).unwrap(), expected, "disk payload");
                     let changed = dirty.drain();
                     assert!(changed.contains(TEST_STATUS_BASE));
                     assert!(changed.contains(TEST_USED));
-                    assert!(!changed.contains(DATA));
+                    assert_eq!(changed.contains(DATA), request == req_type::IN);
+                    assert_eq!(
+                        changed.contains(DATA + payload_len as u64 - 1),
+                        request == req_type::IN
+                    );
                     if event_idx {
                         let avail_event = TEST_USED + 4 + u64::from(TEST_QUEUE_SIZE) * 8;
                         assert_eq!(mem.read_obj::<u16>(GuestAddress(avail_event)).unwrap(), 1);
                     }
 
-                    // Error completions still consume an IOPS token, and a
-                    // subsequent ordinary request must progress after refill.
+                    // A request larger than the bucket borrows its full byte
+                    // cost. One second restores the IOPS token, but leaves
+                    // no bytes for the next request; two seconds permit it.
                     setup_blk_out_requests(&mem, 1);
                     mem.write_obj(2u16, GuestAddress(TEST_AVAIL + 2)).unwrap();
                     mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 6)).unwrap();
@@ -1584,6 +1607,19 @@ mod tests {
                     );
                     clock.advance(1_000_000_000);
                     restored.process_queue(0).unwrap();
+                    assert_eq!(
+                        restored
+                            .processor
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .used_idx(),
+                        1,
+                        "refilled IOPS must not bypass the large request's byte debt"
+                    );
+                    clock.advance(1_000_000_000);
+                    restored.process_queue(0).unwrap();
                     assert_eq!(used_idx(&mem), 2);
                     assert_eq!(
                         mem.read_obj::<u8>(GuestAddress(TEST_STATUS_BASE)).unwrap(),
@@ -1593,6 +1629,94 @@ mod tests {
                     std::fs::remove_file(path).unwrap();
                 }
             }
+        }
+    }
+
+    #[test]
+    fn split_header_large_write_honors_negotiated_size_max() {
+        const DATA: u64 = 0x20_0000;
+        let payload = vec![0xa7; 1_220_608];
+        for negotiated in [false, true] {
+            let mut disk = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut disk, &vec![0x11; payload.len()]).unwrap();
+            let backend = BlkBackend::open(disk.path(), false).unwrap();
+            let dev = VirtioBlkMmio::new(5, backend);
+            let mem = Arc::new(
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap(),
+            );
+            configure_test_blk_queue(&dev, mem.clone());
+            dev.mmio_write(
+                reg::GUEST_FEATURES,
+                if negotiated {
+                    u64::from(VIRTIO_BLK_F_SIZE_MAX)
+                } else {
+                    0
+                },
+                4,
+            )
+            .unwrap();
+            mem.write_obj(
+                BlkReqHeader {
+                    req_type: req_type::OUT,
+                    reserved: 0,
+                    sector: 0,
+                },
+                GuestAddress(TEST_HEADER_BASE),
+            )
+            .unwrap();
+            // Split the header in two; its second half shares the large
+            // payload descriptor. Only those eight bytes may be copied.
+            mem.write_obj(0u64, GuestAddress(DATA - 8)).unwrap();
+            mem.write_slice(&payload, GuestAddress(DATA)).unwrap();
+            for (i, descriptor) in [
+                Descriptor {
+                    addr: TEST_HEADER_BASE,
+                    len: 8,
+                    flags: desc_flags::NEXT,
+                    next: 1,
+                },
+                Descriptor {
+                    addr: DATA - 8,
+                    len: payload.len() as u32 + 8,
+                    flags: desc_flags::NEXT,
+                    next: 2,
+                },
+                Descriptor {
+                    addr: TEST_STATUS_BASE,
+                    len: 1,
+                    flags: desc_flags::WRITE,
+                    next: 0,
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                mem.write_obj(*descriptor, GuestAddress(TEST_DESC + i as u64 * 16))
+                    .unwrap();
+            }
+            mem.write_obj(0xffu8, GuestAddress(TEST_STATUS_BASE))
+                .unwrap();
+            mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(TEST_AVAIL))
+                .unwrap();
+            mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 4)).unwrap();
+            dev.process_queue(0).unwrap();
+            assert_eq!(used_idx(&mem), 1);
+            assert_eq!(
+                mem.read_obj::<u8>(GuestAddress(TEST_STATUS_BASE)).unwrap(),
+                if negotiated {
+                    status::IO_ERR
+                } else {
+                    status::OK
+                }
+            );
+            assert_eq!(
+                std::fs::read(disk.path()).unwrap(),
+                if negotiated {
+                    vec![0x11; payload.len()]
+                } else {
+                    payload.clone()
+                }
+            );
         }
     }
 
