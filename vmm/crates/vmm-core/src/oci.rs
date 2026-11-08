@@ -325,6 +325,12 @@ fn engine_image_source(reference: &str) -> Option<(&'static str, &str)> {
         .map(|name| ("podman", name))
 }
 
+// Darwin's mode_t is u16, while Linux uses u32; exported ext4 modes are u32.
+#[allow(clippy::useless_conversion)]
+fn image_mode(mode: libc::mode_t) -> u32 {
+    u32::from(mode)
+}
+
 /// Owner, mode and type of one exported entry, applied to the ext4 image when
 /// the build runs without root and could not preserve them while unpacking.
 struct EntryMeta {
@@ -334,6 +340,8 @@ struct EntryMeta {
     mode: u32,
     /// Device numbers for character and block devices.
     device: Option<(u32, u32)>,
+    /// Hardlink headers name an existing inode; its original entry owns the metadata.
+    hardlink: bool,
 }
 
 /// Build an ext4 image from an image a local container engine can export.
@@ -521,8 +529,9 @@ fn unpack_export<R: Read>(
         let meta = EntryMeta {
             uid: entry.header().uid()?,
             gid: entry.header().gid()?,
-            mode: type_bits | mode,
+            mode: image_mode(type_bits) | mode,
             device,
+            hardlink: kind == tar::EntryType::Link,
         };
         let special = matches!(
             kind,
@@ -545,9 +554,9 @@ fn unpack_export<R: Read>(
             };
             std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(usable))?;
         }
-        if kind != tar::EntryType::Link {
-            metadata.insert(relative, meta);
-        }
+        // Keep hardlink paths too, so the ownership pass does not mistake
+        // them for files added by the build and reset their shared inode.
+        metadata.insert(relative, meta);
     }
     Ok(metadata)
 }
@@ -561,6 +570,39 @@ fn restore_image_ownership(
     image: &Path,
     workspace: &Path,
 ) -> Result<(), OciError> {
+    let script = image_ownership_script(rootfs, metadata)?;
+    let script_path = workspace.join("ownership.debugfs");
+    std::fs::write(&script_path, script)?;
+    let mut debugfs = Command::new("debugfs");
+    debugfs.arg("-w").arg("-f").arg(&script_path).arg(image);
+    let output = debugfs.output().map_err(|e| OciError::CommandFailed {
+        cmd: "debugfs".into(),
+        stderr: e.to_string(),
+    })?;
+    // debugfs reports per-command failures on stderr but still exits 0.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let failures: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.starts_with("debugfs ") && !line.trim().is_empty())
+        .collect();
+    if !output.status.success() || !failures.is_empty() {
+        return Err(OciError::CommandFailed {
+            cmd: "debugfs ownership fix-up".into(),
+            stderr: failures
+                .iter()
+                .take(5)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("; "),
+        });
+    }
+    Ok(())
+}
+
+fn image_ownership_script(
+    rootfs: &Path,
+    metadata: &HashMap<PathBuf, EntryMeta>,
+) -> Result<String, OciError> {
     use std::fmt::Write as _;
     use std::os::unix::fs::MetadataExt;
 
@@ -571,6 +613,9 @@ fn restore_image_ownership(
     let mut script = String::from("sif / uid 0\nsif / gid 0\n");
     let mut skipped = 0usize;
     for (path, meta) in metadata {
+        if meta.hardlink {
+            continue;
+        }
         let Some(name) = quoted(path) else {
             skipped += 1;
             continue;
@@ -579,21 +624,21 @@ fn restore_image_ownership(
             let _ = writeln!(script, "sif / mode 0{:o}", meta.mode);
             continue;
         }
-        match (meta.mode & libc::S_IFMT, meta.device) {
-            (libc::S_IFCHR, Some((major, minor))) => {
+        match (meta.mode & image_mode(libc::S_IFMT), meta.device) {
+            (kind, Some((major, minor))) if kind == image_mode(libc::S_IFCHR) => {
                 let _ = writeln!(script, "mknod {name} c {major} {minor}");
             }
-            (libc::S_IFBLK, Some((major, minor))) => {
+            (kind, Some((major, minor))) if kind == image_mode(libc::S_IFBLK) => {
                 let _ = writeln!(script, "mknod {name} b {major} {minor}");
             }
-            (libc::S_IFIFO, _) => {
+            (kind, _) if kind == image_mode(libc::S_IFIFO) => {
                 let _ = writeln!(script, "mknod {name} p");
             }
             _ => {}
         }
         let _ = writeln!(script, "sif {name} uid {}", meta.uid);
         let _ = writeln!(script, "sif {name} gid {}", meta.gid);
-        if meta.mode & libc::S_IFMT != libc::S_IFLNK {
+        if meta.mode & image_mode(libc::S_IFMT) != image_mode(libc::S_IFLNK) {
             let _ = writeln!(script, "sif {name} mode 0{:o}", meta.mode);
         }
     }
@@ -624,32 +669,7 @@ fn restore_image_ownership(
     if skipped > 0 {
         log::warn!("oci: {skipped} paths with quotes or newlines keep the build user's owner");
     }
-    let script_path = workspace.join("ownership.debugfs");
-    std::fs::write(&script_path, script)?;
-    let mut debugfs = Command::new("debugfs");
-    debugfs.arg("-w").arg("-f").arg(&script_path).arg(image);
-    let output = debugfs.output().map_err(|e| OciError::CommandFailed {
-        cmd: "debugfs".into(),
-        stderr: e.to_string(),
-    })?;
-    // debugfs reports per-command failures on stderr but still exits 0.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let failures: Vec<&str> = stderr
-        .lines()
-        .filter(|line| !line.starts_with("debugfs ") && !line.trim().is_empty())
-        .collect();
-    if !output.status.success() || !failures.is_empty() {
-        return Err(OciError::CommandFailed {
-            cmd: "debugfs ownership fix-up".into(),
-            stderr: failures
-                .iter()
-                .take(5)
-                .copied()
-                .collect::<Vec<_>>()
-                .join("; "),
-        });
-    }
-    Ok(())
+    Ok(script)
 }
 
 fn resolved_output_path(output_path: &Path) -> Result<PathBuf, OciError> {
@@ -1485,10 +1505,16 @@ mod tests {
         let secret = &meta[Path::new("ro/secret")];
         assert_eq!(
             (secret.uid, secret.gid, secret.mode),
-            (0, 42, libc::S_IFREG)
+            (0, 42, image_mode(libc::S_IFREG))
         );
-        assert_eq!(meta[Path::new("passwd")].mode, libc::S_IFREG | 0o4755);
-        assert_eq!(meta[Path::new("ro")].mode, libc::S_IFDIR | 0o555);
+        assert_eq!(
+            meta[Path::new("passwd")].mode,
+            image_mode(libc::S_IFREG) | 0o4755
+        );
+        assert_eq!(
+            meta[Path::new("ro")].mode,
+            image_mode(libc::S_IFDIR) | 0o555
+        );
         assert_eq!(meta[Path::new("null")].device, Some((1, 3)));
         // The staged copy is readable by the build user and the device node
         // is left for debugfs.
@@ -1503,6 +1529,50 @@ mod tests {
             "no setuid on the host"
         );
         assert!(!dir.path().join("null").exists());
+    }
+
+    #[test]
+    fn rootless_hardlinks_keep_the_exported_inode_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut original = tar::Header::new_gnu();
+        original.set_entry_type(tar::EntryType::Regular);
+        original.set_mode(0o640);
+        original.set_uid(1000);
+        original.set_gid(1001);
+        original.set_size(4);
+        builder
+            .append_data(&mut original, "original", &b"data"[..])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Link);
+        // A hardlink header's owner/mode are not the shared inode metadata.
+        link.set_mode(0o777);
+        link.set_uid(0);
+        link.set_gid(0);
+        link.set_size(0);
+        link.set_link_name("original").unwrap();
+        builder.append_data(&mut link, "alias", &b""[..]).unwrap();
+        let tarball = builder.into_inner().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let metadata =
+            unpack_export(&tarball[..], dir.path(), test_limits(1 << 20, 64), true).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(dir.path().join("original"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(dir.path().join("alias")).unwrap().ino(),
+        );
+        let script = image_ownership_script(dir.path(), &metadata).unwrap();
+        assert!(script.contains("sif \"/original\" uid 1000\n"));
+        assert!(script.contains("sif \"/original\" gid 1001\n"));
+        assert!(script.contains("sif \"/original\" mode 0100640\n"));
+        assert!(
+            !script.contains("/alias"),
+            "a hardlink must not overwrite the original inode's metadata"
+        );
     }
 
     fn test_limits(max_expanded_bytes: u64, max_entries: u64) -> OciResourceLimits {
