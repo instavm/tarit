@@ -271,13 +271,20 @@ export const tarit = defineProvider<TaritInstance, TaritConfig>({
         return { id: snapshot_id, provider: 'tarit', createdAt: new Date(), metadata: { instanceId } };
       },
 
-      list: async (config) => {
+      list: async (config, options) => {
+        if (options?.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 0)) {
+          throw new RangeError("Snapshot limit must be a nonnegative integer");
+        }
         const snapshots = await call<Array<{ snapshot_id: string; source_vm_id: string; created_at: string }>>(
           config,
           'GET',
           '/v1/snapshots',
         );
-        return snapshots.map((snapshot) => ({
+        const instanceId = options?.instanceId ?? options?.sandboxId;
+        const filtered = instanceId === undefined
+          ? snapshots
+          : snapshots.filter((snapshot) => snapshot.source_vm_id === instanceId);
+        return filtered.slice(0, options?.limit).map((snapshot) => ({
           id: snapshot.snapshot_id,
           provider: 'tarit',
           createdAt: new Date(snapshot.created_at),
