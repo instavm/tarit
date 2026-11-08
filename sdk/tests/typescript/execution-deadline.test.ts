@@ -1,10 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { TaritClient, TaritDeadlineExceeded } from "../../typescript/src/index.js";
+import { TaritApiError, TaritClient, TaritDeadlineExceeded } from "../../typescript/src/index.js";
 
 const vmId = "11111111-1111-4111-8111-111111111111";
 const executionId = "33333333-3333-4333-8333-333333333333";
+
+function deadlineWithId(expected: string | undefined): (error: unknown) => boolean {
+  return (error) => {
+    assert.ok(error instanceof TaritDeadlineExceeded);
+    assert.equal(error.executionId, expected);
+    if (expected === undefined) {
+      assert.match(error.message, /execution ID unavailable/);
+      assert.match(error.message, /submission may have been accepted/);
+    } else {
+      assert.ok(error.message.includes(expected));
+    }
+    return true;
+  };
+}
 
 function executionResponse(status: "pending" | "completed", httpStatus = 200): Response {
   return new Response(JSON.stringify({ id: executionId, vm_id: vmId, status }), {
@@ -32,7 +46,7 @@ test("waitExecution aborts a stalled HTTP poll at its deadline", async () => {
     return delayedResponse(request, executionResponse("completed"), 100);
   };
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
-  await assert.rejects(() => client.waitExecution(executionId, { deadlineMs: 10 }), TaritDeadlineExceeded);
+  await assert.rejects(() => client.waitExecution(executionId, { deadlineMs: 10 }), deadlineWithId(executionId));
   assert.equal(request?.signal.aborted, true);
 });
 
@@ -44,7 +58,7 @@ test("execute includes submission in its deadline and never resubmits", async ()
     return delayedResponse(request, executionResponse("pending", 202), 100);
   };
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
-  await assert.rejects(() => client.execute(vmId, "echo test", { deadlineMs: 10 }), TaritDeadlineExceeded);
+  await assert.rejects(() => client.execute(vmId, "echo test", { deadlineMs: 10 }), deadlineWithId(undefined));
   assert.equal(requests, 1);
 });
 
@@ -57,7 +71,7 @@ test("waitExecution does not poll again after sleeping to the deadline", async (
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
   await assert.rejects(
     () => client.waitExecution(executionId, { deadlineMs: 10, pollIntervalMs: 100 }),
-    TaritDeadlineExceeded,
+    deadlineWithId(executionId),
   );
   assert.equal(requests, 1);
 });
@@ -120,7 +134,7 @@ test("execute uses one budget across submission and polling", async (context) =>
     return executionResponse("completed");
   };
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
-  await assert.rejects(() => client.execute(vmId, "echo test", { deadlineMs: 100 }), TaritDeadlineExceeded);
+  await assert.rejects(() => client.execute(vmId, "echo test", { deadlineMs: 100 }), deadlineWithId(executionId));
   assert.equal(requests.length, 2);
 });
 
@@ -146,7 +160,7 @@ test("execution deadline covers the response body as well as headers", async () 
     return new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
   };
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
-  await assert.rejects(() => client.waitExecution(executionId, { deadlineMs: 10 }), TaritDeadlineExceeded);
+  await assert.rejects(() => client.waitExecution(executionId, { deadlineMs: 10 }), deadlineWithId(executionId));
   assert.equal(aborted, true);
 });
 
@@ -190,4 +204,81 @@ test("execution deadlines do not replace unrelated transport errors", async () =
   const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
   await assert.rejects(() => client.execute(vmId, "echo test"), (error) => error === failure);
   assert.equal(requests, 1);
+});
+
+for (const stage of ["submission", "submission decode", "poll decode"] as const) {
+  test(`execute retains its ID when ${stage} finishes late`, async (context) => {
+    let elapsed = 0;
+    context.mock.method(performance, "now", () => elapsed);
+    const methods: string[] = [];
+    const parse = JSON.parse;
+    context.mock.method(JSON, "parse", (...args: Parameters<typeof JSON.parse>) => {
+      const record = parse(...args);
+      if (record?.id === executionId && stage === (methods.length === 1 ? "submission decode" : "poll decode")) {
+        elapsed = 120;
+      }
+      return record;
+    });
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      methods.push(request.method);
+      const submitting = request.method === "POST";
+      if (stage === "submission") elapsed = 120;
+      return executionResponse(submitting ? "pending" : "completed", submitting ? 202 : 200);
+    };
+    const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
+    await assert.rejects(() => client.execute(vmId, "echo once", { deadlineMs: 100 }), deadlineWithId(executionId));
+    assert.deepEqual(methods, stage.startsWith("submission") ? ["POST"] : ["POST", "GET"]);
+  });
+}
+
+test("execute preserves its ID on poll cancellation and can resume without resubmitting", async () => {
+  const methods: string[] = [];
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    methods.push(request.method);
+    if (request.method === "POST") return executionResponse("pending", 202);
+    if (methods.length === 2) return delayedResponse(request, executionResponse("completed"), 100);
+    return executionResponse("completed");
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
+  let submittedId: string | undefined;
+  await assert.rejects(() => client.execute(vmId, "echo once", { deadlineMs: 10 }), (error) => {
+    deadlineWithId(executionId)(error);
+    submittedId = (error as TaritDeadlineExceeded).executionId;
+    return true;
+  });
+  assert.ok(submittedId);
+  assert.equal((await client.waitExecution(submittedId)).status, "completed");
+  assert.deepEqual(methods, ["POST", "GET", "GET"]);
+});
+
+test("submission body timeout cannot claim an execution ID from unread bytes", async () => {
+  let aborted = false;
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    const body = new ReadableStream({
+      start(controller) {
+        request.signal.addEventListener("abort", () => {
+          aborted = true;
+          controller.error(request.signal.reason);
+        }, { once: true });
+      },
+    });
+    return new Response(body, { status: 202, headers: { "Content-Type": "application/json" } });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
+  await assert.rejects(() => client.execute(vmId, "echo once", { deadlineMs: 10 }), deadlineWithId(undefined));
+  assert.equal(aborted, true);
+});
+
+test("execution ID context preserves ordinary API failures", async () => {
+  const fetch: typeof globalThis.fetch = async () => new Response(JSON.stringify({ error: "forbidden" }), {
+    status: 403,
+    headers: { "Content-Type": "application/json" },
+  });
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
+  for (const operation of [() => client.execute(vmId, "echo once"), () => client.waitExecution(executionId)]) {
+    await assert.rejects(operation, (error) => error instanceof TaritApiError && error.status === 403);
+  }
 });

@@ -18,6 +18,13 @@ const SECTOR_SIZE: u64 = 512;
 const SECTOR_SIZE_USIZE: usize = SECTOR_SIZE as usize;
 const VIRTIO_BLK_T_BARRIER: u32 = 0x8000_0000;
 
+/// Bound the work done by one block request, including restored drivers that
+/// did not negotiate SIZE_MAX. 256 MiB covers the entire advertised queue:
+/// 256 descriptors at 1 MiB each (headers/status leave less room for data).
+/// A smaller cap would reject requests permitted by today's queue/SIZE_MAX
+/// contract; SEG_MAX is not offered. Keep this bound independent of guest RAM.
+pub const MAX_BLOCK_REQUEST_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Copy-on-write overlay layout:
 ///
 /// ```text
@@ -854,6 +861,11 @@ impl BlkBackend {
             reserved: header.reserved,
             sector: header.sector,
         };
+        if matches!(op, req_type::IN | req_type::OUT) && data_len as u64 > MAX_BLOCK_REQUEST_BYTES {
+            return Err(BlkBackendError::Validation(format!(
+                "request length {data_len} exceeds {MAX_BLOCK_REQUEST_BYTES} byte limit"
+            )));
+        }
         let offset = validate_req(&normalized, data_len as u64, self.sectors)
             .map_err(|e| BlkBackendError::Validation(e.to_string()))?;
         if matches!(op, req_type::IN | req_type::OUT) {
@@ -1211,6 +1223,24 @@ mod tests {
         let mut data = data.to_vec();
         let status = backend.service(&hdr(req_type::OUT, sector), &mut data);
         assert_eq!(status, status::OK);
+    }
+
+    #[test]
+    fn backend_request_bound_precedes_storage_access() {
+        let disk = tempfile::NamedTempFile::new().unwrap();
+        disk.as_file()
+            .set_len(MAX_BLOCK_REQUEST_BYTES + 512)
+            .unwrap();
+        let backend = BlkBackend::open(disk.path(), false).unwrap();
+        for op in [req_type::IN, req_type::OUT] {
+            assert!(backend
+                .validate_service_req(&hdr(op, 0), MAX_BLOCK_REQUEST_BYTES as usize)
+                .is_ok());
+            assert!(matches!(
+                backend.validate_service_req(&hdr(op, 0), MAX_BLOCK_REQUEST_BYTES as usize + 1),
+                Err(BlkBackendError::Validation(message)) if message.contains("byte limit")
+            ));
+        }
     }
 
     #[test]

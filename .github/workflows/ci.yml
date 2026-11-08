@@ -191,6 +191,12 @@ jobs:
           python3 -m unittest orch/tests/test_e2e_snapshot_disk.py -v
           bash -n orch/tests/e2e_snapshot_disk.sh
 
+      - name: Install ext4 image test tools
+        if: matrix.workspace == 'vmm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+
       - name: Format
         working-directory: ${{ matrix.workspace }}
         run: cargo fmt --all -- --check
@@ -205,6 +211,8 @@ jobs:
 
       - name: Test (non-KVM unit tests)
         working-directory: ${{ matrix.workspace }}
+        env:
+          TARIT_REQUIRE_E2FSPROGS: ${{ matrix.workspace == 'vmm' && '1' || '0' }}
         run: cargo test --locked --workspace
 
       - name: Test lifecycle soak supervisor
