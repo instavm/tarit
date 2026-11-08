@@ -755,6 +755,8 @@ pub struct Config {
     pub api_requests_per_second: u64,
     pub api_request_timeout_ms: u64,
     pub api_max_body_bytes: usize,
+    /// Finished output retention; zero retains indefinitely.
+    pub execution_retention_hours: u64,
     /// Snapshots (and fork snapshots) captured at once on this host. Each
     /// writes and syncs guest RAM; past this many the device is shared so
     /// thinly that every one of them overruns its live pre-copy budget.
@@ -951,6 +953,12 @@ impl Config {
         let api_max_in_flight = env_positive_usize("TARIT_API_MAX_IN_FLIGHT", 1_024)?;
         let api_requests_per_second = env_positive_u64("TARIT_API_REQUESTS_PER_SECOND", 5_000)?;
         let api_request_timeout_ms = env_positive_u64("TARIT_API_REQUEST_TIMEOUT_MS", 180_000)?;
+        let execution_retention_hours = env::var("TARIT_EXECUTION_RETENTION_HOURS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .context("TARIT_EXECUTION_RETENTION_HOURS must be a non-negative integer")?
+            .unwrap_or(24);
         let api_max_body_bytes = env_positive_usize("TARIT_API_MAX_BODY_BYTES", 1024 * 1024)?;
         let max_concurrent_snapshots = env_positive_usize(
             "TARIT_MAX_CONCURRENT_SNAPSHOTS",
@@ -1103,6 +1111,7 @@ impl Config {
             api_requests_per_second,
             api_request_timeout_ms,
             api_max_body_bytes,
+            execution_retention_hours,
             max_concurrent_snapshots,
             vm_cgroup_parent,
             vm_jail,

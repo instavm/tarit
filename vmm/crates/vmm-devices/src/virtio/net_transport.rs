@@ -478,13 +478,15 @@ impl VirtioNetMmio {
     /// else, and the guest would wait for it forever. The guest reads the
     /// status before acting, so a repeated interrupt is harmless.
     pub fn reassert_pending_interrupt(&self) {
-        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
-            return;
-        }
         #[cfg(target_os = "linux")]
-        if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
-            if let Some(evt) = guard.as_ref() {
-                let _ = evt.write(1);
+        {
+            if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
+                if let Some(evt) = guard.as_ref() {
+                    let _ = evt.write(1);
+                }
             }
         }
     }
@@ -830,6 +832,7 @@ impl VirtioNetMmio {
     /// Whether a received frame's header uses only offloads the guest
     /// accepted. A tap holds the previous driver's offloads until the new
     /// one's are applied, so this can briefly fail.
+    #[cfg(target_os = "linux")]
     fn rx_header_allowed(&self, header: &[u8; VIRTIO_NET_HDR_LEN]) -> bool {
         let accepted = self.guest_features.load(Ordering::Relaxed);
         let needs_csum = header[0] & VIRTIO_NET_HDR_F_NEEDS_CSUM != 0;
@@ -844,6 +847,7 @@ impl VirtioNetMmio {
 
     /// Largest frame, header included, the guest can be handed: a
     /// segmentation-offload frame once it accepted one, else one MTU.
+    #[cfg(target_os = "linux")]
     fn rx_frame_limit(&self) -> usize {
         let accepted = self.guest_features.load(Ordering::Relaxed);
         if accepted & (net_features::GUEST_TSO4 | net_features::GUEST_TSO6) != 0 {

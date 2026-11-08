@@ -578,13 +578,15 @@ impl VirtioVsockMmio {
     /// else, and the guest would wait for it forever. The guest reads the
     /// status before acting, so a repeated interrupt is harmless.
     pub fn reassert_pending_interrupt(&self) {
-        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
-            return;
-        }
         #[cfg(target_os = "linux")]
-        if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
-            if let Some(evt) = guard.as_ref() {
-                let _ = evt.write(1);
+        {
+            if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            if let Ok(guard) = self.try_lock_state(&self.irq_evt, "irq_evt") {
+                if let Some(evt) = guard.as_ref() {
+                    let _ = evt.write(1);
+                }
             }
         }
     }

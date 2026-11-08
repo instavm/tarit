@@ -446,6 +446,8 @@ impl Store {
              CREATE INDEX IF NOT EXISTS vm_quota_reservations_owner_expiry
                ON vm_quota_reservations(owner_key, expires_at);",
         )?;
+        ensure_column(&conn, "executions", "owner_key", "TEXT")?;
+        ensure_column(&conn, "executions", "vm_created_at", "TEXT")?;
         ensure_column(&conn, "vms", "owner_key", "TEXT")?;
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
@@ -534,6 +536,22 @@ impl Store {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint_active ON ssh_keys (fingerprint, is_active)",
             [],
+        )?;
+        // Revocation is part of the same SQLite statement as terminal state or
+        // UUID release, including retention deletes and explicit rollback deletes.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS revoke_shares_on_vm_delete
+             BEFORE DELETE ON vms BEGIN
+               UPDATE shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE vm_id = OLD.id AND revoked_at IS NULL;
+             END;
+             CREATE TRIGGER IF NOT EXISTS revoke_shares_on_vm_stop
+             AFTER UPDATE OF status ON vms WHEN NEW.status = 'stopped' BEGIN
+               UPDATE shares SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE vm_id = NEW.id AND revoked_at IS NULL;
+             END;",
         )?;
         Ok(Self { conn })
     }
@@ -1601,6 +1619,51 @@ impl Store {
         Ok(())
     }
 
+    /// Fence publication against the exact VM incarnation checked by the API.
+    /// The transaction also serializes it with terminal-state revocation.
+    pub fn insert_share_for_vm(
+        &self,
+        share: &ShareRecord,
+        vm: &VmRecord,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.check_share_target(share, vm)?;
+        self.insert_share(share)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_share_for_vm_if_current(
+        &self,
+        share: &ShareRecord,
+        expected_token_version: u64,
+        vm: &VmRecord,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.check_share_target(share, vm)?;
+        self.update_share_if_current(share, expected_token_version)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn check_share_target(
+        &self,
+        share: &ShareRecord,
+        expected: &VmRecord,
+    ) -> Result<(), StoreError> {
+        let current = self.get_vm(share.vm_id)?;
+        if current.id != expected.id
+            || current.created_at != expected.created_at
+            || current.owner_key.as_deref() != Some(share.owner_key.as_str())
+            || current.status != VmStatus::Running
+        {
+            return Err(StoreError::Conflict(
+                "share target VM changed or is not running".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn get_share(&self, id: Uuid) -> Result<ShareRecord, StoreError> {
         self.conn
             .query_row(
@@ -2062,11 +2125,19 @@ impl Store {
     }
 
     pub fn insert_execution(&self, exec: &ExecutionRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO executions (
+        let updated = self.conn.execute(
+            "INSERT INTO executions (
                id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-               duration_ms, error, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+               duration_ms, error, created_at, updated_at, owner_key, vm_created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(id) DO UPDATE SET
+               status=excluded.status, exit_code=excluded.exit_code,
+               stdout=excluded.stdout, stderr=excluded.stderr, duration_ms=excluded.duration_ms,
+               error=excluded.error, updated_at=excluded.updated_at
+             WHERE executions.vm_id=excluded.vm_id
+               AND executions.owner_key IS excluded.owner_key
+               AND executions.vm_created_at IS excluded.vm_created_at
+               AND executions.updated_at <= excluded.updated_at",
             params![
                 exec.id.to_string(),
                 exec.vm_id.to_string(),
@@ -2080,8 +2151,15 @@ impl Store {
                 exec.error,
                 exec.created_at.to_rfc3339(),
                 exec.updated_at.to_rfc3339(),
+                exec.owner_key,
+                exec.vm_created_at.map(|at| at.to_rfc3339()),
             ],
         )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict(
+                "execution ownership or transition changed".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2089,7 +2167,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-                        duration_ms, error, created_at, updated_at
+                        duration_ms, error, created_at, updated_at, owner_key, vm_created_at
                  FROM executions WHERE id = ?1",
                 params![id.to_string()],
                 row_to_execution,
@@ -2103,7 +2181,7 @@ impl Store {
             Some(vm_id) => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-                            duration_ms, error, created_at, updated_at
+                            duration_ms, error, created_at, updated_at, owner_key, vm_created_at
                      FROM executions WHERE vm_id = ?1 ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map(params![vm_id.to_string()], row_to_execution)?;
@@ -2113,7 +2191,7 @@ impl Store {
             None => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-                            duration_ms, error, created_at, updated_at
+                            duration_ms, error, created_at, updated_at, owner_key, vm_created_at
                      FROM executions ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([], row_to_execution)?;
@@ -2227,18 +2305,19 @@ impl Store {
             .map_err(StoreError::from)
     }
 
-    pub fn get_active_ssh_key_by_fingerprint(
+    pub fn get_active_ssh_key_for_owner(
         &self,
+        owner_key: &str,
         fingerprint: &str,
     ) -> Result<Option<SshKeyRecord>, StoreError> {
         self.conn
             .query_row(
                 "SELECT id, owner_key, fingerprint, public_key, key_type, created_at, is_active
                  FROM ssh_keys
-                 WHERE fingerprint = ?1 AND is_active = 1
+                 WHERE fingerprint = ?1 AND owner_key = ?2 AND is_active = 1
                  ORDER BY created_at DESC
                  LIMIT 1",
-                params![fingerprint],
+                params![fingerprint, owner_key],
                 row_to_ssh_key,
             )
             .optional()
@@ -3147,6 +3226,11 @@ fn row_to_execution(row: &rusqlite::Row<'_>) -> Result<ExecutionRecord, rusqlite
         vm_id: Uuid::parse_str(&vm_id).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
         })?,
+        owner_key: row.get(12)?,
+        vm_created_at: row
+            .get::<_, Option<String>>(13)?
+            .map(|value| parse_ts(&value))
+            .transpose()?,
         command: row.get(2)?,
         timeout_ms: row.get(3)?,
         status: ExecutionStatus::parse(&status).unwrap_or(ExecutionStatus::Failed),
@@ -4200,6 +4284,68 @@ mod tests {
     }
 
     #[test]
+    fn stopped_vm_shares_are_revoked_before_uuid_reuse_and_stale_publication_fails() {
+        let store = Store::open(":memory:").unwrap();
+        let mut vm = test_vm(Uuid::new_v4(), "tenant-a");
+        vm.status = VmStatus::Running;
+        vm.created_at = Utc::now() - chrono::Duration::days(3);
+        store.insert_vm(&vm).unwrap();
+        let share = ShareRecord {
+            vm_id: vm.id,
+            revoked_at: None,
+            ..test_share("lifetime-test", "tenant-a")
+        };
+        store.insert_share_for_vm(&share, &vm).unwrap();
+        store.update_vm_status(vm.id, VmStatus::Stopped).unwrap();
+        assert!(store.get_share(share.id).unwrap().revoked_at.is_some());
+        assert!(store
+            .insert_share_for_vm(
+                &ShareRecord {
+                    id: Uuid::new_v4(),
+                    slug: "late-share".into(),
+                    ..share.clone()
+                },
+                &vm
+            )
+            .is_err());
+        vm = store.get_vm(vm.id).unwrap();
+        vm.updated_at = Utc::now() - chrono::Duration::days(2);
+        vm.revision += 1;
+        store.insert_vm(&vm).unwrap();
+        // Legacy/orphaned shares created before the fix are also fenced by deletion.
+        let legacy = ShareRecord {
+            id: Uuid::new_v4(),
+            slug: "legacy-share".into(),
+            ..share.clone()
+        };
+        store.insert_share(&legacy).unwrap();
+        assert_eq!(
+            store
+                .prune_stopped_vms(Utc::now() - chrono::Duration::days(1), 10)
+                .unwrap(),
+            1
+        );
+        assert!(store.get_share(legacy.id).unwrap().revoked_at.is_some());
+        let replacement = VmRecord {
+            status: VmStatus::Running,
+            ..test_vm(vm.id, "tenant-a")
+        };
+        store.insert_vm(&replacement).unwrap();
+        let fresh = ShareRecord {
+            id: Uuid::new_v4(),
+            slug: "new-incarnation".into(),
+            ..share.clone()
+        };
+        assert!(store.insert_share_for_vm(&fresh, &vm).is_err());
+        store.insert_share_for_vm(&fresh, &replacement).unwrap();
+        assert!(store
+            .update_share_for_vm_if_current(&share, share.token_version, &replacement)
+            .is_err());
+        store.delete_vm(replacement.id).unwrap();
+        assert!(store.get_share(fresh.id).unwrap().revoked_at.is_some());
+    }
+
+    #[test]
     fn stopped_vms_past_retention_are_pruned_unless_still_referenced() {
         let store = Store::open(":memory:").unwrap();
         let now = Utc::now();
@@ -4474,6 +4620,8 @@ mod tests {
             let exec = ExecutionRecord {
                 id: Uuid::new_v4(),
                 vm_id: Uuid::new_v4(),
+                owner_key: Some("tenant-a".into()),
+                vm_created_at: Some(now),
                 command: "true".into(),
                 timeout_ms: 1000,
                 status,
@@ -4842,14 +4990,41 @@ mod tests {
         store.insert_ssh_key(&key).unwrap();
 
         let found = store
-            .get_active_ssh_key_by_fingerprint("SHA256:test")
+            .get_active_ssh_key_for_owner("owner-a", "SHA256:test")
             .unwrap()
             .unwrap();
         assert_eq!(found.owner_key, "owner-a");
+        let other = SshKeyRecord {
+            id: Uuid::new_v4(),
+            owner_key: "owner-b".into(),
+            created_at: key.created_at + chrono::Duration::seconds(1),
+            ..key.clone()
+        };
+        store.insert_ssh_key(&other).unwrap();
+        assert_eq!(
+            store
+                .get_active_ssh_key_for_owner("owner-a", "SHA256:test")
+                .unwrap()
+                .unwrap()
+                .id,
+            key.id
+        );
+        assert_eq!(
+            store
+                .get_active_ssh_key_for_owner("owner-b", "SHA256:test")
+                .unwrap()
+                .unwrap()
+                .id,
+            other.id
+        );
+        assert!(store
+            .get_active_ssh_key_for_owner("owner-c", "SHA256:test")
+            .unwrap()
+            .is_none());
 
         store.delete_ssh_key("owner-a", key.id).unwrap();
         assert!(store
-            .get_active_ssh_key_by_fingerprint("SHA256:test")
+            .get_active_ssh_key_for_owner("owner-a", "SHA256:test")
             .unwrap()
             .is_none());
     }

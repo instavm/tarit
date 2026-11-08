@@ -640,12 +640,6 @@ async fn run_server(
                             }
                             let _ = completion.send(result);
                         }
-                        api::StoreWrite::Exec(rec) => {
-                            if let Err(error) = s.insert_execution(&rec) {
-                                metrics.inc_store_write_failure();
-                                tracing::error!(execution = %rec.id, %error, "persist execution record");
-                            }
-                        }
                         api::StoreWrite::Usage(ev) => {
                             if let Err(error) = s.enqueue_usage(&ev) {
                                 metrics.inc_store_write_failure();
@@ -702,10 +696,6 @@ async fn run_server(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(90);
-    let execution_retention_hours = std::env::var("TARIT_EXECUTION_RETENTION_HOURS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(24);
     let stopped_vm_retention_hours = std::env::var("TARIT_STOPPED_VM_RETENTION_HOURS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -714,7 +704,7 @@ async fn run_server(
         state.clone(),
         flush_secs,
         local_retention_days,
-        execution_retention_hours,
+        state.config.execution_retention_hours,
         stopped_vm_retention_hours,
         shutdown_rx.clone(),
     );
@@ -2772,6 +2762,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
