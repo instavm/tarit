@@ -765,6 +765,7 @@ mod tests {
         assert!(page.iter().all(|&b| b == 0x11), "neighbours untouched");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn file_backed_ranges_follow_layering_and_discards() {
         use std::io::Write as _;

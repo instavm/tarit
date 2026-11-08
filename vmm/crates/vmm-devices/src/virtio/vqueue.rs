@@ -17,8 +17,8 @@ pub const MAX_QUEUE_SIZE: u16 = 256;
 /// the processor accepts up to this, each device enforces its own offer.
 pub const MAX_SUPPORTED_QUEUE_SIZE: u16 = 1024;
 
-/// Maximum per-descriptor length (1 MiB). Descriptors exceeding this are
-/// rejected to prevent guest-driven OOM allocation attacks.
+/// Maximum per-descriptor length (1 MiB) for payload-copying queue APIs.
+/// Block devices can stream larger validated buffers for legacy drivers.
 pub const MAX_DESC_LEN: u32 = 1024 * 1024;
 
 /// Maximum total bytes across all descriptors in a single chain (4 MiB).
@@ -201,6 +201,17 @@ struct DescriptorChain {
     readable: Vec<(u64, u32)>,
     writable: Vec<(u64, u32)>,
     len: u32,
+    over_limit: bool,
+}
+
+/// A validated descriptor list, without reading its payloads.
+pub(crate) struct Chain<'a> {
+    pub readable: &'a [(u64, u32)],
+    pub writable: &'a [(u64, u32)],
+    /// Payload sizes exceed the allocation limits. The device must stream
+    /// these buffers with bounded metadata or complete with an error; it
+    /// must never allocate a payload-sized buffer.
+    pub over_limit: bool,
 }
 
 /// A device-writable chain seen on the avail ring but not yet used.
@@ -426,6 +437,15 @@ impl VirtQueueProcessor {
         mem: &GuestMemoryMmap,
         head_desc_idx: u16,
     ) -> Option<DescriptorChain> {
+        self.walk_descriptor_chain_with_limits(mem, head_desc_idx, false)
+    }
+
+    fn walk_descriptor_chain_with_limits(
+        &self,
+        mem: &GuestMemoryMmap,
+        head_desc_idx: u16,
+        allow_over_limit: bool,
+    ) -> Option<DescriptorChain> {
         if head_desc_idx >= self.config.size {
             log::warn!(
                 "vqueue: head descriptor {head_desc_idx} >= queue size {} — rejecting chain",
@@ -439,6 +459,7 @@ impl VirtQueueProcessor {
         let mut writable = Vec::new();
         let mut chain_bytes = 0usize;
         let mut chain_len = 0usize;
+        let mut over_limit = false;
 
         loop {
             if desc_idx >= self.config.size {
@@ -472,12 +493,15 @@ impl VirtQueueProcessor {
                 return None;
             }
             if desc.len > MAX_DESC_LEN {
-                log::warn!(
-                    "vqueue: desc.len {} exceeds max {} — rejecting chain",
-                    desc.len,
-                    MAX_DESC_LEN
-                );
-                return None;
+                if !allow_over_limit {
+                    log::warn!(
+                        "vqueue: desc.len {} exceeds max {} — rejecting chain",
+                        desc.len,
+                        MAX_DESC_LEN
+                    );
+                    return None;
+                }
+                over_limit = true;
             }
 
             let next_chain_bytes = match chain_bytes.checked_add(desc.len as usize) {
@@ -488,10 +512,13 @@ impl VirtQueueProcessor {
                 }
             };
             if next_chain_bytes > MAX_CHAIN_BYTES {
-                log::warn!(
-                    "vqueue: chain total {next_chain_bytes} exceeds max {MAX_CHAIN_BYTES} — rejecting"
-                );
-                return None;
+                if !allow_over_limit {
+                    log::warn!(
+                        "vqueue: chain total {next_chain_bytes} exceeds max {MAX_CHAIN_BYTES} — rejecting"
+                    );
+                    return None;
+                }
+                over_limit = true;
             }
             chain_bytes = next_chain_bytes;
 
@@ -516,6 +543,7 @@ impl VirtQueueProcessor {
             readable,
             writable,
             len: chain_len as u32,
+            over_limit,
         })
     }
 
@@ -737,6 +765,37 @@ impl VirtQueueProcessor {
     where
         F: FnMut(&[(u64, u32)], &[(u64, u32)]) -> Option<u32>,
     {
+        self.process_queue_chains_inner(mem, dirty, false, |chain| {
+            handler(chain.readable, chain.writable)
+        })
+    }
+
+    /// Let a device stream an oversized but otherwise valid request, or
+    /// complete it with its own error status. Descriptor count, addresses and
+    /// links are still validated, and payloads are never read by this method. Other queue
+    /// entry points retain their strict size rejection.
+    pub(crate) fn process_queue_chains_dirty<F>(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        handler: F,
+    ) -> usize
+    where
+        F: FnMut(Chain<'_>) -> Option<u32>,
+    {
+        self.process_queue_chains_inner(mem, dirty, true, handler)
+    }
+
+    fn process_queue_chains_inner<F>(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        dirty: Option<&SoftwareDirtyBitmap>,
+        allow_over_limit: bool,
+        mut handler: F,
+    ) -> usize
+    where
+        F: FnMut(Chain<'_>) -> Option<u32>,
+    {
         if !self.queue_is_usable(mem, "process_queue_descriptors") {
             return 0;
         }
@@ -765,7 +824,11 @@ impl VirtQueueProcessor {
                     }
                 };
 
-                let chain = match self.walk_descriptor_chain(mem, head_desc_idx) {
+                let chain = match self.walk_descriptor_chain_with_limits(
+                    mem,
+                    head_desc_idx,
+                    allow_over_limit,
+                ) {
                     Some(chain) => chain,
                     None => {
                         self.reject_available_chain();
@@ -773,7 +836,11 @@ impl VirtQueueProcessor {
                     }
                 };
 
-                let used_len = match handler(&chain.readable, &chain.writable) {
+                let used_len = match handler(Chain {
+                    readable: &chain.readable,
+                    writable: &chain.writable,
+                    over_limit: chain.over_limit,
+                }) {
                     Some(n) => n,
                     None => {
                         // Leave the chain in flight; try again next call.
@@ -1368,6 +1435,62 @@ mod tests {
         assert_eq!(count, 0);
         assert_eq!(p.avail_idx(), 1);
         assert_eq!(p.used_idx(), 0);
+    }
+
+    #[test]
+    fn oversized_error_completion_still_rejects_invalid_chains() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap();
+        let config = QueueConfig {
+            size: 8,
+            desc_table_addr: 0x1000,
+            avail_ring_addr: 0x2000,
+            used_ring_addr: 0x3000,
+            ready: true,
+        };
+        mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(0x2000))
+            .unwrap();
+        mem.write_obj(0u16, GuestAddress(0x2004)).unwrap();
+        let valid = Descriptor {
+            addr: 0x10_0000,
+            len: MAX_DESC_LEN + 1,
+            flags: 0,
+            next: 0,
+        };
+        for descriptor in [
+            Descriptor {
+                addr: u64::MAX,
+                ..valid
+            },
+            Descriptor {
+                addr: 0x3f_0000,
+                ..valid
+            },
+            Descriptor {
+                flags: desc_flags::NEXT,
+                next: 8,
+                ..valid
+            },
+            Descriptor {
+                flags: desc_flags::NEXT,
+                next: 0,
+                ..valid
+            },
+            Descriptor {
+                flags: desc_flags::INDIRECT,
+                ..valid
+            },
+        ] {
+            mem.write_obj(descriptor, GuestAddress(0x1000)).unwrap();
+            let mut processor = VirtQueueProcessor::new(config.clone());
+            assert_eq!(
+                processor.process_queue_chains_dirty(&mem, None, |_| {
+                    panic!("malformed chain must not reach the block error handler");
+                }),
+                0
+            );
+            assert_eq!(processor.avail_idx(), 1);
+            assert_eq!(processor.used_idx(), 0);
+        }
     }
 
     #[test]

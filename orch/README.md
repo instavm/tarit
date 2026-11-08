@@ -160,6 +160,37 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 
 Full request and response schemas are in [docs/API.md](docs/API.md).
 
+Asynchronous execution admission lasts until the command reaches a terminal state.
+Each API node accepts at most `min(TARIT_API_MAX_IN_FLIGHT, 128)` unfinished
+asynchronous commands. Admission checks the tenant first (all its API keys share
+at most 32 slots, or half a smaller global budget, with a minimum of one), then
+the VM (at most four unfinished commands), then the global budget. Excess
+submissions return 429 without reserving global capacity. These limits apply to
+administrators too and are per API node; a global budget of one cannot reserve
+concurrent capacity for a second tenant. Waiting behind another operation on a
+local VM is bounded by `TARIT_API_REQUEST_TIMEOUT_MS`, separately from the
+command's runtime timeout.
+
+The execution polling cache is limited to 1,024 records and 64 MiB; evicted
+records remain readable from durable storage. `TARIT_EXECUTION_RETENTION_HOURS`
+(default 24; zero disables expiry) applies to terminal records in PostgreSQL,
+SQLite and memory, based on `updated_at`. Reads reject expired output immediately,
+even before the hourly bounded cleanup runs. Pending/running work is retained.
+Execution output belongs to the submitting tenant permanently, even after VM
+deletion or UUID reuse. New records also retain the authorized VM creation time.
+Legacy SQLite executions without an owner binding are admin-only: inferring an
+owner from a possibly reused VM UUID would expose another tenant's output.
+
+For PostgreSQL integration tests, use a disposable database and set
+`TARIT_TEST_DATABASE_URL`; set `TARIT_REQUIRE_TEST_DATABASE=1` in CI to fail instead
+of skipping the execution regressions when the database URL is missing.
+Run `cargo test --locked -p tarit-fleet -p taritd -- --test-threads=1`.
+
+Shares are revoked when their VM is deleted, including when retention frees its
+UUID. Recreating that UUID requires new shares. SSH public-key registrations are
+matched within the target VM's tenant, so the same public key can be registered
+by multiple tenants independently.
+
 ## CLI reference
 
 The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_BASE_URL`, default `http://127.0.0.1:8080`), `--api-key <KEY>` (env `TARIT_API_KEY`), and `--json` to print raw JSON responses.

@@ -178,17 +178,19 @@ impl VirtioBalloonMmio {
     /// else, and the guest would wait for it forever. The guest reads the
     /// status before acting, so a repeated interrupt is harmless.
     pub fn reassert_pending_interrupt(&self) {
-        if self.interrupt_status.load(Ordering::SeqCst) == 0 {
-            return;
-        }
         #[cfg(target_os = "linux")]
-        if let Some(event) = self
-            .irq_evt
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
         {
-            let _ = event.write(1);
+            if self.interrupt_status.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            if let Some(event) = self
+                .irq_evt
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                let _ = event.write(1);
+            }
         }
     }
 

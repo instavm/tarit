@@ -797,15 +797,26 @@ async fn cleanup_hibernation_snapshots_for_vm(
     state: &AppState,
     vm_id: Uuid,
 ) -> Result<u64, OrchError> {
-    let snapshots = state
-        .store
-        .lock()
-        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-        .list_ephemeral_snapshots_for_vm(vm_id)
-        .map_err(crate::api::store_err)?
-        .into_iter()
-        .filter(|snapshot| snapshot.vm_id == vm_id)
-        .collect();
+    let snapshots = {
+        let store = state
+            .store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+        let bindings = store.list_hibernations().map_err(crate::api::store_err)?;
+        store
+            .list_ephemeral_snapshots_for_vm(vm_id)
+            .map_err(crate::api::store_err)?
+            .into_iter()
+            .filter(|snapshot| snapshot.vm_id == vm_id)
+            // A failed publication may retain its wake image while the cache
+            // still says Running. Only retire snapshots no binding needs.
+            .filter(|snapshot| {
+                !bindings
+                    .iter()
+                    .any(|binding| binding.snapshot_path == snapshot.path)
+            })
+            .collect()
+    };
     cleanup_ephemeral_snapshots(state, snapshots).await
 }
 
@@ -1059,6 +1070,21 @@ async fn retry_pending_lifecycle(state: &AppState, terminal_gate_held: bool) -> 
     for (id, lifecycle) in states {
         let result = match lifecycle {
             LifecycleState::Publishing { .. } => finish_publication(state, id).await,
+            LifecycleState::Hibernating { .. } if terminal_gate_held => {
+                finish_hibernation(state, id).await
+            }
+            LifecycleState::Hibernating { .. } => {
+                let _operation = match state.supervisor.operation_gate(id) {
+                    Ok(gate) => Some(gate.lock_owned().await),
+                    Err(OrchError::NotFound(_)) => None,
+                    Err(error) => {
+                        failures.push(format!("VM {id} hibernation gate: {error}"));
+                        continue;
+                    }
+                };
+                let _terminal_gate = state.terminal_transition_gate.lock().await;
+                finish_hibernation(state, id).await
+            }
             LifecycleState::Terminal { .. } if terminal_gate_held => {
                 finish_terminal_transition(state, id).await
             }
@@ -2204,24 +2230,37 @@ pub(crate) fn exec_gate_deadline(
         + std::time::Duration::from_millis(config.api_request_timeout_ms.saturating_sub(timeout_ms))
 }
 
-/// `gate_deadline` bounds the wait behind other operations on the VM for
-/// callers holding an API request (and its in-flight permit); background
-/// execs pass `None` and queue.
+/// Execute only against the owner/incarnation already authorized by ingress.
+/// The deadline bounds queueing independently of the guest runtime timeout.
 pub async fn exec_local(
     state: &AppState,
-    vm_id: Uuid,
+    expected_vm: &VmRecord,
     command: String,
     timeout_ms: u64,
     gate_deadline: Option<tokio::time::Instant>,
 ) -> Result<(i32, String, String, u64), OrchError> {
-    ensure_active_local(state, vm_id).await?;
+    let vm_id = expected_vm.id;
+    ensure_active_local_owned(state, vm_id, None, Some(expected_vm)).await?;
     let gate = state.supervisor.operation_gate(vm_id)?;
     let _operation = lock_operation_gate(gate, vm_id, gate_deadline).await?;
-    ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
+    let current = ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
+    ensure_execution_incarnation(expected_vm, &current)?;
     let sup = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+}
+
+fn ensure_execution_incarnation(expected: &VmRecord, current: &VmRecord) -> Result<(), OrchError> {
+    if expected.id != current.id
+        || expected.owner_key != current.owner_key
+        || expected.created_at != current.created_at
+    {
+        return Err(OrchError::Conflict(
+            "VM incarnation changed before execution".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn lock_operation_gate(
@@ -2260,6 +2299,8 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         }
         return Ok(());
     }
+    let activation = activation_gate(state, id)?;
+    let _activation = activation.lock().await;
     let operation_gate = match state.supervisor.operation_gate(id) {
         Ok(gate) => Some(gate),
         Err(OrchError::NotFound(_)) => None,
@@ -2285,6 +2326,7 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
                 return Ok(());
             }
             Some(LifecycleState::Publishing { .. }) => finish_publication(state, id).await?,
+            Some(LifecycleState::Hibernating { .. }) => finish_hibernation(state, id).await?,
             Some(
                 LifecycleState::Creating { .. }
                 | LifecycleState::Running { .. }
@@ -2355,6 +2397,12 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
             tracing::error!(vm = %exit.id, pid = exit.pid, %cleanup_error, "dead VMM left resources requiring operator reconciliation");
         }
         let result = async {
+            if matches!(
+                lifecycle_state(state, exit.id)?,
+                Some(LifecycleState::Hibernating { .. })
+            ) {
+                return finish_hibernation(state, exit.id).await;
+            }
             state.pty_registry.close_vm_sessions(exit.id);
             if matches!(
                 lifecycle_state(state, exit.id)?,
@@ -2409,6 +2457,15 @@ pub async fn stop_all_local(state: &AppState) -> Result<ShutdownSummary, OrchErr
         .collect::<Vec<_>>();
 
     for id in stopped_ids {
+        if matches!(
+            lifecycle_state(state, id)?,
+            Some(LifecycleState::Hibernating { .. })
+        ) {
+            if let Err(error) = finish_hibernation(state, id).await {
+                failures.push(format!("VM {id} retained hibernation for retry: {error}"));
+            }
+            continue;
+        }
         if let Err(error) = start_terminal_transition(state, id, VmStatus::Stopped, true) {
             failures.push(format!(
                 "VM {id} shutdown transition retained scheduler and ownership reservation: {error}"
@@ -2459,14 +2516,77 @@ pub async fn hibernate_local(
     id: Uuid,
     identity: &crate::config::ApiIdentity,
 ) -> Result<VmRecord, OrchError> {
-    // A hibernated VM deliberately has no supervisor runtime/gate. Validate
-    // the durable lifecycle record first so an invalid repeat is a state
-    // conflict, not the misleading claim that the VM does not exist.
     ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
+    let worker_state = state.clone();
+    let identity = identity.clone();
+    // An HTTP timeout must not abandon a paused guest or a durable wake path.
+    // DELETE and shutdown already wait for supervisor-owned lifecycle workers.
+    run_supervised_lifecycle(state, id, move |task| async move {
+        hibernate_local_owned(&worker_state, id, &identity, &task).await
+    })
+    .await
+}
+
+async fn hibernate_local_owned(
+    state: &AppState,
+    id: Uuid,
+    identity: &crate::config::ApiIdentity,
+    task: &OwnedTaskControl,
+) -> Result<VmRecord, OrchError> {
+    // Activation cleanup must not retire the newly captured wake image before
+    // prepare_hibernation has installed its durable binding.
+    let activation = activation_gate(state, id)?;
+    let _activation = activation.lock().await;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
-    let snapshot_path = snapshot_local_locked(state, id, Some(id), None).await?.path;
+    // Check revision exhaustion before pausing or persisting a wake path.
+    let record = terminal_record(state, id, VmStatus::Hibernated)?;
+    if let Err(error) = prepare_hibernation(state, id, &current, identity).await {
+        if task.is_cancelled() {
+            let _terminal_gate = state.terminal_transition_gate.lock().await;
+            return finish_cancelled_lifecycle(state, id, task, error).await;
+        }
+        let supervisor = Arc::clone(&state.supervisor);
+        let resumed = tokio::task::spawn_blocking(move || supervisor.resume_vm(id)).await;
+        return Err(match resumed {
+            Ok(Ok(())) => error,
+            other => {
+                reconcile_failed_live_operation(
+                    state,
+                    &current,
+                    OrchError::Internal(format!(
+                        "{error}; failed to resume after hibernation preparation: {other:?}"
+                    )),
+                )
+                .await
+            }
+        });
+    }
+
+    // The durable binding now owns the captured state. Never discard it after
+    // teardown starts: stop, publication and release are retryable as one unit.
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
+    set_lifecycle_state(
+        state,
+        id,
+        LifecycleState::Hibernating {
+            record: record.clone(),
+        },
+    )?;
+    finish_hibernation(state, id).await?;
+    Ok(record)
+}
+
+async fn prepare_hibernation(
+    state: &AppState,
+    id: Uuid,
+    current: &VmRecord,
+    identity: &crate::config::ApiIdentity,
+) -> Result<(), OrchError> {
+    let snapshot_path = snapshot_local_locked(state, id, Some(id), None, SnapshotMode::LeavePaused)
+        .await?
+        .path;
     let snapshot =
         verify_snapshot_access(state, &snapshot_path, current.owner_key.as_deref(), false)?;
     let owner_key = current.owner_key.as_ref().ok_or_else(|| {
@@ -2492,7 +2612,6 @@ pub async fn hibernate_local(
     )
     .await?;
     let owner_key = owner_key.clone();
-    let desired_egress = get_egress_policy_local(state, id, &owner_key)?;
     let now = Utc::now();
     let hibernation = tarit_store::HibernationRecord {
         vm_id: id,
@@ -2507,75 +2626,62 @@ pub async fn hibernate_local(
         .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
         .upsert_hibernation(&hibernation)
         .map_err(crate::api::store_err)?;
+    Ok(())
+}
+
+/// Caller holds terminal_transition_gate (and the runtime gate if present).
+/// The durable hibernation row also lets startup recover after a daemon crash.
+async fn finish_hibernation(state: &AppState, id: Uuid) -> Result<(), OrchError> {
+    let Some(LifecycleState::Hibernating { record }) = lifecycle_state(state, id)? else {
+        return Ok(());
+    };
     if let Some(fleet) = state.fleet.as_ref() {
-        let fleet_hibernation = tarit_fleet::FleetHibernationRecord {
-            vm_id: id,
-            owner_key: owner_key.clone(),
-            artifact_id: snapshot.snapshot_id,
-            egress_policy: desired_egress,
-            created_at: now,
-            updated_at: now,
-        };
-        if let Err(error) = fleet.upsert_hibernation(&fleet_hibernation).await {
-            let _ = state
+        let owner_key = record.owner_key.as_ref().ok_or_else(|| {
+            OrchError::Internal(format!("vm {id} has no tenant owner for hibernation"))
+        })?;
+        let (hibernation, snapshot) = {
+            let store = state
                 .store
                 .lock()
-                .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-                .delete_hibernation(&owner_key, id);
-            return Err(OrchError::Internal(format!(
-                "publish durable fleet hibernation: {error}"
-            )));
-        }
+                .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+            let hibernation = store
+                .get_hibernation(owner_key, id)
+                .map_err(crate::api::store_err)?;
+            let snapshot = store
+                .get_snapshot(&hibernation.snapshot_path)
+                .map_err(crate::api::store_err)?
+                .ok_or_else(|| {
+                    OrchError::Internal(format!("vm {id} hibernation snapshot missing"))
+                })?;
+            (hibernation, snapshot)
+        };
+        // Publish the durable wake path before teardown. An ambiguous fleet
+        // failure must retain the paused source and local binding for retry,
+        // never resume it against a possibly published older snapshot.
+        fleet
+            .upsert_hibernation(&tarit_fleet::FleetHibernationRecord {
+                vm_id: id,
+                owner_key: owner_key.clone(),
+                artifact_id: snapshot.snapshot_id,
+                egress_policy: get_egress_policy_local(state, id, owner_key)?,
+                created_at: hibernation.created_at,
+                updated_at: hibernation.updated_at,
+            })
+            .await
+            .map_err(|error| {
+                OrchError::Internal(format!("publish durable fleet hibernation: {error}"))
+            })?;
     }
-
     state.pty_registry.close_vm_sessions(id);
     let supervisor = Arc::clone(&state.supervisor);
-    if let Err(error) = tokio::task::spawn_blocking(move || supervisor.stop_vm(id))
+    tokio::task::spawn_blocking(move || supervisor.stop_vm(id))
         .await
-        .map_err(|join| OrchError::Internal(format!("hibernate teardown join: {join}")))?
-    {
-        let fleet_cleanup = if let Some(fleet) = state.fleet.as_ref() {
-            fleet
-                .delete_hibernation(&hibernation.owner_key, id)
-                .await
-                .err()
-        } else {
-            None
-        };
-        let cleanup = state
-            .store
-            .lock()
-            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-            .delete_hibernation(&hibernation.owner_key, id);
-        return Err(match (cleanup, fleet_cleanup) {
-            (Ok(_), None) => error,
-            (local, fleet) => OrchError::Internal(format!(
-                "{error}; failed to fully remove unusable hibernation record: local={local:?}, fleet={fleet:?}"
-            )),
-        });
-    }
-
-    let mut record = current;
-    record.status = VmStatus::Hibernated;
-    record.revision = record
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| OrchError::Internal(format!("VM {id} revision exhausted")))?;
-    record.runtime_layout = None;
-    record.socket_path = None;
-    record.pid = None;
-    record.updated_at = Utc::now();
+        .map_err(|join| OrchError::Internal(format!("hibernate teardown join: {join}")))??;
     claim_lifecycle_ownership(state, &record).await?;
-    state
-        .store
-        .lock()
-        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-        .insert_vm(&record)
-        .map_err(crate::api::store_err)?;
+    persist_vm_record(state, record.clone()).await?;
     commit_vm_record(state, record.clone())?;
-    refresh_running_lifecycle(state, &record)?;
     state.supervisor.release_reservation_after_terminal(id)?;
-    Ok(record)
+    mark_running(state, record)
 }
 
 pub async fn resume_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
@@ -2764,9 +2870,36 @@ fn activation_gate(state: &AppState, id: Uuid) -> Result<Arc<tokio::sync::Mutex<
 /// one restore. This is deliberately callable before a supervisor operation
 /// gate exists: hibernation removes the old runtime and its operation gate.
 pub(crate) async fn ensure_active_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
-    let current = vm_get(state, id)?;
+    ensure_active_local_owned(state, id, None, None).await
+}
+
+/// Share ownership must be checked under the activation gate, before waking
+/// or cleaning up anything belonging to the current VM incarnation.
+pub(crate) async fn ensure_active_local_for_owner(
+    state: &AppState,
+    id: Uuid,
+    owner_key: &str,
+) -> Result<VmRecord, OrchError> {
+    ensure_active_local_owned(state, id, Some(owner_key), None).await
+}
+
+async fn ensure_active_local_owned(
+    state: &AppState,
+    id: Uuid,
+    owner_key: Option<&str>,
+    expected_vm: Option<&VmRecord>,
+) -> Result<VmRecord, OrchError> {
+    let gate = activation_gate(state, id)?;
+    let _activation = gate.lock().await;
+    let current = get_local(state, id)?;
+    if owner_key.is_some_and(|owner| current.owner_key.as_deref() != Some(owner)) {
+        return Err(OrchError::NotFound(format!("VM {id} not found")));
+    }
+    if let Some(expected) = expected_vm {
+        ensure_execution_incarnation(expected, &current)?;
+    }
     if current.status == VmStatus::Hibernated {
-        resume_hibernated_local(state, id, false).await
+        resume_hibernated_local_locked(state, id, false).await
     } else {
         if current.status == VmStatus::Running {
             cleanup_hibernation_snapshots_for_vm(state, id).await?;
@@ -2782,10 +2915,18 @@ async fn resume_hibernated_local(
 ) -> Result<VmRecord, OrchError> {
     let gate = activation_gate(state, id)?;
     let _activation = gate.lock().await;
+    resume_hibernated_local_locked(state, id, allow_degraded_artifact).await
+}
 
+/// Caller holds the activation gate.
+async fn resume_hibernated_local_locked(
+    state: &AppState,
+    id: Uuid,
+    allow_degraded_artifact: bool,
+) -> Result<VmRecord, OrchError> {
     // A waiter in the same ingress burst observes the first caller's durable
     // publication and never starts a second VMM.
-    let current = vm_get(state, id)?;
+    let current = get_local(state, id)?;
     if current.status != VmStatus::Hibernated {
         return if current.status == VmStatus::Running {
             Ok(current)
@@ -3034,7 +3175,11 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, _diff: bool) -> Result<S
     ensure_no_data_volumes(state, &vm, "snapshot").await?;
     let gate = state.supervisor.operation_gate(id)?;
     let _operation = gate.lock_owned().await;
-    Ok(snapshot_local_locked(state, id, None, None).await?.path)
+    Ok(
+        snapshot_local_locked(state, id, None, None, SnapshotMode::ResumeRunning)
+            .await?
+            .path,
+    )
 }
 
 pub(crate) struct ForkSnapshotOutcome {
@@ -3071,7 +3216,14 @@ pub async fn snapshot_local_for_fork(
     ensure_no_data_volumes(state, &source, "fork").await?;
     let gate = state.supervisor.operation_gate(source_id)?;
     let _operation = gate.lock_owned().await;
-    snapshot_local_locked(state, source_id, Some(child_id), Some(child_id)).await
+    snapshot_local_locked(
+        state,
+        source_id,
+        Some(child_id),
+        Some(child_id),
+        SnapshotMode::ResumeRunning,
+    )
+    .await
 }
 
 pub fn bind_localized_snapshot_to_fork(
@@ -3087,6 +3239,12 @@ pub fn bind_localized_snapshot_to_fork(
         .map_err(crate::api::store_err)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotMode {
+    ResumeRunning,
+    LeavePaused,
+}
+
 /// Snapshot implementation for callers that already hold the exact runtime's
 /// operation gate (hibernate must keep it through snapshot and teardown).
 async fn snapshot_local_locked(
@@ -3094,6 +3252,7 @@ async fn snapshot_local_locked(
     id: Uuid,
     ephemeral_owner_vm_id: Option<Uuid>,
     snapshot_id: Option<Uuid>,
+    mode: SnapshotMode,
 ) -> Result<ForkSnapshotOutcome, OrchError> {
     let vm = ensure_vm_status(
         state,
@@ -3119,6 +3278,12 @@ async fn snapshot_local_locked(
         // Released when the bundle's files are durable, even if this request
         // is abandoned while the capture runs.
         let _permit = permit;
+        if mode == SnapshotMode::LeavePaused {
+            // Hibernate must capture disk and RAM while parked, and stay parked
+            // through artifact replication, durable publication and shutdown.
+            sup.pause_vm(id)?;
+            return sup.snapshot_bundle_vm(id, false, overlay_path, memory_mib);
+        }
         if !running {
             return sup.snapshot_bundle_vm(id, false, overlay_path, memory_mib);
         }
@@ -3148,6 +3313,12 @@ async fn snapshot_local_locked(
     .await;
     let mut bundle = match bundle {
         Ok(Ok(bundle)) => bundle,
+        Ok(Err(error)) if mode == SnapshotMode::LeavePaused => return Err(error),
+        Err(error) if mode == SnapshotMode::LeavePaused => {
+            return Err(OrchError::Internal(format!(
+                "snapshot task failed: {error}"
+            )));
+        }
         Ok(Err(error)) => {
             return Err(reconcile_failed_live_operation(state, &vm, error).await);
         }
@@ -4257,10 +4428,16 @@ pub async fn put_egress_policy_local(
     Ok(policy)
 }
 
+/// DELETE must still authorize the tenant while a retryable transition is
+/// pending; stop_local serializes and finishes that transition before teardown.
+pub(crate) fn get_local_for_delete(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
+    vm_get(state, id)
+}
+
 pub fn get_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
     if matches!(
         lifecycle_state(state, id)?,
-        Some(LifecycleState::Reconciling { .. })
+        Some(LifecycleState::Reconciling { .. } | LifecycleState::Hibernating { .. })
     ) {
         return Err(OrchError::Unavailable(format!(
             "vm {id} lifecycle reconciliation is pending"
@@ -4639,7 +4816,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::sync::{Mutex, RwLock};
-    #[cfg(target_os = "linux")]
     use std::time::Duration;
     use tarit_store::Store;
 
@@ -4937,7 +5113,13 @@ mod tests {
             .install_test_control_runtime(id, PathBuf::from("unused.sock"));
 
         let error = test_runtime()
-            .block_on(exec_local(&state, id, "true".into(), 100, None))
+            .block_on(exec_local(
+                &state,
+                &vm_get(&state, id).unwrap(),
+                "true".into(),
+                100,
+                None,
+            ))
             .expect_err("exec against a suspended VM must be rejected");
 
         assert!(matches!(error, OrchError::Conflict(_)));
@@ -5286,7 +5468,13 @@ mod tests {
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
-            runtime.block_on(exec_local(&state, id, "true".into(), 100, None)),
+            runtime.block_on(exec_local(
+                &state,
+                &vm_get(&state, id).unwrap(),
+                "true".into(),
+                100,
+                None
+            )),
             Err(OrchError::Unavailable(_))
         ));
         assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
@@ -5500,6 +5688,313 @@ mod tests {
         std::fs::remove_file(&durable).unwrap();
         std::fs::remove_file(format!("{durable}.integrity")).unwrap();
         assert!(!socket.exists());
+    }
+
+    fn check_hibernation_capture(
+        fault: Option<LifecycleFault>,
+        fail_snapshot: bool,
+        delete_during_capture: bool,
+    ) {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let initial = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+        let scratch = PathBuf::from(format!(
+            "/tmp/vmm-snap-{}-{}.snap",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut scratch_file = options.open(&scratch).unwrap();
+        let memory = b"immutable RAM image";
+        let mut snapshot_bytes = Vec::new();
+        snapshot_bytes.extend_from_slice(b"VMSN");
+        snapshot_bytes.extend_from_slice(&1u16.to_le_bytes());
+        snapshot_bytes.extend_from_slice(&0u16.to_le_bytes());
+        snapshot_bytes.extend_from_slice(&0u64.to_le_bytes());
+        snapshot_bytes.extend_from_slice(&0u32.to_le_bytes());
+        snapshot_bytes.extend_from_slice(&(memory.len() as u64).to_le_bytes());
+        snapshot_bytes.extend_from_slice(&0u32.to_le_bytes());
+        snapshot_bytes.extend_from_slice(memory);
+        scratch_file.write_all(&snapshot_bytes).unwrap();
+        scratch_file.sync_all().unwrap();
+        drop(scratch_file);
+        let socket = PathBuf::from(format!(
+            "/tmp/taritd-snapshot-order-{}-{id}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<Arc<OwnedTaskControl>>();
+        let (capture_tx, capture_rx) = tokio::sync::oneshot::channel();
+        let mut capture_tx = Some(capture_tx);
+        let server_scratch = scratch.display().to_string();
+        let server = std::thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            let response = match &request {
+                tarit_vmm_client::ApiRequest::Status => {
+                    tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
+                        state: tarit_vmm_client::VmState::Paused,
+                        uptime_ms: 1,
+                        vcpus: 1,
+                        mem_mib: 256,
+                        volumes: 0,
+                        nets: 0,
+                        kernel: "kernel".into(),
+                        vcpu_alive: true,
+                    })
+                }
+                tarit_vmm_client::ApiRequest::Exec { .. } => tarit_vmm_client::ApiResponse::Exec {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    duration_ms: 1,
+                },
+                tarit_vmm_client::ApiRequest::Snapshot { .. } if fail_snapshot => {
+                    if delete_during_capture {
+                        capture_tx.take().unwrap().send(()).unwrap();
+                        // Hold the capture response until DELETE has marked
+                        // this exact supervisor-owned worker for cancellation.
+                        task_rx.recv().unwrap().wait_for_cancellation();
+                    }
+                    tarit_vmm_client::ApiResponse::Err {
+                        msg: "injected capture failure".into(),
+                    }
+                }
+                tarit_vmm_client::ApiRequest::Snapshot { .. } => {
+                    tarit_vmm_client::ApiResponse::Snapshot {
+                        path: server_scratch.clone(),
+                        overlay_path: None,
+                        volume_paths: Vec::new(),
+                        integrity_path: None,
+                        live_stats: None,
+                    }
+                }
+                _ => tarit_vmm_client::ApiResponse::Ok,
+            };
+            let encoded = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(encoded.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&encoded).unwrap();
+            stream.flush().unwrap();
+            let stopped = matches!(request, tarit_vmm_client::ApiRequest::Stop);
+            requests_tx.send(request).unwrap();
+            if stopped {
+                break;
+            }
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(id, socket.clone());
+
+        mark_running(&state, initial.clone()).unwrap();
+        state
+            .scheduler
+            .reserve_existing(id, crate::scheduler::ResourceShape::new(1, 256))
+            .unwrap();
+        if let Some(fault) = fault {
+            inject_lifecycle_fault(&state, fault);
+        }
+        let identity = crate::config::ApiIdentity {
+            tenant: "test".into(),
+            role: ApiRole::Admin,
+            max_vms: None,
+            api_key_id: "test".into(),
+        };
+        let runtime = test_runtime();
+        let result = runtime.block_on(async {
+            if delete_during_capture {
+                let request_state = state.clone();
+                let request = tokio::spawn(async move {
+                    let worker_state = request_state.clone();
+                    run_supervised_lifecycle(&request_state, id, move |task| async move {
+                        task_tx.send(Arc::clone(&task)).unwrap();
+                        hibernate_local_owned(&worker_state, id, &identity, &task).await
+                    })
+                    .await
+                });
+                capture_rx.await.expect("capture must start before DELETE");
+                assert!(state.supervisor.has_owned_task(id));
+                stop_local(&state, id)
+                    .await
+                    .expect("DELETE must converge despite the failed capture");
+                request.await.expect("hibernate waiter must complete")
+            } else {
+                hibernate_local(&state, id, &identity).await
+            }
+        });
+        if fail_snapshot {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("injected capture failure"));
+            assert!(state
+                .store
+                .lock()
+                .unwrap()
+                .get_hibernation("test", id)
+                .is_err());
+            if delete_during_capture {
+                assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+                assert_eq!(
+                    state.store.lock().unwrap().get_vm(id).unwrap().status,
+                    VmStatus::Stopped
+                );
+                assert!(!state.supervisor.is_running(id));
+                assert!(!state.supervisor.has_owned_task(id));
+                assert!(!state.scheduler.is_reserved(id));
+                assert!(lifecycle_state(&state, id).unwrap().is_none());
+            } else {
+                assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+                assert!(state.supervisor.is_running(id));
+                state.supervisor.stop_vm(id).unwrap();
+            }
+        } else {
+            if fault.is_some() {
+                assert!(result.is_err());
+                assert!(!state.supervisor.is_running(id));
+                assert!(state.scheduler.is_reserved(id));
+                assert!(matches!(
+                    lifecycle_state(&state, id).unwrap(),
+                    Some(LifecycleState::Hibernating { .. })
+                ));
+                assert!(matches!(
+                    get_local(&state, id),
+                    Err(OrchError::Unavailable(_))
+                ));
+                assert!(matches!(
+                    runtime.block_on(ensure_active_local(&state, id)),
+                    Err(OrchError::Unavailable(_))
+                ));
+                assert_eq!(
+                    runtime
+                        .block_on(cleanup_hibernation_snapshots_for_vm(&state, id))
+                        .unwrap(),
+                    0
+                );
+                let failures = runtime.block_on(reconcile_unexpected_vmm_exits(&state));
+                assert!(failures.is_empty(), "{failures:?}");
+            } else {
+                assert_eq!(result.unwrap().status, VmStatus::Hibernated);
+            }
+            assert_eq!(get_local(&state, id).unwrap().status, VmStatus::Hibernated);
+            assert_eq!(
+                state.store.lock().unwrap().get_vm(id).unwrap().status,
+                VmStatus::Hibernated
+            );
+            assert!(!state.scheduler.is_reserved(id));
+            let durable = state
+                .store
+                .lock()
+                .unwrap()
+                .get_hibernation("test", id)
+                .unwrap()
+                .snapshot_path;
+            assert_eq!(std::fs::read(&durable).unwrap(), snapshot_bytes);
+            std::fs::remove_file(&durable).unwrap();
+            std::fs::remove_file(format!("{durable}.integrity")).unwrap();
+        }
+        server.join().unwrap();
+        let requests = requests_rx.into_iter().collect::<Vec<_>>();
+        if fail_snapshot {
+            if delete_during_capture {
+                assert!(
+                    matches!(
+                        requests.as_slice(),
+                        [
+                            tarit_vmm_client::ApiRequest::Pause,
+                            tarit_vmm_client::ApiRequest::Snapshot {
+                                live: false,
+                                resume: false,
+                                ..
+                            },
+                            tarit_vmm_client::ApiRequest::Stop,
+                        ]
+                    ),
+                    "cancelled capture must stop without resuming: {requests:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        requests.as_slice(),
+                        [
+                            tarit_vmm_client::ApiRequest::Pause,
+                            tarit_vmm_client::ApiRequest::Snapshot {
+                                live: false,
+                                resume: false,
+                                ..
+                            },
+                            tarit_vmm_client::ApiRequest::Status,
+                            tarit_vmm_client::ApiRequest::Resume,
+                            tarit_vmm_client::ApiRequest::Exec { .. },
+                            tarit_vmm_client::ApiRequest::Stop,
+                        ]
+                    ),
+                    "{requests:?}"
+                );
+            }
+            std::fs::remove_file(&scratch).unwrap();
+        } else {
+            assert!(
+                matches!(
+                    requests.as_slice(),
+                    [
+                        tarit_vmm_client::ApiRequest::Pause,
+                        tarit_vmm_client::ApiRequest::Snapshot {
+                            live: false,
+                            resume: false,
+                            ..
+                        },
+                        tarit_vmm_client::ApiRequest::ReleaseScratch { .. },
+                        tarit_vmm_client::ApiRequest::Stop,
+                    ]
+                ),
+                "guest must stay paused until stop: {requests:?}"
+            );
+        }
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn hibernation_stays_paused_until_stop() {
+        check_hibernation_capture(None, false, false);
+    }
+
+    #[test]
+    fn hibernation_retries_every_post_stop_publication_failure() {
+        for fault in [
+            LifecycleFault::FleetClaim,
+            LifecycleFault::SQLite,
+            LifecycleFault::CacheCommit,
+        ] {
+            check_hibernation_capture(Some(fault), false, false);
+        }
+    }
+
+    #[test]
+    fn failed_hibernation_capture_resumes_the_source() {
+        check_hibernation_capture(None, true, false);
+    }
+
+    #[test]
+    fn delete_during_failed_hibernation_capture_converges_without_resume() {
+        check_hibernation_capture(None, true, true);
     }
 
     #[test]
@@ -6356,6 +6851,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,

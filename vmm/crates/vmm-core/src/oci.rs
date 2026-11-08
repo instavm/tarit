@@ -19,7 +19,7 @@
 use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -325,6 +325,12 @@ fn engine_image_source(reference: &str) -> Option<(&'static str, &str)> {
         .map(|name| ("podman", name))
 }
 
+// Darwin's mode_t is u16, while Linux uses u32; exported ext4 modes are u32.
+#[allow(clippy::useless_conversion)]
+fn image_mode(mode: libc::mode_t) -> u32 {
+    u32::from(mode)
+}
+
 /// Owner, mode and type of one exported entry, applied to the ext4 image when
 /// the build runs without root and could not preserve them while unpacking.
 struct EntryMeta {
@@ -334,6 +340,46 @@ struct EntryMeta {
     mode: u32,
     /// Device numbers for character and block devices.
     device: Option<(u32, u32)>,
+}
+
+type InodeIdentity = (u64, u64);
+
+#[derive(Default)]
+struct ExportMetadata {
+    inodes: HashMap<InodeIdentity, EntryMeta>,
+    paths: HashMap<PathBuf, InodeIdentity>,
+    special: HashMap<PathBuf, EntryMeta>,
+}
+
+fn inode_identity(metadata: &std::fs::Metadata) -> InodeIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+/// Match tar::Entry::unpack_in's path normalization, including leading './'.
+fn export_relative_path(path: &Path) -> Result<PathBuf, OciError> {
+    use std::path::Component;
+    let mut relative = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => relative.push(name),
+            Component::CurDir | Component::RootDir => {}
+            _ => return Err(OciError::UnsafePath(path.display().to_string())),
+        }
+    }
+    Ok(relative)
+}
+
+fn debugfs_path(path: &Path) -> Result<String, OciError> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| OciError::UnsafePath("image ownership requires UTF-8 paths".into()))?;
+    if text.contains(['"', '\\']) || text.chars().any(char::is_control) {
+        return Err(OciError::UnsafePath(format!(
+            "path cannot be represented safely in debugfs: {path:?}"
+        )));
+    }
+    Ok(format!("\"/{text}\""))
 }
 
 /// Build an ext4 image from an image a local container engine can export.
@@ -463,7 +509,7 @@ fn unpack_export<R: Read>(
     rootfs: &Path,
     limits: OciResourceLimits,
     rootless: bool,
-) -> Result<HashMap<PathBuf, EntryMeta>, OciError> {
+) -> Result<ExportMetadata, OciError> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut archive = tar::Archive::new(reader);
@@ -471,7 +517,7 @@ fn unpack_export<R: Read>(
     archive.set_preserve_ownerships(!rootless);
     archive.set_unpack_xattrs(!rootless);
     archive.set_overwrite(true);
-    let mut metadata = HashMap::new();
+    let mut metadata = ExportMetadata::default();
     let mut entries = 0u64;
     let mut expanded = 0u64;
     for entry in archive.entries()? {
@@ -498,7 +544,14 @@ fn unpack_export<R: Read>(
         if relative.as_os_str().len() > limits.max_path_bytes {
             return Err(OciError::ResourceLimit("path too long".into()));
         }
+        let relative = export_relative_path(&relative)?;
+        if rootless {
+            debugfs_path(&relative)?;
+        }
         let kind = entry.header().entry_type();
+        if relative.as_os_str().is_empty() && kind != tar::EntryType::Directory {
+            return Err(OciError::UnsafePath("non-directory archive root".into()));
+        }
         let mode = entry.header().mode()? & 0o7777;
         let type_bits = match kind {
             tar::EntryType::Directory => libc::S_IFDIR,
@@ -521,7 +574,7 @@ fn unpack_export<R: Read>(
         let meta = EntryMeta {
             uid: entry.header().uid()?,
             gid: entry.header().gid()?,
-            mode: type_bits | mode,
+            mode: image_mode(type_bits) | mode,
             device,
         };
         let special = matches!(
@@ -530,7 +583,8 @@ fn unpack_export<R: Read>(
         );
         if rootless && special {
             // Device nodes and FIFOs are created in the image by debugfs.
-            metadata.insert(relative, meta);
+            metadata.paths.remove(&relative);
+            metadata.special.insert(relative, meta);
             continue;
         }
         if !entry.unpack_in(rootfs)? {
@@ -545,9 +599,21 @@ fn unpack_export<R: Read>(
             };
             std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(usable))?;
         }
-        if kind != tar::EntryType::Link {
-            metadata.insert(relative, meta);
+        let identity = inode_identity(&std::fs::symlink_metadata(rootfs.join(&relative))?);
+        if kind == tar::EntryType::Link {
+            // The inode's original entry, not the hardlink header, owns its
+            // metadata. Keep it even if its original pathname is replaced.
+            if !metadata.inodes.contains_key(&identity) {
+                return Err(OciError::UnsafePath(format!(
+                    "hardlink target has no exported inode metadata: {}",
+                    relative.display()
+                )));
+            }
+        } else {
+            metadata.inodes.insert(identity, meta);
         }
+        metadata.special.remove(&relative);
+        metadata.paths.insert(relative, identity);
     }
     Ok(metadata)
 }
@@ -557,73 +623,11 @@ fn unpack_export<R: Read>(
 /// as the exec agent, belong to root.
 fn restore_image_ownership(
     rootfs: &Path,
-    metadata: &HashMap<PathBuf, EntryMeta>,
+    metadata: &ExportMetadata,
     image: &Path,
     workspace: &Path,
 ) -> Result<(), OciError> {
-    use std::fmt::Write as _;
-    use std::os::unix::fs::MetadataExt;
-
-    let quoted = |path: &Path| -> Option<String> {
-        let text = path.to_str()?;
-        (!text.contains(['"', '\n', '\\'])).then(|| format!("\"/{text}\""))
-    };
-    let mut script = String::from("sif / uid 0\nsif / gid 0\n");
-    let mut skipped = 0usize;
-    for (path, meta) in metadata {
-        let Some(name) = quoted(path) else {
-            skipped += 1;
-            continue;
-        };
-        if path.as_os_str().is_empty() || path == Path::new(".") {
-            let _ = writeln!(script, "sif / mode 0{:o}", meta.mode);
-            continue;
-        }
-        match (meta.mode & libc::S_IFMT, meta.device) {
-            (libc::S_IFCHR, Some((major, minor))) => {
-                let _ = writeln!(script, "mknod {name} c {major} {minor}");
-            }
-            (libc::S_IFBLK, Some((major, minor))) => {
-                let _ = writeln!(script, "mknod {name} b {major} {minor}");
-            }
-            (libc::S_IFIFO, _) => {
-                let _ = writeln!(script, "mknod {name} p");
-            }
-            _ => {}
-        }
-        let _ = writeln!(script, "sif {name} uid {}", meta.uid);
-        let _ = writeln!(script, "sif {name} gid {}", meta.gid);
-        if meta.mode & libc::S_IFMT != libc::S_IFLNK {
-            let _ = writeln!(script, "sif {name} mode 0{:o}", meta.mode);
-        }
-    }
-    // Anything else in the staged tree was added by this build.
-    let mut stack = vec![PathBuf::new()];
-    while let Some(dir) = stack.pop() {
-        for child in std::fs::read_dir(rootfs.join(&dir))? {
-            let child = child?;
-            let relative = dir.join(child.file_name());
-            let file_type = child.file_type()?;
-            if file_type.is_dir() {
-                stack.push(relative.clone());
-            }
-            if metadata.contains_key(&relative) {
-                continue;
-            }
-            let Some(name) = quoted(&relative) else {
-                skipped += 1;
-                continue;
-            };
-            let stat = std::fs::symlink_metadata(child.path())?;
-            if stat.uid() == 0 {
-                continue;
-            }
-            let _ = writeln!(script, "sif {name} uid 0\nsif {name} gid 0");
-        }
-    }
-    if skipped > 0 {
-        log::warn!("oci: {skipped} paths with quotes or newlines keep the build user's owner");
-    }
+    let script = image_ownership_script(rootfs, metadata)?;
     let script_path = workspace.join("ownership.debugfs");
     std::fs::write(&script_path, script)?;
     let mut debugfs = Command::new("debugfs");
@@ -650,6 +654,80 @@ fn restore_image_ownership(
         });
     }
     Ok(())
+}
+
+fn image_ownership_script(rootfs: &Path, metadata: &ExportMetadata) -> Result<String, OciError> {
+    use std::fmt::Write as _;
+
+    // Only identities still reachable at an exported path retain image
+    // metadata. A file injected by the build must not inherit an old entry's
+    // owner just because its pathname (or a recycled inode number) matches.
+    let live: HashSet<_> = metadata
+        .paths
+        .iter()
+        .filter_map(|(path, expected)| {
+            std::fs::symlink_metadata(rootfs.join(path))
+                .ok()
+                .filter(|stat| inode_identity(stat) == *expected)
+                .map(|_| *expected)
+        })
+        .collect();
+    let mut script = String::from("sif / uid 0\nsif / gid 0\n");
+    let mut seen = HashSet::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        let stat = std::fs::symlink_metadata(rootfs.join(&relative))?;
+        if stat.is_dir() {
+            let mut children = std::fs::read_dir(rootfs.join(&relative))?
+                .map(|child| child.map(|child| relative.join(child.file_name())))
+                .collect::<Result<Vec<_>, _>>()?;
+            children.sort();
+            stack.extend(children.into_iter().rev());
+        }
+        let name = debugfs_path(&relative)?;
+        let identity = inode_identity(&stat);
+        if !seen.insert(identity) {
+            continue;
+        }
+        let meta = live
+            .contains(&identity)
+            .then(|| metadata.inodes.get(&identity))
+            .flatten();
+        if relative.as_os_str().is_empty() {
+            if let Some(meta) = meta {
+                let _ = writeln!(script, "sif / mode 0{:o}", meta.mode);
+            }
+            continue;
+        }
+        if let Some(meta) = meta {
+            let _ = writeln!(script, "sif {name} uid {}", meta.uid);
+            let _ = writeln!(script, "sif {name} gid {}", meta.gid);
+            if meta.mode & image_mode(libc::S_IFMT) != image_mode(libc::S_IFLNK) {
+                let _ = writeln!(script, "sif {name} mode 0{:o}", meta.mode);
+            }
+        } else {
+            let _ = writeln!(script, "sif {name} uid 0\nsif {name} gid 0");
+        }
+    }
+    for (path, meta) in &metadata.special {
+        let name = debugfs_path(path)?;
+        match (meta.mode & image_mode(libc::S_IFMT), meta.device) {
+            (kind, Some((major, minor))) if kind == image_mode(libc::S_IFCHR) => {
+                let _ = writeln!(script, "mknod {name} c {major} {minor}");
+            }
+            (kind, Some((major, minor))) if kind == image_mode(libc::S_IFBLK) => {
+                let _ = writeln!(script, "mknod {name} b {major} {minor}");
+            }
+            (kind, _) if kind == image_mode(libc::S_IFIFO) => {
+                let _ = writeln!(script, "mknod {name} p");
+            }
+            _ => {}
+        }
+        let _ = writeln!(script, "sif {name} uid {}", meta.uid);
+        let _ = writeln!(script, "sif {name} gid {}", meta.gid);
+        let _ = writeln!(script, "sif {name} mode 0{:o}", meta.mode);
+    }
+    Ok(script)
 }
 
 fn resolved_output_path(output_path: &Path) -> Result<PathBuf, OciError> {
@@ -1482,14 +1560,15 @@ mod tests {
         let limits = test_limits(1 << 20, 64);
         let meta = unpack_export(&tarball[..], dir.path(), limits, true).unwrap();
 
-        let secret = &meta[Path::new("ro/secret")];
+        let entry = |path: &str| &meta.inodes[&meta.paths[Path::new(path)]];
+        let secret = entry("ro/secret");
         assert_eq!(
             (secret.uid, secret.gid, secret.mode),
-            (0, 42, libc::S_IFREG)
+            (0, 42, image_mode(libc::S_IFREG))
         );
-        assert_eq!(meta[Path::new("passwd")].mode, libc::S_IFREG | 0o4755);
-        assert_eq!(meta[Path::new("ro")].mode, libc::S_IFDIR | 0o555);
-        assert_eq!(meta[Path::new("null")].device, Some((1, 3)));
+        assert_eq!(entry("passwd").mode, image_mode(libc::S_IFREG) | 0o4755);
+        assert_eq!(entry("ro").mode, image_mode(libc::S_IFDIR) | 0o555);
+        assert_eq!(meta.special[Path::new("null")].device, Some((1, 3)));
         // The staged copy is readable by the build user and the device node
         // is left for debugfs.
         assert_eq!(
@@ -1503,6 +1582,122 @@ mod tests {
             "no setuid on the host"
         );
         assert!(!dir.path().join("null").exists());
+    }
+
+    #[test]
+    fn rootless_hardlinks_keep_the_exported_inode_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut original = tar::Header::new_gnu();
+        original.set_entry_type(tar::EntryType::Regular);
+        original.set_mode(0o640);
+        original.set_uid(1000);
+        original.set_gid(1001);
+        original.set_size(4);
+        builder
+            .append_data(&mut original, "original", &b"data"[..])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Link);
+        // A hardlink header's owner/mode are not the shared inode metadata.
+        link.set_mode(0o777);
+        link.set_uid(0);
+        link.set_gid(0);
+        link.set_size(0);
+        link.set_link_name("original").unwrap();
+        builder.append_data(&mut link, "alias", &b""[..]).unwrap();
+        let tarball = builder.into_inner().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let metadata =
+            unpack_export(&tarball[..], dir.path(), test_limits(1 << 20, 64), true).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(dir.path().join("original"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(dir.path().join("alias")).unwrap().ino(),
+        );
+        let script = image_ownership_script(dir.path(), &metadata).unwrap();
+        assert!(script.contains("sif \"/alias\" uid 1000\n"));
+        assert!(script.contains("sif \"/alias\" gid 1001\n"));
+        assert!(script.contains("sif \"/alias\" mode 0100640\n"));
+        assert!(
+            !script.contains("/original"),
+            "each shared inode must receive metadata only once"
+        );
+    }
+
+    #[test]
+    fn rootless_hardlink_retains_root_owner_after_target_replacement() {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, uid, gid, mode, link) in [
+            ("./target", 0, 0, 0o644, None),
+            ("alias", 1000, 1001, 0o777, Some("target")),
+            ("target", 2000, 2001, 0o600, None),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_uid(uid);
+            header.set_gid(gid);
+            header.set_mode(mode);
+            let data = if let Some(target) = link {
+                header.set_entry_type(tar::EntryType::Link);
+                header.set_link_name(target).unwrap();
+                &b""[..]
+            } else {
+                header.set_entry_type(tar::EntryType::Regular);
+                &b"data"[..]
+            };
+            header.set_size(data.len() as u64);
+            builder.append_data(&mut header, path, data).unwrap();
+        }
+        let tarball = builder.into_inner().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let metadata =
+            unpack_export(&tarball[..], dir.path(), test_limits(1 << 20, 64), true).unwrap();
+        assert_ne!(
+            metadata.paths[Path::new("alias")],
+            metadata.paths[Path::new("target")]
+        );
+        let script = image_ownership_script(dir.path(), &metadata).unwrap();
+        assert!(script.contains("sif \"/alias\" uid 0\n"));
+        assert!(script.contains("sif \"/alias\" gid 0\n"));
+        assert!(script.contains("sif \"/alias\" mode 0100644\n"));
+        assert!(script.contains("sif \"/target\" uid 2000\n"));
+        assert!(script.contains("sif \"/target\" gid 2001\n"));
+        assert!(script.contains("sif \"/target\" mode 0100600\n"));
+
+        // A build-injected replacement at an exported pathname is a new
+        // inode and must receive root ownership, not the image entry's UID.
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"agent").unwrap();
+        std::fs::rename(&replacement, dir.path().join("target")).unwrap();
+        let script = image_ownership_script(dir.path(), &metadata).unwrap();
+        assert!(script.contains("sif \"/target\" uid 0\nsif \"/target\" gid 0\n"));
+        assert!(!script.contains("uid 2000"));
+    }
+
+    #[test]
+    fn rootless_ownership_rejects_unrepresentable_paths() {
+        use std::os::unix::ffi::OsStrExt;
+        for name in ["quote\"name", "line\nname", "slash\\name", "line\rname"] {
+            assert!(matches!(
+                debugfs_path(Path::new(name)),
+                Err(OciError::UnsafePath(_))
+            ));
+        }
+        assert!(debugfs_path(Path::new(std::ffi::OsStr::from_bytes(b"bad-\xff"))).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bad\"name"), b"data").unwrap();
+        assert!(matches!(
+            image_ownership_script(dir.path(), &ExportMetadata::default()),
+            Err(OciError::UnsafePath(_))
+        ));
+        assert_eq!(
+            export_relative_path(Path::new("/./a//b")).unwrap(),
+            Path::new("a/b")
+        );
+        assert!(export_relative_path(Path::new("a/../b")).is_err());
     }
 
     fn test_limits(max_expanded_bytes: u64, max_entries: u64) -> OciResourceLimits {
