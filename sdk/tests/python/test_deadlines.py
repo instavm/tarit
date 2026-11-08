@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import UUID
 
 import httpx
 from tarit_sdk import high_level
@@ -26,6 +28,63 @@ class Clock:
 
 
 class SyncDeadlineTests(unittest.TestCase):
+    def test_fork_deadline_exposes_generated_id_after_late_success(self) -> None:
+        clock = Clock()
+        ids = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            child_id = json.loads(request.content)["id"]
+            ids.append(child_id)
+            clock.advance(2)
+            result = fork_result()
+            result["vm"]["id"] = child_id
+            return httpx.Response(201, json=result)
+
+        with (
+            clock.patched(),
+            TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client,
+            self.assertRaises(TaritDeadlineExceeded) as raised,
+        ):
+            client.fork(VM_ID, deadline_seconds=1)
+        self.assertEqual(raised.exception.child_id, UUID(ids[0]))
+        self.assertIn(ids[0], str(raised.exception))
+        self.assertEqual(len(ids), 1)
+
+    def test_fork_transport_retry_deadline_retains_the_same_id(self) -> None:
+        for supplied in (None, CHILD_ID):
+            with self.subTest(child_id=supplied):
+                clock = Clock()
+                ids = []
+
+                def handler(request: httpx.Request, clock=clock, ids=ids) -> httpx.Response:
+                    ids.append(json.loads(request.content)["id"])
+                    clock.advance(0.1 if len(ids) == 1 else 2)
+                    raise httpx.ReadTimeout("response lost", request=request)
+
+                with (
+                    clock.patched(),
+                    TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client,
+                    self.assertRaises(TaritDeadlineExceeded) as raised,
+                ):
+                    client.fork(VM_ID, child_id=supplied, deadline_seconds=1)
+                self.assertEqual(len(ids), 2)
+                self.assertEqual(ids, [str(raised.exception.child_id)] * 2)
+                if supplied is not None:
+                    self.assertEqual(raised.exception.child_id, supplied)
+
+    def test_invalid_fork_deadline_does_not_generate_or_submit_a_child(self) -> None:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            self.fail("invalid deadline must not submit a fork")
+
+        with (
+            patch("tarit_sdk.high_level.uuid4") as new_id,
+            TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client,
+        ):
+            for value in (0, -1, float("inf"), float("nan")):
+                with self.subTest(deadline=value), self.assertRaises(ValueError):
+                    client.fork(VM_ID, deadline_seconds=value)
+            new_id.assert_not_called()
+
     def test_response_decoding_counts_toward_deadline(self) -> None:
         clock = Clock()
         parse = high_level._parsed
@@ -161,6 +220,73 @@ class SyncDeadlineTests(unittest.TestCase):
 
 
 class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fork_deadline_exposes_generated_id_after_late_success(self) -> None:
+        clock = Clock()
+        ids = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            child_id = json.loads(request.content)["id"]
+            ids.append(child_id)
+            clock.advance(2)
+            result = fork_result()
+            result["vm"]["id"] = child_id
+            return httpx.Response(201, json=result)
+
+        with clock.patched():
+            async with AsyncTaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+                with self.assertRaises(TaritDeadlineExceeded) as raised:
+                    await client.fork(VM_ID, deadline_seconds=1)
+        self.assertEqual(raised.exception.child_id, UUID(ids[0]))
+        self.assertIn(ids[0], str(raised.exception))
+        self.assertEqual(len(ids), 1)
+
+    async def test_fork_transport_retry_deadline_retains_the_same_id(self) -> None:
+        for supplied in (None, CHILD_ID):
+            with self.subTest(child_id=supplied):
+                clock = Clock()
+                ids = []
+
+                async def handler(request: httpx.Request, clock=clock, ids=ids) -> httpx.Response:
+                    ids.append(json.loads(request.content)["id"])
+                    clock.advance(0.1 if len(ids) == 1 else 2)
+                    raise httpx.ReadTimeout("response lost", request=request)
+
+                with clock.patched():
+                    async with AsyncTaritClient(
+                        "https://tarit.test", "key", transport=httpx.MockTransport(handler)
+                    ) as client:
+                        with self.assertRaises(TaritDeadlineExceeded) as raised:
+                            await client.fork(VM_ID, child_id=supplied, deadline_seconds=1)
+                self.assertEqual(len(ids), 2)
+                self.assertEqual(ids, [str(raised.exception.child_id)] * 2)
+                if supplied is not None:
+                    self.assertEqual(raised.exception.child_id, supplied)
+
+    async def test_fork_cancellation_at_deadline_exposes_generated_id(self) -> None:
+        ids = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            ids.append(json.loads(request.content)["id"])
+            await asyncio.sleep(60)
+            self.fail("request was not cancelled")
+
+        async with AsyncTaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(TaritDeadlineExceeded) as raised:
+                await client.fork(VM_ID, deadline_seconds=0.01)
+        self.assertEqual(raised.exception.child_id, UUID(ids[0]))
+        self.assertIn(ids[0], str(raised.exception))
+
+    async def test_invalid_fork_deadline_does_not_generate_or_submit_a_child(self) -> None:
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            self.fail("invalid deadline must not submit a fork")
+
+        with patch("tarit_sdk.high_level.uuid4") as new_id:
+            async with AsyncTaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+                for value in (0, -1, float("inf"), float("nan")):
+                    with self.subTest(deadline=value), self.assertRaises(ValueError):
+                        await client.fork(VM_ID, deadline_seconds=value)
+                new_id.assert_not_called()
+
     async def test_response_decoding_counts_toward_deadline(self) -> None:
         clock = Clock()
         parse = high_level._parsed

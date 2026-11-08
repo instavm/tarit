@@ -46,7 +46,13 @@ class TaritApiError(Exception):
 
 
 class TaritDeadlineExceeded(TimeoutError):
-    pass
+    """The client stopped waiting; a fork may still exist at ``child_id``."""
+
+    def __init__(self, message: str, *, child_id: UUID | None = None) -> None:
+        self.child_id = child_id
+        if child_id is not None:
+            message = f"{message}; fork may have completed as child {child_id}"
+        super().__init__(message)
 
 
 class TaritPtyClosed(ConnectionError):
@@ -413,26 +419,29 @@ class TaritClient:
         child_id: UUID | None = None,
         deadline_seconds: float = 30.0,
     ) -> ForkVmResponse:
-        """Fork with one stable child id across transport and overload retries."""
+        """Fork with one retry id, also exposed on TaritDeadlineExceeded.child_id."""
         deadline = _deadline(deadline_seconds)
         child_id = child_id or uuid4()
         operation = f"fork VM {vm_id}"
         attempt = 0
-        while True:
-            try:
-                response = self._request(
-                    deadline, operation, **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id))
-                )
-            except httpx.TransportError:
-                response = None
-            if response is not None and response.status_code not in RETRYABLE_STATUS:
-                result = _parsed(
-                    fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
-                )
-                _remaining(deadline, operation)
-                return result
-            time.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
-            attempt += 1
+        try:
+            while True:
+                try:
+                    response = self._request(
+                        deadline, operation, **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id))
+                    )
+                except httpx.TransportError:
+                    response = None
+                if response is not None and response.status_code not in RETRYABLE_STATUS:
+                    result = _parsed(
+                        fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
+                    )
+                    _remaining(deadline, operation)
+                    return result
+                time.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
+                attempt += 1
+        except TaritDeadlineExceeded as error:
+            raise TaritDeadlineExceeded(str(error), child_id=child_id) from error
 
     def execute(
         self,
@@ -597,21 +606,24 @@ class AsyncTaritClient:
         child_id = child_id or uuid4()
         operation = f"fork VM {vm_id}"
         attempt = 0
-        while True:
-            try:
-                response = await self._request(
-                    deadline, operation, **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id))
-                )
-            except httpx.TransportError:
-                response = None
-            if response is not None and response.status_code not in RETRYABLE_STATUS:
-                result = _parsed(
-                    fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
-                )
-                _remaining(deadline, operation)
-                return result
-            await asyncio.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
-            attempt += 1
+        try:
+            while True:
+                try:
+                    response = await self._request(
+                        deadline, operation, **fork_vm_api._get_kwargs(vm_id, body=ForkVmRequest(id=child_id))
+                    )
+                except httpx.TransportError:
+                    response = None
+                if response is not None and response.status_code not in RETRYABLE_STATUS:
+                    result = _parsed(
+                        fork_vm_api._build_response(client=self.raw, response=response), ForkVmResponse, "fork VM"
+                    )
+                    _remaining(deadline, operation)
+                    return result
+                await asyncio.sleep(min(_retry_delay(attempt), _remaining(deadline, operation)))
+                attempt += 1
+        except TaritDeadlineExceeded as error:
+            raise TaritDeadlineExceeded(str(error), child_id=child_id) from error
 
     async def execute(
         self,

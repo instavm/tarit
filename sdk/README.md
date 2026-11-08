@@ -57,6 +57,11 @@ with TaritClient("https://tarit.example", "tenant-api-key") as tarit:
 Generated models and operation modules remain available under `tarit_sdk.models`
 and `tarit_sdk.api`.
 
+A fork deadline stops waiting; it does not cancel creation on the server. Catch
+`TaritDeadlineExceeded` and use its `child_id` to query or delete the child VM,
+or retry the fork with that same `child_id`. The error exposes the stable ID
+whether you supplied it or the SDK generated it.
+
 ## TypeScript
 
 The package in `sdk/typescript` supports Node.js 20 and later and browser fetch
