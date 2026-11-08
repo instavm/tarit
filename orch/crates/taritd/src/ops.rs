@@ -2230,24 +2230,37 @@ pub(crate) fn exec_gate_deadline(
         + std::time::Duration::from_millis(config.api_request_timeout_ms.saturating_sub(timeout_ms))
 }
 
-/// `gate_deadline` bounds the wait behind other operations on the VM for
-/// callers holding an API request (and its in-flight permit); background
-/// execs pass `None` and queue.
+/// Execute only against the owner/incarnation already authorized by ingress.
+/// The deadline bounds queueing independently of the guest runtime timeout.
 pub async fn exec_local(
     state: &AppState,
-    vm_id: Uuid,
+    expected_vm: &VmRecord,
     command: String,
     timeout_ms: u64,
     gate_deadline: Option<tokio::time::Instant>,
 ) -> Result<(i32, String, String, u64), OrchError> {
-    ensure_active_local(state, vm_id).await?;
+    let vm_id = expected_vm.id;
+    ensure_active_local_owned(state, vm_id, None, Some(expected_vm)).await?;
     let gate = state.supervisor.operation_gate(vm_id)?;
     let _operation = lock_operation_gate(gate, vm_id, gate_deadline).await?;
-    ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
+    let current = ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
+    ensure_execution_incarnation(expected_vm, &current)?;
     let sup = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms))
         .await
         .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+}
+
+fn ensure_execution_incarnation(expected: &VmRecord, current: &VmRecord) -> Result<(), OrchError> {
+    if expected.id != current.id
+        || expected.owner_key != current.owner_key
+        || expected.created_at != current.created_at
+    {
+        return Err(OrchError::Conflict(
+            "VM incarnation changed before execution".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn lock_operation_gate(
@@ -2857,9 +2870,34 @@ fn activation_gate(state: &AppState, id: Uuid) -> Result<Arc<tokio::sync::Mutex<
 /// one restore. This is deliberately callable before a supervisor operation
 /// gate exists: hibernation removes the old runtime and its operation gate.
 pub(crate) async fn ensure_active_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
+    ensure_active_local_owned(state, id, None, None).await
+}
+
+/// Share ownership must be checked under the activation gate, before waking
+/// or cleaning up anything belonging to the current VM incarnation.
+pub(crate) async fn ensure_active_local_for_owner(
+    state: &AppState,
+    id: Uuid,
+    owner_key: &str,
+) -> Result<VmRecord, OrchError> {
+    ensure_active_local_owned(state, id, Some(owner_key), None).await
+}
+
+async fn ensure_active_local_owned(
+    state: &AppState,
+    id: Uuid,
+    owner_key: Option<&str>,
+    expected_vm: Option<&VmRecord>,
+) -> Result<VmRecord, OrchError> {
     let gate = activation_gate(state, id)?;
     let _activation = gate.lock().await;
     let current = get_local(state, id)?;
+    if owner_key.is_some_and(|owner| current.owner_key.as_deref() != Some(owner)) {
+        return Err(OrchError::NotFound(format!("VM {id} not found")));
+    }
+    if let Some(expected) = expected_vm {
+        ensure_execution_incarnation(expected, &current)?;
+    }
     if current.status == VmStatus::Hibernated {
         resume_hibernated_local_locked(state, id, false).await
     } else {
@@ -5075,7 +5113,13 @@ mod tests {
             .install_test_control_runtime(id, PathBuf::from("unused.sock"));
 
         let error = test_runtime()
-            .block_on(exec_local(&state, id, "true".into(), 100, None))
+            .block_on(exec_local(
+                &state,
+                &vm_get(&state, id).unwrap(),
+                "true".into(),
+                100,
+                None,
+            ))
             .expect_err("exec against a suspended VM must be rejected");
 
         assert!(matches!(error, OrchError::Conflict(_)));
@@ -5424,7 +5468,13 @@ mod tests {
             Err(OrchError::Unavailable(_))
         ));
         assert!(matches!(
-            runtime.block_on(exec_local(&state, id, "true".into(), 100, None)),
+            runtime.block_on(exec_local(
+                &state,
+                &vm_get(&state, id).unwrap(),
+                "true".into(),
+                100,
+                None
+            )),
             Err(OrchError::Unavailable(_))
         ));
         assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
@@ -6801,6 +6851,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,

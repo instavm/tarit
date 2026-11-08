@@ -861,11 +861,11 @@ fn enforce_peer_vm_access(
     state: &AppState,
     id: Uuid,
     identity: Option<&ApiIdentity>,
-) -> Result<(), tarit_types::OrchError> {
+) -> Result<tarit_types::VmRecord, tarit_types::OrchError> {
     let identity = require_peer_identity(identity)?;
     let vm = ops::get_local(state, id)?;
     ensure_vm_access(identity, &vm)?;
-    Ok(())
+    Ok(vm)
 }
 
 async fn internal_create(
@@ -958,12 +958,12 @@ async fn internal_exec(
     Path(id): Path<Uuid>,
     Json(body): Json<InternalExecBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
+    let vm = enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
     // The peer waits on this request, so it is bound by the same deadline.
     let gate_deadline = ops::exec_gate_deadline(&state.config, body.timeout_ms);
     let (code, stdout, stderr, duration_ms) = ops::exec_local(
         &state,
-        id,
+        &vm,
         body.command,
         body.timeout_ms,
         Some(gate_deadline),

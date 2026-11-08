@@ -690,6 +690,9 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             max_vms: None,
             api_key_id: format!("share:{}", share.id),
         };
+        // Legacy shares may still reference a reused UUID. Check the durable
+        // tenant before stale-host recovery can claim or wake that VM.
+        verify_share_vm_owner(&state, &share).await?;
         let owner = ops::resolve_owner_for_activation(&state, share.vm_id, &activation_identity)
             .await
             .map_err(|error| {
@@ -1087,14 +1090,32 @@ fn is_websocket_token_byte(byte: u8) -> bool {
         )
 }
 
+async fn verify_share_vm_owner(state: &AppState, share: &ShareRecord) -> Result<(), GatewayError> {
+    let vm = if let Some(fleet) = &state.fleet {
+        fleet
+            .get_vm(share.vm_id)
+            .await
+            .map_err(|error| match error {
+                tarit_fleet::FleetError::NotFound => GatewayError::NotFound,
+                _ => GatewayError::Unavailable,
+            })?
+    } else {
+        ops::get_local(state, share.vm_id).map_err(|_| GatewayError::NotFound)?
+    };
+    if vm.owner_key.as_deref() != Some(share.owner_key.as_str()) {
+        return Err(GatewayError::NotFound);
+    }
+    Ok(())
+}
+
 async fn proxy_local_http(
     state: &AppState,
     share: &ShareRecord,
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
-    crate::ops::ensure_active_local(state, share.vm_id)
+    crate::ops::ensure_active_local_for_owner(state, share.vm_id, &share.owner_key)
         .await
-        .map_err(|_| GatewayError::Unavailable)?;
+        .map_err(GatewayError::from)?;
     let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
     })?;
@@ -1381,9 +1402,9 @@ async fn proxy_local_websocket(
     if state.share_runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
-    crate::ops::ensure_active_local(state, share.vm_id)
+    crate::ops::ensure_active_local_for_owner(state, share.vm_id, &share.owner_key)
         .await
-        .map_err(|_| GatewayError::Unavailable)?;
+        .map_err(GatewayError::from)?;
     let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
     })?;
@@ -2444,6 +2465,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreign_legacy_share_never_wakes_reused_hibernated_vm_http_or_websocket() {
+        let state = gateway_test_state();
+        let share = install_gateway_share(
+            &state,
+            "127.0.0.1:12345".parse().unwrap(),
+            ShareVisibility::Public,
+        )
+        .await;
+        {
+            let mut vms = state.vm_cache.write().unwrap();
+            let vm = vms.get_mut(&share.vm_id).unwrap();
+            vm.owner_key = Some("tenant-b".into());
+            vm.created_at += chrono::Duration::seconds(1);
+            vm.status = VmStatus::Hibernated;
+        }
+        // A gate already held by another operation must not even be awaited by
+        // an unauthorized old share. The public ingress rejects before wake.
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        state
+            .activation_gates
+            .lock()
+            .unwrap()
+            .insert(share.vm_id, gate.clone());
+        let held = gate.lock_owned().await;
+        for websocket in [false, true] {
+            let mut request = Request::builder().uri("/").header(HOST, SHARE_HOST);
+            if websocket {
+                request = request
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+            }
+            let response = tokio::time::timeout(
+                Duration::from_millis(200),
+                super::router(state.clone()).oneshot(request.body(Body::empty()).unwrap()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        drop(held);
+        // The internal owner's HTTP/WS common activation helper repeats the
+        // ownership check under the gate before invoking restore.
+        assert!(matches!(
+            crate::ops::ensure_active_local_for_owner(&state, share.vm_id, &share.owner_key).await,
+            Err(tarit_types::OrchError::NotFound(_))
+        ));
+        assert_eq!(
+            state
+                .vm_cache
+                .read()
+                .unwrap()
+                .get(&share.vm_id)
+                .unwrap()
+                .status,
+            VmStatus::Hibernated
+        );
+        assert!(state.lifecycle.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn gateway_router_uses_supervisor_target_and_keeps_control_credentials_from_guest() {
         let (upstream, received) = spawn_inspecting_http_upstream().await;
         let state = gateway_test_state();
@@ -3460,6 +3544,18 @@ mod tests {
             let client = gateway_test_state_for_host("non-owner");
             let client_metrics = Arc::clone(&client.metrics);
             client.shares.insert(&share).await.unwrap();
+            // The test's authoritative-host override substitutes for fleet
+            // routing; supply the matching VM ownership metadata too. Real
+            // fleet ingress reads this from PostgreSQL before any activation.
+            let vm = owner_state
+                .vm_cache
+                .read()
+                .unwrap()
+                .get(&share.vm_id)
+                .unwrap()
+                .clone();
+            client.store.lock().unwrap().insert_vm(&vm).unwrap();
+            client.vm_cache.write().unwrap().insert(vm.id, vm);
             let client_addr = start_axum(gateway_router(client.clone())).await;
             crate::cluster::set_test_authoritative_owner(
                 "non-owner",
@@ -3666,6 +3762,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,

@@ -919,6 +919,12 @@ impl ExecutionStatus {
 pub struct ExecutionRecord {
     pub id: Uuid,
     pub vm_id: Uuid,
+    /// Immutable submitting tenant; old local rows without a binding are admin-only.
+    #[serde(skip)]
+    pub owner_key: Option<String>,
+    /// Incarnation authorized when execution was submitted, independent of UUID reuse.
+    #[serde(skip)]
+    pub vm_created_at: Option<DateTime<Utc>>,
     pub command: String,
     pub timeout_ms: u64,
     pub status: ExecutionStatus,
@@ -929,6 +935,16 @@ pub struct ExecutionRecord {
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl ExecutionRecord {
+    pub fn is_expired(&self, cutoff: DateTime<Utc>) -> bool {
+        self.updated_at < cutoff
+            && matches!(
+                self.status,
+                ExecutionStatus::Completed | ExecutionStatus::Failed
+            )
+    }
 }
 
 /// What a usage event meters. `VmRuntime` records billable wall-clock seconds a
