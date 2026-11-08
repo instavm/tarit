@@ -92,6 +92,19 @@ versions may contain breaking changes.
 
 ### Changed
 
+- A restore's RAM CRC check reads only the snapshot's data extents and folds
+  the holes into the CRC without reading them, so it costs what the guest
+  wrote rather than the RAM size; the CRC is the same. A snapshot with an
+  8 GiB virtio-mem window and about 150 MB of data spent 1.4-4 s of every
+  restore in this check, because a jailed VMM that maps the snapshot
+  read-only cannot record that the file passed. On an InstaVM host, a
+  synthetic 8.6 GiB image with 150 MiB in 35,640 scattered extents now
+  checks in 71 ms from the page cache (1.3-2.9 s before) and in 0.8 s from
+  disk (3.2 s before). `vmm snapshot-verify [--record] PATH` checks a full
+  snapshot's header, state and RAM CRCs as a restore does, prints one JSON
+  line, and with `--record` stores the `user.tarit.ram-verified` xattr
+  restores look for, so a privileged caller can stamp golden and freshly
+  downloaded snapshots once.
 - vCPU threads are named `vcpu N` (N = vCPU id) so host tooling can find them,
   for example to place only vCPU threads in a cgroup v2 threaded child.
 - A restore or fork child seeds and verifies its private disk upper while
