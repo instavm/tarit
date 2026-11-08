@@ -281,19 +281,21 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             }
         }
         ApiRequest::Restore {
+            target_memory_mib,
             snapshot_path,
             memory_integrity,
             overlay,
             net,
             volumes,
             memory_policy,
-        } => match controller.restore_with_resource_overrides(
+        } => match controller.restore_with_memory_target(
             &snapshot_path,
             overlay,
             net,
             volumes,
             memory_policy,
             memory_integrity,
+            target_memory_mib,
         ) {
             Ok(()) => ApiResponse::Restored,
             Err(e) => error_response(e),
@@ -386,6 +388,21 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         }
         ApiRequest::Balloon => match controller.balloon_state() {
             Ok((target_pages, actual_pages)) => balloon_response(target_pages, actual_pages),
+            Err(error) => ApiResponse::Err {
+                msg: error.to_string(),
+            },
+        },
+        ApiRequest::MemoryHotplugStatus => match controller.memory_hotplug_status() {
+            Ok(status) => ApiResponse::MemoryHotplug(status),
+            Err(error) => ApiResponse::Err {
+                msg: error.to_string(),
+            },
+        },
+        ApiRequest::SetMemoryHotplug {
+            requested_size_mib,
+            wait_timeout_ms,
+        } => match controller.set_memory_hotplug(requested_size_mib, wait_timeout_ms) {
+            Ok(status) => ApiResponse::MemoryHotplug(status),
             Err(error) => ApiResponse::Err {
                 msg: error.to_string(),
             },
@@ -856,7 +873,10 @@ mod tests {
                 cmdline: "console=ttyS0".into(),
                 initramfs: None,
             },
-            memory: MemoryConfig { size_mib: 64 },
+            memory: MemoryConfig {
+                size_mib: 64,
+                boot_size_mib: None,
+            },
             vcpus: VcpuConfig { count: 1 },
             volumes: vec![],
             net: vec![],
@@ -967,6 +987,23 @@ mod tests {
             response,
             ApiResponse::Exec { stdout, .. } if stdout.starts_with("[output truncated]")
         ));
+    }
+
+    #[test]
+    fn dispatch_memory_hotplug_without_vm_returns_err() {
+        let controller = VmmController::new();
+        for request in [
+            ApiRequest::MemoryHotplugStatus,
+            ApiRequest::SetMemoryHotplug {
+                requested_size_mib: 128,
+                wait_timeout_ms: Some(1_000),
+            },
+        ] {
+            assert!(matches!(
+                dispatch(request, &controller),
+                ApiResponse::Err { .. }
+            ));
+        }
     }
 
     #[test]
