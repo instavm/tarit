@@ -634,10 +634,30 @@ impl VirtioBlkMmio {
 
         // Process available requests until the queue is drained or the limiter
         // asks us to defer the next descriptor chain.
-        let _count = proc_guard
-            .as_mut()
-            .unwrap()
-            .process_queue_descriptors_dirty(&mem, dirty.as_ref(), |readable, writable| {
+        let _count = proc_guard.as_mut().unwrap().process_queue_chains_dirty(
+            &mem,
+            dirty.as_ref(),
+            |chain| {
+                let (readable, writable) = (chain.readable, chain.writable);
+                if chain.over_limit {
+                    // Restored drivers may predate SIZE_MAX negotiation.
+                    // Complete their oversized I/O without reading/allocating
+                    // its payload so the request cannot hang indefinitely.
+                    match self.rate_limit_allows(0) {
+                        Ok(true) => {}
+                        Ok(false) => return None,
+                        Err(_) => {
+                            processing_failed = true;
+                            return None;
+                        }
+                    }
+                    return Some(Self::write_status(
+                        &mem,
+                        dirty.as_ref(),
+                        writable,
+                        status::IO_ERR,
+                    ));
+                }
                 let used_len = (readable.len() + writable.len()) as u32;
                 let readable = match Self::read_descs(&mem, readable) {
                     Some(data) => data,
@@ -761,7 +781,8 @@ impl VirtioBlkMmio {
 
                 Self::write_status(&mem, dirty.as_ref(), writable, st);
                 Some(used_len)
-            });
+            },
+        );
 
         // If we processed any requests, signal an interrupt to the guest.
         if _count > 0 {
@@ -1430,6 +1451,149 @@ mod tests {
         // 4096-byte test disk = 8 sectors.
         assert_eq!(dev.mmio_read(reg::CONFIG, 4).unwrap(), 8);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn restored_legacy_large_io_completes_without_touching_payloads() {
+        use crate::virtio::vqueue::{UsedElem, MAX_DESC_LEN};
+
+        const DATA: u64 = 0x20_0000;
+        // Single-segment I/O observed before SIZE_MAX, and a chain whose
+        // individual segments fit but whose total exceeds the chain limit.
+        for (segments, segment_len) in [(1u16, 1_220_608u32), (4, MAX_DESC_LEN)] {
+            for request in [req_type::IN, req_type::OUT] {
+                for event_idx in [false, true] {
+                    let (backend, path) = new_test_backend("blk-legacy-large-io");
+                    let mem = Arc::new(
+                        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 8 * 1024 * 1024)])
+                            .unwrap(),
+                    );
+                    let old = VirtioBlkMmio::new(5, backend);
+                    configure_test_blk_queue(&old, mem.clone());
+                    old.mmio_write(reg::GUEST_FEATURES_SEL, 0, 4).unwrap();
+                    old.mmio_write(
+                        reg::GUEST_FEATURES,
+                        u64::from(
+                            (1 << 9)
+                                | if event_idx {
+                                    VIRTIO_RING_F_EVENT_IDX
+                                } else {
+                                    0
+                                },
+                        ),
+                        4,
+                    )
+                    .unwrap();
+                    old.mmio_write(reg::GUEST_FEATURES_SEL, 1, 4).unwrap();
+                    old.mmio_write(reg::GUEST_FEATURES, 1, 4).unwrap();
+                    let state = old.save();
+                    assert_eq!(state.guest_features_low & VIRTIO_BLK_F_SIZE_MAX, 0);
+                    drop(old);
+
+                    let mut restored =
+                        VirtioBlkMmio::new(5, BlkBackend::open(&path, false).unwrap());
+                    restored.restore(state);
+                    restored.set_guest_memory(mem.clone());
+                    let dirty = SoftwareDirtyBitmap::new();
+                    restored.set_guest_dirty_tracker(dirty.clone());
+                    let clock = Arc::new(ManualClock::new(0));
+                    restored.set_rate_limiter(RateLimiter::new_with_clock(1, 4096, clock.clone()));
+
+                    mem.write_obj(
+                        BlkReqHeader {
+                            req_type: request,
+                            reserved: 0,
+                            sector: 0,
+                        },
+                        GuestAddress(TEST_HEADER_BASE),
+                    )
+                    .unwrap();
+                    let data = vec![0x5a; segments as usize * segment_len as usize];
+                    mem.write_slice(&data, GuestAddress(DATA)).unwrap();
+                    let mut descriptors = vec![Descriptor {
+                        addr: TEST_HEADER_BASE,
+                        len: BlkReqHeader::SIZE as u32,
+                        flags: desc_flags::NEXT,
+                        next: 1,
+                    }];
+                    for i in 0..segments {
+                        descriptors.push(Descriptor {
+                            addr: DATA + u64::from(i) * u64::from(segment_len),
+                            len: segment_len,
+                            flags: desc_flags::NEXT
+                                | if request == req_type::IN {
+                                    desc_flags::WRITE
+                                } else {
+                                    0
+                                },
+                            next: i + 2,
+                        });
+                    }
+                    descriptors.push(Descriptor {
+                        addr: TEST_STATUS_BASE,
+                        len: 1,
+                        flags: desc_flags::WRITE,
+                        next: 0,
+                    });
+                    for (i, descriptor) in descriptors.iter().enumerate() {
+                        mem.write_obj(*descriptor, GuestAddress(TEST_DESC + i as u64 * 16))
+                            .unwrap();
+                    }
+                    mem.write_obj(0xffu8, GuestAddress(TEST_STATUS_BASE))
+                        .unwrap();
+                    mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(TEST_AVAIL))
+                        .unwrap();
+                    mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 4)).unwrap();
+
+                    restored.process_queue(0).unwrap();
+                    assert_eq!(used_idx(&mem), 1, "oversized I/O must complete");
+                    assert_eq!(
+                        mem.read_obj::<u8>(GuestAddress(TEST_STATUS_BASE)).unwrap(),
+                        status::IO_ERR
+                    );
+                    let used: UsedElem = mem.read_obj(GuestAddress(TEST_USED + 4)).unwrap();
+                    assert_eq!((used.id, used.len), (0, 1));
+                    assert_ne!(restored.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(), 0);
+                    let mut after = vec![0; data.len()];
+                    mem.read_slice(&mut after, GuestAddress(DATA)).unwrap();
+                    assert_eq!(after, data, "error completion must not change payloads");
+                    let changed = dirty.drain();
+                    assert!(changed.contains(TEST_STATUS_BASE));
+                    assert!(changed.contains(TEST_USED));
+                    assert!(!changed.contains(DATA));
+                    if event_idx {
+                        let avail_event = TEST_USED + 4 + u64::from(TEST_QUEUE_SIZE) * 8;
+                        assert_eq!(mem.read_obj::<u16>(GuestAddress(avail_event)).unwrap(), 1);
+                    }
+
+                    // Error completions still consume an IOPS token, and a
+                    // subsequent ordinary request must progress after refill.
+                    setup_blk_out_requests(&mem, 1);
+                    mem.write_obj(2u16, GuestAddress(TEST_AVAIL + 2)).unwrap();
+                    mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 6)).unwrap();
+                    restored.process_queue(0).unwrap();
+                    assert_eq!(
+                        restored
+                            .processor
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .used_idx(),
+                        1
+                    );
+                    clock.advance(1_000_000_000);
+                    restored.process_queue(0).unwrap();
+                    assert_eq!(used_idx(&mem), 2);
+                    assert_eq!(
+                        mem.read_obj::<u8>(GuestAddress(TEST_STATUS_BASE)).unwrap(),
+                        status::OK
+                    );
+                    drop(restored);
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
     }
 
     #[test]
