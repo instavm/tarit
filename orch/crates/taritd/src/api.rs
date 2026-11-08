@@ -516,6 +516,12 @@ struct AsyncExecutionPermits {
     _global: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// The caller's tenant reservation, taken before the VM is resolved. VM and
+/// global capacity are reserved only after the caller is authorised for the VM,
+/// so a tenant cannot occupy another tenant's per-VM queue with requests that
+/// will be refused.
+struct TenantAsyncPermit(tokio::sync::OwnedSemaphorePermit);
+
 impl AsyncExecutionAdmission {
     fn new(global_limit: usize) -> Self {
         let global_limit = global_limit.clamp(1, MAX_ASYNC_EXECUTIONS);
@@ -527,34 +533,26 @@ impl AsyncExecutionAdmission {
         }
     }
 
+    #[cfg(test)]
     fn acquire(&self, tenant: &str, vm_id: Uuid) -> Result<AsyncExecutionPermits, OrchError> {
-        fn keyed<K: Eq + std::hash::Hash>(
-            map: &Mutex<HashMap<K, std::sync::Weak<tokio::sync::Semaphore>>>,
-            key: K,
-            limit: usize,
-        ) -> Result<Arc<tokio::sync::Semaphore>, OrchError> {
-            let mut map = map
-                .lock()
-                .map_err(|_| OrchError::Internal("execution admission lock".into()))?;
-            // Weak references let idle keys disappear rather than growing with
-            // every tenant/VM ever seen. Live permits keep their semaphore alive.
-            map.retain(|_, value| value.strong_count() > 0);
-            if let Some(semaphore) = map.get(&key).and_then(std::sync::Weak::upgrade) {
-                return Ok(semaphore);
-            }
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
-            map.insert(key, Arc::downgrade(&semaphore));
-            Ok(semaphore)
-        }
-        let overloaded = || OrchError::Overloaded {
-            message: "asynchronous execution capacity exhausted".into(),
-            retry_after_secs: 1,
-        };
-        // Reject tenant and VM overload before taking scarce global capacity.
-        // RAII releases earlier permits on every later rejection/error path.
-        let tenant = keyed(&self.tenants, tenant.to_owned(), self.tenant_limit)?
-            .try_acquire_owned()
-            .map_err(|_| overloaded())?;
+        self.admit(self.acquire_tenant(tenant)?, vm_id)
+    }
+
+    fn acquire_tenant(&self, tenant: &str) -> Result<TenantAsyncPermit, OrchError> {
+        Ok(TenantAsyncPermit(
+            keyed(&self.tenants, tenant.to_owned(), self.tenant_limit)?
+                .try_acquire_owned()
+                .map_err(|_| overloaded())?,
+        ))
+    }
+
+    /// Call only after the caller is authorised for `vm_id`.
+    fn admit(
+        &self,
+        tenant: TenantAsyncPermit,
+        vm_id: Uuid,
+    ) -> Result<AsyncExecutionPermits, OrchError> {
+        // RAII releases the tenant reservation on every later rejection/error path.
         let vm = keyed(&self.vms, vm_id, MAX_VM_ASYNC_EXECUTIONS)?
             .try_acquire_owned()
             .map_err(|_| overloaded())?;
@@ -564,10 +562,36 @@ impl AsyncExecutionAdmission {
             .try_acquire_owned()
             .map_err(|_| overloaded())?;
         Ok(AsyncExecutionPermits {
-            _tenant: tenant,
+            _tenant: tenant.0,
             _vm: vm,
             _global: global,
         })
+    }
+}
+
+fn keyed<K: Eq + std::hash::Hash>(
+    map: &Mutex<HashMap<K, std::sync::Weak<tokio::sync::Semaphore>>>,
+    key: K,
+    limit: usize,
+) -> Result<Arc<tokio::sync::Semaphore>, OrchError> {
+    let mut map = map
+        .lock()
+        .map_err(|_| OrchError::Internal("execution admission lock".into()))?;
+    // Weak references let idle keys disappear rather than growing with
+    // every tenant/VM ever seen. Live permits keep their semaphore alive.
+    map.retain(|_, value| value.strong_count() > 0);
+    if let Some(semaphore) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        return Ok(semaphore);
+    }
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+    map.insert(key, Arc::downgrade(&semaphore));
+    Ok(semaphore)
+}
+
+fn overloaded() -> OrchError {
+    OrchError::Overloaded {
+        message: "asynchronous execution capacity exhausted".into(),
+        retry_after_secs: 1,
     }
 }
 
@@ -3353,8 +3377,10 @@ async fn execute_async(
     Extension(admission): Extension<AsyncExecutionAdmission>,
     Json(req): Json<ExecuteRequest>,
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
-    let permit = admission.acquire(&identity.tenant, req.vm_id)?;
-    let result = execute_async_impl(state.clone(), identity, req, permit).await;
+    // Tenant capacity first; VM and global capacity only once the caller is
+    // authorised for the VM (see `execute_async_impl`).
+    let tenant = admission.acquire_tenant(&identity.tenant)?;
+    let result = execute_async_impl(state.clone(), identity, req, &admission, tenant).await;
     if result.is_ok() {
         state.metrics.inc_exec_total();
     }
@@ -3365,13 +3391,15 @@ async fn execute_async_impl(
     state: AppState,
     identity: ApiIdentity,
     req: ExecuteRequest,
-    permit: AsyncExecutionPermits,
+    admission: &AsyncExecutionAdmission,
+    tenant: TenantAsyncPermit,
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
     validate_exec_timeout(req.timeout_ms, None)?;
     // Locate the VM anywhere in the cluster; the exec runs on its owning node.
     // (Resolving here also validates existence for a clean 404.)
     let owner = ops::resolve_owner_for_activation(&state, req.vm_id, &identity).await?;
     let vm = authorize_vm_action(&state, &owner, req.vm_id, &identity).await?;
+    let permit = admission.admit(tenant, req.vm_id)?;
 
     let now = Utc::now();
     let exec_id = Uuid::new_v4();
@@ -4547,6 +4575,34 @@ pub(crate) mod tests {
             state.lifecycle.lock().unwrap().get(&id),
             Some(LifecycleState::Hibernating { .. })
         ));
+    }
+
+    #[test]
+    fn an_unauthorised_tenant_never_holds_another_tenants_vm_queue() {
+        // Tenant reservations are taken before the VM is resolved; VM and global
+        // capacity only after authorisation. Requests that will be refused for a
+        // foreign VM therefore never occupy that VM's queue or global slots.
+        let admission = AsyncExecutionAdmission::new(128);
+        let victim_vm = Uuid::new_v4();
+        let pending: Vec<_> = (0..MAX_VM_ASYNC_EXECUTIONS * 2)
+            .map(|_| admission.acquire_tenant("intruder").unwrap())
+            .collect();
+        assert_eq!(admission.global.available_permits(), 128);
+        assert!(admission.vms.lock().unwrap().is_empty());
+        let mut owner = Vec::new();
+        for _ in 0..MAX_VM_ASYNC_EXECUTIONS {
+            owner.push(admission.acquire("owner", victim_vm).unwrap());
+        }
+        drop(pending);
+        // A refused admission returns the tenant reservation it was given.
+        let tenant = admission.acquire_tenant("owner").unwrap();
+        assert!(matches!(
+            admission.admit(tenant, victim_vm),
+            Err(OrchError::Overloaded { .. })
+        ));
+        drop(owner);
+        assert_eq!(admission.global.available_permits(), 128);
+        assert!(admission.acquire("owner", victim_vm).is_ok());
     }
 
     #[test]
