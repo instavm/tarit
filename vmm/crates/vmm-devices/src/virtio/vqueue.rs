@@ -24,6 +24,23 @@ pub const MAX_DESC_LEN: u32 = 1024 * 1024;
 /// Maximum total bytes across all descriptors in a single chain (4 MiB).
 const MAX_CHAIN_BYTES: usize = 4 * 1024 * 1024;
 
+/// Cooperative limits for one block-worker pass. A started request completes
+/// even if storage latency or its payload exceeds the time/byte quantum.
+#[derive(Clone, Copy)]
+pub(crate) struct QueueWorkBudget {
+    pub max_chains: usize,
+    pub max_bytes: u64,
+    pub max_duration: std::time::Duration,
+}
+
+#[derive(Default)]
+pub(crate) struct QueueProcessResult {
+    pub processed: usize,
+    /// Work remains because this pass used its budget, not because the
+    /// device deferred a request (for example, for rate limiting).
+    pub budget_exhausted: bool,
+}
+
 /// Validate a guest-selected QUEUE_NUM against the device-advertised cap.
 pub fn is_valid_queue_size(size: u16, max_size: u16) -> bool {
     size != 0 && size <= max_size && size.is_power_of_two()
@@ -765,25 +782,28 @@ impl VirtQueueProcessor {
     where
         F: FnMut(&[(u64, u32)], &[(u64, u32)]) -> Option<u32>,
     {
-        self.process_queue_chains_inner(mem, dirty, false, |chain| {
-            handler(chain.readable, chain.writable)
+        self.process_queue_chains_inner(mem, dirty, false, None, |chain| {
+            handler(chain.readable, chain.writable).map(|used| (used, 0))
         })
+        .processed
     }
 
     /// Let a device stream an oversized but otherwise valid request, or
     /// complete it with its own error status. Descriptor count, addresses and
     /// links are still validated, and payloads are never read by this method. Other queue
-    /// entry points retain their strict size rejection.
+    /// entry points retain their strict size rejection. The handler returns
+    /// (used bytes, serviced payload bytes); only block workers supply a budget.
     pub(crate) fn process_queue_chains_dirty<F>(
         &mut self,
         mem: &GuestMemoryMmap,
         dirty: Option<&SoftwareDirtyBitmap>,
+        budget: Option<QueueWorkBudget>,
         handler: F,
-    ) -> usize
+    ) -> QueueProcessResult
     where
-        F: FnMut(Chain<'_>) -> Option<u32>,
+        F: FnMut(Chain<'_>) -> Option<(u32, u64)>,
     {
-        self.process_queue_chains_inner(mem, dirty, true, handler)
+        self.process_queue_chains_inner(mem, dirty, true, budget, handler)
     }
 
     fn process_queue_chains_inner<F>(
@@ -791,24 +811,42 @@ impl VirtQueueProcessor {
         mem: &GuestMemoryMmap,
         dirty: Option<&SoftwareDirtyBitmap>,
         allow_over_limit: bool,
+        budget: Option<QueueWorkBudget>,
         mut handler: F,
-    ) -> usize
+    ) -> QueueProcessResult
     where
-        F: FnMut(Chain<'_>) -> Option<u32>,
+        F: FnMut(Chain<'_>) -> Option<(u32, u64)>,
     {
         if !self.queue_is_usable(mem, "process_queue_descriptors") {
-            return 0;
+            return QueueProcessResult::default();
         }
 
         let avail_addr = GuestAddress(self.config.avail_ring_addr);
-        let mut processed = 0;
+        let mut result = QueueProcessResult::default();
+        let started = budget.map(|_| std::time::Instant::now());
+        let mut attempted = 0usize;
+        let mut serviced_bytes = 0u64;
         loop {
             let avail: AvailRing = match read_obj_mem::<AvailRing>(mem, avail_addr) {
                 Some(a) => a,
-                None => return processed,
+                None => return result,
             };
             let mut stopped = false;
             while self.last_avail_idx != avail.idx {
+                if attempted > 0
+                    && budget.is_some_and(|budget| {
+                        attempted >= budget.max_chains
+                            || serviced_bytes >= budget.max_bytes
+                            || started.unwrap().elapsed() >= budget.max_duration
+                    })
+                {
+                    result.budget_exhausted = true;
+                    stopped = true;
+                    break;
+                }
+                // Malformed chains consume the same attempt budget as valid
+                // ones, including across EVENT_IDX's outer recheck loop.
+                attempted += 1;
                 let avail_entry_addr = match self.avail_entry_addr() {
                     Some(addr) => addr,
                     None => {
@@ -836,7 +874,7 @@ impl VirtQueueProcessor {
                     }
                 };
 
-                let used_len = match handler(Chain {
+                let (used_len, request_bytes) = match handler(Chain {
                     readable: &chain.readable,
                     writable: &chain.writable,
                     over_limit: chain.over_limit,
@@ -863,7 +901,8 @@ impl VirtQueueProcessor {
                 let _ = write_obj_mem(mem, dirty, used_elem, used_entry_addr);
                 self.last_used_idx = self.last_used_idx.wrapping_add(1);
                 self.last_avail_idx = self.last_avail_idx.wrapping_add(1);
-                processed += 1;
+                result.processed += 1;
+                serviced_bytes = serviced_bytes.saturating_add(request_bytes);
             }
 
             // Publish the used ring index at +2 (after the flags field).
@@ -871,14 +910,14 @@ impl VirtQueueProcessor {
                 let _ = write_obj_mem(mem, dirty, self.last_used_idx, used_idx_addr);
             }
             if !self.event_idx {
-                return processed;
+                return result;
             }
             // Ask for a kick when the driver publishes past what we consumed.
             if let Some(addr) = self.avail_event_addr() {
                 let _ = write_obj_mem(mem, dirty, self.last_avail_idx, addr);
             }
             if stopped {
-                return processed;
+                return result;
             }
             // A buffer published between reading the avail index and writing
             // avail_event did not kick us; look again after a full barrier.
@@ -887,7 +926,7 @@ impl VirtQueueProcessor {
                 .and_then(|addr| read_obj_mem::<u16>(mem, addr));
             match avail_idx {
                 Some(idx) if idx != self.last_avail_idx => continue,
-                _ => return processed,
+                _ => return result,
             }
         }
     }
@@ -1048,6 +1087,133 @@ mod tests {
         });
         processor.set_event_idx(true);
         (mem, processor)
+    }
+
+    #[test]
+    fn block_budget_yields_under_continuous_event_idx_refill() {
+        let (mem, mut processor) = event_idx_queue(8, 1);
+        let dirty = SoftwareDirtyBitmap::new();
+        let budget = QueueWorkBudget {
+            max_chains: 32,
+            max_bytes: u64::MAX,
+            max_duration: std::time::Duration::from_secs(60),
+        };
+        let mut published = 1u16;
+        // Each completion publishes another chain before the EVENT_IDX
+        // recheck; the queue can never become empty and no new kick is sent.
+        let progress =
+            processor.process_queue_chains_dirty(&mem, Some(&dirty), Some(budget), |_| {
+                published += 1;
+                mem.write_obj(published, GuestAddress(0x2_0000 + 2))
+                    .unwrap();
+                Some((7, 512))
+            });
+        assert_eq!(progress.processed, 32);
+        assert!(progress.budget_exhausted);
+        assert_eq!(processor.avail_idx(), 32);
+        assert_eq!(processor.used_idx(), 32);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x3_0000 + 2)).unwrap(), 32);
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(0x3_0000 + 4 + 8 * 8))
+                .unwrap(),
+            32
+        );
+        assert!(dirty.snapshot().dirty_pfns().contains(&(0x3_0000 / 4096)));
+        assert!(processor.needs_notification(&mem, 0));
+        // Retry without any guest publication/kick consumes the last request.
+        let last =
+            processor.process_queue_chains_dirty(&mem, None, Some(budget), |_| Some((7, 512)));
+        assert_eq!(last.processed, 1);
+        assert!(!last.budget_exhausted);
+        assert_eq!(processor.used_idx(), 33);
+    }
+
+    #[test]
+    fn block_budget_counts_malformed_chains_across_event_idx_refills() {
+        let (mem, mut processor) = event_idx_queue(8, 2);
+        for slot in 0..8u64 {
+            // Alternate one valid head with one out-of-range head.
+            mem.write_obj(
+                if slot % 2 == 0 { 0u16 } else { u16::MAX },
+                GuestAddress(0x2_0000 + 4 + slot * 2),
+            )
+            .unwrap();
+        }
+        let mut published = 2u16;
+        let progress = processor.process_queue_chains_dirty(
+            &mem,
+            None,
+            Some(QueueWorkBudget {
+                max_chains: 8,
+                max_bytes: u64::MAX,
+                max_duration: std::time::Duration::from_secs(60),
+            }),
+            |_| {
+                published += 2;
+                mem.write_obj(published, GuestAddress(0x2_0000 + 2))
+                    .unwrap();
+                Some((0, 0))
+            },
+        );
+        assert!(progress.budget_exhausted);
+        assert_eq!(progress.processed, 4);
+        assert_eq!(processor.avail_idx(), 8);
+        assert_eq!(processor.used_idx(), 4);
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(0x3_0000 + 4 + 8 * 8))
+                .unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn block_byte_and_time_budgets_allow_one_request_but_not_a_second() {
+        for event_idx in [false, true] {
+            for max_duration in [
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(60),
+            ] {
+                let (mem, mut processor) = event_idx_queue(8, 3);
+                processor.set_event_idx(event_idx);
+                let progress = processor.process_queue_chains_dirty(
+                    &mem,
+                    None,
+                    Some(QueueWorkBudget {
+                        max_chains: 32,
+                        max_bytes: if max_duration.is_zero() {
+                            u64::MAX
+                        } else {
+                            512
+                        },
+                        max_duration,
+                    }),
+                    |_| Some((0, 1024)),
+                );
+                assert_eq!(progress.processed, 1);
+                assert!(progress.budget_exhausted);
+                assert_eq!(processor.avail_idx(), 1);
+                assert_eq!(mem.read_obj::<u16>(GuestAddress(0x3_0000 + 2)).unwrap(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn block_handler_deferral_does_not_request_immediate_rescheduling() {
+        let (mem, mut processor) = event_idx_queue(8, 2);
+        let progress = processor.process_queue_chains_dirty(
+            &mem,
+            None,
+            Some(QueueWorkBudget {
+                max_chains: 32,
+                max_bytes: 512,
+                max_duration: std::time::Duration::from_secs(60),
+            }),
+            |_| None,
+        );
+        assert_eq!(progress.processed, 0);
+        assert!(!progress.budget_exhausted);
+        assert_eq!(processor.avail_idx(), 0);
+        assert_eq!(processor.used_idx(), 0);
     }
 
     /// [`event_idx_queue`] with device-writable 16-byte buffers, as a
@@ -1483,9 +1649,11 @@ mod tests {
             mem.write_obj(descriptor, GuestAddress(0x1000)).unwrap();
             let mut processor = VirtQueueProcessor::new(config.clone());
             assert_eq!(
-                processor.process_queue_chains_dirty(&mem, None, |_| {
-                    panic!("malformed chain must not reach the block error handler");
-                }),
+                processor
+                    .process_queue_chains_dirty(&mem, None, None, |_| {
+                        panic!("malformed chain must not reach the block error handler");
+                    })
+                    .processed,
                 0
             );
             assert_eq!(processor.avail_idx(), 1);

@@ -604,12 +604,30 @@ impl VirtioBlkMmio {
     /// QUEUE_NOTIFY to the block I/O worker; direct MMIO callers retain this
     /// entry point as a portable fallback.
     pub fn process_queue(&self, _queue_idx: u32) -> MmioWriteResult {
+        self.process_queue_inner(None).map(|_| ())
+    }
+
+    /// Cooperatively yield to worker pause/stop between bounded passes. True
+    /// means retry immediately without relying on another guest notification.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn process_queue_pass(&self) -> Result<bool, MmioError> {
+        self.process_queue_inner(Some(crate::virtio::vqueue::QueueWorkBudget {
+            max_chains: 32,
+            max_bytes: 16 * 1024 * 1024,
+            max_duration: std::time::Duration::from_millis(2),
+        }))
+    }
+
+    fn process_queue_inner(
+        &self,
+        budget: Option<crate::virtio::vqueue::QueueWorkBudget>,
+    ) -> Result<bool, MmioError> {
         self.ensure_operational()?;
         let mem = match self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() {
             Some(m) => m,
             None => {
                 log::debug!("BLK process_queue: guest_mem is None");
-                return Ok(());
+                return Ok(false);
             }
         };
         let dirty = self.try_lock_state(&self.host_dirty, "host_dirty")?.clone();
@@ -617,7 +635,7 @@ impl VirtioBlkMmio {
         let qs = self.try_lock_state(&self.queues, "queues")?;
         let Some(q) = qs.first() else {
             log::error!("BLK process_queue: missing queue 0 in restored state");
-            return Ok(());
+            return Ok(false);
         };
         if !q.ready || !q.valid_size() {
             log::debug!(
@@ -625,7 +643,7 @@ impl VirtioBlkMmio {
                 q.ready,
                 q.size
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let config = QueueConfig {
@@ -651,16 +669,17 @@ impl VirtioBlkMmio {
 
         let mut backend_guard = self.try_lock_state(&self.backend, "backend")?;
         if backend_guard.is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let backend = backend_guard.as_mut().unwrap();
         let mut processing_failed = false;
 
-        // Process available requests until the queue is drained or the limiter
-        // asks us to defer the next descriptor chain.
-        let _count = proc_guard.as_mut().unwrap().process_queue_chains_dirty(
+        // The synchronous fallback drains normally; workers use a cooperative
+        // budget. Rate-limit deferral remains distinct from budget exhaustion.
+        let progress = proc_guard.as_mut().unwrap().process_queue_chains_dirty(
             &mem,
             dirty.as_ref(),
+            budget,
             |chain| {
                 let (readable, writable) = (chain.readable, chain.writable);
                 let header = Self::read_header(&mem, readable);
@@ -703,11 +722,9 @@ impl VirtioBlkMmio {
                             return None;
                         }
                     }
-                    return Some(Self::write_status(
-                        &mem,
-                        dirty.as_ref(),
-                        writable,
-                        status::IO_ERR,
+                    return Some((
+                        Self::write_status(&mem, dirty.as_ref(), writable, status::IO_ERR),
+                        0,
                     ));
                 }
                 let header = header.unwrap();
@@ -770,13 +787,19 @@ impl VirtioBlkMmio {
                     _ => status::UNSUPP,
                 };
 
-                Some(data_written + Self::write_status(&mem, dirty.as_ref(), writable, st))
+                Some((
+                    data_written + Self::write_status(&mem, dirty.as_ref(), writable, st),
+                    request_bytes,
+                ))
             },
         );
 
         // If we processed any requests, signal an interrupt to the guest.
-        if _count > 0 {
-            log::debug!("BLK process_queue: processed {_count} request(s)");
+        if progress.processed > 0 {
+            log::debug!(
+                "BLK process_queue: processed {} request(s)",
+                progress.processed
+            );
             if proc_guard
                 .as_ref()
                 .unwrap()
@@ -788,7 +811,7 @@ impl VirtioBlkMmio {
         if processing_failed || self.is_failed() {
             Err(MmioError::Device)
         } else {
-            Ok(())
+            Ok(progress.budget_exhausted)
         }
     }
 }
@@ -1920,6 +1943,129 @@ mod tests {
             host_features_low(true),
             u64::from(BLK_FEATURES_LOW | VIRTIO_BLK_F_RO)
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_pass_preserves_pending_read_write_work_across_restore() {
+        use std::os::unix::fs::FileExt;
+        let (backend, path) = new_test_backend("blk-budget-restore");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        dev.mmio_write(reg::GUEST_FEATURES, u64::from(VIRTIO_RING_F_EVENT_IDX), 4)
+            .unwrap();
+        setup_blk_out_requests(&mem, 3);
+        // The third request reads back the second request's write.
+        mem.write_obj(
+            BlkReqHeader {
+                req_type: req_type::IN,
+                reserved: 0,
+                sector: 1,
+            },
+            GuestAddress(TEST_HEADER_BASE + 0x200),
+        )
+        .unwrap();
+        mem.write_obj(
+            desc_flags::NEXT | desc_flags::WRITE,
+            GuestAddress(TEST_DESC + 7 * 16 + 12),
+        )
+        .unwrap();
+        assert!(dev
+            .process_queue_inner(Some(crate::virtio::vqueue::QueueWorkBudget {
+                max_chains: 1,
+                max_bytes: u64::MAX,
+                max_duration: std::time::Duration::from_secs(60),
+            }))
+            .unwrap());
+        assert_eq!(used_idx(&mem), 1);
+        let state = dev.save();
+        assert_eq!(state.processor.as_ref().unwrap().last_avail_idx, 1);
+        // Replaying an already-completed write would now corrupt sector zero.
+        mem.write_slice(&[0xcc; 512], GuestAddress(TEST_DATA_BASE))
+            .unwrap();
+        let restored_mem = new_test_mem();
+        let mut ram = vec![0; 4 * 1024 * 1024];
+        mem.read_slice(&mut ram, GuestAddress(0)).unwrap();
+        restored_mem.write_slice(&ram, GuestAddress(0)).unwrap();
+        let mut restored = VirtioBlkMmio::new(5, BlkBackend::open(&path, false).unwrap());
+        restored.restore(state);
+        restored.set_guest_memory(restored_mem.clone());
+        let dirty = SoftwareDirtyBitmap::new();
+        restored.set_guest_dirty_tracker(dirty.clone());
+        let restored = Arc::new(restored);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let kick = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let mut worker =
+                super::super::blk_io_loop::spawn_blk_io_loop(restored.clone(), kick.as_raw_fd())
+                    .unwrap();
+            // No kick after restore: startup must inspect pending guest RAM.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while used_idx(&restored_mem) != 3 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "restored work stalled without a kick"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            worker.pause().unwrap();
+            worker.stop();
+        }
+        #[cfg(not(target_os = "linux"))]
+        while restored.process_queue_pass().unwrap() {}
+        assert_eq!(used_idx(&restored_mem), 3);
+        let mut sectors = [0xff; 1024];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut sectors, 0)
+            .unwrap();
+        assert_eq!(&sectors[..512], &[0; 512]);
+        assert_eq!(&sectors[512..], &[1; 512]);
+        let mut read_back = [0; 512];
+        restored_mem
+            .read_slice(&mut read_back, GuestAddress(TEST_DATA_BASE + 0x2000))
+            .unwrap();
+        assert_eq!(read_back, [1; 512]);
+        for request in 0..3u64 {
+            assert_eq!(
+                restored_mem
+                    .read_obj::<u8>(GuestAddress(TEST_STATUS_BASE + request * 0x100))
+                    .unwrap(),
+                status::OK
+            );
+        }
+        assert!(dirty
+            .snapshot()
+            .dirty_pfns()
+            .contains(&((TEST_DATA_BASE + 0x2000) / 4096)));
+        assert!(dirty.snapshot().dirty_pfns().contains(&(TEST_USED / 4096)));
+        assert!(!restored.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&restored_mem), 3);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_pass_keeps_rate_limited_work_on_the_timed_retry_path() {
+        let (backend, path) = new_test_backend("blk-budget-rate");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        setup_blk_out_requests(&mem, 2);
+        let clock = Arc::new(ManualClock::new(0));
+        dev.set_rate_limiter(RateLimiter::new_with_clock(1, 512, clock.clone()));
+        // A slow first host write may use the time quantum before reaching
+        // the limiter. At most one immediate retry then sees its deferral.
+        if dev.process_queue_pass().unwrap() {
+            assert!(!dev.process_queue_pass().unwrap());
+        }
+        assert_eq!(used_idx(&mem), 1);
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 1);
+        clock.advance(1_000_000_000);
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 2);
         std::fs::remove_file(path).unwrap();
     }
 

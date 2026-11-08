@@ -333,6 +333,7 @@ fn image_mode(mode: libc::mode_t) -> u32 {
 
 /// Owner, mode and type of one exported entry, applied to the ext4 image when
 /// the build runs without root and could not preserve them while unpacking.
+#[derive(Clone)]
 struct EntryMeta {
     uid: u64,
     gid: u64,
@@ -632,55 +633,156 @@ fn unpack_export<R: Read>(
     Ok(metadata)
 }
 
-/// Apply recorded ownership and modes inside ext4. Ordinary requests are
-/// batched; requests with embedded line endings or long names are passed as
-/// one byte-preserving `-R` argument, never interpreted by a shell.
+const MAX_OCI_UNBATCHED_SPECIAL_LINKS: usize = 64;
+const DEBUGFS_DIRECTORY_END: &[u8] = b"# tarit-directory-end\n";
+
+struct OwnershipEntry {
+    path: PathBuf,
+    identity: InodeIdentity,
+    staged_mode: u32,
+    meta: Option<EntryMeta>,
+}
+
+struct SpecialOwnership {
+    path: PathBuf,
+    temporary: PathBuf,
+    meta: EntryMeta,
+}
+
+struct OwnershipPlan {
+    entries: Vec<OwnershipEntry>,
+    special: Vec<SpecialOwnership>,
+}
+
+/// Discover image inodes in one read-only session, then apply metadata with
+/// numeric targets. Arbitrary filename bytes never enter metadata commands.
 fn restore_image_ownership(
     rootfs: &Path,
     metadata: &ExportMetadata,
     image: &Path,
     workspace: &Path,
 ) -> Result<(), OciError> {
-    let requests = image_ownership_commands(rootfs, metadata)?;
+    let processes = apply_image_ownership(rootfs, metadata, image, workspace)?;
+    log::debug!("oci: restored image metadata with {processes} debugfs processes");
+    Ok(())
+}
+
+fn apply_image_ownership(
+    rootfs: &Path,
+    metadata: &ExportMetadata,
+    image: &Path,
+    workspace: &Path,
+) -> Result<usize, OciError> {
+    // Validate collisions and the exceptional-link budget before starting
+    // debugfs or changing any image bytes.
+    let plan = image_ownership_plan(rootfs, metadata)?;
+    let image_inodes = map_image_inodes(&plan, image, workspace)?;
+    let mut processes = 1;
+    let mut requests = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in &plan.entries {
+        let inode = image_inodes[&entry.path];
+        if seen.insert(inode) {
+            append_inode_ownership(&mut requests, format!("<{inode}>").as_bytes(), entry);
+        }
+    }
+
+    if !plan.special.is_empty() {
+        let (special_inodes, creation_processes) =
+            create_special_inodes(&plan.special, image, workspace)?;
+        processes += creation_processes;
+        let mut links = Vec::new();
+        let mut exceptional_links = Vec::new();
+        // debugfs ln does not expand destination directories. Each new block
+        // supplies at least 1000 usable bytes, and every dirent is <=264 bytes.
+        // Before first-fit insertion could fail, each added block would have
+        // used >736 bytes (1000 - 264). Reserving ceil(total/736) blocks makes
+        // that impossible, independent of link ordering or existing slack.
+        let mut directory_bytes = HashMap::<u32, usize>::new();
+        for special in &plan.special {
+            let parent = special.path.parent().unwrap_or_else(|| Path::new(""));
+            let bytes =
+                (8 + special.path.file_name().expect("special basename").len()).next_multiple_of(4);
+            *directory_bytes.entry(image_inodes[parent]).or_default() += bytes;
+        }
+        for (directory, bytes) in directory_bytes {
+            for _ in 0..bytes.div_ceil(736) {
+                links.push(format!("expand_dir <{directory}>").into_bytes());
+            }
+        }
+        for (special, inode) in plan.special.iter().zip(special_inodes) {
+            if !seen.insert(inode) {
+                return Err(OciError::InvalidLayout(
+                    "duplicate special inode identity".into(),
+                ));
+            }
+            let target = format!("<{inode}>");
+            let link = special_link_request(inode, &special.path)?;
+            if debugfs_batchable(&link) {
+                links.push(link);
+            } else {
+                exceptional_links.push(link);
+            }
+            append_meta_commands(&mut requests, target.as_bytes(), &special.meta);
+        }
+        // Links are independent. Group ordinary links first so each unusual
+        // link adds just one process, not additional flush/cleanup processes.
+        links.extend(exceptional_links);
+        processes += run_debugfs_requests(image, workspace, links)?;
+    }
+    processes += run_debugfs_requests(image, workspace, requests)?;
+    Ok(processes)
+}
+
+fn debugfs_batchable(request: &[u8]) -> bool {
+    // fgets(BUFSIZ) has only 1024 bytes on Darwin, including newline and NUL.
+    request.len() <= 1022 && !request.contains(&b'\n') && !request.contains(&b'\r')
+}
+
+fn run_debugfs_requests(
+    image: &Path,
+    workspace: &Path,
+    requests: Vec<Vec<u8>>,
+) -> Result<usize, OciError> {
     let script_path = workspace.join("ownership.debugfs");
+    let mut processes = 0;
     let mut batch = Vec::new();
     for request in requests {
-        // debugfs uses fgets(BUFSIZ); Darwin's buffer is only 1024 bytes.
-        // Leave room for both the newline and terminating NUL. -R avoids
-        // both that limit and the command-file reader's CR/LF truncation.
-        if request.len() <= 1022 && !request.contains(&b'\n') && !request.contains(&b'\r') {
+        if debugfs_batchable(&request) {
             if batch.len() + request.len() + 1 > 1024 * 1024 {
-                run_debugfs_batch(image, &script_path, &mut batch)?;
+                processes += run_debugfs_batch(image, &script_path, &mut batch)?;
             }
             batch.extend_from_slice(&request);
             batch.push(b'\n');
         } else {
-            run_debugfs_batch(image, &script_path, &mut batch)?;
+            processes += run_debugfs_batch(image, &script_path, &mut batch)?;
             let mut command = Command::new("debugfs");
             command
                 .args(["-w", "-R"])
                 .arg(std::ffi::OsStr::from_bytes(&request))
                 .arg(image);
             run_debugfs(command)?;
+            processes += 1;
         }
     }
-    run_debugfs_batch(image, &script_path, &mut batch)
+    processes += run_debugfs_batch(image, &script_path, &mut batch)?;
+    Ok(processes)
 }
 
 fn run_debugfs_batch(
     image: &Path,
     script_path: &Path,
     batch: &mut Vec<u8>,
-) -> Result<(), OciError> {
+) -> Result<usize, OciError> {
     if batch.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     std::fs::write(script_path, &*batch)?;
     let mut command = Command::new("debugfs");
     command.args(["-w", "-f"]).arg(script_path).arg(image);
     run_debugfs(command)?;
     batch.clear();
-    Ok(())
+    Ok(1)
 }
 
 fn run_debugfs(mut command: Command) -> Result<(), OciError> {
@@ -688,9 +790,13 @@ fn run_debugfs(mut command: Command) -> Result<(), OciError> {
         cmd: "debugfs".into(),
         stderr: e.to_string(),
     })?;
+    check_debugfs_output(output.status, &output.stderr)
+}
+
+fn check_debugfs_output(status: std::process::ExitStatus, stderr: &[u8]) -> Result<(), OciError> {
     // Per-command failures can leave exit status zero. Ignore only the first
     // version banner, not subsequent diagnostics containing filename bytes.
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(stderr);
     let failures: Vec<&str> = stderr
         .lines()
         .enumerate()
@@ -699,7 +805,7 @@ fn run_debugfs(mut command: Command) -> Result<(), OciError> {
                 .then_some(line)
         })
         .collect();
-    if !output.status.success() || !failures.is_empty() {
+    if !status.success() || !failures.is_empty() {
         return Err(OciError::CommandFailed {
             cmd: "debugfs ownership fix-up".into(),
             stderr: failures
@@ -713,13 +819,13 @@ fn run_debugfs(mut command: Command) -> Result<(), OciError> {
     Ok(())
 }
 
-fn image_ownership_commands(
+fn image_ownership_plan(
     rootfs: &Path,
     metadata: &ExportMetadata,
-) -> Result<Vec<Vec<u8>>, OciError> {
-    // Only identities still reachable at an exported path retain image
-    // metadata. A file injected by the build must not inherit an old entry's
-    // owner just because its pathname (or a recycled inode number) matches.
+) -> Result<OwnershipPlan, OciError> {
+    use std::os::unix::fs::MetadataExt;
+    // Retain metadata by live host inode, including hardlinks whose original
+    // tar pathname was replaced. Build-injected replacement inodes stay root.
     let live: HashSet<_> = metadata
         .paths
         .iter()
@@ -730,114 +836,456 @@ fn image_ownership_commands(
                 .map(|_| *expected)
         })
         .collect();
-    let mut requests = vec![b"sif / uid 0".to_vec(), b"sif / gid 0".to_vec()];
-    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
     let mut staged_paths = HashSet::new();
     let mut staged_directories = HashSet::new();
     let mut stack = vec![PathBuf::new()];
-    while let Some(relative) = stack.pop() {
-        let stat = std::fs::symlink_metadata(rootfs.join(&relative))?;
-        staged_paths.insert(relative.clone());
+    while let Some(path) = stack.pop() {
+        let stat = std::fs::symlink_metadata(rootfs.join(&path))?;
+        staged_paths.insert(path.clone());
         if stat.is_dir() {
-            staged_directories.insert(relative.clone());
-            let mut children = std::fs::read_dir(rootfs.join(&relative))?
-                .map(|child| child.map(|child| relative.join(child.file_name())))
+            staged_directories.insert(path.clone());
+            let mut children = std::fs::read_dir(rootfs.join(&path))?
+                .map(|child| child.map(|child| path.join(child.file_name())))
                 .collect::<Result<Vec<_>, _>>()?;
             children.sort();
             stack.extend(children.into_iter().rev());
         }
-        let name = debugfs_path(&relative)?;
         let identity = inode_identity(&stat);
-        if !seen.insert(identity) {
-            continue;
-        }
         let meta = live
             .contains(&identity)
             .then(|| metadata.inodes.get(&identity))
-            .flatten();
-        if relative.as_os_str().is_empty() {
-            if let Some(meta) = meta {
-                requests.push(format!("sif / mode 0{:o}", meta.mode).into_bytes());
-            }
-            continue;
+            .flatten()
+            .cloned();
+        entries.push(OwnershipEntry {
+            path,
+            identity,
+            staged_mode: stat.mode(),
+            meta,
+        });
+    }
+    let mut exceptional = 0;
+    for path in metadata.special.keys() {
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        // ln treats existing directories as link destinations. Reject them,
+        // mke2fs-created lost+found, and parents reached only through symlinks.
+        // Comparing walk results also supports raw-byte leaves on APFS.
+        if path == Path::new("lost+found")
+            || staged_paths.contains(path)
+            || !staged_directories.contains(parent)
+        {
+            return Err(OciError::UnsafePath(format!(
+                "special inode destination must be absent with a real staged parent, and cannot replace lost+found: {path:?}"
+            )));
         }
-        if let Some(meta) = meta {
-            requests.push(debugfs_request("sif", &name, &format!(" uid {}", meta.uid)));
-            requests.push(debugfs_request("sif", &name, &format!(" gid {}", meta.gid)));
-            // sif resolves the final inode without following a symlink.
-            requests.push(debugfs_request(
-                "sif",
-                &name,
-                &format!(" mode 0{:o}", meta.mode),
+        if path.file_name().is_none_or(|name| name.len() > 255) {
+            return Err(OciError::InvalidLayout(
+                "special basename exceeds ext4's 255-byte limit".into(),
             ));
-        } else {
-            requests.push(debugfs_request("sif", &name, " uid 0"));
-            requests.push(debugfs_request("sif", &name, " gid 0"));
+        }
+        // Use the longest possible numeric target when checking the budget.
+        if !debugfs_batchable(&special_link_request(u32::MAX, path)?) {
+            exceptional += 1;
         }
     }
-    if !metadata.special.is_empty() {
-        // Validate every destination before returning any commands. debugfs
-        // ln treats an existing directory as its destination directory; sif
-        // would then corrupt that directory by changing its inode type.
-        // mke2fs creates lost+found even when it is absent from staging.
-        // Require a real staged parent, so image symlink resolution cannot
-        // reach a different destination (e.g. link -> /, link/lost+found).
-        // Use the byte paths from the non-following walk: querying a raw-byte
-        // special leaf on APFS can fail even though ext4 supports that name.
-        for path in metadata.special.keys() {
-            let parent = path.parent().unwrap_or_else(|| Path::new(""));
-            if path == Path::new("lost+found")
-                || staged_paths.contains(path)
-                || !staged_directories.contains(parent)
+    if exceptional > MAX_OCI_UNBATCHED_SPECIAL_LINKS {
+        return Err(OciError::ResourceLimit(format!(
+            "image requires {exceptional} unbatchable special-node links; maximum is {MAX_OCI_UNBATCHED_SPECIAL_LINKS}"
+        )));
+    }
+    let mut special = Vec::new();
+    let mut sorted: Vec<_> = metadata.special.iter().collect();
+    sorted.sort_by_key(|(path, _)| *path);
+    let mut index = 0;
+    let temporary = loop {
+        let candidate = PathBuf::from(format!(".tarit-oci-node-{index}"));
+        index += 1;
+        if !staged_paths.contains(&candidate) && !metadata.special.contains_key(&candidate) {
+            break candidate;
+        }
+    };
+    for (path, meta) in sorted {
+        special_kind(meta)?;
+        special.push(SpecialOwnership {
+            path: path.clone(),
+            temporary: temporary.clone(),
+            meta: meta.clone(),
+        });
+    }
+    Ok(OwnershipPlan { entries, special })
+}
+
+/// mknod reports the allocated inode numerically. Unlink only the temporary
+/// directory entry, keeping the inode allocated with link count one; a later
+/// ln <inode> establishes its final name without changing that link count.
+fn create_special_inodes(
+    special: &[SpecialOwnership],
+    image: &Path,
+    workspace: &Path,
+) -> Result<(Vec<u32>, usize), OciError> {
+    let mut inodes = Vec::new();
+    let mut processes = 0;
+    for chunk in special.chunks(4096) {
+        let first = inodes.is_empty();
+        let mut script = String::new();
+        if first {
+            script.push_str("expand_dir <2>\n");
+        }
+        let mut commands = Vec::new();
+        for entry in chunk {
+            let create = format!(
+                "mknod {} {}",
+                entry.temporary.display(),
+                special_kind(&entry.meta)?
+            );
+            let unlink = format!("unlink /{}", entry.temporary.display());
+            script.push_str(&create);
+            script.push('\n');
+            script.push_str(&unlink);
+            script.push('\n');
+            commands.push((create, unlink));
+        }
+        let script_path = workspace.join("ownership.debugfs");
+        std::fs::write(&script_path, script)?;
+        let output = Command::new("debugfs")
+            .args(["-w", "-f"])
+            .arg(&script_path)
+            .arg(image)
+            .output()?;
+        check_debugfs_output(output.status, &output.stderr)?;
+        processes += 1;
+        // No filename bytes occur in this output: only our generated ASCII
+        // commands and mknod's numeric allocation response. Exact framing
+        // rejects unexpected diagnostics before linking or publishing.
+        let mut lines = output.stdout.split(|byte| *byte == b'\n');
+        let malformed =
+            || OciError::InvalidLayout("unexpected debugfs inode allocation response".into());
+        if first && lines.next() != Some(b"debugfs: expand_dir <2>".as_slice()) {
+            return Err(malformed());
+        }
+        for (create, unlink) in commands {
+            if lines.next() != Some(format!("debugfs: {create}").as_bytes()) {
+                return Err(malformed());
+            }
+            let inode = lines
+                .next()
+                .and_then(|line| line.strip_prefix(b"Allocated inode: "))
+                .and_then(|number| std::str::from_utf8(number).ok())
+                .and_then(|number| number.parse::<u32>().ok())
+                .filter(|inode| *inode != 0)
+                .ok_or_else(malformed)?;
+            if lines.next() != Some(format!("debugfs: {unlink}").as_bytes()) {
+                return Err(malformed());
+            }
+            inodes.push(inode);
+        }
+        if lines.next() != Some(b"".as_slice()) || lines.next().is_some() {
+            return Err(malformed());
+        }
+    }
+    Ok((inodes, processes))
+}
+
+fn special_kind(meta: &EntryMeta) -> Result<String, OciError> {
+    match (meta.mode & image_mode(libc::S_IFMT), meta.device) {
+        (kind, Some((major, minor))) if kind == image_mode(libc::S_IFCHR) => {
+            Ok(format!("c {major} {minor}"))
+        }
+        (kind, Some((major, minor))) if kind == image_mode(libc::S_IFBLK) => {
+            Ok(format!("b {major} {minor}"))
+        }
+        (kind, _) if kind == image_mode(libc::S_IFIFO) => Ok("p".into()),
+        _ => Err(OciError::InvalidLayout("unsupported special inode".into())),
+    }
+}
+
+fn special_link_request(inode: u32, path: &Path) -> Result<Vec<u8>, OciError> {
+    let mut link = format!("ln <{inode}> ").into_bytes();
+    link.extend_from_slice(&debugfs_path(path)?);
+    Ok(link)
+}
+
+fn append_meta_commands(requests: &mut Vec<Vec<u8>>, target: &[u8], meta: &EntryMeta) {
+    requests.push(debugfs_request(
+        "sif",
+        target,
+        &format!(" uid {}", meta.uid),
+    ));
+    requests.push(debugfs_request(
+        "sif",
+        target,
+        &format!(" gid {}", meta.gid),
+    ));
+    requests.push(debugfs_request(
+        "sif",
+        target,
+        &format!(" mode 0{:o}", meta.mode),
+    ));
+}
+
+fn append_inode_ownership(requests: &mut Vec<Vec<u8>>, target: &[u8], entry: &OwnershipEntry) {
+    if !entry.path.as_os_str().is_empty() {
+        if let Some(meta) = &entry.meta {
+            append_meta_commands(requests, target, meta);
+            return;
+        }
+    }
+    requests.push(debugfs_request("sif", target, " uid 0"));
+    requests.push(debugfs_request("sif", target, " gid 0"));
+    if let Some(meta) = &entry.meta {
+        requests.push(debugfs_request(
+            "sif",
+            target,
+            &format!(" mode 0{:o}", meta.mode),
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct ImageDirectoryEntry {
+    inode: u32,
+    mode: u32,
+    name: Vec<u8>,
+}
+
+/// Read only the documented parseable listing format. Fields are separated
+/// by '/', which cannot occur in a basename; LF/CR and non-UTF8 remain bytes.
+/// See e2fsprogs debugfs/ls.c (PARSE_OPT), not human-readable ls/stat output.
+fn read_debugfs_directory(
+    reader: &mut impl Read,
+    inode: u32,
+    max_entries: usize,
+) -> Result<Vec<ImageDirectoryEntry>, OciError> {
+    fn expect(reader: &mut impl Read, expected: &[u8]) -> Result<(), OciError> {
+        let mut bytes = vec![0; expected.len()];
+        reader.read_exact(&mut bytes)?;
+        if bytes != expected {
+            return Err(OciError::InvalidLayout(
+                "unexpected debugfs directory framing".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn field(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, OciError> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0];
+            reader.read_exact(&mut byte)?;
+            if byte[0] == b'/' {
+                return Ok(bytes);
+            }
+            if bytes.len() == limit || byte[0] == 0 {
+                return Err(OciError::InvalidLayout(
+                    "invalid debugfs directory field".into(),
+                ));
+            }
+            bytes.push(byte[0]);
+        }
+    }
+    fn number(bytes: &[u8], radix: u32) -> Result<u32, OciError> {
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|value| u32::from_str_radix(value, radix).ok())
+            .ok_or_else(|| OciError::InvalidLayout("invalid debugfs inode or mode".into()))
+    }
+    expect(reader, format!("debugfs: ls -p <{inode}>\n").as_bytes())?;
+    let mut entries = Vec::new();
+    loop {
+        let mut first = [0];
+        reader.read_exact(&mut first)?;
+        if first[0] == b'\n' {
+            expect(reader, DEBUGFS_DIRECTORY_END)?;
+            return Ok(entries);
+        }
+        if first[0] != b'/' {
+            return Err(OciError::InvalidLayout(
+                "invalid or oversized debugfs directory listing".into(),
+            ));
+        }
+        let inode = number(&field(reader, 10)?, 10)?;
+        let mode = number(&field(reader, 6)?, 8)?;
+        // e2fsprogs prints owner IDs with signed %d; they are not used for
+        // mapping and can legitimately be negative for high-bit IDs.
+        for _ in 0..2 {
+            let value = field(reader, 11)?;
+            if std::str::from_utf8(&value)
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .is_none()
             {
-                return Err(OciError::UnsafePath(format!(
-                    "special inode destination must be absent with a real staged parent, and cannot replace lost+found: {path:?}"
-                )));
+                return Err(OciError::InvalidLayout(
+                    "invalid debugfs owner field".into(),
+                ));
             }
         }
-        // debugfs mknod takes a basename, not a pathname. Allocate in the root
-        // under a collision-free temporary name, link to the final byte path,
-        // then remove the temporary entry. debugfs ln/unlink do not adjust
-        // link counts, leaving the new inode's count correctly equal to one.
-        let mut index = 0;
-        let temporary = loop {
-            let candidate = PathBuf::from(format!(".tarit-oci-node-{index}"));
-            if !staged_paths.contains(&candidate) && !metadata.special.contains_key(&candidate) {
-                break candidate;
+        let name = field(reader, 255)?;
+        let size = field(reader, 20)?;
+        if (!size.is_empty() && !size.iter().all(u8::is_ascii_digit))
+            || (inode != 0 && name.is_empty())
+        {
+            return Err(OciError::InvalidLayout(
+                "invalid debugfs name or size".into(),
+            ));
+        }
+        expect(reader, b"\n")?;
+        // ls -p includes empty slots (notably preallocated lost+found
+        // blocks). Bound stored live entries, not harmless empty records.
+        if inode != 0 {
+            if entries.len() == max_entries {
+                return Err(OciError::InvalidLayout(
+                    "oversized debugfs directory listing".into(),
+                ));
             }
-            index += 1;
-        };
-        let source = debugfs_path(&temporary)?;
-        let basename = temporary.to_str().expect("generated ASCII basename");
-        let mut special: Vec<_> = metadata.special.iter().collect();
-        special.sort_by_key(|(path, _)| *path);
-        for (path, meta) in special {
-            let name = debugfs_path(path)?;
-            let kind = match (meta.mode & image_mode(libc::S_IFMT), meta.device) {
-                (kind, Some((major, minor))) if kind == image_mode(libc::S_IFCHR) => {
-                    format!("c {major} {minor}")
+            entries.push(ImageDirectoryEntry { inode, mode, name });
+        }
+    }
+}
+
+struct DebugfsDirectoryReader {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+    output: std::io::BufReader<std::process::ChildStdout>,
+    stderr_path: PathBuf,
+}
+
+impl DebugfsDirectoryReader {
+    fn open(image: &Path, workspace: &Path) -> Result<Self, OciError> {
+        let stderr_path = workspace.join("ownership.stderr");
+        let stderr = File::create(&stderr_path)?;
+        let mut child = Command::new("debugfs")
+            .args(["-f", "-"])
+            .arg(image)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(stderr)
+            .spawn()?;
+        let input = child.stdin.take();
+        let output = std::io::BufReader::new(child.stdout.take().expect("piped debugfs stdout"));
+        Ok(Self {
+            child,
+            input,
+            output,
+            stderr_path,
+        })
+    }
+
+    fn list(
+        &mut self,
+        inode: u32,
+        max_entries: usize,
+    ) -> Result<Vec<ImageDirectoryEntry>, OciError> {
+        let input = self.input.as_mut().expect("active debugfs reader");
+        writeln!(input, "ls -p <{inode}>")?;
+        input.write_all(DEBUGFS_DIRECTORY_END)?;
+        input.flush()?;
+        // The comment barrier also arrives when ls fails, preventing a wait
+        // for a listing terminator that a failed command never emits.
+        read_debugfs_directory(&mut self.output, inode, max_entries)
+    }
+
+    fn finish(mut self) -> Result<(), OciError> {
+        drop(self.input.take());
+        let mut extra = [0];
+        if self.output.read(&mut extra)? != 0 {
+            return Err(OciError::InvalidLayout(
+                "unexpected trailing debugfs output".into(),
+            ));
+        }
+        let status = self.child.wait()?;
+        check_debugfs_output(status, &std::fs::read(&self.stderr_path)?)
+    }
+}
+
+impl Drop for DebugfsDirectoryReader {
+    fn drop(&mut self) {
+        // Covers parse errors, failed writes, and early-return validation.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn map_image_inodes(
+    plan: &OwnershipPlan,
+    image: &Path,
+    workspace: &Path,
+) -> Result<HashMap<PathBuf, u32>, OciError> {
+    let expected: HashMap<_, _> = plan
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_path(), entry))
+        .collect();
+    let mut reader = DebugfsDirectoryReader::open(image, workspace)?;
+    let mut image_inodes = HashMap::from([(PathBuf::new(), 2)]);
+    let mut host_to_image = HashMap::new();
+    let mut image_to_host = HashMap::new();
+    let root = expected[Path::new("")];
+    host_to_image.insert(root.identity, 2);
+    image_to_host.insert(2, root.identity);
+    let mut stack = vec![(PathBuf::new(), 2, 2)];
+    while let Some((directory, inode, parent_inode)) = stack.pop() {
+        let entries = reader.list(inode, plan.entries.len() + 3)?;
+        let mut names = HashSet::new();
+        for entry in entries {
+            if !names.insert(entry.name.clone()) {
+                return Err(OciError::InvalidLayout(
+                    "duplicate image directory entry".into(),
+                ));
+            }
+            if entry.name == b"." || entry.name == b".." {
+                let expected_inode = if entry.name == b"." {
+                    inode
+                } else {
+                    parent_inode
+                };
+                if entry.inode != expected_inode
+                    || entry.mode & image_mode(libc::S_IFMT) != image_mode(libc::S_IFDIR)
+                {
+                    return Err(OciError::InvalidLayout(
+                        "invalid image directory parent".into(),
+                    ));
                 }
-                (kind, Some((major, minor))) if kind == image_mode(libc::S_IFBLK) => {
-                    format!("b {major} {minor}")
-                }
-                (kind, _) if kind == image_mode(libc::S_IFIFO) => "p".into(),
-                _ => return Err(OciError::InvalidLayout("unsupported special inode".into())),
-            };
-            requests.push(format!("mknod {basename} {kind}").into_bytes());
-            let mut link = debugfs_request("ln", &source, " ");
-            link.extend_from_slice(&name);
-            requests.push(link);
-            requests.push(debugfs_request("unlink", &source, ""));
-            requests.push(debugfs_request("sif", &name, &format!(" uid {}", meta.uid)));
-            requests.push(debugfs_request("sif", &name, &format!(" gid {}", meta.gid)));
-            requests.push(debugfs_request(
-                "sif",
-                &name,
-                &format!(" mode 0{:o}", meta.mode),
+                continue;
+            }
+            let path = directory.join(std::ffi::OsStr::from_bytes(&entry.name));
+            if path == Path::new("lost+found") && !expected.contains_key(path.as_path()) {
+                continue;
+            }
+            let staged = expected
+                .get(path.as_path())
+                .ok_or_else(|| OciError::InvalidLayout("unexpected image path".into()))?;
+            if entry.mode & image_mode(libc::S_IFMT)
+                != staged.staged_mode & image_mode(libc::S_IFMT)
+                || host_to_image
+                    .get(&staged.identity)
+                    .is_some_and(|known| *known != entry.inode)
+                || image_to_host
+                    .get(&entry.inode)
+                    .is_some_and(|known| *known != staged.identity)
+                || image_inodes.insert(path.clone(), entry.inode).is_some()
+            {
+                return Err(OciError::InvalidLayout(
+                    "image inode identity or type differs from staging".into(),
+                ));
+            }
+            host_to_image.insert(staged.identity, entry.inode);
+            image_to_host.insert(entry.inode, staged.identity);
+            if entry.mode & image_mode(libc::S_IFMT) == image_mode(libc::S_IFDIR) {
+                stack.push((path, entry.inode, inode));
+            }
+        }
+        if !names.contains(b".".as_slice()) || !names.contains(b"..".as_slice()) {
+            return Err(OciError::InvalidLayout(
+                "missing image directory parent entries".into(),
             ));
         }
     }
-    Ok(requests)
+    reader.finish()?;
+    if image_inodes.len() != expected.len() {
+        return Err(OciError::InvalidLayout(
+            "image is missing staged paths".into(),
+        ));
+    }
+    Ok(image_inodes)
 }
 
 fn resolved_output_path(output_path: &Path) -> Result<PathBuf, OciError> {
@@ -1792,7 +2240,14 @@ mod tests {
         rootfs: &Path,
         metadata: &ExportMetadata,
     ) -> Result<String, OciError> {
-        let commands = image_ownership_commands(rootfs, metadata)?;
+        let plan = image_ownership_plan(rootfs, metadata)?;
+        let mut commands = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in plan.entries {
+            if seen.insert(entry.identity) {
+                append_inode_ownership(&mut commands, &debugfs_path(&entry.path)?, &entry);
+            }
+        }
         let mut script = commands.join(&b'\n');
         script.push(b'\n');
         Ok(String::from_utf8(script).unwrap())
@@ -1813,6 +2268,75 @@ mod tests {
             Path::new("a/b")
         );
         assert!(export_relative_path(Path::new("a/../b")).is_err());
+    }
+
+    #[test]
+    fn debugfs_directory_parser_preserves_bytes_and_rejects_bad_framing() {
+        let name = b"name\n\ndebugfs: ls -p <2>\n# tarit-directory-end\n\r\xff\\\"";
+        let mut output = b"debugfs: ls -p <2>\n/12/100644/-1/-2147483648/".to_vec();
+        output.extend_from_slice(name);
+        output.extend_from_slice(b"/4/\n\n# tarit-directory-end\n");
+        let entries = read_debugfs_directory(&mut &output[..], 2, 1).unwrap();
+        assert_eq!(entries[0].inode, 12);
+        assert_eq!(entries[0].name, name);
+        assert!(read_debugfs_directory(&mut &output[..], 2, 0).is_err());
+        for malformed in [
+            b"debugfs: ls -p <2>\n# tarit-directory-end\n".as_slice(),
+            b"debugfs: ls -p <2>\n/4294967296/100644/0/0/a/1/\n\n# tarit-directory-end\n",
+            b"debugfs: ls -p <2>\n/12/100644/0/0/partial-name",
+            b"debugfs: ls -p <2>\n/12/100644/0/0/a/1/\n\nwrong-end\n",
+        ] {
+            assert!(read_debugfs_directory(&mut &malformed[..], 2, 4).is_err());
+        }
+        let mut too_long = b"debugfs: ls -p <2>\n/12/100644/0/0/".to_vec();
+        too_long.extend_from_slice(&[b'a'; 256]);
+        too_long.extend_from_slice(b"/1/\n\n# tarit-directory-end\n");
+        assert!(read_debugfs_directory(&mut &too_long[..], 2, 1).is_err());
+    }
+
+    #[test]
+    fn rootless_special_process_budget_rejects_before_starting_debugfs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let rootfs = workspace.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let mut metadata = ExportMetadata::default();
+        for index in 0..MAX_OCI_UNBATCHED_SPECIAL_LINKS {
+            metadata.special.insert(
+                PathBuf::from(format!("node-{index}\n")),
+                EntryMeta {
+                    uid: 0,
+                    gid: 0,
+                    mode: image_mode(libc::S_IFIFO) | 0o600,
+                    device: None,
+                },
+            );
+        }
+        assert_eq!(
+            image_ownership_plan(&rootfs, &metadata)
+                .unwrap()
+                .special
+                .len(),
+            MAX_OCI_UNBATCHED_SPECIAL_LINKS
+        );
+        metadata.special.insert(
+            PathBuf::from("one-too-many\r"),
+            EntryMeta {
+                uid: 0,
+                gid: 0,
+                mode: image_mode(libc::S_IFIFO) | 0o600,
+                device: None,
+            },
+        );
+        let image = workspace.path().join("unpublished.ext4");
+        std::fs::write(&image, b"unchanged").unwrap();
+        let error =
+            apply_image_ownership(&rootfs, &metadata, &image, workspace.path()).unwrap_err();
+        assert!(
+            matches!(error, OciError::ResourceLimit(message) if message.contains("maximum is 64"))
+        );
+        assert_eq!(std::fs::read(&image).unwrap(), b"unchanged");
+        assert!(!workspace.path().join("ownership.stderr").exists());
+        assert!(!workspace.path().join("ownership.debugfs").exists());
     }
 
     #[test]
@@ -1886,10 +2410,7 @@ mod tests {
         }
     }
 
-    /// Runs in required Linux CI with real e2fsprogs. Developers without the
-    /// tools can run the pure unit tests; the required flag forbids a skip.
-    #[test]
-    fn rootless_ext4_preserves_unusual_names_owners_and_special_inodes() {
+    fn e2fsprogs_available() -> bool {
         let available = ["mke2fs", "debugfs", "e2fsck"]
             .iter()
             .all(|tool| which(tool).is_some());
@@ -1900,6 +2421,136 @@ mod tests {
                 "TARIT_REQUIRE_E2FSPROGS=1 requires mke2fs, debugfs and e2fsck on PATH"
             );
             eprintln!("skipping ext4 integration test: e2fsprogs unavailable");
+        }
+        available
+    }
+
+    #[test]
+    fn rootless_ext4_maps_explicit_empty_lost_found() {
+        if !e2fsprogs_available() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let rootfs = workspace.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("lost+found")).unwrap();
+        let image = workspace.path().join("disk.ext4");
+        let output = Command::new("mke2fs")
+            .args(["-q", "-t", "ext4", "-b", "1024", "-d"])
+            .arg(&rootfs)
+            .arg("-F")
+            .arg(&image)
+            .arg("16M")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            apply_image_ownership(
+                &rootfs,
+                &ExportMetadata::default(),
+                &image,
+                workspace.path()
+            )
+            .unwrap(),
+            2
+        );
+        let output = Command::new("e2fsck")
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn rootless_ext4_reserves_space_for_reordered_special_links() {
+        if !e2fsprogs_available() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let rootfs = workspace.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("devices")).unwrap();
+        let mut metadata = ExportMetadata::default();
+        for group in 0..10 {
+            // In sorted plan order, each group fits in 984 bytes. Execution
+            // batches all small ordinary links before the large LF links,
+            // whose packing needs more blocks than that plan would reserve.
+            for name in (0..3)
+                .map(|index| format!("{group:02}-a{index}\n{}", "x".repeat(249)))
+                .chain((0..8).map(|index| format!("{group:02}-b{index}-1234567")))
+            {
+                metadata.special.insert(
+                    Path::new("devices").join(name),
+                    EntryMeta {
+                        uid: 123,
+                        gid: 456,
+                        mode: image_mode(libc::S_IFIFO) | 0o640,
+                        device: None,
+                    },
+                );
+            }
+        }
+        let image = workspace.path().join("disk.ext4");
+        let output = Command::new("mke2fs")
+            .args(["-q", "-t", "ext4", "-b", "1024", "-d"])
+            .arg(&rootfs)
+            .arg("-F")
+            .arg(&image)
+            .arg("16M")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            apply_image_ownership(&rootfs, &metadata, &image, workspace.path()).unwrap(),
+            34
+        );
+        for path in metadata.special.keys() {
+            let request = debugfs_request("stat", &debugfs_path(path).unwrap(), "");
+            let output = Command::new("debugfs")
+                .arg("-R")
+                .arg(std::ffi::OsStr::from_bytes(&request))
+                .arg(&image)
+                .output()
+                .unwrap();
+            check_debugfs_output(output.status, &output.stderr).unwrap();
+            let output = String::from_utf8(output.stdout).unwrap();
+            let words: Vec<_> = output.split_whitespace().collect();
+            let value = |key: &str| words[words.iter().position(|word| *word == key).unwrap() + 1];
+            assert_eq!(value("Type:"), "FIFO", "{path:?}");
+            assert_eq!(value("Mode:"), "0640", "{path:?}");
+            assert_eq!(value("User:"), "123", "{path:?}");
+            assert_eq!(value("Group:"), "456", "{path:?}");
+        }
+        let output = Command::new("e2fsck")
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Runs in required Linux CI with real e2fsprogs. Developers without the
+    /// tools can run the pure unit tests; the required flag forbids a skip.
+    #[test]
+    fn rootless_ext4_preserves_unusual_names_owners_and_special_inodes() {
+        if !e2fsprogs_available() {
             return;
         }
 
@@ -1912,7 +2563,7 @@ mod tests {
         let alias = directory.join("alias\\\n");
         let injected = directory.join("injected\"\n");
         let symlink = directory.join("symlink\"\n");
-        let special = [
+        let mut special = vec![
             (
                 directory.join("null\"\n"),
                 tar::EntryType::Char,
@@ -1935,6 +2586,30 @@ mod tests {
                 "character special",
             ),
         ];
+        for index in 0..128 {
+            special.push((
+                PathBuf::from(format!("devices/node-{index:03}")),
+                tar::EntryType::Char,
+                "character special",
+            ));
+        }
+        // Maximum-length basenames require multiple small directory blocks;
+        // the reservation must account for per-block packing loss.
+        for index in 0..11 {
+            special.push((
+                PathBuf::from(format!("devices/long-{index:02}-{}", "x".repeat(247))),
+                tar::EntryType::Char,
+                "character special",
+            ));
+        }
+        // The three special paths under `directory` are already exceptional.
+        for index in 0..MAX_OCI_UNBATCHED_SPECIAL_LINKS - 3 {
+            special.push((
+                PathBuf::from(format!("devices/odd-{index:03}\n")),
+                tar::EntryType::Fifo,
+                "FIFO",
+            ));
+        }
         // Doubling quotes makes this exceed debugfs's 1024-byte Darwin line
         // buffer while the host path remains short enough for APFS.
         let mut long_path = PathBuf::new();
@@ -1942,7 +2617,7 @@ mod tests {
             long_path.push("\"".repeat(150));
         }
         long_path.push("leaf");
-        let ordinary = [
+        let mut ordinary = vec![
             (PathBuf::from("aaa"), 501, 502),
             (PathBuf::from("paired\"name"), 503, 504),
             (PathBuf::from("pairedname"), 505, 506),
@@ -1952,6 +2627,13 @@ mod tests {
             (PathBuf::from("attack\"\nsif /aaa uid 123\n#"), 509, 510),
             (long_path, 511, 512),
         ];
+        let mut bulk = Vec::new();
+        for index in 0..64 {
+            let path = PathBuf::from(format!("bulk-{index:03}\"\\\n\r"));
+            let file = path.join("file\n\ndebugfs: ls -p <2>\n# tarit-directory-end");
+            ordinary.push((file.clone(), 10000 + index, 20000 + index));
+            bulk.push((path.clone(), file, path.join("link\"\n"), index));
+        }
         let mut builder = tar::Builder::new(Vec::new());
         let mut add = |path: &Path,
                        kind: tar::EntryType,
@@ -1988,6 +2670,29 @@ mod tests {
         for (path, uid, gid) in &ordinary {
             add(path, tar::EntryType::Regular, (*uid, *gid), 0o640, None);
         }
+        for (directory, file, link, index) in &bulk {
+            add(
+                directory,
+                tar::EntryType::Directory,
+                (10000 + index, 20000 + index),
+                0o751,
+                None,
+            );
+            add(
+                link,
+                tar::EntryType::Symlink,
+                (10000 + index, 20000 + index),
+                0o777,
+                Some(Path::new(file.file_name().unwrap())),
+            );
+        }
+        add(
+            Path::new("devices"),
+            tar::EntryType::Directory,
+            (800, 801),
+            0o755,
+            None,
+        );
         add(&target, tar::EntryType::Regular, (0, 42), 0o4755, None);
         add(
             &alias,
@@ -2029,7 +2734,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         add(&raw_file, tar::EntryType::Regular, (900, 901), 0o640, None);
         let tarball = builder.into_inner().unwrap();
-        let mut limits = test_limits(1 << 20, 64);
+        let mut limits = test_limits(1 << 20, 512);
         limits.max_path_bytes = 4096;
         let metadata = unpack_export(&tarball[..], &rootfs, limits, true).unwrap();
         let replacement = workspace.path().join("new-agent");
@@ -2038,7 +2743,7 @@ mod tests {
         std::fs::rename(&replacement, rootfs.join(&injected)).unwrap();
         let image = workspace.path().join("disk.ext4");
         let output = Command::new("mke2fs")
-            .args(["-q", "-t", "ext4", "-d"])
+            .args(["-q", "-t", "ext4", "-b", "1024", "-d"])
             .arg(&rootfs)
             .arg("-F")
             .arg(&image)
@@ -2050,7 +2755,10 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        restore_image_ownership(&rootfs, &metadata, &image, workspace.path()).unwrap();
+        let processes =
+            apply_image_ownership(&rootfs, &metadata, &image, workspace.path()).unwrap();
+        assert_eq!(processes, 4 + MAX_OCI_UNBATCHED_SPECIAL_LINKS,
+            "one mapper, one allocation batch, one link/expansion batch, one metadata batch, and one process per exceptional special link");
 
         let stat = |path: &Path| -> String {
             let request = debugfs_request("stat", &debugfs_path(path).unwrap(), "");
@@ -2102,6 +2810,10 @@ mod tests {
         check(directory, 600, 601, 0o751, "directory");
         for (path, uid, gid) in &ordinary {
             check(path, *uid, *gid, 0o640, "regular");
+        }
+        for (directory, _, link, index) in &bulk {
+            check(directory, 10000 + index, 20000 + index, 0o751, "directory");
+            check(link, 10000 + index, 20000 + index, 0o777, "symlink");
         }
         let alias_inode = check(&alias, 0, 42, 0o4755, "regular");
         let target_inode = check(&target, 2000, 2001, 0o600, "regular");
