@@ -969,6 +969,26 @@ fn iov_range(iov: &[libc::iovec], start: usize, end: usize) -> Vec<libc::iovec> 
     out
 }
 
+/// The maximum vector count accepted by preadv on this host. Keep the Linux
+/// path constant for sandboxed block workers; other Unix hosts query POSIX's
+/// limit, falling back to its minimum when no limit is available.
+fn preadv_iov_limit() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        libc::UIO_MAXIOV as usize
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: sysconf takes a scalar selector and retains no pointers.
+        let limit = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+        usize::try_from(limit)
+            .ok()
+            .filter(|&limit| limit > 0)
+            .unwrap_or(16)
+            .min(libc::c_int::MAX as usize)
+    }
+}
+
 /// Fill every byte of `iov` from `fd` at `offset`, retrying short reads; a
 /// read past the end of the file is an error, as for `read_exact`.
 fn preadv_exact(fd: std::os::fd::RawFd, iov: &[libc::iovec], offset: u64) -> std::io::Result<()> {
@@ -976,8 +996,9 @@ fn preadv_exact(fd: std::os::fd::RawFd, iov: &[libc::iovec], offset: u64) -> std
     iov.retain(|v| v.iov_len > 0);
     let mut first = 0usize;
     let mut offset = offset;
+    let iov_limit = preadv_iov_limit();
     while first < iov.len() {
-        let count = (iov.len() - first).min(libc::UIO_MAXIOV as usize);
+        let count = (iov.len() - first).min(iov_limit);
         let file_offset = libc::off_t::try_from(offset).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "read offset overflows")
         })?;
@@ -1318,7 +1339,7 @@ mod tests {
                 iov_len: b.len(),
             })
             .collect();
-        assert!(iov.len() > libc::UIO_MAXIOV as usize);
+        assert!(iov.len() > preadv_iov_limit());
         // SAFETY: the iovecs cover `buffers`, untouched until the call returns.
         let status = unsafe { backend.service_read_into(&hdr(req_type::IN, 0), &iov) };
         assert_eq!(status, status::OK);
