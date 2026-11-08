@@ -135,6 +135,12 @@ components:
           type: string
           format: uuid
           description: Optional VM id; generated when omitted. A create with the id of an existing VM is refused with 409. Ids of deleted VMs stay reserved for TARIT_STOPPED_VM_RETENTION_HOURS (24 by default).
+        boot_memory_mib:
+          type: integer
+          minimum: 128
+          maximum: 3328
+          multipleOf: 128
+          description: Fixed boot RAM for new virtio-mem templates. memory_mib is the fully reserved maximum and must be larger and 128-MiB aligned.
         memory_mib:
           type: integer
           default: 256
@@ -289,7 +295,14 @@ components:
     RestoreRequest:
       type: object
       required: [snapshot_id]
+      additionalProperties: false
       properties:
+        target_memory_mib:
+          type: integer
+          minimum: 128
+          maximum: 65536
+          multipleOf: 128
+          description: Grow guest-visible RAM to this total within the snapshot reserved maximum. Requires a live hotplug-ready snapshot; shrinking is rejected.
         snapshot_id:
           type: string
           format: uuid

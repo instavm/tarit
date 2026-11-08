@@ -754,7 +754,30 @@ impl VmmClient {
         memory_policy: RestoreMemoryPolicy,
         memory_integrity: Option<MemoryIntegrity>,
     ) -> Result<(), VmmError> {
+        self.restore_with_memory_target(
+            snapshot_path,
+            overlay,
+            net,
+            volumes,
+            memory_policy,
+            memory_integrity,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Preserve the existing restore resource-override API.
+    pub fn restore_with_memory_target(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net: Option<Vec<NetConfig>>,
+        volumes: Option<Vec<VolumeConfig>>,
+        memory_policy: RestoreMemoryPolicy,
+        memory_integrity: Option<MemoryIntegrity>,
+        target_memory_mib: Option<u64>,
+    ) -> Result<(), VmmError> {
         match self.request_ok(&ApiRequest::Restore {
+            target_memory_mib,
             snapshot_path: snapshot_path.to_string(),
             overlay,
             net,
@@ -829,6 +852,7 @@ mod tests {
     #[test]
     fn restore_request_round_trips_with_lazy_memory_policy() {
         let req = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/snapshots/golden.snap".into(),
             memory_integrity: None,
             overlay: None,
@@ -1030,6 +1054,7 @@ mod tests {
     #[test]
     fn restore_request_round_trips_without_overlay() {
         let req = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/snapshots/golden.snap".into(),
             memory_integrity: None,
             overlay: None,
@@ -1050,6 +1075,7 @@ mod tests {
         let decoded: ApiRequest = serde_json::from_value(value).unwrap();
         match decoded {
             ApiRequest::Restore {
+                target_memory_mib: None,
                 snapshot_path,
                 memory_integrity,
                 overlay,
@@ -1071,6 +1097,7 @@ mod tests {
     #[test]
     fn restore_request_round_trips_with_overlay() {
         let req = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/snapshots/golden.snap".into(),
             memory_integrity: None,
             overlay: Some("/overlays/clone.cow".into()),
@@ -1092,6 +1119,7 @@ mod tests {
         let decoded: ApiRequest = serde_json::from_value(value).unwrap();
         match decoded {
             ApiRequest::Restore {
+                target_memory_mib: None,
                 snapshot_path,
                 memory_integrity,
                 overlay,

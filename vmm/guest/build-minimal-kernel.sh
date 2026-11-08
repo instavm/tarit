@@ -74,7 +74,7 @@ cp "${BASE_CONFIG}" "${BUILD}/.config"
   --enable VIRTIO --enable VIRTIO_MENU --enable VIRTIO_MMIO \
   --enable VIRTIO_MMIO_CMDLINE_DEVICES --enable VIRTIO_BLK --enable VIRTIO_NET \
   --disable VIRTIO_CONSOLE --enable VSOCKETS --enable VIRTIO_VSOCKETS \
-  --disable VIRTIO_PMEM --enable VIRTIO_BALLOON --disable VIRTIO_MEM \
+  --disable VIRTIO_PMEM --enable VIRTIO_BALLOON --enable VIRTIO_MEM \
   --enable HW_RANDOM --enable HW_RANDOM_VIRTIO \
   --disable HW_RANDOM_TIMERIOMEM --disable HW_RANDOM_INTEL --disable HW_RANDOM_AMD \
   --disable HW_RANDOM_BA431 --disable HW_RANDOM_VIA --disable HW_RANDOM_XIPHERA \
@@ -100,6 +100,12 @@ export SOURCE_DATE_EPOCH="${KERNEL_SOURCE_DATE_EPOCH}"
 export KCFLAGS="-fdebug-prefix-map=${SRC}=linux-${KERNEL_VERSION} -fdebug-prefix-map=${BUILD}=linux-${KERNEL_VERSION}"
 
 make -C "${SRC}" O="${BUILD}" olddefconfig
+for feature in MEMORY_HOTPLUG MEMORY_HOTREMOVE VIRTIO_MEM; do
+  grep -qx "CONFIG_${feature}=y" "${BUILD}/.config" || {
+    echo "error: required guest memory growth feature ${feature} is disabled" >&2
+    exit 1
+  }
+done
 make -C "${SRC}" O="${BUILD}" -j"${JOBS}" vmlinux
 
 mkdir -p "$(dirname "${OUT}")" "$(dirname "${CONFIG_OUT}")"
