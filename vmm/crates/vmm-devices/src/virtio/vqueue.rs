@@ -17,9 +17,8 @@ pub const MAX_QUEUE_SIZE: u16 = 256;
 /// the processor accepts up to this, each device enforces its own offer.
 pub const MAX_SUPPORTED_QUEUE_SIZE: u16 = 1024;
 
-/// Maximum per-descriptor length (1 MiB). Oversized payloads are never
-/// processed; block devices may inspect the bounded descriptor list to
-/// complete an older driver's request with an error.
+/// Maximum per-descriptor length (1 MiB) for payload-copying queue APIs.
+/// Block devices can stream larger validated buffers for legacy drivers.
 pub const MAX_DESC_LEN: u32 = 1024 * 1024;
 
 /// Maximum total bytes across all descriptors in a single chain (4 MiB).
@@ -209,8 +208,9 @@ struct DescriptorChain {
 pub(crate) struct Chain<'a> {
     pub readable: &'a [(u64, u32)],
     pub writable: &'a [(u64, u32)],
-    /// Payload sizes exceed our limits. Only write the device's error status;
-    /// do not allocate, read, or write the data buffers in this chain.
+    /// Payload sizes exceed the allocation limits. The device must stream
+    /// these buffers with bounded metadata or complete with an error; it
+    /// must never allocate a payload-sized buffer.
     pub over_limit: bool,
 }
 
@@ -770,9 +770,9 @@ impl VirtQueueProcessor {
         })
     }
 
-    /// Let a device complete an oversized but otherwise valid request with
-    /// its own error status. Descriptor count, addresses and links are still
-    /// validated, and payloads are never read by this method. Other queue
+    /// Let a device stream an oversized but otherwise valid request, or
+    /// complete it with its own error status. Descriptor count, addresses and
+    /// links are still validated, and payloads are never read by this method. Other queue
     /// entry points retain their strict size rejection.
     pub(crate) fn process_queue_chains_dirty<F>(
         &mut self,
