@@ -57,6 +57,14 @@ with TaritClient("https://tarit.example", "tenant-api-key") as tarit:
 Generated models and operation modules remain available under `tarit_sdk.models`
 and `tarit_sdk.api`.
 
+Execution deadlines stop waiting without cancelling the guest command. Python
+`TaritDeadlineExceeded.execution_id` contains the server-returned UUID once
+submission is decoded, or the ID passed to `wait_execution`. The error message
+also includes it. Call `wait_execution(error.execution_id)` to resume polling
+without submitting the command again. If submission times out before a usable
+response arrives, `execution_id` is `None`: the command may still have been
+accepted, and the SDK cannot recover its server-generated ID from that response.
+
 A fork deadline stops waiting; it does not cancel creation on the server. Catch
 `TaritDeadlineExceeded` and use its `child_id` to query or delete the child VM,
 or retry the fork with that same `child_id`. The error exposes the stable ID

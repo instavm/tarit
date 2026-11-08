@@ -27,5 +27,12 @@ poll intervals must be finite and nonnegative. Expiry raises
 `TaritDeadlineExceeded` and stops waiting; an already submitted guest command
 may continue running.
 
+The error's `executionId` and message preserve the server-returned ID once
+submission is decoded, or the ID passed to `waitExecution`. Use
+`tarit.waitExecution(error.executionId)` to resume polling without resubmitting.
+If submission times out before a usable response arrives, `executionId` is
+`undefined` and the message says the ID is unavailable. The server may still
+have accepted the command; the SDK does not invent an ID or retry submission.
+
 `pollIntervalMs` is the minimum wait after a pending response before another
 poll. If the deadline expires before that interval ends, no further poll is sent.

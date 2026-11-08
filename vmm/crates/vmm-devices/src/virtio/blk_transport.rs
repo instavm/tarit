@@ -9,7 +9,7 @@ use crate::bus::{MmioDevice, MmioError, MmioReadResult, MmioWriteResult};
 use crate::persist::{Persist, PersistError};
 use crate::rate_limit::RateLimiter;
 use crate::virtio::blk::{req_type, status, BlkReqHeader};
-use crate::virtio::blk_backend::BlkBackend;
+use crate::virtio::blk_backend::{BlkBackend, MAX_BLOCK_REQUEST_BYTES};
 use crate::virtio::regs::{reg, MAGIC};
 use crate::virtio::vqueue::{
     is_valid_queue_size, QueueConfig, VirtQueueProcessor, VirtQueueProcessorState, MAX_QUEUE_SIZE,
@@ -684,9 +684,15 @@ impl VirtioBlkMmio {
                     .as_ref()
                     .is_some_and(|header| header.req_type == req_type::IN)
                     && request_bytes.is_some_and(|len| len >= u64::from(u32::MAX));
+                // Check the full payload before constructing guest iovecs or
+                // accessing the backend. Rejection consumes one IOPS token,
+                // but no byte tokens: no payload has been transferred.
+                let oversized_request =
+                    request_bytes.is_some_and(|len| len > MAX_BLOCK_REQUEST_BYTES);
                 if request_bytes.is_none()
                     || invalid_size
                     || invalid_used_len
+                    || oversized_request
                     || (chain.over_limit && !streamable)
                 {
                     match self.rate_limit_allows(0) {
@@ -1627,6 +1633,186 @@ mod tests {
                     );
                     drop(restored);
                     std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_cap_completes_boundary_and_rejects_aggregate_overflow_before_io() {
+        use crate::virtio::vqueue::{UsedElem, MAX_DESC_LEN};
+        use std::io::Read;
+        use std::os::unix::fs::FileExt;
+
+        // Preserve every payload possible under the offered queue/SIZE_MAX
+        // contract. SEG_MAX is not offered, so all queue entries count.
+        assert!(MAX_BLOCK_REQUEST_BYTES >= u64::from(MAX_QUEUE_SIZE) * u64::from(MAX_DESC_LEN));
+        const DATA: u64 = 0x20_0000;
+        const SEGMENT_BYTES: usize = 2 * 1024 * 1024;
+        for request in [req_type::IN, req_type::OUT] {
+            for over_cap in [false, true] {
+                let disk = tempfile::NamedTempFile::new().unwrap();
+                disk.as_file()
+                    .set_len(MAX_BLOCK_REQUEST_BYTES + 512)
+                    .unwrap();
+                if request == req_type::IN && !over_cap {
+                    disk.as_file()
+                        .write_all_at(&[0x3c; 512], MAX_BLOCK_REQUEST_BYTES - 512)
+                        .unwrap();
+                }
+                let dev = VirtioBlkMmio::new(5, BlkBackend::open(disk.path(), false).unwrap());
+                // Reuse one 2 MiB guest range in all data descriptors. The
+                // logical I/O is 256 MiB but neither guest nor host needs a
+                // payload-sized allocation. The backing file starts sparse.
+                let mem = new_test_mem();
+                configure_test_blk_queue(&dev, mem.clone());
+                dev.mmio_write(reg::QUEUE_NUM, u64::from(MAX_QUEUE_SIZE), 4)
+                    .unwrap();
+                dev.mmio_write(reg::GUEST_FEATURES, u64::from(VIRTIO_RING_F_EVENT_IDX), 4)
+                    .unwrap();
+                let dirty = SoftwareDirtyBitmap::new();
+                dev.set_guest_dirty_tracker(dirty.clone());
+                let clock = Arc::new(ManualClock::new(0));
+                if over_cap {
+                    dev.set_rate_limiter(RateLimiter::new_with_clock(1, 512, clock.clone()));
+                }
+                mem.write_obj(
+                    BlkReqHeader {
+                        req_type: request,
+                        reserved: 0,
+                        sector: 0,
+                    },
+                    GuestAddress(TEST_HEADER_BASE),
+                )
+                .unwrap();
+                let mut expected = vec![0x5a; SEGMENT_BYTES];
+                mem.write_slice(&expected, GuestAddress(DATA)).unwrap();
+                let mut lengths =
+                    vec![SEGMENT_BYTES as u32; MAX_BLOCK_REQUEST_BYTES as usize / SEGMENT_BYTES];
+                if over_cap {
+                    lengths.push(1);
+                }
+                assert!(lengths.len() + 2 <= usize::from(MAX_QUEUE_SIZE));
+                assert_eq!(
+                    lengths.iter().map(|&len| u64::from(len)).sum::<u64>(),
+                    MAX_BLOCK_REQUEST_BYTES + u64::from(over_cap)
+                );
+                mem.write_obj(
+                    Descriptor {
+                        addr: TEST_HEADER_BASE,
+                        len: BlkReqHeader::SIZE as u32,
+                        flags: desc_flags::NEXT,
+                        next: 1,
+                    },
+                    GuestAddress(TEST_DESC),
+                )
+                .unwrap();
+                for (i, &len) in lengths.iter().enumerate() {
+                    mem.write_obj(
+                        Descriptor {
+                            addr: DATA,
+                            len,
+                            flags: desc_flags::NEXT
+                                | if request == req_type::IN {
+                                    desc_flags::WRITE
+                                } else {
+                                    0
+                                },
+                            next: i as u16 + 2,
+                        },
+                        GuestAddress(TEST_DESC + (i as u64 + 1) * 16),
+                    )
+                    .unwrap();
+                }
+                mem.write_obj(
+                    Descriptor {
+                        addr: TEST_STATUS_BASE,
+                        len: 1,
+                        flags: desc_flags::WRITE,
+                        next: 0,
+                    },
+                    GuestAddress(TEST_DESC + (lengths.len() as u64 + 1) * 16),
+                )
+                .unwrap();
+                mem.write_obj(0xffu8, GuestAddress(TEST_STATUS_BASE))
+                    .unwrap();
+                mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(TEST_AVAIL))
+                    .unwrap();
+                mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 4)).unwrap();
+
+                dev.process_queue(0).unwrap();
+                assert_eq!(used_idx(&mem), 1);
+                assert_eq!(
+                    mem.read_obj::<u8>(GuestAddress(TEST_STATUS_BASE)).unwrap(),
+                    if over_cap { status::IO_ERR } else { status::OK }
+                );
+                let used: UsedElem = mem.read_obj(GuestAddress(TEST_USED + 4)).unwrap();
+                assert_eq!(
+                    (used.id, used.len),
+                    (
+                        0,
+                        if request == req_type::IN && !over_cap {
+                            MAX_BLOCK_REQUEST_BYTES as u32 + 1
+                        } else {
+                            1
+                        }
+                    )
+                );
+                let avail_event = TEST_USED + 4 + u64::from(MAX_QUEUE_SIZE) * 8;
+                assert_eq!(mem.read_obj::<u16>(GuestAddress(avail_event)).unwrap(), 1);
+                assert_ne!(dev.mmio_read(reg::INTERRUPT_STATUS, 4).unwrap(), 0);
+                if request == req_type::IN && !over_cap {
+                    expected.fill(0);
+                    expected[SEGMENT_BYTES - 512..].fill(0x3c);
+                }
+                let mut after = vec![0; SEGMENT_BYTES];
+                mem.read_slice(&mut after, GuestAddress(DATA)).unwrap();
+                assert!(
+                    after == expected,
+                    "rejected I/O must not change guest payloads"
+                );
+                let changed = dirty.drain();
+                assert!(changed.contains(TEST_STATUS_BASE));
+                assert!(changed.contains(TEST_USED));
+                assert_eq!(changed.contains(DATA), request == req_type::IN && !over_cap);
+
+                if request == req_type::OUT {
+                    // Check the entire disk with fixed-size buffers: even a
+                    // partial write from a rejected request must be detected.
+                    let expected = [if over_cap { 0 } else { 0x5a }; 64 * 1024];
+                    let mut buffer = [0u8; 64 * 1024];
+                    let mut file = disk.reopen().unwrap();
+                    let mut remaining = MAX_BLOCK_REQUEST_BYTES;
+                    while remaining > 0 {
+                        let take = remaining.min(buffer.len() as u64) as usize;
+                        file.read_exact(&mut buffer[..take]).unwrap();
+                        assert!(
+                            buffer[..take] == expected[..take],
+                            "unexpected disk mutation"
+                        );
+                        remaining -= take as u64;
+                    }
+                    file.read_exact(&mut buffer[..512]).unwrap();
+                    assert_eq!(&buffer[..512], &[0; 512]);
+                }
+                if over_cap {
+                    // Rejection costs one op and zero bytes. An ordinary
+                    // request waits for that op, then has its full byte budget.
+                    setup_blk_out_requests(&mem, 1);
+                    mem.write_obj(2u16, GuestAddress(TEST_AVAIL + 2)).unwrap();
+                    mem.write_obj(0u16, GuestAddress(TEST_AVAIL + 6)).unwrap();
+                    dev.process_queue(0).unwrap();
+                    assert_eq!(
+                        dev.processor.lock().unwrap().as_ref().unwrap().used_idx(),
+                        1
+                    );
+                    clock.advance(1_000_000_000);
+                    dev.process_queue(0).unwrap();
+                    assert_eq!(used_idx(&mem), 2);
+                    assert_eq!(
+                        mem.read_obj::<u8>(GuestAddress(TEST_STATUS_BASE)).unwrap(),
+                        status::OK
+                    );
                 }
             }
         }
