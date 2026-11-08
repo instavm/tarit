@@ -191,6 +191,34 @@ vmm snapshot [--diff] [--socket <PATH>]
 |---|---|---|
 | `--diff` | off | Create a diff snapshot |
 
+### `vmm snapshot-verify`: Check a full snapshot file offline
+
+```sh
+vmm snapshot-verify [--record] <PATH>
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `<PATH>` | (required) | Full (`VMSN`) snapshot file |
+| `--record` | off | Mark this version of the file verified for restores |
+
+Checks the header, state CRC and RAM CRC as a restore does, reading only the
+RAM image's data extents (holes count as zeros without being read), and prints
+one JSON line:
+
+```json
+{"verified":true,"mem_len":9233760256,"data_bytes":157286400,"recorded":true,"elapsed_ms":101}
+```
+
+A mapped restore checks the RAM CRC the first time it maps a file and records
+the result in the `user.tarit.ram-verified` xattr, keyed by the file's device,
+inode, size, mtime, layout and CRC, so later restores of the same unmodified
+file skip the check. A VMM that cannot write the file, such as a jailed one
+with the snapshot bind-mounted read-only, cannot record it and checks again on
+every restore. `--record` records it beforehand; run it as a user that can
+write the file, on the file the jail mounts (a copy has its own identity). Any
+failed check exits non-zero and records nothing.
+
 ### `vmm status` (`info`): Show VM status
 
 ```sh
