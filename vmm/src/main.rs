@@ -413,6 +413,24 @@ enum Cmd {
         gid: u32,
     },
 
+    /// Check a full snapshot file's checksums without restoring it.
+    ///
+    /// Checks the header, state CRC and RAM CRC as a restore does, reading
+    /// only the RAM image's data extents, and prints one JSON line. With
+    /// --record, also marks this version of the file verified (the
+    /// `user.tarit.ram-verified` xattr), so restores of it skip the RAM scan
+    /// even where they cannot write the file, such as a jail that mounts it
+    /// read-only. Exits non-zero, recording nothing, if any check fails.
+    SnapshotVerify {
+        /// Record the verification on the file; needs write access to it.
+        #[arg(long)]
+        record: bool,
+
+        /// Full snapshot file to check.
+        #[arg(value_name = "PATH")]
+        path: std::path::PathBuf,
+    },
+
     /// Start the API server on a Unix socket.
     #[command(alias = "server")]
     Serve {
@@ -666,6 +684,7 @@ fn main() -> Result<()> {
             uid,
             gid,
         ),
+        Cmd::SnapshotVerify { record, path } => snapshot_verify(&path, record),
         Cmd::Serve {
             jail,
             uid,
@@ -1508,6 +1527,28 @@ fn api_request(socket: &str, req: &vmm_api::types::ApiRequest) -> Result<()> {
     Ok(())
 }
 
+fn snapshot_verify(path: &std::path::Path, record: bool) -> Result<()> {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    {
+        let started = std::time::Instant::now();
+        let verified = vmm_core::controller::verify_full_snapshot(path, record)
+            .map_err(|e| anyhow::anyhow!("snapshot-verify: {e}"))?;
+        println!(
+            r#"{{"verified":true,"mem_len":{},"data_bytes":{},"recorded":{},"elapsed_ms":{}}}"#,
+            verified.mem_len,
+            verified.data_bytes,
+            verified.recorded,
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    {
+        let _ = (path, record);
+        anyhow::bail!("snapshot-verify needs a Linux x86_64 build with the boot feature")
+    }
+}
+
 fn gc(dir: std::path::PathBuf, max_age_secs: u64) -> Result<()> {
     let report =
         vmm_core::gc::gc_scratch_files(&dir, std::time::Duration::from_secs(max_age_secs))?;
@@ -1950,6 +1991,21 @@ mod tests {
             _ => panic!("expected attach-pty command"),
         }
         assert_eq!(cli.socket, "/run/vmm.sock");
+    }
+
+    #[test]
+    fn cli_snapshot_verify_takes_a_path_and_optional_record() {
+        let cli = Cli::try_parse_from(["vmm", "snapshot-verify", "--record", "/s.snap"]).unwrap();
+        match cli.cmd {
+            Cmd::SnapshotVerify { record, path } => {
+                assert!(record);
+                assert_eq!(path, std::path::Path::new("/s.snap"));
+            }
+            _ => panic!("expected snapshot-verify command"),
+        }
+        let cli = Cli::try_parse_from(["vmm", "snapshot-verify", "/s.snap"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::SnapshotVerify { record: false, .. }));
+        assert!(Cli::try_parse_from(["vmm", "snapshot-verify"]).is_err());
     }
 
     #[test]
