@@ -87,6 +87,15 @@ jobs:
           npm --prefix sdk/typescript test
           npm --prefix sdk/typescript run build
 
+      - name: Check ComputeSDK adapter
+        run: |
+          npm install --ignore-scripts --prefix sdk/computesdk
+          npm --prefix sdk/computesdk run typecheck
+          npm --prefix sdk/computesdk test
+
+      - name: Test benchmark API contract
+        run: python -m unittest discover -s scripts/tests -v
+
   check:
     name: check / test / clippy / fmt (${{ matrix.workspace }})
     runs-on: ubuntu-latest

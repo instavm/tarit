@@ -11,16 +11,20 @@
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts --sourcemap",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test tests/*.test.cjs"
   },
   "dependencies": {
     "@computesdk/provider": "^2.1.22",
     "computesdk": "^4.1.16"
   },
   "devDependencies": {
+    "@types/node": "^18.19.130",
     "tsup": "^8.0.0",
     "typescript": "^5.4.0"
   },
