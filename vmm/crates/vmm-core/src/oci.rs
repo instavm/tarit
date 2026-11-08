@@ -492,7 +492,7 @@ fn convert_engine_image(
     log::info!("oci: creating ext4 disk image ({}MB)", size_mb);
     let mut mke2fs = Command::new("mke2fs");
     mke2fs
-        .args(["-q", "-t", "ext4", "-b", "1024", "-d"])
+        .args(["-q", "-t", "ext4", "-d"])
         .arg(&rootfs)
         .args(["-L", "rootfs", "-F"])
         .arg(&staged_output)
