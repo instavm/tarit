@@ -67,6 +67,11 @@ versions may contain breaking changes.
   network, soak) with correctness checks.
 - `VmmController::net_counters` reports per-device packet counts and queue
   kicks the vCPU had to handle.
+- Experimental: the VMM API can resize a running virtio-mem VM.
+  `memory_hotplug_status` reports aperture, block, plugged and requested sizes;
+  `set_memory_hotplug` grows or shrinks the requested hotplug size (0 unplugs
+  all) with an optional bounded wait. Unplugged blocks are discarded so host
+  RSS drops. See `docs/memory-growth.md`.
 - Generated Python and TypeScript clients now cover the public OpenAPI contract.
   Their handwritten layers provide API-key setup, typed failures,
   deadline-bounded execution polling, stable-child-id live-fork retries, and
@@ -87,6 +92,8 @@ versions may contain breaking changes.
 
 ### Changed
 
+- vCPU threads are named `vcpu N` (N = vCPU id) so host tooling can find them,
+  for example to place only vCPU threads in a cgroup v2 threaded child.
 - A restore or fork child seeds and verifies its private disk upper while
   the network is provisioned and the VMM process starts, instead of after.
 

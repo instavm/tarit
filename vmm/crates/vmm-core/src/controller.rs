@@ -40,12 +40,14 @@ pub struct RunningVm {
     pub net_io_loops: Vec<vmm_devices::virtio::net_io_loop::NetIoLoop>,
     pub blk_devices: Vec<Arc<vmm_devices::virtio::blk_transport::VirtioBlkMmio>>,
     pub net_devices: Vec<Arc<vmm_devices::virtio::net_transport::VirtioNetMmio>>,
+    pub memory_device: Option<Arc<vmm_devices::virtio::mem::VirtioMemMmio>>,
+    pub memory_irq_resample: Option<LevelIrqResample>,
     pub balloon_device: Option<Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>>,
     /// virtio-rng transport, kept so snapshots carry its queue state.
     pub rng_device: Option<Arc<vmm_devices::virtio::rng_transport::VirtioRngMmio>>,
     /// Reasserts the balloon's level IRQ after guest EOI when another virtio
     /// cause arrived during the interrupt-service window.
-    pub balloon_irq_resample: Option<BalloonIrqResample>,
+    pub balloon_irq_resample: Option<LevelIrqResample>,
     /// TAP devices backing the virtio-net loops; closed after the loops stop.
     pub taps: Vec<vmm_net::tap::Tap>,
     /// virtio-vsock host pump thread (host→guest RX). Dropped before the irqfds.
@@ -594,6 +596,9 @@ impl VmmController {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     fn boot_vm(&self, config: &VmConfig) -> Result<(vmm_memory_backend::GuestMemory, Vec<u8>)> {
+        if config.memory.boot_size_mib.is_some() {
+            return Err(VmmError::InvalidConfig("hotplug requires live boot".into()));
+        }
         use std::time::Instant;
         use vmm_loader::load;
         use vmm_memory_backend::GuestMemory;
@@ -1155,7 +1160,12 @@ impl VmmController {
         }
 
         let mem_size = config.memory.size_bytes()?;
-        let mem = GuestMemory::new(mem_size).map_err(|e| VmmError::Memory(e.to_string()))?;
+        let mem = if config.memory.boot_size_mib.is_some() {
+            GuestMemory::new_hotplug(mem_size, config.memory.boot_bytes()?)
+        } else {
+            GuestMemory::new(mem_size)
+        }
+        .map_err(|e| VmmError::Memory(e.to_string()))?;
         let mut cmdline = if config.kernel.cmdline.is_empty() {
             vmm_loader::default_cmdline()
         } else {
@@ -1174,6 +1184,15 @@ impl VmmController {
             }
         }
 
+        // Auto-online plugged virtio-mem blocks unless the caller chose a
+        // policy (e.g. `online_movable`, which makes later unplug reliable).
+        if config.memory.boot_size_mib.is_some()
+            && !cmdline
+                .split_whitespace()
+                .any(|arg| arg.starts_with("memhp_default_state="))
+        {
+            cmdline.push_str(" memhp_default_state=online");
+        }
         // Running VMs always need an in-kernel IRQCHIP + PIT. Without it KVM has
         // no LAPIC to service the guest timer, so HLT exits to userspace and the
         // vCPU thread busy-spins at 100% CPU instead of blocking while idle
@@ -1202,6 +1221,7 @@ impl VmmController {
             rng_irq,
             vsock,
             balloon,
+            memory,
         } = build_devices(&config, &mem)?;
         let mut irq_evts: Vec<vmm_sys_util::eventfd::EventFd> = blk_irq_evts;
 
@@ -1218,7 +1238,7 @@ impl VmmController {
             &kernel_path,
             &cmdline,
             config.kernel.initramfs.as_ref().map(PathBuf::from).as_ref(),
-            mem.size_bytes,
+            config.memory.boot_bytes()?,
         )
         .map_err(|e| VmmError::Loader(e.to_string()))?;
         crate::vcpu_setup::write_gdt(&mem).map_err(|e| VmmError::Device(e.to_string()))?;
@@ -1237,6 +1257,12 @@ impl VmmController {
             crate::kvm::KvmVm::new_with_options(mem.clone(), devices, template, full_boot)?;
         // Overlap the slow resampler registration with the rest of the wiring.
         let balloon_irqfd = balloon
+            .as_ref()
+            .map(|wired| {
+                kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
+            })
+            .transpose()?;
+        let memory_irqfd = memory
             .as_ref()
             .map(|wired| {
                 kvm_vm.begin_irqfd_with_resample(&wired.irq_evt, &wired.resample_evt, wired.irq)
@@ -1345,12 +1371,30 @@ impl VmmController {
             irq_evts.push(evt);
         }
 
+        let memory_device = memory.as_ref().map(|wired| wired.device.clone());
+        let mut memory_irq_resample = match memory {
+            Some(wired) => {
+                let evt = wired
+                    .irq_evt
+                    .try_clone()
+                    .map_err(|e| VmmError::Kvm(e.to_string()))?;
+                let loop_handle = LevelIrqResample::spawn(
+                    memory_irqfd,
+                    move || wired.device.has_pending_interrupt(),
+                    evt,
+                    wired.resample_evt,
+                )?;
+                irq_evts.push(wired.irq_evt);
+                Some(loop_handle)
+            }
+            None => None,
+        };
         let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
         let mut balloon_irq_resample = match balloon {
             Some(wired) => {
-                let loop_handle = BalloonIrqResample::spawn(
+                let loop_handle = LevelIrqResample::spawn(
                     balloon_irqfd,
-                    wired.device,
+                    move || wired.device.has_pending_interrupt(),
                     wired
                         .irq_evt
                         .try_clone()
@@ -1419,7 +1463,12 @@ impl VmmController {
         kvm_vm.commit_gsi_routing()?;
         let vcpu = kvm_vm.create_vcpu(0)?;
         kvm_vm.setup_vcpu_for_bzimage_boot_full(&vcpu, &loaded, full_boot)?;
-        let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
+        let vcpu_thread = VcpuThread::spawn(
+            crate::vcpu::VcpuId(0),
+            vcpu,
+            kvm_vm.mmio_bus.clone(),
+            serial.clone(),
+        )?;
 
         // SMP: create the application processors (vCPU ids 1..count). Each AP
         // gets CPUID (with its APIC id) + MP_STATE=UNINITIALIZED and its own
@@ -1430,14 +1479,18 @@ impl VmmController {
             let ap = kvm_vm.create_vcpu(id)?;
             kvm_vm.setup_ap_vcpu(&ap, id)?;
             ap_threads.push(VcpuThread::spawn(
+                crate::vcpu::VcpuId(id),
                 ap,
                 kvm_vm.mmio_bus.clone(),
                 serial.clone(),
-            ));
+            )?);
             log::info!("SMP: AP vCPU {id} created (UNINITIALIZED, awaiting SIPI)");
         }
 
-        if let Some(resample) = balloon_irq_resample.as_mut() {
+        for resample in [memory_irq_resample.as_mut(), balloon_irq_resample.as_mut()]
+            .into_iter()
+            .flatten()
+        {
             resample.finish_registration()?;
         }
 
@@ -1471,6 +1524,8 @@ impl VmmController {
                 net_io_loops,
                 blk_devices: blks,
                 net_devices,
+                memory_device,
+                memory_irq_resample,
                 balloon_device,
                 rng_device: Some(rng),
                 balloon_irq_resample,
@@ -1939,6 +1994,29 @@ impl VmmController {
         memory_policy: tarit_proto::RestoreMemoryPolicy,
         memory_integrity: Option<tarit_proto::MemoryIntegrity>,
     ) -> Result<()> {
+        self.restore_with_memory_target(
+            snapshot_path,
+            overlay,
+            net_override,
+            volume_override,
+            memory_policy,
+            memory_integrity,
+            None,
+        )
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[allow(clippy::too_many_arguments)] // Preserve the existing restore resource-override API.
+    pub fn restore_with_memory_target(
+        &self,
+        snapshot_path: &str,
+        overlay: Option<String>,
+        net_override: Option<Vec<crate::config::NetConfig>>,
+        volume_override: Option<Vec<crate::config::VolumeConfig>>,
+        memory_policy: tarit_proto::RestoreMemoryPolicy,
+        memory_integrity: Option<tarit_proto::MemoryIntegrity>,
+        target_memory_mib: Option<u64>,
+    ) -> Result<()> {
         use std::time::Instant;
 
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Restore)?;
@@ -2029,6 +2107,10 @@ impl VmmController {
                 initramfs: None,
             },
             memory: crate::config::MemoryConfig {
+                boot_size_mib: saved
+                    .virtio_mem
+                    .as_ref()
+                    .map(|m| m.boot_bytes / crate::config::MIB),
                 size_mib: u64::try_from(mem_len / mib).map_err(|_| {
                     VmmError::InvalidConfig("snapshot memory size too large".into())
                 })?,
@@ -2076,10 +2158,17 @@ impl VmmController {
                     virtio_net: &virtio_net,
                     vsock: vsock_state.as_ref(),
                     balloon: balloon_state.as_ref(),
+                    memory: saved.virtio_mem.as_ref(),
+                    target_memory_mib,
                     rng: saved.rng.as_ref(),
                 };
                 let running = build_running_vm(mem.clone(), &config, restored, entry)?;
                 (Some(running), VmState::Running)
+            }
+            None if target_memory_mib.is_some() => {
+                return Err(VmmError::InvalidConfig(
+                    "memory growth requires a live hotplug-ready snapshot".into(),
+                ))
             }
             None => (None, VmState::Paused),
         };
@@ -2129,8 +2218,9 @@ impl VmmController {
         });
         drop(slot);
         if resumed {
-            if let Err(error) =
-                await_clone_repair_barrier(self).and_then(|()| self.finish_irq_registration())
+            if let Err(error) = await_clone_repair_barrier(self)
+                .and_then(|()| self.finish_irq_registration())
+                .and_then(|()| await_memory_online(self))
             {
                 // A clone whose kernel/userspace state was not repaired must
                 // never become externally usable. Taking the instance drops
@@ -2167,6 +2257,21 @@ impl VmmController {
         _volume_override: Option<Vec<crate::config::VolumeConfig>>,
         _memory_policy: tarit_proto::RestoreMemoryPolicy,
         _memory_integrity: Option<tarit_proto::MemoryIntegrity>,
+    ) -> Result<()> {
+        Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    #[allow(clippy::too_many_arguments)] // Preserve the existing restore resource-override API.
+    pub fn restore_with_memory_target(
+        &self,
+        _snapshot_path: &str,
+        _overlay: Option<String>,
+        _net_override: Option<Vec<crate::config::NetConfig>>,
+        _volume_override: Option<Vec<crate::config::VolumeConfig>>,
+        _memory_policy: tarit_proto::RestoreMemoryPolicy,
+        _memory_integrity: Option<tarit_proto::MemoryIntegrity>,
+        _target_memory_mib: Option<u64>,
     ) -> Result<()> {
         Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
     }
@@ -2337,6 +2442,70 @@ impl VmmController {
         Err(VmmError::Device(
             "virtio-balloon needs Linux+KVM+boot".into(),
         ))
+    }
+
+    /// Live virtio-mem sizes of a hotplug-ready VM.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn memory_hotplug_status(&self) -> Result<tarit_proto::MemoryHotplugStatus> {
+        let (device, _) = self.memory_hotplug_device()?;
+        Ok(crate::memory_hotplug::status(&device))
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn memory_hotplug_status(&self) -> Result<tarit_proto::MemoryHotplugStatus> {
+        Err(VmmError::Device("virtio-mem needs Linux+KVM+boot".into()))
+    }
+
+    /// Set the requested hotplug size (MiB, excluding boot RAM) of a live VM;
+    /// see [`crate::memory_hotplug::set_requested`]. The controller lock is
+    /// released before any wait, so vCPU MMIO and other readers proceed.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    pub fn set_memory_hotplug(
+        &self,
+        requested_size_mib: u64,
+        wait_timeout_ms: Option<u64>,
+    ) -> Result<tarit_proto::MemoryHotplugStatus> {
+        let (device, state) = self.memory_hotplug_device()?;
+        if wait_timeout_ms.is_some() && state != VmState::Running {
+            return Err(VmmError::InvalidConfig(format!(
+                "waiting for the guest requires a running VM (state: {state:?})"
+            )));
+        }
+        crate::memory_hotplug::set_requested(
+            &device,
+            requested_size_mib,
+            wait_timeout_ms.map(std::time::Duration::from_millis),
+        )
+    }
+
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+    pub fn set_memory_hotplug(
+        &self,
+        _requested_size_mib: u64,
+        _wait_timeout_ms: Option<u64>,
+    ) -> Result<tarit_proto::MemoryHotplugStatus> {
+        Err(VmmError::Device("virtio-mem needs Linux+KVM+boot".into()))
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn memory_hotplug_device(
+        &self,
+    ) -> Result<(Arc<vmm_devices::virtio::mem::VirtioMemMmio>, VmState)> {
+        let slot = self.lock();
+        let vm = slot
+            .as_ref()
+            .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        let device = vm
+            .running
+            .as_ref()
+            .and_then(|running| running.memory_device.clone())
+            .ok_or_else(|| {
+                VmmError::InvalidConfig(
+                    "VM has no active virtio-mem device (create it with memory.boot_size_mib)"
+                        .into(),
+                )
+            })?;
+        Ok((device, vm.state))
     }
 
     pub fn balloon_state(&self) -> Result<(u32, u32)> {
@@ -2874,20 +3043,76 @@ fn build_clone_repair_v3_command(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-impl VmmController {
-    /// Finish interrupt registrations a restore started in the background.
-    /// The join happens outside the controller lock.
-    fn finish_irq_registration(&self) -> Result<()> {
-        let pending = self
-            .lock()
-            .as_mut()
-            .and_then(|vm| vm.running.as_mut())
-            .and_then(|running| running.balloon_irq_resample.as_mut())
-            .and_then(|resample| resample.registration.take());
-        match pending {
-            Some(mut pending) => pending.finish(),
-            None => Ok(()),
+fn await_memory_online(controller: &VmmController) -> Result<()> {
+    use std::time::{Duration, Instant};
+    let (device, channel, region, boot) = {
+        let slot = controller.lock();
+        let vm = slot
+            .as_ref()
+            .ok_or_else(|| VmmError::Device("missing restored VM".into()))?;
+        let Some(running) = vm.running.as_ref() else {
+            return Ok(());
+        };
+        let Some(device) = running.memory_device.clone() else {
+            return Ok(());
+        };
+        let boot = vm.config.memory.boot_bytes()?;
+        (
+            device,
+            running.vsock_exec.clone(),
+            vm.config.memory.size_bytes()? - boot,
+            boot,
+        )
+    };
+    let requested = device.target_total_mib() * crate::config::MIB - boot;
+    let channel =
+        channel.ok_or_else(|| VmmError::Device("memory readiness requires guest agent".into()))?;
+    let command = format!("VMM_MEMORY_ONLINE_V1:{region}:{requested}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        // At least the requested RAM: a snapshot taken mid-shrink restores
+        // with plugged > requested and the guest keeps unplugging.
+        if device.plugged_total_mib() >= device.target_total_mib() && channel.is_connected() {
+            let timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(2));
+            if let Some(Ok((0, stdout, _, _))) = channel.exec(&command, timeout) {
+                if stdout.trim() == "TARIT_MEMORY_ONLINE_V1_OK" {
+                    return Ok(());
+                }
+            }
         }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(VmmError::Device(
+        "restored guest did not online requested virtio-mem RAM within 30 seconds".into(),
+    ))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+impl VmmController {
+    /// Finish interrupt registrations a restore started in the background
+    /// (the balloon's and, for a hotplug-ready VM, virtio-mem's). The joins
+    /// happen outside the controller lock.
+    fn finish_irq_registration(&self) -> Result<()> {
+        let pending: Vec<crate::kvm::PendingIrqfd> = {
+            let mut slot = self.lock();
+            let Some(running) = slot.as_mut().and_then(|vm| vm.running.as_mut()) else {
+                return Ok(());
+            };
+            [
+                running.memory_irq_resample.as_mut(),
+                running.balloon_irq_resample.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|resample| resample.registration.take())
+            .collect()
+        };
+        for mut pending in pending {
+            pending.finish()?;
+        }
+        Ok(())
     }
 }
 
@@ -3356,6 +3581,10 @@ fn capture_live_state_blob(running: &RunningVm, existing: &[u8]) -> Result<Vec<u
     b.vm_full = Some(vm_state);
     b.serial = serial_state;
     b.serial_runtime = Some(serial_runtime);
+    b.virtio_mem = running
+        .memory_device
+        .as_ref()
+        .map(|device| vmm_devices::persist::Persist::save(&**device));
     b.virtio_blk = virtio_blk;
     b.virtio_net = virtio_net;
     b.vsock = Some(vsock_state);
@@ -6078,6 +6307,20 @@ fn constant_time_ascii_eq(left: &[u8], right: &[u8]) -> bool {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn allocate_snapshot_memory(size: u64, state: &[u8]) -> Result<vmm_memory_backend::GuestMemory> {
+    // The framing loader also supports opaque state for format-level tools.
+    // Runtime restore separately requires a fully decoded, compatible blob.
+    let hotplug = decode_state_blob(state).and_then(|(blob, _, _)| blob.virtio_mem);
+    let memory = if let Some(hotplug) = hotplug.as_ref() {
+        hotplug.validate_layout(size).map_err(VmmError::Snapshot)?;
+        vmm_memory_backend::GuestMemory::new_hotplug(size, hotplug.boot_bytes)
+    } else {
+        vmm_memory_backend::GuestMemory::new(size)
+    };
+    memory.map_err(|e| VmmError::Memory(e.to_string()))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 struct RestoredSnapshot {
     mem: vmm_memory_backend::GuestMemory,
     state_blob: Vec<u8>,
@@ -6237,8 +6480,7 @@ fn try_lazy_restore_full_snapshot(
         None
     };
 
-    let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
-        .map_err(|e| VmmError::Memory(e.to_string()))?;
+    let mem = allocate_snapshot_memory(layout.mem_len, &state_blob)?;
     let lazy_restore = vmm_memory_backend::start_lazy_restore_with_integrity(
         mem.as_ptr() as *mut u8,
         mem_len,
@@ -6593,8 +6835,9 @@ fn read_snapshot_with(
                 )));
             }
             verify_ram_crc_once(&file, &path_display, &layout, header.mem_crc)?;
-            let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
-                .map_err(|e| VmmError::Memory(e.to_string()))?;
+            // The packed RAM image is the same for every layout; the state
+            // says whether it is a virtio-mem boot/aperture split.
+            let mem = allocate_snapshot_memory(layout.mem_len, &state)?;
             mem.map_file_private(&file, layout.mem_offset)
                 .map_err(|e| VmmError::Memory(e.to_string()))?;
             return Ok(SnapshotContent::Full {
@@ -6616,8 +6859,7 @@ fn read_snapshot_with(
                 header.mem_crc
             )));
         }
-        let mem = vmm_memory_backend::GuestMemory::new(layout.mem_len)
-            .map_err(|e| VmmError::Memory(e.to_string()))?;
+        let mem = allocate_snapshot_memory(layout.mem_len, &state)?;
         let mem_slice: &mut [u8] = {
             // SAFETY: `mem` was just allocated with `mem_len` bytes and is owned here.
             unsafe { std::slice::from_raw_parts_mut(mem.as_ptr() as *mut u8, mem_len) }
@@ -7127,6 +7369,10 @@ pub struct StateBlob {
     /// none and restore a fresh device.
     #[serde(skip)]
     pub rng: Option<vmm_devices::virtio::rng_transport::VirtioRngMmioState>,
+    /// virtio-mem plug state of a hotplug-ready VM, also in a framed trailer
+    /// (after the rng one). Its presence selects the boot/aperture layout.
+    #[serde(skip)]
+    pub virtio_mem: Option<vmm_devices::virtio::mem::VirtioMemMmioState>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -7159,6 +7405,7 @@ fn validate_restored_runtime_shape(
             || !saved.virtio_net.is_empty()
             || saved.vsock.is_some()
             || has_balloon
+            || saved.virtio_mem.is_some()
         {
             return Err(VmmError::Snapshot(
                 "memory-only snapshot contains partial live runtime state".into(),
@@ -7213,6 +7460,8 @@ const COMPATIBILITY_TRAILER_MAGIC: &[u8; 8] = b"TRTCMP01";
 const SERIAL_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTSER01";
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const RNG_STATE_TRAILER_MAGIC: &[u8; 8] = b"TRTRNG01";
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+const VIRTIO_MEM_STATE_TRAILER_MAGIC: &[u8; 8] = b"VMEM0001";
 #[cfg(all(
     target_arch = "x86_64",
     target_os = "linux",
@@ -7366,6 +7615,11 @@ fn decode_state_blob(
         blob.rng = Some(decoded);
         trailing = remaining;
     }
+    if trailing.starts_with(VIRTIO_MEM_STATE_TRAILER_MAGIC) {
+        let (decoded, remaining) = decode_trailer(trailing, VIRTIO_MEM_STATE_TRAILER_MAGIC)?;
+        blob.virtio_mem = Some(decoded);
+        trailing = remaining;
+    }
     let mut compatibility = None;
     if trailing.starts_with(COMPATIBILITY_TRAILER_MAGIC) {
         let (decoded, remaining) = decode_trailer(trailing, COMPATIBILITY_TRAILER_MAGIC)?;
@@ -7406,6 +7660,13 @@ fn encode_state_blob(
             u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
         bytes.extend_from_slice(RNG_STATE_TRAILER_MAGIC);
         bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+    if let Some(memory) = blob.virtio_mem.as_ref() {
+        let payload = postcard::to_allocvec(memory)?;
+        let len = u32::try_from(payload.len()).map_err(|_| postcard::Error::SerializeBufferFull)?;
+        bytes.extend_from_slice(VIRTIO_MEM_STATE_TRAILER_MAGIC);
+        bytes.extend_from_slice(&len.to_le_bytes());
         bytes.extend_from_slice(&payload);
     }
     let compatibility = postcard::to_allocvec(&SnapshotCompatibility::current()?)?;
@@ -7555,6 +7816,8 @@ struct RestoredRuntimeState<'a> {
     virtio_net: &'a [Vec<u8>],
     vsock: Option<&'a vmm_devices::virtio::vsock::VirtioVsockMmioState>,
     balloon: Option<&'a vmm_devices::virtio::balloon::VirtioBalloonMmioState>,
+    memory: Option<&'a vmm_devices::virtio::mem::VirtioMemMmioState>,
+    target_memory_mib: Option<u64>,
     rng: Option<&'a vmm_devices::virtio::rng_transport::VirtioRngMmioState>,
 }
 
@@ -7670,7 +7933,28 @@ fn build_running_vm(
         rng_irq,
         vsock,
         balloon,
+        memory,
     } = build_devices(config, &mem)?;
+    match (memory.as_ref(), restored.memory) {
+        (Some(wired), Some(state)) => {
+            wired
+                .device
+                .restore_checked(state.clone())
+                .map_err(VmmError::Snapshot)?;
+            if let Some(target) = restored.target_memory_mib {
+                wired
+                    .device
+                    .prepare_restore_target_total_mib(target)
+                    .map_err(VmmError::InvalidConfig)?;
+            }
+        }
+        (None, None) if restored.target_memory_mib.is_none() => {}
+        _ => {
+            return Err(VmmError::InvalidConfig(
+                "memory growth requires a hotplug-ready snapshot".into(),
+            ))
+        }
+    }
     restore_virtio_blk_states(&mut blks, restored.virtio_blk)?;
     if let Some(state) = restored.rng {
         vmm_devices::persist::Persist::restore(&mut rng, state.clone());
@@ -7814,12 +8098,44 @@ fn build_running_vm(
         }
         irq_evts.push(evt);
     }
+    let memory_device = memory.as_ref().map(|wired| wired.device.clone());
+    let memory_irqfd_fds = memory
+        .as_ref()
+        .map(|wired| -> Result<_> {
+            let clone = |evt: &vmm_sys_util::eventfd::EventFd| {
+                evt.try_clone()
+                    .map_err(|error| VmmError::Kvm(format!("virtio-mem irq clone: {error}")))
+            };
+            Ok((
+                clone(&wired.irq_evt)?,
+                clone(&wired.resample_evt)?,
+                wired.irq,
+            ))
+        })
+        .transpose()?;
+    let mut memory_irq_resample = match memory {
+        Some(wired) => {
+            let evt = wired
+                .irq_evt
+                .try_clone()
+                .map_err(|e| VmmError::Kvm(e.to_string()))?;
+            let loop_handle = LevelIrqResample::spawn(
+                None,
+                move || wired.device.has_pending_interrupt(),
+                evt,
+                wired.resample_evt,
+            )?;
+            irq_evts.push(wired.irq_evt);
+            Some(loop_handle)
+        }
+        None => None,
+    };
     let balloon_device = balloon.as_ref().map(|wired| wired.device.clone());
     let mut balloon_irq_resample = match balloon {
         Some(wired) => {
-            let loop_handle = BalloonIrqResample::spawn(
+            let loop_handle = LevelIrqResample::spawn(
                 None,
-                wired.device,
+                move || wired.device.has_pending_interrupt(),
                 wired
                     .irq_evt
                     .try_clone()
@@ -7887,11 +8203,14 @@ fn build_running_vm(
     // last route is installed so the two do not queue behind each other; it
     // then overlaps vCPU startup and the guest's reconnect, and restore
     // finishes it before reporting success.
-    if let (Some((irq_evt, resample_evt, irq)), Some(resample)) =
-        (balloon_irqfd_fds, balloon_irq_resample.as_mut())
-    {
-        resample.registration =
-            Some(kvm_vm.begin_irqfd_with_resample(&irq_evt, &resample_evt, irq)?);
+    for (fds, resample) in [
+        (memory_irqfd_fds, memory_irq_resample.as_mut()),
+        (balloon_irqfd_fds, balloon_irq_resample.as_mut()),
+    ] {
+        if let (Some((irq_evt, resample_evt, irq)), Some(resample)) = (fds, resample) {
+            resample.registration =
+                Some(kvm_vm.begin_irqfd_with_resample(&irq_evt, &resample_evt, irq)?);
+        }
     }
     // The workers above started in parallel; each must have its sandbox
     // in place before the guest runs.
@@ -7910,7 +8229,12 @@ fn build_running_vm(
         // safety hint, not a reason to discard an otherwise valid restore.
         log::warn!("restored BSP clock notification unavailable: {error}");
     }
-    let vcpu_thread = VcpuThread::spawn(vcpu, kvm_vm.mmio_bus.clone(), serial.clone());
+    let vcpu_thread = VcpuThread::spawn(
+        crate::vcpu::VcpuId(0),
+        vcpu,
+        kvm_vm.mmio_bus.clone(),
+        serial.clone(),
+    )?;
 
     // SMP restore (phase B): recreate each AP (id 1..N) and re-apply its captured
     // state (which includes its RUNNABLE MP_STATE + LAPIC), so the restored VM
@@ -7927,10 +8251,18 @@ fn build_running_vm(
             log::warn!("restored AP {id} clock notification unavailable: {error}");
         }
         ap_threads.push(VcpuThread::spawn(
+            crate::vcpu::VcpuId(id),
             ap,
             kvm_vm.mmio_bus.clone(),
             serial.clone(),
-        ));
+        )?);
+    }
+
+    // The target was staged before vCPUs started. Signal only after every saved
+    // LAPIC is installed, so restore cannot overwrite an injected config IRQ.
+    // Replay saved pending causes even when there was no target override.
+    if let Some(device) = memory_device.as_ref() {
+        device.reassert_pending_interrupt();
     }
 
     // Notify only after the restored vCPUs are live. Injecting a GED edge into
@@ -7984,6 +8316,8 @@ fn build_running_vm(
         net_io_loops,
         blk_devices: blks,
         net_devices,
+        memory_device,
+        memory_irq_resample,
         balloon_device,
         rng_device: Some(rng),
         balloon_irq_resample,
@@ -8024,6 +8358,7 @@ struct WiredDevices {
     /// virtio-vsock exec device (pump + control-socket accept wired by caller).
     vsock: Option<WiredVsock>,
     balloon: Option<WiredBalloon>,
+    memory: Option<WiredMemory>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -8060,7 +8395,15 @@ struct WiredBalloon {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-pub struct BalloonIrqResample {
+struct WiredMemory {
+    device: Arc<vmm_devices::virtio::mem::VirtioMemMmio>,
+    irq_evt: vmm_sys_util::eventfd::EventFd,
+    resample_evt: vmm_sys_util::eventfd::EventFd,
+    irq: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+pub struct LevelIrqResample {
     /// The irqfd registration, until it is finished.
     registration: Option<crate::kvm::PendingIrqfd>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -8135,10 +8478,10 @@ fn tap_ipv4(name: &str) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-impl BalloonIrqResample {
+impl LevelIrqResample {
     fn spawn(
         registration: Option<crate::kvm::PendingIrqfd>,
-        device: Arc<vmm_devices::virtio::balloon::VirtioBalloonMmio>,
+        pending: impl Fn() -> bool + Send + 'static,
         irq_evt: vmm_sys_util::eventfd::EventFd,
         resample_evt: vmm_sys_util::eventfd::EventFd,
     ) -> Result<Self> {
@@ -8148,12 +8491,12 @@ impl BalloonIrqResample {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let wake = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
-            .map_err(|error| VmmError::Kvm(format!("balloon IRQ resample wake: {error}")))?;
+            .map_err(|error| VmmError::Kvm(format!("virtio IRQ resample wake: {error}")))?;
         let wake_thread = wake
             .try_clone()
-            .map_err(|error| VmmError::Kvm(format!("balloon IRQ resample wake: {error}")))?;
+            .map_err(|error| VmmError::Kvm(format!("virtio IRQ resample wake: {error}")))?;
         let handle = std::thread::Builder::new()
-            .name("balloon-irq-resample".into())
+            .name("virtio-level-irq-resample".into())
             .spawn(move || {
                 while !stop_thread.load(Ordering::Acquire) {
                     let mut pollfds = [
@@ -8175,12 +8518,12 @@ impl BalloonIrqResample {
                         continue;
                     }
                     let _ = resample_evt.read();
-                    if device.has_pending_interrupt() {
+                    if pending() {
                         let _ = irq_evt.write(1);
                     }
                 }
             })
-            .map_err(|error| VmmError::Kvm(format!("spawn balloon IRQ resample: {error}")))?;
+            .map_err(|error| VmmError::Kvm(format!("spawn virtio IRQ resample: {error}")))?;
         Ok(Self {
             registration,
             stop,
@@ -8189,7 +8532,7 @@ impl BalloonIrqResample {
         })
     }
 
-    /// Wait for the balloon irqfd registration started alongside this loop.
+    /// Wait for the irqfd registration started alongside this loop.
     fn finish_registration(&mut self) -> Result<()> {
         match self.registration.as_mut() {
             Some(pending) => pending.finish(),
@@ -8199,7 +8542,7 @@ impl BalloonIrqResample {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-impl Drop for BalloonIrqResample {
+impl Drop for LevelIrqResample {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.stop.store(true, Ordering::Release);
@@ -8382,7 +8725,42 @@ fn build_devices(config: &VmConfig, mem: &vmm_memory_backend::GuestMemory) -> Re
     acpi_devices.push((balloon_mmio, 0x1000, balloon_irq, false));
     log::info!("virtio-balloon at mmio 0x{balloon_mmio:x} irq {balloon_irq}");
 
+    let memory = if config.memory.boot_size_mib.is_some() {
+        let slot = balloon_slot + 1;
+        let irq = 5 + slot as u32;
+        if irq >= 24 {
+            return Err(VmmError::InvalidConfig(
+                "virtio-mem exceeds IOAPIC IRQ capacity".into(),
+            ));
+        }
+        let base = MMIO_START + slot as u64 * 0x1000;
+        let device = Arc::new(
+            vmm_devices::virtio::mem::VirtioMemMmio::new(irq, mem.clone())
+                .map_err(VmmError::Device)?,
+        );
+        let irq_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| VmmError::Kvm(e.to_string()))?;
+        let resample_evt = vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK)
+            .map_err(|e| VmmError::Kvm(e.to_string()))?;
+        device.set_irq_evt(
+            irq_evt
+                .try_clone()
+                .map_err(|e| VmmError::Kvm(e.to_string()))?,
+        );
+        devices.push((MmioRange::new(base, 0x1000), Box::new(device.clone())));
+        acpi_devices.push((base, 0x1000, irq, false));
+        Some(WiredMemory {
+            device,
+            irq_evt,
+            resample_evt,
+            irq,
+        })
+    } else {
+        None
+    };
+
     Ok(WiredDevices {
+        memory,
         devices,
         acpi_devices,
         blks,
@@ -8493,6 +8871,7 @@ fn serialize_state_blob(
         virtio_net: Vec::new(),
         vsock: None,
         serial_runtime: None,
+        virtio_mem: None,
         rng: None,
     };
 
@@ -8511,6 +8890,36 @@ mod tests {
         // order 9 + 2 x order 10: DMA 2 + 4, DMA32 2 + 0, Normal 16 + 6.
         assert_eq!(free_huge_page_blocks(info), 30);
         assert_eq!(free_huge_page_blocks(""), 0);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    fn hotplug_snapshot_trailer_preserves_layout_and_validates_maximum() {
+        let memory = vmm_memory_backend::GuestMemory::new_hotplug(512 << 20, 256 << 20).unwrap();
+        let device = vmm_devices::virtio::mem::VirtioMemMmio::new(10, memory).unwrap();
+        device.set_target_total_mib(512).unwrap();
+        let rng = vmm_devices::virtio::rng_transport::VirtioRngMmio::new(
+            7,
+            vmm_devices::virtio::rng::VirtioRng::new(),
+        );
+        let blob = StateBlob {
+            virtio_mem: Some(vmm_devices::persist::Persist::save(&device)),
+            rng: Some(vmm_devices::persist::Persist::save(&rng)),
+            ..Default::default()
+        };
+        let encoded = encode_state_blob(&blob, None).unwrap();
+        let (decoded, _, _) = decode_state_blob(&encoded).unwrap();
+        assert_eq!(decoded.virtio_mem, blob.virtio_mem);
+        // Both trailers decode when present together (rng first).
+        assert_eq!(decoded.rng, blob.rng);
+        assert!(validate_restored_runtime_shape(&blob, false, false, false, 0, 1).is_err());
+        let restored = allocate_snapshot_memory(512 << 20, &encoded).unwrap();
+        assert_eq!(restored.low_size_bytes, 256 << 20);
+        assert_eq!(restored.gpa_to_offset(1 << 32), Some(256 << 20));
+        assert!(allocate_snapshot_memory(640 << 20, &encoded).is_err());
+        let mut truncated = encoded.clone();
+        truncated.truncate(truncated.len() - 4);
+        assert!(decode_state_blob(&truncated).is_none());
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -8568,7 +8977,10 @@ mod tests {
                 cmdline: "console=ttyS0".into(),
                 initramfs: None,
             },
-            memory: MemoryConfig { size_mib: 128 },
+            memory: MemoryConfig {
+                size_mib: 128,
+                boot_size_mib: None,
+            },
             vcpus: VcpuConfig { count: 2 },
             volumes: vec![],
             net: vec![],

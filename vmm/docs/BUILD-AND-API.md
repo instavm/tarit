@@ -465,6 +465,18 @@ and reports the rule count without applying host-wide rules.
 { "op": "status" }
 ```
 
+#### `memory_hotplug_status` / `set_memory_hotplug`: Live virtio-mem resize
+
+Only for VMs created with `memory.boot_size_mib` (virtio-mem). Sizes are MiB
+and exclude boot RAM. `requested_size_mib` grows or shrinks (`0` unplugs all)
+and must be a multiple of `block_size_mib`, at most `total_size_mib`.
+`wait_timeout_ms` (optional, at most 60000) waits until plugged equals
+requested. See `docs/memory-growth.md` at the repository root.
+```json
+{ "op": "memory_hotplug_status" }
+{ "op": "set_memory_hotplug", "requested_size_mib": 2048, "wait_timeout_ms": 30000 }
+```
+
 ### Responses
 
 All responses are JSON objects with a `status` field:
@@ -478,6 +490,7 @@ All responses are JSON objects with a `status` field:
 | `guest_network_repaired` | none | `repair_guest_network` |
 | `egress_updated` | `rules_applied`, `enforced` | `update_egress` |
 | `vm_status` | `state`, `uptime_ms`, `vcpus`, `mem_mib`, `volumes`, `nets`, `kernel`, `vcpu_alive` | `status` |
+| `memory_hotplug` | `total_size_mib`, `block_size_mib`, `plugged_size_mib`, `requested_size_mib`, `boot_memory_mib` | `memory_hotplug_status`, `set_memory_hotplug` |
 | `err` | `msg` | Any non-PTY request |
 
 ```json

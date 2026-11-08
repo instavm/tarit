@@ -13,6 +13,7 @@ pub mod cpu_template;
 pub mod error;
 pub mod gc;
 pub mod guest_channel;
+pub mod memory_hotplug;
 pub mod oci;
 pub mod pty_stream;
 pub mod restore_semantics;
