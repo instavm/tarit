@@ -446,6 +446,8 @@ impl Store {
              CREATE INDEX IF NOT EXISTS vm_quota_reservations_owner_expiry
                ON vm_quota_reservations(owner_key, expires_at);",
         )?;
+        ensure_column(&conn, "executions", "owner_key", "TEXT")?;
+        ensure_column(&conn, "executions", "vm_created_at", "TEXT")?;
         ensure_column(&conn, "vms", "owner_key", "TEXT")?;
         ensure_column(&conn, "vms", "api_key_id", "TEXT")?;
         ensure_column(&conn, "vms", "revision", "INTEGER NOT NULL DEFAULT 1")?;
@@ -2123,11 +2125,19 @@ impl Store {
     }
 
     pub fn insert_execution(&self, exec: &ExecutionRecord) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO executions (
+        let updated = self.conn.execute(
+            "INSERT INTO executions (
                id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-               duration_ms, error, created_at, updated_at
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+               duration_ms, error, created_at, updated_at, owner_key, vm_created_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+             ON CONFLICT(id) DO UPDATE SET
+               status=excluded.status, exit_code=excluded.exit_code,
+               stdout=excluded.stdout, stderr=excluded.stderr, duration_ms=excluded.duration_ms,
+               error=excluded.error, updated_at=excluded.updated_at
+             WHERE executions.vm_id=excluded.vm_id
+               AND executions.owner_key IS excluded.owner_key
+               AND executions.vm_created_at IS excluded.vm_created_at
+               AND executions.updated_at <= excluded.updated_at",
             params![
                 exec.id.to_string(),
                 exec.vm_id.to_string(),
@@ -2141,8 +2151,15 @@ impl Store {
                 exec.error,
                 exec.created_at.to_rfc3339(),
                 exec.updated_at.to_rfc3339(),
+                exec.owner_key,
+                exec.vm_created_at.map(|at| at.to_rfc3339()),
             ],
         )?;
+        if updated != 1 {
+            return Err(StoreError::Conflict(
+                "execution ownership or transition changed".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2150,7 +2167,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-                        duration_ms, error, created_at, updated_at
+                        duration_ms, error, created_at, updated_at, owner_key, vm_created_at
                  FROM executions WHERE id = ?1",
                 params![id.to_string()],
                 row_to_execution,
@@ -2164,7 +2181,7 @@ impl Store {
             Some(vm_id) => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-                            duration_ms, error, created_at, updated_at
+                            duration_ms, error, created_at, updated_at, owner_key, vm_created_at
                      FROM executions WHERE vm_id = ?1 ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map(params![vm_id.to_string()], row_to_execution)?;
@@ -2174,7 +2191,7 @@ impl Store {
             None => {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, vm_id, command, timeout_ms, status, exit_code, stdout, stderr,
-                            duration_ms, error, created_at, updated_at
+                            duration_ms, error, created_at, updated_at, owner_key, vm_created_at
                      FROM executions ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([], row_to_execution)?;
@@ -3209,6 +3226,11 @@ fn row_to_execution(row: &rusqlite::Row<'_>) -> Result<ExecutionRecord, rusqlite
         vm_id: Uuid::parse_str(&vm_id).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
         })?,
+        owner_key: row.get(12)?,
+        vm_created_at: row
+            .get::<_, Option<String>>(13)?
+            .map(|value| parse_ts(&value))
+            .transpose()?,
         command: row.get(2)?,
         timeout_ms: row.get(3)?,
         status: ExecutionStatus::parse(&status).unwrap_or(ExecutionStatus::Failed),
@@ -4598,6 +4620,8 @@ mod tests {
             let exec = ExecutionRecord {
                 id: Uuid::new_v4(),
                 vm_id: Uuid::new_v4(),
+                owner_key: Some("tenant-a".into()),
+                vm_created_at: Some(now),
                 command: "true".into(),
                 timeout_ms: 1000,
                 status,

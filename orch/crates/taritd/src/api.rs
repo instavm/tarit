@@ -496,18 +496,84 @@ impl IntoResponse for ShareApiError {
     }
 }
 
-/// Detached work needs admission that outlives the HTTP 202 response. The hard
-/// ceiling also bounds retained command bodies when HTTP concurrency is raised.
+/// Detached work retains admission until terminal persistence, not just HTTP 202.
 const MAX_ASYNC_EXECUTIONS: usize = 128;
+const MAX_TENANT_ASYNC_EXECUTIONS: usize = 32;
+// Includes a running command, so at most three additional commands normally wait.
+const MAX_VM_ASYNC_EXECUTIONS: usize = 4;
 
 #[derive(Clone)]
-struct AsyncExecutionAdmission(Arc<tokio::sync::Semaphore>);
+struct AsyncExecutionAdmission {
+    global: Arc<tokio::sync::Semaphore>,
+    tenants: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Semaphore>>>>,
+    vms: Arc<Mutex<HashMap<Uuid, std::sync::Weak<tokio::sync::Semaphore>>>>,
+    tenant_limit: usize,
+}
+
+struct AsyncExecutionPermits {
+    _tenant: tokio::sync::OwnedSemaphorePermit,
+    _vm: tokio::sync::OwnedSemaphorePermit,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsyncExecutionAdmission {
+    fn new(global_limit: usize) -> Self {
+        let global_limit = global_limit.clamp(1, MAX_ASYNC_EXECUTIONS);
+        Self {
+            global: Arc::new(tokio::sync::Semaphore::new(global_limit)),
+            tenants: Default::default(),
+            vms: Default::default(),
+            tenant_limit: MAX_TENANT_ASYNC_EXECUTIONS.min((global_limit / 2).max(1)),
+        }
+    }
+
+    fn acquire(&self, tenant: &str, vm_id: Uuid) -> Result<AsyncExecutionPermits, OrchError> {
+        fn keyed<K: Eq + std::hash::Hash>(
+            map: &Mutex<HashMap<K, std::sync::Weak<tokio::sync::Semaphore>>>,
+            key: K,
+            limit: usize,
+        ) -> Result<Arc<tokio::sync::Semaphore>, OrchError> {
+            let mut map = map
+                .lock()
+                .map_err(|_| OrchError::Internal("execution admission lock".into()))?;
+            // Weak references let idle keys disappear rather than growing with
+            // every tenant/VM ever seen. Live permits keep their semaphore alive.
+            map.retain(|_, value| value.strong_count() > 0);
+            if let Some(semaphore) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+                return Ok(semaphore);
+            }
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+            map.insert(key, Arc::downgrade(&semaphore));
+            Ok(semaphore)
+        }
+        let overloaded = || OrchError::Overloaded {
+            message: "asynchronous execution capacity exhausted".into(),
+            retry_after_secs: 1,
+        };
+        // Reject tenant and VM overload before taking scarce global capacity.
+        // RAII releases earlier permits on every later rejection/error path.
+        let tenant = keyed(&self.tenants, tenant.to_owned(), self.tenant_limit)?
+            .try_acquire_owned()
+            .map_err(|_| overloaded())?;
+        let vm = keyed(&self.vms, vm_id, MAX_VM_ASYNC_EXECUTIONS)?
+            .try_acquire_owned()
+            .map_err(|_| overloaded())?;
+        let global = self
+            .global
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| overloaded())?;
+        Ok(AsyncExecutionPermits {
+            _tenant: tenant,
+            _vm: vm,
+            _global: global,
+        })
+    }
+}
 
 pub fn router(state: AppState) -> Router {
     let traffic_limits = ApiTrafficLimits::new(&state.config);
-    let async_executions = AsyncExecutionAdmission(Arc::new(tokio::sync::Semaphore::new(
-        state.config.api_max_in_flight.min(MAX_ASYNC_EXECUTIONS),
-    )));
+    let async_executions = AsyncExecutionAdmission::new(state.config.api_max_in_flight);
     let max_body_bytes = state.config.api_max_body_bytes;
     let protected = Router::new()
         .route("/v1/vms", post(create_vm).get(list_vms))
@@ -3242,22 +3308,23 @@ async fn authorize_vm_action(
     owner: &Owner,
     vm_id: Uuid,
     identity: &ApiIdentity,
-) -> Result<(), ApiError> {
+) -> Result<VmRecord, ApiError> {
     match owner {
         Owner::Local => {
             let vm = ops::get_local(state, vm_id)?;
             ensure_vm_access(identity, &vm)?;
+            Ok(vm)
         }
         Owner::Remote(rpc) => {
             let peer = Arc::clone(&state.peer);
             let rpc = rpc.clone();
             let identity = identity.clone();
-            tokio::task::spawn_blocking(move || peer.get_remote(&rpc, vm_id, &identity))
+            let vm = tokio::task::spawn_blocking(move || peer.get_remote(&rpc, vm_id, &identity))
                 .await
                 .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
+            Ok(vm)
         }
     }
-    Ok(())
 }
 
 /// Bound an exec budget. A synchronous exec must also fit inside the API
@@ -3286,13 +3353,7 @@ async fn execute_async(
     Extension(admission): Extension<AsyncExecutionAdmission>,
     Json(req): Json<ExecuteRequest>,
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
-    let permit = admission
-        .0
-        .try_acquire_owned()
-        .map_err(|_| OrchError::Overloaded {
-            message: "asynchronous execution capacity exhausted".into(),
-            retry_after_secs: 1,
-        })?;
+    let permit = admission.acquire(&identity.tenant, req.vm_id)?;
     let result = execute_async_impl(state.clone(), identity, req, permit).await;
     if result.is_ok() {
         state.metrics.inc_exec_total();
@@ -3304,19 +3365,21 @@ async fn execute_async_impl(
     state: AppState,
     identity: ApiIdentity,
     req: ExecuteRequest,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: AsyncExecutionPermits,
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
     validate_exec_timeout(req.timeout_ms, None)?;
     // Locate the VM anywhere in the cluster; the exec runs on its owning node.
     // (Resolving here also validates existence for a clean 404.)
     let owner = ops::resolve_owner_for_activation(&state, req.vm_id, &identity).await?;
-    authorize_vm_action(&state, &owner, req.vm_id, &identity).await?;
+    let vm = authorize_vm_action(&state, &owner, req.vm_id, &identity).await?;
 
     let now = Utc::now();
     let exec_id = Uuid::new_v4();
     let record = ExecutionRecord {
         id: exec_id,
         vm_id: req.vm_id,
+        owner_key: Some(identity.tenant.clone()),
+        vm_created_at: Some(vm.created_at),
         command: req.command.clone(),
         timeout_ms: req.timeout_ms,
         status: ExecutionStatus::Pending,
@@ -3354,7 +3417,7 @@ async fn execute_async_impl(
             Owner::Local => {
                 ops::exec_local(
                     &state2,
-                    vm_id,
+                    &vm,
                     command.clone(),
                     timeout_ms,
                     Some(gate_deadline),
@@ -3381,6 +3444,8 @@ async fn execute_async_impl(
                 let rec = ExecutionRecord {
                     id: exec_id,
                     vm_id,
+                    owner_key: Some(identity.tenant.clone()),
+                    vm_created_at: Some(vm.created_at),
                     command,
                     timeout_ms,
                     status: ExecutionStatus::Completed,
@@ -3463,7 +3528,7 @@ async fn execute_impl(
     validate_exec_timeout(req.timeout_ms, Some(state.config.api_request_timeout_ms))?;
     let gate_deadline = ops::exec_gate_deadline(&state.config, req.timeout_ms);
     let owner = ops::resolve_owner_for_activation(state, req.vm_id, identity).await?;
-    authorize_vm_action(state, &owner, req.vm_id, identity).await?;
+    let vm = authorize_vm_action(state, &owner, req.vm_id, identity).await?;
     let now = Utc::now();
     let exec_id = Uuid::new_v4();
     let vm_id = req.vm_id;
@@ -3472,14 +3537,7 @@ async fn execute_impl(
 
     let result = match owner {
         Owner::Local => {
-            ops::exec_local(
-                state,
-                vm_id,
-                command.clone(),
-                timeout_ms,
-                Some(gate_deadline),
-            )
-            .await
+            ops::exec_local(state, &vm, command.clone(), timeout_ms, Some(gate_deadline)).await
         }
         Owner::Remote(rpc) => {
             let peer = Arc::clone(&state.peer);
@@ -3500,6 +3558,8 @@ async fn execute_impl(
         Ok((code, stdout, stderr, duration_ms)) => ExecutionRecord {
             id: exec_id,
             vm_id,
+            owner_key: Some(identity.tenant.clone()),
+            vm_created_at: Some(vm.created_at),
             command,
             timeout_ms,
             status: ExecutionStatus::Completed,
@@ -3521,6 +3581,8 @@ async fn execute_impl(
             ExecutionRecord {
                 id: exec_id,
                 vm_id,
+                owner_key: Some(identity.tenant.clone()),
+                vm_created_at: Some(vm.created_at),
                 command,
                 timeout_ms,
                 status: ExecutionStatus::Failed,
@@ -3578,6 +3640,7 @@ async fn get_execution(
         if !identity.is_admin() && global.owner_key != identity.tenant {
             return Err(OrchError::Forbidden("execution belongs to another tenant".into()).into());
         }
+        reject_expired_execution(&state, &global.record)?;
         cache_execution(&state, &global.record);
         return Ok(Json(global.record));
     }
@@ -3595,8 +3658,13 @@ async fn get_execution(
             .map_err(|_| OrchError::Internal("store lock".into()))?;
         store.get_execution(id).map_err(store_err)?
     };
-    let owner = cluster::resolve_owner(&state, rec.vm_id).await?;
-    authorize_vm_action(&state, &owner, rec.vm_id, &identity).await?;
+    reject_expired_execution(&state, &rec)?;
+    // Execution ownership is immutable. A reused VM UUID must never transfer
+    // access to an earlier tenant's captured output. Legacy unbound rows are
+    // admin-only because their original owner cannot safely be reconstructed.
+    if !identity.is_admin() && rec.owner_key.as_deref() != Some(identity.tenant.as_str()) {
+        return Err(OrchError::Forbidden("execution belongs to another tenant".into()).into());
+    }
     Ok(Json(rec))
 }
 
@@ -4295,12 +4363,31 @@ const EXECUTION_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 fn execution_cache_bytes(record: &ExecutionRecord) -> usize {
     std::mem::size_of::<ExecutionRecord>()
         .saturating_add(record.command.len())
+        .saturating_add(record.owner_key.as_ref().map_or(0, String::len))
         .saturating_add(record.stdout.as_ref().map_or(0, String::len))
         .saturating_add(record.stderr.as_ref().map_or(0, String::len))
         .saturating_add(record.error.as_ref().map_or(0, String::len))
 }
 
+fn reject_expired_execution(state: &AppState, record: &ExecutionRecord) -> Result<(), OrchError> {
+    if usage::execution_retention_cutoff(state.config.execution_retention_hours, Utc::now())
+        .is_some_and(|cutoff| record.is_expired(cutoff))
+    {
+        if let Ok(mut cache) = state.exec_cache.write() {
+            cache.remove(&record.id);
+        }
+        return Err(OrchError::NotFound(format!(
+            "execution {} not found",
+            record.id
+        )));
+    }
+    Ok(())
+}
+
 fn cache_execution(state: &AppState, record: &ExecutionRecord) {
+    if reject_expired_execution(state, record).is_err() {
+        return;
+    }
     let Ok(mut cache) = state.exec_cache.write() else {
         return;
     };
@@ -4345,6 +4432,13 @@ async fn persist_exec(
     rec: &ExecutionRecord,
     identity: &ApiIdentity,
 ) -> Result<(), OrchError> {
+    // PostgreSQL timestamps have microsecond precision. Keep this immutable
+    // binding identical in SQLite/cache even after polling rehydrates from PG.
+    let mut normalized = rec.clone();
+    normalized.vm_created_at = normalized
+        .vm_created_at
+        .and_then(|at| chrono::DateTime::from_timestamp_micros(at.timestamp_micros()));
+    let rec = &normalized;
     if let Some(fleet) = &state.fleet {
         fleet
             .upsert_execution(
@@ -4456,6 +4550,331 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn asynchronous_admission_enforces_tenant_vm_and_global_limits_without_leaking_permits() {
+        let admission = AsyncExecutionAdmission::new(128);
+        let mut held = Vec::new();
+        let vm = Uuid::new_v4();
+        for _ in 0..MAX_VM_ASYNC_EXECUTIONS {
+            held.push(admission.acquire("tenant-a", vm).unwrap());
+        }
+        assert!(matches!(
+            admission.acquire("tenant-a", vm),
+            Err(OrchError::Overloaded { .. })
+        ));
+        for _ in held.len()..MAX_TENANT_ASYNC_EXECUTIONS {
+            held.push(admission.acquire("tenant-a", Uuid::new_v4()).unwrap());
+        }
+        for _ in 0..100 {
+            assert!(admission.acquire("tenant-a", Uuid::new_v4()).is_err());
+        }
+        // Tenant rejection occurs before any VM entry or global slot is retained.
+        assert_eq!(admission.global.available_permits(), 96);
+        assert!(admission.acquire("tenant-b", Uuid::new_v4()).is_ok());
+        drop(held);
+        let permit = admission.acquire("tenant-a", vm).unwrap();
+        assert_eq!(admission.tenants.lock().unwrap().len(), 1);
+        assert_eq!(admission.vms.lock().unwrap().len(), 1);
+        drop(permit);
+        assert_eq!(admission.global.available_permits(), 128);
+
+        let tiny = AsyncExecutionAdmission::new(2);
+        let one = tiny.acquire("one", vm).unwrap();
+        let two = tiny.acquire("two", vm).unwrap();
+        assert!(tiny.acquire("three", vm).is_err());
+        drop(one);
+        // A failed global reservation returned both earlier reservations.
+        assert!(tiny.acquire("three", vm).is_ok());
+        drop(two);
+        assert_eq!(tiny.global.available_permits(), 2);
+    }
+
+    #[test]
+    fn ordinary_tenant_queue_cannot_block_another_tenants_execution() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let (mut state, mut writes) = test_state_with_audit();
+        state.config.api_max_in_flight = 4; // two per tenant, four globally
+        state.config.warm_pool.enabled = true;
+        let request: CreateVmRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for id in ids {
+            state
+                .supervisor
+                .seed_warm_for_test(
+                    id,
+                    crate::supervisor::VmSpawnConfig::from_defaults(&state.config, &request),
+                )
+                .unwrap();
+        }
+        let socket = PathBuf::from(format!("warm-test-{}.sock", ids[1]));
+        let listener = UnixListener::bind(&socket).unwrap();
+        // A real control socket proves tenant B reaches Exec and completes while
+        // tenant A is still waiting. No unlimited/admin key is used.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut body).unwrap();
+            let request: tarit_vmm_client::ApiRequest = serde_json::from_slice(&body).unwrap();
+            assert!(matches!(request, tarit_vmm_client::ApiRequest::Exec { .. }));
+            let response = serde_json::to_vec(&tarit_vmm_client::ApiResponse::Exec {
+                exit_code: 0,
+                stdout: "tenant-b ran".into(),
+                stderr: String::new(),
+                duration_ms: 1,
+            })
+            .unwrap();
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        test_runtime().block_on(async {
+            tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write { let _ = completion.send(Ok(())); }
+                }
+            });
+            let app = router(state.clone());
+            for key in ["tenant-a-key", "tenant-b-key"] {
+                assert_eq!(request_json(app.clone(), "POST", "/v1/vms", key, serde_json::json!({})).await.status(), StatusCode::CREATED);
+            }
+            let _held = state.supervisor.operation_gate(ids[0]).unwrap().lock_owned().await;
+            let command = serde_json::json!({"vm_id":ids[0],"command":"echo waiting","timeout_ms":1000});
+            for _ in 0..2 {
+                assert_eq!(request_json(app.clone(), "POST", "/v1/execute_async", "tenant-a-key", command.clone()).await.status(), StatusCode::ACCEPTED);
+            }
+            assert_eq!(request_json(app.clone(), "POST", "/v1/execute_async", "tenant-a-key", command).await.status(), StatusCode::TOO_MANY_REQUESTS);
+            let accepted = request_json(app.clone(), "POST", "/v1/execute_async", "tenant-b-key",
+                serde_json::json!({"vm_id":ids[1],"command":"echo independent","timeout_ms":1000})).await;
+            assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+            let body = response_json(accepted).await;
+            let id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(rec) = state.exec_cache.read().unwrap().get(&id) {
+                        if rec.status == ExecutionStatus::Completed {
+                            assert_eq!(rec.stdout.as_deref(), Some("tenant-b ran")); break;
+                        }
+                        assert_ne!(rec.status, ExecutionStatus::Failed, "{:?}", rec.error);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            // Validation failures release every level too.
+            for _ in 0..8 {
+                assert_eq!(request_json(app.clone(), "POST", "/v1/execute_async", "tenant-b-key",
+                    serde_json::json!({"vm_id":Uuid::new_v4(),"command":"true","timeout_ms":1000})).await.status(), StatusCode::NOT_FOUND);
+            }
+        });
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn queued_execution_rejects_replaced_vm_before_wake_and_after_gate_wait() {
+        let state = test_state();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            insert_vm(&state, id, "tenant-a", VmStatus::Running);
+            let expected = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
+            state
+                .supervisor
+                .install_test_control_runtime(id, PathBuf::from("must-not-receive-exec.sock"));
+            let gate = state.supervisor.operation_gate(id).unwrap();
+            let held = gate.lock_owned().await;
+            let queued = ops::exec_local(&state, &expected, "private command".into(), 1000, None);
+            tokio::pin!(queued);
+            assert!(futures_util::poll!(&mut queued).is_pending());
+            {
+                let mut cache = state.vm_cache.write().unwrap();
+                let replacement = cache.get_mut(&id).unwrap();
+                replacement.owner_key = Some("tenant-b".into());
+                replacement.created_at += chrono::Duration::seconds(1);
+            }
+            drop(held);
+            assert!(matches!(queued.await, Err(OrchError::Conflict(_))));
+            state.vm_cache.write().unwrap().get_mut(&id).unwrap().status = VmStatus::Hibernated;
+            assert!(matches!(
+                ops::exec_local(&state, &expected, "private command".into(), 1000, None).await,
+                Err(OrchError::Conflict(_))
+            ));
+            assert!(state.lifecycle.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn execution_owner_survives_vm_reuse_eviction_and_legacy_rows_fail_closed() {
+        let state = test_state();
+        let vm = Uuid::new_v4();
+        insert_vm(&state, vm, "tenant-a", VmStatus::Running);
+        test_runtime().block_on(async {
+            let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
+            let record = test_execution(vm, ExecutionStatus::Completed);
+            persist_exec(&state, &record, &identity).await.unwrap();
+            let mut replacement = state.vm_cache.read().unwrap().get(&vm).unwrap().clone();
+            replacement.owner_key = Some("tenant-b".into());
+            replacement.created_at += chrono::Duration::seconds(1);
+            state.store.lock().unwrap().delete_vm(vm).unwrap();
+            state.store.lock().unwrap().insert_vm(&replacement).unwrap();
+            state.vm_cache.write().unwrap().insert(vm, replacement);
+            let app = router(state.clone());
+            for evict in [false, true] {
+                if evict {
+                    state.exec_cache.write().unwrap().clear();
+                }
+                for (key, expected) in [
+                    ("tenant-b-key", StatusCode::FORBIDDEN),
+                    ("tenant-a-key", StatusCode::OK),
+                ] {
+                    let response = request_json(
+                        app.clone(),
+                        "GET",
+                        &format!("/v1/executions/{}", record.id),
+                        key,
+                        serde_json::json!({}),
+                    )
+                    .await;
+                    assert_eq!(response.status(), expected);
+                    if expected == StatusCode::OK {
+                        let json = response_json(response).await;
+                        assert!(json.get("owner_key").is_none());
+                        assert!(json.get("vm_created_at").is_none());
+                    }
+                }
+            }
+            let mut legacy = test_execution(vm, ExecutionStatus::Completed);
+            legacy.owner_key = None;
+            legacy.vm_created_at = None;
+            state
+                .store
+                .lock()
+                .unwrap()
+                .insert_execution(&legacy)
+                .unwrap();
+            assert_eq!(
+                request_json(
+                    app,
+                    "GET",
+                    &format!("/v1/executions/{}", legacy.id),
+                    "tenant-b-key",
+                    serde_json::json!({})
+                )
+                .await
+                .status(),
+                StatusCode::FORBIDDEN
+            );
+        });
+    }
+
+    #[test]
+    fn postgres_execution_retention_rejects_rehydration_and_prunes_authority() {
+        let url = std::env::var("TARIT_TEST_DATABASE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        assert!(
+            url.is_some() || std::env::var("TARIT_REQUIRE_TEST_DATABASE").as_deref() != Ok("1"),
+            "TARIT_TEST_DATABASE_URL is required for PostgreSQL regressions"
+        );
+        let Some(url) = url else {
+            return;
+        };
+        let mut state = test_state();
+        test_runtime().block_on(async {
+            state.fleet = Some(Arc::new(
+                tarit_fleet::PostgresFleet::connect(&url).await.unwrap(),
+            ));
+            let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
+            let mut old = test_execution(Uuid::new_v4(), ExecutionStatus::Completed);
+            old.updated_at -= chrono::Duration::hours(48);
+            old.created_at = old.updated_at;
+            persist_exec(&state, &old, &identity).await.unwrap();
+            assert!(state
+                .fleet
+                .as_ref()
+                .unwrap()
+                .get_execution(old.id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(!state.exec_cache.read().unwrap().contains_key(&old.id));
+            let app = router(state.clone());
+            assert_eq!(
+                request_json(
+                    app,
+                    "GET",
+                    &format!("/v1/executions/{}", old.id),
+                    "tenant-a-key",
+                    serde_json::json!({})
+                )
+                .await
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert!(!state.exec_cache.read().unwrap().contains_key(&old.id));
+            let recent = test_execution(old.vm_id, ExecutionStatus::Completed);
+            persist_exec(&state, &recent, &identity).await.unwrap();
+            let mut running = test_execution(old.vm_id, ExecutionStatus::Running);
+            running.updated_at = old.updated_at;
+            persist_exec(&state, &running, &identity).await.unwrap();
+            // Zero means disabled in both polling and cleanup.
+            state.config.execution_retention_hours = 0;
+            assert!(get_execution(
+                State(state.clone()),
+                Extension(identity.clone()),
+                Path(old.id)
+            )
+            .await
+            .is_ok());
+            usage::prune_executions(&state, 0).await;
+            assert!(state
+                .fleet
+                .as_ref()
+                .unwrap()
+                .get_execution(old.id)
+                .await
+                .unwrap()
+                .is_some());
+            state.config.execution_retention_hours = 24;
+            usage::prune_executions(&state, 24).await;
+            let fleet = state.fleet.as_ref().unwrap();
+            assert!(fleet.get_execution(old.id).await.unwrap().is_none());
+            assert!(state.store.lock().unwrap().get_execution(old.id).is_err());
+            assert!(!state.exec_cache.read().unwrap().contains_key(&old.id));
+            for record in [&recent, &running] {
+                assert!(fleet.get_execution(record.id).await.unwrap().is_some());
+                assert!(state.store.lock().unwrap().get_execution(record.id).is_ok());
+            }
+            // PG rehydration must not change the immutable local binding's
+            // precision and prevent a later terminal transition from persisting.
+            assert!(get_execution(
+                State(state.clone()),
+                Extension(identity.clone()),
+                Path(running.id)
+            )
+            .await
+            .is_ok());
+            update_exec_status(&state, &identity, running.id, ExecutionStatus::Failed, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .get_execution(running.id)
+                    .unwrap()
+                    .status,
+                ExecutionStatus::Failed
+            );
+        });
+    }
+
+    #[test]
     fn asynchronous_admission_survives_202_and_queue_wait_expires() {
         let (mut state, mut writes) = test_state_with_audit();
         state.config.api_max_in_flight = 1;
@@ -4541,6 +4960,8 @@ pub(crate) mod tests {
         ExecutionRecord {
             id: Uuid::new_v4(),
             vm_id,
+            owner_key: Some("tenant-a".into()),
+            vm_created_at: Some(now),
             command: "echo cached".into(),
             timeout_ms: 1000,
             status,
@@ -4626,6 +5047,13 @@ pub(crate) mod tests {
         test_runtime().block_on(async {
             let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
             persist_exec(&state, &execution, &identity).await.unwrap();
+            // Simulate a record cached while fresh that aged past retention.
+            // New cache insertions already reject expired records immediately.
+            state
+                .exec_cache
+                .write()
+                .unwrap()
+                .insert(execution.id, execution.clone());
             let (shutdown, receiver) = tokio::sync::watch::channel(None);
             let flusher =
                 usage::spawn_outbox_flusher(state.clone(), 1, 90, 24, 0, receiver).unwrap();
@@ -6765,6 +7193,7 @@ pub(crate) mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,

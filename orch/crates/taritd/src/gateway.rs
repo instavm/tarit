@@ -515,7 +515,7 @@ async fn attach_authorized_pty(
     // PTY to that record's owner too.
     authorize_vm_owner(state, auth).await?;
 
-    crate::ops::ensure_active_local(state, auth.vm_id).await?;
+    crate::ops::ensure_active_local_for_owner(state, auth.vm_id, &auth.owner_key).await?;
 
     let supervisor = Arc::clone(&state.supervisor);
     let vm_id = auth.vm_id;
@@ -1168,6 +1168,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,

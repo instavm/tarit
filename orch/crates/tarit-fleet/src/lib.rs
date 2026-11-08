@@ -127,6 +127,7 @@ impl PostgresFleet {
         tx.batch_execute(
             "ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS owner_key TEXT;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS api_key_id TEXT;
+             ALTER TABLE fleet_executions ADD COLUMN IF NOT EXISTS vm_created_at TIMESTAMPTZ;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS startup_path TEXT;
              ALTER TABLE fleet_vms ADD COLUMN IF NOT EXISTS rootfs_read_only BOOLEAN NOT NULL DEFAULT FALSE;
@@ -2497,8 +2498,8 @@ impl PostgresFleet {
             .execute(
                 "INSERT INTO fleet_executions (
                    id, vm_id, owner_key, api_key_id, host_id, command, timeout_ms, status,
-                   exit_code, stdout, stderr, duration_ms, error, created_at, updated_at
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                   exit_code, stdout, stderr, duration_ms, error, created_at, updated_at, vm_created_at
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                  ON CONFLICT (id) DO UPDATE SET
                    status = EXCLUDED.status,
                    exit_code = EXCLUDED.exit_code,
@@ -2509,6 +2510,7 @@ impl PostgresFleet {
                    updated_at = EXCLUDED.updated_at
                  WHERE fleet_executions.owner_key = EXCLUDED.owner_key
                    AND fleet_executions.vm_id = EXCLUDED.vm_id
+                   AND fleet_executions.vm_created_at IS NOT DISTINCT FROM EXCLUDED.vm_created_at
                    AND fleet_executions.updated_at <= EXCLUDED.updated_at",
                 &[
                     &exec.id,
@@ -2534,6 +2536,7 @@ impl PostgresFleet {
                     &exec.error,
                     &exec.created_at,
                     &exec.updated_at,
+                    &exec.vm_created_at,
                 ],
             )
             .await?;
@@ -2554,12 +2557,34 @@ impl PostgresFleet {
         let row = client
             .query_opt(
                 "SELECT id, vm_id, owner_key, api_key_id, host_id, command, timeout_ms,
-                        status, exit_code, stdout, stderr, duration_ms, error, created_at, updated_at
+                        status, exit_code, stdout, stderr, duration_ms, error, created_at, updated_at, vm_created_at
                    FROM fleet_executions WHERE id = $1",
                 &[&id],
             )
             .await?;
         row.as_ref().map(row_to_execution).transpose()
+    }
+
+    /// Prune bounded batches from the authoritative output store. Row locks
+    /// serialize with terminal updates; SKIP LOCKED allows concurrent node GC.
+    pub async fn prune_finished_executions(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<usize, FleetError> {
+        let client = self.pool.get().await?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let deleted = client
+            .execute(
+                "WITH expired AS (
+               SELECT id FROM fleet_executions
+                WHERE updated_at < $1 AND status IN ('completed','failed')
+                ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED
+             ) DELETE FROM fleet_executions WHERE id IN (SELECT id FROM expired)",
+                &[&cutoff, &limit],
+            )
+            .await?;
+        Ok(deleted as usize)
     }
 
     pub async fn fail_incomplete_executions_for_host(
@@ -3260,6 +3285,8 @@ CREATE INDEX IF NOT EXISTS fleet_executions_owner_time
   ON fleet_executions (owner_key, created_at DESC);
 CREATE INDEX IF NOT EXISTS fleet_executions_host_status
   ON fleet_executions (host_id, status);
+CREATE INDEX IF NOT EXISTS fleet_executions_finished_updated
+  ON fleet_executions (updated_at) WHERE status IN ('completed','failed');
 ";
 
 const VOLUME_COLUMNS: &str = "id, owner_key, name, provider, storage_class, size_bytes, status,
@@ -3596,6 +3623,8 @@ fn row_to_execution(row: &tokio_postgres::Row) -> Result<FleetExecutionRecord, F
         record: ExecutionRecord {
             id: row.get(0),
             vm_id: row.get(1),
+            owner_key: Some(row.get(2)),
+            vm_created_at: row.get(15),
             command: row.get(5),
             timeout_ms,
             status: ExecutionStatus::parse(&status).ok_or_else(|| {
@@ -3733,9 +3762,14 @@ fn make_rustls_connector() -> Result<MakeRustlsConnect, FleetError> {
             }
         }
     }
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    // Workspace feature unification may also enable aws-lc through another
+    // client. Choose our configured ring provider without process-global state.
+    let config =
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .map_err(|error| FleetError::Config(format!("fleet TLS protocols: {error}")))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     Ok(MakeRustlsConnect::new(config))
 }
 
@@ -3798,6 +3832,110 @@ mod tests {
     // PostgreSQL DDL can deadlock even though test rows use unique UUIDs, so
     // serialize only these external-DB cases.
     static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn postgres_test_database_url() -> Option<String> {
+        let url = std::env::var("TARIT_TEST_DATABASE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty());
+        assert!(
+            url.is_some() || std::env::var("TARIT_REQUIRE_TEST_DATABASE").as_deref() != Ok("1"),
+            "TARIT_TEST_DATABASE_URL is required for PostgreSQL regressions"
+        );
+        url
+    }
+
+    #[tokio::test]
+    async fn postgres_execution_retention_is_batched_terminal_only_and_ownership_is_immutable(
+    ) -> Result<(), FleetError> {
+        let Some(url) = postgres_test_database_url() else {
+            return Ok(());
+        };
+        let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+        let fleet = PostgresFleet::connect(&url).await?;
+        let now = DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+        let cutoff = now - chrono::Duration::hours(24);
+        let mut records = Vec::new();
+        for (status, updated_at) in [
+            (
+                ExecutionStatus::Completed,
+                cutoff - chrono::Duration::seconds(1),
+            ),
+            (
+                ExecutionStatus::Failed,
+                cutoff - chrono::Duration::seconds(1),
+            ),
+            (
+                ExecutionStatus::Completed,
+                cutoff - chrono::Duration::seconds(1),
+            ),
+            (ExecutionStatus::Completed, cutoff),
+            (ExecutionStatus::Completed, now),
+            (
+                ExecutionStatus::Running,
+                cutoff - chrono::Duration::hours(24),
+            ),
+            (
+                ExecutionStatus::Pending,
+                cutoff - chrono::Duration::hours(24),
+            ),
+        ] {
+            let record = ExecutionRecord {
+                id: Uuid::new_v4(),
+                vm_id: Uuid::new_v4(),
+                owner_key: Some("retention-owner".into()),
+                vm_created_at: Some(now),
+                command: "echo private".into(),
+                timeout_ms: 1000,
+                status,
+                exit_code: None,
+                stdout: Some("private output".into()),
+                stderr: None,
+                duration_ms: None,
+                error: None,
+                created_at: updated_at,
+                updated_at,
+            };
+            fleet
+                .upsert_execution(&record, "retention-owner", "key", "retention-test")
+                .await?;
+            records.push(record);
+        }
+        let result = async {
+            let mut changed = records[4].clone();
+            changed.vm_created_at = Some(now + chrono::Duration::seconds(1));
+            assert!(matches!(
+                fleet
+                    .upsert_execution(&changed, "retention-owner", "key", "retention-test")
+                    .await,
+                Err(FleetError::Conflict(_))
+            ));
+            assert!(matches!(
+                fleet
+                    .upsert_execution(&records[4], "foreign-owner", "key", "retention-test")
+                    .await,
+                Err(FleetError::Conflict(_))
+            ));
+            let read = fleet.get_execution(records[4].id).await?.unwrap();
+            assert_eq!(read.record.owner_key.as_deref(), Some("retention-owner"));
+            assert_eq!(read.record.vm_created_at, Some(now));
+            let first = fleet.prune_finished_executions(cutoff, 2).await?;
+            assert_eq!(first, 2);
+            while fleet.prune_finished_executions(cutoff, 2).await? == 2 {}
+            for (index, record) in records.iter().enumerate() {
+                assert_eq!(fleet.get_execution(record.id).await?.is_some(), index >= 3);
+            }
+            Ok::<_, FleetError>(())
+        }
+        .await;
+        let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+        fleet
+            .pool
+            .get()
+            .await?
+            .execute("DELETE FROM fleet_executions WHERE id = ANY($1)", &[&ids])
+            .await?;
+        result
+    }
 
     fn test_vm(id: Uuid, host_id: &str, owner_key: &str) -> VmRecord {
         let now = Utc::now();
@@ -3986,7 +4124,7 @@ mod tests {
     #[tokio::test]
     async fn fork_operation_is_source_bound_and_recoverable_in_postgres() -> Result<(), FleetError>
     {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             eprintln!("skipping PostgreSQL fork operation test: TARIT_TEST_DATABASE_URL is absent");
             return Ok(());
         };
@@ -4117,7 +4255,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_volumes_are_tenant_scoped_cas_fenced_and_single_writer() -> Result<(), FleetError>
     {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             eprintln!("skipping PostgreSQL volume test: TARIT_TEST_DATABASE_URL is absent");
             return Ok(());
         };
@@ -4310,7 +4448,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_replication_and_branch_cas_use_postgres_when_database_is_configured(
     ) -> Result<(), FleetError> {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             eprintln!(
                 "skipping PostgreSQL artifact/branch test: TARIT_TEST_DATABASE_URL is absent"
             );
@@ -4768,7 +4906,7 @@ mod tests {
     #[tokio::test]
     async fn opaque_snapshot_locator_round_trips_when_database_is_configured(
     ) -> Result<(), FleetError> {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             return Ok(());
         };
         if database_url.is_empty() {
@@ -4817,7 +4955,7 @@ mod tests {
     #[tokio::test]
     async fn vm_claims_and_deletes_are_incarnation_fenced_when_database_is_configured(
     ) -> Result<(), FleetError> {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             return Ok(());
         };
         if database_url.is_empty() {
@@ -4882,7 +5020,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_restore_vm_reference_is_idempotent_incarnation_fenced_and_released(
     ) -> Result<(), FleetError> {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             return Ok(());
         };
         if database_url.is_empty() {
@@ -4978,7 +5116,7 @@ mod tests {
     #[tokio::test]
     async fn deleting_vm_revokes_shares_and_fences_stale_publication_when_database_is_configured(
     ) -> Result<(), FleetError> {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             return Ok(());
         };
         if database_url.is_empty() {
@@ -5052,7 +5190,7 @@ mod tests {
     #[tokio::test]
     async fn share_compare_and_swap_uses_postgres_when_database_is_configured(
     ) -> Result<(), FleetError> {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             eprintln!(
                 "skipping PostgreSQL share compare-and-swap test: TARIT_TEST_DATABASE_URL is absent"
             );
@@ -5116,7 +5254,7 @@ mod tests {
     #[tokio::test]
     async fn share_persistence_round_trip_matches_sqlite_when_database_is_configured(
     ) -> Result<(), FleetError> {
-        let Ok(database_url) = std::env::var("TARIT_TEST_DATABASE_URL") else {
+        let Some(database_url) = postgres_test_database_url() else {
             eprintln!(
                 "skipping PostgreSQL share integration test: TARIT_TEST_DATABASE_URL is absent"
             );
