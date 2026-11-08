@@ -1,8 +1,9 @@
 name: Release
 
 # Builds static (musl) x86_64 Linux binaries plus Python and TypeScript SDK
-# packages. Tag runs publish the binaries as a GitHub Release, then publish the
-# coordinated SDK version through registry-trusted OIDC identities.
+# packages. Tag runs publish the binaries as a GitHub Release and, when the
+# PUBLISH_SDKS repository variable is "true", the coordinated SDK version
+# through registry-trusted OIDC identities.
 #
 # Triggered by pushing a version tag (e.g. `v0.1.0`). A manual `workflow_dispatch`
 # run only builds, verifies, attests, and uploads artifacts; it never publishes,
@@ -270,7 +271,9 @@ jobs:
   pypi:
     name: Publish Python SDK
     needs: [sdk, release]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # Off until the registry trusted publishers exist; set the repository
+    # variable PUBLISH_SDKS=true to publish.
+    if: vars.PUBLISH_SDKS == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -290,7 +293,9 @@ jobs:
   npm:
     name: Publish TypeScript SDK
     needs: [sdk, release]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # Off until the registry trusted publishers exist; set the repository
+    # variable PUBLISH_SDKS=true to publish.
+    if: vars.PUBLISH_SDKS == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     environment: npm
     permissions:

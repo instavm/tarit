@@ -10,6 +10,8 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-08
+
 ### Added
 
 - Restores load the memory the guest is going to need before it asks. A
