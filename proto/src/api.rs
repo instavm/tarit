@@ -12,6 +12,30 @@ use serde::{Deserialize, Serialize};
 /// contract cannot drift between them.
 pub const MAX_API_FRAME_LEN: usize = 16 * 1024 * 1024;
 
+/// Upper bound for `SetMemoryHotplug::wait_timeout_ms`. The VMM serves one
+/// control request at a time, so a wait holds the socket for its duration.
+pub const MAX_MEMORY_HOTPLUG_WAIT_MS: u64 = 60_000;
+
+/// Live virtio-mem sizes of a hotplug-ready VM, in MiB.
+///
+/// Hotplug sizes exclude boot RAM. Guest-visible RAM is
+/// `boot_memory_mib + plugged_size_mib`; the host reservation is
+/// `boot_memory_mib + total_size_mib`. While the guest converges, plugged may
+/// be above (shrinking) or below (growing) requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryHotplugStatus {
+    /// Size of the hotplug aperture (maximum RAM minus boot RAM).
+    pub total_size_mib: u64,
+    /// Plug/unplug granularity; requested sizes must be multiples of it.
+    pub block_size_mib: u64,
+    /// Memory the guest driver currently has plugged.
+    pub plugged_size_mib: u64,
+    /// Hotplug size the host last requested.
+    pub requested_size_mib: u64,
+    /// Fixed RAM below the MMIO gap, outside the hotplug aperture.
+    pub boot_memory_mib: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestoreMemoryPolicy {
@@ -100,6 +124,9 @@ pub enum ApiRequest {
         identity: ScratchIdentity,
     },
     Restore {
+        /// Grow guest-visible RAM to this total MiB within its reserved maximum.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_memory_mib: Option<u64>,
         snapshot_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         memory_integrity: Option<MemoryIntegrity>,
@@ -153,6 +180,22 @@ pub enum ApiRequest {
     },
     /// Read target/actual balloon state reported through virtio config space.
     Balloon,
+    /// Read the live virtio-mem sizes (`ApiResponse::MemoryHotplug`).
+    MemoryHotplugStatus,
+    /// Set the requested virtio-mem hotplug size of a running VM, in MiB,
+    /// EXCLUDING boot RAM (Firecracker's `requested_size_mib`). Grows or
+    /// shrinks; `0` asks the guest to unplug all hotplugged memory. Must be a
+    /// multiple of `block_size_mib` and at most `total_size_mib`. Without
+    /// `wait_timeout_ms` the call returns immediately after notifying the
+    /// guest. With it, the call returns once the device's plugged size equals
+    /// the request, or fails when the deadline passes (the request stays
+    /// applied and the guest keeps converging). Capped at
+    /// [`MAX_MEMORY_HOTPLUG_WAIT_MS`].
+    SetMemoryHotplug {
+        requested_size_mib: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait_timeout_ms: Option<u64>,
+    },
     /// Return a cheap health/info snapshot of the VM (state, uptime, config).
     Status,
 }
@@ -227,6 +270,8 @@ pub enum ApiResponse {
     /// Health/info snapshot (response to `Status`).
     #[serde(rename = "vm_status")]
     Status(VmStatus),
+    /// Response to `MemoryHotplugStatus` and `SetMemoryHotplug`.
+    MemoryHotplug(MemoryHotplugStatus),
     Err {
         msg: String,
     },
@@ -259,7 +304,10 @@ mod tests {
                 cmdline: "console=ttyS0".into(),
                 initramfs: None,
             },
-            memory: MemoryConfig { size_mib: 256 },
+            memory: MemoryConfig {
+                size_mib: 256,
+                boot_size_mib: None,
+            },
             vcpus: VcpuConfig { count: 1 },
             volumes: vec![],
             net: vec![],
@@ -306,6 +354,71 @@ mod tests {
             }
             _ => panic!("expected create"),
         }
+    }
+
+    #[test]
+    fn memory_hotplug_requests_use_stable_wire_names() {
+        let status: ApiRequest = serde_json::from_str(r#"{"op":"memory_hotplug_status"}"#).unwrap();
+        assert!(matches!(status, ApiRequest::MemoryHotplugStatus));
+
+        let set: ApiRequest =
+            serde_json::from_str(r#"{"op":"set_memory_hotplug","requested_size_mib":2048}"#)
+                .unwrap();
+        assert!(matches!(
+            set,
+            ApiRequest::SetMemoryHotplug {
+                requested_size_mib: 2048,
+                wait_timeout_ms: None
+            }
+        ));
+        let encoded = serde_json::to_string(&set).unwrap();
+        assert!(!encoded.contains("wait_timeout_ms"));
+
+        let waiting = ApiRequest::SetMemoryHotplug {
+            requested_size_mib: 0,
+            wait_timeout_ms: Some(5_000),
+        };
+        let encoded = serde_json::to_string(&waiting).unwrap();
+        assert!(encoded.contains(r#""op":"set_memory_hotplug""#));
+        assert!(encoded.contains(r#""wait_timeout_ms":5000"#));
+        assert!(matches!(
+            serde_json::from_str::<ApiRequest>(&encoded).unwrap(),
+            ApiRequest::SetMemoryHotplug {
+                requested_size_mib: 0,
+                wait_timeout_ms: Some(5_000)
+            }
+        ));
+    }
+
+    #[test]
+    fn memory_hotplug_response_round_trips() {
+        let response = ApiResponse::MemoryHotplug(MemoryHotplugStatus {
+            total_size_mib: 7168,
+            block_size_mib: 128,
+            plugged_size_mib: 1024,
+            requested_size_mib: 2048,
+            boot_memory_mib: 1024,
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "status": "memory_hotplug",
+                "total_size_mib": 7168,
+                "block_size_mib": 128,
+                "plugged_size_mib": 1024,
+                "requested_size_mib": 2048,
+                "boot_memory_mib": 1024
+            })
+        );
+        let back: ApiResponse = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            back,
+            ApiResponse::MemoryHotplug(MemoryHotplugStatus {
+                plugged_size_mib: 1024,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -586,6 +699,7 @@ mod tests {
         let back: ApiRequest = serde_json::from_str(json).unwrap();
         match back {
             ApiRequest::Restore {
+                target_memory_mib: None,
                 snapshot_path,
                 memory_integrity,
                 overlay,
@@ -607,6 +721,7 @@ mod tests {
     #[test]
     fn request_restore_round_trips_with_overlay() {
         let r = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/golden.snap".into(),
             memory_integrity: None,
             overlay: Some("/clones/a.cow".into()),
@@ -623,6 +738,7 @@ mod tests {
         assert!(matches!(
             back,
             ApiRequest::Restore {
+            target_memory_mib: None,
                 snapshot_path,
                 memory_integrity: None,
                 overlay: Some(overlay),
@@ -636,6 +752,7 @@ mod tests {
     #[test]
     fn request_restore_round_trips_with_explicit_network_rebind() {
         let r = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/golden.snap".into(),
             memory_integrity: None,
             overlay: None,
@@ -664,6 +781,7 @@ mod tests {
     #[test]
     fn request_restore_round_trips_non_default_memory_policy() {
         let r = ApiRequest::Restore {
+            target_memory_mib: None,
             snapshot_path: "/golden.snap".into(),
             memory_integrity: None,
             overlay: None,
