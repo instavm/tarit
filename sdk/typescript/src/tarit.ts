@@ -77,9 +77,12 @@ export class TaritApiError extends Error {
 }
 
 export class TaritDeadlineExceeded extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly executionId: string | undefined;
+
+  constructor(message: string, options: { executionId?: string | undefined } = {}) {
+    super(options.executionId === undefined ? message : `${message}; execution ID ${options.executionId}`);
     this.name = "TaritDeadlineExceeded";
+    this.executionId = options.executionId;
   }
 }
 
@@ -125,12 +128,20 @@ async function withExecutionDeadline<T>(
   milliseconds: number,
   message: string,
   operation: (signal: AbortSignal, deadline: number) => Promise<T>,
+  executionId: () => string | undefined,
 ): Promise<T> {
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
     throw new RangeError("deadlineMs must be a finite positive number");
   }
   const deadline = performance.now() + milliseconds;
   const controller = new AbortController();
+  const deadlineError = () => {
+    const id = executionId();
+    return new TaritDeadlineExceeded(
+      id === undefined ? `${message}; execution ID unavailable; submission may have been accepted` : message,
+      { executionId: id },
+    );
+  };
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expire = () => {
     const remaining = deadline - performance.now();
@@ -140,10 +151,10 @@ async function withExecutionDeadline<T>(
   expire();
   try {
     const result = await operation(controller.signal, deadline);
-    if (controller.signal.aborted || performance.now() >= deadline) throw new TaritDeadlineExceeded(message);
+    if (controller.signal.aborted || performance.now() >= deadline) throw deadlineError();
     return result;
   } catch (error) {
-    if (controller.signal.aborted) throw new TaritDeadlineExceeded(message);
+    if (controller.signal.aborted || error instanceof TaritDeadlineExceeded) throw deadlineError();
     throw error;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
@@ -541,6 +552,7 @@ export class TaritClient {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const pollInterval = options.pollIntervalMs ?? 100;
     validatePollInterval(pollInterval);
+    let executionId: string | undefined;
     return withExecutionDeadline(
       options.deadlineMs ?? Math.max(timeoutMs + 5_000, 5_000),
       `execute command on VM ${vmId} exceeded its deadline`,
@@ -557,8 +569,10 @@ export class TaritClient {
             result.error,
           );
         }
-        return this.waitExecutionUntil(result.data.id, signal, deadline, pollInterval);
+        executionId = result.data.id;
+        return this.waitExecutionUntil(executionId, signal, deadline, pollInterval);
       },
+      () => executionId,
     );
   }
 
@@ -569,6 +583,7 @@ export class TaritClient {
       options.deadlineMs ?? 35_000,
       `execution ${executionId} exceeded its deadline`,
       (signal, deadline) => this.waitExecutionUntil(executionId, signal, deadline, pollInterval),
+      () => executionId,
     );
   }
 
