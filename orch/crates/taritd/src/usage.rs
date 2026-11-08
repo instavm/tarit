@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use tarit_fleet::PostgresFleet;
-use tarit_types::{UsageEvent, UsageKind, VmStatus};
+use tarit_types::{ExecutionStatus, UsageEvent, UsageKind, VmStatus};
 
 use crate::api::{AppState, StoreWrite};
 
@@ -291,6 +291,17 @@ async fn prune_executions(state: &AppState, retention_hours: u64) {
             }
         }
         tokio::task::yield_now().await;
+    }
+    // SQLite and the polling cache have the same retention boundary. Prune
+    // even when SQLite deleted zero rows (e.g. an earlier cleanup already ran).
+    if let Ok(mut cache) = state.exec_cache.write() {
+        cache.retain(|_, record| {
+            record.updated_at >= cutoff
+                || !matches!(
+                    record.status,
+                    ExecutionStatus::Completed | ExecutionStatus::Failed
+                )
+        });
     }
     if total > 0 {
         tracing::info!(

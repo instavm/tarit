@@ -640,12 +640,6 @@ async fn run_server(
                             }
                             let _ = completion.send(result);
                         }
-                        api::StoreWrite::Exec(rec) => {
-                            if let Err(error) = s.insert_execution(&rec) {
-                                metrics.inc_store_write_failure();
-                                tracing::error!(execution = %rec.id, %error, "persist execution record");
-                            }
-                        }
                         api::StoreWrite::Usage(ev) => {
                             if let Err(error) = s.enqueue_usage(&ev) {
                                 metrics.inc_store_write_failure();

@@ -160,6 +160,20 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 
 Full request and response schemas are in [docs/API.md](docs/API.md).
 
+Asynchronous execution admission lasts until the command reaches a terminal state.
+Each API node accepts at most `min(TARIT_API_MAX_IN_FLIGHT, 128)` unfinished
+asynchronous commands; further submissions return 429. Waiting behind another
+operation on a local VM is bounded by `TARIT_API_REQUEST_TIMEOUT_MS`, separately
+from the command's runtime timeout. The execution polling cache is limited to
+1,024 records and 64 MiB; evicted records remain readable from durable storage,
+and configured execution retention removes terminal records from both SQLite
+and memory.
+
+Shares are revoked when their VM is deleted, including when retention frees its
+UUID. Recreating that UUID requires new shares. SSH public-key registrations are
+matched within the target VM's tenant, so the same public key can be registered
+by multiple tenants independently.
+
 ## CLI reference
 
 The client subcommands share three global flags: `--base-url <URL>` (env `TARIT_BASE_URL`, default `http://127.0.0.1:8080`), `--api-key <KEY>` (env `TARIT_API_KEY`), and `--json` to print raw JSON responses.

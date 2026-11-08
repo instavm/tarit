@@ -94,8 +94,8 @@ use tarit_types::{audit_action, audit_outcome};
 
 /// A durability write applied by the bounded background store writer. VM
 /// lifecycle transitions use the acknowledged variant because reservations and
-/// fleet ownership must not advance ahead of SQLite durability. Execution and
-/// outbox writes retain their bounded write-behind behavior.
+/// fleet ownership must not advance ahead of SQLite durability. Outbox writes
+/// retain their bounded write-behind behavior; executions are acknowledged before caching.
 pub enum StoreWrite {
     /// A lifecycle transition that must reach SQLite before its resource
     /// reservation or fleet ownership may be released.
@@ -103,7 +103,6 @@ pub enum StoreWrite {
         VmRecord,
         tokio::sync::oneshot::Sender<Result<(), OrchError>>,
     ),
-    Exec(ExecutionRecord),
     Usage(UsageEvent),
     Audit(AuditEvent),
 }
@@ -123,6 +122,11 @@ pub(crate) enum LifecycleState {
         phase: PublicationPhase,
     },
     Running {
+        record: VmRecord,
+    },
+    /// Owns the durable hibernation binding until stop, publication and resource
+    /// release have all converged; retries must not resume the captured guest.
+    Hibernating {
         record: VmRecord,
     },
     /// A live VMM transition could not be rolled back or observed. The record
@@ -176,6 +180,7 @@ impl LifecycleState {
             Self::Creating { record, .. }
             | Self::Publishing { record, .. }
             | Self::Running { record }
+            | Self::Hibernating { record }
             | Self::Reconciling { record }
             | Self::Abandoned { record }
             | Self::Terminal { record, .. } => record,
@@ -491,8 +496,18 @@ impl IntoResponse for ShareApiError {
     }
 }
 
+/// Detached work needs admission that outlives the HTTP 202 response. The hard
+/// ceiling also bounds retained command bodies when HTTP concurrency is raised.
+const MAX_ASYNC_EXECUTIONS: usize = 128;
+
+#[derive(Clone)]
+struct AsyncExecutionAdmission(Arc<tokio::sync::Semaphore>);
+
 pub fn router(state: AppState) -> Router {
     let traffic_limits = ApiTrafficLimits::new(&state.config);
+    let async_executions = AsyncExecutionAdmission(Arc::new(tokio::sync::Semaphore::new(
+        state.config.api_max_in_flight.min(MAX_ASYNC_EXECUTIONS),
+    )));
     let max_body_bytes = state.config.api_max_body_bytes;
     let protected = Router::new()
         .route("/v1/vms", post(create_vm).get(list_vms))
@@ -562,6 +577,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             require_api_key,
         ))
+        .layer(Extension(async_executions))
         .layer(DefaultBodyLimit::max(max_body_bytes));
     let admitted = protected
         .route(
@@ -2472,7 +2488,7 @@ async fn delete_vm(
 ) -> Result<StatusCode, ApiError> {
     match cluster::resolve_owner(&state, id).await? {
         Owner::Local => {
-            let vm = ops::get_local(&state, id)?;
+            let vm = ops::get_local_for_delete(&state, id)?;
             ensure_vm_access(&identity, &vm)?;
             ops::stop_local(&state, id).await?
         }
@@ -3267,9 +3283,17 @@ fn validate_exec_timeout(
 async fn execute_async(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
+    Extension(admission): Extension<AsyncExecutionAdmission>,
     Json(req): Json<ExecuteRequest>,
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
-    let result = execute_async_impl(state.clone(), identity, req).await;
+    let permit = admission
+        .0
+        .try_acquire_owned()
+        .map_err(|_| OrchError::Overloaded {
+            message: "asynchronous execution capacity exhausted".into(),
+            retry_after_secs: 1,
+        })?;
+    let result = execute_async_impl(state.clone(), identity, req, permit).await;
     if result.is_ok() {
         state.metrics.inc_exec_total();
     }
@@ -3280,6 +3304,7 @@ async fn execute_async_impl(
     state: AppState,
     identity: ApiIdentity,
     req: ExecuteRequest,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(StatusCode, Json<ExecutionRecord>), ApiError> {
     validate_exec_timeout(req.timeout_ms, None)?;
     // Locate the VM anywhere in the cluster; the exec runs on its owning node.
@@ -3312,8 +3337,13 @@ async fn execute_async_impl(
     let command = req.command;
     let timeout_ms = req.timeout_ms;
     let vm_id = req.vm_id;
+    // A command's runtime timeout starts after the operation gate is acquired.
+    // Bound the queue separately so one busy VM cannot retain work indefinitely.
+    let gate_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(state.config.api_request_timeout_ms);
 
     tokio::spawn(async move {
+        let _permit = permit;
         if let Err(error) =
             update_exec_status(&state2, &identity, exec_id, ExecutionStatus::Running, None).await
         {
@@ -3322,7 +3352,14 @@ async fn execute_async_impl(
 
         let result = match owner {
             Owner::Local => {
-                ops::exec_local(&state2, vm_id, command.clone(), timeout_ms, None).await
+                ops::exec_local(
+                    &state2,
+                    vm_id,
+                    command.clone(),
+                    timeout_ms,
+                    Some(gate_deadline),
+                )
+                .await
             }
             Owner::Remote(rpc) => {
                 let peer = Arc::clone(&state2.peer);
@@ -3541,9 +3578,7 @@ async fn get_execution(
         if !identity.is_admin() && global.owner_key != identity.tenant {
             return Err(OrchError::Forbidden("execution belongs to another tenant".into()).into());
         }
-        if let Ok(mut cache) = state.exec_cache.write() {
-            cache.insert(id, global.record.clone());
-        }
+        cache_execution(&state, &global.record);
         return Ok(Json(global.record));
     }
     let rec = if let Some(rec) = state
@@ -4252,10 +4287,59 @@ pub(crate) fn store_err(e: tarit_store::StoreError) -> OrchError {
     }
 }
 
-/// Write an execution record through to the global operation store, local
-/// in-memory cache, and bounded SQLite write-behind queue. Queue saturation uses
-/// a synchronous SQLite fallback: overload may add latency, but never silently
-/// loses terminal operation state.
+// Bound both tiny-record overhead and retained output. Oversized records remain
+// available from SQLite without consuming the in-memory polling cache.
+const EXECUTION_CACHE_MAX_ENTRIES: usize = 1_024;
+const EXECUTION_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+fn execution_cache_bytes(record: &ExecutionRecord) -> usize {
+    std::mem::size_of::<ExecutionRecord>()
+        .saturating_add(record.command.len())
+        .saturating_add(record.stdout.as_ref().map_or(0, String::len))
+        .saturating_add(record.stderr.as_ref().map_or(0, String::len))
+        .saturating_add(record.error.as_ref().map_or(0, String::len))
+}
+
+fn cache_execution(state: &AppState, record: &ExecutionRecord) {
+    let Ok(mut cache) = state.exec_cache.write() else {
+        return;
+    };
+    cache_execution_with_limits(
+        &mut cache,
+        record,
+        EXECUTION_CACHE_MAX_ENTRIES,
+        EXECUTION_CACHE_MAX_BYTES,
+    );
+}
+
+fn cache_execution_with_limits(
+    cache: &mut HashMap<Uuid, ExecutionRecord>,
+    record: &ExecutionRecord,
+    max_entries: usize,
+    max_bytes: usize,
+) {
+    cache.remove(&record.id);
+    let bytes = execution_cache_bytes(record);
+    if max_entries == 0 || bytes > max_bytes {
+        return;
+    }
+    let mut current_bytes = cache.values().map(execution_cache_bytes).sum::<usize>();
+    while cache.len() >= max_entries || current_bytes.saturating_add(bytes) > max_bytes {
+        let Some(oldest) = cache
+            .values()
+            .min_by_key(|record| record.updated_at)
+            .map(|record| record.id)
+        else {
+            break;
+        };
+        if let Some(evicted) = cache.remove(&oldest) {
+            current_bytes = current_bytes.saturating_sub(execution_cache_bytes(&evicted));
+        }
+    }
+    cache.insert(record.id, record.clone());
+}
+
+/// Acknowledge global and local durable stores before publishing a cache entry.
 async fn persist_exec(
     state: &AppState,
     rec: &ExecutionRecord,
@@ -4274,20 +4358,21 @@ async fn persist_exec(
                 OrchError::Internal(format!("persist global execution state: {error}"))
             })?;
     }
-    if let Ok(mut c) = state.exec_cache.write() {
-        c.insert(rec.id, rec.clone());
-    }
-    if let Err(error) = state.store_tx.try_send(StoreWrite::Exec(rec.clone())) {
-        state.metrics.inc_store_enqueue_failure();
-        state
-            .store
+    // A bounded cache may evict even an in-flight record. Acknowledge SQLite
+    // before publishing it so polling and later status updates can always fall
+    // back to durable storage. Keep database waits off the async executor.
+    let store = Arc::clone(&state.store);
+    let durable = rec.clone();
+    tokio::task::spawn_blocking(move || {
+        store
             .lock()
             .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
-            .insert_execution(rec)
-            .map_err(store_err)?;
-        tracing::warn!(execution = %rec.id, %error,
-            "bounded persistence queue unavailable; wrote execution synchronously");
-    }
+            .insert_execution(&durable)
+            .map_err(store_err)
+    })
+    .await
+    .map_err(|error| OrchError::Internal(format!("persist execution join: {error}")))??;
+    cache_execution(state, rec);
     Ok(())
 }
 
@@ -4320,7 +4405,7 @@ async fn update_exec_status(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::{ApiIdentity, ApiKeyRegistry, ApiRole, AutoscaleConfig, WarmPoolConfig};
     use crate::metrics::Metrics;
@@ -4339,6 +4424,240 @@ mod tests {
     use std::time::Duration;
     use tarit_store::Store;
     use tower::ServiceExt;
+
+    #[test]
+    fn pending_hibernation_delete_still_checks_tenant_ownership() {
+        let state = test_state();
+        let id = Uuid::new_v4();
+        insert_vm(&state, id, "tenant-a", VmStatus::Running);
+        let mut record = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
+        record.status = VmStatus::Hibernated;
+        state
+            .lifecycle
+            .lock()
+            .unwrap()
+            .insert(id, LifecycleState::Hibernating { record });
+        assert!(matches!(
+            ops::get_local(&state, id),
+            Err(OrchError::Unavailable(_))
+        ));
+        let response = test_runtime().block_on(request_json(
+            router(state.clone()),
+            "DELETE",
+            &format!("/v1/vms/{id}"),
+            "tenant-b-key",
+            serde_json::json!({}),
+        ));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(matches!(
+            state.lifecycle.lock().unwrap().get(&id),
+            Some(LifecycleState::Hibernating { .. })
+        ));
+    }
+
+    #[test]
+    fn asynchronous_admission_survives_202_and_queue_wait_expires() {
+        let (mut state, mut writes) = test_state_with_audit();
+        state.config.api_max_in_flight = 1;
+        state.config.api_request_timeout_ms = 2_000;
+        state.config.warm_pool.enabled = true;
+        let request: CreateVmRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        let vm_id = Uuid::new_v4();
+        state
+            .supervisor
+            .seed_warm_for_test(
+                vm_id,
+                crate::supervisor::VmSpawnConfig::from_defaults(&state.config, &request),
+            )
+            .unwrap();
+        test_runtime().block_on(async {
+            tokio::spawn(async move {
+                while let Some(write) = writes.recv().await {
+                    if let StoreWrite::VmDurable(_, completion) = write {
+                        let _ = completion.send(Ok(()));
+                    }
+                }
+            });
+            let app = router(state.clone());
+            let created = request_json(
+                app.clone(),
+                "POST",
+                "/v1/vms",
+                "tenant-a-key",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(created.status(), StatusCode::CREATED);
+            let gate = state.supervisor.operation_gate(vm_id).unwrap();
+            let _held = gate.lock_owned().await;
+            let command =
+                serde_json::json!({"vm_id":vm_id,"command":"echo queued","timeout_ms":3_600_000});
+            let first = request_json(
+                app.clone(),
+                "POST",
+                "/v1/execute_async",
+                "tenant-a-key",
+                command.clone(),
+            )
+            .await;
+            assert_eq!(first.status(), StatusCode::ACCEPTED);
+            let first = response_json(first).await;
+            let id = Uuid::parse_str(first["id"].as_str().unwrap()).unwrap();
+            let second = request_json(
+                app.clone(),
+                "POST",
+                "/v1/execute_async",
+                "tenant-a-key",
+                command.clone(),
+            )
+            .await;
+            assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(state.exec_cache.read().unwrap().len(), 1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if state
+                        .exec_cache
+                        .read()
+                        .unwrap()
+                        .get(&id)
+                        .is_some_and(|rec| rec.status == ExecutionStatus::Failed)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // A queue timeout persists terminal state and releases admission.
+            let third =
+                request_json(app, "POST", "/v1/execute_async", "tenant-a-key", command).await;
+            assert_eq!(third.status(), StatusCode::ACCEPTED);
+        });
+    }
+
+    fn test_execution(vm_id: Uuid, status: ExecutionStatus) -> ExecutionRecord {
+        let now = Utc::now();
+        ExecutionRecord {
+            id: Uuid::new_v4(),
+            vm_id,
+            command: "echo cached".into(),
+            timeout_ms: 1000,
+            status,
+            exit_code: None,
+            stdout: Some("cached output".into()),
+            stderr: None,
+            duration_ms: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn bounded_execution_cache_preserves_polling_and_status_updates_after_eviction() {
+        let state = test_state();
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        test_runtime().block_on(async {
+            let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
+            let original = test_execution(vm_id, ExecutionStatus::Pending);
+            persist_exec(&state, &original, &identity).await.unwrap();
+            for _ in 0..EXECUTION_CACHE_MAX_ENTRIES {
+                cache_execution(&state, &test_execution(vm_id, ExecutionStatus::Completed));
+            }
+            assert_eq!(
+                state.exec_cache.read().unwrap().len(),
+                EXECUTION_CACHE_MAX_ENTRIES
+            );
+            assert!(!state.exec_cache.read().unwrap().contains_key(&original.id));
+            let response = request_json(
+                router(state.clone()),
+                "GET",
+                &format!("/v1/executions/{}", original.id),
+                "tenant-a-key",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            update_exec_status(
+                &state,
+                &identity,
+                original.id,
+                ExecutionStatus::Failed,
+                Some("queue expired".into()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .get_execution(original.id)
+                    .unwrap()
+                    .status,
+                ExecutionStatus::Failed
+            );
+        });
+        let mut cache = HashMap::new();
+        let one = test_execution(vm_id, ExecutionStatus::Completed);
+        let bytes = execution_cache_bytes(&one);
+        cache_execution_with_limits(&mut cache, &one, 100, bytes);
+        let two = test_execution(vm_id, ExecutionStatus::Completed);
+        cache_execution_with_limits(&mut cache, &two, 100, bytes);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&two.id));
+        let mut oversized = test_execution(vm_id, ExecutionStatus::Completed);
+        oversized.stdout = Some("x".repeat(bytes * 2));
+        cache_execution_with_limits(&mut cache, &oversized, 100, bytes);
+        assert!(!cache.contains_key(&oversized.id));
+        assert!(cache.values().map(execution_cache_bytes).sum::<usize>() <= bytes);
+    }
+
+    #[test]
+    fn execution_retention_evicts_cached_output_and_api_returns_not_found() {
+        let state = test_state();
+        let vm_id = Uuid::new_v4();
+        insert_vm(&state, vm_id, "tenant-a", VmStatus::Running);
+        let mut execution = test_execution(vm_id, ExecutionStatus::Completed);
+        execution.created_at = Utc::now() - chrono::Duration::days(2);
+        execution.updated_at = execution.created_at;
+        test_runtime().block_on(async {
+            let identity = state.config.api_keys.resolve("tenant-a-key").unwrap();
+            persist_exec(&state, &execution, &identity).await.unwrap();
+            let (shutdown, receiver) = tokio::sync::watch::channel(None);
+            let flusher =
+                usage::spawn_outbox_flusher(state.clone(), 1, 90, 24, 0, receiver).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if !state.exec_cache.read().unwrap().contains_key(&execution.id) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            shutdown.send(Some("test complete")).unwrap();
+            flusher.await.unwrap();
+            assert!(state
+                .store
+                .lock()
+                .unwrap()
+                .get_execution(execution.id)
+                .is_err());
+            let response = request_json(
+                router(state.clone()),
+                "GET",
+                &format!("/v1/executions/{}", execution.id),
+                "tenant-a-key",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        });
+    }
 
     #[test]
     fn a_create_without_an_id_is_served_from_the_warm_pool() {
@@ -6405,7 +6724,7 @@ mod tests {
         }
     }
 
-    fn test_state() -> AppState {
+    pub(crate) fn test_state() -> AppState {
         test_state_with_audit().0
     }
 
@@ -6509,7 +6828,7 @@ mod tests {
             .unwrap()
     }
 
-    fn insert_vm(state: &AppState, id: Uuid, tenant: &str, status: VmStatus) {
+    pub(crate) fn insert_vm(state: &AppState, id: Uuid, tenant: &str, status: VmStatus) {
         let now = Utc::now();
         let record = VmRecord {
             id,
