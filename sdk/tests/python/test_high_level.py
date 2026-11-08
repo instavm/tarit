@@ -159,7 +159,7 @@ class SyncClientTests(unittest.TestCase):
             TaritClient("https://tarit.test", "tenant-key", transport=httpx.MockTransport(handler)) as client,
             self.assertRaises(TaritDeadlineExceeded),
         ):
-            client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=0)
+            client.fork(VM_ID, child_id=CHILD_ID, deadline_seconds=0.01)
 
     def test_open_pty_bridges_binary_resize_exit_and_deletes_session(self) -> None:
         requests: list[httpx.Request] = []

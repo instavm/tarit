@@ -2852,7 +2852,7 @@ impl OwnedTaskControl {
     }
 
     #[cfg(test)]
-    fn wait_for_cancellation(&self) {
+    pub(crate) fn wait_for_cancellation(&self) {
         let mut cancelled = self.cancellation.0.lock().unwrap();
         while !*cancelled {
             cancelled = self.cancellation.1.wait(cancelled).unwrap();
@@ -7624,7 +7624,7 @@ impl VmmSupervisor {
         );
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn install_test_control_runtime(&self, id: Uuid, socket_path: PathBuf) {
         let process = ManagedProcess::new(
             Command::new("sleep")
@@ -9610,6 +9610,7 @@ mod tests {
         assert_eq!(failed.http_status(), 500);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn tap_descriptor_becomes_inheritable_only_in_the_vmm_child() {
         let mut pipe_fds = [-1; 2];
@@ -9878,6 +9879,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
@@ -10353,6 +10355,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,
