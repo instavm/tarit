@@ -273,7 +273,7 @@ impl server::Handler for GatewayHandler {
             }
         };
 
-        match lookup_active_key(&self.state, fingerprint.clone()).await {
+        match lookup_active_key(&self.state, vm_id, fingerprint.clone()).await {
             Ok(Some(record)) => {
                 let owner_key = record.owner_key.clone();
                 self.auth = Some(Authenticated {
@@ -464,15 +464,22 @@ fn public_key_fingerprint_sha256(key: &PublicKey) -> Result<String, russh::keys:
 
 async fn lookup_active_key(
     state: &AppState,
+    vm_id: Uuid,
     fingerprint: String,
 ) -> Result<Option<SshKeyRecord>, OrchError> {
+    // A public key may legitimately be registered by several tenants. Resolve
+    // the requested VM first; another tenant's later registration must never
+    // change the identity selected for this connection.
+    let Some(owner_key) = vm_owner_key(state, vm_id).await? else {
+        return Ok(None);
+    };
     let store = Arc::clone(&state.store);
     tokio::task::spawn_blocking(move || {
         let store = store
             .lock()
             .map_err(|_| OrchError::Internal("store lock".into()))?;
         store
-            .get_active_ssh_key_by_fingerprint(&fingerprint)
+            .get_active_ssh_key_for_owner(&owner_key, &fingerprint)
             .map_err(store_err)
     })
     .await
@@ -508,7 +515,7 @@ async fn attach_authorized_pty(
     // PTY to that record's owner too.
     authorize_vm_owner(state, auth).await?;
 
-    crate::ops::ensure_active_local(state, auth.vm_id).await?;
+    crate::ops::ensure_active_local_for_owner(state, auth.vm_id, &auth.owner_key).await?;
 
     let supervisor = Arc::clone(&state.supervisor);
     let vm_id = auth.vm_id;
@@ -523,23 +530,7 @@ async fn attach_authorized_pty(
 /// activating it. Missing and foreign VMs return the same error.
 async fn authorize_vm_owner(state: &AppState, auth: &Authenticated) -> Result<(), OrchError> {
     let not_found = || OrchError::NotFound(format!("vm {} not found", auth.vm_id));
-    let owner_key = match local_vm_record(state, auth.vm_id) {
-        Ok(record) => record.owner_key,
-        Err(OrchError::NotFound(_)) => {
-            let Some(fleet) = state.fleet.as_ref() else {
-                return Err(not_found());
-            };
-            fleet
-                .get_vm(auth.vm_id)
-                .await
-                .map_err(|error| match error {
-                    tarit_fleet::FleetError::NotFound => not_found(),
-                    other => OrchError::Internal(format!("read fleet VM owner: {other}")),
-                })?
-                .owner_key
-        }
-        Err(error) => return Err(error),
-    };
+    let owner_key = vm_owner_key(state, auth.vm_id).await?;
     if owner_key.as_deref() != Some(auth.owner_key.as_str()) {
         tracing::warn!(
             vm_id = %auth.vm_id,
@@ -549,6 +540,27 @@ async fn authorize_vm_owner(state: &AppState, auth: &Authenticated) -> Result<()
         return Err(not_found());
     }
     Ok(())
+}
+
+async fn vm_owner_key(state: &AppState, vm_id: Uuid) -> Result<Option<String>, OrchError> {
+    let not_found = || OrchError::NotFound(format!("vm {vm_id} not found"));
+    match local_vm_record(state, vm_id) {
+        Ok(record) => Ok(record.owner_key),
+        Err(OrchError::NotFound(_)) => {
+            let Some(fleet) = state.fleet.as_ref() else {
+                return Err(not_found());
+            };
+            Ok(fleet
+                .get_vm(vm_id)
+                .await
+                .map_err(|error| match error {
+                    tarit_fleet::FleetError::NotFound => not_found(),
+                    other => OrchError::Internal(format!("read fleet VM owner: {other}")),
+                })?
+                .owner_key)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Validate an SSH channel's command and reserve the same global, tenant, and
@@ -819,8 +831,9 @@ mod tests {
                 is_active: true,
             })
             .unwrap();
-        let mut handler = GatewayHandler::new(state, None);
         let vm_id = Uuid::new_v4();
+        insert_vm_record(&state, vm_id, "test-owner");
+        let mut handler = GatewayHandler::new(state, None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1031,8 +1044,26 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let vm_id = Uuid::new_v4();
+        insert_vm_record(&state, vm_id, "tenant-a");
+        // Public keys are not secret: a later registration by another tenant
+        // must neither shadow this VM's key nor confer access to that tenant.
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert_ssh_key(&SshKeyRecord {
+                id: Uuid::new_v4(),
+                owner_key: "tenant-b".into(),
+                fingerprint: ED25519_FINGERPRINT.into(),
+                public_key: ED25519_KEY.into(),
+                key_type: "ssh-ed25519".into(),
+                created_at: Utc::now() + chrono::Duration::seconds(1),
+                is_active: true,
+            })
+            .unwrap();
         let mut handler = GatewayHandler::new(state, None);
-        let vm = Uuid::new_v4().to_string();
+        let vm = vm_id.to_string();
 
         let offered = |handler: &mut GatewayHandler, user: &str, key: &PublicKey| {
             runtime
@@ -1062,7 +1093,7 @@ mod tests {
         assert_ne!(signed(&mut handler, &other), server::Auth::Accept);
         assert!(handler.auth.is_none());
         assert_eq!(signed(&mut handler, &registered), server::Auth::Accept);
-        assert!(handler.auth.is_some());
+        assert_eq!(handler.auth.as_ref().unwrap().owner_key, "tenant-a");
     }
 
     #[test]
@@ -1137,6 +1168,7 @@ mod tests {
             rootfs_read_only: false,
             metrics_expose_tenant_labels: false,
             api_max_in_flight: 128,
+            execution_retention_hours: 24,
             max_concurrent_snapshots: 2,
             api_requests_per_second: 10_000,
             api_request_timeout_ms: 5_000,

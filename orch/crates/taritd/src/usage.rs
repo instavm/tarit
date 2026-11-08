@@ -264,14 +264,42 @@ const EXECUTION_PRUNE_BATCH: usize = 2_000;
 /// Drop finished executions (and their captured output) older than
 /// `retention_hours`; 0 keeps them forever. Runs in short batches so creates
 /// and commands are not held off the store behind one large delete.
-async fn prune_executions(state: &AppState, retention_hours: u64) {
+pub(crate) fn execution_retention_cutoff(
+    retention_hours: u64,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     if retention_hours == 0 {
-        return;
+        return None;
     }
     let hours = i64::try_from(retention_hours).unwrap_or(i64::MAX);
-    let cutoff = chrono::Duration::try_hours(hours)
-        .and_then(|age| Utc::now().checked_sub_signed(age))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    Some(
+        chrono::Duration::try_hours(hours)
+            .and_then(|age| now.checked_sub_signed(age))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC),
+    )
+}
+
+pub(crate) async fn prune_executions(state: &AppState, retention_hours: u64) {
+    let Some(cutoff) = execution_retention_cutoff(retention_hours, Utc::now()) else {
+        return;
+    };
+    // Independently prune both durable stores. A failed fleet pass must not
+    // prevent local eviction; polling also enforces expiry before rehydration.
+    if let Some(fleet) = &state.fleet {
+        loop {
+            match fleet
+                .prune_finished_executions(cutoff, EXECUTION_PRUNE_BATCH)
+                .await
+            {
+                Ok(deleted) if deleted == EXECUTION_PRUNE_BATCH => tokio::task::yield_now().await,
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "fleet execution record prune failed");
+                    break;
+                }
+            }
+        }
+    }
     let mut total = 0usize;
     loop {
         let deleted = match state.store.lock() {
@@ -291,6 +319,11 @@ async fn prune_executions(state: &AppState, retention_hours: u64) {
             }
         }
         tokio::task::yield_now().await;
+    }
+    // SQLite and the polling cache have the same retention boundary. Prune
+    // even when SQLite deleted zero rows (e.g. an earlier cleanup already ran).
+    if let Ok(mut cache) = state.exec_cache.write() {
+        cache.retain(|_, record| !record.is_expired(cutoff));
     }
     if total > 0 {
         tracing::info!(

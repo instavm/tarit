@@ -773,7 +773,13 @@ async fn ensure_local_vm_for_pty(
         Owner::Local => {
             let vm = ops::get_local(state, vm_id)?;
             ensure_vm_access(identity, &vm)?;
-            ops::ensure_active_local(state, vm_id).await?;
+            if let Some(owner_key) = vm.owner_key.as_deref() {
+                ops::ensure_active_local_for_owner(state, vm_id, owner_key).await?;
+            } else {
+                // Only admins can authorize an unowned legacy VM. Preserve
+                // that access without treating the admin's tenant as its owner.
+                ops::ensure_active_local(state, vm_id).await?;
+            }
             Ok(())
         }
         // TODO: proxy the WebSocket to the peer returned here once the internal
@@ -922,6 +928,55 @@ enum BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_activation_preserves_admin_access_and_rechecks_owner_after_waiting() {
+        let state = crate::api::tests::test_state();
+        let id = Uuid::new_v4();
+        crate::api::tests::insert_vm(&state, id, "tenant-a", tarit_types::VmStatus::Running);
+        let admin = state.config.api_keys.resolve("admin-key").unwrap();
+        let tenant = state.config.api_keys.resolve("tenant-a-key").unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // Admin identity's tenant differs from the authorized VM's owner.
+                ensure_local_vm_for_pty(&state, id, &admin).await.unwrap();
+                let gate = state
+                    .activation_gates
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .unwrap()
+                    .clone();
+                let held = gate.lock_owned().await;
+                let activation = ensure_local_vm_for_pty(&state, id, &tenant);
+                tokio::pin!(activation);
+                assert!(futures_util::poll!(&mut activation).is_pending());
+                {
+                    let mut cache = state.vm_cache.write().unwrap();
+                    let vm = cache.get_mut(&id).unwrap();
+                    vm.owner_key = Some("tenant-b".into());
+                    vm.status = tarit_types::VmStatus::Hibernated;
+                }
+                drop(held);
+                assert!(matches!(activation.await, Err(OrchError::NotFound(_))));
+                assert!(state.lifecycle.lock().unwrap().is_empty());
+                // Only an admin may activate a legacy VM with no owner binding.
+                {
+                    let mut cache = state.vm_cache.write().unwrap();
+                    let vm = cache.get_mut(&id).unwrap();
+                    vm.owner_key = None;
+                    vm.status = tarit_types::VmStatus::Running;
+                }
+                ensure_local_vm_for_pty(&state, id, &admin).await.unwrap();
+                assert!(matches!(
+                    ensure_local_vm_for_pty(&state, id, &tenant).await,
+                    Err(OrchError::Forbidden(_))
+                ));
+            });
+    }
     use crate::config::ApiRole;
 
     fn test_identity() -> ApiIdentity {

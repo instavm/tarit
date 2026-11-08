@@ -81,6 +81,39 @@ impl ShareRepository {
         store.insert_share(share).map_err(map_store_error)
     }
 
+    pub async fn insert_for_vm(&self, share: &ShareRecord, vm: &VmRecord) -> Result<(), OrchError> {
+        if let Some(fleet) = &self.fleet {
+            return fleet
+                .insert_share_for_vm(share, vm)
+                .await
+                .map_err(map_fleet_error);
+        }
+        self.local
+            .lock()
+            .map_err(|_| OrchError::Internal("share store lock".into()))?
+            .insert_share_for_vm(share, vm)
+            .map_err(map_store_error)
+    }
+
+    pub async fn update_for_vm_if_current(
+        &self,
+        share: &ShareRecord,
+        expected_token_version: u64,
+        vm: &VmRecord,
+    ) -> Result<(), OrchError> {
+        if let Some(fleet) = &self.fleet {
+            return fleet
+                .update_share_for_vm_if_current(share, expected_token_version, vm)
+                .await
+                .map_err(map_fleet_error);
+        }
+        self.local
+            .lock()
+            .map_err(|_| OrchError::Internal("share store lock".into()))?
+            .update_share_for_vm_if_current(share, expected_token_version, vm)
+            .map_err(map_store_error)
+    }
+
     pub async fn update(&self, share: &ShareRecord) -> Result<(), OrchError> {
         if let Some(fleet) = &self.fleet {
             return fleet.update_share(share).await.map_err(map_fleet_error);
@@ -143,7 +176,7 @@ fn map_fleet_error(error: FleetError) -> OrchError {
 async fn insert_with_generated_slug<F>(
     repository: &ShareRepository,
     owner_key: &str,
-    vm_id: Uuid,
+    vm: &VmRecord,
     guest_port: u16,
     visibility: ShareVisibility,
     now: DateTime<Utc>,
@@ -157,7 +190,7 @@ where
             id: Uuid::new_v4(),
             slug: next_slug(),
             owner_key: owner_key.into(),
-            vm_id,
+            vm_id: vm.id,
             guest_port,
             visibility,
             token_version: 0,
@@ -165,9 +198,13 @@ where
             created_at: now,
             updated_at: now,
         };
-        match repository.insert(&share).await {
+        match repository.insert_for_vm(&share, vm).await {
             Ok(()) => return Ok(share),
-            Err(OrchError::Conflict(_)) => continue,
+            Err(OrchError::Conflict(message))
+                if message != "share target VM changed or is not running" =>
+            {
+                continue
+            }
             Err(error) => return Err(error),
         }
     }
@@ -310,7 +347,7 @@ async fn create_for_vm(
     insert_with_generated_slug(
         repository,
         owner_key,
-        vm.id,
+        vm,
         request.guest_port,
         request.visibility,
         Utc::now(),
@@ -346,9 +383,15 @@ async fn update_for_share(
     }
     let updated = apply_update(&share, &request, now)?;
     if updated.token_version != share.token_version {
-        repository
-            .update_if_current(&updated, share.token_version)
-            .await?;
+        if let Some(vm) = replacement_vm {
+            repository
+                .update_for_vm_if_current(&updated, share.token_version, vm)
+                .await?;
+        } else {
+            repository
+                .update_if_current(&updated, share.token_version)
+                .await?;
+        }
     }
     Ok(updated)
 }
@@ -783,11 +826,13 @@ mod tests {
         let repository =
             ShareRepository::new(Arc::new(Mutex::new(Store::open(":memory:").unwrap())), None);
         repository.insert(&test_private_share(0)).await.unwrap();
+        let vm = test_vm("tenant-a", VmStatus::Running);
+        repository.local.lock().unwrap().insert_vm(&vm).unwrap();
         let mut attempts = 0;
         let created = insert_with_generated_slug(
             &repository,
             "tenant-a",
-            Uuid::new_v4(),
+            &vm,
             8081,
             ShareVisibility::Private,
             Utc::now(),
@@ -809,7 +854,7 @@ mod tests {
         let exhausted = insert_with_generated_slug(
             &repository,
             "tenant-a",
-            Uuid::new_v4(),
+            &vm,
             8082,
             ShareVisibility::Private,
             Utc::now(),
@@ -837,6 +882,7 @@ mod tests {
             api_key_id: "admin-key".into(),
         };
         let vm = test_vm("tenant-a", VmStatus::Running);
+        repository.local.lock().unwrap().insert_vm(&vm).unwrap();
 
         let share = create_for_vm(
             &repository,
@@ -919,6 +965,7 @@ mod tests {
             ..identity.clone()
         };
         let vm = test_vm("tenant-a", VmStatus::Running);
+        repository.local.lock().unwrap().insert_vm(&vm).unwrap();
         let request = CreateShareRequest {
             vm_id: vm.id,
             guest_port: 8080,

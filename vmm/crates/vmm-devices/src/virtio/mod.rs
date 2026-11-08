@@ -20,6 +20,7 @@ pub mod transport;
 pub mod vqueue;
 pub mod vsock;
 pub mod vsock_io_loop;
+#[cfg(any(target_os = "linux", test))]
 pub mod worker_startup;
 
 pub use balloon::VirtioBalloonMmio;
