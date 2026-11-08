@@ -2,8 +2,9 @@
 //!
 //! KVM routes queue-0 notifications to an eventfd owned by this thread. Host
 //! storage latency therefore cannot stall the vCPU/MMIO dispatch path. Before
-//! snapshot capture, the worker drains the queue and parks so neither device
-//! state nor guest memory can change while it is serialized.
+//! snapshot capture, the worker finishes its current bounded pass and parks.
+//! Queued requests remain in guest memory with snapshot-persisted cursors;
+//! resume and startup inspect them even without another guest notification.
 
 #![cfg(target_os = "linux")]
 
@@ -50,8 +51,9 @@ impl BlkIoLoop {
         }
     }
 
-    /// Drain all work published by stopped vCPUs, then park without touching
-    /// guest memory or device state until resumed.
+    /// Finish the current bounded pass, then park without touching guest
+    /// memory or device state. Unconsumed descriptors remain snapshot-visible.
+    /// A single blocking host storage operation can still exceed the timeout.
     pub fn pause(&self) -> io::Result<()> {
         if self.thread_gone() {
             self.fail_if_unexpected_exit();
@@ -223,20 +225,31 @@ fn run(
     kick_fd: RawFd,
     wake_fd: RawFd,
 ) {
+    run_queue(stop, pause_req, pause_ack, kick_fd, wake_fd, || {
+        device.process_queue_pass()
+    });
+}
+
+fn run_queue<F>(
+    stop: Arc<AtomicBool>,
+    pause_req: Arc<AtomicBool>,
+    pause_ack: Arc<AtomicBool>,
+    kick_fd: RawFd,
+    wake_fd: RawFd,
+    mut process: F,
+) where
+    F: FnMut() -> Result<bool, crate::bus::MmioError>,
+{
+    // Eventfd counters are host-only state and are not in a snapshot. Always
+    // inspect the queue on startup, after resume, and after a budget yield.
+    let mut pending = true;
     while !stop.load(Ordering::Relaxed) {
         if pause_req.load(Ordering::SeqCst) {
-            // Eventfd counters are host-only state. Always inspect the queue
-            // after draining the counter so a kick racing with quiescence can
-            // never disappear from a restored VM.
-            drain_eventfd(kick_fd, "queue kick");
-            if let Err(error) = device.process_queue(0) {
-                log::error!("block I/O worker: queue drain before pause failed: {error}");
-                break;
-            }
             pause_ack.store(true, Ordering::SeqCst);
             while pause_req.load(Ordering::SeqCst) && !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(PAUSE_POLL);
             }
+            pending = true;
             pause_ack.store(false, Ordering::SeqCst);
             continue;
         }
@@ -258,7 +271,7 @@ fn run(
             libc::poll(
                 pollfds.as_mut_ptr(),
                 pollfds.len() as libc::nfds_t,
-                POLL_TIMEOUT_MS,
+                if pending { 0 } else { POLL_TIMEOUT_MS },
             )
         };
         if ready < 0 {
@@ -275,11 +288,17 @@ fn run(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if ready == 0 || pollfds[0].revents != 0 {
+        if pause_req.load(Ordering::SeqCst) {
+            continue;
+        }
+        if pending || ready == 0 || pollfds[0].revents != 0 {
             drain_eventfd(kick_fd, "queue kick");
-            if let Err(error) = device.process_queue(0) {
-                log::error!("block I/O worker: device failure: {error}");
-                break;
+            match process() {
+                Ok(more) => pending = more,
+                Err(error) => {
+                    log::error!("block I/O worker: device failure: {error}");
+                    break;
+                }
             }
         }
     }
@@ -318,6 +337,137 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("descriptor is invalid"));
         assert!(message.contains(&io::Error::from_raw_os_error(libc::EBADF).to_string()));
+    }
+
+    #[test]
+    fn continuous_refill_yields_to_pause_and_resumes_without_a_new_kick() {
+        use super::super::vqueue::{
+            AvailRing, Descriptor, QueueConfig, QueueWorkBudget, VirtQueueProcessor,
+        };
+        use std::sync::atomic::AtomicUsize;
+        use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+        let mem = Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_000)]).unwrap());
+        for slot in 0..8u64 {
+            mem.write_obj(
+                Descriptor {
+                    addr: 0x4000,
+                    len: 1,
+                    flags: 0,
+                    next: 0,
+                },
+                GuestAddress(0x1000 + slot * 16),
+            )
+            .unwrap();
+            mem.write_obj(slot as u16, GuestAddress(0x2000 + 4 + slot * 2))
+                .unwrap();
+        }
+        mem.write_obj(AvailRing { flags: 0, idx: 1 }, GuestAddress(0x2000))
+            .unwrap();
+        let mut queue = VirtQueueProcessor::new(QueueConfig {
+            size: 8,
+            desc_table_addr: 0x1000,
+            avail_ring_addr: 0x2000,
+            used_ring_addr: 0x3000,
+            ready: true,
+        });
+        queue.set_event_idx(true);
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let wake_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let kick_fd = kick.as_raw_fd();
+        let wake_fd = wake_evt.as_raw_fd();
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause_req = Arc::new(AtomicBool::new(false));
+        let pause_ack = Arc::new(AtomicBool::new(false));
+        let refill = Arc::new(AtomicBool::new(true));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resumed_tx, resumed_rx) = std::sync::mpsc::channel();
+        let handle = {
+            let (stop, pause_req, pause_ack, refill, completed, mem) = (
+                stop.clone(),
+                pause_req.clone(),
+                pause_ack.clone(),
+                refill.clone(),
+                completed.clone(),
+                mem.clone(),
+            );
+            std::thread::spawn(move || {
+                let stop_during_io = stop.clone();
+                let pause_during_io = pause_req.clone();
+                let mut published = 1u16;
+                run_queue(stop, pause_req, pause_ack, kick_fd, wake_fd, || {
+                    let result = queue.process_queue_chains_dirty(
+                        &mem,
+                        None,
+                        Some(QueueWorkBudget {
+                            max_chains: 32,
+                            max_bytes: u64::MAX,
+                            max_duration: std::time::Duration::from_secs(60),
+                        }),
+                        |_| {
+                            if completed.load(Ordering::SeqCst) == 64 {
+                                // Three passes must run with no kick. Hold a
+                                // request until pause is pending, then keep the
+                                // queue continuously nonempty through this pass.
+                                entered_tx.send(()).unwrap();
+                                while !pause_during_io.load(Ordering::SeqCst)
+                                    && !stop_during_io.load(Ordering::SeqCst)
+                                {
+                                    std::thread::yield_now();
+                                }
+                            }
+                            if refill.load(Ordering::SeqCst)
+                                && !stop_during_io.load(Ordering::SeqCst)
+                            {
+                                published = published.wrapping_add(1);
+                                mem.write_obj(published, GuestAddress(0x2002)).unwrap();
+                            }
+                            completed.fetch_add(1, Ordering::SeqCst);
+                            Some((0, 0))
+                        },
+                    );
+                    if !refill.load(Ordering::SeqCst) && result.processed > 0 {
+                        resumed_tx.send(queue.used_idx()).unwrap();
+                    }
+                    Ok(result.budget_exhausted)
+                });
+            })
+        };
+        let mut worker = BlkIoLoop {
+            stop,
+            pause_req,
+            pause_ack,
+            wake_evt,
+            handle: Some(handle),
+            startup: None,
+            device: Arc::new(VirtioBlkMmio::new_stub(5, 2)),
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("queue did not self-reschedule");
+        worker
+            .pause()
+            .expect("continuously refilled queue must yield to pause");
+        assert_eq!(completed.load(Ordering::SeqCst), 96);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x3002)).unwrap(), 96);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(0x2002)).unwrap(), 97);
+        assert_eq!(
+            mem.read_obj::<u16>(GuestAddress(0x3000 + 4 + 8 * 8))
+                .unwrap(),
+            96
+        );
+        refill.store(false, Ordering::SeqCst);
+        worker.resume().unwrap();
+        assert_eq!(
+            resumed_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            97
+        );
+        worker.pause().unwrap();
+        assert_eq!(completed.load(Ordering::SeqCst), 97);
+        worker.stop();
     }
 
     #[test]
