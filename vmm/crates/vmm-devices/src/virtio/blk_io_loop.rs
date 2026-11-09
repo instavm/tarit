@@ -5,6 +5,12 @@
 //! snapshot capture, the worker finishes its current bounded pass and parks.
 //! Queued requests remain in guest memory with snapshot-persisted cursors;
 //! resume and startup inspect them even without another guest notification.
+//!
+//! A guest FLUSH is served between passes, holding no device state, and can
+//! take seconds on a busy NBD-backed disk. Pause does not wait for it: the
+//! FLUSH stays unconsumed on the avail ring until the flush has finished and
+//! the worker is running again, so a snapshot captures it as pending and the
+//! restored VM serves it again.
 
 #![cfg(target_os = "linux")]
 
@@ -26,6 +32,10 @@ pub struct BlkIoLoop {
     stop: Arc<AtomicBool>,
     pause_req: Arc<AtomicBool>,
     pause_ack: Arc<AtomicBool>,
+    /// Set while the worker waits on a host flush (see the module docs). It
+    /// touches no device state or guest memory then, and checks for a pause
+    /// before it does again, so it counts as parked.
+    in_host_flush: Arc<AtomicBool>,
     wake_evt: EventFd,
     handle: Option<JoinHandle<()>>,
     startup: Option<super::worker_startup::PendingStartup>,
@@ -53,7 +63,8 @@ impl BlkIoLoop {
 
     /// Finish the current bounded pass, then park without touching guest
     /// memory or device state. Unconsumed descriptors remain snapshot-visible.
-    /// A single blocking host storage operation can still exceed the timeout.
+    /// A host flush in progress does not delay it. A single blocking host read
+    /// or write can still exceed the timeout.
     pub fn pause(&self) -> io::Result<()> {
         if self.thread_gone() {
             self.fail_if_unexpected_exit();
@@ -65,7 +76,10 @@ impl BlkIoLoop {
         self.pause_req.store(true, Ordering::SeqCst);
         self.wake_evt.write(1)?;
         let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
-        while !self.pause_ack.load(Ordering::SeqCst) {
+        // Both flags are SeqCst, as are the worker's clear of `in_host_flush`
+        // and its next read of `pause_req`: if this sees the flush still in
+        // progress, the worker sees this pause when the flush ends.
+        while !self.pause_ack.load(Ordering::SeqCst) && !self.in_host_flush.load(Ordering::SeqCst) {
             if self.thread_gone() {
                 self.fail_if_unexpected_exit();
                 self.pause_req.store(false, Ordering::SeqCst);
@@ -168,11 +182,13 @@ pub fn start_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Resu
     let stop = Arc::new(AtomicBool::new(false));
     let pause_req = Arc::new(AtomicBool::new(false));
     let pause_ack = Arc::new(AtomicBool::new(false));
+    let in_host_flush = Arc::new(AtomicBool::new(false));
     let wake_evt = EventFd::new(libc::EFD_NONBLOCK)?;
 
     let stop_t = Arc::clone(&stop);
     let pause_req_t = Arc::clone(&pause_req);
     let pause_ack_t = Arc::clone(&pause_ack);
+    let in_host_flush_t = Arc::clone(&in_host_flush);
     let device_t = Arc::clone(&device);
     let health_device = Arc::clone(&device);
     let wake_fd = wake_evt.as_raw_fd();
@@ -191,7 +207,15 @@ pub fn start_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Resu
             }
             let stop_health = Arc::clone(&stop_t);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run(stop_t, pause_req_t, pause_ack_t, device_t, kick_fd, wake_fd);
+                run(
+                    stop_t,
+                    pause_req_t,
+                    pause_ack_t,
+                    in_host_flush_t,
+                    device_t,
+                    kick_fd,
+                    wake_fd,
+                );
             }));
             if !stop_health.load(Ordering::SeqCst) {
                 let context = if outcome.is_err() {
@@ -207,6 +231,7 @@ pub fn start_blk_io_loop(device: Arc<VirtioBlkMmio>, kick_fd: RawFd) -> io::Resu
         stop,
         pause_req,
         pause_ack,
+        in_host_flush,
         wake_evt,
         handle: Some(handle),
         startup: Some(super::worker_startup::PendingStartup::new(
@@ -221,12 +246,53 @@ fn run(
     stop: Arc<AtomicBool>,
     pause_req: Arc<AtomicBool>,
     pause_ack: Arc<AtomicBool>,
+    in_host_flush: Arc<AtomicBool>,
     device: Arc<VirtioBlkMmio>,
     kick_fd: RawFd,
     wake_fd: RawFd,
 ) {
+    serve_queue(
+        stop,
+        pause_req,
+        pause_ack,
+        &in_host_flush,
+        kick_fd,
+        wake_fd,
+        || device.process_queue_pass(),
+        || device.host_flush_wanted(),
+        || device.service_host_flush(),
+    );
+}
+
+/// [`run_queue`] for passes that may stop at a guest FLUSH. The host flush
+/// runs between passes with `in_host_flush` set, so a pause need not wait
+/// for it. Once it returns the worker reaches its pause check before the
+/// next pass, which completes the FLUSH.
+#[allow(clippy::too_many_arguments)]
+fn serve_queue<P, W, F>(
+    stop: Arc<AtomicBool>,
+    pause_req: Arc<AtomicBool>,
+    pause_ack: Arc<AtomicBool>,
+    in_host_flush: &AtomicBool,
+    kick_fd: RawFd,
+    wake_fd: RawFd,
+    mut pass: P,
+    mut flush_wanted: W,
+    mut host_flush: F,
+) where
+    P: FnMut() -> Result<bool, crate::bus::MmioError>,
+    W: FnMut() -> bool,
+    F: FnMut() -> Result<(), crate::bus::MmioError>,
+{
     run_queue(stop, pause_req, pause_ack, kick_fd, wake_fd, || {
-        device.process_queue_pass()
+        let more = pass()?;
+        if !flush_wanted() {
+            return Ok(more);
+        }
+        in_host_flush.store(true, Ordering::SeqCst);
+        let flushed = host_flush();
+        in_host_flush.store(false, Ordering::SeqCst);
+        flushed.map(|()| true)
     });
 }
 
@@ -438,6 +504,7 @@ mod tests {
             stop,
             pause_req,
             pause_ack,
+            in_host_flush: Arc::new(AtomicBool::new(false)),
             wake_evt,
             handle: Some(handle),
             startup: None,
@@ -467,6 +534,99 @@ mod tests {
         );
         worker.pause().unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), 97);
+        worker.stop();
+    }
+
+    #[test]
+    fn pause_does_not_wait_for_a_host_flush_and_the_worker_parks_after_it() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+
+        let kick = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let wake_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let (kick_fd, wake_fd) = (kick.as_raw_fd(), wake_evt.as_raw_fd());
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause_req = Arc::new(AtomicBool::new(false));
+        let pause_ack = Arc::new(AtomicBool::new(false));
+        let in_host_flush = Arc::new(AtomicBool::new(false));
+        // The first pass stops at a FLUSH; its host flush blocks until the
+        // test releases it, as a flush of a busy NBD device does.
+        let wanted = Arc::new(AtomicBool::new(false));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = {
+            let (stop, pause_req, pause_ack, in_host_flush, wanted, passes) = (
+                stop.clone(),
+                pause_req.clone(),
+                pause_ack.clone(),
+                in_host_flush.clone(),
+                wanted.clone(),
+                passes.clone(),
+            );
+            std::thread::spawn(move || {
+                let flush_wanted = wanted.clone();
+                serve_queue(
+                    stop,
+                    pause_req,
+                    pause_ack,
+                    &in_host_flush,
+                    kick_fd,
+                    wake_fd,
+                    || {
+                        if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                            wanted.store(true, Ordering::SeqCst);
+                        }
+                        Ok(false)
+                    },
+                    || flush_wanted.load(Ordering::SeqCst),
+                    || {
+                        flush_wanted.store(false, Ordering::SeqCst);
+                        entered_tx.send(()).unwrap();
+                        let _ = release_rx.recv();
+                        Ok(())
+                    },
+                );
+            })
+        };
+        let mut worker = BlkIoLoop {
+            stop,
+            pause_req,
+            pause_ack: pause_ack.clone(),
+            in_host_flush,
+            wake_evt,
+            handle: Some(handle),
+            startup: None,
+            device: Arc::new(VirtioBlkMmio::new_stub(5, 2)),
+        };
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker never started the host flush");
+        let started = std::time::Instant::now();
+        worker
+            .pause()
+            .expect("a host flush in progress must not block the pause");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let passes_at_pause = passes.load(Ordering::SeqCst);
+
+        // The flush ends during the pause: the worker parks without another
+        // pass, so it cannot complete the FLUSH into a snapshot being taken.
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pause_ack.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < deadline, "worker did not park");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(passes.load(Ordering::SeqCst), passes_at_pause);
+
+        // Resumed, it completes the FLUSH without another guest kick.
+        worker.resume().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while passes.load(Ordering::SeqCst) == passes_at_pause {
+            assert!(std::time::Instant::now() < deadline, "no pass after resume");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         worker.stop();
     }
 

@@ -10,6 +10,20 @@ versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A guest FLUSH no longer blocks a pause or snapshot. On a disk backed by
+  an NBD device, a FLUSH writes every page the host has buffered for it to
+  storage, which under heavy guest writes takes seconds; the block worker
+  served it with the queue held, so a pause that arrived meanwhile ran out
+  of its 5 s budget and the suspend or clone failed (8 of 20 pauses on an
+  Azure host with a guest writing 200 MB/s). The worker now runs the host
+  flush between passes, holding no queue state, and a pause proceeds at
+  once. The FLUSH stays on the avail ring until the flush has finished and
+  the worker runs again, so a snapshot taken in between records it as
+  pending and the restored VM serves it again. The same benchmark: 0 of 20
+  refused, 19 pauses in about 1 ms.
+
 ## [0.2.0] - 2026-11-08
 
 ### Added

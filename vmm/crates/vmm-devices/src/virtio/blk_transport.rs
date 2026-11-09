@@ -105,6 +105,33 @@ impl QueueState {
     }
 }
 
+/// A guest FLUSH that the block worker serves outside the device locks.
+///
+/// On an NBD-backed disk a flush sends every page the host buffered down to
+/// storage and can take seconds under heavy writes. The request stays on the
+/// avail ring, unconsumed, until a host flush that started after it was seen
+/// has finished: a snapshot taken in the meantime captures it as not yet
+/// served, and the restored VM serves it again.
+#[derive(Debug, Default)]
+struct HostFlush {
+    /// Avail-ring position of the FLUSH waiting for a host flush.
+    wanted: Option<u16>,
+    /// The host flush for the FLUSH at this position finished, with this
+    /// status for the guest.
+    done: Option<(u16, u8)>,
+    /// Bumped by a device reset or restore, so a host flush that was running
+    /// across one cannot complete a different request at the same position.
+    epoch: u64,
+}
+
+impl HostFlush {
+    fn forget(&mut self) {
+        self.wanted = None;
+        self.done = None;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+}
+
 /// Snapshot state for virtio-blk MMIO negotiation and queue configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct VirtioBlkMmioState {
@@ -151,6 +178,9 @@ pub struct VirtioBlkMmio {
     processor: Mutex<Option<VirtQueueProcessor>>,
     /// Optional per-device token bucket for IOPS and bandwidth caps.
     rate_limiter: Mutex<Option<RateLimiter>>,
+    /// The block worker's FLUSH in progress, if any. Host-only: never in a
+    /// snapshot (the request itself stays on the avail ring).
+    host_flush: Mutex<HostFlush>,
     /// Interrupt status (set when device raises an interrupt).
     interrupt_status: AtomicU32,
     /// IRQ EventFd — written to when the device needs to interrupt the guest.
@@ -265,6 +295,7 @@ impl VirtioBlkMmio {
         self.host_dirty.clear_poison();
         self.processor.clear_poison();
         self.rate_limiter.clear_poison();
+        self.host_flush.clear_poison();
         #[cfg(target_os = "linux")]
         self.irq_evt.clear_poison();
         self.status.store(0, Ordering::SeqCst);
@@ -279,6 +310,7 @@ impl VirtioBlkMmio {
             *q = QueueState::default();
         }
         *self.lock_state(&self.processor, "processor") = None;
+        self.lock_state(&self.host_flush, "host_flush").forget();
     }
 
     fn lock_state<'a, T>(
@@ -317,6 +349,7 @@ impl VirtioBlkMmio {
             activated: AtomicBool::new(false),
             processor: Mutex::new(None),
             rate_limiter: Mutex::new(None),
+            host_flush: Mutex::new(HostFlush::default()),
             interrupt_status: AtomicU32::new(0),
             #[cfg(target_os = "linux")]
             irq_evt: Mutex::new(None),
@@ -347,6 +380,7 @@ impl VirtioBlkMmio {
             activated: AtomicBool::new(false),
             processor: Mutex::new(None),
             rate_limiter: Mutex::new(None),
+            host_flush: Mutex::new(HostFlush::default()),
             interrupt_status: AtomicU32::new(0),
             #[cfg(target_os = "linux")]
             irq_evt: Mutex::new(None),
@@ -618,6 +652,51 @@ impl VirtioBlkMmio {
         }))
     }
 
+    /// Whether the last pass stopped at a guest FLUSH that waits for
+    /// [`Self::service_host_flush`].
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn host_flush_wanted(&self) -> bool {
+        self.lock_state(&self.host_flush, "host_flush")
+            .wanted
+            .is_some()
+    }
+
+    /// Flush the backing store for the FLUSH the last pass stopped at.
+    ///
+    /// Holds no queue or processor lock and writes no guest memory, so the
+    /// device state stays capturable while the host flush runs: the request
+    /// is still on the avail ring, and the next pass completes it with this
+    /// flush's status. A snapshot taken meanwhile serves it again on restore.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn service_host_flush(&self) -> MmioWriteResult {
+        let (at, epoch) = {
+            let mut flush = self.try_lock_state(&self.host_flush, "host_flush")?;
+            match flush.wanted.take() {
+                Some(at) => (at, flush.epoch),
+                None => return Ok(()),
+            }
+        };
+        let st = {
+            let mut backend = self.try_lock_state(&self.backend, "backend")?;
+            match backend.as_mut() {
+                Some(backend) => backend.service(
+                    &BlkReqHeader {
+                        req_type: req_type::FLUSH,
+                        reserved: 0,
+                        sector: 0,
+                    },
+                    &mut [],
+                ),
+                None => status::IO_ERR,
+            }
+        };
+        let mut flush = self.try_lock_state(&self.host_flush, "host_flush")?;
+        if flush.epoch == epoch {
+            flush.done = Some((at, st));
+        }
+        Ok(())
+    }
+
     fn process_queue_inner(
         &self,
         budget: Option<crate::virtio::vqueue::QueueWorkBudget>,
@@ -729,6 +808,38 @@ impl VirtioBlkMmio {
                 }
                 let header = header.unwrap();
                 let request_bytes = request_bytes.unwrap();
+                // The block worker (a budgeted pass) serves FLUSH outside the
+                // device locks; see `HostFlush`. The synchronous fallback
+                // flushes inline below.
+                if header.req_type == req_type::FLUSH && budget.is_some() {
+                    let mut flush = match self.try_lock_state(&self.host_flush, "host_flush") {
+                        Ok(flush) => flush,
+                        Err(_) => {
+                            processing_failed = true;
+                            return None;
+                        }
+                    };
+                    match flush.done.take() {
+                        Some((at, st)) if at == chain.avail_idx => {
+                            // Charged when first seen, below.
+                            return Some((
+                                Self::write_status(&mem, dirty.as_ref(), writable, st),
+                                0,
+                            ));
+                        }
+                        _ => {}
+                    }
+                    match self.rate_limit_allows(0) {
+                        Ok(true) => {}
+                        Ok(false) => return None,
+                        Err(_) => {
+                            processing_failed = true;
+                            return None;
+                        }
+                    }
+                    flush.wanted = Some(chain.avail_idx);
+                    return None;
+                }
                 match self.rate_limit_allows(request_bytes) {
                     Ok(true) => {}
                     Ok(false) => return None,
@@ -851,6 +962,7 @@ impl Persist for VirtioBlkMmio {
         *self.lock_state(&self.processor, "processor") = state
             .processor
             .map(|p| VirtQueueProcessor::from_state(config, p));
+        self.lock_state(&self.host_flush, "host_flush").forget();
     }
 }
 
@@ -888,6 +1000,7 @@ impl Persist for std::sync::Arc<VirtioBlkMmio> {
         *self.lock_state(&self.processor, "processor") = state
             .processor
             .map(|p| VirtQueueProcessor::from_state(config, p));
+        self.lock_state(&self.host_flush, "host_flush").forget();
     }
 }
 
@@ -2043,6 +2156,138 @@ mod tests {
         assert!(dirty.snapshot().dirty_pfns().contains(&(TEST_USED / 4096)));
         assert!(!restored.process_queue_pass().unwrap());
         assert_eq!(used_idx(&restored_mem), 3);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Turn request `index` of [`setup_blk_out_requests`] into a FLUSH: its
+    /// header descriptor links straight to its status descriptor.
+    fn make_flush_request(mem: &GuestMemoryMmap, index: u16) {
+        let head = index * 3;
+        mem.write_obj(
+            BlkReqHeader {
+                req_type: req_type::FLUSH,
+                reserved: 0,
+                sector: 0,
+            },
+            GuestAddress(TEST_HEADER_BASE + u64::from(index) * 0x100),
+        )
+        .unwrap();
+        mem.write_obj(
+            head + 2,
+            GuestAddress(TEST_DESC + u64::from(head) * 16 + 14),
+        )
+        .unwrap();
+    }
+
+    fn request_status(mem: &GuestMemoryMmap, index: u64) -> u8 {
+        mem.read_obj(GuestAddress(TEST_STATUS_BASE + index * 0x100))
+            .unwrap()
+    }
+
+    #[test]
+    fn worker_flush_stays_on_the_ring_until_its_host_flush_finishes() {
+        let (backend, path) = new_test_backend("blk-host-flush");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        // A write, a FLUSH, then another write.
+        setup_blk_out_requests(&mem, 3);
+        make_flush_request(&mem, 1);
+
+        // The worker's pass completes the first write and stops at the
+        // FLUSH instead of flushing the backing store with the queue held.
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 1);
+        assert!(dev.host_flush_wanted());
+
+        // While the host flush runs the FLUSH is still the driver's: a
+        // snapshot holds it unconsumed, with its status untouched.
+        let state = dev.save();
+        assert_eq!(state.processor.as_ref().unwrap().last_avail_idx, 1);
+        assert_eq!(state.processor.as_ref().unwrap().last_used_idx, 1);
+        assert_eq!(request_status(&mem, 1), 0xff);
+
+        // The restored VM serves it again, on its own backing store.
+        let restored_mem = new_test_mem();
+        let mut ram = vec![0; 4 * 1024 * 1024];
+        mem.read_slice(&mut ram, GuestAddress(0)).unwrap();
+        restored_mem.write_slice(&ram, GuestAddress(0)).unwrap();
+        let mut restored = VirtioBlkMmio::new(5, BlkBackend::open(&path, false).unwrap());
+        restored.restore(state);
+        restored.set_guest_memory(restored_mem.clone());
+        assert!(!restored.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&restored_mem), 1);
+        assert!(restored.host_flush_wanted());
+        restored.service_host_flush().unwrap();
+        assert!(!restored.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&restored_mem), 3);
+        for request in 0..3 {
+            assert_eq!(request_status(&restored_mem, request), status::OK);
+        }
+
+        // The source completes it once its own host flush is done, and only
+        // then moves on to the write behind it.
+        dev.service_host_flush().unwrap();
+        assert!(!dev.host_flush_wanted());
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 3);
+        assert_eq!(request_status(&mem, 1), status::OK);
+        assert_eq!(request_status(&mem, 2), status::OK);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_host_flush_that_outlives_a_reset_completes_nothing() {
+        let (backend, path) = new_test_backend("blk-host-flush-reset");
+        let mem = new_test_mem();
+        let dev = Arc::new(VirtioBlkMmio::new(5, backend));
+        configure_test_blk_queue(&dev, mem.clone());
+        setup_blk_out_requests(&mem, 1);
+        make_flush_request(&mem, 0);
+        assert!(!dev.process_queue_pass().unwrap());
+        assert!(dev.host_flush_wanted());
+
+        // Hold the backing store so the host flush is still running when the
+        // driver resets the device.
+        let backing = dev.backend.lock().unwrap();
+        let flusher = {
+            let dev = Arc::clone(&dev);
+            std::thread::spawn(move || dev.service_host_flush().unwrap())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while dev.host_flush_wanted() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host flush never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        dev.mmio_write(reg::STATUS, 0, 4).unwrap();
+        drop(backing);
+        flusher.join().unwrap();
+
+        // The driver sets the queue up again. Its FLUSH at the same position
+        // is a new request and waits for a host flush of its own.
+        configure_test_blk_queue(&dev, mem.clone());
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 0);
+        assert_eq!(request_status(&mem, 0), 0xff);
+        assert!(dev.host_flush_wanted());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn synchronous_queue_processing_still_flushes_inline() {
+        let (backend, path) = new_test_backend("blk-inline-flush");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        setup_blk_out_requests(&mem, 2);
+        make_flush_request(&mem, 0);
+        dev.process_queue(0).unwrap();
+        assert_eq!(used_idx(&mem), 2);
+        assert_eq!(request_status(&mem, 0), status::OK);
+        assert!(!dev.host_flush_wanted());
         std::fs::remove_file(path).unwrap();
     }
 
