@@ -223,6 +223,10 @@ struct DescriptorChain {
 
 /// A validated descriptor list, without reading its payloads.
 pub(crate) struct Chain<'a> {
+    /// The avail-ring position this chain was read from. It stays the same
+    /// on every pass until the chain is used, so a device that leaves a
+    /// chain in flight can recognise it on a later pass.
+    pub avail_idx: u16,
     pub readable: &'a [(u64, u32)],
     pub writable: &'a [(u64, u32)],
     /// Payload sizes exceed the allocation limits. The device must stream
@@ -875,6 +879,7 @@ impl VirtQueueProcessor {
                 };
 
                 let (used_len, request_bytes) = match handler(Chain {
+                    avail_idx: self.last_avail_idx,
                     readable: &chain.readable,
                     writable: &chain.writable,
                     over_limit: chain.over_limit,
