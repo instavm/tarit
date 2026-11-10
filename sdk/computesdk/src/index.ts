@@ -113,6 +113,38 @@ async function call<T>(
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+interface ShareRecord {
+  slug: string;
+  vm_id: string;
+  guest_port: number;
+  visibility: string;
+  revoked_at: string | null;
+}
+
+// Retain only outstanding operations: every later call checks revocation again.
+// Scope by resolved transport identity, including separate provider instances.
+const pendingPublicShares = new Map<string, Promise<ShareRecord>>();
+
+function publicShare(config: TaritConfig, vmId: string, port: number): Promise<ShareRecord> {
+  const resolved = { ...config, baseUrl: baseUrl(config), apiKey: apiKey(config) };
+  const key = JSON.stringify([resolved.baseUrl, resolved.apiKey, vmId, port]);
+  const pending = pendingPublicShares.get(key);
+  if (pending) return pending;
+  const operation = (async () => {
+    const shares = await call<ShareRecord[]>(resolved, 'GET', '/v1/shares');
+    const existing = shares.find((share) =>
+      share.vm_id === vmId && share.guest_port === port &&
+      share.visibility === 'public' && share.revoked_at === null);
+    if (existing) return existing;
+    return call<ShareRecord>(resolved, 'POST', '/v1/shares', {
+      vm_id: vmId, guest_port: port, visibility: 'public',
+    });
+  })();
+  const tracked = operation.finally(() => pendingPublicShares.delete(key));
+  pendingPublicShares.set(key, tracked);
+  return tracked;
+}
+
 function defaultImage(config: TaritConfig, runtime?: string): string {
   return (
     config.image ??
@@ -272,11 +304,7 @@ export const tarit = defineProvider<TaritInstance, TaritConfig>({
         if (!domain) {
           throw new Error("Port URLs need the host's share domain: set 'shareDomain' or TARIT_SHARE_DOMAIN.");
         }
-        const share = await call<{ slug: string }>(vm.config, 'POST', '/v1/shares', {
-          vm_id: vm.id,
-          guest_port: port,
-          visibility: 'public',
-        });
+        const share = await publicShare(vm.config, vm.id, port);
         return `${protocol ?? 'https'}://${share.slug}.${domain}`;
       },
 
