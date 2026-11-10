@@ -4010,8 +4010,8 @@ async fn update_branch_head(
 
 /// A tenant's snapshot as the public API shows it: an opaque handle plus the
 /// shape it restores to. Host placement and storage paths stay private.
-#[derive(Debug, Serialize)]
-struct PublicSnapshot {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PublicSnapshot {
     snapshot_id: Uuid,
     source_vm_id: Uuid,
     created_at: chrono::DateTime<Utc>,
@@ -4023,26 +4023,66 @@ struct PublicSnapshot {
     vcpus: Option<u8>,
 }
 
-/// Snapshots this node holds for the caller's tenant, oldest first.
+pub(crate) fn public_snapshots_local(
+    state: &AppState,
+    identity: &ApiIdentity,
+) -> Result<Vec<PublicSnapshot>, OrchError> {
+    Ok(ops::list_snapshots_local(
+        state,
+        (!identity.is_admin()).then_some(identity.tenant.as_str()),
+    )?
+    .into_iter()
+    .map(|snapshot| PublicSnapshot {
+        snapshot_id: snapshot.snapshot_id,
+        source_vm_id: snapshot.vm_id,
+        created_at: snapshot.created_at,
+        size_bytes: snapshot.size_bytes,
+        memory_mib: snapshot.memory_mib,
+        vcpus: snapshot.vcpus,
+    })
+    .collect())
+}
+
+/// Snapshots across the fleet, oldest first. Fail if a required owner cannot
+/// answer, rather than returning a node-dependent partial view.
 async fn list_snapshots(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
 ) -> Result<Json<Vec<PublicSnapshot>>, ApiError> {
-    let mut snapshots = ops::list_snapshots_local(&state, Some(&identity.tenant))?;
-    snapshots.sort_by_key(|snapshot| snapshot.created_at);
-    Ok(Json(
-        snapshots
-            .into_iter()
-            .map(|snapshot| PublicSnapshot {
-                snapshot_id: snapshot.snapshot_id,
-                source_vm_id: snapshot.vm_id,
-                created_at: snapshot.created_at,
-                size_bytes: snapshot.size_bytes,
-                memory_mib: snapshot.memory_mib,
-                vcpus: snapshot.vcpus,
-            })
-            .collect(),
-    ))
+    let mut snapshots = public_snapshots_local(&state, &identity)?;
+    if let Some(fleet) = state.fleet.as_ref() {
+        use futures_util::{stream, StreamExt, TryStreamExt};
+        let hosts = fleet
+            .snapshot_hosts((!identity.is_admin()).then_some(identity.tenant.as_str()))
+            .await
+            .map_err(|error| OrchError::Unavailable(format!("fleet snapshot hosts: {error}")))?;
+        let remote = stream::iter(
+            hosts
+                .into_iter()
+                .filter(|host| host != &state.config.host_id),
+        )
+        .map(|host| {
+            let state = &state;
+            let identity = identity.clone();
+            async move {
+                let target = cluster::peer_rpc(state, &host).await?.ok_or_else(|| {
+                    OrchError::Unavailable("snapshot peer is not configured".into())
+                })?;
+                let peer = Arc::clone(&state.peer);
+                tokio::task::spawn_blocking(move || peer.list_snapshots_remote(&target, &identity))
+                    .await
+                    .map_err(|error| OrchError::Internal(format!("join: {error}")))?
+            }
+        })
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+        snapshots.extend(remote.into_iter().flatten());
+    }
+    snapshots.sort_by_key(|snapshot| (snapshot.created_at, snapshot.snapshot_id));
+    let mut seen = std::collections::HashSet::new();
+    snapshots.retain(|snapshot| seen.insert(snapshot.snapshot_id));
+    Ok(Json(snapshots))
 }
 
 /// Delete a snapshot nothing still needs. Refused with 409 while a branch,
@@ -4052,7 +4092,24 @@ async fn delete_snapshot(
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    ops::delete_snapshot_local(&state, Some(&identity.tenant), id).await?;
+    let (host_id, _) = resolve_snapshot_locator(&state, &identity, id).await?;
+    if host_id == state.config.host_id {
+        ops::delete_snapshot_local(
+            &state,
+            (!identity.is_admin()).then_some(identity.tenant.as_str()),
+            id,
+        )
+        .await?;
+    } else {
+        let target = cluster::peer_rpc(&state, &host_id)
+            .await?
+            .ok_or_else(|| OrchError::Unavailable("snapshot peer is not configured".into()))?;
+        let peer = Arc::clone(&state.peer);
+        let caller = identity.clone();
+        tokio::task::spawn_blocking(move || peer.delete_snapshot_remote(&target, id, &caller))
+            .await
+            .map_err(|error| OrchError::Internal(format!("join: {error}")))??;
+    }
     audit::record(
         &state,
         &identity,
@@ -4547,6 +4604,225 @@ pub(crate) mod tests {
     use tarit_store::Store;
     use tower::ServiceExt;
 
+    static API_POSTGRES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) fn snapshot_fixture(
+        state: &AppState,
+        owner: &str,
+        managed: bool,
+    ) -> tarit_store::SnapshotRecord {
+        let id = Uuid::new_v4();
+        let snapshot = tarit_store::SnapshotRecord {
+            snapshot_id: id,
+            path: state
+                .config
+                .socket_dir
+                .join("snapshots")
+                .join(format!("bundle-{id}.ram"))
+                .display()
+                .to_string(),
+            overlay_path: None,
+            host_id: state.config.host_id.clone(),
+            owner_key: Some(owner.into()),
+            api_key_id: None,
+            vm_id: Uuid::new_v4(),
+            ephemeral_owner_vm_id: managed.then(Uuid::new_v4),
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: None,
+            rootfs_path: None,
+            rootfs_read_only: None,
+            cmdline: None,
+            content_digest: None,
+            size_bytes: Some(3),
+            created_at: Utc::now(),
+        };
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert_snapshot(&snapshot)
+            .unwrap();
+        snapshot
+    }
+
+    #[test]
+    fn fleet_snapshot_listing_and_delete_reach_the_owner_with_tenant_and_admin_identity() {
+        let url = std::env::var("TARIT_TEST_DATABASE_URL")
+            .ok()
+            .filter(|url| !url.is_empty());
+        assert!(
+            url.is_some() || std::env::var("TARIT_REQUIRE_TEST_DATABASE").as_deref() != Ok("1"),
+            "TARIT_TEST_DATABASE_URL is required for PostgreSQL regressions"
+        );
+        let Some(url) = url else {
+            return;
+        };
+        let _guard = API_POSTGRES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut front = test_state();
+        let mut remote = test_state();
+        remote.config.host_id = format!("snapshot-peer-{}", Uuid::new_v4());
+        remote.config.host_session_id = Uuid::new_v4();
+        remote.config.socket_dir =
+            std::env::temp_dir().join(format!("tarit-snapshot-routing-{}", Uuid::new_v4()));
+        let root = remote.config.socket_dir.clone();
+        std::fs::create_dir_all(root.join("snapshots")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join("snapshots"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let local_a = snapshot_fixture(&front, "tenant-a", false);
+        let local_b = snapshot_fixture(&front, "tenant-b", false);
+        let remote_a = snapshot_fixture(&remote, "tenant-a", false);
+        let remote_b = snapshot_fixture(&remote, "tenant-b", false);
+        let managed = snapshot_fixture(&remote, "tenant-a", true);
+        std::fs::write(&remote_a.path, b"ram").unwrap();
+        std::fs::write(&remote_b.path, b"ram").unwrap();
+        for snapshot in [&remote_a, &remote_b] {
+            std::fs::set_permissions(&snapshot.path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        test_runtime().block_on(async {
+            let fleet = Arc::new(tarit_fleet::PostgresFleet::connect(&url).await.unwrap());
+            front.fleet = Some(Arc::clone(&fleet));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = crate::internal::internal_router(remote.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            fleet
+                .upsert_host(&tarit_store::HostRecord {
+                    host_id: remote.config.host_id.clone(),
+                    boot_session_id: Some(remote.config.host_session_id),
+                    peer_certificate_sha256: None,
+                    rpc_addr: Some(format!("http://{address}")),
+                    sandbox_count: 0,
+                    free_vcpus: 1,
+                    free_memory_mib: 256,
+                    healthy: true,
+                    last_heartbeat: Utc::now(),
+                })
+                .await
+                .unwrap();
+            for snapshot in [&remote_a, &remote_b, &managed] {
+                fleet.upsert_snapshot(snapshot).await.unwrap();
+            }
+            let owner = front.config.api_keys.resolve("tenant-a-key").unwrap();
+            let foreign = front.config.api_keys.resolve("tenant-b-key").unwrap();
+            let admin = front.config.api_keys.resolve("admin-key").unwrap();
+            let Json(list) = list_snapshots(State(front.clone()), Extension(owner.clone()))
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.0));
+            let ids: std::collections::HashSet<_> =
+                list.iter().map(|snapshot| snapshot.snapshot_id).collect();
+            assert_eq!(
+                ids,
+                [local_a.snapshot_id, remote_a.snapshot_id]
+                    .into_iter()
+                    .collect()
+            );
+            let serialized = serde_json::to_value(&list).unwrap().to_string();
+            assert!(!serialized.contains(&root.display().to_string()));
+            assert!(!serialized.contains("owner_key"));
+            let Json(all) = list_snapshots(State(front.clone()), Extension(admin.clone()))
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.0));
+            assert_eq!(
+                all.iter()
+                    .map(|snapshot| snapshot.snapshot_id)
+                    .collect::<std::collections::HashSet<_>>(),
+                [
+                    local_a.snapshot_id,
+                    local_b.snapshot_id,
+                    remote_a.snapshot_id,
+                    remote_b.snapshot_id
+                ]
+                .into_iter()
+                .collect()
+            );
+            assert_eq!(
+                delete_snapshot(
+                    State(front.clone()),
+                    Extension(foreign),
+                    Path(remote_a.snapshot_id)
+                )
+                .await
+                .err()
+                .unwrap()
+                .into_response()
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                delete_snapshot(
+                    State(front.clone()),
+                    Extension(owner.clone()),
+                    Path(managed.snapshot_id)
+                )
+                .await
+                .err()
+                .unwrap()
+                .into_response()
+                .status(),
+                StatusCode::CONFLICT
+            );
+            assert_eq!(
+                delete_snapshot(
+                    State(front.clone()),
+                    Extension(owner.clone()),
+                    Path(remote_a.snapshot_id)
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.0)),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                delete_snapshot(
+                    State(front.clone()),
+                    Extension(admin),
+                    Path(remote_b.snapshot_id)
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{}", error.0)),
+                StatusCode::NO_CONTENT
+            );
+            assert!(!std::path::Path::new(&remote_a.path).exists());
+            assert!(!std::path::Path::new(&remote_b.path).exists());
+            assert!(remote
+                .store
+                .lock()
+                .unwrap()
+                .get_snapshot_by_id(managed.snapshot_id)
+                .unwrap()
+                .is_some());
+            server.abort();
+            let _ = server.await;
+            let mut failed_host = fleet
+                .get_host(&remote.config.host_id)
+                .await
+                .unwrap()
+                .unwrap();
+            failed_host.healthy = false;
+            fleet.upsert_host(&failed_host).await.unwrap();
+            assert!(
+                list_snapshots(State(front.clone()), Extension(owner))
+                    .await
+                    .is_err(),
+                "unreachable owner must not produce a partial list"
+            );
+            for snapshot in [&remote_a, &remote_b, &managed] {
+                fleet.delete_snapshot(snapshot).await.unwrap();
+            }
+        });
+        std::fs::remove_dir(root.join("snapshots")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn pending_hibernation_delete_still_checks_tenant_ownership() {
         let state = test_state();
@@ -4829,6 +5105,9 @@ pub(crate) mod tests {
 
     #[test]
     fn postgres_execution_retention_rejects_rehydration_and_prunes_authority() {
+        let _guard = API_POSTGRES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let url = std::env::var("TARIT_TEST_DATABASE_URL")
             .ok()
             .filter(|s| !s.is_empty());
