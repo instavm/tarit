@@ -54,7 +54,7 @@ pub struct RunningVm {
     pub vsock_pump: Option<vmm_devices::virtio::vsock_io_loop::VsockPump>,
     /// Host side of the vsock exec channel (accepts the guest agent's dial).
     pub vsock_exec: Option<std::sync::Arc<crate::vsock_exec::VsockExecChannel>>,
-    /// Host side of the interactive PTY channel (connects to guest port 1025).
+    /// Host side of the interactive PTY channel (connects to guest port 1022).
     pub vsock_pty: Option<std::sync::Arc<crate::vsock_pty::VsockPtyChannel>>,
     /// irqfd EventFds that must stay open for the VM's lifetime. Owned here so
     /// they are closed when the VM stops — create/stop cycles must not leak fds
