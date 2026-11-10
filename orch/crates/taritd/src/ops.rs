@@ -2387,21 +2387,46 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
         failures.push(format!("VMM exit scan task failed: {error}"));
         return failures;
     }
-    let exits = state.supervisor.take_unexpected_exits();
+    // Inspect under the terminal gate: overlapping scans must not both consume
+    // an event after the first reconciler has transferred its retry ownership.
+    let _terminal_gate = state.terminal_transition_gate.lock().await;
+    let exits = state.supervisor.pending_unexpected_exits();
     if exits.is_empty() {
         return failures;
     }
-    let _terminal_gate = state.terminal_transition_gate.lock().await;
     for exit in exits {
         if let Some(cleanup_error) = &exit.cleanup_error {
             tracing::error!(vm = %exit.id, pid = exit.pid, %cleanup_error, "dead VMM left resources requiring operator reconciliation");
         }
         let result = async {
+            // A retained delivery must not terminate a replacement runtime.
+            // The watcher withdraws the exited runtime before enqueuing this
+            // event, so any currently registered runtime is a later owner.
+            let current = lifecycle_state(state, exit.id)?
+                .map(|lifecycle| lifecycle.record().clone())
+                .or_else(|| vm_get(state, exit.id).ok());
+            if state.supervisor.is_running(exit.id)
+                || current.as_ref().is_none_or(|record| {
+                    record.pid.is_some_and(|pid| pid != exit.pid)
+                        || matches!(record.status, VmStatus::Stopped | VmStatus::Error)
+                })
+            {
+                state.supervisor.acknowledge_unexpected_exit(&exit);
+                return Ok(());
+            }
             if matches!(
                 lifecycle_state(state, exit.id)?,
                 Some(LifecycleState::Hibernating { .. })
             ) {
+                state.supervisor.acknowledge_unexpected_exit(&exit);
                 return finish_hibernation(state, exit.id).await;
+            }
+            if matches!(
+                lifecycle_state(state, exit.id)?,
+                Some(LifecycleState::Terminal { .. })
+            ) {
+                state.supervisor.acknowledge_unexpected_exit(&exit);
+                return finish_terminal_transition(state, exit.id).await;
             }
             state.pty_registry.close_vm_sessions(exit.id);
             if matches!(
@@ -2412,6 +2437,10 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
             }
             crate::usage::meter_vm_final(state, exit.id);
             start_terminal_transition(state, exit.id, VmStatus::Error, false)?;
+            // No await between installing the retryable terminal intent and
+            // acknowledging the event. Cancellation before this point retains
+            // the exit; cancellation afterwards leaves the terminal retry.
+            state.supervisor.acknowledge_unexpected_exit(&exit);
             finish_terminal_transition(state, exit.id).await
         }
         .await;
@@ -6261,6 +6290,124 @@ mod tests {
         });
         drop(runtime);
         drop(state);
+    }
+
+    fn enqueue_test_exit(state: &AppState, id: Uuid, pid: u32) {
+        state
+            .supervisor
+            .enqueue_unexpected_exit_for_test(crate::supervisor::UnexpectedVmmExit {
+                id,
+                pid,
+                status: "exit 7".into(),
+                cleanup_error: None,
+            });
+    }
+
+    #[test]
+    fn exit_delivery_survives_publication_failure_until_terminal_handoff() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        let record = vm_get(&state, id).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Publishing {
+                record,
+                phase: PublicationPhase::FleetUpdated,
+            },
+        )
+        .unwrap();
+        enqueue_test_exit(&state, id, 42);
+        // Both the ordinary lifecycle retry and the event's publication retry
+        // fail before a terminal intent exists.
+        inject_lifecycle_fault(&state, LifecycleFault::SQLite);
+        inject_lifecycle_fault(&state, LifecycleFault::SQLite);
+        test_runtime().block_on(async {
+            assert_eq!(reconcile_unexpected_vmm_exits(&state).await.len(), 2);
+            assert_eq!(state.supervisor.pending_unexpected_exits().len(), 1);
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+            assert!(reconcile_unexpected_vmm_exits(&state).await.is_empty());
+            assert!(state.supervisor.pending_unexpected_exits().is_empty());
+            let terminal = vm_get(&state, id).unwrap();
+            assert_eq!(terminal.status, VmStatus::Error);
+            assert_eq!(state.store.lock().unwrap().get_vm(id).unwrap(), terminal);
+            assert!(reconcile_unexpected_vmm_exits(&state).await.is_empty());
+            assert_eq!(vm_get(&state, id).unwrap(), terminal);
+        });
+    }
+
+    #[test]
+    fn terminal_intent_owns_exit_retry_after_delivery_is_acknowledged() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        enqueue_test_exit(&state, id, 42);
+        inject_lifecycle_fault(&state, LifecycleFault::SQLite);
+        test_runtime().block_on(async {
+            assert_eq!(reconcile_unexpected_vmm_exits(&state).await.len(), 1);
+            assert!(state.supervisor.pending_unexpected_exits().is_empty());
+            let Some(LifecycleState::Terminal { record, .. }) =
+                lifecycle_state(&state, id).unwrap()
+            else {
+                panic!("terminal retry must own the acknowledged exit");
+            };
+            assert!(reconcile_unexpected_vmm_exits(&state).await.is_empty());
+            assert_eq!(vm_get(&state, id).unwrap(), record);
+        });
+    }
+
+    #[test]
+    fn cancelled_exit_reconciliation_preserves_delivery_and_replacement_owner() {
+        let (state, mut writes) = test_state_with_durable_writer();
+        let state = Arc::new(state);
+        let id = insert_running_vm(&state);
+        let record = vm_get(&state, id).unwrap();
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Publishing {
+                record,
+                phase: PublicationPhase::FleetUpdated,
+            },
+        )
+        .unwrap();
+        enqueue_test_exit(&state, id, 42);
+        inject_lifecycle_fault(&state, LifecycleFault::SQLite);
+        test_runtime().block_on(async {
+            let task_state = Arc::clone(&state);
+            let task =
+                tokio::spawn(async move { reconcile_unexpected_vmm_exits(&task_state).await });
+            let write = tokio::time::timeout(Duration::from_secs(2), writes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            drop(write);
+            drop(writes);
+            assert_eq!(state.supervisor.pending_unexpected_exits().len(), 1);
+            // A later incarnation acquired the UUID while delivery was pending.
+            let mut replacement = vm_get(&state, id).unwrap();
+            replacement.pid = Some(99);
+            replacement.created_at += chrono::Duration::seconds(1);
+            set_lifecycle_state(
+                &state,
+                id,
+                LifecycleState::Running {
+                    record: replacement.clone(),
+                },
+            )
+            .unwrap();
+            state
+                .vm_cache
+                .write()
+                .unwrap()
+                .insert(id, replacement.clone());
+            assert!(reconcile_unexpected_vmm_exits(&state).await.is_empty());
+            assert!(state.supervisor.pending_unexpected_exits().is_empty());
+            assert_eq!(vm_get(&state, id).unwrap(), replacement);
+        });
     }
 
     #[test]

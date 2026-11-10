@@ -773,13 +773,13 @@ impl Store {
     }
 
     pub fn upsert_hibernation(&self, record: &HibernationRecord) -> Result<(), StoreError> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "INSERT INTO hibernations (vm_id, owner_key, snapshot_path, created_at, updated_at)
              VALUES (?1,?2,?3,?4,?5)
              ON CONFLICT(vm_id) DO UPDATE SET
-               owner_key = excluded.owner_key,
                snapshot_path = excluded.snapshot_path,
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at
+             WHERE hibernations.owner_key = excluded.owner_key",
             params![
                 record.vm_id.to_string(),
                 record.owner_key,
@@ -788,6 +788,11 @@ impl Store {
                 record.updated_at.to_rfc3339(),
             ],
         )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(
+                "hibernation belongs to another tenant".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2057,7 +2062,7 @@ impl Store {
                host_id = ?2, owner_key = ?3, api_key_id = ?4, status = ?5, revision = ?6,
                startup_path = ?7, memory_mib = ?8, vcpus = ?9, kernel_path = ?10,
                rootfs_path = ?11, cmdline = ?12, socket_path = ?13, pid = ?14, updated_at = ?15
-             WHERE id = ?1 AND revision < ?6",
+             WHERE id = ?1 AND revision < ?6 AND host_id = ?2 AND created_at = ?16",
             params![
                 vm.id.to_string(),
                 vm.host_id,
@@ -2074,6 +2079,7 @@ impl Store {
                 vm.socket_path,
                 vm.pid,
                 vm.updated_at.to_rfc3339(),
+                vm.created_at.to_rfc3339(),
             ],
         )?;
         if n == 0 {
@@ -2098,18 +2104,6 @@ impl Store {
                 Err(StoreError::NotFound) => return Err(StoreError::NotFound),
                 Err(error) => return Err(error),
             }
-        }
-        Ok(())
-    }
-
-    pub fn update_vm_status(&self, id: Uuid, status: VmStatus) -> Result<(), StoreError> {
-        let now = Utc::now().to_rfc3339();
-        let n = self.conn.execute(
-            "UPDATE vms SET status = ?2, revision = revision + 1, updated_at = ?3 WHERE id = ?1",
-            params![id.to_string(), status.as_str(), now],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound);
         }
         Ok(())
     }
@@ -4028,6 +4022,16 @@ mod tests {
         };
         store.upsert_hibernation(&record).unwrap();
         assert_eq!(store.get_hibernation("tenant-a", vm_id).unwrap(), record);
+        let other = HibernationRecord {
+            owner_key: "tenant-b".into(),
+            ..record.clone()
+        };
+        assert!(matches!(
+            store.upsert_hibernation(&other),
+            Err(StoreError::Conflict(_))
+        ));
+        assert_eq!(store.get_hibernation("tenant-a", vm_id).unwrap(), record);
+        store.upsert_hibernation(&record).unwrap();
         assert!(matches!(
             store.get_hibernation("tenant-b", vm_id),
             Err(StoreError::NotFound)
@@ -4284,6 +4288,28 @@ mod tests {
     }
 
     #[test]
+    fn stale_high_revision_cannot_overwrite_a_reused_vm_incarnation() {
+        let store = Store::open(":memory:").unwrap();
+        let current = test_vm(Uuid::new_v4(), "tenant-a");
+        store.insert_vm(&current).unwrap();
+        for change_host in [false, true] {
+            let mut stale = current.clone();
+            stale.revision += 100;
+            stale.status = VmStatus::Error;
+            if change_host {
+                stale.host_id.push_str("-previous");
+            } else {
+                stale.created_at -= chrono::Duration::days(1);
+            }
+            assert!(matches!(
+                store.update_vm(&stale),
+                Err(StoreError::Conflict(_))
+            ));
+            assert_eq!(store.get_vm(current.id).unwrap(), current);
+        }
+    }
+
+    #[test]
     fn stopped_vm_shares_are_revoked_before_uuid_reuse_and_stale_publication_fails() {
         let store = Store::open(":memory:").unwrap();
         let mut vm = test_vm(Uuid::new_v4(), "tenant-a");
@@ -4296,7 +4322,9 @@ mod tests {
             ..test_share("lifetime-test", "tenant-a")
         };
         store.insert_share_for_vm(&share, &vm).unwrap();
-        store.update_vm_status(vm.id, VmStatus::Stopped).unwrap();
+        vm.status = VmStatus::Stopped;
+        vm.revision += 1;
+        store.update_vm(&vm).unwrap();
         assert!(store.get_share(share.id).unwrap().revoked_at.is_some());
         assert!(store
             .insert_share_for_vm(
