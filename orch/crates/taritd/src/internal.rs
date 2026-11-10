@@ -133,6 +133,20 @@ struct InternalRestoreRequest {
 pub fn internal_router(state: AppState) -> Router {
     let traffic_limits = ApiTrafficLimits::new(&state.config);
     let max_body_bytes = state.config.api_max_body_bytes;
+    let exec_routes = Router::new()
+        .route("/internal/v1/vms/{id}/exec", post(internal_exec))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_peer_signature,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            traffic_limits
+                .clone()
+                .with_timeout(crate::peer::exec_rpc_timeout(
+                    tarit_types::MAX_EXEC_TIMEOUT_MS,
+                )),
+            enforce_api_traffic,
+        ));
     Router::new()
         .route("/internal/v1/vms", post(internal_create))
         .route("/internal/v1/restore", post(internal_restore))
@@ -150,7 +164,6 @@ pub fn internal_router(state: AppState) -> Router {
             "/internal/v1/vms/{id}/balloon",
             get(internal_get_balloon).post(internal_set_balloon),
         )
-        .route("/internal/v1/vms/{id}/exec", post(internal_exec))
         .route("/internal/v1/vms/{id}/pause", post(internal_pause))
         .route("/internal/v1/vms/{id}/suspend", post(internal_suspend))
         .route("/internal/v1/vms/{id}/hibernate", post(internal_hibernate))
@@ -178,11 +191,12 @@ pub fn internal_router(state: AppState) -> Router {
             state.clone(),
             require_peer_signature,
         ))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(axum::middleware::from_fn_with_state(
             traffic_limits,
             enforce_api_traffic,
         ))
+        .merge(exec_routes)
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
@@ -959,14 +973,16 @@ async fn internal_exec(
     Json(body): Json<InternalExecBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let vm = enforce_peer_vm_access(&state, id, identity.as_ref().map(|i| &i.0))?;
-    // The peer waits on this request, so it is bound by the same deadline.
-    let gate_deadline = ops::exec_gate_deadline(&state.config, body.timeout_ms);
-    let (code, stdout, stderr, duration_ms) = ops::exec_local(
+    crate::api::validate_exec_timeout(body.timeout_ms, None)?;
+    let admission_deadline = tokio::time::Instant::now()
+        + crate::peer::EXEC_ADMISSION_TIMEOUT
+            .min(Duration::from_millis(state.config.api_request_timeout_ms));
+    let (code, stdout, stderr, duration_ms) = ops::exec_local_with_admission_deadline(
         &state,
         &vm,
         body.command,
         body.timeout_ms,
-        Some(gate_deadline),
+        admission_deadline,
     )
     .await?;
     Ok(Json(serde_json::json!({

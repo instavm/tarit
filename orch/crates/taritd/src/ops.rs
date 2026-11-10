@@ -2239,16 +2239,63 @@ pub async fn exec_local(
     timeout_ms: u64,
     gate_deadline: Option<tokio::time::Instant>,
 ) -> Result<(i32, String, String, u64), OrchError> {
+    exec_local_impl(state, expected_vm, command, timeout_ms, gate_deadline, None).await
+}
+
+pub(crate) async fn exec_local_with_admission_deadline(
+    state: &AppState,
+    expected_vm: &VmRecord,
+    command: String,
+    timeout_ms: u64,
+    admission_deadline: tokio::time::Instant,
+) -> Result<(i32, String, String, u64), OrchError> {
+    exec_local_impl(
+        state,
+        expected_vm,
+        command,
+        timeout_ms,
+        Some(admission_deadline),
+        Some(admission_deadline),
+    )
+    .await
+}
+
+fn check_exec_admission(deadline: Option<tokio::time::Instant>) -> Result<(), OrchError> {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+        return Err(OrchError::Conflict(
+            "peer exec admission deadline exceeded".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn exec_local_impl(
+    state: &AppState,
+    expected_vm: &VmRecord,
+    command: String,
+    timeout_ms: u64,
+    gate_deadline: Option<tokio::time::Instant>,
+    admission_deadline: Option<tokio::time::Instant>,
+) -> Result<(i32, String, String, u64), OrchError> {
     let vm_id = expected_vm.id;
+    check_exec_admission(admission_deadline)?;
+    // Activation may commit lifecycle transitions: let it finish, then refuse
+    // to launch a command if the caller's admission budget has elapsed.
     ensure_active_local_owned(state, vm_id, None, Some(expected_vm)).await?;
+    check_exec_admission(admission_deadline)?;
     let gate = state.supervisor.operation_gate(vm_id)?;
     let _operation = lock_operation_gate(gate, vm_id, gate_deadline).await?;
+    check_exec_admission(admission_deadline)?;
     let current = ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
     ensure_execution_incarnation(expected_vm, &current)?;
     let sup = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms))
-        .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        // A saturated blocking pool must not turn queueing into a late command.
+        check_exec_admission(admission_deadline)?;
+        sup.exec_vm(vm_id, &command, timeout_ms)
+    })
+    .await
+    .map_err(|e| OrchError::Internal(format!("join: {e}")))?
 }
 
 fn ensure_execution_incarnation(expected: &VmRecord, current: &VmRecord) -> Result<(), OrchError> {
@@ -5076,6 +5123,31 @@ mod tests {
             rollback_plan(VmStatus::Suspended, VmStatus::Running),
             Some(RollbackPlan::Suspend)
         );
+    }
+
+    #[test]
+    fn peer_exec_does_not_start_after_waiting_for_activation() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let expected = vm_get(&state, id).unwrap();
+        test_runtime().block_on(async {
+            let activation = activation_gate(&state, id).unwrap();
+            let held = activation.lock_owned().await;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+            let release = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(held);
+            };
+            let execute = exec_local_with_admission_deadline(&state, &expected, "must not run".into(), 1000, deadline);
+            let (_, result) = tokio::join!(release, execute);
+            assert!(matches!(result, Err(OrchError::Conflict(message)) if message.contains("admission deadline")));
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Running);
+            // A free operation gate can be acquired even after timeout_at's
+            // deadline; the explicit check must still prevent command start.
+            let gate = Arc::new(tokio::sync::Mutex::new(()));
+            let _held = lock_operation_gate(gate, id, Some(deadline)).await.unwrap();
+            assert!(matches!(check_exec_admission(Some(deadline)), Err(OrchError::Conflict(_))));
+        });
     }
 
     #[test]
