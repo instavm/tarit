@@ -81,6 +81,14 @@ pub struct ShareWebSocketRequest<'a> {
     pub trusted_proto: &'static str,
 }
 
+// Keep pre-command queue/activation time bounded independently of guest runtime.
+pub(crate) const EXEC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(120);
+const EXEC_RESPONSE_MARGIN: Duration = Duration::from_secs(5);
+
+pub(crate) fn exec_rpc_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms) + EXEC_ADMISSION_TIMEOUT + EXEC_RESPONSE_MARGIN
+}
+
 #[derive(Serialize)]
 struct RemoteExecRequest {
     command: String,
@@ -158,6 +166,7 @@ impl PeerClient {
     ) -> Result<Self, OrchError> {
         let mut http_builder = Client::builder()
             .timeout(Duration::from_secs(120))
+            .no_proxy()
             .connect_timeout(Duration::from_secs(5))
             // SSRF hardening: never follow redirects to an attacker-chosen host.
             .redirect(reqwest::redirect::Policy::none());
@@ -634,6 +643,18 @@ impl PeerClient {
         identity: Option<&ApiIdentity>,
         what: &str,
     ) -> Result<R, OrchError> {
+        self.post_json_with_timeout(target, path, body, identity, what, None)
+    }
+
+    fn post_json_with_timeout<B: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        target: &PeerTarget,
+        path: &str,
+        body: &B,
+        identity: Option<&ApiIdentity>,
+        what: &str,
+        timeout: Option<Duration>,
+    ) -> Result<R, OrchError> {
         self.validate_rpc_addr(&target.rpc_addr)?;
         let body = serde_json::to_vec(body)
             .map_err(|e| OrchError::Internal(format!("peer {what} encode: {e}")))?;
@@ -643,6 +664,11 @@ impl PeerClient {
             .post(Self::peer_url(&target.rpc_addr, path))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
+        let req = if let Some(timeout) = timeout {
+            req.timeout(timeout)
+        } else {
+            req
+        };
         let req = self.with_request_signature(req, target, "POST", path, &payload_hash, identity);
         let resp = req
             .send()
@@ -887,7 +913,8 @@ impl PeerClient {
         timeout_ms: u64,
         identity: &ApiIdentity,
     ) -> Result<(i32, String, String, u64), OrchError> {
-        let body: RemoteExecResponse = self.post_json(
+        crate::api::validate_exec_timeout(timeout_ms, None)?;
+        let body: RemoteExecResponse = self.post_json_with_timeout(
             target,
             &format!("/internal/v1/vms/{vm_id}/exec"),
             &RemoteExecRequest {
@@ -896,6 +923,7 @@ impl PeerClient {
             },
             Some(identity),
             "exec",
+            Some(exec_rpc_timeout(timeout_ms)),
         )?;
         Ok((body.exit_code, body.stdout, body.stderr, body.duration_ms))
     }
@@ -1327,6 +1355,94 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::config::ApiRole;
+
+    #[test]
+    fn exec_override_outlives_default_rpc_deadline_and_ignores_proxy_environment() {
+        const CHILD: &str = "TARIT_PEER_DEADLINE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "peer::tests::exec_override_outlives_default_rpc_deadline_and_ignores_proxy_environment", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:1")
+                .env("http_proxy", "http://127.0.0.1:1")
+                .env("ALL_PROXY", "http://127.0.0.1:1")
+                .env("all_proxy", "http://127.0.0.1:1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let read = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..read]).starts_with("POST /internal/v1/vms/")
+                );
+                std::thread::sleep(Duration::from_millis(150));
+                let body = r#"{"exit_code":0,"stdout":"retained","stderr":"","duration_ms":150}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        let mut client = PeerClient::new("peer-secret".into());
+        let target = PeerTarget {
+            host_id: "owner".into(),
+            boot_session_id: Uuid::new_v4(),
+            rpc_addr: format!("http://{address}"),
+        };
+        let identity = ApiIdentity {
+            api_key_id: "key".into(),
+            tenant: "tenant".into(),
+            role: ApiRole::User,
+            max_vms: None,
+        };
+        // Exercise the production builder with hostile proxy environment first.
+        assert_eq!(
+            client
+                .exec_remote(&target, Uuid::new_v4(), "echo retained", 200, &identity)
+                .unwrap()
+                .1,
+            "retained"
+        );
+        // Accelerate only the ordinary client budget; exec must override it.
+        client.http = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let ordinary: Result<RemoteExecResponse, _> = client.post_json(
+            &target,
+            "/internal/v1/vms/test/exec",
+            &serde_json::json!({}),
+            Some(&identity),
+            "ordinary",
+        );
+        assert!(
+            ordinary.is_err(),
+            "ordinary RPC retains its short client deadline"
+        );
+        let result = client
+            .exec_remote(&target, Uuid::new_v4(), "echo retained", 200, &identity)
+            .unwrap();
+        assert_eq!(result.1, "retained");
+        server.join().unwrap();
+        assert_eq!(
+            exec_rpc_timeout(tarit_types::MAX_EXEC_TIMEOUT_MS),
+            Duration::from_secs(3725)
+        );
+    }
 
     #[test]
     fn artifact_download_is_bounded_streamed_and_hashed() {

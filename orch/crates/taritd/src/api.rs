@@ -284,6 +284,11 @@ impl ApiTrafficLimits {
         }
     }
 
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     fn take_rate_token(&self) -> bool {
         let Ok(mut bucket) = self.rate.lock() else {
             return false;
@@ -3354,7 +3359,7 @@ async fn authorize_vm_action(
 /// Bound an exec budget. A synchronous exec must also fit inside the API
 /// request deadline: past it the client receives a 504, but the handler and
 /// its in-flight permit would otherwise keep running.
-fn validate_exec_timeout(
+pub(crate) fn validate_exec_timeout(
     timeout_ms: u64,
     request_timeout_ms: Option<u64>,
 ) -> Result<(), OrchError> {
@@ -4546,6 +4551,24 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tarit_store::Store;
     use tower::ServiceExt;
+
+    #[test]
+    fn extended_exec_deadline_shares_global_admission_limits() {
+        let state = test_state();
+        let ordinary = ApiTrafficLimits::new(&state.config);
+        let exec = ordinary
+            .clone()
+            .with_timeout(crate::peer::exec_rpc_timeout(MAX_EXEC_TIMEOUT_MS));
+        assert!(Arc::ptr_eq(&ordinary.concurrency, &exec.concurrency));
+        assert!(Arc::ptr_eq(&ordinary.rate, &exec.rate));
+        assert!(exec.timeout > ordinary.timeout);
+        let _permits = ordinary
+            .concurrency
+            .clone()
+            .try_acquire_many_owned(state.config.api_max_in_flight as u32)
+            .unwrap();
+        assert!(exec.concurrency.try_acquire().is_err());
+    }
 
     #[test]
     fn pending_hibernation_delete_still_checks_tenant_ownership() {
