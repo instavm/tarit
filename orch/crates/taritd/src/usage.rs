@@ -116,6 +116,7 @@ fn meter_runtime_once(state: &AppState) {
 
 /// Emit the final runtime interval when a VM stops, then drop its watermark.
 /// Called after successful teardown; failures keep the interval open for retry.
+#[cfg(test)]
 pub fn meter_vm_final(state: &AppState, vm_id: Uuid) -> Result<(), tarit_types::OrchError> {
     meter_vm_final_at(state, vm_id, Utc::now())
 }
