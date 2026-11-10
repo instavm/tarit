@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tarit_types::{openssh_sha256_fingerprint, OrchError, SshKeyRecord, VmRecord};
 use tarit_vmm_client::{
-    PtyResize, PtyStreamFrame, MAX_FRAME_LEN, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE,
-    TYPE_STDERR, TYPE_STDIN_EOF,
+    PtyResize, PtyStreamFrame, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE, TYPE_STDERR,
+    TYPE_STDIN_EOF,
 };
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
@@ -926,6 +926,17 @@ enum BridgeError {
 }
 
 #[cfg(test)]
+async fn attach_authorized_pty(
+    state: &AppState,
+    auth: &Authenticated,
+    cols: u16,
+    rows: u16,
+    shell: Option<String>,
+) -> Result<(std::os::unix::net::UnixStream, PtyConnectionPermit), OrchError> {
+    attach_authorized_stream(state, auth, cols, rows, shell, false).await
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
@@ -1571,15 +1582,4 @@ mod tests {
             share_runtime: Arc::new(crate::share_gateway::ShareRuntime::default()),
         }
     }
-}
-
-#[cfg(test)]
-async fn attach_authorized_pty(
-    state: &AppState,
-    auth: &Authenticated,
-    cols: u16,
-    rows: u16,
-    shell: Option<String>,
-) -> Result<(std::os::unix::net::UnixStream, PtyConnectionPermit), OrchError> {
-    attach_authorized_stream(state, auth, cols, rows, shell, false).await
 }
