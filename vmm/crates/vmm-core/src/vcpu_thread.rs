@@ -680,6 +680,8 @@ mod tests {
             vec![0x67, 0xa2, 0, 0, 0, 0xf0], // mov byte [0xf0000000], al
         ] {
             let vm = kvm.create_vm().unwrap();
+            // Match production VM setup before entering real mode on VMX.
+            vm.set_tss_address(0xfffbd000).unwrap();
             let mem = vmm_memory_backend::GuestMemory::new(0x4000).unwrap();
             mem.register(&vm, 0).unwrap();
             let mut program = code.clone();
@@ -698,7 +700,14 @@ mod tests {
             match vcpu.run().unwrap() {
                 VcpuExit::IoIn(_, data) | VcpuExit::MmioRead(_, data) => data[0] = 0x5a,
                 VcpuExit::IoOut(_, _) | VcpuExit::MmioWrite(_, _) => {}
-                other => panic!("expected I/O exit: {other:?}"),
+                VcpuExit::InternalError => {
+                    // SAFETY: this union member is selected by INTERNAL_ERROR.
+                    let internal = unsafe { vcpu.get_kvm_run().__bindgen_anon_1.internal };
+                    panic!("first KVM_RUN internal error: code={code:02x?} suberror={} data={:x?} regs={:?} sregs={:?}",
+                        internal.suberror, &internal.data[..(internal.ndata as usize).min(internal.data.len())],
+                        vcpu.get_regs().unwrap(), vcpu.get_sregs().unwrap());
+                }
+                other => panic!("expected first I/O exit for {code:02x?}: {other:?}"),
             }
             let bus = MmioBus::new();
             let serial = vmm_devices::serial::Serial::new(
