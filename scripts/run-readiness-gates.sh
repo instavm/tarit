@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the single-node readiness gates on this host and keep the evidence:
-# the gates .github/workflows/kvm.yml enforces, the whole test/e2e.sh suite,
+# the manual KVM validation gates, the whole test/e2e.sh suite,
 # and a bounded mixed-image lifecycle soak. Needs root (TAP networking, the
 # jailer, OCI unpack) and release builds of both binaries:
 #
