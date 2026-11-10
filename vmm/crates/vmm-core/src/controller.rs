@@ -867,6 +867,13 @@ impl VmmController {
                 // whole function; we only read it, and we mutate only other `vm` fields.
                 unsafe { std::slice::from_raw_parts(mem_ptr, mem_bytes) }
             };
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            let lazy_reader = vm
+                .guest_mem
+                .as_ref()
+                .map(crate::snapshot_memory::LazySnapshotReader::new)
+                .transpose()?
+                .flatten();
             let state_blob: Vec<u8> = vm.state_blob.clone().unwrap_or_default();
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             let state_blob = if volume_rewrites.is_empty() {
@@ -929,6 +936,7 @@ impl VmmController {
                     base_file,
                     base_mem_offset,
                     base_mem_crc,
+                    lazy_reader.as_ref(),
                 )?);
                 return Ok(mem_slice.len());
             }
@@ -954,6 +962,7 @@ impl VmmController {
                         &state_blob,
                         mem_slice,
                         &dirty,
+                        lazy_reader.as_ref(),
                     )
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
@@ -981,31 +990,40 @@ impl VmmController {
                     .filter(|guest_mem| guest_mem.is_file_backed())
                     .map(|guest_mem| guest_mem.file_backed_ranges());
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-                match (file_ranges, populated.as_deref()) {
-                    (Some(ranges), Some(populated)) => {
-                        deferred_full = Some(write_snapshot_memory_deferred(
-                            owned_snapshot.file(),
+                if let Some(reader) = lazy_reader.as_ref() {
+                    write_lazy_snapshot_to_file(
+                        owned_snapshot.file(),
+                        &state_blob,
+                        mem_slice,
+                        reader,
+                    )?;
+                } else {
+                    match (file_ranges, populated.as_deref()) {
+                        (Some(ranges), Some(populated)) => {
+                            deferred_full = Some(write_snapshot_memory_deferred(
+                                owned_snapshot.file(),
+                                &state_blob,
+                                mem_slice,
+                                populated,
+                                &ranges,
+                            )?);
+                        }
+                        // File-backed RAM without a pagemap must be read in full.
+                        (Some(_), None) => write_scratch_snapshot_file(
+                            &owned_snapshot,
+                            &state_blob,
+                            mem_slice,
+                            None,
+                            false,
+                        )?,
+                        (None, populated) => write_scratch_snapshot_file(
+                            &owned_snapshot,
                             &state_blob,
                             mem_slice,
                             populated,
-                            &ranges,
-                        )?);
+                            false,
+                        )?,
                     }
-                    // File-backed RAM without a pagemap must be read in full.
-                    (Some(_), None) => write_scratch_snapshot_file(
-                        &owned_snapshot,
-                        &state_blob,
-                        mem_slice,
-                        None,
-                        false,
-                    )?,
-                    (None, populated) => write_scratch_snapshot_file(
-                        &owned_snapshot,
-                        &state_blob,
-                        mem_slice,
-                        populated,
-                        false,
-                    )?,
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
                 write_scratch_snapshot_file(
@@ -5246,6 +5264,27 @@ impl SnapshotWriteLayout {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_lazy_snapshot_to_file(
+    file: &std::fs::File,
+    state: &[u8],
+    memory: &[u8],
+    reader: &crate::snapshot_memory::LazySnapshotReader,
+) -> Result<()> {
+    let layout = SnapshotWriteLayout::new(state, memory.len(), false)?;
+    file.set_len(0)
+        .map_err(|error| VmmError::Snapshot(error.to_string()))?;
+    let mut crc = crc32fast::Hasher::new();
+    for start in (0..memory.len()).step_by(2 * 1024 * 1024) {
+        let end = (start + 2 * 1024 * 1024).min(memory.len());
+        let bytes = crate::snapshot_memory::read_snapshot_bytes(memory, Some(reader), start, end)?;
+        crc.update(&bytes);
+        crate::live_snapshot::write_nonzero_pages(file, &bytes, layout.mem_offset + start as u64)
+            .map_err(|error| VmmError::Snapshot(error.to_string()))?;
+    }
+    layout.finish(file, state, crc.finalize())
+}
+
 fn write_snapshot_to_file(
     file: &std::fs::File,
     state_blob: &[u8],
@@ -5428,6 +5467,7 @@ fn check_snapshot_base(
 /// written from memory, every other page is queued to be copied from `base`
 /// after the guest resumes ([`finish_deferred_snapshot`]).
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[allow(clippy::too_many_arguments)] // Base identity and optional lazy reader describe one source.
 fn write_snapshot_memory_from_base(
     file: &std::fs::File,
     state_blob: &[u8],
@@ -5436,6 +5476,7 @@ fn write_snapshot_memory_from_base(
     base: Arc<std::fs::File>,
     base_mem_offset: u64,
     base_mem_crc: u32,
+    reader: Option<&crate::snapshot_memory::LazySnapshotReader>,
 ) -> Result<DeferredFullSnapshot> {
     use std::os::unix::fs::FileExt;
 
@@ -5458,9 +5499,14 @@ fn write_snapshot_memory_from_base(
         // Write the dirty run page by page, leaving zero pages as holes.
         let mut page = start;
         while page < end {
-            let bytes = &mem[page as usize..(page + PAGE).min(end) as usize];
-            if !is_zero(bytes) {
-                file.write_all_at(bytes, layout.mem_offset + page)
+            let bytes = crate::snapshot_memory::read_snapshot_bytes(
+                mem,
+                reader,
+                page as usize,
+                (page + PAGE).min(end) as usize,
+            )?;
+            if !is_zero(&bytes) {
+                file.write_all_at(&bytes, layout.mem_offset + page)
                     .map_err(|e| VmmError::Snapshot(e.to_string()))?;
             }
             page += PAGE;
@@ -5852,8 +5898,9 @@ fn write_scratch_diff_snapshot_file(
     state_blob: &[u8],
     mem: &[u8],
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+    reader: Option<&crate::snapshot_memory::LazySnapshotReader>,
 ) -> Result<usize> {
-    write_diff_snapshot_to_file(owned_file.file(), parent, state_blob, mem, dirty)
+    write_diff_snapshot_to_file(owned_file.file(), parent, state_blob, mem, dirty, reader)
 }
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5866,7 +5913,7 @@ fn write_diff_snapshot_file_with_mode(
     mode: SnapshotCreateMode,
 ) -> Result<usize> {
     let file = open_snapshot_output(path, mode)?;
-    write_diff_snapshot_to_file(&file, parent, state_blob, mem, dirty)
+    write_diff_snapshot_to_file(&file, parent, state_blob, mem, dirty, None)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5876,6 +5923,7 @@ fn write_diff_snapshot_to_file(
     state_blob: &[u8],
     mem: &[u8],
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+    reader: Option<&crate::snapshot_memory::LazySnapshotReader>,
 ) -> Result<usize> {
     use std::io::Write;
 
@@ -5891,7 +5939,15 @@ fn write_diff_snapshot_to_file(
         let start = offset as usize;
         let full_end = start + pages as usize * DIFF_PAGE_BYTES;
         let end = full_end.min(mem.len());
-        data_crc.update(&mem[start..end]);
+        for at in (start..end).step_by(2 * 1024 * 1024) {
+            let bytes = crate::snapshot_memory::read_snapshot_bytes(
+                mem,
+                reader,
+                at,
+                (at + 2 * 1024 * 1024).min(end),
+            )?;
+            data_crc.update(&bytes);
+        }
         // The reader checks the padded run, so pad the CRC the same way.
         data_crc.update(&vec![0u8; full_end - end]);
         data_len += end - start;
@@ -5927,14 +5983,18 @@ fn write_diff_snapshot_to_file(
     wr(&header)?;
     for &(offset, pages) in &runs {
         let start = offset as usize;
-        let end = start + pages as usize * DIFF_PAGE_BYTES;
-        if end <= mem.len() {
-            wr(&mem[start..end])?;
-        } else {
-            // A partial final page is zero-filled so the data stays aligned.
-            wr(&mem[start..])?;
-            wr(&vec![0u8; end - mem.len()])?;
+        let full_end = start + pages as usize * DIFF_PAGE_BYTES;
+        let end = full_end.min(mem.len());
+        for at in (start..end).step_by(2 * 1024 * 1024) {
+            let bytes = crate::snapshot_memory::read_snapshot_bytes(
+                mem,
+                reader,
+                at,
+                (at + 2 * 1024 * 1024).min(end),
+            )?;
+            wr(&bytes)?;
         }
+        wr(&vec![0u8; full_end - end])?;
     }
     file.flush()
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
@@ -9594,6 +9654,132 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     #[test]
+    #[ignore = "requires permitted userfaultfd; run explicitly on Linux"]
+    fn lazy_snapshot_writers_preserve_balloon_reclaim_and_current_bytes() {
+        use std::io::Write as _;
+        use vmm_memory_backend::{
+            dirty::DirtyBitmap, uffd_restore::start_lazy_restore, GuestMemory,
+        };
+        const PAGE: usize = 4096;
+        const LEN: usize = 16 * PAGE;
+        let memory = GuestMemory::new(LEN as u64).unwrap();
+        // SAFETY: this is the live page-aligned mapping owned by memory.
+        assert_eq!(
+            unsafe {
+                libc::madvise(
+                    memory.as_ptr() as *mut libc::c_void,
+                    LEN,
+                    libc::MADV_NOHUGEPAGE,
+                )
+            },
+            0
+        );
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(&vec![0x5a; LEN]).unwrap();
+        let lazy = start_lazy_restore(
+            memory.as_ptr() as *mut u8,
+            LEN,
+            &source,
+            0,
+            LEN as u64,
+            None,
+        )
+        .expect("explicit UFFD regression requires permitted userfaultfd");
+        memory.set_lazy_page_discard(lazy.page_discard());
+        memory.read_phys(PAGE as u64, &mut [0; PAGE]).unwrap();
+        memory.write_phys((3 * PAGE) as u64, &[0xa5; PAGE]).unwrap();
+        memory
+            .discard_range(PAGE as u64, (2 * PAGE) as u64)
+            .unwrap();
+        // Reusing a discarded page must preserve its new guest bytes too.
+        memory
+            .discard_range((4 * PAGE) as u64, PAGE as u64)
+            .unwrap();
+        memory.write_phys((4 * PAGE) as u64, &[0xb6; PAGE]).unwrap();
+        let before = memory.populated_pages().unwrap();
+        assert!(!before[1] && !before[2] && before[3] && before[4]);
+        let reader = crate::snapshot_memory::LazySnapshotReader::new(&memory)
+            .unwrap()
+            .unwrap();
+        // SAFETY: the mapping stays live and no guest/device workers run here.
+        let raw = unsafe { std::slice::from_raw_parts(memory.as_ptr(), LEN) };
+        let mut expected = vec![0x5a; LEN];
+        expected[PAGE..3 * PAGE].fill(0);
+        expected[3 * PAGE..4 * PAGE].fill(0xa5);
+        expected[4 * PAGE..5 * PAGE].fill(0xb6);
+        let reference = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(reference.path(), b"state", &expected);
+        let full = tempfile::NamedTempFile::new().unwrap();
+        write_lazy_snapshot_to_file(full.as_file(), b"state", raw, &reader).unwrap();
+        assert_eq!(
+            std::fs::read(full.path()).unwrap(),
+            std::fs::read(reference.path()).unwrap()
+        );
+        assert_eq!(memory.populated_pages().unwrap(), before);
+
+        let mut dirty = DirtyBitmap::new();
+        for page in 1..=4 {
+            dirty.mark((page * PAGE) as u64);
+        }
+        let base = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(base.path(), b"state", &vec![0x5a; LEN]);
+        let identity = full_snapshot_identity(base.path()).unwrap();
+        let (base_file, offset, crc) =
+            open_snapshot_base(base.path().to_str().unwrap(), &identity, LEN).unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let pending = write_snapshot_memory_from_base(
+            output.as_file(),
+            b"state",
+            raw,
+            &dirty,
+            base_file,
+            offset,
+            crc,
+            Some(&reader),
+        )
+        .unwrap();
+        finish_deferred_snapshot(output.as_file(), pending).unwrap();
+        assert_eq!(
+            std::fs::read(output.path()).unwrap(),
+            std::fs::read(reference.path()).unwrap()
+        );
+        assert_eq!(memory.populated_pages().unwrap(), before);
+
+        let diff = tempfile::NamedTempFile::new().unwrap();
+        let diff_reference = tempfile::NamedTempFile::new().unwrap();
+        write_diff_snapshot_to_file(
+            diff.as_file(),
+            "parent",
+            b"state",
+            raw,
+            &dirty,
+            Some(&reader),
+        )
+        .unwrap();
+        write_diff_snapshot_to_file(
+            diff_reference.as_file(),
+            "parent",
+            b"state",
+            &expected,
+            &dirty,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(diff.path()).unwrap(),
+            std::fs::read(diff_reference.path()).unwrap()
+        );
+        assert_eq!(memory.populated_pages().unwrap(), before);
+        let live = tempfile::NamedTempFile::new().unwrap();
+        crate::live_snapshot::copy_page_run(&memory, live.as_file(), 0, 16).unwrap();
+        assert_eq!(std::fs::read(live.path()).unwrap(), expected);
+        assert_eq!(memory.populated_pages().unwrap(), before);
+        memory.clear_lazy_page_discard();
+        drop(lazy);
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
     fn snapshot_from_base_is_identical_to_a_full_snapshot() {
         use vmm_memory_backend::dirty::DirtyBitmap;
         const PAGE: usize = 4096;
@@ -9636,6 +9822,7 @@ mod tests {
             file,
             offset,
             crc,
+            None,
         )
         .unwrap();
         finish_deferred_snapshot(out.as_file(), pending).unwrap();
@@ -9676,6 +9863,7 @@ mod tests {
             file,
             offset,
             crc,
+            None,
         )
         .unwrap();
         let error = finish_deferred_snapshot(out.as_file(), pending).unwrap_err();
