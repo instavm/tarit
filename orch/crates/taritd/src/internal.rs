@@ -133,6 +133,11 @@ pub fn internal_router(state: AppState) -> Router {
     let max_body_bytes = state.config.api_max_body_bytes;
     Router::new()
         .route("/internal/v1/vms", post(internal_create))
+        .route("/internal/v1/snapshots", get(internal_list_snapshots))
+        .route(
+            "/internal/v1/snapshots/{id}",
+            axum::routing::delete(internal_delete_snapshot),
+        )
         .route("/internal/v1/restore", post(internal_restore))
         .route("/internal/v1/restore-memory-target", post(internal_restore))
         .route(
@@ -1111,6 +1116,29 @@ async fn internal_egress(
     Ok(Json(serde_json::json!({ "rules_applied": rules })))
 }
 
+async fn internal_list_snapshots(
+    State(state): State<AppState>,
+    identity: Option<Extension<ApiIdentity>>,
+) -> Result<Json<Vec<crate::api::PublicSnapshot>>, ApiError> {
+    let identity = require_peer_identity(identity.as_ref().map(|identity| &identity.0))?;
+    Ok(Json(crate::api::public_snapshots_local(&state, identity)?))
+}
+
+async fn internal_delete_snapshot(
+    State(state): State<AppState>,
+    identity: Option<Extension<ApiIdentity>>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let identity = require_peer_identity(identity.as_ref().map(|identity| &identity.0))?;
+    ops::delete_snapshot_local(
+        &state,
+        (!identity.is_admin()).then_some(identity.tenant.as_str()),
+        id,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn internal_get_egress_policy(
     State(state): State<AppState>,
     identity: Option<Extension<ApiIdentity>>,
@@ -1406,6 +1434,79 @@ mod tests {
                 StatusCode::UNAUTHORIZED
             );
         });
+    }
+
+    #[test]
+    fn snapshot_peer_handlers_require_identity_and_enforce_tenant_visibility() {
+        let state = crate::api::tests::test_state();
+        let snapshot = crate::api::tests::snapshot_fixture(&state, "tenant-a", true);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let owner = state.config.api_keys.resolve("tenant-a-key").unwrap();
+        let foreign = state.config.api_keys.resolve("tenant-b-key").unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                internal_list_snapshots(State(state.clone()), None)
+                    .await
+                    .err()
+                    .unwrap()
+                    .into_response()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                internal_delete_snapshot(State(state.clone()), None, Path(snapshot.snapshot_id))
+                    .await
+                    .err()
+                    .unwrap()
+                    .into_response()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert!(internal_list_snapshots(
+                State(state.clone()),
+                Some(Extension(foreign.clone()))
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.0))
+            .0
+            .is_empty());
+            assert_eq!(
+                internal_delete_snapshot(
+                    State(state.clone()),
+                    Some(Extension(foreign)),
+                    Path(snapshot.snapshot_id)
+                )
+                .await
+                .err()
+                .unwrap()
+                .into_response()
+                .status(),
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                internal_delete_snapshot(
+                    State(state.clone()),
+                    Some(Extension(owner)),
+                    Path(snapshot.snapshot_id)
+                )
+                .await
+                .err()
+                .unwrap()
+                .into_response()
+                .status(),
+                StatusCode::CONFLICT
+            );
+        });
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .get_snapshot_by_id(snapshot.snapshot_id)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
