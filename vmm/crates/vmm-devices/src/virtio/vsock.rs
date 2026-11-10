@@ -1233,7 +1233,15 @@ impl MmioDevice for VirtioVsockMmio {
         Ok(val as u64)
     }
 
-    fn mmio_write(&self, off: u64, val: u64, _len: u8) -> MmioWriteResult {
+    fn mmio_write(&self, off: u64, val: u64, len: u8) -> MmioWriteResult {
+        // Virtio MMIO control registers require aligned 32-bit accesses
+        // (Virtio 1.2, 4.2.2.2). KVM's u32 ioeventfd only catches that width:
+        // malformed notifications otherwise reach the confined vCPU thread,
+        // where processing TX could attempt a forbidden host socket connect.
+        // Reject before acquiring queue locks or changing transport state.
+        if len != 4 || !off.is_multiple_of(4) {
+            return Err(MmioError::Device);
+        }
         let val = val as u32;
         if self.is_failed() && !(off == reg::STATUS && val == 0) {
             return Err(MmioError::Device);
@@ -1572,13 +1580,7 @@ mod tests {
         )
     }
 
-    fn submit_tx(
-        dev: &VirtioVsockMmio,
-        mem: &Arc<GuestMemoryMmap>,
-        head_idx: u16,
-        avail_idx: u16,
-        packet: &VsockPacket,
-    ) {
+    fn publish_tx(mem: &Arc<GuestMemoryMmap>, head_idx: u16, avail_idx: u16, packet: &VsockPacket) {
         let bytes = packet.to_bytes();
         let pkt_addr = TX_BUF + head_idx as u64 * 0x1000;
         mem.write_slice(&bytes, GuestAddress(pkt_addr)).unwrap();
@@ -1605,6 +1607,16 @@ mod tests {
             GuestAddress(TX_AVAIL),
         )
         .unwrap();
+    }
+
+    fn submit_tx(
+        dev: &VirtioVsockMmio,
+        mem: &Arc<GuestMemoryMmap>,
+        head_idx: u16,
+        avail_idx: u16,
+        packet: &VsockPacket,
+    ) {
+        publish_tx(mem, head_idx, avail_idx, packet);
         dev.mmio_write(reg::QUEUE_NOTIFY, QUEUE_TX as u64, 4)
             .unwrap();
     }
@@ -1620,6 +1632,98 @@ mod tests {
                 .unwrap();
         }
         VsockPacket { header, data }
+    }
+
+    #[test]
+    fn malformed_control_writes_preserve_pending_tx_and_transport_state() {
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let mem = new_mem();
+        setup_queues(&dev, &mem, 4);
+        let listener = Arc::new(FakeListener {
+            connects: AtomicUsize::new(0),
+            state: Arc::new(Mutex::new(FakeStreamState::default())),
+        });
+        dev.set_host_listener(listener.clone());
+        publish_tx(&mem, 0, 0, &guest_packet(5000, op::REQUEST, &[]));
+        for width in [0, 1, 2, 3, 5, 8, 16] {
+            assert!(dev
+                .mmio_write(reg::QUEUE_NOTIFY, QUEUE_TX as u64, width)
+                .is_err());
+            assert!(dev.mmio_write(reg::STATUS, 0, width).is_err());
+        }
+        assert!(dev
+            .mmio_write(reg::QUEUE_NOTIFY + 1, QUEUE_TX as u64, 4)
+            .is_err());
+        assert_eq!(listener.connects.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(dev.notify_count.load(Ordering::Relaxed), 0);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(TX_USED + 2)).unwrap(), 0);
+        assert!(Persist::try_save(&dev).is_ok());
+        // A valid notification still consumes precisely the preserved request.
+        dev.mmio_write(reg::QUEUE_NOTIFY, QUEUE_TX as u64, 4)
+            .unwrap();
+        assert_eq!(listener.connects.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(TX_USED + 2)).unwrap(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_notify_survives_real_vcpu_seccomp_and_preserves_socket_request() {
+        const CHILD_ENV: &str = "VMM_VSOCK_MMIO_SECCOMP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "virtio::vsock::tests::malformed_notify_survives_real_vcpu_seccomp_and_preserves_socket_request", "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "seccomp child failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("malformed notify killed or wedged confined worker");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dev = Arc::new(VirtioVsockMmio::new(7, GUEST_CID));
+        let mem = new_mem();
+        setup_queues(&dev, &mem, 4);
+        dev.set_host_listener(Arc::new(UdsHostListener { path }));
+        publish_tx(&mem, 0, 0, &guest_packet(5000, op::REQUEST, &[]));
+        let confined = dev.clone();
+        std::thread::spawn(move || {
+            vmm_jailer::seccomp::SeccompProfile::vcpu()
+                .install()
+                .unwrap();
+            for width in [1, 2, 8] {
+                assert!(confined
+                    .mmio_write(reg::QUEUE_NOTIFY, QUEUE_TX as u64, width)
+                    .is_err());
+            }
+        })
+        .join()
+        .unwrap();
+        assert!(
+            Persist::try_save(dev.as_ref()).is_ok(),
+            "queue locks remain usable"
+        );
+        assert_eq!(
+            dev.process_tx_queue().unwrap(),
+            1,
+            "pump context drains preserved request"
+        );
+        assert!(
+            listener.accept().is_ok(),
+            "normal host socket connection succeeds"
+        );
+        assert_eq!(mem.read_obj::<u16>(GuestAddress(TX_USED + 2)).unwrap(), 1);
     }
 
     #[test]
