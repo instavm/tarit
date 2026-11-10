@@ -1004,7 +1004,7 @@ mod tests {
                 golden_snapshot_path: None,
                 prewarm: None,
             };
-            let store = Arc::new(Mutex::new(Store::open(&dir.join("store.db")).unwrap()));
+            let store = Arc::new(Mutex::new(Store::open(dir.join("store.db")).unwrap()));
             store.lock().unwrap().upsert_image(&record).unwrap();
             let req: CreateVmRequest =
                 serde_json::from_value(serde_json::json!({"image":"test"})).unwrap();
@@ -1032,24 +1032,25 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let guard = store
-                .try_lock()
-                .expect("hashing must not hold the shared store");
-            match change {
-                "replace" => {
-                    let mut replacement = record.clone();
-                    replacement.rootfs_digest = Some(format!("sha256:{}", "c".repeat(64)));
-                    guard.upsert_image(&replacement).unwrap();
+            {
+                let guard = store
+                    .try_lock()
+                    .expect("hashing must not hold the shared store");
+                match change {
+                    "replace" => {
+                        let mut replacement = record.clone();
+                        replacement.rootfs_digest = Some(format!("sha256:{}", "c".repeat(64)));
+                        guard.upsert_image(&replacement).unwrap();
+                    }
+                    "delete" => {
+                        guard.delete_image("test", "latest").unwrap();
+                    }
+                    "tamper" => {
+                        std::fs::write(&path, b"tampered rootfs bytes").unwrap();
+                    }
+                    _ => {}
                 }
-                "delete" => {
-                    guard.delete_image("test", "latest").unwrap();
-                }
-                "tamper" => {
-                    std::fs::write(&path, b"tampered rootfs bytes").unwrap();
-                }
-                _ => {}
             }
-            drop(guard);
             release_tx.send(()).unwrap();
             let result = task.await.unwrap();
             match change {
