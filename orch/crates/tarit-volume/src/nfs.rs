@@ -375,6 +375,36 @@ fn decode_mount_field(value: &str) -> String {
         .replace("\\134", "\\")
 }
 
+// mountinfo reports the negotiated minor version in vers=4.1 even when
+// mount.nfs was given vers=4,minorversion=1. Reject ambiguous/conflicting
+// declarations rather than accepting any one matching option.
+fn nfs_version<'a>(options: impl Iterator<Item = &'a String>) -> Option<(u32, u32)> {
+    let mut version = None;
+    let mut minor = None;
+    for option in options {
+        if let Some(value) = option.strip_prefix("vers=") {
+            if version.is_some() {
+                return None;
+            }
+            let (major, embedded_minor) = match value.split_once('.') {
+                Some((major, minor)) => (major.parse().ok()?, Some(minor.parse().ok()?)),
+                None => (value.parse().ok()?, None),
+            };
+            version = Some((major, embedded_minor));
+        } else if let Some(value) = option.strip_prefix("minorversion=") {
+            if minor.is_some() {
+                return None;
+            }
+            minor = Some(value.parse().ok()?);
+        }
+    }
+    let (major, embedded_minor) = version?;
+    if embedded_minor.zip(minor).is_some_and(|(a, b)| a != b) {
+        return None;
+    }
+    Some((major, embedded_minor.or(minor).unwrap_or(0)))
+}
+
 fn verify_mount(spec: &NfsMountSpec, entry: &MountEntry) -> Result<(), VolumeError> {
     let expected_access = if spec.read_only { "ro" } else { "rw" };
     let has_option = |expected: &str| {
@@ -385,13 +415,14 @@ fn verify_mount(spec: &NfsMountSpec, entry: &MountEntry) -> Result<(), VolumeErr
             .any(|option| option == expected)
     };
     let required_protocol_options = spec.options.iter().filter(|option| {
-        option.as_str() == "hard"
-            || option.as_str() == "proto=tcp"
-            || option.starts_with("vers=")
-            || option.starts_with("minorversion=")
-            || option.starts_with("sec=")
+        option.as_str() == "hard" || option.as_str() == "proto=tcp" || option.starts_with("sec=")
     });
-    if entry.fs_type != "nfs4"
+    let expected_version = nfs_version(spec.options.iter());
+    let observed_version =
+        nfs_version(entry.mount_options.iter().chain(entry.super_options.iter()));
+    if expected_version.is_none()
+        || expected_version != observed_version
+        || entry.fs_type != "nfs4"
         || entry.source != spec.source
         || !has_option(expected_access)
         || ["nosuid", "nodev", "noexec"]
@@ -801,6 +832,66 @@ mod tests {
                 None,
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn azure_mount_verifies_negotiated_version_without_relaxing_identity() {
+        let provider = NfsProvider::new(
+            NfsDialect::AzureFiles,
+            "account.file.core.windows.net",
+            "/account/share",
+            None,
+            None,
+        )
+        .unwrap();
+        let spec = provider.prepare(Uuid::new_v4(), 1, true).unwrap();
+        for version in [
+            "vers=4.1",
+            "vers=4,minorversion=1",
+            "vers=4.1,minorversion=1",
+        ] {
+            let line = format!(
+                "41 32 0:51 / /run/tarit ro,nosuid,nodev,noexec - nfs4 {} ro,{version},hard,proto=tcp,sec=sys\n",
+                spec.source
+            );
+            let entry = parse_mountinfo(&line).remove(0);
+            assert!(verify_mount(&spec, &entry).is_ok(), "{version}");
+            for option in ["sec=krb5", "soft", "proto=udp"] {
+                let mut wrong = entry.clone();
+                let replaced = option.split('=').next().unwrap();
+                wrong.super_options.retain(|value| {
+                    if option == "soft" {
+                        value != "hard"
+                    } else {
+                        !value.starts_with(replaced)
+                    }
+                });
+                wrong.super_options.push(option.into());
+                assert!(verify_mount(&spec, &wrong).is_err(), "{option}");
+            }
+            let mut wrong = entry;
+            wrong.source.push_str("-other");
+            assert!(verify_mount(&spec, &wrong).is_err());
+        }
+        for version in [
+            "vers=4",
+            "vers=4.0",
+            "vers=4.2",
+            "vers=3",
+            "vers=4.1,minorversion=0",
+            "vers=4.1,vers=4.2",
+            "vers=4,minorversion=1,minorversion=0",
+            "vers=bad",
+        ] {
+            let line = format!(
+                "41 32 0:51 / /run/tarit ro,nosuid,nodev,noexec - nfs4 {} ro,{version},hard,proto=tcp,sec=sys\n",
+                spec.source
+            );
+            assert!(
+                verify_mount(&spec, &parse_mountinfo(&line)[0]).is_err(),
+                "{version}"
+            );
         }
     }
 
