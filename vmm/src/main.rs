@@ -1455,7 +1455,9 @@ fn api_update_egress(socket: &str, allowlist: Vec<String>, allow_existing: bool)
             Ok(())
         }
         vmm_api::types::ApiResponse::EgressUpdated { .. } => Ok(()),
-        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("update-egress failed: {msg}"),
+        vmm_api::types::ApiResponse::Err { msg, .. } => {
+            anyhow::bail!("update-egress failed: {msg}")
+        }
         other => anyhow::bail!("unexpected update-egress response: {other:?}"),
     }
 }
@@ -1485,7 +1487,7 @@ fn api_snapshot(
             integrity_path,
             ..
         } => (path, overlay_path, volume_paths, integrity_path),
-        vmm_api::types::ApiResponse::Err { msg } => anyhow::bail!("snapshot failed: {msg}"),
+        vmm_api::types::ApiResponse::Err { msg, .. } => anyhow::bail!("snapshot failed: {msg}"),
         other => anyhow::bail!("unexpected snapshot response: {other:?}"),
     };
     for owned_path in std::iter::once(path)
@@ -1506,7 +1508,7 @@ fn api_snapshot(
         let release = send_raw(socket, &release)?;
         match serde_json::from_slice::<vmm_api::types::ApiResponse>(&release)? {
             vmm_api::types::ApiResponse::Ok => {}
-            vmm_api::types::ApiResponse::Err { msg } => {
+            vmm_api::types::ApiResponse::Err { msg, .. } => {
                 anyhow::bail!("release snapshot artifact: {msg}")
             }
             other => anyhow::bail!("unexpected release response: {other:?}"),
@@ -1520,7 +1522,7 @@ fn api_request(socket: &str, req: &vmm_api::types::ApiRequest) -> Result<()> {
     let body = serde_json::to_vec(req)?;
     let resp = send_raw(socket, &body)?;
     let resp: vmm_api::types::ApiResponse = serde_json::from_slice(&resp)?;
-    if let vmm_api::types::ApiResponse::Err { msg } = &resp {
+    if let vmm_api::types::ApiResponse::Err { msg, .. } = &resp {
         anyhow::bail!(msg.clone());
     }
     println!("{}", serde_json::to_string_pretty(&resp)?);

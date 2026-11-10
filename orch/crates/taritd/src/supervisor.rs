@@ -4451,7 +4451,7 @@ impl VmmSupervisor {
                 }
                 ReservationError::VmLimit
                 | ReservationError::VcpuLimit
-                | ReservationError::MemoryLimit => OrchError::Overloaded {
+                | ReservationError::MemoryLimit => OrchError::HostCapacity {
                     message: format!("{HOST_CAPACITY_EXHAUSTED}: {error:?}"),
                     retry_after_secs: 1,
                 },
@@ -8775,6 +8775,9 @@ fn vmm_call_error(operation: &str, error: tarit_vmm_client::VmmError) -> OrchErr
                 retry_after_secs: VMM_BUSY_RETRY_AFTER_SECS,
             }
         }
+        error @ tarit_vmm_client::VmmError::ReflinkRequired(_) => {
+            OrchError::ReflinkRequired(format!("{operation}: {error}"))
+        }
         other => OrchError::Vmm(format!("{operation}: {other}")),
     }
 }
@@ -9591,6 +9594,20 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use tarit_volume::BlockVolumeProvider;
+
+    #[test]
+    fn reflink_classification_survives_supervisor_mapping_without_matching_text() {
+        let error = vmm_call_error(
+            "atomic live snapshot",
+            tarit_vmm_client::VmmError::ReflinkRequired("new wording".into()),
+        );
+        assert!(matches!(error, OrchError::ReflinkRequired(_)));
+        assert_eq!(error.http_status(), 500);
+        assert_eq!(
+            error.to_string(),
+            "vmm error: atomic live snapshot: vmm: new wording"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -11629,7 +11646,7 @@ mod tests {
                 Ok(())
             },
         ));
-        assert!(matches!(result, Err(OrchError::Overloaded { .. })));
+        assert!(matches!(result, Err(OrchError::HostCapacity { .. })));
         assert!(
             !registered.load(Ordering::SeqCst),
             "capacity rejection must leave no durable trace so admission retries the same id"
@@ -13141,6 +13158,7 @@ mod tests {
                     match ram {
                         ScriptedRam::Failed => tarit_vmm_client::ApiResponse::Err {
                             msg: "scripted RAM snapshot failure".into(),
+                            code: None,
                         },
                         ScriptedRam::Unclaimable | ScriptedRam::Written => {
                             if matches!(ram, ScriptedRam::Written) {

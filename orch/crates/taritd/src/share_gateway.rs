@@ -612,12 +612,16 @@ impl From<OrchError> for GatewayError {
             OrchError::NotFound(_)
             | OrchError::BadRequest(_)
             | OrchError::Unprocessable(_)
-            | OrchError::Conflict(_) => Self::NotFound,
+            | OrchError::Conflict(_)
+            | OrchError::ShareCollision(_)
+            | OrchError::ShareTargetChanged => Self::NotFound,
             OrchError::Forbidden(_)
             | OrchError::Unavailable(_)
             | OrchError::Internal(_)
             | OrchError::Vmm(_)
-            | OrchError::Overloaded { .. } => Self::Unavailable,
+            | OrchError::Overloaded { .. }
+            | OrchError::HostCapacity { .. }
+            | OrchError::ReflinkRequired(_) => Self::Unavailable,
         }
     }
 }

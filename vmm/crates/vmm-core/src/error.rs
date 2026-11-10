@@ -25,6 +25,8 @@ pub enum VmmError {
     },
     #[error("snapshot error: {0}")]
     Snapshot(String),
+    #[error("snapshot error: {0}")]
+    ReflinkRequired(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

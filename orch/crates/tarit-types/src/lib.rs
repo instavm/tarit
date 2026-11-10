@@ -1171,11 +1171,26 @@ pub enum OrchError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("conflict: {0}")]
+    ShareCollision(String),
+
+    #[error("conflict: share target VM changed or is not running")]
+    ShareTargetChanged,
+
     #[error("overloaded: {message}")]
     Overloaded {
         message: String,
         retry_after_secs: u64,
     },
+
+    #[error("overloaded: {message}")]
+    HostCapacity {
+        message: String,
+        retry_after_secs: u64,
+    },
+
+    #[error("vmm error: {0}")]
+    ReflinkRequired(String),
 
     #[error("unauthorized")]
     Unauthorized,
@@ -1199,18 +1214,21 @@ impl OrchError {
             Self::NotFound(_) => 404,
             Self::BadRequest(_) => 400,
             Self::Unprocessable(_) => 422,
-            Self::Conflict(_) => 409,
-            Self::Overloaded { .. } => 429,
+            Self::Conflict(_) | Self::ShareCollision(_) | Self::ShareTargetChanged => 409,
+            Self::Overloaded { .. } | Self::HostCapacity { .. } => 429,
             Self::Unauthorized => 401,
             Self::Forbidden(_) => 403,
             Self::Unavailable(_) => 503,
-            Self::Internal(_) | Self::Vmm(_) => 500,
+            Self::Internal(_) | Self::Vmm(_) | Self::ReflinkRequired(_) => 500,
         }
     }
 
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             Self::Overloaded {
+                retry_after_secs, ..
+            }
+            | Self::HostCapacity {
                 retry_after_secs, ..
             } => Some(*retry_after_secs),
             _ => None,
@@ -1221,6 +1239,27 @@ impl OrchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classified_failures_keep_http_status_retry_and_display_contracts() {
+        let capacity = OrchError::HostCapacity {
+            message: "any wording".into(),
+            retry_after_secs: 1,
+        };
+        assert_eq!(capacity.http_status(), 429);
+        assert_eq!(capacity.retry_after_secs(), Some(1));
+        assert_eq!(capacity.to_string(), "overloaded: any wording");
+        for error in [
+            OrchError::ShareCollision("collision".into()),
+            OrchError::ShareTargetChanged,
+        ] {
+            assert_eq!(error.http_status(), 409);
+            assert_eq!(error.retry_after_secs(), None);
+        }
+        let reflink = OrchError::ReflinkRequired("detail".into());
+        assert_eq!(reflink.http_status(), 500);
+        assert_eq!(reflink.to_string(), "vmm error: detail");
+    }
 
     #[test]
     fn openssh_sha256_fingerprint_matches_known_key_blob() {

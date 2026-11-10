@@ -29,6 +29,10 @@ pub enum FleetError {
     NotFound,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("conflict: {0}")]
+    ShareCollision(String),
+    #[error("conflict: share target VM changed or is not running")]
+    ShareTargetChanged,
     #[error("tenant {owner_key} VM quota exceeded (max {max_vms})")]
     QuotaExceeded { owner_key: String, max_vms: usize },
     #[error("invalid fleet share row: {0}")]
@@ -2626,9 +2630,7 @@ impl PostgresFleet {
             )
             .await?;
         if vm.id != share.vm_id || current.is_none() {
-            return Err(FleetError::Conflict(
-                "share target VM changed or is not running".into(),
-            ));
+            return Err(FleetError::ShareTargetChanged);
         }
         let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
         let created_at = share.created_at.to_rfc3339();
@@ -2652,7 +2654,7 @@ impl PostgresFleet {
             ],
         )
         .await
-        .map_err(fleet_error_from_postgres)?;
+        .map_err(share_insert_error_from_postgres)?;
         tx.commit().await?;
         Ok(())
     }
@@ -2682,7 +2684,7 @@ impl PostgresFleet {
                 ],
             )
             .await
-            .map_err(fleet_error_from_postgres)?;
+            .map_err(share_insert_error_from_postgres)?;
         Ok(())
     }
 
@@ -2775,9 +2777,7 @@ impl PostgresFleet {
             )
             .await?;
         if vm.id != share.vm_id || current.is_none() {
-            return Err(FleetError::Conflict(
-                "share target VM changed or is not running".into(),
-            ));
+            return Err(FleetError::ShareTargetChanged);
         }
         let revoked_at = share.revoked_at.as_ref().map(DateTime::to_rfc3339);
         let updated_at = share.updated_at.to_rfc3339();
@@ -3714,6 +3714,14 @@ fn env_positive_u64(name: &str, default: u64) -> Result<u64, FleetError> {
             .ok_or_else(|| FleetError::Config(format!("{name} must be a positive integer"))),
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(FleetError::Config(format!("read {name}: {error}"))),
+    }
+}
+
+fn share_insert_error_from_postgres(error: tokio_postgres::Error) -> FleetError {
+    if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+        FleetError::ShareCollision(error.to_string())
+    } else {
+        fleet_error_from_postgres(error)
     }
 }
 
@@ -5155,7 +5163,7 @@ mod tests {
             fleet.upsert_vm(&replacement).await?;
             assert!(matches!(
                 fleet.insert_share_for_vm(&late, &vm).await,
-                Err(FleetError::Conflict(_))
+                Err(FleetError::ShareTargetChanged)
             ));
             fleet.insert_share_for_vm(&late, &replacement).await?;
             assert!(matches!(
@@ -5305,12 +5313,34 @@ mod tests {
             };
             if !matches!(
                 fleet.insert_share(&duplicate_slug).await,
-                Err(FleetError::Conflict(_))
+                Err(FleetError::ShareCollision(_))
             ) {
                 return Err(FleetError::Config(
                     "duplicate share slug was accepted".into(),
                 ));
             }
+
+            let duplicate_id = ShareRecord {
+                slug: format!("other-{suffix}"),
+                ..first.clone()
+            };
+            assert!(matches!(
+                fleet.insert_share(&duplicate_id).await,
+                Err(FleetError::ShareCollision(_))
+            ));
+            let invalid_port = ShareRecord {
+                id: Uuid::new_v4(),
+                slug: format!("invalid-{suffix}"),
+                guest_port: 0,
+                ..first.clone()
+            };
+            assert!(
+                matches!(
+                    fleet.insert_share(&invalid_port).await,
+                    Err(FleetError::Conflict(_))
+                ),
+                "CHECK failures must not be retried as slug collisions"
+            );
 
             let listed = fleet.list_shares(&tenant_a).await?;
             if listed.iter().map(|share| share.id).collect::<Vec<_>>() != vec![second.id, first.id]

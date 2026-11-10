@@ -112,6 +112,10 @@ pub enum StoreError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("conflict: {0}")]
+    ShareCollision(String),
+    #[error("conflict: share target VM changed or is not running")]
+    ShareTargetChanged,
 }
 
 pub struct Store {
@@ -1657,9 +1661,7 @@ impl Store {
             || current.owner_key.as_deref() != Some(share.owner_key.as_str())
             || current.status != VmStatus::Running
         {
-            return Err(StoreError::Conflict(
-                "share target VM changed or is not running".into(),
-            ));
+            return Err(StoreError::ShareTargetChanged);
         }
         Ok(())
     }
@@ -3683,7 +3685,7 @@ fn share_error_from_sqlite(error: rusqlite::Error) -> StoreError {
             if db_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
                 || db_error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
     ) {
-        StoreError::Conflict("share slug already exists".into())
+        StoreError::ShareCollision("share slug already exists".into())
     } else {
         StoreError::Sqlite(error)
     }
@@ -4058,7 +4060,7 @@ mod tests {
         };
         assert!(matches!(
             store.insert_share(&duplicate),
-            Err(StoreError::Conflict(_))
+            Err(StoreError::ShareCollision(_))
         ));
     }
 
@@ -4074,7 +4076,7 @@ mod tests {
         };
         assert!(matches!(
             store.insert_share(&duplicate_id),
-            Err(StoreError::Conflict(_))
+            Err(StoreError::ShareCollision(_))
         ));
 
         let duplicate_slug = ShareRecord {
@@ -4083,7 +4085,7 @@ mod tests {
         };
         assert!(matches!(
             store.insert_share(&duplicate_slug),
-            Err(StoreError::Conflict(_))
+            Err(StoreError::ShareCollision(_))
         ));
 
         let invalid_port = ShareRecord {

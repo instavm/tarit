@@ -21,10 +21,27 @@ pub enum VmmError {
     #[error("vmm: {0}")]
     Api(String),
 
+    #[error("vmm: {0}")]
+    ReflinkRequired(String),
+
     /// The VMM refused the request without changing the VM, because the host
     /// was too busy to finish it in time; the same request can be sent again.
     #[error("vmm busy: {0}")]
     Busy(String),
+}
+
+// Only legacy, unclassified peers require message recognition. Explicit codes win.
+fn classify_api_error(msg: String, code: Option<ApiErrorCode>) -> VmmError {
+    match code {
+        Some(ApiErrorCode::ReflinkRequired) => VmmError::ReflinkRequired(msg),
+        _ => match msg.strip_prefix(RETRYABLE_ERROR_PREFIX) {
+            Some(reason) => VmmError::Busy(reason.to_string()),
+            None if code.is_none() && msg.contains("requires reflink/FICLONE") => {
+                VmmError::ReflinkRequired(msg)
+            }
+            None => VmmError::Api(msg),
+        },
+    }
 }
 
 fn read_api_frame(stream: &mut UnixStream) -> Result<Vec<u8>, VmmError> {
@@ -430,10 +447,7 @@ impl VmmClient {
 
     pub fn request_ok(&self, req: &ApiRequest) -> Result<ApiResponse, VmmError> {
         match self.request(req)? {
-            ApiResponse::Err { msg } => Err(match msg.strip_prefix(RETRYABLE_ERROR_PREFIX) {
-                Some(reason) => VmmError::Busy(reason.to_string()),
-                None => VmmError::Api(msg),
-            }),
+            ApiResponse::Err { msg, code } => Err(classify_api_error(msg, code)),
             other => Ok(other),
         }
     }
@@ -815,6 +829,36 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) -> Result<(), VmmError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_reflink_and_legacy_failures_are_classified_at_boundary() {
+        assert!(matches!(
+            classify_api_error("new wording".into(), Some(ApiErrorCode::ReflinkRequired)),
+            VmmError::ReflinkRequired(_)
+        ));
+        assert!(matches!(
+            classify_api_error("snapshot error: requires reflink/FICLONE".into(), None),
+            VmmError::ReflinkRequired(_)
+        ));
+        assert!(matches!(
+            classify_api_error(
+                "requires reflink/FICLONE".into(),
+                Some(ApiErrorCode::Unknown)
+            ),
+            VmmError::Api(_)
+        ));
+        assert!(
+            matches!(classify_api_error("retryable: busy".into(), None), VmmError::Busy(reason) if reason == "busy")
+        );
+        assert!(matches!(
+            classify_api_error("retryable: requires reflink/FICLONE".into(), None),
+            VmmError::Busy(_)
+        ));
+        assert!(matches!(
+            classify_api_error("ordinary failure".into(), None),
+            VmmError::Api(_)
+        ));
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -1287,6 +1331,7 @@ mod tests {
         let (request, result) = serve_one_snapshot(
             ApiResponse::Err {
                 msg: "snapshot failed".into(),
+                code: None,
             },
             |client| client.snapshot_unreleased_with(false, Some("/snapshots/base.snap"), true),
         );

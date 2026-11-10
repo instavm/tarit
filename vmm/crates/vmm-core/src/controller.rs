@@ -4305,14 +4305,17 @@ fn capture_overlay(source: &Path, require_reflink: bool) -> Result<OwnedScratchF
         };
         if let Err(error) = copied {
             remove_owned_scratch_file(&captured);
-            return Err(VmmError::Snapshot(if require_reflink {
-                format!(
+            return Err(if require_reflink {
+                VmmError::ReflinkRequired(format!(
                     "atomic live disk snapshot requires reflink/FICLONE for {}: {error}",
                     source.display()
-                )
+                ))
             } else {
-                format!("capture disk overlay {}: {error}", source.display())
-            }));
+                VmmError::Snapshot(format!(
+                    "capture disk overlay {}: {error}",
+                    source.display()
+                ))
+            });
         }
     }
     if let Err(error) = persist_owned_output(&mut captured, &target) {

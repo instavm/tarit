@@ -1416,15 +1416,7 @@ async fn restore_warm_on_demand(state: &AppState, spec: &VmSpawnConfig) -> OnDem
     .await;
     match restored {
         Ok(Ok(())) => OnDemandRestore::Restored,
-        Ok(Err(OrchError::Overloaded {
-            message,
-            retry_after_secs,
-        })) if message.contains(crate::supervisor::HOST_CAPACITY_EXHAUSTED) => {
-            OnDemandRestore::AtCapacity(OrchError::Overloaded {
-                message,
-                retry_after_secs,
-            })
-        }
+        Ok(Err(error @ OrchError::HostCapacity { .. })) => OnDemandRestore::AtCapacity(error),
         Ok(Err(error)) => {
             tracing::warn!(%error, "on-demand warm restore failed");
             OnDemandRestore::Unavailable
@@ -3300,7 +3292,7 @@ async fn snapshot_local_locked(
             return sup.snapshot_bundle_vm(id, true, overlay_path, memory_mib);
         }
         match sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some()) {
-            Err(OrchError::Vmm(message)) if message.contains("requires reflink/FICLONE") => {
+            Err(OrchError::ReflinkRequired(_)) => {
                 tracing::warn!(
                     %id,
                     "overlay filesystem lacks reflink; using a paused snapshot instead of a live one"
@@ -5239,6 +5231,7 @@ mod tests {
             let response = match &request {
                 tarit_vmm_client::ApiRequest::Pause => tarit_vmm_client::ApiResponse::Err {
                     msg: "injected I/O quiescence failure".into(),
+                    code: None,
                 },
                 tarit_vmm_client::ApiRequest::Status => {
                     tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
@@ -5325,6 +5318,7 @@ mod tests {
                 tarit_vmm_client::ApiRequest::Snapshot { .. } => {
                     tarit_vmm_client::ApiResponse::Err {
                         msg: "injected snapshot failure".into(),
+                        code: None,
                     }
                 }
                 tarit_vmm_client::ApiRequest::Status => {
@@ -5414,6 +5408,7 @@ mod tests {
                     tarit_vmm_client::ApiRequest::Snapshot { .. } => {
                         tarit_vmm_client::ApiResponse::Err {
                             msg: "injected snapshot failure".into(),
+                            code: None,
                         }
                     }
                     tarit_vmm_client::ApiRequest::Status => {
@@ -5421,6 +5416,7 @@ mod tests {
                         if status_requests == 1 {
                             tarit_vmm_client::ApiResponse::Err {
                                 msg: "injected status outage".into(),
+                                code: None,
                             }
                         } else {
                             tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
@@ -5774,6 +5770,7 @@ mod tests {
                     }
                     tarit_vmm_client::ApiResponse::Err {
                         msg: "injected capture failure".into(),
+                        code: None,
                     }
                 }
                 tarit_vmm_client::ApiRequest::Snapshot { .. } => {
