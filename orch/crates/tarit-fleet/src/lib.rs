@@ -522,15 +522,15 @@ impl PostgresFleet {
             .as_deref()
             .ok_or_else(|| FleetError::Conflict("fleet snapshot requires a tenant owner".into()))?;
         let client = self.pool.get().await?;
-        client
+        let changed = client
             .execute(
                 "INSERT INTO fleet_snapshots (snapshot_id, host_id, owner_key, snapshot_path, created_at)
                  VALUES ($1,$2,$3,$4,$5)
                  ON CONFLICT (snapshot_id) DO UPDATE SET
                    host_id = EXCLUDED.host_id,
-                   owner_key = EXCLUDED.owner_key,
                    snapshot_path = EXCLUDED.snapshot_path,
-                   created_at = EXCLUDED.created_at",
+                   created_at = EXCLUDED.created_at
+                 WHERE fleet_snapshots.owner_key = EXCLUDED.owner_key",
                 &[
                     &snapshot.snapshot_id,
                     &snapshot.host_id,
@@ -540,6 +540,11 @@ impl PostgresFleet {
                 ],
             )
             .await?;
+        if changed != 1 {
+            return Err(FleetError::Conflict(
+                "snapshot identity belongs to another tenant".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -4942,7 +4947,60 @@ mod tests {
         assert_eq!(location.host_id, snapshot.host_id);
         assert_eq!(location.owner_key, snapshot.owner_key.as_deref().unwrap());
         assert_eq!(location.snapshot_path, snapshot.path);
+        let mut moved = snapshot.clone();
+        moved.host_id = "host-b".into();
+        moved.path = format!("/private/{}.ram", Uuid::new_v4());
+        fleet.upsert_snapshot(&moved).await?;
+        let mut other_tenant = moved.clone();
+        other_tenant.owner_key = Some("tenant-b".into());
+        other_tenant.host_id = "host-attacker".into();
+        other_tenant.path = "/private/replacement.ram".into();
+        assert!(matches!(
+            fleet.upsert_snapshot(&other_tenant).await,
+            Err(FleetError::Conflict(_))
+        ));
+        let retained = fleet
+            .get_snapshot_location(snapshot.snapshot_id)
+            .await?
+            .unwrap();
+        assert_eq!(retained.owner_key, "tenant-a");
+        assert_eq!(retained.host_id, moved.host_id);
+        assert_eq!(retained.snapshot_path, moved.path);
+        let mut ownerless = moved.clone();
+        ownerless.owner_key = None;
+        assert!(matches!(
+            fleet.upsert_snapshot(&ownerless).await,
+            Err(FleetError::Conflict(_))
+        ));
+        // Concurrent first publication has one immutable tenant winner, rather
+        // than a last-writer owner transfer.
+        let mut first = moved.clone();
+        first.snapshot_id = Uuid::new_v4();
+        let mut second = first.clone();
+        second.owner_key = Some("tenant-b".into());
+        let (left, right) = tokio::join!(
+            fleet.upsert_snapshot(&first),
+            fleet.upsert_snapshot(&second)
+        );
+        assert!(matches!(
+            (&left, &right),
+            (Ok(()), Err(FleetError::Conflict(_))) | (Err(FleetError::Conflict(_)), Ok(()))
+        ));
+        let winner = fleet
+            .get_snapshot_location(first.snapshot_id)
+            .await?
+            .unwrap();
+        assert_eq!(
+            winner.owner_key,
+            if left.is_ok() { "tenant-a" } else { "tenant-b" }
+        );
         let client = fleet.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM fleet_snapshots WHERE snapshot_id = $1",
+                &[&first.snapshot_id],
+            )
+            .await?;
         client
             .execute(
                 "DELETE FROM fleet_snapshots WHERE snapshot_id = $1",
