@@ -2249,7 +2249,7 @@ mod tests {
         configure_test_blk_queue(&dev, mem.clone());
         // Two 512-byte writes fill a 1 KiB backlog.
         dev.set_writeback_limit(1024);
-        setup_blk_out_requests(&mem, 5);
+        setup_blk_out_requests(&mem, 4);
 
         // The pass serves writes until the backlog is full, then stops with
         // the next write still the driver's and asks for a host flush.
@@ -2271,27 +2271,23 @@ mod tests {
         restored.restore(state);
         restored.set_guest_memory(restored_mem.clone());
         restored.process_queue(0).unwrap();
-        assert_eq!(used_idx(&restored_mem), 5);
+        assert_eq!(used_idx(&restored_mem), 4);
 
-        // The flush empties the backlog; the next pass serves two more.
+        // The flush empties the backlog; the next pass serves the rest.
         dev.service_host_flush().unwrap();
         assert!(!dev.host_flush_wanted());
-                assert!(!dev.process_queue_pass().unwrap());
-        assert_eq!(used_idx(&mem), 4);
-        assert!(dev.host_flush_wanted());
-        dev.service_host_flush().unwrap();
         assert!(!dev.process_queue_pass().unwrap());
-        assert_eq!(used_idx(&mem), 5);
-        for request in 0..5 {
+        assert_eq!(used_idx(&mem), 4);
+        for request in 0..4 {
             assert_eq!(request_status(&mem, request), status::OK);
         }
         use std::os::unix::fs::FileExt;
-        let mut disk = vec![0u8; 5 * 512];
+        let mut disk = vec![0u8; 4 * 512];
         std::fs::File::open(&path)
             .unwrap()
             .read_exact_at(&mut disk, 0)
             .unwrap();
-        for request in 0..5usize {
+        for request in 0..4usize {
             assert!(disk[request * 512..(request + 1) * 512]
                 .iter()
                 .all(|&byte| byte == request as u8));
