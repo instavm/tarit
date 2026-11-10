@@ -34,7 +34,7 @@ What maps to what:
   capped at 180 s.
 - `snapshot.create` takes an incremental checkpoint: the guest pauses only for
   memory changed since the last one, and the result restores on its own.
-- `pause`/`resume` keep memory. `getUrl` creates a public share of the port.
+- `pause`/`resume` keep memory. `getUrl` reuses an active public share for the VM and port, creating one if needed. Private and revoked shares are left untouched. Concurrent calls with the same API URL/key, VM, and port share one lookup/create operation within this process. Separate processes can still create duplicates because the API does not enforce uniqueness. Each later call checks current shares again; a concurrent revocation can still invalidate a returned URL.
 
 ## Fast creates
 
