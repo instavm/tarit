@@ -27,6 +27,9 @@ pub mod kvm;
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub mod live_snapshot;
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
+mod snapshot_memory;
+
+#[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub mod vcpu_setup;
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 pub mod vcpu_thread;
