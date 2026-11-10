@@ -45,6 +45,8 @@ pub enum OciError {
     CommandFailed { cmd: String, stderr: String },
     #[error("invalid output path: {0}")]
     InvalidOutput(String),
+    #[error("rootless registry conversion needs a local Docker/Podman engine and no explicit auth_file; authenticate the engine and retry, use docker-daemon:IMAGE or podman:IMAGE, or run the ownership-capable registry converter")]
+    RootlessRegistryUnsupported,
     #[error("unsafe OCI rootfs path: {0}")]
     UnsafePath(String),
     #[error("invalid OCI layout: {0}")]
@@ -200,21 +202,25 @@ pub fn pull_and_convert_with_agent(
             start,
         );
     }
-    if let Some(name) = image.reference.strip_prefix("docker://") {
-        if (which("skopeo").is_none() || which("umoci").is_none()) && image.auth_file.is_none() {
-            if let Some(engine) = ENGINES.iter().find(|engine| which(engine).is_some()) {
-                log::info!("oci: skopeo/umoci unavailable; exporting {name} through {engine}");
-                return convert_engine_image(
-                    engine,
-                    name,
-                    output_path,
-                    size_mb,
-                    agent_path,
-                    limits,
-                    start,
-                );
-            }
-        }
+    let owner_capable = can_set_any_owner();
+    let registry_tools = which("skopeo").is_some() && which("umoci").is_some();
+    let engine = ENGINES
+        .iter()
+        .copied()
+        .find(|engine| which(engine).is_some());
+    if let Some((engine, name)) =
+        registry_conversion_route(image, owner_capable, registry_tools, engine)?
+    {
+        log::info!("oci: exporting {name} through {engine} for ownership-safe conversion");
+        return convert_engine_image(
+            engine,
+            name,
+            output_path,
+            size_mb,
+            agent_path,
+            limits,
+            start,
+        );
     }
 
     // Check for required tools.
@@ -323,6 +329,30 @@ fn engine_image_source(reference: &str) -> Option<(&'static str, &str)> {
     reference
         .strip_prefix("podman:")
         .map(|name| ("podman", name))
+}
+
+// umoci's rootless unpack emulates owners in xattrs and devices with empty
+// files. mke2fs -d does not understand that emulation. Use the existing engine
+// export metadata restoration path, or fail before download instead of silently
+// producing an image owned by the host user. An explicit auth file must never
+// be silently replaced with the engine's credentials.
+fn registry_conversion_route<'a>(
+    image: &'a OciImageRef,
+    owner_capable: bool,
+    registry_tools: bool,
+    engine: Option<&'static str>,
+) -> Result<Option<(&'static str, &'a str)>, OciError> {
+    if let Some(name) = image.reference.strip_prefix("docker://") {
+        if image.auth_file.is_none() && (!owner_capable || !registry_tools) {
+            if let Some(engine) = engine {
+                return Ok(Some((engine, name)));
+            }
+        }
+    }
+    if !owner_capable {
+        return Err(OciError::RootlessRegistryUnsupported);
+    }
+    Ok(None)
 }
 
 // Darwin's mode_t is u16, while Linux uses u32; exported ext4 modes are u32.
@@ -2051,11 +2081,21 @@ fn can_set_any_owner() -> bool {
     if unsafe { libc::geteuid() } != 0 {
         return false;
     }
-    let full = |path: &str| std::fs::read_to_string(path).is_ok_and(|map| maps_every_id(&map));
-    full("/proc/self/uid_map") && full("/proc/self/gid_map")
+    #[cfg(target_os = "linux")]
+    {
+        let full = |path: &str| std::fs::read_to_string(path).is_ok_and(|map| maps_every_id(&map));
+        full("/proc/self/uid_map") && full("/proc/self/gid_map")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // User-namespace ID maps are Linux-specific; root on other Unix hosts
+        // can preserve image owners without /proc/self/{uid,gid}_map.
+        true
+    }
 }
 
 /// A `uid_map`/`gid_map` that maps IDs 0..2^32-1 onto themselves.
+#[cfg(any(target_os = "linux", test))]
 fn maps_every_id(map: &str) -> bool {
     let fields: Vec<&str> = map.split_whitespace().collect();
     fields == ["0", "0", "4294967295"]
@@ -2847,6 +2887,64 @@ mod tests {
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn rootless_registry_uses_ownership_aware_engine_even_with_registry_tools() {
+        let image = OciImageRef {
+            reference: "docker://registry.test/image:tag".into(),
+            auth_file: None,
+        };
+        for tools in [false, true] {
+            assert_eq!(
+                registry_conversion_route(&image, false, tools, Some("podman")).unwrap(),
+                Some(("podman", "registry.test/image:tag"))
+            );
+            assert!(matches!(
+                registry_conversion_route(&image, false, tools, None),
+                Err(OciError::RootlessRegistryUnsupported)
+            ));
+        }
+        assert_eq!(
+            registry_conversion_route(&image, true, true, Some("podman")).unwrap(),
+            None
+        );
+        assert_eq!(
+            registry_conversion_route(&image, true, false, Some("docker")).unwrap(),
+            Some(("docker", "registry.test/image:tag"))
+        );
+        assert_eq!(
+            registry_conversion_route(&image, true, false, None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rootless_explicit_credentials_and_non_registry_transports_fail_closed() {
+        let mut image = OciImageRef {
+            reference: "docker://registry.test/private:tag".into(),
+            auth_file: Some("private-auth.json".into()),
+        };
+        for tools in [false, true] {
+            assert!(matches!(
+                registry_conversion_route(&image, false, tools, Some("docker")),
+                Err(OciError::RootlessRegistryUnsupported)
+            ));
+            assert_eq!(
+                registry_conversion_route(&image, true, tools, Some("docker")).unwrap(),
+                None
+            );
+        }
+        image.auth_file = None;
+        image.reference = "oci:/tmp/layout:default".into();
+        assert!(matches!(
+            registry_conversion_route(&image, false, true, Some("docker")),
+            Err(OciError::RootlessRegistryUnsupported)
+        ));
+        assert_eq!(
+            registry_conversion_route(&image, true, true, Some("docker")).unwrap(),
+            None
         );
     }
 
