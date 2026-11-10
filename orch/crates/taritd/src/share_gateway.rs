@@ -2482,13 +2482,8 @@ mod tests {
         }
         // A gate already held by another operation must not even be awaited by
         // an unauthorized old share. The public ingress rejects before wake.
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        state
-            .activation_gates
-            .lock()
-            .unwrap()
-            .insert(share.vm_id, gate.clone());
-        let held = gate.lock_owned().await;
+        let gate = crate::ops::activation_gate(&state, share.vm_id).unwrap();
+        let held = gate.lock().await;
         for websocket in [false, true] {
             let mut request = Request::builder().uri("/").header(HOST, SHARE_HOST);
             if websocket {

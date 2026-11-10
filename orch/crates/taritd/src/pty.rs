@@ -943,14 +943,9 @@ mod tests {
             .block_on(async {
                 // Admin identity's tenant differs from the authorized VM's owner.
                 ensure_local_vm_for_pty(&state, id, &admin).await.unwrap();
-                let gate = state
-                    .activation_gates
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .unwrap()
-                    .clone();
-                let held = gate.lock_owned().await;
+                assert!(state.activation_gates.lock().unwrap().is_empty());
+                let gate = crate::ops::activation_gate(&state, id).unwrap();
+                let held = gate.lock().await;
                 let activation = ensure_local_vm_for_pty(&state, id, &tenant);
                 tokio::pin!(activation);
                 assert!(futures_util::poll!(&mut activation).is_pending());

@@ -142,6 +142,13 @@ pub struct VolumeTransition<'a> {
     pub updated_at: DateTime<Utc>,
 }
 
+const UNBOUND_HIBERNATION_SNAPSHOTS_QUERY: &str = "SELECT path, overlay_path, host_id, owner_key, api_key_id, vm_id, ephemeral_owner_vm_id, memory_mib, vcpus,
+                    kernel_path, rootfs_path, rootfs_read_only, cmdline, content_digest,
+                    size_bytes, created_at, snapshot_id
+             FROM snapshots s
+             WHERE ephemeral_owner_vm_id = ?1 AND vm_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM hibernations h WHERE h.snapshot_path = s.path)";
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         if let Some(parent) = path.as_ref().parent() {
@@ -439,6 +446,8 @@ impl Store {
              CREATE INDEX IF NOT EXISTS branches_owner_created
                ON branches(owner_key, created_at DESC);
              CREATE INDEX IF NOT EXISTS branches_head ON branches(head_artifact_id);
+             CREATE INDEX IF NOT EXISTS hibernations_snapshot_path
+               ON hibernations(snapshot_path);
              CREATE INDEX IF NOT EXISTS hibernations_owner
                ON hibernations(owner_key, updated_at DESC);
              CREATE INDEX IF NOT EXISTS vm_egress_policies_owner
@@ -744,6 +753,19 @@ impl Store {
             .query_map(params![vm_id.to_string()], row_to_snapshot)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)?;
+        Ok(snapshots)
+    }
+
+    /// Hibernation-owned images no durable binding still needs. Live-fork
+    /// images have a different source VM and must survive their child's wake.
+    pub fn list_unbound_hibernation_snapshots_for_vm(
+        &self,
+        vm_id: Uuid,
+    ) -> Result<Vec<SnapshotRecord>, StoreError> {
+        let mut statement = self.conn.prepare(UNBOUND_HIBERNATION_SNAPSHOTS_QUERY)?;
+        let snapshots = statement
+            .query_map(params![vm_id.to_string()], row_to_snapshot)?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(snapshots)
     }
 
@@ -4038,6 +4060,99 @@ mod tests {
         ));
         store.delete_hibernation("tenant-a", vm_id).unwrap();
         store.delete_snapshot(&snapshot.path).unwrap();
+    }
+
+    #[test]
+    fn activation_cleanup_uses_indexes_and_preserves_cross_vm_bindings() {
+        let store = Store::open(":memory:").unwrap();
+        let vm_id = Uuid::new_v4();
+        let snapshot = SnapshotRecord {
+            snapshot_id: Uuid::new_v4(),
+            path: "/private/hibernate.ram".into(),
+            overlay_path: None,
+            host_id: "host-a".into(),
+            owner_key: Some("tenant-a".into()),
+            api_key_id: Some("key-a".into()),
+            vm_id,
+            ephemeral_owner_vm_id: Some(vm_id),
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: Some("kernel".into()),
+            rootfs_path: None,
+            rootfs_read_only: Some(false),
+            cmdline: Some("console=ttyS0".into()),
+            content_digest: Some("sha256:test".into()),
+            size_bytes: Some(42),
+            created_at: Utc::now(),
+        };
+        store.insert_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            store
+                .list_unbound_hibernation_snapshots_for_vm(vm_id)
+                .unwrap(),
+            vec![snapshot.clone()]
+        );
+        let bound_id = Uuid::new_v4();
+        store
+            .upsert_hibernation(&HibernationRecord {
+                vm_id: bound_id,
+                owner_key: "tenant-b".into(),
+                snapshot_path: snapshot.path.clone(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        assert!(store
+            .list_unbound_hibernation_snapshots_for_vm(vm_id)
+            .unwrap()
+            .is_empty());
+        store.delete_hibernation("tenant-b", bound_id).unwrap();
+        let fork = SnapshotRecord {
+            snapshot_id: Uuid::new_v4(),
+            path: "/private/fork.ram".into(),
+            vm_id: Uuid::new_v4(),
+            ..snapshot.clone()
+        };
+        store.insert_snapshot(&fork).unwrap();
+        assert_eq!(
+            store
+                .list_unbound_hibernation_snapshots_for_vm(vm_id)
+                .unwrap(),
+            vec![snapshot.clone()]
+        );
+        // Invalid unrelated timestamps prove activation does not decode the
+        // full binding table. Live-fork images remain owned by the child.
+        for _ in 0..2000 {
+            store.conn.execute("INSERT INTO hibernations (vm_id, owner_key, snapshot_path, created_at, updated_at) VALUES (?1, 'other', ?2, 'invalid', 'invalid')",
+                params![Uuid::new_v4().to_string(), fork.path]).unwrap();
+        }
+        assert!(store.list_hibernations().is_err());
+        assert_eq!(
+            store
+                .list_unbound_hibernation_snapshots_for_vm(vm_id)
+                .unwrap(),
+            vec![snapshot]
+        );
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {UNBOUND_HIBERNATION_SNAPSHOTS_QUERY}"
+            ))
+            .unwrap()
+            .query_map(params![vm_id.to_string()], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("snapshots_ephemeral_owner")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("hibernations_snapshot_path")),
+            "{plan:?}"
+        );
     }
 
     #[test]
