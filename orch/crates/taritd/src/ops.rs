@@ -689,7 +689,7 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
             TerminalPhase::PersistRecordAndRelease | TerminalPhase::PersistRecordOnly => {
                 // The terminal lifecycle remains retryable if the outbox write
                 // fails; never publish inactive state before closing its usage.
-                crate::usage::meter_vm_final(state, id)?;
+                crate::usage::meter_vm_final_at(state, id, record.updated_at)?;
                 persist_vm_record(state, record.clone()).await?;
                 set_lifecycle_state(
                     state,
@@ -2571,6 +2571,7 @@ async fn hibernate_local_owned(
         id,
         LifecycleState::Hibernating {
             record: record.clone(),
+            stopped_at: None,
         },
     )?;
     finish_hibernation(state, id).await?;
@@ -2631,7 +2632,8 @@ async fn prepare_hibernation(
 /// Caller holds terminal_transition_gate (and the runtime gate if present).
 /// The durable hibernation row also lets startup recover after a daemon crash.
 async fn finish_hibernation(state: &AppState, id: Uuid) -> Result<(), OrchError> {
-    let Some(LifecycleState::Hibernating { record }) = lifecycle_state(state, id)? else {
+    let Some(LifecycleState::Hibernating { record, stopped_at }) = lifecycle_state(state, id)?
+    else {
         return Ok(());
     };
     if let Some(fleet) = state.fleet.as_ref() {
@@ -2671,12 +2673,31 @@ async fn finish_hibernation(state: &AppState, id: Uuid) -> Result<(), OrchError>
                 OrchError::Internal(format!("publish durable fleet hibernation: {error}"))
             })?;
     }
-    state.pty_registry.close_vm_sessions(id);
-    let supervisor = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || supervisor.stop_vm(id))
-        .await
-        .map_err(|join| OrchError::Internal(format!("hibernate teardown join: {join}")))??;
-    crate::usage::meter_vm_final(state, id)?;
+    let stopped_at = match stopped_at {
+        Some(end) => end,
+        None => {
+            state.pty_registry.close_vm_sessions(id);
+            let supervisor = Arc::clone(&state.supervisor);
+            tokio::task::spawn_blocking(move || supervisor.stop_vm(id))
+                .await
+                .map_err(|join| {
+                    OrchError::Internal(format!("hibernate teardown join: {join}"))
+                })??;
+            let end = Utc::now();
+            // Keep the exact boundary even if persisting the freeze itself
+            // fails. Retries must not run teardown again and choose a later end.
+            set_lifecycle_state(
+                state,
+                id,
+                LifecycleState::Hibernating {
+                    record: record.clone(),
+                    stopped_at: Some(end),
+                },
+            )?;
+            end
+        }
+    };
+    crate::usage::meter_vm_final_at(state, id, stopped_at)?;
     claim_lifecycle_ownership(state, &record).await?;
     persist_vm_record(state, record.clone()).await?;
     commit_vm_record(state, record.clone())?;

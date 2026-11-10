@@ -19,7 +19,7 @@ use uuid::Uuid;
 use tarit_fleet::PostgresFleet;
 use tarit_types::{UsageEvent, UsageKind, VmStatus};
 
-use crate::api::{AppState, StoreWrite};
+use crate::api::{AppState, LifecycleState, StoreWrite};
 
 const FLUSH_BATCH: usize = 500;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
@@ -80,6 +80,28 @@ fn meter_runtime_once(state: &AppState) {
         let (Some(api_key_id), Some(owner_key)) = (api_key_id, owner_key) else {
             continue;
         };
+        // Check under the store mutex, immediately before metering, so a
+        // stale cache scan cannot bill a stopped lifecycle if persisting its
+        // frozen end failed. Lifecycle writers release their mutex before I/O.
+        let closed = state
+            .lifecycle
+            .lock()
+            .map(|lifecycle| {
+                matches!(
+                    lifecycle.get(&vm_id),
+                    Some(
+                        LifecycleState::Terminal { .. }
+                            | LifecycleState::Hibernating {
+                                stopped_at: Some(_),
+                                ..
+                            }
+                    )
+                )
+            })
+            .unwrap_or(true);
+        if closed || !matches!(store.get_billing_end(vm_id), Ok(None)) {
+            continue;
+        }
         let Ok(Some(start)) = store.get_billing_watermark(vm_id) else {
             continue;
         };
@@ -98,7 +120,7 @@ pub fn meter_vm_final(state: &AppState, vm_id: Uuid) -> Result<(), tarit_types::
     meter_vm_final_at(state, vm_id, Utc::now())
 }
 
-fn meter_vm_final_at(
+pub(crate) fn meter_vm_final_at(
     state: &AppState,
     vm_id: Uuid,
     now: DateTime<Utc>,
@@ -131,8 +153,14 @@ fn meter_vm_final_at(
     else {
         return Ok(());
     };
-    if now > start {
-        let event = runtime_event(state, vm_id, api_key_id, owner_key, start, now);
+    let Some(end) = store
+        .freeze_billing_end(vm_id, now)
+        .map_err(crate::api::store_err)?
+    else {
+        return Ok(());
+    };
+    if end > start {
+        let event = runtime_event(state, vm_id, api_key_id, owner_key, start, end);
         store
             .commit_runtime_usage(&event, true)
             .map_err(crate::api::store_err)?;
@@ -561,6 +589,33 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].window_start, start);
         assert!(events[0].seconds.unwrap() >= 10.0);
+    }
+
+    #[test]
+    fn runtime_final_retry_keeps_teardown_end_and_meter_cannot_extend_it() {
+        let state = test_state();
+        let id = owned_vm(&state, VmStatus::Running);
+        let start = Utc::now() - chrono::Duration::seconds(20);
+        let stopped_at = start + chrono::Duration::seconds(10);
+        {
+            let store = state.store.lock().unwrap();
+            store.set_billing_watermark(id, start).unwrap();
+            // This marker survives an unsuccessful final outbox transaction.
+            store.freeze_billing_end(id, stopped_at).unwrap();
+        }
+        meter_runtime_once(&state);
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .list_unsent_usage(100)
+            .unwrap()
+            .is_empty());
+        meter_vm_final_at(&state, id, stopped_at + chrono::Duration::hours(8)).unwrap();
+        let events = state.store.lock().unwrap().list_unsent_usage(100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].window_end, stopped_at);
+        assert_eq!(events[0].seconds, Some(10.0));
     }
 
     #[test]

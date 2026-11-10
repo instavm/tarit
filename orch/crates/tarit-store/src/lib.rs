@@ -320,6 +320,10 @@ impl Store {
                vm_id TEXT PRIMARY KEY,
                last_billed_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS billing_runtime_end (
+               vm_id TEXT PRIMARY KEY,
+               ended_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS snapshots (
                path TEXT PRIMARY KEY NOT NULL,
                snapshot_id TEXT UNIQUE,
@@ -566,6 +570,10 @@ impl Store {
              WHEN NEW.status IN ('running','paused','suspended')
               AND OLD.status NOT IN ('running','paused','suspended') BEGIN
                INSERT OR REPLACE INTO billing_watermark VALUES (NEW.id, NEW.updated_at);
+             END;
+             CREATE TRIGGER IF NOT EXISTS clear_runtime_end_on_watermark_delete
+             AFTER DELETE ON billing_watermark BEGIN
+               DELETE FROM billing_runtime_end WHERE vm_id = OLD.vm_id;
              END;
              CREATE TRIGGER IF NOT EXISTS clear_runtime_on_vm_inactive
              AFTER UPDATE OF status ON vms
@@ -2926,6 +2934,35 @@ impl Store {
         mark_outbox_sent(&self.conn, "audit_outbox", ids)
     }
 
+    /// Freeze the first confirmed teardown boundary before attempting outbox
+    /// writes. A failed final transaction must never move this end on retry.
+    pub fn freeze_billing_end(
+        &self,
+        vm_id: Uuid,
+        end: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO billing_runtime_end (vm_id, ended_at)
+             SELECT vm_id, ?2 FROM billing_watermark WHERE vm_id = ?1",
+            params![vm_id.to_string(), end.to_rfc3339()],
+        )?;
+        self.get_billing_end(vm_id)
+    }
+
+    pub fn get_billing_end(&self, vm_id: Uuid) -> Result<Option<DateTime<Utc>>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT ended_at FROM billing_runtime_end WHERE vm_id = ?1",
+                params![vm_id.to_string()],
+                |row| {
+                    let ts: String = row.get(0)?;
+                    parse_ts(&ts)
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     /// Commit the event and interval advancement/closure as one durable unit.
     /// The caller holds the store mutex from watermark read through this write.
     pub fn commit_runtime_usage(
@@ -5282,17 +5319,28 @@ mod tests {
             window_end: end,
             created_at: end,
         };
+        assert_eq!(store.freeze_billing_end(id, end).unwrap(), Some(end));
         store.conn.execute_batch("CREATE TRIGGER reject_billing_close BEFORE DELETE ON billing_watermark BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
         assert!(store.commit_runtime_usage(&event, true).is_err());
         assert!(store.list_unsent_usage(100).unwrap().is_empty());
         assert_eq!(store.get_billing_watermark(id).unwrap(), Some(start));
+        // Advancing retry time cannot bill the stopped gap, even though the
+        // final outbox transaction rolled back and its watermark remains open.
+        let retried_end = store
+            .freeze_billing_end(id, end + chrono::Duration::hours(8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried_end, end);
         store
             .conn
             .execute_batch("DROP TRIGGER reject_billing_close")
             .unwrap();
         store.commit_runtime_usage(&event, true).unwrap();
-        assert_eq!(store.list_unsent_usage(100).unwrap().len(), 1);
+        let events = store.list_unsent_usage(100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].window_end, end);
         assert_eq!(store.get_billing_watermark(id).unwrap(), None);
+        assert_eq!(store.get_billing_end(id).unwrap(), None);
     }
 
     #[test]
