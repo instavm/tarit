@@ -9,7 +9,7 @@
 use axum::{
     body::Body,
     http::{
-        header::{HeaderName, HeaderValue, CONNECTION, SEC_WEBSOCKET_PROTOCOL},
+        header::{HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL},
         HeaderMap, Request, Response, Uri,
     },
 };
@@ -24,7 +24,6 @@ use std::{
     collections::HashSet,
     fs::File,
     io::{self, Read, Write},
-    str::FromStr,
     time::Duration,
 };
 use tarit_types::{
@@ -605,7 +604,7 @@ impl PeerClient {
         trusted_proto: &'static str,
         signature: RequestSignature<'_>,
     ) -> Result<HeaderMap, OrchError> {
-        let connection_headers = Self::connection_headers(headers);
+        let connection_headers = crate::proxy_headers::connection_headers(headers);
         let mut sanitized = HeaderMap::new();
         for (name, value) in headers {
             if Self::is_share_hop_header(name, &connection_headers) {
@@ -1228,30 +1227,11 @@ impl PeerClient {
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     }
 
-    fn connection_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
-        headers
-            .get_all(CONNECTION)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .filter_map(|value| HeaderName::from_str(value.trim()).ok())
-            .collect()
-    }
-
     fn is_share_hop_header(name: &HeaderName, connection_headers: &HashSet<HeaderName>) -> bool {
-        connection_headers.contains(name)
+        crate::proxy_headers::is_hop_by_hop(name, connection_headers)
             || matches!(
                 name.as_str(),
-                "connection"
-                    | "keep-alive"
-                    | "proxy-connection"
-                    | "proxy-authenticate"
-                    | "proxy-authorization"
-                    | "te"
-                    | "trailer"
-                    | "transfer-encoding"
-                    | "upgrade"
-                    | "host"
+                "host"
                     | "forwarded"
                     | "x-real-ip"
                     | "x-api-key"
@@ -1263,25 +1243,12 @@ impl PeerClient {
     }
 
     fn sanitized_share_response_headers(headers: &HeaderMap) -> HeaderMap {
-        let connection_headers = Self::connection_headers(headers);
+        let connection_headers = crate::proxy_headers::connection_headers(headers);
         headers
             .iter()
             .filter(|(name, _)| {
-                !connection_headers.contains(*name)
-                    && !matches!(
-                        name.as_str(),
-                        "connection"
-                            | "keep-alive"
-                            | "proxy-connection"
-                            | "proxy-authenticate"
-                            | "proxy-authorization"
-                            | "te"
-                            | "trailer"
-                            | "transfer-encoding"
-                            | "upgrade"
-                            | "forwarded"
-                            | "x-real-ip"
-                    )
+                !crate::proxy_headers::is_hop_by_hop(name, &connection_headers)
+                    && !matches!(name.as_str(), "forwarded" | "x-real-ip")
                     && !name.as_str().starts_with("x-forwarded-")
                     && !name.as_str().starts_with("x-tarit-")
             })

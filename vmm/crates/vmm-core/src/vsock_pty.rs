@@ -38,6 +38,7 @@ impl VsockPtyChannel {
         cols: u16,
         rows: u16,
         shell: Option<String>,
+        exec: bool,
     ) -> Result<(), String> {
         let mut guest_stream = self
             .device
@@ -46,7 +47,11 @@ impl VsockPtyChannel {
 
         pty_stream::write_json_frame(
             &mut guest_stream,
-            pty_stream::TYPE_START,
+            if exec {
+                pty_stream::TYPE_EXEC_START
+            } else {
+                pty_stream::TYPE_START
+            },
             &PtyStart { cols, rows, shell },
         )
         .and_then(|_| guest_stream.flush())

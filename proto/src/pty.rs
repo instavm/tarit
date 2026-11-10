@@ -11,8 +11,21 @@ pub const TYPE_RESIZE: u8 = 1;
 pub const TYPE_EXIT: u8 = 2;
 pub const TYPE_ERROR: u8 = 3;
 pub const TYPE_START: u8 = 4;
+pub const TYPE_EXEC_START: u8 = 5;
+pub const TYPE_STDIN_EOF: u8 = 6;
+pub const TYPE_STDERR: u8 = 7;
 
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+pub const MAX_STREAM_EXEC_COMMAND_LEN: usize = 64 * 1024;
+
+pub fn valid_stream_exec_command(command: &str) -> bool {
+    !command.is_empty()
+        && command.len() <= MAX_STREAM_EXEC_COMMAND_LEN
+        && !command
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r')
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtyStreamFrame {
@@ -39,7 +52,7 @@ pub struct PtyExit {
 }
 
 pub fn write_frame<W: Write>(writer: &mut W, frame_type: u8, payload: &[u8]) -> io::Result<()> {
-    if payload.len() > u32::MAX as usize {
+    if payload.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "PTY stream frame too large",

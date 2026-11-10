@@ -1,20 +1,24 @@
 use anyhow::{Context, Result};
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
-use russh::server::{self, Msg, Server as _, Session};
+use russh::server::{self, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tarit_types::{openssh_sha256_fingerprint, OrchError, SshKeyRecord, VmRecord};
 use tarit_vmm_client::{
-    PtyResize, PtyStreamFrame, MAX_FRAME_LEN, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE,
+    PtyResize, PtyStreamFrame, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE, TYPE_STDERR,
+    TYPE_STDIN_EOF,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{oneshot, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::api::{public_operation_error, store_err, AppState};
@@ -51,11 +55,88 @@ pub(crate) async fn run(state: AppState, listener: TcpListener) -> Result<()> {
         "SSH gateway listening"
     );
 
-    let mut server = GatewayServer { state };
-    server
-        .run_on_socket(config, &listener)
-        .await
-        .context("SSH gateway server")
+    serve_connections(state, listener, config, 256, 32, Duration::from_secs(15)).await
+}
+
+async fn serve_connections(
+    state: AppState,
+    listener: TcpListener,
+    config: Arc<server::Config>,
+    max_sessions: usize,
+    max_unauthenticated: usize,
+    auth_timeout: Duration,
+) -> Result<()> {
+    let sessions = Arc::new(Semaphore::new(max_sessions));
+    let unauthenticated = Arc::new(Semaphore::new(max_unauthenticated));
+    let denied_audits = Arc::new(std::sync::Mutex::new(DeniedAuditBudget::new()));
+    loop {
+        let (socket, peer) = listener.accept().await.context("accept SSH connection")?;
+        let Ok(session_permit) = Arc::clone(&sessions).try_acquire_owned() else {
+            continue;
+        };
+        let Ok(auth_permit) = Arc::clone(&unauthenticated).try_acquire_owned() else {
+            continue;
+        };
+        let socket = socket.into_std().context("SSH socket into_std")?;
+        let shutdown = socket.try_clone().context("SSH shutdown socket")?;
+        let socket = tokio::net::TcpStream::from_std(socket).context("SSH socket from_std")?;
+        let (authenticated_tx, authenticated_rx) = oneshot::channel();
+        let mut handler = GatewayHandler::new(state.clone(), Some(peer));
+        handler.session_permit = Some(session_permit);
+        handler.auth_permit = Some(auth_permit);
+        handler.authenticated_tx = Some(authenticated_tx);
+        handler.denied_audits = Arc::clone(&denied_audits);
+        let config = Arc::clone(&config);
+        tokio::spawn(async move {
+            // One absolute deadline includes SSH identification, key exchange,
+            // signed-key lookup and the authentication callback.
+            let deadline = tokio::time::Instant::now() + auth_timeout;
+            let running =
+                tokio::time::timeout_at(deadline, server::run_stream(config, socket, handler))
+                    .await;
+            if let Ok(Ok(mut running)) = running {
+                tokio::select! {
+                    result = &mut running => {
+                        if let Err(error) = result { tracing::debug!(%error, "SSH session closed"); }
+                    }
+                    authenticated = tokio::time::timeout_at(deadline, authenticated_rx) => {
+                        if matches!(authenticated, Ok(Ok(()))) {
+                            let _ = running.await;
+                        } else {
+                            // Dropping RunningSession does not cancel russh's
+                            // background task: close its actual socket instead.
+                            let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                            let _ = running.await;
+                        }
+                    }
+                }
+            }
+            let _ = shutdown.shutdown(std::net::Shutdown::Both);
+        });
+    }
+}
+
+struct DeniedAuditBudget {
+    tokens: f64,
+    updated: Instant,
+}
+impl DeniedAuditBudget {
+    fn new() -> Self {
+        Self {
+            tokens: 20.0,
+            updated: Instant::now(),
+        }
+    }
+    fn take(&mut self, now: Instant) -> bool {
+        self.tokens =
+            (self.tokens + now.saturating_duration_since(self.updated).as_secs_f64()).min(20.0);
+        self.updated = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
 }
 
 fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey> {
@@ -90,27 +171,15 @@ fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey> {
     Ok(key)
 }
 
-struct GatewayServer {
-    state: AppState,
-}
-
-impl server::Server for GatewayServer {
-    type Handler = GatewayHandler;
-
-    fn new_client(&mut self, peer_addr: Option<SocketAddr>) -> Self::Handler {
-        GatewayHandler::new(self.state.clone(), peer_addr)
-    }
-
-    fn handle_session_error(&mut self, error: <Self::Handler as server::Handler>::Error) {
-        tracing::debug!("SSH gateway session closed: {error}");
-    }
-}
-
 struct GatewayHandler {
     state: AppState,
     peer_addr: Option<SocketAddr>,
     auth: Option<Authenticated>,
     channels: HashMap<ChannelId, ChannelState>,
+    session_permit: Option<OwnedSemaphorePermit>,
+    auth_permit: Option<OwnedSemaphorePermit>,
+    authenticated_tx: Option<oneshot::Sender<()>>,
+    denied_audits: Arc<std::sync::Mutex<DeniedAuditBudget>>,
 }
 
 impl GatewayHandler {
@@ -120,6 +189,10 @@ impl GatewayHandler {
             peer_addr,
             auth: None,
             channels: HashMap::new(),
+            session_permit: None,
+            auth_permit: None,
+            authenticated_tx: None,
+            denied_audits: Arc::new(std::sync::Mutex::new(DeniedAuditBudget::new())),
         }
     }
 
@@ -127,6 +200,7 @@ impl GatewayHandler {
         &mut self,
         channel: ChannelId,
         shell: Option<String>,
+        exec: bool,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         tracing::debug!(?channel, "gateway: start_pty enter");
@@ -151,7 +225,7 @@ impl GatewayHandler {
             .unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
 
         let (stream, permit) =
-            match attach_authorized_pty(&self.state, &auth, cols, rows, shell).await {
+            match attach_authorized_stream(&self.state, &auth, cols, rows, shell, exec).await {
                 Ok(attached) => attached,
                 Err(error) => {
                     tracing::warn!(?channel, vm_id = %auth.vm_id, %error, "gateway: attach failed");
@@ -181,13 +255,20 @@ impl GatewayHandler {
         let handle = session.handle();
         let vm_id = auth.vm_id;
         let task = tokio::spawn(async move {
+            let error_handle = handle.clone();
             if let Err(e) = vmm_to_ssh(reader, handle, channel).await {
                 tracing::debug!(%vm_id, ?channel, "SSH gateway VMM->SSH bridge ended: {e}");
+                // A broken guest stream must finish SSH with a failure rather
+                // than leave a command waiting forever without EOF/status.
+                let _ = error_handle.exit_status_request(channel, 1).await;
+                let _ = error_handle.eof(channel).await;
+                let _ = error_handle.close(channel).await;
             }
         });
 
         let entry = self.channels.entry(channel).or_default();
         entry.started = true;
+        entry.exec = exec;
         entry.writer = Some(writer);
         entry.vmm_task = Some(task);
         entry.connection_permit = Some(permit);
@@ -238,6 +319,14 @@ impl Drop for GatewayHandler {
 impl server::Handler for GatewayHandler {
     type Error = russh::Error;
 
+    async fn auth_succeeded(&mut self, _session: &mut Session) -> Result<(), Self::Error> {
+        self.auth_permit.take();
+        if let Some(sender) = self.authenticated_tx.take() {
+            let _ = sender.send(());
+        }
+        Ok(())
+    }
+
     /// Answer every offered key the same way. Whether a key is registered is
     /// looked up only once the client has signed with it (`auth_publickey`),
     /// so an offer, which needs no private key, cannot be used to find out
@@ -273,7 +362,13 @@ impl server::Handler for GatewayHandler {
             }
         };
 
-        match lookup_active_key(&self.state, vm_id, fingerprint.clone()).await {
+        let lookup = tokio::time::timeout(
+            Duration::from_secs(5),
+            lookup_active_key(&self.state, vm_id, fingerprint.clone()),
+        )
+        .await;
+        match lookup.unwrap_or_else(|_| Err(OrchError::Internal("SSH key lookup timed out".into())))
+        {
             Ok(Some(record)) => {
                 let owner_key = record.owner_key.clone();
                 self.auth = Some(Authenticated {
@@ -283,7 +378,7 @@ impl server::Handler for GatewayHandler {
                 });
                 crate::audit::record_parts(
                     &self.state,
-                    "",
+                    &format!("ssh:{fingerprint}"),
                     &owner_key,
                     tarit_types::audit_action::SSH_ATTEMPT,
                     Some(vm_id),
@@ -293,15 +388,22 @@ impl server::Handler for GatewayHandler {
                 Ok(server::Auth::Accept)
             }
             Ok(None) => {
-                crate::audit::record_parts(
-                    &self.state,
-                    "",
-                    "",
-                    tarit_types::audit_action::SSH_ATTEMPT,
-                    Some(vm_id),
-                    tarit_types::audit_outcome::DENIED,
-                    Some(fingerprint),
-                );
+                if self
+                    .denied_audits
+                    .lock()
+                    .map(|mut budget| budget.take(Instant::now()))
+                    .unwrap_or(false)
+                {
+                    crate::audit::record_parts(
+                        &self.state,
+                        "",
+                        "",
+                        tarit_types::audit_action::SSH_ATTEMPT,
+                        Some(vm_id),
+                        tarit_types::audit_outcome::DENIED,
+                        Some(fingerprint),
+                    );
+                }
                 Ok(server::Auth::reject())
             }
             Err(e) => {
@@ -316,6 +418,9 @@ impl server::Handler for GatewayHandler {
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        if self.auth.is_none() || self.channels.len() >= 16 {
+            return Ok(false);
+        }
         self.channels.insert(channel.id(), ChannelState::default());
         Ok(true)
     }
@@ -332,6 +437,14 @@ impl server::Handler for GatewayHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         tracing::debug!(?channel, col_width, row_height, "gateway: pty_request");
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.started)
+        {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         // OpenSSH sends 0x0 when stdin is not a real terminal (e.g. batch mode
         // with -tt, or piped stdin). Treat 0 as "no size hint" and fall back to
         // a sane default rather than rejecting, which would derail the session.
@@ -340,6 +453,7 @@ impl server::Handler for GatewayHandler {
         let entry = self.channels.entry(channel).or_default();
         entry.cols = cols;
         entry.rows = rows;
+        entry.pty_requested = true;
         session.channel_success(channel)?;
         Ok(())
     }
@@ -350,7 +464,7 @@ impl server::Handler for GatewayHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         tracing::debug!(?channel, "gateway: shell_request");
-        self.start_pty(channel, None, session).await
+        self.start_pty(channel, None, false, session).await
     }
 
     async fn exec_request(
@@ -359,8 +473,22 @@ impl server::Handler for GatewayHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let command = String::from_utf8_lossy(data).to_string();
-        self.start_pty(channel, Some(command), session).await
+        let command = match std::str::from_utf8(data) {
+            Ok(command) if validate_exec_command(command).is_ok() => command.to_owned(),
+            _ => {
+                fail_channel_request(
+                    session,
+                    channel,
+                    "invalid SSH command (UTF-8, at most 64KiB)",
+                )?;
+                return Ok(());
+            }
+        };
+        let exec = !self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.pty_requested);
+        self.start_pty(channel, Some(command), exec, session).await
     }
 
     async fn data(
@@ -369,6 +497,15 @@ impl server::Handler for GatewayHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if !self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.started)
+        {
+            session.close(channel)?;
+            self.remove_channel(channel);
+            return Ok(());
+        }
         tracing::debug!(?channel, n = data.len(), "gateway: ssh->vmm data");
         self.write_to_vmm(channel, data_frame(data.to_vec()), session)
             .await
@@ -383,6 +520,9 @@ impl server::Handler for GatewayHandler {
         _pix_height: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.channels.get(&channel).is_some_and(|state| state.exec) {
+            return Ok(());
+        }
         let cols = pty_dim(col_width, DEFAULT_COLS);
         let rows = pty_dim(row_height, DEFAULT_ROWS);
         let entry = self.channels.entry(channel).or_default();
@@ -396,13 +536,21 @@ impl server::Handler for GatewayHandler {
 
     async fn channel_eof(
         &mut self,
-        _channel: ChannelId,
-        _session: &mut Session,
+        channel: ChannelId,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Keep the VMM writer open: dropping it half-closes the UDS, which the
-        // VMM relay escalates to a full PTY teardown. Command mode (`ssh vm
-        // "cmd"`) sends EOF right after exec, before any output has returned.
-        // The stream is reclaimed on channel_close or PTY exit.
+        if self.channels.get(&channel).is_some_and(|state| state.exec) {
+            self.write_to_vmm(
+                channel,
+                PtyStreamFrame {
+                    frame_type: TYPE_STDIN_EOF,
+                    payload: Vec::new(),
+                },
+                session,
+            )
+            .await?;
+        }
+        // Interactive PTY EOF remains a terminal operation, not stream teardown.
         Ok(())
     }
 
@@ -427,6 +575,8 @@ struct ChannelState {
     cols: u16,
     rows: u16,
     started: bool,
+    pty_requested: bool,
+    exec: bool,
     writer: Option<Arc<AsyncMutex<OwnedWriteHalf>>>,
     vmm_task: Option<tokio::task::JoinHandle<()>>,
     /// Shared PTY connection capacity held until the channel state drops.
@@ -439,11 +589,20 @@ impl Default for ChannelState {
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
             started: false,
+            pty_requested: false,
+            exec: false,
             writer: None,
             vmm_task: None,
             connection_permit: None,
         }
     }
+}
+
+fn validate_exec_command(command: &str) -> Result<(), OrchError> {
+    if !tarit_vmm_client::pty::valid_stream_exec_command(command) {
+        return Err(OrchError::BadRequest("invalid SSH command".into()));
+    }
+    Ok(())
 }
 
 fn parse_target_vm_id(user: &str) -> Result<Uuid, String> {
@@ -476,7 +635,7 @@ async fn lookup_active_key(
     let store = Arc::clone(&state.store);
     tokio::task::spawn_blocking(move || {
         let store = store
-            .lock()
+            .try_lock()
             .map_err(|_| OrchError::Internal("store lock".into()))?;
         store
             .get_active_ssh_key_for_owner(&owner_key, &fingerprint)
@@ -486,17 +645,25 @@ async fn lookup_active_key(
     .map_err(|e| OrchError::Internal(format!("join: {e}")))?
 }
 
-async fn attach_authorized_pty(
+async fn attach_authorized_stream(
     state: &AppState,
     auth: &Authenticated,
     cols: u16,
     rows: u16,
     shell: Option<String>,
+    exec: bool,
 ) -> Result<(std::os::unix::net::UnixStream, PtyConnectionPermit), OrchError> {
     // Authorize before cluster routing or activation: a foreign VM must look
     // exactly like a missing one and never reveal or wake its owner node.
     authorize_vm_owner(state, auth).await?;
-    let permit = admit_ssh_pty(&state.pty_registry, auth, shell.as_deref())?;
+    let permit = if exec {
+        validate_exec_command(shell.as_deref().unwrap_or_default())?;
+        state
+            .pty_registry
+            .try_acquire_connection(&auth.owner_key, auth.vm_id)?
+    } else {
+        admit_ssh_pty(&state.pty_registry, auth, shell.as_deref())?
+    };
     let identity = ApiIdentity {
         tenant: auth.owner_key.clone(),
         role: ApiRole::User,
@@ -519,10 +686,15 @@ async fn attach_authorized_pty(
 
     let supervisor = Arc::clone(&state.supervisor);
     let vm_id = auth.vm_id;
-    let stream =
-        tokio::task::spawn_blocking(move || supervisor.attach_pty(vm_id, cols, rows, shell))
-            .await
-            .map_err(|e| OrchError::Internal(format!("attach PTY join: {e}")))??;
+    let stream = tokio::task::spawn_blocking(move || {
+        if exec {
+            supervisor.attach_exec(vm_id, shell.unwrap_or_default())
+        } else {
+            supervisor.attach_pty(vm_id, cols, rows, shell)
+        }
+    })
+    .await
+    .map_err(|e| OrchError::Internal(format!("attach PTY join: {e}")))??;
     Ok((stream, permit))
 }
 
@@ -544,7 +716,11 @@ async fn authorize_vm_owner(state: &AppState, auth: &Authenticated) -> Result<()
 
 async fn vm_owner_key(state: &AppState, vm_id: Uuid) -> Result<Option<String>, OrchError> {
     let not_found = || OrchError::NotFound(format!("vm {vm_id} not found"));
-    match local_vm_record(state, vm_id) {
+    let lookup_state = state.clone();
+    let local = tokio::task::spawn_blocking(move || local_vm_record(&lookup_state, vm_id))
+        .await
+        .map_err(|e| OrchError::Internal(format!("SSH owner lookup join: {e}")))?;
+    match local {
         Ok(record) => Ok(record.owner_key),
         Err(OrchError::NotFound(_)) => {
             let Some(fleet) = state.fleet.as_ref() else {
@@ -588,16 +764,18 @@ fn public_gateway_error(error: &OrchError) -> String {
 fn local_vm_record(state: &AppState, vm_id: Uuid) -> Result<VmRecord, OrchError> {
     if let Some(record) = state
         .vm_cache
-        .read()
+        .try_read()
         .ok()
         .and_then(|cache| cache.get(&vm_id).cloned())
     {
         return Ok(record);
     }
 
+    // Authentication must not park a blocking worker behind lifecycle writes.
+    // Reject busy metadata and allow the client to retry.
     let store = state
         .store
-        .lock()
+        .try_lock()
         .map_err(|_| OrchError::Internal("store lock".into()))?;
     store.get_vm(vm_id).map_err(store_err)
 }
@@ -614,6 +792,12 @@ async fn vmm_to_ssh(
                 tracing::debug!(?channel, n = frame.payload.len(), "gateway: vmm->ssh data");
                 handle
                     .data(channel, frame.payload)
+                    .await
+                    .map_err(|_| BridgeError::SshClosed)?;
+            }
+            TYPE_STDERR => {
+                handle
+                    .extended_data(channel, 1, frame.payload)
                     .await
                     .map_err(|_| BridgeError::SshClosed)?;
             }
@@ -653,42 +837,26 @@ async fn write_vmm_stream_frame_locked(
     write_vmm_stream_frame(&mut *writer, frame).await
 }
 
-async fn read_vmm_stream_frame<R>(reader: &mut R) -> Result<PtyStreamFrame, BridgeError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; 5];
-    reader.read_exact(&mut header).await?;
-    let frame_type = header[0];
-    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(BridgeError::Protocol("stream frame too large".into()));
-    }
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
-    Ok(PtyStreamFrame {
-        frame_type,
-        payload,
-    })
+async fn read_vmm_stream_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<PtyStreamFrame, BridgeError> {
+    crate::stream_frame::read(reader)
+        .await
+        .map_err(|error| match error {
+            crate::stream_frame::FrameError::Io(error) => BridgeError::Io(error),
+            crate::stream_frame::FrameError::Protocol(message) => BridgeError::Protocol(message),
+        })
 }
-
-async fn write_vmm_stream_frame<W>(
+async fn write_vmm_stream_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &PtyStreamFrame,
-) -> Result<(), BridgeError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if frame.payload.len() > u32::MAX as usize {
-        return Err(BridgeError::Protocol("stream frame too large".into()));
-    }
-    let mut header = [0u8; 5];
-    header[0] = frame.frame_type;
-    header[1..5].copy_from_slice(&(frame.payload.len() as u32).to_be_bytes());
-    writer.write_all(&header).await?;
-    writer.write_all(&frame.payload).await?;
-    writer.flush().await?;
-    Ok(())
+) -> Result<(), BridgeError> {
+    crate::stream_frame::write(writer, frame)
+        .await
+        .map_err(|error| match error {
+            crate::stream_frame::FrameError::Io(error) => BridgeError::Io(error),
+            crate::stream_frame::FrameError::Protocol(message) => BridgeError::Protocol(message),
+        })
 }
 
 fn data_frame(data: Vec<u8>) -> PtyStreamFrame {
@@ -758,6 +926,17 @@ enum BridgeError {
 }
 
 #[cfg(test)]
+async fn attach_authorized_pty(
+    state: &AppState,
+    auth: &Authenticated,
+    cols: u16,
+    rows: u16,
+    shell: Option<String>,
+) -> Result<(std::os::unix::net::UnixStream, PtyConnectionPermit), OrchError> {
+    attach_authorized_stream(state, auth, cols, rows, shell, false).await
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
@@ -779,6 +958,188 @@ mod tests {
     const ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g test@example";
     const ED25519_FINGERPRINT: &str = "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4";
     const OTHER_ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJaoaaRVap6UfINs/dHmZf9oRJXKxV9wMwuOHBBDC9M other@example";
+    #[test]
+    fn exec_commands_allow_large_scripts_but_reject_invalid_wire_values() {
+        assert!(validate_exec_command(&"x".repeat(8192)).is_ok());
+        assert!(validate_exec_command("cat\nexit 7").is_ok());
+        assert!(validate_exec_command("").is_err());
+        assert!(validate_exec_command("bad\0command").is_err());
+        assert!(validate_exec_command(&"x".repeat(65537)).is_err());
+    }
+
+    #[test]
+    fn denial_audits_have_a_shared_fixed_burst_and_refill_bound() {
+        let mut budget = DeniedAuditBudget::new();
+        let now = budget.updated;
+        for _ in 0..20 {
+            assert!(budget.take(now));
+        }
+        for _ in 0..1000 {
+            assert!(!budget.take(now));
+        }
+        assert!(budget.take(now + Duration::from_secs(1)));
+        assert!(!budget.take(now + Duration::from_secs(1)));
+        assert!(budget.take(now + Duration::from_secs(3600)));
+        assert!(budget.tokens <= 19.0);
+    }
+
+    #[test]
+    fn session_capacity_is_retained_until_handler_drop() {
+        let state = crate::api::tests::test_state();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut handler = GatewayHandler::new(state, None);
+        handler.session_permit = Some(Arc::clone(&semaphore).try_acquire_owned().unwrap());
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_err());
+        drop(handler);
+        assert!(Arc::clone(&semaphore).try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn idle_handshakes_are_capped_and_expire_without_retaining_capacity() {
+        let state = crate::api::tests::test_state();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(serve_connections(
+                state,
+                listener,
+                Arc::new(server::Config::default()),
+                1,
+                1,
+                Duration::from_millis(200),
+            ));
+            let mut first = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut banner = [0; 256];
+            assert!(first.read(&mut banner).await.unwrap() > 0);
+            let mut rejected = tokio::net::TcpStream::connect(address).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut banner))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), first.read(&mut banner))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            let mut after_expiry = tokio::net::TcpStream::connect(address).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), after_expiry.read(&mut banner))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    > 0
+            );
+            drop(after_expiry);
+            server.abort();
+            let _ = server.await;
+        });
+    }
+
+    struct TestSshClient;
+    impl russh::client::Handler for TestSshClient {
+        type Error = russh::Error;
+        async fn check_server_key(&mut self, _key: &PublicKey) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn authenticated_connections_release_only_preauth_capacity_and_bound_channels() {
+        let state = test_state();
+        let vm_id = Uuid::new_v4();
+        insert_vm_record(&state, vm_id, "test-owner");
+        let mut rng = russh::keys::key::safe_rng();
+        let key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .insert_ssh_key(&SshKeyRecord {
+                id: Uuid::new_v4(),
+                owner_key: "test-owner".into(),
+                fingerprint: public_key_fingerprint_sha256(key.public_key()).unwrap(),
+                public_key: key.public_key().to_openssh().unwrap(),
+                key_type: "ssh-ed25519".into(),
+                created_at: Utc::now(),
+                is_active: true,
+            })
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let config = server::Config {
+                    keys: vec![host_key],
+                    ..Default::default()
+                };
+                let server = tokio::spawn(serve_connections(
+                    state,
+                    listener,
+                    Arc::new(config),
+                    2,
+                    1,
+                    Duration::from_secs(5),
+                ));
+                let mut client = russh::client::connect(
+                    Arc::new(russh::client::Config::default()),
+                    address,
+                    TestSshClient,
+                )
+                .await
+                .unwrap();
+                assert!(client
+                    .authenticate_publickey(
+                        vm_id.to_string(),
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None)
+                    )
+                    .await
+                    .unwrap()
+                    .success());
+                let mut second = tokio::net::TcpStream::connect(address).await.unwrap();
+                let mut banner = [0; 256];
+                assert!(
+                    second.read(&mut banner).await.unwrap() > 0,
+                    "successful auth must release preauth permit"
+                );
+                let mut third = tokio::net::TcpStream::connect(address).await.unwrap();
+                assert_eq!(
+                    third.read(&mut banner).await.unwrap(),
+                    0,
+                    "authenticated session must retain total permit"
+                );
+                let mut channels = Vec::new();
+                for _ in 0..16 {
+                    channels.push(client.channel_open_session().await.unwrap());
+                }
+                assert!(client.channel_open_session().await.is_err());
+                drop(channels);
+                drop(second);
+                client
+                    .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+                    .await
+                    .unwrap();
+                server.abort();
+                let _ = server.await;
+            })
+            .await
+            .unwrap();
+        });
+    }
+
     #[test]
     fn parses_vm_id_username() {
         let vm_id = Uuid::new_v4();

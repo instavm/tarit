@@ -167,6 +167,10 @@ pub enum ApiRequest {
         rows: u16,
         shell: Option<String>,
     },
+    /// Pipe-backed command stream with explicit stdin EOF and separate stderr.
+    AttachExec {
+        command: String,
+    },
     /// Update egress policy on a running VM (live, no restart).
     UpdateEgress {
         allowlist: Vec<String>,

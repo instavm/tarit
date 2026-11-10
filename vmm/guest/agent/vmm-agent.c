@@ -57,6 +57,9 @@
 #define PTY_FRAME_EXIT 2
 #define PTY_FRAME_ERROR 3
 #define PTY_FRAME_START 4
+#define PTY_FRAME_EXEC_START 5
+#define PTY_FRAME_STDIN_EOF 6
+#define PTY_FRAME_STDERR 7
 #define PTY_MAX_FRAME_LEN (16U * 1024U * 1024U)
 #define EXEC_FRAME_MAGIC "VEX2"
 #define EXEC_FRAME_MAGIC_LEN 4U
@@ -1897,6 +1900,117 @@ static void relay_pty_session(int fd, int master_fd, pid_t child) {
     }
 }
 
+/* Pipe-backed SSH exec: stdin EOF is independent of stdout/stderr lifetime. */
+static void handle_exec_client(int fd, const char *command) {
+    int pipes[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
+    pid_t child = -1;
+    unsigned char *pending = NULL;
+    uint32_t pending_len = 0, pending_off = 0;
+    bool exited = false, failed = false;
+    if (command == NULL || strlen(command) > 65536U) {
+        (void)send_pty_error(fd, "invalid command");
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (pipe2(pipes[i], O_CLOEXEC) < 0) goto cleanup;
+    }
+    child = fork();
+    if (child < 0) goto cleanup;
+    if (child == 0) {
+        close(fd);
+        if (setpgid(0, 0) < 0) _exit(127);
+        (void)signal(SIGPIPE, SIG_DFL);
+        if (dup2(pipes[0][0], STDIN_FILENO) < 0 ||
+            dup2(pipes[1][1], STDOUT_FILENO) < 0 ||
+            dup2(pipes[2][1], STDERR_FILENO) < 0) _exit(127);
+        for (int i = 0; i < 3; i++) {
+            close(pipes[i][0]); close(pipes[i][1]);
+        }
+        if (getenv("PATH") == NULL) setenv("PATH", DEFAULT_PATH, 1);
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+    /* Establish the group from both sides of fork: an immediate disconnect
+     * must not race the child's group setup and leave grandchildren alive. */
+    (void)setpgid(child, child);
+    close(pipes[0][0]); pipes[0][0] = -1;
+    close(pipes[1][1]); pipes[1][1] = -1;
+    close(pipes[2][1]); pipes[2][1] = -1;
+    if (fcntl(pipes[0][1], F_SETFL, O_NONBLOCK) < 0) { failed = true; goto cleanup; }
+    while (pipes[1][0] >= 0 || pipes[2][0] >= 0 || !exited) {
+        if (!exited) {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            /* Keep the zombie until cleanup so its PID/process-group identity
+             * cannot be reused while descendant output is still draining. */
+            int result = waitid(P_PID, (id_t)child, &info, WEXITED | WNOHANG | WNOWAIT);
+            if (result == 0 && info.si_pid == child) exited = true;
+            else if (result < 0 && errno != EINTR) { failed = true; break; }
+        }
+        struct pollfd fds[4] = {
+            {fd, pending == NULL ? POLLIN : 0, 0},
+            {pipes[1][0], POLLIN, 0},
+            {pipes[2][0], POLLIN, 0},
+            {pipes[0][1], pending != NULL ? POLLOUT : 0, 0},
+        };
+        int ready = poll(fds, 4, 100);
+        if (ready < 0) { if (errno == EINTR) continue; failed = true; break; }
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) { failed = true; break; }
+        /* Drain both output pipes even after waitpid observes child exit. */
+        for (int i = 1; i <= 2; i++) {
+            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                unsigned char output[8192];
+                ssize_t n = read(pipes[i][0], output, sizeof(output));
+                if (n > 0) {
+                    if (write_pty_frame(fd, i == 1 ? PTY_FRAME_DATA : PTY_FRAME_STDERR,
+                                        output, (uint32_t)n) < 0) { failed = true; break; }
+                } else if (n == 0 || (n < 0 && errno != EINTR)) {
+                    close(pipes[i][0]); pipes[i][0] = -1;
+                }
+            }
+        }
+        if (failed) break;
+        if (pending != NULL && (fds[3].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            ssize_t n = write(pipes[0][1], pending + pending_off, pending_len - pending_off);
+            if (n > 0) pending_off += (uint32_t)n;
+            else if (n < 0 && errno != EINTR && errno != EAGAIN) {
+                close(pipes[0][1]); pipes[0][1] = -1;
+                pending_off = pending_len;
+            }
+            if (pending_off == pending_len) { free(pending); pending = NULL; }
+        }
+        if (pending == NULL && (fds[0].revents & POLLIN)) {
+            uint8_t type = 0;
+            unsigned char *payload = NULL;
+            uint32_t len = 0;
+            if (read_pty_frame(fd, &type, &payload, &len) != 0) { failed = true; break; }
+            if (type == PTY_FRAME_STDIN_EOF && len == 0) {
+                if (pipes[0][1] >= 0) { close(pipes[0][1]); pipes[0][1] = -1; }
+            } else if (type == PTY_FRAME_DATA && len <= 65536U) {
+                if (pipes[0][1] >= 0 && len != 0) {
+                    pending = payload; payload = NULL; pending_len = len; pending_off = 0;
+                }
+            } else { failed = true; }
+            free(payload);
+            if (failed) break;
+        }
+    }
+cleanup:
+    free(pending);
+    for (int i = 0; i < 3; i++) {
+        if (pipes[i][0] >= 0) close(pipes[i][0]);
+        if (pipes[i][1] >= 0) close(pipes[i][1]);
+    }
+    if (child > 0) {
+        /* A disconnected client must not strand a command that ignores HUP. */
+        (void)kill(-child, SIGKILL);
+        if (!exited) (void)kill(child, SIGKILL);
+        int exit_code = wait_for_child(child);
+        if (!failed) (void)send_pty_exit(fd, exit_code);
+    }
+    if (child < 0) (void)send_pty_error(fd, strerror(errno));
+}
+
 static void handle_pty_client(int fd) {
     uint8_t type = 0;
     uint32_t len = 0;
@@ -1905,7 +2019,7 @@ static void handle_pty_client(int fd) {
     if (rc != 0) {
         return;
     }
-    if (type != PTY_FRAME_START) {
+    if (type != PTY_FRAME_START && type != PTY_FRAME_EXEC_START) {
         free(payload);
         (void)send_pty_error(fd, "expected START frame");
         return;
@@ -1917,6 +2031,11 @@ static void handle_pty_client(int fd) {
     (void)json_get_u16((const char *)payload, "rows", &rows);
     char *shell = json_get_shell((const char *)payload);
     free(payload);
+    if (type == PTY_FRAME_EXEC_START) {
+        handle_exec_client(fd, shell);
+        free(shell);
+        return;
+    }
 
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));

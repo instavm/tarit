@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use crate::proxy_headers::{connection_headers, is_hop_by_hop};
+
 use axum::{
     body::{Body, Bytes, HttpBody as _},
     extract::{
@@ -26,7 +28,6 @@ use std::{
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
-    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -1323,16 +1324,6 @@ fn sanitized_response_headers(headers: &axum::http::HeaderMap) -> axum::http::He
         )
 }
 
-fn connection_headers(headers: &axum::http::HeaderMap) -> HashSet<HeaderName> {
-    headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|value| HeaderName::from_str(value.trim()).ok())
-        .collect()
-}
-
 fn trusted_forwarded_scheme(headers: &axum::http::HeaderMap) -> ForwardedScheme {
     let mut values = headers.get_all("x-forwarded-proto").iter();
     let Some(value) = values.next() else {
@@ -1376,22 +1367,6 @@ fn should_strip_response_header(
         || name.as_str().starts_with("x-forwarded-")
         || name.as_str() == "x-real-ip"
         || name.as_str().starts_with("x-tarit-")
-}
-
-fn is_hop_by_hop(name: &HeaderName, connection_headers: &HashSet<HeaderName>) -> bool {
-    connection_headers.contains(name)
-        || matches!(
-            name.as_str(),
-            "connection"
-                | "keep-alive"
-                | "proxy-connection"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailer"
-                | "transfer-encoding"
-                | "upgrade"
-        )
 }
 
 async fn proxy_local_websocket(
