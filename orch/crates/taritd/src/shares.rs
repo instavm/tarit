@@ -161,6 +161,8 @@ fn map_store_error(error: StoreError) -> OrchError {
     match error {
         StoreError::NotFound => OrchError::NotFound("share not found".into()),
         StoreError::Conflict(message) => OrchError::Conflict(message),
+        StoreError::ShareCollision(message) => OrchError::ShareCollision(message),
+        StoreError::ShareTargetChanged => OrchError::ShareTargetChanged,
         StoreError::Sqlite(error) => OrchError::Internal(format!("share store: {error}")),
     }
 }
@@ -169,6 +171,8 @@ fn map_fleet_error(error: FleetError) -> OrchError {
     match error {
         FleetError::NotFound => OrchError::NotFound("share not found".into()),
         FleetError::Conflict(message) => OrchError::Conflict(message),
+        FleetError::ShareCollision(message) => OrchError::ShareCollision(message),
+        FleetError::ShareTargetChanged => OrchError::ShareTargetChanged,
         error => OrchError::Internal(format!("share fleet: {error}")),
     }
 }
@@ -200,11 +204,7 @@ where
         };
         match repository.insert_for_vm(&share, vm).await {
             Ok(()) => return Ok(share),
-            Err(OrchError::Conflict(message))
-                if message != "share target VM changed or is not running" =>
-            {
-                continue
-            }
+            Err(OrchError::ShareCollision(_)) => continue,
             Err(error) => return Err(error),
         }
     }
@@ -787,7 +787,7 @@ mod tests {
         };
         assert!(matches!(
             repository.insert(&duplicate).await,
-            Err(tarit_types::OrchError::Conflict(_))
+            Err(tarit_types::OrchError::ShareCollision(_))
         ));
         assert_eq!(repository.list(&share.owner_key).await.unwrap().len(), 1);
     }
@@ -819,6 +819,44 @@ mod tests {
                 .await,
             Err(OrchError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn changed_share_target_stops_allocation_after_one_attempt() {
+        let repository =
+            ShareRepository::new(Arc::new(Mutex::new(Store::open(":memory:").unwrap())), None);
+        let vm = test_vm("tenant-a", VmStatus::Running);
+        let mut replacement = vm.clone();
+        replacement.created_at += chrono::Duration::seconds(1);
+        repository
+            .local
+            .lock()
+            .unwrap()
+            .insert_vm(&replacement)
+            .unwrap();
+        let mut attempts = 0;
+        let result = insert_with_generated_slug(
+            &repository,
+            "tenant-a",
+            &vm,
+            8081,
+            ShareVisibility::Private,
+            Utc::now(),
+            || {
+                attempts += 1;
+                "available-share".into()
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(OrchError::ShareTargetChanged)));
+        assert_eq!(attempts, 1);
+        assert!(repository
+            .local
+            .lock()
+            .unwrap()
+            .get_share_by_slug("available-share")
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

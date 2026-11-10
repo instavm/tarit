@@ -7,9 +7,9 @@ pub mod pty;
 pub mod state;
 
 pub use api::{
-    ApiRequest, ApiResponse, GuestNetworkRepair, LiveSnapshotStats, LiveSnapshotTermination,
-    MemoryHotplugStatus, MemoryIntegrity, RestoreMemoryPolicy, ScratchIdentity, VmSpec,
-    MAX_API_FRAME_LEN, MAX_MEMORY_HOTPLUG_WAIT_MS, RETRYABLE_ERROR_PREFIX,
+    ApiErrorCode, ApiRequest, ApiResponse, GuestNetworkRepair, LiveSnapshotStats,
+    LiveSnapshotTermination, MemoryHotplugStatus, MemoryIntegrity, RestoreMemoryPolicy,
+    ScratchIdentity, VmSpec, MAX_API_FRAME_LEN, MAX_MEMORY_HOTPLUG_WAIT_MS, RETRYABLE_ERROR_PREFIX,
 };
 pub use config::{
     KernelConfig, MemoryConfig, NetConfig, PortForwardConfig, VcpuConfig, VmConfig, VolumeConfig,

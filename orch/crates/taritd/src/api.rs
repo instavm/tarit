@@ -443,7 +443,9 @@ impl ShareApiError {
                 tracing::debug!(%error, "share resource not found");
                 Self::NotFound
             }
-            OrchError::Conflict(error) => {
+            error @ (OrchError::Conflict(_)
+            | OrchError::ShareCollision(_)
+            | OrchError::ShareTargetChanged) => {
                 tracing::debug!(%error, "share request conflicted");
                 Self::Conflict
             }
@@ -458,7 +460,9 @@ impl ShareApiError {
             error @ (OrchError::Unavailable(_)
             | OrchError::Internal(_)
             | OrchError::Vmm(_)
-            | OrchError::Overloaded { .. }) => {
+            | OrchError::Overloaded { .. }
+            | OrchError::HostCapacity { .. }
+            | OrchError::ReflinkRequired(_)) => {
                 tracing::warn!(error = %error, "share service unavailable");
                 Self::ServiceUnavailable
             }
@@ -1948,9 +1952,10 @@ async fn create_vm_after_quota(
     let deadline = Instant::now() + Duration::from_millis(state.config.admission_timeout_ms);
     let mut capacity_wait = None;
     loop {
-        let last_overloaded = match ops::create_local(state, &req).await {
+        let (last_overloaded, host_capacity) = match ops::create_local(state, &req).await {
             Ok(record) => return Ok((StatusCode::CREATED, Json(PublicVmRecord::from(record)))),
-            Err(OrchError::Overloaded { message, .. }) => message, // local full — try the rest of the fleet
+            Err(OrchError::Overloaded { message, .. }) => (message, false),
+            Err(OrchError::HostCapacity { message, .. }) => (message, true),
             Err(e) => return Err(e.into()),
         };
 
@@ -1983,7 +1988,7 @@ async fn create_vm_after_quota(
 
         // Idle warm VMs of classes this create cannot use hold capacity that
         // nobody is using: stop one and try again at once.
-        if last_overloaded.contains(crate::supervisor::HOST_CAPACITY_EXHAUSTED) {
+        if host_capacity {
             capacity_wait.get_or_insert_with(|| state.supervisor.wait_for_capacity());
             let supervisor = Arc::clone(&state.supervisor);
             if tokio::task::spawn_blocking(move || supervisor.reclaim_idle_warm())
@@ -2106,7 +2111,11 @@ async fn place_on_peer(
             // Peer filled up or the VM vanished between the capacity read and the
             // call — just try the next candidate. A peer 409 is a real conflict
             // (for example a duplicate requested id), not capacity backpressure.
-            Err(OrchError::Overloaded { .. }) | Err(OrchError::NotFound(_)) => continue,
+            Err(
+                OrchError::Overloaded { .. }
+                | OrchError::HostCapacity { .. }
+                | OrchError::NotFound(_),
+            ) => continue,
             Err(e @ OrchError::Conflict(_)) => return Err(e.into()),
             Err(e) => {
                 tracing::warn!(peer = %rpc_for_log, "peer create failed: {e}; trying next");
@@ -4379,6 +4388,8 @@ pub(crate) fn store_err(e: tarit_store::StoreError) -> OrchError {
     match e {
         tarit_store::StoreError::NotFound => OrchError::NotFound("record not found".into()),
         tarit_store::StoreError::Conflict(message) => OrchError::Conflict(message),
+        tarit_store::StoreError::ShareCollision(message) => OrchError::ShareCollision(message),
+        tarit_store::StoreError::ShareTargetChanged => OrchError::ShareTargetChanged,
         tarit_store::StoreError::Sqlite(e) => OrchError::Internal(e.to_string()),
     }
 }

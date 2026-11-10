@@ -274,7 +274,18 @@ pub enum ApiResponse {
     MemoryHotplug(MemoryHotplugStatus),
     Err {
         msg: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<ApiErrorCode>,
     },
+}
+
+/// Optional machine classification. Unknown future codes remain ordinary failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiErrorCode {
+    ReflinkRequired,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Start of an [`ApiResponse::Err`] message for a request that failed
@@ -288,6 +299,7 @@ impl ApiResponse {
     pub fn retryable_err(msg: impl std::fmt::Display) -> Self {
         Self::Err {
             msg: format!("{RETRYABLE_ERROR_PREFIX}{msg}"),
+            code: None,
         }
     }
 }
@@ -836,7 +848,10 @@ mod tests {
             },
             ApiResponse::Restored,
             ApiResponse::GuestNetworkRepaired,
-            ApiResponse::Err { msg: "bad".into() },
+            ApiResponse::Err {
+                msg: "bad".into(),
+                code: None,
+            },
         ] {
             let s = serde_json::to_string(&r).unwrap();
             let back: ApiResponse = serde_json::from_str(&s).unwrap();
@@ -874,8 +889,40 @@ mod tests {
     }
 
     #[test]
+    fn error_codes_accept_legacy_and_future_peers() {
+        let legacy: ApiResponse =
+            serde_json::from_str(r#"{"status":"err","msg":"legacy"}"#).unwrap();
+        assert!(matches!(legacy, ApiResponse::Err { code: None, .. }));
+        let future: ApiResponse =
+            serde_json::from_str(r#"{"status":"err","msg":"future","code":"future_reason"}"#)
+                .unwrap();
+        assert!(matches!(
+            future,
+            ApiResponse::Err {
+                code: Some(ApiErrorCode::Unknown),
+                ..
+            }
+        ));
+        let coded = ApiResponse::Err {
+            msg: "wording can change".into(),
+            code: Some(ApiErrorCode::ReflinkRequired),
+        };
+        #[derive(Deserialize)]
+        #[serde(tag = "status", rename_all = "snake_case")]
+        enum LegacyResponse {
+            Err { msg: String },
+        }
+        let LegacyResponse::Err { msg } =
+            serde_json::from_value(serde_json::to_value(coded).unwrap()).unwrap();
+        assert_eq!(msg, "wording can change");
+    }
+
+    #[test]
     fn response_err_has_msg_field() {
-        let r = ApiResponse::Err { msg: "nope".into() };
+        let r = ApiResponse::Err {
+            msg: "nope".into(),
+            code: None,
+        };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"msg\":\"nope\""));
         assert!(s.contains("\"status\":\"err\""));

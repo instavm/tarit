@@ -170,6 +170,8 @@ fn error_response(error: vmm_core::error::VmmError) -> ApiResponse {
         ApiResponse::retryable_err(error)
     } else {
         ApiResponse::Err {
+            code: matches!(error, vmm_core::error::VmmError::ReflinkRequired(_))
+                .then_some(tarit_proto::api::ApiErrorCode::ReflinkRequired),
             msg: error.to_string(),
         }
     }
@@ -324,6 +326,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         },
         ApiRequest::AttachPty { .. } => ApiResponse::Err {
             msg: "AttachPty is a streaming request".into(),
+            code: None,
         },
         ApiRequest::UpdateEgress {
             allowlist,
@@ -334,7 +337,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
 
             let rules = match parse_egress_allowlist(&allowlist) {
                 Ok(rules) => rules,
-                Err(msg) => return ApiResponse::Err { msg },
+                Err(msg) => return ApiResponse::Err { msg, code: None },
             };
 
             let update = EgressUpdate {
@@ -361,6 +364,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
                         log::error!("egress apply failed: {e}");
                         ApiResponse::Err {
                             msg: format!("egress apply failed: {e}"),
+                            code: None,
                         }
                     }
                 }
@@ -382,6 +386,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             match controller.set_balloon_target_mib(target_mib) {
                 Ok((target_pages, actual_pages)) => balloon_response(target_pages, actual_pages),
                 Err(error) => ApiResponse::Err {
+                    code: None,
                     msg: error.to_string(),
                 },
             }
@@ -389,12 +394,14 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         ApiRequest::Balloon => match controller.balloon_state() {
             Ok((target_pages, actual_pages)) => balloon_response(target_pages, actual_pages),
             Err(error) => ApiResponse::Err {
+                code: None,
                 msg: error.to_string(),
             },
         },
         ApiRequest::MemoryHotplugStatus => match controller.memory_hotplug_status() {
             Ok(status) => ApiResponse::MemoryHotplug(status),
             Err(error) => ApiResponse::Err {
+                code: None,
                 msg: error.to_string(),
             },
         },
@@ -404,6 +411,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
         } => match controller.set_memory_hotplug(requested_size_mib, wait_timeout_ms) {
             Ok(status) => ApiResponse::MemoryHotplug(status),
             Err(error) => ApiResponse::Err {
+                code: None,
                 msg: error.to_string(),
             },
         },
@@ -466,6 +474,7 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
             Err(e) => {
                 let resp = ApiResponse::Err {
                     msg: format!("bad request: {e}"),
+                    code: None,
                 };
                 let _ = write_frame(&mut stream, &encode_response(&resp));
                 continue;
@@ -501,6 +510,7 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
                     log::error!("request handler panicked: {msg}");
                     ApiResponse::Err {
                         msg: format!("internal error: {msg}"),
+                        code: None,
                     }
                 });
         if let Err(e) = write_frame(&mut stream, &encode_response_for_frame(&resp)) {
@@ -845,6 +855,7 @@ fn encode_response_for_frame(resp: &ApiResponse) -> Vec<u8> {
             "response exceeds {} MiB control-frame limit",
             MAX_FRAME_BYTES / (1024 * 1024)
         ),
+        code: None,
     })
 }
 
@@ -863,6 +874,21 @@ fn output_tail(output: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reflink_error_has_code_without_changing_message_or_other_failures() {
+        let error = vmm_core::error::VmmError::ReflinkRequired("new wording".into());
+        let expected = error.to_string();
+        assert!(
+            matches!(error_response(error), ApiResponse::Err { msg, code: Some(tarit_proto::ApiErrorCode::ReflinkRequired) } if msg == expected)
+        );
+        assert!(matches!(
+            error_response(vmm_core::error::VmmError::Snapshot(
+                "requires reflink/FICLONE".into()
+            )),
+            ApiResponse::Err { code: None, .. }
+        ));
+    }
+
     use super::*;
     use vmm_core::config::{KernelConfig, MemoryConfig, VcpuConfig, VmConfig};
 
@@ -933,7 +959,7 @@ mod tests {
             ApiRequest::Snapshot { base: Some(b), resume: true, .. } if b == "/snapshots/prev.snap"
         ));
         match dispatch(req, &controller) {
-            ApiResponse::Err { msg } => {
+            ApiResponse::Err { msg, .. } => {
                 assert!(msg.contains("no VM"), "unexpected error: {msg}");
                 assert!(!msg.contains("bad request"), "unexpected error: {msg}");
             }
@@ -955,7 +981,7 @@ mod tests {
                 },
                 &controller,
             ) {
-                ApiResponse::Err { msg } => msg,
+                ApiResponse::Err { msg, .. } => msg,
                 other => panic!("expected no-VM error, got {other:?}"),
             }
         };
