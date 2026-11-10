@@ -105,23 +105,54 @@ impl QueueState {
     }
 }
 
-/// A guest FLUSH that the block worker serves outside the device locks.
+/// Default cap on the guest data a device may have written to its backing
+/// store without a host flush (see [`HostFlush::backlog`]).
+///
+/// Host writes are buffered, so a guest that writes faster than the host disk
+/// absorbs leaves a backlog in the host page cache bounded only by the host's
+/// global dirty limit (gigabytes). A guest FLUSH must then wait for all of it
+/// to reach the disk, and every request queued behind the FLUSH waits too:
+/// 8-31 s per FLUSH after a resume on a 100 MB/s host disk, once for more than
+/// 12 minutes. With this cap the device flushes its own backing store each
+/// time the guest has written this much, so a FLUSH waits for at most this
+/// much data, and the guest writes no faster than the host disk sustains.
+pub const WRITEBACK_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Why the block worker wants a host flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushRequest {
+    /// The guest's FLUSH at this avail-ring position.
+    Guest(u16),
+    /// The device's write-back backlog reached its limit. The write that
+    /// found it there stays on the avail ring until the flush has finished.
+    Writeback,
+}
+
+/// A host flush that the block worker runs outside the device locks.
 ///
 /// On an NBD-backed disk a flush sends every page the host buffered down to
-/// storage and can take seconds under heavy writes. The request stays on the
+/// storage and can take seconds under heavy writes. The request that needs it
+/// (a guest FLUSH, or the write that found the backlog full) stays on the
 /// avail ring, unconsumed, until a host flush that started after it was seen
 /// has finished: a snapshot taken in the meantime captures it as not yet
 /// served, and the restored VM serves it again.
 #[derive(Debug, Default)]
 struct HostFlush {
-    /// Avail-ring position of the FLUSH waiting for a host flush.
-    wanted: Option<u16>,
+    /// The host flush the worker's last pass stopped for.
+    wanted: Option<FlushRequest>,
     /// The host flush for the FLUSH at this position finished, with this
     /// status for the guest.
     done: Option<(u16, u8)>,
     /// Bumped by a device reset or restore, so a host flush that was running
     /// across one cannot complete a different request at the same position.
     epoch: u64,
+    /// Guest bytes the worker wrote to the backing store since the last host
+    /// flush that succeeded. Host-only: a reset or restore keeps it, because
+    /// the host still holds those writes unflushed.
+    backlog: u64,
+    /// A write-back flush failed. The guest's next FLUSH reports the error,
+    /// because the backing store has already reported it to that flush.
+    writeback_failed: bool,
 }
 
 impl HostFlush {
@@ -181,6 +212,12 @@ pub struct VirtioBlkMmio {
     /// The block worker's FLUSH in progress, if any. Host-only: never in a
     /// snapshot (the request itself stays on the avail ring).
     host_flush: Mutex<HostFlush>,
+    /// Write-back limit for the block worker in bytes; 0 = unbounded. See
+    /// [`WRITEBACK_LIMIT_BYTES`].
+    writeback_limit: AtomicU64,
+    /// Diagnostic counter: host flushes the worker ran because the
+    /// write-back backlog reached its limit.
+    pub writeback_flushes: AtomicU64,
     /// Interrupt status (set when device raises an interrupt).
     interrupt_status: AtomicU32,
     /// IRQ EventFd — written to when the device needs to interrupt the guest.
@@ -350,6 +387,8 @@ impl VirtioBlkMmio {
             processor: Mutex::new(None),
             rate_limiter: Mutex::new(None),
             host_flush: Mutex::new(HostFlush::default()),
+            writeback_limit: AtomicU64::new(WRITEBACK_LIMIT_BYTES),
+            writeback_flushes: AtomicU64::new(0),
             interrupt_status: AtomicU32::new(0),
             #[cfg(target_os = "linux")]
             irq_evt: Mutex::new(None),
@@ -381,6 +420,8 @@ impl VirtioBlkMmio {
             processor: Mutex::new(None),
             rate_limiter: Mutex::new(None),
             host_flush: Mutex::new(HostFlush::default()),
+            writeback_limit: AtomicU64::new(WRITEBACK_LIMIT_BYTES),
+            writeback_flushes: AtomicU64::new(0),
             interrupt_status: AtomicU32::new(0),
             #[cfg(target_os = "linux")]
             irq_evt: Mutex::new(None),
@@ -652,8 +693,15 @@ impl VirtioBlkMmio {
         }))
     }
 
-    /// Whether the last pass stopped at a guest FLUSH that waits for
-    /// [`Self::service_host_flush`].
+    /// Bound the guest data the block worker writes without a host flush;
+    /// 0 removes the bound. See [`WRITEBACK_LIMIT_BYTES`].
+    pub fn set_writeback_limit(&self, bytes: u64) {
+        self.writeback_limit.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Whether the last pass stopped at a request that waits for
+    /// [`Self::service_host_flush`]: a guest FLUSH, or a write behind a full
+    /// write-back backlog.
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn host_flush_wanted(&self) -> bool {
         self.lock_state(&self.host_flush, "host_flush")
@@ -661,18 +709,19 @@ impl VirtioBlkMmio {
             .is_some()
     }
 
-    /// Flush the backing store for the FLUSH the last pass stopped at.
+    /// Flush the backing store for the request the last pass stopped at.
     ///
     /// Holds no queue or processor lock and writes no guest memory, so the
     /// device state stays capturable while the host flush runs: the request
-    /// is still on the avail ring, and the next pass completes it with this
-    /// flush's status. A snapshot taken meanwhile serves it again on restore.
+    /// is still on the avail ring, and the next pass completes it (a FLUSH,
+    /// with this flush's status) or serves it (a write). A snapshot taken
+    /// meanwhile serves it again on restore.
     #[cfg(any(target_os = "linux", test))]
     pub(crate) fn service_host_flush(&self) -> MmioWriteResult {
-        let (at, epoch) = {
+        let (want, epoch) = {
             let mut flush = self.try_lock_state(&self.host_flush, "host_flush")?;
             match flush.wanted.take() {
-                Some(at) => (at, flush.epoch),
+                Some(want) => (want, flush.epoch),
                 None => return Ok(()),
             }
         };
@@ -691,8 +740,31 @@ impl VirtioBlkMmio {
             }
         };
         let mut flush = self.try_lock_state(&self.host_flush, "host_flush")?;
-        if flush.epoch == epoch {
-            flush.done = Some((at, st));
+        if st == status::OK {
+            // Only the worker writes, and it is here: everything it wrote is
+            // on the backing store's stable storage now.
+            flush.backlog = 0;
+        }
+        match want {
+            FlushRequest::Guest(at) => {
+                if flush.epoch == epoch {
+                    let st = if st == status::OK && std::mem::take(&mut flush.writeback_failed) {
+                        status::IO_ERR
+                    } else {
+                        st
+                    };
+                    flush.done = Some((at, st));
+                }
+            }
+            FlushRequest::Writeback => {
+                self.writeback_flushes.fetch_add(1, Ordering::Relaxed);
+                if st != status::OK {
+                    log::warn!("blk: write-back flush failed; the guest's next FLUSH reports it");
+                    flush.writeback_failed = true;
+                    // Retry after another full backlog, not before every write.
+                    flush.backlog = 0;
+                }
+            }
         }
         Ok(())
     }
@@ -837,8 +909,27 @@ impl VirtioBlkMmio {
                             return None;
                         }
                     }
-                    flush.wanted = Some(chain.avail_idx);
+                    flush.wanted = Some(FlushRequest::Guest(chain.avail_idx));
                     return None;
+                }
+                // The block worker keeps the guest's unflushed writes under
+                // the write-back limit: a write that finds the backlog full
+                // stays on the ring until the worker has flushed the backing
+                // store. Checked before the rate limiter, so it takes no
+                // tokens. The synchronous fallback writes unbounded.
+                let limit = self.writeback_limit.load(Ordering::Relaxed);
+                if header.req_type == req_type::OUT && budget.is_some() && limit != 0 {
+                    let mut flush = match self.try_lock_state(&self.host_flush, "host_flush") {
+                        Ok(flush) => flush,
+                        Err(_) => {
+                            processing_failed = true;
+                            return None;
+                        }
+                    };
+                    if flush.backlog >= limit {
+                        flush.wanted.get_or_insert(FlushRequest::Writeback);
+                        return None;
+                    }
                 }
                 match self.rate_limit_allows(request_bytes) {
                     Ok(true) => {}
@@ -897,6 +988,14 @@ impl VirtioBlkMmio {
                     }
                     _ => status::UNSUPP,
                 };
+                if header.req_type == req_type::OUT && st == status::OK && budget.is_some() {
+                    match self.try_lock_state(&self.host_flush, "host_flush") {
+                        Ok(mut flush) => {
+                            flush.backlog = flush.backlog.saturating_add(request_bytes);
+                        }
+                        Err(_) => processing_failed = true,
+                    }
+                }
 
                 Some((
                     data_written + Self::write_status(&mem, dirty.as_ref(), writable, st),
@@ -2233,6 +2332,106 @@ mod tests {
         assert_eq!(used_idx(&mem), 3);
         assert_eq!(request_status(&mem, 1), status::OK);
         assert_eq!(request_status(&mem, 2), status::OK);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn worker_writes_wait_for_a_host_flush_once_the_backlog_reaches_its_limit() {
+        let (backend, path) = new_test_backend("blk-writeback-limit");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        // Two 512-byte writes fill a 1 KiB backlog.
+        dev.set_writeback_limit(1024);
+        setup_blk_out_requests(&mem, 5);
+
+        // The pass serves writes until the backlog is full, then stops with
+        // the next write still the driver's and asks for a host flush.
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 2);
+        assert_eq!(request_status(&mem, 1), status::OK);
+        assert_eq!(request_status(&mem, 2), 0xff);
+        assert!(dev.host_flush_wanted());
+
+        // A snapshot taken while that host flush runs holds the write
+        // unconsumed; the restored VM serves it on its own backing store.
+        let state = dev.save();
+        assert_eq!(state.processor.as_ref().unwrap().last_avail_idx, 2);
+        let restored_mem = new_test_mem();
+        let mut ram = vec![0; 4 * 1024 * 1024];
+        mem.read_slice(&mut ram, GuestAddress(0)).unwrap();
+        restored_mem.write_slice(&ram, GuestAddress(0)).unwrap();
+        let mut restored = VirtioBlkMmio::new(5, BlkBackend::open(&path, false).unwrap());
+        restored.restore(state);
+        restored.set_guest_memory(restored_mem.clone());
+        restored.process_queue(0).unwrap();
+        assert_eq!(used_idx(&restored_mem), 5);
+
+        // The flush empties the backlog; the next pass serves two more.
+        dev.service_host_flush().unwrap();
+        assert!(!dev.host_flush_wanted());
+        assert_eq!(dev.writeback_flushes.load(Ordering::Relaxed), 1);
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 4);
+        assert!(dev.host_flush_wanted());
+        dev.service_host_flush().unwrap();
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 5);
+        for request in 0..5 {
+            assert_eq!(request_status(&mem, request), status::OK);
+        }
+        use std::os::unix::fs::FileExt;
+        let mut disk = vec![0u8; 5 * 512];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut disk, 0)
+            .unwrap();
+        for request in 0..5usize {
+            assert!(disk[request * 512..(request + 1) * 512]
+                .iter()
+                .all(|&byte| byte == request as u8));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_guest_flush_resets_the_backlog_and_reports_a_failed_writeback_flush() {
+        let (backend, path) = new_test_backend("blk-writeback-guest-flush");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        dev.set_writeback_limit(1024);
+        // write, write, FLUSH, write, write: the guest's FLUSH empties the
+        // backlog, so the writes after it need no write-back flush.
+        setup_blk_out_requests(&mem, 5);
+        make_flush_request(&mem, 2);
+        // An earlier write-back flush failed.
+        dev.host_flush.lock().unwrap().writeback_failed = true;
+
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 2);
+        dev.service_host_flush().unwrap();
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 5);
+        assert_eq!(request_status(&mem, 2), status::IO_ERR);
+        assert_eq!(request_status(&mem, 3), status::OK);
+        assert_eq!(request_status(&mem, 4), status::OK);
+        assert_eq!(dev.writeback_flushes.load(Ordering::Relaxed), 0);
+        assert!(!dev.host_flush.lock().unwrap().writeback_failed);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn synchronous_queue_processing_writes_without_the_writeback_limit() {
+        let (backend, path) = new_test_backend("blk-writeback-sync");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        dev.set_writeback_limit(512);
+        setup_blk_out_requests(&mem, 3);
+        dev.process_queue(0).unwrap();
+        assert_eq!(used_idx(&mem), 3);
+        assert!(!dev.host_flush_wanted());
         std::fs::remove_file(path).unwrap();
     }
 
