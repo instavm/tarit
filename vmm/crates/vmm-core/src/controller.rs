@@ -2537,8 +2537,18 @@ impl VmmController {
         shell: Option<String>,
     ) -> Result<()> {
         let pty = {
+            // Admission is brief and independent of exec's guest-agent lock.
+            // Keep lifecycle admission locked until the transport is cloned;
+            // a later stop cancels it through VsockPtyChannel::stop.
+            let lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if lifecycle.is_some() {
+                return Err(VmmError::Device(
+                    "PTY unavailable during lifecycle operation".into(),
+                ));
+            }
             let slot = self.lock();
             slot.as_ref()
+                .filter(|vm| vm.state == VmState::Running)
                 .and_then(|vm| vm.running.as_ref())
                 .and_then(|r| r.vsock_pty.clone())
         }
@@ -3285,6 +3295,9 @@ fn finish_exec_output(mut output: Vec<u8>, truncated: bool) -> String {
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn stop_running_vm(vm: &mut VmInstance) {
     if let Some(mut running) = vm.running.take() {
+        if let Some(pty) = &running.vsock_pty {
+            pty.stop();
+        }
         if let Err(e) = running.vcpu_thread.stop() {
             log::warn!("VM: vCPU thread stop returned: {e}");
         }
