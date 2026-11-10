@@ -572,20 +572,10 @@ pub fn load_and_setup_boot<P: AsRef<Path>>(
                 .map_err(|e| LoaderError::BootConfig(format!("write e820[{i}]: {e:?}")))?;
         }
 
-        // Set pref_address (offset 0x230) — the preferred load address for
-        // the real-mode code. Standard value is 0x100000 (1 MiB).
-        guest_memory
-            .write_obj(0x100000u64, GuestAddress(zp_addr + 0x230))
-            .map_err(|e| LoaderError::BootConfig(format!("write pref_address: {e:?}")))?;
-
-        // Set init_size (offset 0x238) — the kernel initialization size.
-        // The decompressor uses this to calculate memory allocation.
-        // Without it, the decompressor runs out of memory.
-        // Use a generous default (64 MiB) that covers the decompressed kernel
-        // plus heap overhead.
-        guest_memory
-            .write_obj(0x400_0000u32, GuestAddress(zp_addr + 0x238))
-            .map_err(|e| LoaderError::BootConfig(format!("write init_size: {e:?}")))?;
+        // Preserve kernel-supplied header fields. In the x86 boot protocol,
+        // pref_address (0x258) and init_size (0x260) are read-only inputs to
+        // the loader. Offsets 0x230..0x238 instead contain kernel_alignment,
+        // relocatable_kernel, min_alignment and xloadflags; 0x238 is cmdline_size.
     }
 
     // Silence the unused-import warnings for re-exported constants above;
@@ -724,6 +714,46 @@ mod tests {
 
         header[BZIMAGE_HEADER_OFFSET] = b'X';
         assert!(parse_bzimage_header(&header).is_err());
+    }
+
+    #[test]
+    fn bzimage_boot_preserves_kernel_supplied_header_fields() {
+        const MEM: usize = 4 * 1024 * 1024;
+        let mut image = vec![0; (DEFAULT_BZIMAGE_SETUP_SECTS + 1) * SECTOR_SIZE + 16];
+        image[BZIMAGE_BOOT_FLAG_OFFSET..BZIMAGE_BOOT_FLAG_OFFSET + 2]
+            .copy_from_slice(&BZIMAGE_BOOT_FLAG.to_le_bytes());
+        image[BZIMAGE_HEADER_OFFSET..BZIMAGE_HEADER_OFFSET + 4]
+            .copy_from_slice(BZIMAGE_HEADER_MAGIC);
+        image[BZIMAGE_VERSION_OFFSET..BZIMAGE_VERSION_OFFSET + 2]
+            .copy_from_slice(&0x020cu16.to_le_bytes());
+        image[BZIMAGE_CODE32_START_OFFSET..BZIMAGE_CODE32_START_OFFSET + 4]
+            .copy_from_slice(&(DEFAULT_BZIMAGE_CODE32_START as u32).to_le_bytes());
+        image[0x230..0x234].copy_from_slice(&0x20_0000u32.to_le_bytes());
+        image[0x234] = 1; // relocatable
+        image[0x235] = 21; // minimum alignment
+        image[0x236..0x238].copy_from_slice(&0x0003u16.to_le_bytes());
+        image[0x238..0x23c].copy_from_slice(&4095u32.to_le_bytes());
+        image[0x258..0x260].copy_from_slice(&0x100_0000u64.to_le_bytes());
+        image[0x260..0x264].copy_from_slice(&0x5ab_c000u32.to_le_bytes());
+        let path =
+            std::env::temp_dir().join(format!("tarit-bzimage-header-{}", std::process::id()));
+        std::fs::write(&path, &image).unwrap();
+        let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM)]).unwrap();
+        let boot = load_and_setup_boot(&memory, &path, "console=ttyS0", None, MEM as u64).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut fields = [0; 0x264 - 0x230];
+        memory
+            .read_slice(&mut fields, GuestAddress(boot.zero_page_addr.0 + 0x230))
+            .unwrap();
+        assert_eq!(&fields, &image[0x230..0x264]);
+        let cmdline: u32 = memory
+            .read_obj(GuestAddress(boot.zero_page_addr.0 + 0x228))
+            .unwrap();
+        assert_eq!(u64::from(cmdline), boot.cmdline_addr.0);
+        let entries: u8 = memory
+            .read_obj(GuestAddress(boot.zero_page_addr.0 + 0x1e8))
+            .unwrap();
+        assert!(entries > 0, "loader-owned E820 fields still populated");
     }
 
     #[test]
