@@ -62,9 +62,29 @@ impl VcpuThread {
     /// that runs KVM_RUN in a loop.
     pub fn spawn(
         id: VcpuId,
+        vcpu: VcpuFd,
+        mmio_bus: Arc<MmioBus>,
+        serial: Arc<vmm_devices::serial::Serial>,
+    ) -> Result<Self> {
+        Self::spawn_with_start_gate(id, vcpu, mmio_bus, serial, None)
+    }
+
+    pub(crate) fn spawn_parked(
+        id: VcpuId,
+        vcpu: VcpuFd,
+        mmio_bus: Arc<MmioBus>,
+        serial: Arc<vmm_devices::serial::Serial>,
+        start: crate::vcpu_start::VcpuStartToken,
+    ) -> Result<Self> {
+        Self::spawn_with_start_gate(id, vcpu, mmio_bus, serial, Some(start))
+    }
+
+    fn spawn_with_start_gate(
+        id: VcpuId,
         mut vcpu: VcpuFd,
         mmio_bus: Arc<MmioBus>,
         serial: Arc<vmm_devices::serial::Serial>,
+        start: Option<crate::vcpu_start::VcpuStartToken>,
     ) -> Result<Self> {
         let control = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -133,6 +153,11 @@ impl VcpuThread {
                 paused: paus.clone(),
                 exited: exited_for_thread.clone(),
             };
+            if let Some(start) = start {
+                if !start.wait(&stop_for_thread) {
+                    return Ok(());
+                }
+            }
             let result = (|| -> Result<()> {
                 loop {
                     // Stop requested — exit cleanly (no error).

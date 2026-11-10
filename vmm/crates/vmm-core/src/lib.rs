@@ -20,6 +20,11 @@ pub mod restore_semantics;
 pub mod security;
 pub mod state;
 pub mod vcpu;
+#[cfg(any(
+    test,
+    all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
+))]
+mod vcpu_start;
 pub mod volume;
 
 #[cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
