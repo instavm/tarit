@@ -11914,7 +11914,7 @@ mod tests {
             id,
             SpawnPurpose::Live,
             ResourceShape::new(1, 1),
-            || std::future::pending::<Result<(), OrchError>>(),
+            std::future::pending::<Result<(), OrchError>>,
         ));
         runtime.block_on(async {
             tokio::select! {
