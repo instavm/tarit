@@ -130,6 +130,60 @@ struct LazySource {
 /// Chunk size of [`LazyPageDiscard::read_untouched`] without a manifest.
 const UNTOUCHED_READ_CHUNK: usize = 2 * 1024 * 1024;
 
+/// Owned capture: no guest mapping access or exclusion fence is needed to finish it.
+pub struct CapturedSnapshotRange {
+    lazy: LazyPageDiscard,
+    offset: usize,
+    bytes: Vec<u8>,
+    populated: Vec<bool>,
+    discarded: Vec<bool>,
+}
+
+impl CapturedSnapshotRange {
+    pub fn all_source_pages(&self) -> bool {
+        self.populated
+            .iter()
+            .zip(&self.discarded)
+            .all(|(present, discarded)| !present && !discarded)
+    }
+
+    /// Source I/O and integrity verification run after releasing guest exclusion.
+    pub fn finish(self) -> Result<Vec<u8>, UffdRestoreError> {
+        const PAGE: usize = 4096;
+        if self
+            .populated
+            .iter()
+            .zip(&self.discarded)
+            .all(|(present, discarded)| *present || *discarded)
+        {
+            return Ok(self.bytes);
+        }
+        let mut out = vec![0; self.bytes.len()];
+        let chunk = self.lazy.untouched_chunk();
+        let end = self.offset + out.len();
+        let mut buffer = vec![0; chunk.min(self.lazy.guest_len)];
+        let mut at = self.offset / chunk * chunk;
+        while at < end {
+            let chunk_end = (at + chunk).min(self.lazy.guest_len);
+            self.lazy
+                .read_untouched(at, &mut buffer[..chunk_end - at])?;
+            let from = at.max(self.offset);
+            let to = chunk_end.min(end);
+            out[from - self.offset..to - self.offset].copy_from_slice(&buffer[from - at..to - at]);
+            at = chunk_end;
+        }
+        for (page, (present, discarded)) in self.populated.iter().zip(&self.discarded).enumerate() {
+            let range = page * PAGE..(page + 1) * PAGE;
+            if *present {
+                out[range.clone()].copy_from_slice(&self.bytes[range]);
+            } else if *discarded {
+                out[range].fill(0);
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl LazyPageDiscard {
     pub fn snapshot_fence(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
         self.snapshot_fence.clone()
@@ -218,6 +272,55 @@ impl LazyPageDiscard {
             }
         }
         Ok(())
+    }
+
+    /// Capture one bounded page-aligned range while the caller holds snapshot_fence.
+    /// Only populated RAM is copied here; file I/O is deferred to finish().
+    pub fn capture_snapshot_range(
+        &self,
+        offset: usize,
+        len: usize,
+        populated: Vec<bool>,
+    ) -> Result<CapturedSnapshotRange, UffdRestoreError> {
+        const PAGE: usize = 4096;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.guest_len)
+            .ok_or_else(|| UffdRestoreError::Uffd("capture beyond guest RAM".into()))?;
+        if !offset.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+            || populated.len() != len / PAGE
+        {
+            return Err(UffdRestoreError::Uffd(
+                "capture requires aligned pages and population map".into(),
+            ));
+        }
+        let discarded = self
+            .discarded_pages
+            .lock()
+            .map_err(|_| UffdRestoreError::Uffd("discard bitmap lock poisoned".into()))?
+            [offset / PAGE..end / PAGE]
+            .to_vec();
+        let mut bytes = vec![0; len];
+        for (page, present) in populated.iter().enumerate() {
+            if *present {
+                // SAFETY: validated live mmap range; caller excludes concurrent discard.
+                let source = unsafe {
+                    std::slice::from_raw_parts(
+                        (self.guest_base + offset + page * PAGE) as *const u8,
+                        PAGE,
+                    )
+                };
+                bytes[page * PAGE..(page + 1) * PAGE].copy_from_slice(source);
+            }
+        }
+        Ok(CapturedSnapshotRange {
+            lazy: self.clone(),
+            offset,
+            bytes,
+            populated,
+            discarded,
+        })
     }
 
     /// Copy snapshot-visible bytes without faulting missing guest pages in.

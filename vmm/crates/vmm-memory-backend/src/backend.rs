@@ -463,12 +463,23 @@ impl GuestMemory {
     /// snapshot. `None` when the map cannot be read.
     #[cfg(target_os = "linux")]
     pub fn populated_pages(&self) -> Option<Vec<bool>> {
+        self.populated_pages_range(0, usize::try_from(self.size_bytes).ok()?)
+    }
+
+    /// Population map for one page-aligned packed-RAM range.
+    #[cfg(target_os = "linux")]
+    pub fn populated_pages_range(&self, offset: usize, len: usize) -> Option<Vec<bool>> {
         use std::os::unix::fs::FileExt;
         const PAGE: usize = 4096;
         const PRESENT: u64 = 1 << 63;
         const SWAPPED: u64 = 1 << 62;
-        let addr = self.as_ptr() as usize;
-        let len = usize::try_from(self.size_bytes).ok()?;
+        if !offset.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+            || offset.checked_add(len)? > usize::try_from(self.size_bytes).ok()?
+        {
+            return None;
+        }
+        let addr = (self.as_ptr() as usize).checked_add(offset)?;
         if !addr.is_multiple_of(PAGE) {
             return None;
         }
