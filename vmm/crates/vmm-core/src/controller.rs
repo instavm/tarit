@@ -3792,31 +3792,101 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
-    // Use the system temp dir (disk-backed, large enough for multi-hundred-MB
-    // snapshots), under a private per-process 0700 subdir. Never the CWD/source
-    // tree, and never a small runtime tmpfs like XDG_RUNTIME_DIR (/run/user),
-    // which fills up when large snapshots are written to it.
-    let dir = std::env::temp_dir()
-        .join(".vmm-runtime")
-        .join(format!("vmm-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| VmmError::Snapshot(format!("create runtime dir {}: {e}", dir.display())))?;
+fn runtime_namespace_name() -> String {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::symlink_metadata(&dir)
-            .map_err(|e| VmmError::Snapshot(format!("stat runtime dir {}: {e}", dir.display())))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(VmmError::Snapshot(format!(
-                "runtime path is not a directory: {}",
-                dir.display()
-            )));
+        // SAFETY: geteuid has no preconditions.
+        format!(".vmm-runtime-{}", unsafe { libc::geteuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        ".vmm-runtime".into()
+    }
+}
+
+#[cfg(unix)]
+fn verify_private_runtime_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        VmmError::Snapshot(format!(
+            "stat runtime directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(VmmError::Snapshot(format!(
+            "runtime directory is not private and owned by this user: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn private_runtime_dir_in(base: &Path, pid: u32) -> Result<PathBuf> {
+    // Return a canonical path so a mutable symlink in TMPDIR cannot redirect
+    // later scratch/socket operations after validation.
+    let base = std::fs::canonicalize(base).map_err(|error| {
+        VmmError::Snapshot(format!("resolve runtime base {}: {error}", base.display()))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        for ancestor in base.ancestors() {
+            let meta = std::fs::symlink_metadata(ancestor).map_err(|error| {
+                VmmError::Snapshot(format!(
+                    "stat runtime ancestor {}: {error}",
+                    ancestor.display()
+                ))
+            })?;
+            // Root-owned sticky temporary directories safely protect our
+            // user-owned child from rename/removal by other users.
+            let root_sticky = meta.uid() == 0 && meta.mode() & 0o1000 != 0;
+            if !meta.is_dir()
+                || (meta.uid() != 0 && meta.uid() != uid)
+                || (meta.mode() & 0o022 != 0 && !root_sticky)
+            {
+                return Err(VmmError::Snapshot(format!(
+                    "untrusted runtime ancestor: {}",
+                    ancestor.display()
+                )));
+            }
         }
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| VmmError::Snapshot(format!("chmod runtime dir {}: {e}", dir.display())))?;
+    }
+    let namespace = base.join(runtime_namespace_name());
+    let dir = namespace.join(format!("vmm-{pid}"));
+    for path in [&namespace, &dir] {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(VmmError::Snapshot(format!(
+                    "create runtime directory {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+        #[cfg(unix)]
+        verify_private_runtime_directory(path)?;
     }
     Ok(dir)
+}
+
+pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
+    private_runtime_dir_in(&std::env::temp_dir(), std::process::id())
 }
 
 #[cfg(test)]
@@ -3832,8 +3902,14 @@ fn cleanup_private_runtime_dir() {
     use std::io::ErrorKind;
 
     let dir = std::env::temp_dir()
-        .join(".vmm-runtime")
+        .join(runtime_namespace_name())
         .join(format!("vmm-{}", std::process::id()));
+    #[cfg(unix)]
+    if verify_private_runtime_directory(dir.parent().expect("runtime namespace")).is_err()
+        || verify_private_runtime_directory(&dir).is_err()
+    {
+        return;
+    }
     let metadata = match std::fs::symlink_metadata(&dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return,
@@ -10663,6 +10739,40 @@ mod tests {
         remove_owned_scratch_file(&output);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_namespace_rejects_symlink_and_writable_ancestors_without_chmod() {
+        use std::os::unix::{
+            fs::MetadataExt,
+            fs::{symlink, PermissionsExt},
+        };
+        let base = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let namespace = base.path().join(runtime_namespace_name());
+        symlink(victim.path(), &namespace).unwrap();
+        let before = std::fs::metadata(victim.path()).unwrap().mode();
+        assert!(private_runtime_dir_in(base.path(), 123).is_err());
+        assert_eq!(std::fs::metadata(victim.path()).unwrap().mode(), before);
+        assert!(!victim.path().join("vmm-123").exists());
+        std::fs::remove_file(&namespace).unwrap();
+        std::fs::create_dir(&namespace).unwrap();
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_runtime_dir_in(base.path(), 123).is_err());
+        assert_eq!(std::fs::metadata(&namespace).unwrap().mode() & 0o777, 0o777);
+        std::fs::set_permissions(&namespace, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = private_runtime_dir_in(base.path(), 123).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(private_runtime_dir_in(base.path(), 123).unwrap(), dir);
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_runtime_dir_in(base.path(), 124).is_err());
+        assert!(!namespace.join("vmm-124").exists());
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        symlink(victim.path(), &dir).unwrap();
+        assert!(private_runtime_dir_in(base.path(), 123).is_err());
+        assert_eq!(std::fs::metadata(victim.path()).unwrap().mode(), before);
+    }
+
     #[test]
     fn suspend_image_path_is_process_local_and_private() {
         let path = PathBuf::from(unique_suspend_snapshot_path().unwrap());
@@ -10671,7 +10781,9 @@ mod tests {
         assert!(name.starts_with(".vmm-suspend-"));
         assert!(name.ends_with(".snap"));
         assert!(path.is_absolute());
-        assert!(path.components().any(|c| c.as_os_str() == ".vmm-runtime"));
+        assert!(path
+            .components()
+            .any(|c| c.as_os_str() == runtime_namespace_name().as_str()));
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
