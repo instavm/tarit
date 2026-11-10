@@ -57,8 +57,6 @@ const MAX_PEER_SOURCE_LEN: usize = 128;
 const MAX_TRACKED_NONCES_PER_SOURCE: usize = 65_536;
 const MAX_TRACKED_NONCES_TOTAL: usize = 262_144;
 const MAX_TRACKED_PEER_SOURCES: usize = 1_024;
-const MAX_PEER_SOURCE_HEARTBEAT_AGE_SECS: i64 = 15;
-const MAX_PEER_SOURCE_FUTURE_SKEW_SECS: i64 = 5;
 static USED_PEER_IDENTITY_NONCES: OnceLock<Mutex<ReplayCache>> = OnceLock::new();
 static USED_PEER_REQUEST_NONCES: OnceLock<Mutex<ReplayCache>> = OnceLock::new();
 
@@ -599,14 +597,15 @@ async fn verify_peer_request(
     }
     mac.verify_slice(&signature).ok()?;
     if let Some(fleet) = state.fleet.as_ref() {
-        let current_source = fleet.get_host(&source).await.ok().flatten()?;
+        let (registry_now, current_source) =
+            fleet.get_host_with_clock(&source).await.ok().flatten()?;
         let connection_certificate = request.extensions().get::<VerifiedPeerCertificate>()?;
         if !current_peer_source(
             &current_source,
             &source,
             source_session,
             &connection_certificate.0,
-            Utc::now(),
+            registry_now,
         ) {
             return None;
         }
@@ -623,13 +622,11 @@ fn current_peer_source(
     peer_certificate_sha256: &str,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    let age = now - host.last_heartbeat;
     host.host_id == source
         && host.boot_session_id == Some(session)
         && host.peer_certificate_sha256.as_deref() == Some(peer_certificate_sha256)
         && host.healthy
-        && age <= chrono::Duration::seconds(MAX_PEER_SOURCE_HEARTBEAT_AGE_SECS)
-        && age >= -chrono::Duration::seconds(MAX_PEER_SOURCE_FUTURE_SKEW_SECS)
+        && tarit_fleet::host_heartbeat_is_fresh(host.last_heartbeat, now)
 }
 
 async fn internal_share_proxy_root(
