@@ -202,6 +202,14 @@ impl KvmVm {
             let kvm = guard
                 .as_ref()
                 .expect("cached KVM fd is initialized before use");
+            // Snapshot pause must finish pending userspace I/O without letting
+            // the guest execute another instruction (KVM API, kvm_run §5).
+            // Without this capability immediate_exit would silently be ignored.
+            if !kvm.check_extension(kvm_ioctls::Cap::ImmediateExit) {
+                return Err(VmmError::Kvm(
+                    "KVM_CAP_IMMEDIATE_EXIT required for coherent vCPU pause".into(),
+                ));
+            }
             kvm.create_vm_with_type(0)
                 .map_err(|e| VmmError::Kvm(format!("KVM_CREATE_VM: {e}")))?
         };

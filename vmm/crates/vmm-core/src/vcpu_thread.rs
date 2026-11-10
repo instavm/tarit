@@ -134,6 +134,7 @@ impl VcpuThread {
                 exited: exited_for_thread.clone(),
             };
             let result = (|| -> Result<()> {
+                let mut pending_io = false;
                 loop {
                     // Stop requested — exit cleanly (no error).
                     if stop_for_thread.load(Ordering::Relaxed) {
@@ -142,6 +143,25 @@ impl VcpuThread {
                     }
                     // Check control channel.
                     if ctrl.load(Ordering::Relaxed) {
+                        if pending_io {
+                            if !complete_pending_io(
+                                &mut vcpu,
+                                &mmio_bus,
+                                &serial_for_thread,
+                                &stop_for_thread,
+                            )? {
+                                return Ok(());
+                            }
+                            pending_io = false;
+                        }
+                        // Cancellation/stop can race completion. Never publish a
+                        // capture after stop, or park after pause was withdrawn.
+                        if stop_for_thread.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        if !ctrl.load(Ordering::Acquire) {
+                            continue;
+                        }
                         // Tell KVM that userspace deliberately paused this
                         // vCPU. A kvm-clock guest consumes the flag to avoid a
                         // false watchdog soft-lockup after a long pause. The
@@ -166,7 +186,7 @@ impl VcpuThread {
                             },
                             Err(e) => log::warn!("capture vCPU state: {e}"),
                         }
-                        paus.store(true, Ordering::Relaxed);
+                        paus.store(true, Ordering::Release);
                         log::info!("vCPU thread pausing");
                         // Wait for control to clear (resume) or for stop.
                         // Adaptive backoff: a live-snapshot final stop resumes
@@ -197,40 +217,16 @@ impl VcpuThread {
 
                     match vcpu.run() {
                         Ok(VcpuExit::Hlt) => {
+                            pending_io = false;
                             // With in-kernel IRQCHIP, HLT should be handled
                             // by KVM internally (no exit to userspace). If we
                             // DO get a HLT exit, the kernel is idle — yield
                             // to let other threads (serial, net) run.
                             std::thread::yield_now();
                         }
-                        Ok(VcpuExit::MmioWrite(addr, data)) => {
-                            let mut val: u64 = 0;
-                            for (i, &b) in data.iter().enumerate().take(8) {
-                                val |= (b as u64) << (i * 8);
-                            }
-                            let _ = mmio_bus.write(addr, val, data.len() as u8);
-                        }
-                        Ok(VcpuExit::MmioRead(addr, data)) => {
-                            if let Ok(val) = mmio_bus.read(addr, data.len() as u8) {
-                                let bytes = val.to_le_bytes();
-                                for (i, slot) in data.iter_mut().enumerate().take(8) {
-                                    *slot = bytes[i];
-                                }
-                            }
-                        }
-                        Ok(VcpuExit::IoOut(port, data)) => {
-                            if (0x3f8..=0x3ff).contains(&port) {
-                                serial_for_thread.write((port - 0x3f8) as u8, data[0]);
-                            }
-                        }
-                        Ok(VcpuExit::IoIn(port, data)) => {
-                            if (0x3f8..=0x3ff).contains(&port) {
-                                data[0] = serial_for_thread.read((port - 0x3f8) as u8);
-                            }
-                        }
-                        Ok(other) => {
-                            log::warn!("vCPU exit {other:?} — stopping");
-                            return Err(VmmError::Kvm(format!("unhandled exit: {other:?}")));
+                        Ok(exit) => {
+                            handle_io_exit(exit, &mmio_bus, &serial_for_thread)?;
+                            pending_io = true;
                         }
                         Err(e) => {
                             // EINTR = a control-thread tgkill(SIGALRM) fired
@@ -240,6 +236,11 @@ impl VcpuThread {
                             // bringup state machine — it is retryable, not
                             // fatal. Anything else is fatal.
                             let errno = e.errno();
+                            // KVM completes a previous I/O operation before
+                            // checking signals. EAGAIN makes no such promise.
+                            if errno == libc::EINTR {
+                                pending_io = false;
+                            }
                             if errno != libc::EINTR && errno != libc::EAGAIN {
                                 return Err(VmmError::Kvm(format!("KVM_RUN: {e}")));
                             }
@@ -518,6 +519,175 @@ impl Drop for VcpuThread {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = handle.join();
             }));
+        }
+    }
+}
+
+/// Finish the instruction that caused the last userspace I/O exit before any
+/// KVM_GET_* capture. KVM API §5 guarantees immediate_exit completes pending
+/// operations without executing further guest instructions. Only this vCPU
+/// thread accesses kvm_run; device handlers run without holding controller locks.
+fn complete_pending_io(
+    vcpu: &mut VcpuFd,
+    bus: &MmioBus,
+    serial: &vmm_devices::serial::Serial,
+    stop: &AtomicBool,
+) -> Result<bool> {
+    vcpu.set_kvm_immediate_exit(1);
+    let result = drain_pending_io(stop, || match vcpu.run() {
+        Err(error) if error.errno() == libc::EINTR => Ok(true),
+        Err(error) if error.errno() == libc::EAGAIN => Ok(false),
+        Err(error) => Err(VmmError::Snapshot(format!(
+            "complete pending vCPU I/O: {error}"
+        ))),
+        // One instruction may need multiple exits (e.g. split MMIO). Service
+        // those with immediate_exit still set, until KVM confirms completion.
+        Ok(exit) => {
+            handle_io_exit(exit, bus, serial)?;
+            Ok(false)
+        }
+    });
+    vcpu.set_kvm_immediate_exit(0);
+    result
+}
+
+fn drain_pending_io(stop: &AtomicBool, mut step: impl FnMut() -> Result<bool>) -> Result<bool> {
+    // A broken backend must fail the snapshot rather than spin forever while
+    // the controller holds a lifecycle lock. Each run has immediate_exit set.
+    for _ in 0..64 {
+        if stop.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if step()? {
+            return Ok(true);
+        }
+        std::thread::yield_now();
+    }
+    Err(VmmError::Snapshot(
+        "pending vCPU I/O did not complete in 64 reentries".into(),
+    ))
+}
+
+fn handle_io_exit(
+    exit: VcpuExit<'_>,
+    bus: &MmioBus,
+    serial: &vmm_devices::serial::Serial,
+) -> Result<()> {
+    match exit {
+        VcpuExit::MmioWrite(addr, data) => {
+            let mut bytes = [0; 8];
+            for (dst, src) in bytes.iter_mut().zip(data.iter()) {
+                *dst = *src;
+            }
+            let _ = bus.write(addr, u64::from_le_bytes(bytes), data.len() as u8);
+        }
+        VcpuExit::MmioRead(addr, data) => {
+            if let Ok(value) = bus.read(addr, data.len() as u8) {
+                for (dst, src) in data.iter_mut().zip(value.to_le_bytes()) {
+                    *dst = src;
+                }
+            }
+        }
+        VcpuExit::IoOut(port, data) => {
+            if (0x3f8..=0x3ff).contains(&port) {
+                serial.write((port - 0x3f8) as u8, data[0]);
+            }
+        }
+        VcpuExit::IoIn(port, data) => {
+            if (0x3f8..=0x3ff).contains(&port) {
+                data[0] = serial.read((port - 0x3f8) as u8);
+            }
+        }
+        other => return Err(VmmError::Kvm(format!("unhandled exit: {other:?}"))),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_retries_abort_on_fault_and_observe_stop_before_reentry() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        assert!(drain_pending_io(&stop, || {
+            attempts += 1;
+            Ok(attempts == 3)
+        })
+        .unwrap());
+        assert_eq!(attempts, 3);
+        assert!(drain_pending_io(&stop, || Err(VmmError::Snapshot(
+            "injected completion fault".into()
+        )))
+        .is_err());
+        assert!(!drain_pending_io(&stop, || {
+            stop.store(true, Ordering::Release);
+            Ok(false)
+        })
+        .unwrap());
+        assert!(!drain_pending_io(&stop, || panic!("stop must precede reentry")).unwrap());
+    }
+
+    #[test]
+    fn completion_retry_budget_is_bounded() {
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0;
+        assert!(drain_pending_io(&stop, || {
+            attempts += 1;
+            Ok(false)
+        })
+        .is_err());
+        assert_eq!(attempts, 64);
+    }
+
+    // Requires real KVM: explicitly ignored by ordinary unit runs rather than
+    // silently counting an unavailable /dev/kvm as passing execution evidence.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_pending_pio_mmio_complete_without_executing_next_instruction() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        assert!(kvm.check_extension(kvm_ioctls::Cap::ImmediateExit));
+        for code in [
+            vec![0xe4, 0x80],                // in al, 0x80
+            vec![0xe6, 0x80],                // out 0x80, al
+            vec![0x67, 0xa0, 0, 0, 0, 0xf0], // mov al, byte [0xf0000000]
+            vec![0x67, 0xa2, 0, 0, 0, 0xf0], // mov byte [0xf0000000], al
+        ] {
+            let vm = kvm.create_vm().unwrap();
+            let mem = vmm_memory_backend::GuestMemory::new(0x4000).unwrap();
+            mem.register(&vm, 0).unwrap();
+            let mut program = code.clone();
+            program.extend_from_slice(&[0xb0, 0xcc, 0xf4]); // mov al,0xcc; hlt
+            mem.write_phys(0x1000, &program).unwrap();
+            let mut vcpu = vm.create_vcpu(0).unwrap();
+            let mut sregs = vcpu.get_sregs().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            vcpu.set_sregs(&sregs).unwrap();
+            let mut regs = vcpu.get_regs().unwrap();
+            regs.rip = 0x1000;
+            regs.rflags = 2;
+            regs.rax = 0x5a;
+            vcpu.set_regs(&regs).unwrap();
+            match vcpu.run().unwrap() {
+                VcpuExit::IoIn(_, data) | VcpuExit::MmioRead(_, data) => data[0] = 0x5a,
+                VcpuExit::IoOut(_, _) | VcpuExit::MmioWrite(_, _) => {}
+                other => panic!("expected I/O exit: {other:?}"),
+            }
+            let bus = MmioBus::new();
+            let serial = vmm_devices::serial::Serial::new(
+                vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            );
+            assert!(
+                complete_pending_io(&mut vcpu, &bus, &serial, &AtomicBool::new(false)).unwrap()
+            );
+            let regs = vcpu.get_regs().unwrap();
+            assert_eq!(regs.rip, 0x1000 + code.len() as u64);
+            assert_eq!(regs.rax & 0xff, 0x5a, "next mov must not execute");
+            assert_eq!(vcpu.get_kvm_run().immediate_exit, 0);
+            assert!(matches!(vcpu.run().unwrap(), VcpuExit::Hlt));
+            assert_eq!(vcpu.get_regs().unwrap().rax & 0xff, 0xcc);
         }
     }
 }
