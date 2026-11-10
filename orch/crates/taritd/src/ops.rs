@@ -5231,6 +5231,7 @@ mod tests {
             let response = match &request {
                 tarit_vmm_client::ApiRequest::Pause => tarit_vmm_client::ApiResponse::Err {
                     msg: "injected I/O quiescence failure".into(),
+                    code: None,
                 },
                 tarit_vmm_client::ApiRequest::Status => {
                     tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
@@ -5317,6 +5318,7 @@ mod tests {
                 tarit_vmm_client::ApiRequest::Snapshot { .. } => {
                     tarit_vmm_client::ApiResponse::Err {
                         msg: "injected snapshot failure".into(),
+                        code: None,
                     }
                 }
                 tarit_vmm_client::ApiRequest::Status => {
@@ -5406,6 +5408,7 @@ mod tests {
                     tarit_vmm_client::ApiRequest::Snapshot { .. } => {
                         tarit_vmm_client::ApiResponse::Err {
                             msg: "injected snapshot failure".into(),
+                            code: None,
                         }
                     }
                     tarit_vmm_client::ApiRequest::Status => {
@@ -5413,6 +5416,7 @@ mod tests {
                         if status_requests == 1 {
                             tarit_vmm_client::ApiResponse::Err {
                                 msg: "injected status outage".into(),
+                                code: None,
                             }
                         } else {
                             tarit_vmm_client::ApiResponse::Status(tarit_vmm_client::VmStatus {
