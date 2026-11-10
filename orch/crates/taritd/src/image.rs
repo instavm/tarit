@@ -314,10 +314,35 @@ fn resolve_warm_pool_image_refs_with_policy(
     Ok(())
 }
 
-pub fn resolve_request_image(
-    store: &Store,
+/// File admission can read an entire rootfs. Keep it off async workers and
+/// outside the shared store mutex, then fence concurrent registration changes.
+pub async fn resolve_request_image(
+    store: &std::sync::Arc<std::sync::Mutex<Store>>,
     req: &CreateVmRequest,
     policy: &ImageAdmissionPolicy,
+) -> Result<CreateVmRequest, OrchError> {
+    resolve_request_image_using(store, req, policy, verify_admitted_image).await
+}
+
+async fn resolve_request_image_using(
+    store: &std::sync::Arc<std::sync::Mutex<Store>>,
+    req: &CreateVmRequest,
+    policy: &ImageAdmissionPolicy,
+    verify: impl FnOnce(&ImageRecord, &ImageAdmissionPolicy) -> Result<()> + Send + 'static,
+) -> Result<CreateVmRequest, OrchError> {
+    let store = std::sync::Arc::clone(store);
+    let req = req.clone();
+    let policy = policy.clone();
+    tokio::task::spawn_blocking(move || resolve_request_image_with(&store, &req, &policy, verify))
+        .await
+        .map_err(|error| OrchError::Internal(format!("image admission task: {error}")))?
+}
+
+fn resolve_request_image_with(
+    store: &std::sync::Mutex<Store>,
+    req: &CreateVmRequest,
+    policy: &ImageAdmissionPolicy,
+    verify: impl FnOnce(&ImageRecord, &ImageAdmissionPolicy) -> Result<()>,
 ) -> Result<CreateVmRequest, OrchError> {
     if req.image.is_some() && req.rootfs_path.is_some() {
         return Err(OrchError::BadRequest(
@@ -329,22 +354,32 @@ pub fn resolve_request_image(
     };
     let image_ref =
         parse_image_ref(raw).map_err(|e| OrchError::BadRequest(format!("invalid image: {e}")))?;
-    let image = match store.get_image(&image_ref.name, &image_ref.tag) {
-        Ok(image) => image,
-        Err(StoreError::NotFound) => {
-            return Err(OrchError::NotFound(format!(
-                "image {} not found",
-                image_ref.label()
-            )))
-        }
-        Err(e) => return Err(OrchError::Internal(format!("image lookup: {e}"))),
+    let lookup = || {
+        store
+            .lock()
+            .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+            .get_image(&image_ref.name, &image_ref.tag)
+            .map_err(|error| match error {
+                StoreError::NotFound => {
+                    OrchError::NotFound(format!("image {} not found", image_ref.label()))
+                }
+                error => OrchError::Internal(format!("image lookup: {error}")),
+            })
     };
-    verify_admitted_image(&image, policy).map_err(|error| {
+    let image = lookup()?;
+    /* lookup returns owned metadata and drops the guard before verification. */
+    verify(&image, policy).map_err(|error| {
         OrchError::Unprocessable(format!(
             "image {} failed immutable admission: {error}",
             image_ref.label()
         ))
     })?;
+    if lookup()? != image {
+        return Err(OrchError::Conflict(format!(
+            "image {} changed during admission; retry",
+            image_ref.label()
+        )));
+    }
     let mut resolved = req.clone();
     resolved.rootfs_path = Some(image.rootfs_path);
     resolved.image = None;
@@ -660,6 +695,7 @@ pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
         let cache = digest_cache().lock().unwrap_or_else(|e| e.into_inner());
         if let Some((cached, digest)) = cache.get(&key) {
             if *cached == identity {
+                ensure_file_unchanged(&file, path, identity)?;
                 return Ok(digest.clone());
             }
         }
@@ -675,7 +711,8 @@ pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     let digest = format!("sha256:{:x}", hasher.finalize());
-    if identity.settled() && FileIdentity::of(&file.metadata()?) == identity {
+    ensure_file_unchanged(&file, path, identity)?;
+    if identity.settled() {
         let mut cache = digest_cache().lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= DIGEST_CACHE_ENTRIES {
             cache.clear();
@@ -683,6 +720,18 @@ pub(crate) fn sha256_regular_file(path: &Path) -> Result<String> {
         cache.insert(key, (identity, digest.clone()));
     }
     Ok(digest)
+}
+
+/// Do not return or cache a digest of changing bytes or a replaced pathname.
+fn ensure_file_unchanged(file: &std::fs::File, path: &Path, identity: FileIdentity) -> Result<()> {
+    let current = std::fs::symlink_metadata(path)?;
+    if !current.file_type().is_file()
+        || FileIdentity::of(&current) != identity
+        || FileIdentity::of(&file.metadata()?) != identity
+    {
+        bail!("{} changed while hashing", path.display());
+    }
+    Ok(())
 }
 
 pub fn remove_image(config: &LocalImageConfig, image_ref: &ImageRef) -> Result<ImageRecord> {
@@ -927,6 +976,114 @@ fn remove_registered_file(images_dir: &Path, rootfs_path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_admission_releases_store_and_async_worker_and_fences_registration_races() {
+        use std::sync::{Arc, Mutex};
+        for change in ["none", "replace", "delete", "tamper"] {
+            let dir = std::env::temp_dir()
+                .join(format!("tarit-unlocked-admission-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("image.ext4");
+            let bytes = b"cold immutable rootfs";
+            std::fs::write(&path, bytes).unwrap();
+            let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+            let source = format!("sha256:{}", "a".repeat(64));
+            let record = ImageRecord {
+                name: "test".into(),
+                tag: "latest".into(),
+                rootfs_path: path.display().to_string(),
+                created_at: Utc::now(),
+                size_bytes: bytes.len() as u64,
+                source_ref: format!("docker://test@{source}"),
+                source_digest: Some(source),
+                rootfs_digest: Some(digest),
+                agent_digest: Some(format!("sha256:{}", "b".repeat(64))),
+                provenance_key_digest: None,
+                provenance_verified_at: None,
+                golden_snapshot_path: None,
+                prewarm: None,
+            };
+            let store = Arc::new(Mutex::new(Store::open(&dir.join("store.db")).unwrap()));
+            store.lock().unwrap().upsert_image(&record).unwrap();
+            let req: CreateVmRequest =
+                serde_json::from_value(serde_json::json!({"image":"test"})).unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let resolver_store = store.clone();
+            let task = tokio::spawn(async move {
+                resolve_request_image_using(
+                    &resolver_store,
+                    &req,
+                    &ImageAdmissionPolicy::default(),
+                    move |image, policy| {
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        // Real verification of a unique, cold file, not a stubbed success.
+                        verify_admitted_image(image, policy)
+                    },
+                )
+                .await
+            });
+            // This runs on the sole async worker while admission is paused.
+            tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let guard = store
+                .try_lock()
+                .expect("hashing must not hold the shared store");
+            match change {
+                "replace" => {
+                    let mut replacement = record.clone();
+                    replacement.rootfs_digest = Some(format!("sha256:{}", "c".repeat(64)));
+                    guard.upsert_image(&replacement).unwrap();
+                }
+                "delete" => {
+                    guard.delete_image("test", "latest").unwrap();
+                }
+                "tamper" => {
+                    std::fs::write(&path, b"tampered rootfs bytes").unwrap();
+                }
+                _ => {}
+            }
+            drop(guard);
+            release_tx.send(()).unwrap();
+            let result = task.await.unwrap();
+            match change {
+                "none" => assert_eq!(
+                    result.unwrap().rootfs_path.as_deref(),
+                    Some(record.rootfs_path.as_str())
+                ),
+                "replace" => assert!(matches!(result, Err(OrchError::Conflict(_)))),
+                "delete" => assert!(matches!(result, Err(OrchError::NotFound(_)))),
+                "tamper" => assert!(matches!(result, Err(OrchError::Unprocessable(_)))),
+                _ => unreachable!(),
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn hash_identity_fence_rejects_replacement_and_in_place_writes() {
+        let dir = std::env::temp_dir().join(format!("tarit-hash-fence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("image");
+        std::fs::write(&path, b"first").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let identity = FileIdentity::of(&file.metadata().unwrap());
+        ensure_file_unchanged(&file, &path, identity).unwrap();
+        std::fs::write(&path, b"modified in place").unwrap();
+        assert!(ensure_file_unchanged(&file, &path, identity).is_err());
+        let identity = FileIdentity::of(&file.metadata().unwrap());
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, b"modified in place").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(ensure_file_unchanged(&file, &path, identity).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn file_digests_are_reused_only_while_the_file_is_unchanged() {
