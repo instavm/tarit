@@ -52,10 +52,82 @@ pub(crate) async fn run(state: AppState, listener: TcpListener) -> Result<()> {
     );
 
     let mut server = GatewayServer { state };
-    server
-        .run_on_socket(config, &listener)
+    serve_ssh(config, &listener, &mut server)
         .await
         .context("SSH gateway server")
+}
+
+async fn serve_ssh(
+    config: Arc<server::Config>,
+    listener: &TcpListener,
+    server: &mut GatewayServer,
+) -> std::io::Result<()> {
+    // Closing this sender when the listener task stops also disconnects existing
+    // sessions, as russh's convenience server does on shutdown.
+    let (shutdown, _) = tokio::sync::watch::channel(());
+    loop {
+        let (socket, peer) = accept_with_retry(|| listener.accept()).await?;
+        let handler = server.new_client(Some(peer));
+        let config = Arc::clone(&config);
+        let mut shutdown = shutdown.subscribe();
+        tokio::spawn(async move {
+            if config.nodelay {
+                if let Err(error) = socket.set_nodelay(true) {
+                    tracing::warn!(%error, "SSH TCP_NODELAY failed");
+                }
+            }
+            let session = tokio::select! {
+                _ = shutdown.changed() => return,
+                result = server::run_stream(config, socket, handler) => match result {
+                    Ok(session) => session,
+                    Err(error) => {
+                        tracing::debug!(%error, "SSH gateway connection setup failed");
+                        return;
+                    }
+                }
+            };
+            let handle = session.handle();
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    let _ = handle.disconnect(russh::Disconnect::ByApplication, "gateway stopped".into(), "".into()).await;
+                }
+                result = session => {
+                    if let Err(error) = result {
+                        tracing::debug!(%error, "SSH gateway session closed");
+                    }
+                }
+            }
+        });
+    }
+}
+
+async fn accept_with_retry<T, F, Fut>(mut accept: F) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        match accept().await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => {
+                // An invalid listener requires supervisor intervention. Pending
+                // connection errors and temporary resource exhaustion do not.
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EBADF | libc::ENOTSOCK | libc::EINVAL | libc::EOPNOTSUPP)
+                ) || matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                ) {
+                    return Err(error);
+                }
+                tracing::warn!(%error, ?delay, "SSH accept failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(1));
+            }
+        }
+    }
 }
 
 fn load_or_generate_host_key(path: &Path) -> Result<PrivateKey> {
@@ -775,6 +847,109 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, RwLock};
     use tarit_store::Store;
+
+    #[tokio::test]
+    async fn transient_accept_failures_back_off_then_accept_a_real_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            accept_with_retry(|| {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let listener = &listener;
+                async move {
+                    match call {
+                        0 => Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+                        1 => Err(std::io::Error::from_raw_os_error(libc::ECONNABORTED)),
+                        _ => listener.accept().await,
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(300),
+            "two transient errors must back off instead of busy-looping"
+        );
+        socket.write_all(b"SSH-2.0-retry-test\r\n").await.unwrap();
+        let mut banner = [0; 20];
+        client.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-retry-test\r\n");
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn ssh_accept_loop_serves_key_exchange_and_disconnects_on_shutdown() {
+        let state = test_state();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            struct TrustTestKey;
+            impl russh::client::Handler for TrustTestKey {
+                type Error = russh::Error;
+                async fn check_server_key(&mut self, _: &PublicKey) -> Result<bool, Self::Error> {
+                    Ok(true)
+                }
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let key =
+                PrivateKey::random(&mut russh::keys::key::safe_rng(), Algorithm::Ed25519).unwrap();
+            let config = Arc::new(server::Config {
+                keys: vec![key],
+                ..Default::default()
+            });
+            let state = state.clone();
+            let server = tokio::spawn(async move {
+                serve_ssh(config, &listener, &mut GatewayServer { state }).await
+            });
+            let mut client = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                russh::client::connect(
+                    Arc::new(russh::client::Config::default()),
+                    address,
+                    TrustTestKey,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let authentication = client.authenticate_none("test").await.unwrap();
+            assert!(!authentication.success());
+            server.abort();
+            let _ = server.await;
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !client.is_closed() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn invalid_ssh_listener_error_is_terminal() {
+        let mut calls = 0;
+        let error = accept_with_retry(|| {
+            calls += 1;
+            std::future::ready(Err::<(), _>(std::io::Error::from_raw_os_error(libc::EBADF)))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        assert_eq!(calls, 1);
+    }
 
     const ED25519_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g test@example";
     const ED25519_FINGERPRINT: &str = "SHA256:mKqU+0K8OhKmA8bBQi9Rz0Q5l7/g160hIP+rJYSTNj4";
