@@ -40,6 +40,7 @@ pub(crate) struct PtyRegistry {
 const CONNECT_TOKEN_TTL_SECS: i64 = 5 * 60;
 const MAX_PENDING_PTY_SESSIONS: usize = 4_096;
 const MAX_PENDING_PTY_SESSIONS_PER_VM: usize = 32;
+const MAX_PENDING_PTY_SESSIONS_PER_TENANT: usize = 128;
 const MAX_SHELL_BYTES: usize = 4_096;
 const PTY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
@@ -251,7 +252,12 @@ impl PtyRegistry {
             .lock()
             .map_err(|_| OrchError::Internal("pty registry lock".into()))?;
         purge_expired_sessions(&mut sessions);
-        if sessions.len() >= MAX_PENDING_PTY_SESSIONS
+        if sessions
+            .values()
+            .filter(|session| session.owner.tenant == owner.tenant)
+            .count()
+            >= MAX_PENDING_PTY_SESSIONS_PER_TENANT
+            || sessions.len() >= MAX_PENDING_PTY_SESSIONS
             || sessions
                 .values()
                 .filter(|session| session.vm_id == vm_id)
@@ -1029,6 +1035,47 @@ mod tests {
             registry.create(Uuid::new_v4(), 0, 24, None, test_identity()),
             Err(OrchError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn pending_tenant_cap_spans_vms_and_releases_deleted_and_expired_slots() {
+        let registry = PtyRegistry::default();
+        let mut sessions = Vec::new();
+        for index in 0..MAX_PENDING_PTY_SESSIONS_PER_TENANT {
+            let vm = if index % MAX_PENDING_PTY_SESSIONS_PER_VM == 0 {
+                Uuid::new_v4()
+            } else {
+                sessions.last().map(|s: &PtySession| s.vm_id).unwrap()
+            };
+            sessions.push(
+                registry
+                    .create(vm, 80, 24, None, test_identity_for("noisy"))
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            registry.create(Uuid::new_v4(), 80, 24, None, test_identity_for("noisy")),
+            Err(OrchError::Overloaded { .. })
+        ));
+        registry
+            .create(Uuid::new_v4(), 80, 24, None, test_identity_for("other"))
+            .unwrap();
+        let deleted = sessions.pop().unwrap();
+        registry.delete(deleted.vm_id, deleted.pty_id).unwrap();
+        let replacement = registry
+            .create(Uuid::new_v4(), 80, 24, None, test_identity_for("noisy"))
+            .unwrap();
+        registry
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&replacement.pty_id)
+            .unwrap()
+            .connect_token_expires_at = Utc::now() - ChronoDuration::seconds(1);
+        registry
+            .create(Uuid::new_v4(), 80, 24, None, test_identity_for("noisy"))
+            .unwrap();
+        assert!(registry.get(replacement.vm_id, replacement.pty_id).is_err());
     }
 
     #[test]
