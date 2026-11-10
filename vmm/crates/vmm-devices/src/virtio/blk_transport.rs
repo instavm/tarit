@@ -1345,6 +1345,11 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    trait NoWritebackLimit {
+        fn set_writeback_limit(&self, _bytes: u64) {}
+    }
+    impl NoWritebackLimit for VirtioBlkMmio {}
+
     fn new_test_mem() -> Arc<GuestMemoryMmap> {
         Arc::new(GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4 * 1024 * 1024)]).unwrap())
     }
@@ -2233,6 +2238,64 @@ mod tests {
         assert_eq!(used_idx(&mem), 3);
         assert_eq!(request_status(&mem, 1), status::OK);
         assert_eq!(request_status(&mem, 2), status::OK);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn worker_writes_wait_for_a_host_flush_once_the_backlog_reaches_its_limit() {
+        let (backend, path) = new_test_backend("blk-writeback-limit");
+        let mem = new_test_mem();
+        let dev = VirtioBlkMmio::new(5, backend);
+        configure_test_blk_queue(&dev, mem.clone());
+        // Two 512-byte writes fill a 1 KiB backlog.
+        dev.set_writeback_limit(1024);
+        setup_blk_out_requests(&mem, 5);
+
+        // The pass serves writes until the backlog is full, then stops with
+        // the next write still the driver's and asks for a host flush.
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 2);
+        assert_eq!(request_status(&mem, 1), status::OK);
+        assert_eq!(request_status(&mem, 2), 0xff);
+        assert!(dev.host_flush_wanted());
+
+        // A snapshot taken while that host flush runs holds the write
+        // unconsumed; the restored VM serves it on its own backing store.
+        let state = dev.save();
+        assert_eq!(state.processor.as_ref().unwrap().last_avail_idx, 2);
+        let restored_mem = new_test_mem();
+        let mut ram = vec![0; 4 * 1024 * 1024];
+        mem.read_slice(&mut ram, GuestAddress(0)).unwrap();
+        restored_mem.write_slice(&ram, GuestAddress(0)).unwrap();
+        let mut restored = VirtioBlkMmio::new(5, BlkBackend::open(&path, false).unwrap());
+        restored.restore(state);
+        restored.set_guest_memory(restored_mem.clone());
+        restored.process_queue(0).unwrap();
+        assert_eq!(used_idx(&restored_mem), 5);
+
+        // The flush empties the backlog; the next pass serves two more.
+        dev.service_host_flush().unwrap();
+        assert!(!dev.host_flush_wanted());
+                assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 4);
+        assert!(dev.host_flush_wanted());
+        dev.service_host_flush().unwrap();
+        assert!(!dev.process_queue_pass().unwrap());
+        assert_eq!(used_idx(&mem), 5);
+        for request in 0..5 {
+            assert_eq!(request_status(&mem, request), status::OK);
+        }
+        use std::os::unix::fs::FileExt;
+        let mut disk = vec![0u8; 5 * 512];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut disk, 0)
+            .unwrap();
+        for request in 0..5usize {
+            assert!(disk[request * 512..(request + 1) * 512]
+                .iter()
+                .all(|&byte| byte == request as u8));
+        }
         std::fs::remove_file(path).unwrap();
     }
 
