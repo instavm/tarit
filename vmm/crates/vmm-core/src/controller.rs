@@ -8360,18 +8360,16 @@ fn build_running_vm(
         // safety hint, not a reason to discard an otherwise valid restore.
         log::warn!("restored BSP clock notification unavailable: {error}");
     }
-    let vcpu_thread = VcpuThread::spawn(
-        crate::vcpu::VcpuId(0),
-        vcpu,
-        kvm_vm.mmio_bus.clone(),
-        serial.clone(),
-    )?;
+    // Install every saved BSP/AP state before constructing any runnable
+    // thread. BSP execution can otherwise send IPIs to an absent AP or race
+    // the later LAPIC restore, overwriting guest-visible state.
+    let mut restored_vcpus = Vec::with_capacity(restored.aps.len() + 1);
+    restored_vcpus.push((crate::vcpu::VcpuId(0), vcpu));
 
     // SMP restore (phase B): recreate each AP (id 1..N) and re-apply its captured
     // state (which includes its RUNNABLE MP_STATE + LAPIC), so the restored VM
     // comes back with all vCPUs online. Per-AP CPUID (with its APIC id) is set
     // before the saved state, matching create_live.
-    let mut ap_threads = Vec::with_capacity(restored.aps.len());
     for (i, ap_state) in restored.aps.iter().enumerate() {
         let id = (i + 1) as u8;
         let ap = kvm_vm.create_vcpu(id)?;
@@ -8381,13 +8379,35 @@ fn build_running_vm(
         if let Err(error) = kvm_vm.notify_restored_clock(&ap) {
             log::warn!("restored AP {id} clock notification unavailable: {error}");
         }
-        ap_threads.push(VcpuThread::spawn(
-            crate::vcpu::VcpuId(id),
+        restored_vcpus.push((crate::vcpu::VcpuId(id), ap));
+    }
+
+    // A failed thread spawn or sandbox install cancels the unreleased gate;
+    // no CPU can reach KVM_RUN until every worker is ready. Parked-thread Drop
+    // also observes stop without relying on the controller releasing the gate.
+    let start = crate::vcpu_start::VcpuStartGate::new(restored_vcpus.len());
+    let mut restored_vcpus = restored_vcpus.into_iter();
+    let (bsp_id, bsp) = restored_vcpus.next().expect("restored BSP was staged");
+    let vcpu_thread = VcpuThread::spawn_parked(
+        bsp_id,
+        bsp,
+        kvm_vm.mmio_bus.clone(),
+        serial.clone(),
+        start.participant(),
+    )?;
+    let mut ap_threads = Vec::with_capacity(restored.aps.len());
+    for (id, ap) in restored_vcpus {
+        ap_threads.push(VcpuThread::spawn_parked(
+            id,
             ap,
             kvm_vm.mmio_bus.clone(),
             serial.clone(),
+            start.participant(),
         )?);
     }
+    start
+        .release_when_ready(std::time::Duration::from_secs(5))
+        .map_err(VmmError::Kvm)?;
 
     // The target was staged before vCPUs started. Signal only after every saved
     // LAPIC is installed, so restore cannot overwrite an injected config IRQ.
