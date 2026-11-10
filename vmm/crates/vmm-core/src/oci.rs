@@ -1781,6 +1781,11 @@ fn preflight_skopeo_source(
     size_mb: u64,
     output_dir: &Path,
 ) -> Result<String, OciError> {
+    if !image.reference.starts_with("docker://") {
+        // Local OCI/dir/archive transports have different inspect metadata and
+        // mutability contracts; preserve their existing conversion behavior.
+        return Ok(image.reference.clone());
+    }
     let mut inspect = Command::new("skopeo");
     inspect.args(["inspect", "--no-tags"]).arg(&image.reference);
     if let Some(auth) = &image.auth_file {
@@ -2994,6 +2999,30 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn non_registry_sources_keep_baseline_path_without_inspection() {
+        for reference in [
+            "oci:/missing/layout:default",
+            "dir:/missing/image",
+            "docker-archive:/missing/image.tar",
+        ] {
+            let image = OciImageRef {
+                reference: reference.into(),
+                auth_file: None,
+            };
+            assert_eq!(
+                preflight_skopeo_source(
+                    &image,
+                    test_limits(1, 1),
+                    u64::MAX,
+                    Path::new("/missing/staging")
+                )
+                .unwrap(),
+                reference
+            );
+        }
     }
 
     #[test]
