@@ -1023,6 +1023,52 @@ impl PeerClient {
         Self::decode(resp, "egress")
     }
 
+    pub fn list_snapshots_remote(
+        &self,
+        target: &PeerTarget,
+        identity: &ApiIdentity,
+    ) -> Result<Vec<crate::api::PublicSnapshot>, OrchError> {
+        let request = self.empty_request(
+            target,
+            reqwest::Method::GET,
+            "/internal/v1/snapshots",
+            Some(identity),
+        )?;
+        let response = request
+            .send()
+            .map_err(|error| OrchError::Unavailable(format!("peer snapshot list: {error}")))?;
+        if response.status().as_u16() == 503 {
+            return Err(OrchError::Unavailable(
+                "peer snapshot list unavailable".into(),
+            ));
+        }
+        Self::decode(response, "snapshot list")
+    }
+
+    pub fn delete_snapshot_remote(
+        &self,
+        target: &PeerTarget,
+        id: Uuid,
+        identity: &ApiIdentity,
+    ) -> Result<(), OrchError> {
+        let path = format!("/internal/v1/snapshots/{id}");
+        let request = self.empty_request(target, reqwest::Method::DELETE, &path, Some(identity))?;
+        let response = request
+            .send()
+            .map_err(|error| OrchError::Unavailable(format!("peer snapshot delete: {error}")))?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        if response.status().as_u16() == 503 {
+            return Err(OrchError::Unavailable(
+                "peer snapshot delete unavailable".into(),
+            ));
+        }
+        // Decode preserves the owner-side lifecycle/authentication error. A
+        // successful delete is 204 and deliberately has no JSON body.
+        Self::decode::<serde_json::Value>(response, "snapshot delete").map(|_| ())
+    }
+
     pub fn get_egress_policy_remote(
         &self,
         target: &PeerTarget,
