@@ -1768,12 +1768,7 @@ fn spawn_fleet_sync(
                 tracing::warn!("fleet heartbeat failed");
                 continue;
             }
-            if let Err(error) = fleet
-                .refresh_artifact_replication_health(
-                    chrono::Utc::now() - chrono::Duration::seconds(15),
-                )
-                .await
-            {
+            if let Err(error) = fleet.refresh_artifact_replication_health().await {
                 tracing::warn!(%error, "fleet artifact health reconciliation failed");
             }
             match fleet.list_hosts().await {

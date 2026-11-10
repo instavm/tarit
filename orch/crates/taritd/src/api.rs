@@ -4184,9 +4184,9 @@ async fn cluster_status(
     Extension(identity): Extension<ApiIdentity>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&identity)?;
-    let hosts: Vec<tarit_store::HostRecord> = if let Some(fleet) = &state.fleet {
+    let (now, hosts) = if let Some(fleet) = &state.fleet {
         fleet
-            .list_hosts()
+            .list_hosts_with_clock()
             .await
             .map_err(|e| OrchError::Internal(format!("fleet list_hosts: {e}")))?
     } else {
@@ -4194,20 +4194,16 @@ async fn cluster_status(
             .store
             .lock()
             .map_err(|_| OrchError::Internal("store lock".into()))?;
-        store.list_hosts().map_err(store_err)?
+        (chrono::Utc::now(), store.list_hosts().map_err(store_err)?)
     };
 
-    let now = chrono::Utc::now();
     let mut healthy_nodes = 0usize;
     let mut free_vcpus = 0u64;
     let mut free_mem = 0u64;
     let nodes: Vec<_> = hosts
         .iter()
         .map(|h| {
-            let fresh = (now - h.last_heartbeat)
-                .to_std()
-                .map(|d| d < std::time::Duration::from_secs(15))
-                .unwrap_or(false);
+            let fresh = tarit_fleet::host_heartbeat_is_fresh(h.last_heartbeat, now);
             let up = h.healthy && fresh;
             if up {
                 healthy_nodes += 1;
