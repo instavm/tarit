@@ -3805,38 +3805,53 @@ fn verify_private_runtime_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn verify_runtime_ancestors(base: &Path, allow_symlinks: bool) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    for ancestor in base.ancestors() {
+        let meta = std::fs::symlink_metadata(ancestor).map_err(|error| {
+            VmmError::Snapshot(format!(
+                "stat runtime ancestor {}: {error}",
+                ancestor.display()
+            ))
+        })?;
+        let trusted_owner = meta.uid() == 0 || meta.uid() == uid;
+        // Symlink permissions have no meaning. Trusted selectors such as macOS
+        // /var are allowed, but their containing directories are checked too.
+        let trusted_symlink = allow_symlinks && meta.file_type().is_symlink() && trusted_owner;
+        // Root-owned sticky directories protect our user-owned child against
+        // other users' rename/removal, including after these checks.
+        let root_sticky = meta.uid() == 0 && meta.mode() & 0o1000 != 0;
+        if !trusted_symlink
+            && (!meta.is_dir() || !trusted_owner || (meta.mode() & 0o022 != 0 && !root_sticky))
+        {
+            return Err(VmmError::Snapshot(format!(
+                "untrusted runtime ancestor: {}",
+                ancestor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn private_runtime_dir_in(base: &Path, pid: u32) -> Result<PathBuf> {
-    // Return a canonical path so a mutable symlink in TMPDIR cannot redirect
-    // later scratch/socket operations after validation.
-    let base = std::fs::canonicalize(base).map_err(|error| {
+    let base = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(base)
+    };
+    // Validate selectors before canonicalization: resolving first could bless
+    // an attacker-controlled symlink through an otherwise unsafe directory.
+    #[cfg(unix)]
+    verify_runtime_ancestors(&base, true)?;
+    // Return a canonical path so TMPDIR symlinks cannot redirect later uses.
+    let base = std::fs::canonicalize(&base).map_err(|error| {
         VmmError::Snapshot(format!("resolve runtime base {}: {error}", base.display()))
     })?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions.
-        let uid = unsafe { libc::geteuid() };
-        for ancestor in base.ancestors() {
-            let meta = std::fs::symlink_metadata(ancestor).map_err(|error| {
-                VmmError::Snapshot(format!(
-                    "stat runtime ancestor {}: {error}",
-                    ancestor.display()
-                ))
-            })?;
-            // Root-owned sticky temporary directories safely protect our
-            // user-owned child from rename/removal by other users.
-            let root_sticky = meta.uid() == 0 && meta.mode() & 0o1000 != 0;
-            if !meta.is_dir()
-                || (meta.uid() != 0 && meta.uid() != uid)
-                || (meta.mode() & 0o022 != 0 && !root_sticky)
-            {
-                return Err(VmmError::Snapshot(format!(
-                    "untrusted runtime ancestor: {}",
-                    ancestor.display()
-                )));
-            }
-        }
-    }
+    verify_runtime_ancestors(&base, false)?;
     let namespace = base.join(runtime_namespace_name());
     let dir = namespace.join(format!("vmm-{pid}"));
     for path in [&namespace, &dir] {
@@ -10700,6 +10715,35 @@ mod tests {
         };
         let base = tempfile::tempdir().unwrap();
         let victim = tempfile::tempdir().unwrap();
+        let selector_parent = tempfile::tempdir().unwrap();
+        let selector = selector_parent.path().join("selected-temp");
+        symlink(base.path(), &selector).unwrap();
+        let selected = private_runtime_dir_in(&selector, 122).unwrap();
+        assert_eq!(
+            selected,
+            std::fs::canonicalize(base.path())
+                .unwrap()
+                .join(runtime_namespace_name())
+                .join("vmm-122")
+        );
+        std::fs::set_permissions(
+            selector_parent.path(),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        assert!(private_runtime_dir_in(&selector, 121).is_err());
+        assert!(!base
+            .path()
+            .join(runtime_namespace_name())
+            .join("vmm-121")
+            .exists());
+        std::fs::set_permissions(
+            selector_parent.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::remove_dir(&selected).unwrap();
+        std::fs::remove_dir(selected.parent().unwrap()).unwrap();
         let namespace = base.path().join(runtime_namespace_name());
         symlink(victim.path(), &namespace).unwrap();
         let before = std::fs::metadata(victim.path()).unwrap().mode();
