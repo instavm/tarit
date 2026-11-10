@@ -7455,6 +7455,8 @@ esac
         );
         let alloc = NetAlloc::for_slot(Uuid::new_v4(), 0).unwrap();
         let guest = alloc.guest_ip.as_str();
+        // INSERT infers family from tuple addresses; conntrack-tools 1.4.8
+        // rejects --family for INSERT (it remains supported for DELETE/LIST).
         // Include noninverse NAT reply tuples: each of the four selectors must
         // delete a flow that none of the preceding selectors would match.
         for (index, (protocol, source, destination, reply_source, reply_destination, zone)) in [
@@ -7506,8 +7508,6 @@ esac
             let port = (20_000 + index).to_string();
             let mut args = vec![
                 "-I",
-                "-f",
-                "ipv4",
                 "-p",
                 protocol,
                 "--orig-src",
@@ -7540,8 +7540,6 @@ esac
             "conntrack",
             &[
                 "-I",
-                "-f",
-                "ipv4",
                 "-p",
                 "icmp",
                 "--orig-src",
@@ -7565,8 +7563,6 @@ esac
             "conntrack",
             &[
                 "-I",
-                "-f",
-                "ipv6",
                 "-p",
                 "udp",
                 "--orig-src",
