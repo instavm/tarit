@@ -233,12 +233,16 @@ pub fn pull_and_convert_with_agent(
     let rootfs_dir = workspace.path().join("bundle");
     let staged_output = workspace.path().join("disk.ext4");
 
+    // Admit selected-platform descriptor sizes before downloading layers.
+    // Registry references are pinned to the inspected manifest/list digest.
+    let source = preflight_skopeo_source(image, limits, size_mb, output_dir)?;
+
     // Step 1: Pull the image via skopeo.
     log::info!("oci: pulling {} via skopeo", image.reference);
     let mut skopeo_cmd = std::process::Command::new("skopeo");
     skopeo_cmd
         .arg("copy")
-        .arg(&image.reference)
+        .arg(&source)
         .arg(format!("oci:{}:default", oci_dir.display()));
     if let Some(ref auth) = image.auth_file {
         skopeo_cmd.arg("--authfile").arg(auth);
@@ -1702,6 +1706,148 @@ fn check_tool(name: &str) -> Result<(), OciError> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SkopeoInspection {
+    name: String,
+    digest: String,
+    layers_data: Vec<SkopeoLayer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct SkopeoLayer {
+    size: u64,
+}
+
+fn admitted_skopeo_source(
+    original: &str,
+    inspection: &SkopeoInspection,
+    limits: OciResourceLimits,
+) -> Result<(String, u64), OciError> {
+    if inspection.layers_data.len() > limits.max_layers {
+        return Err(OciError::ResourceLimit("too many registry layers".into()));
+    }
+    let compressed = inspection.layers_data.iter().try_fold(0u64, |sum, layer| {
+        sum.checked_add(layer.size)
+            .filter(|total| *total <= limits.max_compressed_bytes)
+            .ok_or_else(|| {
+                OciError::ResourceLimit("registry compressed byte budget exceeded".into())
+            })
+    })?;
+    let source = if original.starts_with("docker://") {
+        let digest = inspection
+            .digest
+            .strip_prefix("sha256:")
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .ok_or_else(|| {
+                OciError::InvalidLayout("registry inspection has no SHA256 digest".into())
+            })?;
+        validate_registry_name(&inspection.name)?;
+        format!("docker://{}@sha256:{digest}", inspection.name)
+    } else {
+        // Non-registry transports do not share docker reference syntax.
+        original.to_owned()
+    };
+    Ok((source, compressed))
+}
+
+fn validate_registry_name(name: &str) -> Result<(), OciError> {
+    if name.is_empty()
+        || name.contains('@')
+        || name.chars().any(char::is_whitespace)
+        || name.contains("://")
+        || !name.contains('/')
+        || name
+            .rsplit('/')
+            .next()
+            .is_some_and(|last| last.contains(':'))
+    {
+        return Err(OciError::InvalidLayout(
+            "invalid canonical registry name".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_skopeo_source(
+    image: &OciImageRef,
+    limits: OciResourceLimits,
+    size_mb: u64,
+    output_dir: &Path,
+) -> Result<String, OciError> {
+    let mut inspect = Command::new("skopeo");
+    inspect.args(["inspect", "--no-tags"]).arg(&image.reference);
+    if let Some(auth) = &image.auth_file {
+        inspect.arg("--authfile").arg(auth);
+    }
+    let inspection = read_skopeo_inspection(inspect)?;
+    let (source, compressed) = admitted_skopeo_source(&image.reference, &inspection, limits)?;
+    let disk_bytes = size_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| OciError::ResourceLimit("disk size overflows".into()))?;
+    let required = compressed
+        .checked_add(disk_bytes)
+        .and_then(|bytes| bytes.checked_add(2 * MAX_OCI_JSON_BYTES))
+        .ok_or_else(|| OciError::ResourceLimit("staging capacity overflows".into()))?;
+    require_staging_capacity(output_dir, required)?;
+    Ok(source)
+}
+
+fn read_skopeo_inspection(mut inspect: Command) -> Result<SkopeoInspection, OciError> {
+    let mut child = inspect
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .expect("piped inspect stdout")
+        .take(MAX_OCI_JSON_BYTES + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() as u64 > MAX_OCI_JSON_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        read?;
+        return Err(OciError::ResourceLimit(
+            "registry inspection JSON exceeds budget".into(),
+        ));
+    }
+    if !child.wait()?.success() {
+        return Err(OciError::CommandFailed {
+            cmd: "skopeo inspect".into(),
+            stderr: "registry inspection failed before layer download".into(),
+        });
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| OciError::InvalidLayout(format!("registry inspection: {error}")))
+}
+
+fn require_staging_capacity(directory: &Path, required: u64) -> Result<(), OciError> {
+    let path = std::ffi::CString::new(directory.as_os_str().as_bytes())
+        .map_err(|_| OciError::InvalidOutput("NUL in staging path".into()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: path is NUL-terminated and stat points to writable storage.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: statvfs succeeded and initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    let available = u128::from(stat.f_bavail) * u128::from(stat.f_frsize);
+    if available < u128::from(required) {
+        return Err(OciError::ResourceLimit(format!(
+            "staging needs at least {required} free bytes; available {available}"
+        )));
+    }
+    Ok(())
+}
+
 fn preflight_oci_layout(
     oci_dir: &Path,
     tag: &str,
@@ -2848,6 +2994,87 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn registry_admission_pins_digest_and_rejects_declared_budget_before_copy() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let mut inspection: SkopeoInspection = serde_json::from_value(serde_json::json!({
+            "Name": "registry.test:5000/team/image", "Digest": digest,
+            "LayersData": [{"Size": 1024}, {"Size": 2048}],
+        }))
+        .unwrap();
+        let limits = test_limits(64 * 1024, 10);
+        let (source, bytes) =
+            admitted_skopeo_source("docker://image:mutable", &inspection, limits).unwrap();
+        assert_eq!(
+            source,
+            format!("docker://registry.test:5000/team/image@{digest}")
+        );
+        assert_eq!(bytes, 3072);
+        inspection.layers_data[0].size = limits.max_compressed_bytes;
+        assert!(matches!(
+            admitted_skopeo_source("docker://image:mutable", &inspection, limits),
+            Err(OciError::ResourceLimit(_))
+        ));
+        inspection.layers_data[0].size = u64::MAX;
+        assert!(admitted_skopeo_source("docker://image:mutable", &inspection, limits).is_err());
+        inspection.layers_data = (0..=limits.max_layers)
+            .map(|_| SkopeoLayer { size: 0 })
+            .collect();
+        assert!(admitted_skopeo_source("docker://image:mutable", &inspection, limits).is_err());
+        inspection.layers_data.clear();
+        inspection.digest = "sha256:bad".into();
+        assert!(admitted_skopeo_source("docker://image:mutable", &inspection, limits).is_err());
+        inspection.digest = digest;
+        for name in [
+            "",
+            "image:tag",
+            "registry.test/image@sha256:bad",
+            "https://registry.test/image",
+            "registry.test/a b",
+        ] {
+            inspection.name = name.into();
+            assert!(
+                admitted_skopeo_source("docker://image:mutable", &inspection, limits).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_inspection_output_is_bounded_and_errors_fail_closed() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '%s' '{\"Name\":\"registry.test/image\",\"Digest\":\"sha256:bad\",\"LayersData\":[]}'"]);
+        assert!(read_skopeo_inspection(command).is_ok());
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '%s' '{\"Layers\":[]}'"]);
+        assert!(matches!(
+            read_skopeo_inspection(command),
+            Err(OciError::InvalidLayout(_))
+        ));
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 7"]);
+        assert!(matches!(
+            read_skopeo_inspection(command),
+            Err(OciError::CommandFailed { .. })
+        ));
+        let command = Command::new("yes");
+        assert!(matches!(
+            read_skopeo_inspection(command),
+            Err(OciError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn staging_capacity_is_checked_without_allocating_the_requested_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(require_staging_capacity(temp.path(), 0).is_ok());
+        assert!(matches!(
+            require_staging_capacity(temp.path(), u64::MAX),
+            Err(OciError::ResourceLimit(_))
+        ));
+        assert!(require_staging_capacity(&temp.path().join("missing"), 0).is_err());
     }
 
     fn test_limits(max_expanded_bytes: u64, max_entries: u64) -> OciResourceLimits {
