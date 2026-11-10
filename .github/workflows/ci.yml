@@ -13,6 +13,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  guest-agent:
+    name: guest agent / protocol tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Build static guest agent and test protocol helpers
+        run: make -C vmm/guest/agent CFLAGS='-O2 -Wall -Wextra -Werror -pedantic' all syntax-check test
+
+  shell-hygiene:
+    name: shellcheck errors (all tracked scripts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install checksum-pinned ShellCheck
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --retry 3 \
+            -o shellcheck.tar.xz https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  shellcheck.tar.xz' | sha256sum --check --strict
+          tar -xJf shellcheck.tar.xz
+          echo "$RUNNER_TEMP/shellcheck-v0.11.0" >> "$GITHUB_PATH"
+      - name: Check all tracked shell scripts
+        run: |
+          set -euo pipefail
+          # Start with actionable error diagnostics across the existing suite;
+          # warnings/style suggestions remain visible in local default runs.
+          git ls-files -z -- '*.sh' | xargs -0 shellcheck --severity=error
+
   musl:
     name: build release targets (musl)
     runs-on: ubuntu-latest
@@ -20,8 +55,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # Rust 1.99.0
         with:
+          toolchain: 1.99.0
           targets: x86_64-unknown-linux-musl
 
       - name: Install zig
@@ -120,7 +156,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # Rust 1.99.0
+        with:
+          toolchain: 1.99.0
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -144,8 +182,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # Rust 1.99.0
         with:
+          toolchain: 1.99.0
           components: clippy, rustfmt
 
       - name: Cache cargo build
@@ -176,8 +215,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # Rust 1.99.0
         with:
+          toolchain: 1.99.0
           components: clippy, rustfmt
 
       - name: Cache cargo build

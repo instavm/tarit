@@ -49,7 +49,36 @@ const STALE_TAP_MIN_AGE: Duration = Duration::from_secs(30);
 static STATE_WRITE_SEQUENCE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
-static FAIL_NEXT_STATE_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
+static STATE_DIRECTORY_SYNC_FAULTS: Mutex<BTreeMap<PathBuf, bool>> = Mutex::new(BTreeMap::new());
+
+/// Own a one-shot fault for one test directory, including cleanup on panic.
+#[cfg(test)]
+struct StateDirectorySyncFault(PathBuf);
+
+#[cfg(test)]
+impl StateDirectorySyncFault {
+    fn arm(parent: &Path) -> Self {
+        let mut faults = STATE_DIRECTORY_SYNC_FAULTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !faults.contains_key(parent),
+            "directory fault already owned"
+        );
+        faults.insert(parent.to_owned(), true);
+        Self(parent.to_owned())
+    }
+}
+
+#[cfg(test)]
+impl Drop for StateDirectorySyncFault {
+    fn drop(&mut self) {
+        STATE_DIRECTORY_SYNC_FAULTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
 
 /// A provisioned per-VM network: the tap name and the /30 addressing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1613,7 +1642,12 @@ fn persist_entries(path: &Path, allocations: Vec<NetStateEntry>) -> Result<(), P
 
 fn sync_state_directory(parent: &Path) -> std::io::Result<()> {
     #[cfg(test)]
-    if FAIL_NEXT_STATE_DIRECTORY_SYNC.swap(false, Ordering::SeqCst) {
+    if STATE_DIRECTORY_SYNC_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(parent)
+        .is_some_and(std::mem::take)
+    {
         return Err(std::io::Error::other("injected directory sync failure"));
     }
     std::fs::File::open(parent).and_then(|directory| directory.sync_all())
@@ -7554,6 +7588,40 @@ esac
     }
 
     #[test]
+    fn directory_sync_fault_does_not_escape_to_parallel_writer() {
+        let _environment_guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = std::env::temp_dir().join(format!("net-sync-isolation-{}", Uuid::new_v4()));
+        let unrelated = root.join("unrelated");
+        let target = root.join("target");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let fault = StateDirectorySyncFault::arm(&target);
+        let result = std::thread::spawn(move || sync_state_directory(&unrelated))
+            .join()
+            .unwrap();
+        assert!(
+            result.is_ok(),
+            "another writer consumed the fault: {result:?}"
+        );
+        assert!(sync_state_directory(&target).is_err());
+        assert!(
+            sync_state_directory(&target).is_ok(),
+            "fault must be one-shot"
+        );
+        drop(fault);
+        // Unconsumed injections are removed when their owner unwinds.
+        let cleanup = std::panic::catch_unwind(|| {
+            let _fault = StateDirectorySyncFault::arm(&target);
+            panic!("injection owner failed");
+        });
+        assert!(cleanup.is_err());
+        assert!(sync_state_directory(&target).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ambiguous_directory_sync_retains_slot_and_fails_closed_provisioning() {
         let _environment_guard = RECOVERY_TEST_LOCK
             .lock()
@@ -7583,7 +7651,7 @@ esac
             fail_closed: AtomicBool::new(false),
         };
 
-        FAIL_NEXT_STATE_DIRECTORY_SYNC.store(true, Ordering::SeqCst);
+        let _fault = StateDirectorySyncFault::arm(&root);
         let error = provisioner
             .free_allocation_locked(&alloc)
             .expect_err("directory-sync ambiguity must retain the allocation");

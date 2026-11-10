@@ -14,9 +14,8 @@
 # to ~/.cargo/bin). Make it visible so cargo builds work with `sudo test/...`.
 if [ -n "${SUDO_USER:-}" ]; then
   _uh="$(python3 -c 'import pwd, sys; print(pwd.getpwnam(sys.argv[1]).pw_dir)' "$SUDO_USER" 2>/dev/null || true)"
-  for _d in "$_uh/.cargo/bin"; do
-    [ -d "$_d" ] && case ":$PATH:" in *":$_d:"*) ;; *) PATH="$_d:$PATH";; esac
-  done
+  _d="$_uh/.cargo/bin"
+  [ -d "$_d" ] && case ":$PATH:" in *":$_d:"*) ;; *) PATH="$_d:$PATH";; esac
   [ -d "$_uh/.rustup" ] && export RUSTUP_HOME="$_uh/.rustup"
   [ -d "$_uh/.cargo" ] && export CARGO_HOME="$_uh/.cargo"
   export PATH
