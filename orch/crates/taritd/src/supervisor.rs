@@ -4318,16 +4318,14 @@ impl VmmSupervisor {
         &self,
         id: Uuid,
         memory_mib: u64,
-        has_overlay: bool,
+        overlay: Option<&Path>,
     ) -> Result<DiskReservation, OrchError> {
         let ram_bytes = memory_mib
             .checked_mul(1024 * 1024)
             .ok_or_else(|| OrchError::BadRequest("snapshot RAM estimate overflow".into()))?;
-        let overlay_bytes = if has_overlay {
-            let path = PathBuf::from(self.overlay_path_for(id));
-            match std::fs::metadata(&path) {
+        let overlay_bytes = if let Some(path) = overlay {
+            match std::fs::metadata(path) {
                 Ok(metadata) => metadata.blocks().saturating_mul(512),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
                 Err(error) => {
                     return Err(OrchError::Internal(format!(
                         "estimate snapshot overlay {}: {error}",
@@ -4367,7 +4365,7 @@ impl VmmSupervisor {
                 inodes: 1,
             },
         ];
-        if has_overlay {
+        if overlay.is_some() {
             growth.push(PathGrowth {
                 path: self.snapshot_overlay_staging_path(),
                 bytes: overlay_bytes,
@@ -6235,13 +6233,18 @@ impl VmmSupervisor {
         if let Some(error) = prewarm_error {
             return Err(self.cleanup_boot_failure(id, &booted.control, &booted.vm, error));
         }
-        let _reservation =
-            match self.reserve_snapshot_space(id, spec.memory_mib, spec.rootfs_path.is_some()) {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    return Err(self.cleanup_boot_failure(id, &booted.control, &booted.vm, error));
-                }
-            };
+        let _reservation = match self.reserve_snapshot_space(
+            id,
+            spec.memory_mib,
+            self.overlay_path_for_config(id, &spec)
+                .as_deref()
+                .map(Path::new),
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return Err(self.cleanup_boot_failure(id, &booted.control, &booted.vm, error));
+            }
+        };
         let socket_path = booted.vm.socket_path.clone();
         // The golden stays paused from here until it is torn down, so its
         // disk upper cannot change between the RAM snapshot and the copy.
@@ -7903,7 +7906,7 @@ impl VmmSupervisor {
     ) -> Result<SnapshotBundle, OrchError> {
         let started = Instant::now();
         let has_overlay = overlay_path.is_some();
-        let _reservation = self.reserve_snapshot_space(id, memory_mib, has_overlay)?;
+        let _reservation = self.reserve_snapshot_space(id, memory_mib, overlay_path.as_deref())?;
         let client = self.lifecycle_client_for(id)?;
         let expected_uid = self
             .jail_identity(id)?
@@ -8083,9 +8086,10 @@ impl VmmSupervisor {
         &self,
         id: Uuid,
         memory_mib: u64,
-        expects_overlay: bool,
+        overlay: Option<&Path>,
     ) -> Result<SnapshotBundle, OrchError> {
-        let _reservation = self.reserve_snapshot_space(id, memory_mib, expects_overlay)?;
+        let expects_overlay = overlay.is_some();
+        let _reservation = self.reserve_snapshot_space(id, memory_mib, overlay)?;
         let client = self.lifecycle_client_for(id)?;
         let (
             scratch_ram_vmm_path,
@@ -11217,6 +11221,47 @@ mod tests {
         closer.join().unwrap();
         assert!(closed.load(Ordering::Acquire));
         assert!(matches!(gate.enter(), Err(OrchError::Overloaded { .. })));
+    }
+
+    #[test]
+    fn snapshot_reservation_accounts_for_the_actual_restored_overlay() {
+        let root = PathBuf::from(format!(
+            "target/restored-overlay-reservation-{}",
+            Uuid::new_v4()
+        ));
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+        let id = Uuid::new_v4();
+        let restored = PathBuf::from(
+            supervisor.restore_overlay_path_for_snapshot(id, &root.join("source.snap")),
+        );
+        std::fs::create_dir_all(restored.parent().unwrap()).unwrap();
+        std::fs::write(&restored, vec![0x5a; 1024 * 1024]).unwrap();
+        assert!(!Path::new(&supervisor.overlay_path_for(id)).exists());
+        let allocated = std::fs::metadata(&restored).unwrap().blocks() * 512;
+        assert!(allocated > 0);
+        let baseline = supervisor.reserve_snapshot_space(id, 1, None).unwrap();
+        let base_bytes = supervisor.refresh_disk_pressure().unwrap().reserved_bytes;
+        drop(baseline);
+        let reservation = supervisor
+            .reserve_snapshot_space(id, 1, Some(&restored))
+            .unwrap();
+        let reserved = supervisor.refresh_disk_pressure().unwrap().reserved_bytes;
+        assert!(
+            reserved >= base_bytes + allocated,
+            "restored disk copy and integrity data must add to RAM reservation"
+        );
+        drop(reservation);
+        assert_eq!(
+            supervisor.refresh_disk_pressure().unwrap().reserved_bytes,
+            0
+        );
+        std::fs::remove_file(&restored).unwrap();
+        assert!(
+            supervisor
+                .reserve_snapshot_space(id, 1, Some(&restored))
+                .is_err(),
+            "missing expected overlay must not silently reserve zero bytes"
+        );
     }
 
     #[test]

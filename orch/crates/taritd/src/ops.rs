@@ -3344,7 +3344,7 @@ async fn snapshot_local_locked(
         if reflink == Some(false) {
             return sup.snapshot_bundle_vm(id, true, overlay_path, memory_mib);
         }
-        match sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.is_some()) {
+        match sup.live_snapshot_bundle_vm(id, memory_mib, overlay_path.as_deref()) {
             Err(OrchError::Vmm(message)) if message.contains("requires reflink/FICLONE") => {
                 tracing::warn!(
                     %id,
