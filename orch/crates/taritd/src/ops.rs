@@ -4351,7 +4351,7 @@ pub async fn put_egress_policy_local(
     // Serialize with HTTP/PTY/SSH activation so a policy update cannot race a
     // hibernated VM's transition back to a newly provisioned TAP.
     let activation = activation_gate(state, id)?;
-    let _activation = activation.lock().await;
+    let activation_guard = activation.lock_owned().await;
     let vm = vm_get(state, id)?;
     if vm.owner_key.as_deref() != Some(owner_key) {
         return Err(OrchError::Forbidden("VM belongs to another tenant".into()));
@@ -4369,6 +4369,49 @@ pub async fn put_egress_policy_local(
     };
     let allowlist = crate::net::normalize_tenant_egress_allowlist(&allowlist)?;
     let now = Utc::now();
+    if vm.status != VmStatus::Hibernated {
+        let current = get_egress_policy_local(state, id, owner_key)?;
+        if current.revision != expected_revision {
+            return Err(OrchError::Conflict(format!(
+                "egress policy revision is {}, expected {expected_revision}",
+                current.revision
+            )));
+        }
+        expected_revision
+            .checked_add(1)
+            .ok_or_else(|| OrchError::Conflict("egress policy revision overflow".into()))?;
+        // The owned blocking operation survives request cancellation with both
+        // lifecycle gates held until host application and persistence settle.
+        let state = state.clone();
+        let owner_key = owner_key.to_owned();
+        return tokio::task::spawn_blocking(move || {
+            let _activation = activation_guard;
+            let _operation = _operation;
+            apply_and_commit_egress(
+                &current,
+                &allowlist,
+                allow_existing,
+                |rules, existing| state.supervisor.update_egress(id, rules.to_vec(), existing),
+                || {
+                    state
+                        .store
+                        .lock()
+                        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?
+                        .update_egress_policy(
+                            &owner_key,
+                            id,
+                            expected_revision,
+                            &allowlist,
+                            allow_existing,
+                            now,
+                        )
+                        .map_err(crate::api::store_err)
+                },
+            )
+        })
+        .await
+        .map_err(|error| OrchError::Internal(format!("egress update join: {error}")))?;
+    }
     if vm.status == VmStatus::Hibernated {
         if let Some(fleet) = state.fleet.as_ref() {
             let current = get_egress_policy_local(state, id, owner_key)?;
@@ -4418,14 +4461,30 @@ pub async fn put_egress_policy_local(
                 "local hibernation egress persistence failed after fleet CAS");
             crate::api::store_err(error)
         })?;
-    if vm.status != VmStatus::Hibernated {
-        let sup = Arc::clone(&state.supervisor);
-        let applied = allowlist.clone();
-        tokio::task::spawn_blocking(move || sup.update_egress(id, applied, allow_existing))
-            .await
-            .map_err(|e| OrchError::Internal(format!("join: {e}")))??;
-    }
     Ok(policy)
+}
+
+// Host application may have partially changed rules even on error. Restore the
+// last committed policy on either failure; never publish the requested revision
+// before successful host application. NetProvisioner contains failed updates.
+fn apply_and_commit_egress(
+    current: &EgressPolicyRecord,
+    allowlist: &[String],
+    allow_existing: bool,
+    mut apply: impl FnMut(&[String], bool) -> Result<usize, OrchError>,
+    persist: impl FnOnce() -> Result<EgressPolicyRecord, OrchError>,
+) -> Result<EgressPolicyRecord, OrchError> {
+    let result = apply(allowlist, allow_existing).and_then(|_| persist());
+    match result {
+        Ok(policy) => Ok(policy),
+        Err(error) => match apply(&current.allowlist, current.allow_existing) {
+            Ok(_) => Err(error),
+            Err(rollback) => Err(OrchError::Internal(format!(
+                "egress update failed: {error}; restoring committed revision {} also failed: {rollback}; host containment remains required; policy update was not committed",
+                current.revision
+            ))),
+        },
+    }
 }
 
 /// DELETE must still authorize the tenant while a retryable transition is
@@ -7159,6 +7218,92 @@ mod tests {
             .block_on(stop_local(&state, id))
             .expect_err("a completed concurrent delete must be terminal");
         assert!(matches!(error, OrchError::NotFound(_)));
+    }
+
+    #[test]
+    fn live_egress_commits_only_after_apply_and_restores_on_apply_or_store_failure() {
+        for failure in ["none", "apply", "persist", "restore"] {
+            let (state, _) = test_state_with_durable_writer();
+            let id = insert_running_vm(&state);
+            let current = get_egress_policy_local(&state, id, "test").unwrap();
+            let requested = vec!["1.1.1.1:443/tcp".to_owned()];
+            let effective = std::cell::RefCell::new(current.allowlist.clone());
+            let calls = std::cell::Cell::new(0);
+            let result = apply_and_commit_egress(
+                &current,
+                &requested,
+                true,
+                |rules, _| {
+                    let call = calls.get() + 1;
+                    calls.set(call);
+                    *effective.borrow_mut() = rules.to_vec();
+                    if failure == "apply" && call == 1 || failure == "restore" && call == 2 {
+                        return Err(OrchError::Internal("injected host failure".into()));
+                    }
+                    Ok(rules.len())
+                },
+                || {
+                    // Real SQLite has not advanced while host application runs.
+                    assert_eq!(
+                        get_egress_policy_local(&state, id, "test")
+                            .unwrap()
+                            .revision,
+                        1
+                    );
+                    assert_eq!(*effective.borrow(), requested);
+                    if failure == "persist" || failure == "restore" {
+                        return state
+                            .store
+                            .lock()
+                            .unwrap()
+                            .update_egress_policy("test", id, 0, &requested, true, Utc::now())
+                            .map_err(crate::api::store_err);
+                    }
+                    state
+                        .store
+                        .lock()
+                        .unwrap()
+                        .update_egress_policy("test", id, 1, &requested, true, Utc::now())
+                        .map_err(crate::api::store_err)
+                },
+            );
+            let stored = get_egress_policy_local(&state, id, "test").unwrap();
+            if failure == "none" {
+                assert_eq!(result.unwrap().revision, 2);
+                assert_eq!(stored.allowlist, requested);
+                assert_eq!(calls.get(), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(stored.revision, 1);
+                assert_eq!(stored.allowlist, current.allowlist);
+                assert_eq!(calls.get(), 2);
+                if failure == "restore" {
+                    assert!(error
+                        .to_string()
+                        .contains("restoring committed revision 1 also failed"));
+                } else {
+                    assert_eq!(*effective.borrow(), current.allowlist);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_egress_without_host_network_does_not_advance_persisted_policy() {
+        let (state, _) = test_state_with_durable_writer();
+        let id = insert_running_vm(&state);
+        let result = test_runtime().block_on(put_egress_policy_local(
+            &state,
+            id,
+            "test",
+            1,
+            vec!["1.1.1.1:443".into()],
+            true,
+        ));
+        assert!(result.is_err());
+        let stored = get_egress_policy_local(&state, id, "test").unwrap();
+        assert_eq!(stored.revision, 1);
+        assert!(stored.allowlist.is_empty());
     }
 
     #[test]
