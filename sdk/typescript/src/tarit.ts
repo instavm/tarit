@@ -451,7 +451,7 @@ export class TaritClient {
     if (!validTimerDeadline(deadlineMs)) {
       throw new RangeError("PTY deadlineMs must be positive and at most 2147483647");
     }
-    const deadline = Date.now() + deadlineMs;
+    const deadline = performance.now() + deadlineMs;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), deadlineMs);
     let created: { pty_id: string; connect_token: string };
@@ -476,7 +476,7 @@ export class TaritClient {
     } finally {
       clearTimeout(timer);
     }
-    const remaining = deadline - Date.now();
+    const remaining = deadline - performance.now();
     if (remaining <= 0) {
       await this.deletePtySession(vmId, created.pty_id);
       throw new TaritDeadlineExceeded(`open PTY for VM ${vmId} exceeded its deadline`);
@@ -489,7 +489,7 @@ export class TaritClient {
         remaining,
       );
       connection = new PtyConnection(this, vmId, created.pty_id, socket);
-      const attachRemaining = deadline - Date.now();
+      const attachRemaining = deadline - performance.now();
       if (attachRemaining <= 0) {
         throw new TaritDeadlineExceeded(`open PTY for VM ${vmId} exceeded its deadline`);
       }
