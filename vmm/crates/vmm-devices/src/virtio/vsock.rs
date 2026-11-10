@@ -21,6 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_memory_backend::dirty::SoftwareDirtyBitmap;
 
@@ -41,6 +42,7 @@ const MAX_PENDING_RX: usize = 4096;
 /// Maximum active stream connections for this device. One vsock device maps to
 /// one guest, so this bounds guest-controlled REQUEST fan-out.
 const MAX_CONNECTIONS: usize = 1024;
+const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const VIRTIO_MMIO_INT_VRING: u32 = 0x01;
 const VSOCK_FEATURES_LOW: u32 = 0;
 const VSOCK_FEATURES_HIGH: u32 = 1;
@@ -299,6 +301,7 @@ struct Connection {
     pending_host_write: VecDeque<u8>,
     shutdown_pending: Option<u32>,
     established: bool,
+    handshake_deadline: Option<Instant>,
 }
 
 impl Connection {
@@ -496,6 +499,8 @@ impl VirtioVsockMmio {
     pub fn connect_guest_stream(&self, guest_port: u32) -> io::Result<UnixStream> {
         self.ensure_operational()
             .map_err(|_| io::Error::other("virtio-vsock requires reset"))?;
+        self.expire_handshakes_at(Instant::now())
+            .map_err(|_| io::Error::other("virtio-vsock requires reset"))?;
         if self
             .try_lock_state(&self.connections, "connections")
             .map_err(|_| io::Error::other("virtio-vsock requires reset"))?
@@ -547,6 +552,7 @@ impl VirtioVsockMmio {
                     pending_host_write: VecDeque::new(),
                     shutdown_pending: None,
                     established: false,
+                    handshake_deadline: Some(Instant::now() + HOST_HANDSHAKE_TIMEOUT),
                 },
             );
             (key, port)
@@ -846,8 +852,46 @@ impl VirtioVsockMmio {
         }
     }
 
+    fn expire_handshakes_at(&self, now: Instant) -> Result<usize, MmioError> {
+        let expired = {
+            let mut connections = self.try_lock_state(&self.connections, "connections")?;
+            let expired: Vec<_> = connections
+                .iter()
+                .filter_map(|(key, conn)| {
+                    (!conn.established
+                        && conn
+                            .handshake_deadline
+                            .is_some_and(|deadline| now >= deadline))
+                    .then_some((*key, conn.fwd_cnt))
+                })
+                .collect();
+            for (key, _) in &expired {
+                connections.remove(key);
+            }
+            if expired.is_empty() {
+                return Ok(0);
+            }
+            // Same connections -> pending_rx ordering as REQUEST processing.
+            // Remove an undelivered REQUEST before queuing its terminal reset.
+            let mut pending = self.try_lock_state(&self.pending_rx, "pending_rx")?;
+            pending.retain(|packet| {
+                !expired.iter().any(|(key, _)| {
+                    packet.header.dst_cid == key.guest_cid
+                        && packet.header.dst_port == key.guest_port
+                        && packet.header.src_port == key.host_port
+                })
+            });
+            expired
+        };
+        for (key, fwd_cnt) in &expired {
+            self.enqueue_rx(host_packet(*key, op::RST, 0, Vec::new(), *fwd_cnt))?;
+        }
+        Ok(expired.len())
+    }
+
     pub fn pump_host_streams(&self) -> Result<usize, MmioError> {
         self.ensure_operational()?;
+        self.expire_handshakes_at(Instant::now())?;
         let mut packets = Vec::new();
         let mut closed = Vec::new();
         {
@@ -1045,6 +1089,7 @@ impl VirtioVsockMmio {
                         pending_host_write: VecDeque::new(),
                         shutdown_pending: None,
                         established: true,
+                        handshake_deadline: None,
                     },
                 );
                 log::info!(
@@ -1065,6 +1110,7 @@ impl VirtioVsockMmio {
             .get_mut(&key)
         {
             conn.established = true;
+            conn.handshake_deadline = None;
             conn.peer_buf_alloc = header.buf_alloc;
             conn.peer_fwd_cnt = header.fwd_cnt;
             log::info!(
@@ -1072,6 +1118,10 @@ impl VirtioVsockMmio {
                 header.dst_port,
                 header.src_port
             );
+        } else {
+            // A delayed response must not leave a peer believing an expired
+            // host handshake established a usable connection.
+            return self.enqueue_rx(self.reply_packet(&header, op::RST, 0, Vec::new(), 0));
         }
         Ok(())
     }
@@ -2212,6 +2262,85 @@ mod tests {
             &guest_packet(GUEST_PORT, op::RW, b"fresh"),
         );
         assert_eq!(restored_stream.lock().unwrap().outbound, b"fresh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unanswered_host_handshake_expires_and_closes_stream_without_stale_request() {
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let mut host = dev.connect_guest_stream(1025).unwrap();
+        host.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let (key, deadline) = {
+            let table = dev.connections.lock().unwrap();
+            let (key, connection) = table.iter().next().unwrap();
+            (*key, connection.handshake_deadline.unwrap())
+        };
+        assert_eq!(
+            dev.expire_handshakes_at(deadline - Duration::from_nanos(1))
+                .unwrap(),
+            0
+        );
+        assert_eq!(dev.expire_handshakes_at(deadline).unwrap(), 1);
+        assert!(dev.connections.lock().unwrap().is_empty());
+        assert_eq!(host.read(&mut [0; 1]).unwrap(), 0);
+        let pending = dev.pending_rx.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].header.op, op::RST);
+        drop(pending);
+        assert_eq!(
+            dev.expire_handshakes_at(deadline + HOST_HANDSHAKE_TIMEOUT)
+                .unwrap(),
+            0
+        );
+        let late = VsockPacketHeader {
+            src_cid: key.guest_cid,
+            dst_cid: VSOCK_HOST_CID,
+            src_port: key.guest_port,
+            dst_port: key.host_port,
+            len: 0,
+            type_: packet_type::STREAM,
+            op: op::RESPONSE,
+            flags: 0,
+            buf_alloc: DEFAULT_BUF_ALLOC,
+            fwd_cnt: 0,
+        };
+        dev.handle_response(late).unwrap();
+        assert!(dev.connections.lock().unwrap().is_empty());
+        assert_eq!(
+            dev.pending_rx.lock().unwrap().back().unwrap().header.op,
+            op::RST
+        );
+        let _replacement = dev.connect_guest_stream(1025).unwrap();
+        assert_eq!(dev.connections.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timely_host_handshake_response_cancels_expiry() {
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let _host = dev.connect_guest_stream(1025).unwrap();
+        let request = dev.pending_rx.lock().unwrap()[0].header;
+        dev.handle_response(VsockPacketHeader {
+            src_cid: request.dst_cid,
+            dst_cid: request.src_cid,
+            src_port: request.dst_port,
+            dst_port: request.src_port,
+            op: op::RESPONSE,
+            ..request
+        })
+        .unwrap();
+        assert_eq!(
+            dev.expire_handshakes_at(Instant::now() + HOST_HANDSHAKE_TIMEOUT * 2)
+                .unwrap(),
+            0
+        );
+        assert_eq!(dev.connections.lock().unwrap().len(), 1);
+        assert!(dev
+            .connections
+            .lock()
+            .unwrap()
+            .values()
+            .all(|conn| conn.established && conn.handshake_deadline.is_none()));
     }
 
     #[cfg(unix)]
