@@ -3276,6 +3276,8 @@ struct BootingVm {
 /// A pre-booted VM held in the warm pool, ready to be assigned instantly.
 #[derive(Debug)]
 struct WarmVm {
+    // Retain cleanup ownership without offering this runtime to new creates.
+    retiring: bool,
     id: Uuid,
     vm: RunningVm,
     spec: VmSpawnConfig,
@@ -3454,6 +3456,8 @@ pub struct VmmSupervisor {
     owned_tasks: Mutex<HashMap<Uuid, Arc<OwnedTaskControl>>>,
     #[cfg(test)]
     spawn_attachment_pause: Mutex<Option<SpawnAttachmentPause>>,
+    #[cfg(test)]
+    warm_spawn_attempts: AtomicUsize,
     #[cfg(test)]
     warm_handoff_pause: Mutex<Option<SpawnAttachmentPause>>,
     scheduler: Arc<Scheduler>,
@@ -3678,6 +3682,8 @@ impl VmmSupervisor {
             owned_tasks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             spawn_attachment_pause: Mutex::new(None),
+            #[cfg(test)]
+            warm_spawn_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             warm_handoff_pause: Mutex::new(None),
             scheduler,
@@ -4196,17 +4202,29 @@ impl VmmSupervisor {
             .lock()
             .map(|warm| {
                 warm.iter()
-                    .map(|vm| {
-                        (
-                            vm.id,
-                            vm.vm.process.clone(),
-                            Arc::clone(&vm.vm.operation_gate),
-                        )
-                    })
+                    .map(|entry| (entry.id, entry.vm.clone(), entry.retiring))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for (id, process, operation_gate) in processes.into_iter().chain(warm_processes) {
+        for (id, vm, retiring) in warm_processes {
+            if retiring {
+                let _ = self.cleanup_retiring_warm(id, &vm);
+            } else {
+                match vm.process.try_exit() {
+                    Ok(Some(status)) => self.reconcile_process_exit(
+                        id,
+                        vm.pid,
+                        &status,
+                        Arc::clone(&vm.operation_gate),
+                    ),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(vm = %id, pid = vm.pid, %error, "warm VMM exit scan failed")
+                    }
+                }
+            }
+        }
+        for (id, process, operation_gate) in processes {
             match process.try_exit() {
                 Ok(Some(status)) => {
                     self.reconcile_process_exit(id, process.pid, &status, operation_gate);
@@ -4253,10 +4271,12 @@ impl VmmSupervisor {
             })
             .or_else(|| {
                 self.warm.lock().ok().and_then(|mut warm| {
-                    warm.iter()
-                        .position(|vm| vm.id == id && vm.vm.pid == pid)
-                        .and_then(|index| warm.remove(index))
-                        .map(|vm| Location::Warm(vm.vm))
+                    warm.iter_mut()
+                        .find(|vm| vm.id == id && vm.vm.pid == pid)
+                        .map(|entry| {
+                            entry.retiring = true;
+                            Location::Warm(entry.vm.clone())
+                        })
                 })
             });
         drop(gate);
@@ -4265,27 +4285,27 @@ impl VmmSupervisor {
             // Expected teardown removed ownership before signalling the child.
             return;
         };
-        let (vm, user_vm) = match location {
-            Location::Running(vm) => (vm, true),
-            Location::Warm(vm) => (vm, false),
+        let vm = match location {
+            Location::Running(vm) => vm,
+            Location::Warm(vm) => {
+                drop(_operation);
+                let _ = self.cleanup_retiring_warm(id, &vm);
+                return;
+            }
         };
         let cleanup_error = self.teardown_vm(id, &vm).err().map(|error| {
             tracing::error!(vm = %id, pid, %error, "unexpected VMM exit cleanup incomplete");
             error.to_string()
         });
         self.release_reservation_after_cleanup(id);
-        if user_vm {
-            tracing::error!(vm = %id, pid, %status, "VMM exited unexpectedly");
-            if let Ok(mut exits) = self.unexpected_exits.lock() {
-                exits.push_back(UnexpectedVmmExit {
-                    id,
-                    pid,
-                    status: status.to_string(),
-                    cleanup_error,
-                });
-            }
-        } else {
-            tracing::warn!(vm = %id, pid, %status, "warm VMM exited; capacity will be replenished");
+        tracing::error!(vm = %id, pid, %status, "VMM exited unexpectedly");
+        if let Ok(mut exits) = self.unexpected_exits.lock() {
+            exits.push_back(UnexpectedVmmExit {
+                id,
+                pid,
+                status: status.to_string(),
+                cleanup_error,
+            });
         }
     }
 
@@ -5173,7 +5193,7 @@ impl VmmSupervisor {
     pub(crate) fn has_warm_outside(&self, keep: impl Fn(&VmSpawnConfig) -> bool) -> bool {
         self.warm
             .lock()
-            .map(|warm| warm.iter().any(|vm| !keep(&vm.spec)))
+            .map(|warm| warm.iter().any(|vm| !vm.retiring && !keep(&vm.spec)))
             .unwrap_or(false)
     }
 
@@ -5187,27 +5207,53 @@ impl VmmSupervisor {
             let claims = self.warm_claims.lock().ok()?;
             let restoring = self.owned_tasks.lock().ok()?;
             let index = warm.iter().position(|vm| {
-                !claims.contains(&vm.id) && !restoring.contains_key(&vm.id) && select(&vm.spec)
+                !vm.retiring
+                    && !claims.contains(&vm.id)
+                    && !restoring.contains_key(&vm.id)
+                    && select(&vm.spec)
             })?;
-            warm.remove(index)
+            let vm = warm.get_mut(index)?;
+            vm.retiring = true;
+            Some((vm.id, vm.vm.clone()))
         });
         drop(gate);
-        let Some(warm_vm) = taken else {
+        let Some((id, vm)) = taken else {
             return false;
         };
-        let _ = VmmClient::new(&warm_vm.vm.socket_path).stop();
-        match self.teardown_vm(warm_vm.id, &warm_vm.vm) {
-            Ok(()) => {
-                self.release_reservation_after_cleanup(warm_vm.id);
-                tracing::info!(vm = %warm_vm.id, "stopped an idle warm VM");
-                true
-            }
-            Err(error) => {
-                // The VMM may still be alive, so its capacity stays reserved.
-                tracing::error!(vm = %warm_vm.id, %error, "idle warm VM teardown incomplete");
-                false
-            }
+        self.cleanup_retiring_warm(id, &vm).unwrap_or(false)
+    }
+
+    /// Retry failed warm teardown even while its process is still alive. The
+    /// entry and reservation remain owned until every cleanup step succeeds.
+    fn cleanup_retiring_warm(&self, id: Uuid, vm: &RunningVm) -> Result<bool, OrchError> {
+        let _operation = vm.operation_gate.blocking_lock();
+        if !self.warm.lock().is_ok_and(|warm| {
+            warm.iter()
+                .any(|entry| entry.id == id && entry.vm.pid == vm.pid && entry.retiring)
+        }) {
+            return Ok(false);
         }
+        let _ = VmmClient::new(&vm.socket_path).stop();
+        if let Err(error) = self.teardown_vm(id, vm) {
+            tracing::error!(vm = %id, %error, "idle warm VM teardown incomplete; retaining for retry");
+            return Err(error);
+        }
+        let _gate = self.boot_gate.blocking_write();
+        let removed = self.warm.lock().is_ok_and(|mut warm| {
+            let Some(index) = warm
+                .iter()
+                .position(|entry| entry.id == id && entry.vm.pid == vm.pid && entry.retiring)
+            else {
+                return false;
+            };
+            warm.remove(index);
+            true
+        });
+        if removed {
+            self.release_reservation_after_cleanup(id);
+            tracing::info!(vm = %id, "stopped an idle warm VM");
+        }
+        Ok(removed)
     }
 
     fn release_reservation_after_cleanup(&self, id: Uuid) {
@@ -5269,6 +5315,7 @@ impl VmmSupervisor {
             .lock()
             .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?
             .push_back(WarmVm {
+                retiring: false,
                 id,
                 vm: RunningVm::new(
                     process.pid,
@@ -5639,7 +5686,12 @@ impl VmmSupervisor {
             return Err(self.cleanup_boot_failure(id, &control, &vm, self.shutdown_error()));
         }
         booting.remove(&id);
-        warm.push_back(WarmVm { id, vm, spec });
+        warm.push_back(WarmVm {
+            retiring: false,
+            id,
+            vm,
+            spec,
+        });
         control.complete(Ok(()));
         drop(booting);
         drop(warm);
@@ -6423,6 +6475,8 @@ impl VmmSupervisor {
     }
 
     pub(crate) async fn spawn_warm(self: Arc<Self>, class: WarmClass) -> Result<(), OrchError> {
+        #[cfg(test)]
+        self.warm_spawn_attempts.fetch_add(1, Ordering::Relaxed);
         let id = Uuid::new_v4();
         let worker = Arc::clone(&self);
         self.run_owned_task(id, SpawnPurpose::Refill, move |task| async move {
@@ -6871,7 +6925,8 @@ impl VmmSupervisor {
                 .lock()
                 .map_err(|_| OrchError::Internal("owned task lock poisoned".into()))?;
             let Some(warm_vm) = warm.iter().find(|warm_vm| {
-                &warm_vm.spec == want
+                !warm_vm.retiring
+                    && &warm_vm.spec == want
                     && !claims.contains(&warm_vm.id)
                     && !restoring.contains_key(&warm_vm.id)
             }) else {
@@ -6938,7 +6993,7 @@ impl VmmSupervisor {
     pub fn warm_count(&self, want: &VmSpawnConfig) -> usize {
         self.warm
             .lock()
-            .map(|w| w.iter().filter(|x| &x.spec == want).count())
+            .map(|w| w.iter().filter(|x| !x.retiring && &x.spec == want).count())
             .unwrap_or(0)
     }
 
@@ -8054,14 +8109,15 @@ impl VmmSupervisor {
                     .warm
                     .lock()
                     .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?;
-                warm.iter()
-                    .position(|warm_vm| warm_vm.id == id)
-                    .and_then(|index| warm.remove(index))
+                warm.iter_mut()
+                    .find(|warm_vm| warm_vm.id == id)
+                    .map(|entry| {
+                        entry.retiring = true;
+                        entry.vm.clone()
+                    })
             };
             if let Some(warm) = warm {
-                let client = VmmClient::new(&warm.vm.socket_path);
-                let _ = client.stop();
-                return self.teardown_vm(id, &warm.vm);
+                return self.cleanup_retiring_warm(id, &warm).map(|_| ());
             }
             if let Some(net) = &self.net {
                 net.teardown_vm_id(id)?;
@@ -12959,6 +13015,7 @@ mod tests {
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         supervisor.complete_booting(id, &ticket.control, Ok(()));
         supervisor.warm.lock().unwrap().push_back(WarmVm {
+            retiring: false,
             id,
             vm: RunningVm::new(
                 process.pid,
@@ -13138,6 +13195,7 @@ mod tests {
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         supervisor.complete_booting(id, &ticket.control, Ok(()));
         supervisor.warm.lock().unwrap().push_back(WarmVm {
+            retiring: false,
             id,
             vm: RunningVm::new(
                 process.pid,
@@ -13195,6 +13253,7 @@ mod tests {
         let second = spawn_config(false, Some(PathBuf::from("/images/b.ext4")));
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         supervisor.warm.lock().unwrap().push_back(WarmVm {
+            retiring: false,
             id,
             vm: RunningVm::new(process.pid, PathBuf::from("exact-warm.sock"), process, None),
             spec: first.clone(),
@@ -13228,6 +13287,7 @@ mod tests {
                 .unwrap();
             let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
             supervisor.warm.lock().unwrap().push_back(WarmVm {
+                retiring: false,
                 id,
                 vm: RunningVm::new(
                     process.pid,
@@ -13255,6 +13315,124 @@ mod tests {
         supervisor.warm_claims.lock().unwrap().remove(&claimed);
         assert!(supervisor.reclaim_idle_warm());
         assert_eq!(supervisor.warm_count(&spec), 0);
+    }
+
+    #[test]
+    fn failed_warm_reclaim_retains_unclaimable_owner_and_retries_cleanup() {
+        for mode in ["reclaim", "exit", "stop"] {
+            let supervisor = test_supervisor();
+            let spec = spawn_config(false, Some(PathBuf::from("/images/a.ext4")));
+            let id = Uuid::new_v4();
+            supervisor
+                .scheduler
+                .try_reserve(id, ResourceShape::new(1, 1))
+                .unwrap();
+            let socket =
+                PathBuf::from(format!("target/taritd-supervisor-test/failed-reclaim-{id}"));
+            // A directory at the socket path makes unlink fail after the process
+            // stops. This exercises actual teardown rather than a mock result.
+            std::fs::create_dir_all(&socket).unwrap();
+            let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+            if mode == "exit" {
+                process.kill_wait().unwrap();
+            }
+            supervisor.warm.lock().unwrap().push_back(WarmVm {
+                retiring: false,
+                id,
+                vm: RunningVm::new(process.pid, socket.clone(), process, None),
+                spec: spec.clone(),
+            });
+            match mode {
+                "reclaim" => assert!(!supervisor.reclaim_idle_warm()),
+                "stop" => assert!(supervisor.stop_vm(id).is_err()),
+                "exit" => supervisor.scan_for_exited_processes(),
+                _ => unreachable!(),
+            }
+            assert!(supervisor.scheduler.is_reserved(id));
+            assert_eq!(supervisor.warm_count(&spec), 0);
+            assert!(!supervisor.has_warm_outside(|_| false));
+            assert!(supervisor.warm.lock().unwrap()[0].retiring);
+            let outcome = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(supervisor.take_warm_with_publication(
+                    &spec,
+                    &OwnedTaskControl::new(),
+                    |_| async { Ok(()) },
+                    |_, _, _| async { Ok::<(), PublicationFailure>(()) },
+                ))
+                .unwrap();
+            assert!(matches!(outcome, WarmClaimOutcome::NoMatch));
+            supervisor.scan_for_exited_processes();
+            assert_eq!(supervisor.warm.lock().unwrap().len(), 1);
+            assert!(supervisor.scheduler.is_reserved(id));
+            std::fs::remove_dir(&socket).unwrap();
+            supervisor.scan_for_exited_processes();
+            assert!(supervisor.warm.lock().unwrap().is_empty());
+            assert!(!supervisor.scheduler.is_reserved(id));
+            supervisor.scan_for_exited_processes(); // Idempotent after successful retry.
+            assert!(supervisor.take_unexpected_exits().is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_failure_refill_burst_is_bounded_and_shutdown_interrupts_idle() {
+        let template = test_supervisor();
+        let mut config = template.config.clone();
+        config.warm_pool.enabled = true;
+        config.warm_pool.replenish_concurrency = 2;
+        config.warm_pool.classes = vec![WarmClass::learned(
+            1,
+            256,
+            Some("rootfs".into()),
+            1000,
+            None,
+        )];
+        config.warm_pool.classes[0].restore = false;
+        let supervisor = Arc::new(VmmSupervisor::new(config.clone()));
+        // Fill the actual host placement ledger, so every attempt fails before
+        // launching a VMM. A huge target must not turn this into 1000 attempts.
+        for _ in 0..config.max_vms {
+            supervisor
+                .scheduler
+                .try_reserve(Uuid::new_v4(), ResourceShape::new(1, 256))
+                .unwrap();
+        }
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(None);
+        let replenisher = crate::warmpool::spawn_replenisher(
+            Arc::clone(&supervisor),
+            config,
+            Arc::clone(&supervisor.scheduler),
+            shutdown_rx,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while supervisor.warm_spawn_attempts.load(Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Sample early in the idle interval, relative to the first completed batch.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(supervisor.warm_spawn_attempts.load(Ordering::Relaxed), 2);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while supervisor.warm_spawn_attempts.load(Ordering::Relaxed) < 4 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        shutdown_tx.send(Some("test")).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            replenisher.quiesce(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(supervisor.warm_spawn_attempts.load(Ordering::Relaxed), 4);
+        assert!(supervisor.warm.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -13563,6 +13741,7 @@ mod tests {
         let id = Uuid::new_v4();
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         supervisor.warm.lock().unwrap().push_back(WarmVm {
+            retiring: false,
             id,
             vm: RunningVm::new(
                 process.pid,
