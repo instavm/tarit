@@ -8192,7 +8192,7 @@ fn build_running_vm(
     let serial = Arc::new(serial_dev);
     irq_evts.push(serial_evt);
 
-    // virtio-net: mirror create_live — irqfd + TX ioeventfd + host<->tap loop
+    // virtio-net: mirror create_live — irqfd + RX/TX ioeventfd + host<->tap loop
     // per device, kept alive (loop before fds) in the returned RunningVm.
     let mut net_io_loops = Vec::new();
     let mut taps = Vec::new();
