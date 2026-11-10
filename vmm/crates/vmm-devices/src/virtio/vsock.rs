@@ -275,6 +275,7 @@ struct Connection {
     peer_buf_alloc: u32,
     peer_fwd_cnt: u32,
     fwd_cnt: u32,
+    credit_update_pending: bool,
     established: bool,
 }
 
@@ -495,6 +496,7 @@ impl VirtioVsockMmio {
                     peer_buf_alloc: DEFAULT_BUF_ALLOC,
                     peer_fwd_cnt: 0,
                     fwd_cnt: 0,
+                    credit_update_pending: false,
                     established: false,
                 },
             );
@@ -704,6 +706,7 @@ impl VirtioVsockMmio {
 
     pub fn process_rx_queue(&self) -> Result<usize, MmioError> {
         self.ensure_operational()?;
+        self.queue_pending_credit_updates()?;
         let mem = match self.try_lock_state(&self.guest_mem, "guest_mem")?.clone() {
             Some(mem) => mem,
             None => return Ok(0),
@@ -861,6 +864,33 @@ impl VirtioVsockMmio {
         }
     }
 
+    fn queue_pending_credit_updates(&self) -> MmioWriteResult {
+        // Keep the same connections -> pending_rx order everywhere these locks
+        // overlap. Never call RX processing while holding either lock.
+        let mut connections = self.try_lock_state(&self.connections, "connections")?;
+        let mut pending = self.try_lock_state(&self.pending_rx, "pending_rx")?;
+        for (key, conn) in connections.iter_mut() {
+            if !conn.credit_update_pending {
+                continue;
+            }
+            if pending.len() >= MAX_PENDING_RX {
+                // Unlike disposable queue overflow, lost credit can block a
+                // quiet guest forever. Keep one coalesced retry per connection;
+                // the host pump retries even when it has no inbound data.
+                break;
+            }
+            pending.push_back(host_packet(
+                *key,
+                op::CREDIT_UPDATE,
+                0,
+                Vec::new(),
+                conn.fwd_cnt,
+            ));
+            conn.credit_update_pending = false;
+        }
+        Ok(())
+    }
+
     fn enqueue_rx(&self, packet: VsockPacket) -> MmioWriteResult {
         let mut q = self.try_lock_state(&self.pending_rx, "pending_rx")?;
         if q.len() >= MAX_PENDING_RX {
@@ -937,6 +967,7 @@ impl VirtioVsockMmio {
                         peer_buf_alloc: header.buf_alloc,
                         peer_fwd_cnt: header.fwd_cnt,
                         fwd_cnt: 0,
+                        credit_update_pending: false,
                         established: true,
                     },
                 );
@@ -979,11 +1010,13 @@ impl VirtioVsockMmio {
                 if let Err(err) = conn.stream.write_all(data) {
                     log::debug!("vsock write to host stream failed: {err}");
                     reset = true;
+                } else if !data.is_empty() {
+                    // Only bytes accepted by the host free guest send credit.
+                    // Linux can block without sending a CREDIT_REQUEST, so an
+                    // unsolicited update must follow successful forwarding.
+                    conn.fwd_cnt = conn.fwd_cnt.wrapping_add(data.len() as u32);
+                    conn.credit_update_pending = true;
                 }
-                // We forwarded `data.len()` bytes from the guest to the host
-                // application; advance fwd_cnt so our credit updates to the guest
-                // reflect the freed receive-buffer space (vsock flow control).
-                conn.fwd_cnt = conn.fwd_cnt.wrapping_add(data.len() as u32);
                 conn.peer_buf_alloc = header.buf_alloc;
                 conn.peer_fwd_cnt = header.fwd_cnt;
             } else {
@@ -1413,6 +1446,7 @@ mod tests {
     struct FakeStreamState {
         inbound: VecDeque<u8>,
         outbound: Vec<u8>,
+        write_error: Option<ErrorKind>,
     }
 
     #[derive(Clone)]
@@ -1440,7 +1474,11 @@ mod tests {
 
     impl Write for FakeStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.state.lock().unwrap().outbound.extend_from_slice(buf);
+            let mut state = self.state.lock().unwrap();
+            if let Some(kind) = state.write_error {
+                return Err(io::Error::from(kind));
+            }
+            state.outbound.extend_from_slice(buf);
             Ok(buf.len())
         }
 
@@ -1798,14 +1836,17 @@ mod tests {
         assert_eq!(state.lock().unwrap().outbound, b"ping");
 
         assert_eq!(dev.pump_host_streams().unwrap(), 1);
-        let rw = read_rx_packet(&mem, rx_bufs[1]);
+        let update = read_rx_packet(&mem, rx_bufs[1]);
+        assert_eq!(update.header.op, op::CREDIT_UPDATE);
+        assert_eq!(update.header.fwd_cnt, 4);
+        let rw = read_rx_packet(&mem, rx_bufs[2]);
         assert_eq!(rw.header.op, op::RW);
         assert_eq!(rw.data, b"pong");
 
         let mut shutdown = guest_packet(GUEST_PORT, op::SHUTDOWN, &[]);
         shutdown.header.flags = shutdown_flags::RCV | shutdown_flags::SEND;
         submit_tx(&dev, &mem, 3, 3, &shutdown);
-        let shutdown_reply = read_rx_packet(&mem, rx_bufs[2]);
+        let shutdown_reply = read_rx_packet(&mem, rx_bufs[3]);
         assert_eq!(shutdown_reply.header.op, op::SHUTDOWN);
         assert_eq!(shutdown_reply.header.flags, shutdown.header.flags);
         assert!(dev.connections.lock().unwrap().is_empty());
@@ -1818,7 +1859,7 @@ mod tests {
             &guest_packet(GUEST_PORT + 1, op::REQUEST, &[]),
         );
         assert_eq!(listener.connects.load(AtomicOrdering::Relaxed), 2);
-        let second_response = read_rx_packet(&mem, rx_bufs[3]);
+        let second_response = read_rx_packet(&mem, rx_bufs[4]);
         assert_eq!(second_response.header.op, op::RESPONSE);
         submit_tx(
             &dev,
@@ -1832,7 +1873,7 @@ mod tests {
         let tx_used_idx: u16 = mem.read_obj(GuestAddress(TX_USED + 2)).unwrap();
         assert_eq!(tx_used_idx, 6);
         let rx_used_idx: u16 = mem.read_obj(GuestAddress(RX_USED + 2)).unwrap();
-        assert_eq!(rx_used_idx, 4);
+        assert_eq!(rx_used_idx, 5);
         let used: UsedElem = mem.read_obj(GuestAddress(RX_USED + 4)).unwrap();
         assert_eq!(used.id, 0);
     }
@@ -2091,6 +2132,154 @@ mod tests {
             dev.pending_rx.lock().unwrap().back().unwrap().header.op,
             op::RST
         );
+    }
+
+    #[test]
+    fn guest_one_way_output_replenishes_credit_without_credit_requests() {
+        let mem = new_mem();
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        setup_queues(&dev, &mem, 1);
+        let state = Arc::new(Mutex::new(FakeStreamState::default()));
+        dev.set_host_listener(Arc::new(FakeListener {
+            state: state.clone(),
+            connects: AtomicUsize::new(0),
+        }));
+        submit_tx(
+            &dev,
+            &mem,
+            0,
+            0,
+            &guest_packet(GUEST_PORT, op::REQUEST, &[]),
+        );
+        assert_eq!(read_rx_packet(&mem, RX_BUF).header.op, op::RESPONSE);
+        let chunk = vec![0x5a; 2048];
+        let mut sent = 0u32;
+        let mut forwarded = 0u32;
+        for idx in 1u16..=512 {
+            assert!(sent.wrapping_sub(forwarded) + chunk.len() as u32 <= DEFAULT_BUF_ALLOC);
+            // Recycle the guest RX descriptor, as Linux does when consuming
+            // control packets. The host never sends application data back.
+            mem.write_obj(0u16, GuestAddress(RX_AVAIL + 4 + (idx % QSIZE) as u64 * 2))
+                .unwrap();
+            mem.write_obj(idx + 1, GuestAddress(RX_AVAIL + 2)).unwrap();
+            submit_tx(
+                &dev,
+                &mem,
+                0,
+                idx,
+                &guest_packet(GUEST_PORT, op::RW, &chunk),
+            );
+            sent += chunk.len() as u32;
+            let update = read_rx_packet(&mem, RX_BUF);
+            assert_eq!(update.header.op, op::CREDIT_UPDATE);
+            assert_eq!(update.header.src_port, SERVICE_PORT);
+            assert_eq!(update.header.dst_port, GUEST_PORT);
+            assert_eq!(update.header.buf_alloc, DEFAULT_BUF_ALLOC);
+            assert_eq!(update.header.fwd_cnt, sent);
+            forwarded = update.header.fwd_cnt;
+        }
+        assert_eq!(sent, 1024 * 1024);
+        assert_eq!(state.lock().unwrap().outbound, vec![0x5a; sent as usize]);
+    }
+
+    #[test]
+    fn credit_retry_survives_full_rx_queue_wraps_and_waits_for_guest_buffers() {
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let state = Arc::new(Mutex::new(FakeStreamState::default()));
+        dev.set_host_listener(Arc::new(FakeListener {
+            state,
+            connects: AtomicUsize::new(0),
+        }));
+        let packet = guest_packet(GUEST_PORT, op::REQUEST, &[]);
+        dev.handle_request(packet.header).unwrap();
+        let key = key_from_guest(&packet.header);
+        dev.connections
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .fwd_cnt = u32::MAX - 3;
+        while dev.pending_rx.lock().unwrap().len() < MAX_PENDING_RX {
+            dev.enqueue_rx(host_packet(key, op::RST, 0, Vec::new(), 0))
+                .unwrap();
+        }
+        dev.handle_rw(
+            guest_packet(GUEST_PORT, op::RW, b"abcdefgh").header,
+            b"abcdefgh",
+        )
+        .unwrap();
+        dev.process_rx_queue().unwrap();
+        assert_eq!(dev.pending_rx.lock().unwrap().len(), MAX_PENDING_RX);
+        assert!(
+            dev.connections
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .credit_update_pending
+        );
+        // Stand in for draining older packets, then retry with no RX buffers.
+        dev.pending_rx.lock().unwrap().clear();
+        let mem = new_mem();
+        setup_queues(&dev, &mem, 0);
+        dev.pump_host_streams().unwrap();
+        assert_eq!(dev.pending_rx.lock().unwrap().len(), 1);
+        assert_eq!(
+            dev.pending_rx
+                .lock()
+                .unwrap()
+                .front()
+                .unwrap()
+                .header
+                .fwd_cnt,
+            4
+        );
+        mem.write_obj(
+            Descriptor {
+                addr: RX_BUF,
+                len: 0x1000,
+                flags: desc_flags::WRITE,
+                next: 0,
+            },
+            GuestAddress(RX_DESC),
+        )
+        .unwrap();
+        mem.write_obj(0u16, GuestAddress(RX_AVAIL + 4)).unwrap();
+        mem.write_obj(1u16, GuestAddress(RX_AVAIL + 2)).unwrap();
+        dev.pump_host_streams().unwrap();
+        let update = read_rx_packet(&mem, RX_BUF);
+        assert_eq!(update.header.op, op::CREDIT_UPDATE);
+        assert_eq!(update.header.fwd_cnt, 4);
+        assert!(dev.pending_rx.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_host_write_resets_without_replenishing_credit() {
+        for kind in [ErrorKind::WouldBlock, ErrorKind::BrokenPipe] {
+            let dev = VirtioVsockMmio::new(7, GUEST_CID);
+            let state = Arc::new(Mutex::new(FakeStreamState {
+                write_error: Some(kind),
+                ..Default::default()
+            }));
+            dev.set_host_listener(Arc::new(FakeListener {
+                state: state.clone(),
+                connects: AtomicUsize::new(0),
+            }));
+            dev.handle_request(guest_packet(GUEST_PORT, op::REQUEST, &[]).header)
+                .unwrap();
+            dev.pending_rx.lock().unwrap().clear();
+            dev.handle_rw(
+                guest_packet(GUEST_PORT, op::RW, b"failed").header,
+                b"failed",
+            )
+            .unwrap();
+            dev.process_rx_queue().unwrap();
+            assert!(dev.connections.lock().unwrap().is_empty());
+            assert!(state.lock().unwrap().outbound.is_empty());
+            let pending = dev.pending_rx.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].header.op, op::RST);
+        }
     }
 
     #[test]
