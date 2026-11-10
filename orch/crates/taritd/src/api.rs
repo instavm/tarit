@@ -4617,6 +4617,8 @@ pub(crate) mod tests {
     use tarit_store::Store;
     use tower::ServiceExt;
 
+    pub(crate) static API_POSTGRES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn pending_hibernation_delete_still_checks_tenant_ownership() {
         let state = test_state();
@@ -4911,6 +4913,9 @@ pub(crate) mod tests {
         let Some(url) = url else {
             return;
         };
+        let _guard = API_POSTGRES_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut state = test_state();
         test_runtime().block_on(async {
             state.fleet = Some(Arc::new(
