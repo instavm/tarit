@@ -48,6 +48,17 @@ For a syntax-only check on hosts where static Linux linking is unavailable:
 make syntax-check
 ```
 
+PR CI builds the static Linux binary with warnings treated as errors and runs
+`make test`. The test executable includes the production protocol helpers but
+never invokes the agent entry point: no init setup, guest execution server,
+mounts, KVM or root privileges are needed. It checks line overflow recovery and
+clone-repair version/nonce/timestamp boundaries. These are Linux tests; a native
+macOS syntax check does not cover Linux-only helpers.
+
+Shell hygiene CI runs checksum-pinned ShellCheck0.11.0 error diagnostics on all
+tracked `*.sh` files. It does not yet make the existing warning/style backlog a
+merge gate; run ShellCheck without `--severity=error` to inspect those locally.
+
 ## Bake into a systemd ext4 rootfs
 
 Run as root on Linux with loop-device support:

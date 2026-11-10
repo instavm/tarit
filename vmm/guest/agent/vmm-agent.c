@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,7 +25,6 @@
 #include <net/route.h>
 #include <linux/random.h>
 #include <linux/vm_sockets.h>
-#include <poll.h>
 #include <pty.h>
 #include <sys/mount.h>
 #include <sys/random.h>

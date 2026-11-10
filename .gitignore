@@ -25,3 +25,6 @@ orch/e/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Guest agent protocol test executable
+/vmm/guest/agent/test-protocol
