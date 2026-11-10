@@ -22,7 +22,7 @@ use futures_util::{
     SinkExt, StreamExt,
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
@@ -66,6 +66,80 @@ const SHARE_TOKEN_HEADER: &str = "x-tarit-share-token";
 /// Minimum time the closing direction of a WebSocket bridge gets to finish
 /// its close handshake, independent of how short the idle timeout is.
 const WEBSOCKET_CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+// Per-node budgets; these are admission bounds, not DDoS protection.
+const MAX_SHARE_REQUESTS: usize = 256;
+const MAX_SHARE_REQUESTS_PER_TENANT: usize = 32;
+const MAX_SHARE_REQUESTS_PER_SHARE: usize = 8;
+const SHARE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct ShareAdmissionCounts {
+    tenants: HashMap<String, usize>,
+    shares: HashMap<uuid::Uuid, usize>,
+}
+
+struct ShareAdmissionPermit {
+    _global: Arc<tokio::sync::OwnedSemaphorePermit>,
+    counts: Arc<Mutex<ShareAdmissionCounts>>,
+    tenant: String,
+    share: uuid::Uuid,
+}
+
+impl Drop for ShareAdmissionPermit {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = counts.tenants.get_mut(&self.tenant) {
+            *count -= 1;
+        }
+        if counts.tenants.get(&self.tenant) == Some(&0) {
+            counts.tenants.remove(&self.tenant);
+        }
+        if let Some(count) = counts.shares.get_mut(&self.share) {
+            *count -= 1;
+        }
+        if counts.shares.get(&self.share) == Some(&0) {
+            counts.shares.remove(&self.share);
+        }
+    }
+}
+
+// Preserve all HTTP frames, including trailers, while retaining admission.
+struct AdmittedShareBody {
+    body: Body,
+    _admission: Arc<ShareAdmissionPermit>,
+}
+
+impl http_body::Body for AdmittedShareBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+fn hold_share_response(response: Response, admission: Arc<ShareAdmissionPermit>) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(AdmittedShareBody {
+            body,
+            _admission: admission,
+        }),
+    )
+}
 
 struct PendingUpgradeState {
     accepting: bool,
@@ -143,6 +217,8 @@ struct BridgeState {
 }
 
 pub(crate) struct ShareRuntime {
+    admission_global: Arc<tokio::sync::Semaphore>,
+    admission_counts: Arc<Mutex<ShareAdmissionCounts>>,
     shutdown_tx: watch::Sender<Option<&'static str>>,
     shutdown_rx: watch::Receiver<Option<&'static str>>,
     pending_upgrades: Mutex<PendingUpgradeState>,
@@ -154,6 +230,7 @@ pub(crate) struct ShareRuntime {
 
 pub(crate) struct PendingUpgrade {
     runtime: Arc<ShareRuntime>,
+    admission: Option<Arc<ShareAdmissionPermit>>,
 }
 
 impl Drop for PendingUpgrade {
@@ -185,6 +262,8 @@ impl ShareRuntime {
     ) -> Self {
         let (pending_upgrade_tx, pending_upgrade_rx) = watch::channel(0);
         Self {
+            admission_global: Arc::new(tokio::sync::Semaphore::new(MAX_SHARE_REQUESTS)),
+            admission_counts: Arc::new(Mutex::new(ShareAdmissionCounts::default())),
             shutdown_tx,
             shutdown_rx,
             pending_upgrades: Mutex::new(PendingUpgradeState {
@@ -200,6 +279,39 @@ impl ShareRuntime {
             }),
             shutdown_lock: AsyncMutex::new(()),
         }
+    }
+
+    fn admit_lookup(&self) -> Result<Arc<tokio::sync::OwnedSemaphorePermit>, GatewayError> {
+        self.admission_global
+            .clone()
+            .try_acquire_owned()
+            .map(Arc::new)
+            .map_err(|_| GatewayError::Overloaded)
+    }
+
+    fn admit_share(
+        &self,
+        global: Arc<tokio::sync::OwnedSemaphorePermit>,
+        share: &ShareRecord,
+    ) -> Result<Arc<ShareAdmissionPermit>, GatewayError> {
+        let mut counts = self
+            .admission_counts
+            .lock()
+            .map_err(|_| GatewayError::Unavailable)?;
+        if counts.tenants.get(&share.owner_key).copied().unwrap_or(0)
+            >= MAX_SHARE_REQUESTS_PER_TENANT
+            || counts.shares.get(&share.id).copied().unwrap_or(0) >= MAX_SHARE_REQUESTS_PER_SHARE
+        {
+            return Err(GatewayError::Overloaded);
+        }
+        *counts.tenants.entry(share.owner_key.clone()).or_default() += 1;
+        *counts.shares.entry(share.id).or_default() += 1;
+        Ok(Arc::new(ShareAdmissionPermit {
+            _global: global,
+            counts: Arc::clone(&self.admission_counts),
+            tenant: share.owner_key.clone(),
+            share: share.id,
+        }))
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
@@ -222,6 +334,7 @@ impl ShareRuntime {
         self.pending_upgrade_tx.send_replace(state.count);
         Some(PendingUpgrade {
             runtime: Arc::clone(self),
+            admission: None,
         })
     }
 
@@ -532,6 +645,7 @@ struct UpstreamTarget {
 }
 
 struct LocalWebSocketRequest<'a> {
+    admission: Option<Arc<ShareAdmissionPermit>>,
     request_uri: &'a Uri,
     websocket: WebSocketUpgrade,
     protocols: Vec<String>,
@@ -542,6 +656,7 @@ struct LocalWebSocketRequest<'a> {
 }
 
 struct RemoteWebSocketRequest<'a> {
+    admission: Option<Arc<ShareAdmissionPermit>>,
     target: &'a crate::cluster::PeerTarget,
     request_uri: &'a Uri,
     websocket: WebSocketUpgrade,
@@ -551,6 +666,7 @@ struct RemoteWebSocketRequest<'a> {
 }
 
 struct WebSocketTargetRequest<'a> {
+    admission: Option<Arc<ShareAdmissionPermit>>,
     target: UpstreamTarget,
     path_and_query: &'a str,
     websocket: WebSocketUpgrade,
@@ -600,6 +716,7 @@ impl UpstreamTarget {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum GatewayError {
+    Overloaded,
     Unauthorized,
     NotFound,
     Unavailable,
@@ -625,6 +742,7 @@ impl From<OrchError> for GatewayError {
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
         let (status, error) = match self {
+            Self::Overloaded => (StatusCode::TOO_MANY_REQUESTS, "too many share requests"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not found"),
             Self::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "share unavailable"),
@@ -660,6 +778,12 @@ async fn reject_internal_path() -> Response {
 }
 
 async fn handle_request(State(state): State<AppState>, request: Request<Body>) -> Response {
+    // Bound work before any share lookup or activation, including unknown slugs.
+    let lookup = match state.share_runtime.admit_lookup() {
+        Ok(permit) => permit,
+        Err(error) => return error.into_response(),
+    };
+    let mut admission = None;
     let active_request = state.metrics.track_share_http();
     let metrics = Arc::clone(&state.metrics);
     let request_method = request.method().clone();
@@ -676,7 +800,22 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             .map(|ConnectInfo(peer)| *peer);
         let slug = share_slug_from_headers(request.headers(), domain)?;
         let token = share_token(request.headers())?;
-        let share = shares::authorize_gateway(&state, &slug, token.as_deref()).await?;
+        let auth_state = state.clone();
+        let auth_slug = slug.clone();
+        let auth_token = token.clone();
+        let lookup_hold = Arc::clone(&lookup);
+        // Cancellation must not release admission while a blocking SQLite
+        // lookup is still running. This owned task retains the budget.
+        let auth = tokio::spawn(async move {
+            let _lookup_hold = lookup_hold;
+            shares::authorize_gateway(&auth_state, &auth_slug, auth_token.as_deref()).await
+        });
+        let share = time::timeout(SHARE_LOOKUP_TIMEOUT, auth)
+            .await
+            .map_err(|_| GatewayError::Unavailable)?
+            .map_err(|_| GatewayError::Unavailable)??;
+        let permit = state.share_runtime.admit_share(lookup, &share)?;
+        admission = Some(Arc::clone(&permit));
         active_request.set_visibility(ShareMetricVisibility::from(share.visibility));
         let forwarding = TrustedForwarding {
             peer,
@@ -715,6 +854,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
                         &state,
                         &share,
                         LocalWebSocketRequest {
+                            admission: Some(Arc::clone(&permit)),
                             request_uri: &parts.uri,
                             websocket,
                             protocols,
@@ -731,6 +871,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
                         &state,
                         &share,
                         RemoteWebSocketRequest {
+                            admission: Some(Arc::clone(&permit)),
                             target: &target,
                             request_uri: &parts.uri,
                             websocket,
@@ -761,6 +902,11 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             }
             error.into_response()
         }
+    };
+    let response = if let Some(permit) = admission {
+        hold_share_response(response, permit)
+    } else {
+        response
     };
     meter_response_body(response, metrics, active_request, request_method)
 }
@@ -872,6 +1018,7 @@ async fn proxy_remote_websocket(
     request: RemoteWebSocketRequest<'_>,
 ) -> Result<Response, GatewayError> {
     let RemoteWebSocketRequest {
+        admission,
         target,
         request_uri,
         websocket,
@@ -902,7 +1049,11 @@ async fn proxy_remote_websocket(
     .map_err(|error| {
         tracing::warn!(share_id = %share.id, %error, "owner share WebSocket proxy failed");
         state.metrics.inc_share_target_failures();
-        GatewayError::Unavailable
+        if matches!(error, OrchError::Overloaded { .. }) {
+            GatewayError::Overloaded
+        } else {
+            GatewayError::Unavailable
+        }
     })?;
     let protocol =
         negotiated_protocol(response_protocol.as_deref(), &protocols).inspect_err(|_| {
@@ -919,9 +1070,10 @@ async fn proxy_remote_websocket(
     if runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
-    let pending_upgrade = runtime
+    let mut pending_upgrade = runtime
         .register_upgrade()
         .ok_or(GatewayError::Unavailable)?;
+    pending_upgrade.admission = admission;
     Ok(websocket.on_upgrade(move |client| async move {
         run_pending_websocket_upgrade(
             client,
@@ -944,6 +1096,9 @@ pub(crate) async fn proxy_authoritative_local_share(
     share: &ShareRecord,
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
+    let permit = state
+        .share_runtime
+        .admit_share(state.share_runtime.admit_lookup()?, share)?;
     let domain = state
         .config
         .share_domain
@@ -955,7 +1110,7 @@ pub(crate) async fn proxy_authoritative_local_share(
         scheme: trusted_forwarded_scheme(request.headers()),
     };
     let (mut parts, body) = request.into_parts();
-    if is_websocket_request(&parts) {
+    let response = if is_websocket_request(&parts) {
         let protocols = requested_subprotocols(&parts.headers)?;
         let websocket = WebSocketUpgrade::from_request_parts(&mut parts, state)
             .await
@@ -964,6 +1119,7 @@ pub(crate) async fn proxy_authoritative_local_share(
             state,
             share,
             LocalWebSocketRequest {
+                admission: Some(Arc::clone(&permit)),
                 request_uri: &parts.uri,
                 websocket,
                 protocols,
@@ -977,7 +1133,8 @@ pub(crate) async fn proxy_authoritative_local_share(
     } else {
         parts.extensions.insert(forwarding);
         proxy_local_http(state, share, Request::from_parts(parts, body)).await
-    }
+    }?;
+    Ok(hold_share_response(response, permit))
 }
 
 fn is_websocket_request(parts: &axum::http::request::Parts) -> bool {
@@ -1409,6 +1566,7 @@ async fn proxy_local_websocket(
         state.metrics.inc_share_target_failures();
     })?;
     let result = proxy_websocket_to_target(WebSocketTargetRequest {
+        admission: request.admission,
         target,
         path_and_query: request
             .request_uri
@@ -1492,10 +1650,11 @@ async fn proxy_websocket_to_target(
     if request.runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
-    let pending_upgrade = request
+    let mut pending_upgrade = request
         .runtime
         .register_upgrade()
         .ok_or(GatewayError::Unavailable)?;
+    pending_upgrade.admission = request.admission;
     Ok(websocket.on_upgrade(move |client| async move {
         run_pending_websocket_upgrade(
             client,
@@ -1533,6 +1692,7 @@ async fn start_tracked_websocket_bridge(
     idle_timeout: Duration,
     metrics: Arc<Metrics>,
     runtime: Arc<ShareRuntime>,
+    admission: Option<Arc<ShareAdmissionPermit>>,
 ) {
     if runtime.is_shutting_down() {
         return;
@@ -1540,6 +1700,7 @@ async fn start_tracked_websocket_bridge(
     let shutdown_rx = runtime.shutdown_receiver();
     if let Err(client) = runtime
         .spawn_bridge(client, move |client| async move {
+            let _admission = admission;
             let _lease = lease;
             let _active_websocket = metrics.track_share_websocket();
             bridge_websocket(client, upstream, idle_timeout, metrics, shutdown_rx).await;
@@ -1560,13 +1721,14 @@ async fn run_pending_websocket_upgrade(
     idle_timeout: Duration,
     metrics: Arc<Metrics>,
     runtime: Arc<ShareRuntime>,
-    _pending_upgrade: PendingUpgrade,
+    mut pending_upgrade: PendingUpgrade,
 ) {
+    let admission = pending_upgrade.admission.take();
     let mut shutdown_rx = runtime.shutdown_receiver();
     tokio::select! {
         biased;
         _ = wait_for_bridge_shutdown(&mut shutdown_rx) => {}
-        _ = start_tracked_websocket_bridge(client, upstream, lease, idle_timeout, metrics, runtime) => {}
+        _ = start_tracked_websocket_bridge(client, upstream, lease, idle_timeout, metrics, runtime, admission) => {}
     }
 }
 
@@ -1978,6 +2140,190 @@ mod tests {
             );
             Ok(response)
         }
+    }
+
+    #[test]
+    fn admission_bounds_unknown_work_then_stored_tenant_and_share() {
+        let runtime = ShareRuntime::default();
+        let permits: Vec<_> = (0..super::MAX_SHARE_REQUESTS)
+            .map(|_| runtime.admit_lookup().unwrap())
+            .collect();
+        assert!(matches!(
+            runtime.admit_lookup(),
+            Err(super::GatewayError::Overloaded)
+        ));
+        assert!(runtime.admission_counts.lock().unwrap().tenants.is_empty());
+        drop(permits);
+        let mut share = gateway_share(Uuid::new_v4(), 8080, ShareVisibility::Public);
+        let mut holds = Vec::new();
+        for index in 0..super::MAX_SHARE_REQUESTS_PER_TENANT {
+            if index % super::MAX_SHARE_REQUESTS_PER_SHARE == 0 {
+                share.id = Uuid::new_v4();
+            }
+            holds.push(
+                runtime
+                    .admit_share(runtime.admit_lookup().unwrap(), &share)
+                    .unwrap(),
+            );
+            if index == super::MAX_SHARE_REQUESTS_PER_SHARE - 1 {
+                assert!(matches!(
+                    runtime.admit_share(runtime.admit_lookup().unwrap(), &share),
+                    Err(super::GatewayError::Overloaded)
+                ));
+            }
+        }
+        share.id = Uuid::new_v4();
+        assert!(matches!(
+            runtime.admit_share(runtime.admit_lookup().unwrap(), &share),
+            Err(super::GatewayError::Overloaded)
+        ));
+        share.owner_key = "different-stored-owner".into();
+        let other = runtime
+            .admit_share(runtime.admit_lookup().unwrap(), &share)
+            .unwrap();
+        drop(holds);
+        drop(other);
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS
+        );
+        let counts = runtime.admission_counts.lock().unwrap();
+        assert!(counts.tenants.is_empty() && counts.shares.is_empty());
+    }
+
+    #[tokio::test]
+    async fn streaming_body_drop_and_lookup_cancellation_retain_their_budgets() {
+        let runtime = Arc::new(ShareRuntime::default());
+        let share = gateway_share(Uuid::new_v4(), 8080, ShareVisibility::Public);
+        let permit = runtime
+            .admit_share(runtime.admit_lookup().unwrap(), &share)
+            .unwrap();
+        let response = super::hold_share_response(
+            Response::new(Body::from_stream(futures_util::stream::pending::<
+                Result<Bytes, std::io::Error>,
+            >())),
+            permit,
+        );
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS - 1
+        );
+        drop(response);
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS
+        );
+        let lookup = runtime.admit_lookup().unwrap();
+        let held = Arc::clone(&lookup);
+        let (release, wait) = oneshot::channel::<()>();
+        let job = tokio::spawn(async move {
+            let _held = held;
+            let _ = wait.await;
+        });
+        drop(job); // Dropping a waiter must not cancel the owned lookup job.
+        drop(lookup);
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS - 1
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.admission_global.available_permits() != super::MAX_SHARE_REQUESTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_request_retains_budget_until_its_actual_blocked_lookup_finishes() {
+        let state = gateway_test_state();
+        let runtime = Arc::clone(&state.share_runtime);
+        let store = Arc::clone(&state.store);
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _guard = store.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        locked_rx.await.unwrap();
+        let request = Request::builder()
+            .uri("/")
+            .header(HOST, "unknown.shares.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let task = tokio::spawn(gateway_router(state).oneshot(request));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.admission_global.available_permits() == super::MAX_SHARE_REQUESTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS - 1
+        );
+        assert!(runtime.admission_counts.lock().unwrap().tenants.is_empty());
+        release_tx.send(()).unwrap();
+        holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.admission_global.available_permits() != super::MAX_SHARE_REQUESTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_gateway_rejects_before_any_slug_lookup() {
+        let state = gateway_test_state();
+        let _permits: Vec<_> = (0..super::MAX_SHARE_REQUESTS)
+            .map(|_| state.share_runtime.admit_lookup().unwrap())
+            .collect();
+
+        let request = Request::builder()
+            .uri("/")
+            .header(HOST, "unknown.shares.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            gateway_router(state).oneshot(request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn websocket_bridge_keeps_admission_after_upgrade_headers_until_shutdown() {
+        let (upstream, _observed) = spawn_permissive_websocket_echo_upstream().await;
+        let (gateway, _metrics, runtime) =
+            start_gateway_router(upstream, Duration::from_secs(10)).await;
+        let mut request = format!("ws://{gateway}/socket")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat"));
+        let (_client, response) = connect_async(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS - 1
+        );
+        runtime.stop(Duration::from_secs(1)).await;
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS
+        );
     }
 
     #[test]
@@ -2808,7 +3154,8 @@ mod tests {
             b"Bearer app-authorization-token-7",
         ))
         .await;
-        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_secs(1)).await;
+        let (gateway, metrics, _runtime) =
+            start_gateway_router(upstream, Duration::from_secs(1)).await;
         let mut request = format!("ws://{gateway}/socket?keep=this")
             .into_client_request()
             .unwrap();
@@ -2893,7 +3240,8 @@ mod tests {
     #[tokio::test]
     async fn websocket_idle_timeout_closes_an_inactive_bridge() {
         let (upstream, _observed) = spawn_websocket_echo_upstream().await;
-        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_millis(100)).await;
+        let (gateway, metrics, _runtime) =
+            start_gateway_router(upstream, Duration::from_millis(100)).await;
         let mut request = format!("ws://{gateway}/socket")
             .into_client_request()
             .unwrap();
@@ -2933,7 +3281,8 @@ mod tests {
     #[tokio::test]
     async fn upstream_eof_closes_client_without_waiting_for_idle_timeout() {
         let (upstream, drop_upstream) = spawn_websocket_drop_upstream().await;
-        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_millis(100)).await;
+        let (gateway, metrics, _runtime) =
+            start_gateway_router(upstream, Duration::from_millis(100)).await;
         let (mut client, _) = connect_async(format!("ws://{gateway}/socket"))
             .await
             .unwrap();
@@ -2953,7 +3302,8 @@ mod tests {
     #[tokio::test]
     async fn client_disconnect_releases_the_active_websocket_gauge() {
         let (upstream, _observed) = spawn_websocket_echo_upstream().await;
-        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_secs(1)).await;
+        let (gateway, metrics, _runtime) =
+            start_gateway_router(upstream, Duration::from_secs(1)).await;
         let mut request = format!("ws://{gateway}/socket")
             .into_client_request()
             .unwrap();
@@ -3313,6 +3663,40 @@ mod tests {
         let (uri, received_len) = received.await.unwrap();
         assert_eq!(uri, "/upload?large=yes");
         assert_eq!(received_len, payload.len());
+    }
+
+    #[tokio::test]
+    async fn owner_admission_saturation_remains_429_for_http_and_websocket() {
+        let cluster = TestShareCluster::start().await;
+        let _permits: Vec<_> = (0..super::MAX_SHARE_REQUESTS_PER_SHARE)
+            .map(|_| {
+                let global = cluster.owner_state.share_runtime.admit_lookup().unwrap();
+                cluster
+                    .owner_state
+                    .share_runtime
+                    .admit_share(global, &cluster.share)
+                    .unwrap()
+            })
+            .collect();
+        let response = reqwest::Client::new()
+            .get(format!("http://{}/", cluster.client_addr))
+            .header(HOST, SHARE_HOST)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let mut request = format!("ws://{}/socket", cluster.client_addr)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static(SHARE_HOST));
+        match connect_async(request).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            _ => panic!("owner saturation must reject WebSocket upgrade with 429"),
+        }
     }
 
     #[tokio::test]
@@ -4079,7 +4463,7 @@ mod tests {
     async fn start_gateway_router(
         upstream: SocketAddr,
         idle: Duration,
-    ) -> (SocketAddr, Arc<Metrics>) {
+    ) -> (SocketAddr, Arc<Metrics>, Arc<ShareRuntime>) {
         let metrics = Arc::new(Metrics::default());
         let runtime = Arc::new(ShareRuntime::default());
         let app = Router::new().route(
@@ -4097,6 +4481,18 @@ mod tests {
                             scheme: ForwardedScheme::Http,
                         };
                         proxy_websocket_to_target(WebSocketTargetRequest {
+                            admission: Some(
+                                runtime
+                                    .admit_share(
+                                        runtime.admit_lookup().unwrap(),
+                                        &gateway_share(
+                                            Uuid::new_v4(),
+                                            8080,
+                                            ShareVisibility::Public,
+                                        ),
+                                    )
+                                    .unwrap(),
+                            ),
                             target: UpstreamTarget::new(upstream.ip(), upstream.port()),
                             path_and_query: "/echo?keep=this",
                             websocket: ws,
@@ -4115,7 +4511,7 @@ mod tests {
                 }
             }),
         );
-        (start_axum(app).await, metrics)
+        (start_axum(app).await, metrics, runtime)
     }
 
     fn assert_bodyless_response_completion(

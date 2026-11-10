@@ -63,11 +63,16 @@ impl ShareRepository {
         if let Some(fleet) = &self.fleet {
             return fleet.get_share_by_slug(slug).await.map_err(map_fleet_error);
         }
-        let store = self
-            .local
-            .lock()
-            .map_err(|_| OrchError::Internal("share store lock".into()))?;
-        store.get_share_by_slug(slug).map_err(map_store_error)
+        let local = Arc::clone(&self.local);
+        let slug = slug.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let store = local
+                .lock()
+                .map_err(|_| OrchError::Internal("share store lock".into()))?;
+            store.get_share_by_slug(&slug).map_err(map_store_error)
+        })
+        .await
+        .map_err(|error| OrchError::Internal(format!("share lookup task: {error}")))?
     }
 
     pub async fn insert(&self, share: &ShareRecord) -> Result<(), OrchError> {

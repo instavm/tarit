@@ -685,7 +685,13 @@ async fn internal_share_proxy_impl(
         let request = rewrite_share_request_uri(request, id)?;
         share_gateway::proxy_authoritative_local_share(&state, &share, request)
             .await
-            .map_err(|_| tarit_types::OrchError::Internal("share proxy unavailable".into()))
+            .map_err(|error| match error {
+                GatewayError::Overloaded => tarit_types::OrchError::Overloaded {
+                    message: "too many share requests".into(),
+                    retry_after_secs: 1,
+                },
+                _ => tarit_types::OrchError::Internal("share proxy unavailable".into()),
+            })
     }
     .await;
 
@@ -693,7 +699,11 @@ async fn internal_share_proxy_impl(
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(share_id = %id, %error, "internal share proxy rejected");
-            GatewayError::Unavailable.into_response()
+            if matches!(error, tarit_types::OrchError::Overloaded { .. }) {
+                GatewayError::Overloaded.into_response()
+            } else {
+                GatewayError::Unavailable.into_response()
+            }
         }
     }
 }
