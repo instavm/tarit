@@ -57,3 +57,18 @@ sudo guest/agent/bake-agent.sh /path/to/rootfs.ext4 guest/agent/vmm-agent
 ```
 
 The script mounts the ext4 image with a loop device, installs the agent at `/usr/sbin/vmm-agent`, creates and enables `/etc/systemd/system/vmm-agent.service`, and masks `serial-getty@ttyS0.service` so getty does not compete for the serial port.
+
+## Worker recovery
+
+On Linux the original agent process supervises three independent workers:
+vsock exec, vsock PTY, and serial fallback. A dead worker is restarted even
+while another worker is executing a command or reading a partial request.
+Restarts and fork failures back off from 100 ms to 5 seconds; ten seconds of
+stable service resets the backoff. In-flight commands or PTY sessions are not
+replayed. A reconnect after a worker failure starts a new request/session.
+When running as PID 1, the supervisor also reaps adopted command orphans.
+
+Run `make test` for process-level crash/restart, orphan isolation, fork failure,
+backoff, and cleanup regressions. The supervision tests use ordinary POSIX
+children and do not require KVM or vsock. A live guest test must install the
+rebuilt agent into a private rootfs fixture before exercising worker recovery.
