@@ -267,8 +267,13 @@ impl LazyPageDiscard {
         }
         // Never dereference a missing page: doing so would allocate a zero
         // page for a balloon discard and undo the host-memory reclaim.
-        for page in offset / PAGE..end.div_ceil(PAGE) {
-            if populated[page] {
+        for (page, present) in populated
+            .iter()
+            .enumerate()
+            .take(end.div_ceil(PAGE))
+            .skip(offset / PAGE)
+        {
+            if *present {
                 let from = (page * PAGE).max(offset);
                 let to = ((page + 1) * PAGE).min(end);
                 // SAFETY: the validated range is inside the live guest mmap;
