@@ -30,8 +30,8 @@ const CACHE_EVICT_INTERVAL: Duration = Duration::from_secs(60);
 /// finish against the same record.
 pub(crate) const STOPPED_VM_CACHE_GRACE: Duration = Duration::from_secs(300);
 
-/// A local alive VM the meter needs: id, key id, tenant, and creation time.
-type AliveVm = (Uuid, Option<String>, Option<String>, DateTime<Utc>);
+/// A local alive VM the meter needs: id, key id, and tenant.
+type AliveVm = (Uuid, Option<String>, Option<String>);
 
 /// Spawn the VM-runtime meter. Every `interval_secs` it bills each alive local
 /// VM for the wall-clock seconds since its last billed watermark.
@@ -65,14 +65,7 @@ fn meter_runtime_once(state: &AppState) {
                         VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
                     )
             })
-            .map(|v| {
-                (
-                    v.id,
-                    v.api_key_id.clone(),
-                    v.owner_key.clone(),
-                    v.created_at,
-                )
-            })
+            .map(|v| (v.id, v.api_key_id.clone(), v.owner_key.clone()))
             .collect(),
         Err(_) => return,
     };
@@ -83,58 +76,72 @@ fn meter_runtime_once(state: &AppState) {
     let Ok(store) = state.store.lock() else {
         return;
     };
-    for (vm_id, api_key_id, owner_key, created_at) in alive {
+    for (vm_id, api_key_id, owner_key) in alive {
         let (Some(api_key_id), Some(owner_key)) = (api_key_id, owner_key) else {
             continue;
         };
-        let start = store
-            .get_billing_watermark(vm_id)
-            .ok()
-            .flatten()
-            .unwrap_or(created_at);
+        let Ok(Some(start)) = store.get_billing_watermark(vm_id) else {
+            continue;
+        };
         let seconds = (now - start).num_milliseconds() as f64 / 1000.0;
         if seconds <= 0.0 {
             continue;
         }
         let event = runtime_event(state, vm_id, api_key_id, owner_key, start, now);
-        if store.enqueue_usage(&event).is_ok() {
-            let _ = store.set_billing_watermark(vm_id, now);
-        }
+        let _ = store.commit_runtime_usage(&event, false);
     }
 }
 
 /// Emit the final runtime interval when a VM stops, then drop its watermark.
-/// Called off the delete/teardown path; best effort.
-pub fn meter_vm_final(state: &AppState, vm_id: Uuid) {
+/// Called after successful teardown; failures keep the interval open for retry.
+pub fn meter_vm_final(state: &AppState, vm_id: Uuid) -> Result<(), tarit_types::OrchError> {
+    meter_vm_final_at(state, vm_id, Utc::now())
+}
+
+fn meter_vm_final_at(
+    state: &AppState,
+    vm_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), tarit_types::OrchError> {
+    use tarit_types::OrchError;
     let vm = state
         .vm_cache
         .read()
-        .ok()
-        .and_then(|c| c.get(&vm_id).cloned());
+        .map_err(|_| OrchError::Internal("vm cache lock poisoned".into()))?
+        .get(&vm_id)
+        .cloned();
     let Some(vm) = vm else {
-        return;
+        return Ok(());
     };
     if vm.host_id != state.config.host_id {
-        return;
+        return Ok(());
     }
     let (Some(api_key_id), Some(owner_key)) = (vm.api_key_id.clone(), vm.owner_key.clone()) else {
-        return;
+        return Ok(());
     };
-    let now = Utc::now();
-    let Ok(store) = state.store.lock() else {
-        return;
-    };
-    let start = store
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+    // Missing means never published live, or already finalized. In particular,
+    // deleting an Error VM must not reconstruct its entire lifetime.
+    let Some(start) = store
         .get_billing_watermark(vm_id)
-        .ok()
-        .flatten()
-        .unwrap_or(vm.created_at);
-    let seconds = (now - start).num_milliseconds() as f64 / 1000.0;
-    if seconds > 0.0 {
+        .map_err(crate::api::store_err)?
+    else {
+        return Ok(());
+    };
+    if now > start {
         let event = runtime_event(state, vm_id, api_key_id, owner_key, start, now);
-        let _ = store.enqueue_usage(&event);
+        store
+            .commit_runtime_usage(&event, true)
+            .map_err(crate::api::store_err)?;
+    } else {
+        store
+            .clear_billing_watermark(vm_id)
+            .map_err(crate::api::store_err)?;
     }
-    let _ = store.clear_billing_watermark(vm_id);
+    Ok(())
 }
 
 /// Enqueue an exec usage stat (secondary metering). Fire-and-forget.
@@ -487,5 +494,116 @@ async fn flush_once(state: &AppState, fleet: &PostgresFleet) {
         if let Ok(s) = state.store.lock() {
             let _ = s.mark_audit_sent(&ids);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::tests::{insert_vm, test_state};
+
+    fn owned_vm(state: &AppState, status: VmStatus) -> Uuid {
+        let id = Uuid::new_v4();
+        insert_vm(state, id, "tenant", status);
+        let mut cache = state.vm_cache.write().unwrap();
+        cache.get_mut(&id).unwrap().api_key_id = Some("key".into());
+        id
+    }
+
+    #[test]
+    fn runtime_finalization_is_consuming_and_failed_boot_is_not_billed() {
+        let state = test_state();
+        let failed = owned_vm(&state, VmStatus::Creating);
+        state
+            .vm_cache
+            .write()
+            .unwrap()
+            .get_mut(&failed)
+            .unwrap()
+            .status = VmStatus::Error;
+        meter_vm_final(&state, failed).unwrap();
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .list_unsent_usage(100)
+            .unwrap()
+            .is_empty());
+
+        let running = owned_vm(&state, VmStatus::Running);
+        let start = Utc::now() - chrono::Duration::seconds(10);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .set_billing_watermark(running, start)
+            .unwrap();
+        meter_vm_final(&state, running).unwrap();
+        state
+            .vm_cache
+            .write()
+            .unwrap()
+            .get_mut(&running)
+            .unwrap()
+            .status = VmStatus::Error;
+        meter_vm_final(&state, running).unwrap();
+        // Also exercise a stale meter snapshot after teardown: it must never
+        // reopen a consumed interval while terminal publication is pending.
+        state
+            .vm_cache
+            .write()
+            .unwrap()
+            .get_mut(&running)
+            .unwrap()
+            .status = VmStatus::Running;
+        meter_runtime_once(&state);
+        let events = state.store.lock().unwrap().list_unsent_usage(100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].window_start, start);
+        assert!(events[0].seconds.unwrap() >= 10.0);
+    }
+
+    #[test]
+    fn runtime_hibernate_wake_bills_only_live_intervals() {
+        let state = test_state();
+        let id = owned_vm(&state, VmStatus::Running);
+        let first_start = Utc::now() - chrono::Duration::seconds(20);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .set_billing_watermark(id, first_start)
+            .unwrap();
+        meter_vm_final_at(&state, id, Utc::now() - chrono::Duration::seconds(10)).unwrap();
+        let mut vm = state.store.lock().unwrap().get_vm(id).unwrap();
+        vm.api_key_id = Some("key".into());
+        vm.status = VmStatus::Hibernated;
+        vm.revision += 1;
+        state.store.lock().unwrap().insert_vm(&vm).unwrap();
+        state.vm_cache.write().unwrap().insert(id, vm.clone());
+        meter_runtime_once(&state);
+        // Failed wake leaves Hibernated and does not reopen billing.
+        meter_vm_final(&state, id).unwrap();
+        assert!(state
+            .store
+            .lock()
+            .unwrap()
+            .get_billing_watermark(id)
+            .unwrap()
+            .is_none());
+        vm.status = VmStatus::Running;
+        vm.revision += 1;
+        vm.updated_at = Utc::now() - chrono::Duration::seconds(2);
+        let wake_start = vm.updated_at;
+        state.store.lock().unwrap().insert_vm(&vm).unwrap();
+        // Retry publication must not reset an already advanced watermark.
+        state.store.lock().unwrap().insert_vm(&vm).unwrap();
+        state.vm_cache.write().unwrap().insert(id, vm);
+        meter_vm_final(&state, id).unwrap();
+        let events = state.store.lock().unwrap().list_unsent_usage(100).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].window_start, first_start);
+        assert_eq!(events[1].window_start, wake_start);
+        assert!(events[0].window_end <= events[1].window_start);
     }
 }
