@@ -48,8 +48,8 @@ def main(agent):
                             stderr=subprocess.DEVNULL, start_new_session=True)
     try:
         read_until(master, b'VMM_AGENT_READY', 10)
-        os.write(master, b'VMM_PROBE:before\n')
-        read_until(master, b'VMM_PROBE_OK:before', 5)
+        os.write(master, b'VMM_PROBE:00000000000000b1\n')
+        read_until(master, b'VMM_PROBE_OK:00000000000000b1', 5)
 
         fcntl.ioctl(slave, TIOCVHANGUP)
         time.sleep(2.5)
@@ -59,8 +59,8 @@ def main(agent):
         burned = cpu_seconds(proc.pid) - start
         assert burned < 0.2, 'agent burned %.2f s of CPU in 1 s after the hangup (spinning)' % burned
 
-        os.write(master, b'\nVMM_PROBE:after\n')
-        read_until(master, b'VMM_PROBE_OK:after', 5)
+        os.write(master, b'\nVMM_PROBE:00000000000000a2\n')
+        read_until(master, b'VMM_PROBE_OK:00000000000000a2', 5)
         os.write(master, b'\nVMM_EXEC:echo serial-ok\n')
         out = read_until(master, b'VMM_EXEC_EXIT=0', 10)
         assert b'serial-ok' in out, out
