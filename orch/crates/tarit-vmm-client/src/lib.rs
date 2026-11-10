@@ -416,7 +416,9 @@ impl VmmClient {
         };
         let path = Path::new(&self.socket_path);
         let started = Instant::now();
-        let connect_deadline = deadline.min(started + self.connect_timeout);
+        let connect_deadline = started
+            .checked_add(self.connect_timeout)
+            .map_or(deadline, |connect| deadline.min(connect));
 
         loop {
             request_phase_timeout(Some(connect_deadline), Instant::now(), Duration::MAX)?;
@@ -967,6 +969,26 @@ mod tests {
         assert!(!retry_connect_error(&std::io::Error::from(
             std::io::ErrorKind::PermissionDenied
         )));
+    }
+
+    #[test]
+    fn extreme_timeouts_do_not_overflow_monotonic_deadlines() {
+        let socket = socket_path();
+        let error = VmmClient::new(&socket.0)
+            .with_connect_timeout(Duration::MAX)
+            .with_request_timeout(Duration::from_millis(10))
+            .status()
+            .unwrap_err();
+        assert!(
+            matches!(error, VmmError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        let error = VmmClient::new(&socket.0)
+            .with_request_timeout(Duration::MAX)
+            .status()
+            .unwrap_err();
+        assert!(
+            matches!(error, VmmError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput)
+        );
     }
 
     #[test]
