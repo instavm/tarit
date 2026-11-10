@@ -563,6 +563,21 @@ impl PostgresFleet {
         }))
     }
 
+    /// Hosts with published snapshots visible to a tenant, or all owners for
+    /// an administrator. Local metadata on each host remains authoritative for
+    /// shape and lifecycle-managed image filtering.
+    pub async fn snapshot_hosts(&self, owner_key: Option<&str>) -> Result<Vec<String>, FleetError> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT DISTINCT host_id FROM fleet_snapshots
+             WHERE ($1::TEXT IS NULL OR owner_key = $1) ORDER BY host_id",
+                &[&owner_key],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
+
     pub async fn delete_snapshot(&self, snapshot: &SnapshotRecord) -> Result<(), FleetError> {
         let owner_key = snapshot
             .owner_key
@@ -4919,7 +4934,7 @@ mod tests {
             path: format!("/private/{}.ram", Uuid::new_v4()),
             overlay_path: None,
             host_id: "host-a".into(),
-            owner_key: Some("tenant-a".into()),
+            owner_key: Some(format!("snapshot-owner-{}", Uuid::new_v4())),
             api_key_id: Some("key-a".into()),
             vm_id: Uuid::new_v4(),
             ephemeral_owner_vm_id: None,
@@ -4942,6 +4957,25 @@ mod tests {
         assert_eq!(location.host_id, snapshot.host_id);
         assert_eq!(location.owner_key, snapshot.owner_key.as_deref().unwrap());
         assert_eq!(location.snapshot_path, snapshot.path);
+        let unrelated = SnapshotRecord {
+            snapshot_id: Uuid::new_v4(),
+            host_id: format!("other-snapshot-host-{}", Uuid::new_v4()),
+            owner_key: Some(format!("other-snapshot-owner-{}", Uuid::new_v4())),
+            path: format!("/private/{}.ram", Uuid::new_v4()),
+            ..snapshot.clone()
+        };
+        fleet.upsert_snapshot(&unrelated).await?;
+        assert_eq!(
+            fleet.snapshot_hosts(snapshot.owner_key.as_deref()).await?,
+            vec![snapshot.host_id.clone()]
+        );
+        assert_eq!(
+            fleet.snapshot_hosts(unrelated.owner_key.as_deref()).await?,
+            vec![unrelated.host_id.clone()]
+        );
+        let all_hosts = fleet.snapshot_hosts(None).await?;
+        assert!(all_hosts.contains(&snapshot.host_id));
+        assert!(all_hosts.contains(&unrelated.host_id));
         let client = fleet.pool.get().await?;
         client
             .execute(
@@ -4949,6 +4983,7 @@ mod tests {
                 &[&snapshot.snapshot_id],
             )
             .await?;
+        fleet.delete_snapshot(&unrelated).await?;
         Ok(())
     }
 
