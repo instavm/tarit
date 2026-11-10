@@ -14,6 +14,7 @@ mod openapi;
 mod ops;
 mod peer;
 mod peer_tls;
+mod proxy_headers;
 mod pty;
 mod scheduler;
 mod share_gateway;
