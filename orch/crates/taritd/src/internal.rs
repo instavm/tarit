@@ -131,7 +131,7 @@ struct InternalRestoreRequest {
 }
 
 pub fn internal_router(state: AppState) -> Router {
-    let traffic_limits = ApiTrafficLimits::new(&state.config);
+    let traffic_limits = ApiTrafficLimits::new_peer(&state.config);
     let max_body_bytes = state.config.api_max_body_bytes;
     Router::new()
         .route("/internal/v1/vms", post(internal_create))

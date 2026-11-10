@@ -2263,6 +2263,17 @@ fn ensure_execution_incarnation(expected: &VmRecord, current: &VmRecord) -> Resu
     Ok(())
 }
 
+/// Take a live-control gate without queueing behind another VM operation.
+/// Never cancel a handler after it acquires this guard: its publication and
+/// rollback work must still run to completion even if the HTTP deadline fires.
+fn try_live_operation_gate(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    vm_id: Uuid,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, OrchError> {
+    gate.try_lock_owned()
+        .map_err(|_| OrchError::Conflict(format!("VM {vm_id} is busy with another operation")))
+}
+
 async fn lock_operation_gate(
     gate: Arc<tokio::sync::Mutex<()>>,
     vm_id: Uuid,
@@ -2307,7 +2318,7 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         Err(error) => return Err(error),
     };
     let _operation = match operation_gate {
-        Some(gate) => Some(gate.lock_owned().await),
+        Some(gate) => Some(try_live_operation_gate(gate, id)?),
         None => None,
     };
     {
@@ -2538,7 +2549,7 @@ async fn hibernate_local_owned(
     let activation = activation_gate(state, id)?;
     let _activation = activation.lock().await;
     let gate = state.supervisor.operation_gate(id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = try_live_operation_gate(gate, id)?;
     let current = ensure_vm_status(state, id, "hibernate", &[VmStatus::Running])?;
     // Check revision exhaustion before pausing or persisting a wake path.
     let record = terminal_record(state, id, VmStatus::Hibernated)?;
@@ -3174,7 +3185,7 @@ pub async fn snapshot_local(state: &AppState, id: Uuid, _diff: bool) -> Result<S
     )?;
     ensure_no_data_volumes(state, &vm, "snapshot").await?;
     let gate = state.supervisor.operation_gate(id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = try_live_operation_gate(gate, id)?;
     Ok(
         snapshot_local_locked(state, id, None, None, SnapshotMode::ResumeRunning)
             .await?
@@ -3215,7 +3226,7 @@ pub async fn snapshot_local_for_fork(
     let source = ensure_vm_status(state, source_id, "fork", &[VmStatus::Running])?;
     ensure_no_data_volumes(state, &source, "fork").await?;
     let gate = state.supervisor.operation_gate(source_id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = try_live_operation_gate(gate, source_id)?;
     snapshot_local_locked(
         state,
         source_id,
@@ -4365,7 +4376,10 @@ pub async fn put_egress_policy_local(
     let _operation = if vm.status == VmStatus::Hibernated {
         None
     } else {
-        Some(state.supervisor.operation_gate(id)?.lock_owned().await)
+        Some(try_live_operation_gate(
+            state.supervisor.operation_gate(id)?,
+            id,
+        )?)
     };
     let allowlist = crate::net::normalize_tenant_egress_allowlist(&allowlist)?;
     let now = Utc::now();
@@ -4451,7 +4465,7 @@ pub fn get_local(state: &AppState, id: Uuid) -> Result<VmRecord, OrchError> {
 pub async fn status_local(state: &AppState, id: Uuid) -> Result<serde_json::Value, OrchError> {
     ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
     let gate = state.supervisor.operation_gate(id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = try_live_operation_gate(gate, id)?;
     ensure_vm_status(state, id, "query live status for", LIVE_CONTROL_STATUSES)?;
     let sup = Arc::clone(&state.supervisor);
     let status = tokio::task::spawn_blocking(move || sup.status_vm(id))
@@ -4478,7 +4492,7 @@ pub async fn set_balloon_local(
         )));
     }
     let gate = state.supervisor.operation_gate(id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = try_live_operation_gate(gate, id)?;
     let vm = ensure_vm_status(
         state,
         id,
@@ -4505,7 +4519,7 @@ pub async fn balloon_local(state: &AppState, id: Uuid) -> Result<(u64, u64, u32,
         &[VmStatus::Running, VmStatus::Paused],
     )?;
     let gate = state.supervisor.operation_gate(id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = try_live_operation_gate(gate, id)?;
     ensure_vm_status(
         state,
         id,
@@ -4533,7 +4547,7 @@ where
     let observed = get_local(state, id)?;
     validate_live_transition(id, observed.status, new_status)?;
     let gate = state.supervisor.operation_gate(id)?;
-    let _operation = gate.lock_owned().await;
+    let _operation = try_live_operation_gate(gate, id)?;
     let current = get_local(state, id)?;
     match validate_live_transition(id, current.status, new_status)? {
         TransitionDecision::Noop => return Ok(current),
