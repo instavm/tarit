@@ -1331,7 +1331,7 @@ pub async fn create_local(state: &AppState, req: &CreateVmRequest) -> Result<VmR
 /// start makes, so a pool class built from the image serves it. A request
 /// that fails to resolve skips the pool; the cold path resolves it again and
 /// rejects the create with the error.
-fn warm_pool_spawn_config(
+async fn warm_pool_spawn_config(
     state: &AppState,
     req: &CreateVmRequest,
 ) -> Result<Option<VmSpawnConfig>, OrchError> {
@@ -1341,12 +1341,9 @@ fn warm_pool_spawn_config(
     if req.image.is_none() {
         return Ok(Some(VmSpawnConfig::from_defaults(&state.config, req)));
     }
-    let store = state
-        .store
-        .lock()
-        .map_err(|_| OrchError::Internal("store lock".into()))?;
     Ok(
-        image::resolve_request_image(&store, req, &state.config.image_admission_policy)
+        image::resolve_request_image(&state.store, req, &state.config.image_admission_policy)
+            .await
             .ok()
             .map(|resolved| VmSpawnConfig::from_defaults(&state.config, &resolved)),
     )
@@ -1451,7 +1448,7 @@ async fn create_local_owned(
     .map_err(|e| OrchError::BadRequest(e.to_string()))?;
     let unverified_cfg = VmSpawnConfig::from_defaults(&state.config, req);
 
-    if let Some(warm_cfg) = warm_pool_spawn_config(state, req)? {
+    if let Some(warm_cfg) = warm_pool_spawn_config(state, req).await? {
         learn_warm_class(state, &warm_cfg);
         // A create that finds the pool empty restores a clone of the class's
         // golden into it and claims again, so a burst larger than the pool
@@ -1598,13 +1595,8 @@ async fn create_local_owned(
         return cancel_unstarted_lifecycle(state, id, &ticket, task, lifecycle_cancelled_error())
             .await;
     }
-    let resolved_request = {
-        let store = state
-            .store
-            .lock()
-            .map_err(|_| OrchError::Internal("store lock".into()))?;
-        image::resolve_request_image(&store, req, &state.config.image_admission_policy)
-    };
+    let resolved_request =
+        image::resolve_request_image(&state.store, req, &state.config.image_admission_policy).await;
     let req = match resolved_request {
         Ok(req) => req,
         Err(error) => {
@@ -6072,6 +6064,7 @@ mod tests {
     #[test]
     fn the_warm_pool_serves_a_request_for_its_image() {
         let (mut state, _writes) = test_state_with_durable_writer();
+        let runtime = test_runtime();
         state.config.warm_pool.enabled = true;
         let dir = PathBuf::from(format!("target/warm-image-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6113,7 +6106,8 @@ mod tests {
             egress: None,
         };
 
-        let by_image = warm_pool_spawn_config(&state, &request(Some("node:22")))
+        let by_image = runtime
+            .block_on(warm_pool_spawn_config(&state, &request(Some("node:22"))))
             .unwrap()
             .expect("a registered image can be served warm");
         let by_path = VmSpawnConfig::from_defaults(
@@ -6124,26 +6118,30 @@ mod tests {
             },
         );
         assert!(by_image == by_path, "matches a class built from the image");
-        let default = warm_pool_spawn_config(&state, &request(None))
+        let default = runtime
+            .block_on(warm_pool_spawn_config(&state, &request(None)))
             .unwrap()
             .unwrap();
         assert_eq!(default.rootfs_path, Some(state.config.rootfs.clone()));
 
         assert!(
-            warm_pool_spawn_config(&state, &request(Some("node:20")))
+            runtime
+                .block_on(warm_pool_spawn_config(&state, &request(Some("node:20"))))
                 .unwrap()
                 .is_none(),
             "an unknown image is left to the cold path to reject"
         );
         std::fs::write(&rootfs, b"tampered rootfs").unwrap();
         assert!(
-            warm_pool_spawn_config(&state, &request(Some("node:22")))
+            runtime
+                .block_on(warm_pool_spawn_config(&state, &request(Some("node:22"))))
                 .unwrap()
                 .is_none(),
             "an image failing admission is never served warm"
         );
         state.config.warm_pool.enabled = false;
-        assert!(warm_pool_spawn_config(&state, &request(None))
+        assert!(runtime
+            .block_on(warm_pool_spawn_config(&state, &request(None)))
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(dir);
