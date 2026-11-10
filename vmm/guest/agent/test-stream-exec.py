@@ -63,8 +63,10 @@ def main():
         wrapper = Path(directory) / 'handler.c'
         wrapper.write_text('#define main guest_agent_main\n#include "' + str(source) +
                            '"\n#undef main\nint main(int argc, char **argv) {\n'
-                           'if (argc != 2) return 2; signal(SIGPIPE, SIG_IGN); '
-                           'handle_pty_client(atoi(argv[1])); return 0; }\n')
+                           '    if (argc != 2) { return 2; }\n'
+                           '    signal(SIGPIPE, SIG_IGN);\n'
+                           '    handle_pty_client(atoi(argv[1]));\n'
+                           '    return 0;\n}\n')
         binary = Path(directory) / 'handler'
         subprocess.run([os.environ.get('CC', 'cc'), '-O2', '-Wall', '-Wextra', '-Werror',
                         str(wrapper), '-lutil', '-o', str(binary)], check=True)
