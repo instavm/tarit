@@ -513,3 +513,62 @@ impl Drop for VcpuThread {
         }
     }
 }
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// Exercise actual KVM_RUN and the production stop/Drop paths. Keep the
+    /// overall test bounded even if a regression leaves a worker blocked.
+    #[test]
+    #[ignore = "requires /dev/kvm; explicitly run on the KVM fixture host"]
+    fn kvm_busy_vcpus_stop_and_drop_during_startup_and_execution() {
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let kvm = kvm_ioctls::Kvm::new().unwrap();
+            for stop_explicitly in [true, false] {
+                for allow_startup in [true, false] {
+                    for _ in 0..8 {
+                        let vm = kvm.create_vm().unwrap();
+                        vm.set_tss_address(0xfffbd000).unwrap();
+                        let mem = vmm_memory_backend::GuestMemory::new(0x4000).unwrap();
+                        mem.register(&vm, 0).unwrap();
+                        mem.write_phys(0x1000, &[0xeb, 0xfe]).unwrap(); // jmp $
+                        let vcpu = vm.create_vcpu(0).unwrap();
+                        let mut sregs = vcpu.get_sregs().unwrap();
+                        sregs.cs.base = 0;
+                        sregs.cs.selector = 0;
+                        vcpu.set_sregs(&sregs).unwrap();
+                        let mut regs = vcpu.get_regs().unwrap();
+                        regs.rip = 0x1000;
+                        regs.rflags = 2;
+                        vcpu.set_regs(&regs).unwrap();
+                        let serial = Arc::new(vmm_devices::serial::Serial::new(
+                            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                        ));
+                        let thread =
+                            VcpuThread::spawn(VcpuId(0), vcpu, Arc::new(MmioBus::new()), serial)
+                                .unwrap();
+                        let exited = thread.exited.clone();
+                        if allow_startup {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        if stop_explicitly {
+                            thread.stop().unwrap();
+                        } else {
+                            drop(thread);
+                        }
+                        assert!(
+                            exited.load(Ordering::Acquire),
+                            "stop/Drop must join before VM memory is released"
+                        );
+                    }
+                }
+            }
+            send.send(()).unwrap();
+        });
+        recv.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("vCPU shutdown exceeded 10 seconds");
+        worker.join().unwrap();
+    }
+}

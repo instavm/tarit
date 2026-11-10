@@ -694,6 +694,12 @@ impl VmmController {
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM (boot first)".into()))?;
 
+        if vm.state == VmState::Stopped {
+            return Err(VmmError::InvalidConfig(
+                "cannot snapshot a stopped VM".into(),
+            ));
+        }
+
         let path_buf = unique_scratch_snapshot_path("vmm-snap")?;
         let path = path_buf.to_string_lossy().into_owned();
         let mut owned_snapshot = staged_owned_output(&path_buf)?;
@@ -2305,6 +2311,11 @@ impl VmmController {
         let vm = slot
             .as_mut()
             .ok_or_else(|| VmmError::InvalidConfig("no VM".into()))?;
+        if vm.state == VmState::Stopped {
+            return Err(VmmError::InvalidConfig(
+                "cannot suspend a stopped VM".into(),
+            ));
+        }
         vm.base_identity = None;
         vm.restore_base = None;
 
@@ -3305,58 +3316,109 @@ fn stop_running_vm(vm: &mut VmInstance) {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn pause_running_vcpus(vm: &mut VmInstance) -> Result<bool> {
-    if let Some(r) = vm.running.as_ref() {
-        let vcpu_threads = std::iter::once(&r.vcpu_thread)
-            .chain(r.ap_threads.iter())
-            .collect::<Vec<_>>();
-        if vcpu_threads.is_empty() {
-            return Ok(false);
-        }
-        for vcpu_thread in &vcpu_threads {
-            if let Err(error) = vcpu_thread.request_snapshot_pause() {
-                let (error, rollback_confirmed) = rollback_failed_vcpu_pause(vcpu_threads, error);
-                if !rollback_confirmed {
-                    vm.state = VmState::Paused;
-                }
-                return Err(error);
-            }
-        }
-        for vcpu_thread in &vcpu_threads {
-            if let Err(error) = vcpu_thread.wait_snapshot_paused() {
-                let (error, rollback_confirmed) = rollback_failed_vcpu_pause(vcpu_threads, error);
-                if !rollback_confirmed {
-                    vm.state = VmState::Paused;
-                }
-                return Err(error);
-            }
-        }
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+trait SnapshotPauseTarget {
+    fn request_pause(&self) -> Result<()>;
+    fn wait_paused(&self) -> Result<()>;
+    fn resume_target(&self);
+    fn wait_resumed(&self) -> Result<()>;
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-fn rollback_failed_vcpu_pause(
-    vcpu_threads: Vec<&crate::vcpu_thread::VcpuThread>,
-    primary: VmmError,
-) -> (VmmError, bool) {
-    for vcpu_thread in &vcpu_threads {
-        vcpu_thread.resume();
+impl SnapshotPauseTarget for crate::vcpu_thread::VcpuThread {
+    fn request_pause(&self) -> Result<()> {
+        self.request_snapshot_pause()
     }
-    let rollback = vcpu_threads
-        .iter()
-        .try_for_each(|vcpu_thread| vcpu_thread.wait_snapshot_resumed());
-    match rollback {
-        Ok(()) => (primary, true),
-        Err(resume_error) => (
-            VmmError::Snapshot(format!(
-                "{primary}; failed to confirm vCPU rollback: {resume_error}"
+    fn wait_paused(&self) -> Result<()> {
+        self.wait_snapshot_paused()
+    }
+    fn resume_target(&self) {
+        self.resume();
+    }
+    fn wait_resumed(&self) -> Result<()> {
+        self.wait_snapshot_resumed()
+    }
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn pause_vcpu_group<T: SnapshotPauseTarget>(
+    targets: &[&T],
+) -> std::result::Result<(), (VmmError, bool)> {
+    let result = (|| {
+        for target in targets {
+            target.request_pause()?;
+        }
+        for target in targets {
+            target.wait_paused()?;
+        }
+        Ok(())
+    })();
+    if let Err(primary) = result {
+        // Resume every target before waiting on any one: some requests may
+        // have succeeded even when another request/acknowledgement failed.
+        for target in targets {
+            target.resume_target();
+        }
+        return match targets.iter().try_for_each(|target| target.wait_resumed()) {
+            Ok(()) => Err((primary, true)),
+            Err(resume_error) => Err((
+                VmmError::Snapshot(format!(
+                    "{primary}; failed to confirm vCPU rollback: {resume_error}"
+                )),
+                false,
             )),
-            false,
-        ),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn stop_after_uncertain_pause(vm: &mut VmInstance) {
+    // No coherent Paused/Running state was established. Stop every producer
+    // before publishing a terminal state; stale captures must never be reused.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    stop_running_vm(vm);
+    vm.state = VmState::Stopped;
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn pause_running_vcpus(vm: &mut VmInstance) -> Result<bool> {
+    let result = if let Some(running) = vm.running.as_ref() {
+        let targets = std::iter::once(&running.vcpu_thread)
+            .chain(running.ap_threads.iter())
+            .collect::<Vec<_>>();
+        pause_vcpu_group(&targets)
+    } else {
+        return Ok(false);
+    };
+    resolve_vcpu_pause(vm, result)
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn resolve_vcpu_pause(
+    vm: &mut VmInstance,
+    result: std::result::Result<(), (VmmError, bool)>,
+) -> Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err((error, rollback_confirmed)) => {
+            if !rollback_confirmed {
+                stop_after_uncertain_pause(vm);
+            }
+            Err(error)
+        }
     }
 }
 
@@ -9117,6 +9179,118 @@ mod tests {
             runtime_dir: RuntimeDirUse::acquire(),
         });
         controller
+    }
+
+    #[test]
+    fn pause_group_rolls_back_every_target_and_reports_uncertainty() {
+        struct Target {
+            id: usize,
+            fail_request: bool,
+            fail_pause: bool,
+            fail_resume: bool,
+            log: Arc<Mutex<Vec<(usize, &'static str)>>>,
+        }
+        impl Target {
+            fn step(&self, name: &'static str, fail: bool) -> Result<()> {
+                self.log.lock().unwrap().push((self.id, name));
+                if fail {
+                    Err(VmmError::Snapshot(format!("injected {name}")))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl SnapshotPauseTarget for Target {
+            fn request_pause(&self) -> Result<()> {
+                self.step("request", self.fail_request)
+            }
+            fn wait_paused(&self) -> Result<()> {
+                self.step("pause", self.fail_pause)
+            }
+            fn resume_target(&self) {
+                self.step("resume", false).unwrap();
+            }
+            fn wait_resumed(&self) -> Result<()> {
+                self.step("rollback", self.fail_resume)
+            }
+        }
+        for request_failure in [true, false] {
+            for rollback_failure in [true, false] {
+                let log = Arc::new(Mutex::new(Vec::new()));
+                let targets = (0..3)
+                    .map(|id| Target {
+                        id,
+                        fail_request: request_failure && id == 1,
+                        fail_pause: !request_failure && id == 1,
+                        fail_resume: rollback_failure && id == 2,
+                        log: log.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let refs = targets.iter().collect::<Vec<_>>();
+                let (error, confirmed) = pause_vcpu_group(&refs).unwrap_err();
+                assert_eq!(confirmed, !rollback_failure);
+                let controller = controller_in_state(VmState::Running);
+                let mut slot = controller.lock();
+                let vm = slot.as_mut().unwrap();
+                let error = resolve_vcpu_pause(vm, Err((error, confirmed))).unwrap_err();
+                assert_eq!(
+                    vm.state,
+                    if confirmed {
+                        VmState::Running
+                    } else {
+                        VmState::Stopped
+                    }
+                );
+                drop(slot);
+                assert!(error.to_string().contains(if request_failure {
+                    "injected request"
+                } else {
+                    "injected pause"
+                }));
+                assert_eq!(
+                    error.to_string().contains("failed to confirm"),
+                    rollback_failure
+                );
+                let log = log.lock().unwrap();
+                let resume_start = log.iter().position(|(_, step)| *step == "resume").unwrap();
+                assert_eq!(
+                    &log[resume_start..],
+                    &[
+                        (0, "resume"),
+                        (1, "resume"),
+                        (2, "resume"),
+                        (0, "rollback"),
+                        (1, "rollback"),
+                        (2, "rollback")
+                    ]
+                );
+                if !request_failure {
+                    assert_eq!(&log[..3], &[(0, "request"), (1, "request"), (2, "request")]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uncertain_pause_is_terminal_and_rejects_state_capture() {
+        let controller = controller_in_state(VmState::Running);
+        stop_after_uncertain_pause(controller.lock().as_mut().unwrap());
+        assert_eq!(controller.lock().as_ref().unwrap().state, VmState::Stopped);
+        assert!(controller.pause().is_err());
+        assert!(controller.resume().is_err());
+        assert!(controller
+            .snapshot(false)
+            .unwrap_err()
+            .to_string()
+            .contains("stopped"));
+        assert!(controller
+            .suspend()
+            .unwrap_err()
+            .to_string()
+            .contains("stopped"));
+        assert_eq!(controller.lock().as_ref().unwrap().state, VmState::Stopped);
+        controller.stop().unwrap();
+        assert!(controller.lock().is_none());
     }
 
     fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {
