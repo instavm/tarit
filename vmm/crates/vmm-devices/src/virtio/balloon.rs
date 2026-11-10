@@ -250,12 +250,8 @@ impl VirtioBalloonMmio {
                     .read_slice(&mut raw, GuestAddress(pfn_address))
                     .ok()?;
                 let pfn = u32::from_le_bytes(raw);
-                let end = u64::from(pfn)
-                    .checked_mul(PAGE_SIZE)
-                    .and_then(|start| start.checked_add(PAGE_SIZE))?;
-                if end > self.memory.size_bytes {
-                    return None;
-                }
+                let gpa = u64::from(pfn).checked_mul(PAGE_SIZE)?;
+                self.memory.gpa_range_to_offset(gpa, PAGE_SIZE)?;
                 pfns.push(pfn);
             }
         }
@@ -629,6 +625,50 @@ mod tests {
                 .id,
             0
         );
+    }
+
+    #[test]
+    fn pfn_validation_accepts_split_and_hotplug_ram_but_rejects_holes_atomically() {
+        use vmm_memory_backend::backend::{MMIO_GAP_END, MMIO_GAP_START};
+        for memory in [
+            GuestMemory::new(MMIO_GAP_START + 2 * PAGE_SIZE).unwrap(),
+            GuestMemory::new_hotplug(256 * 1024 * 1024, 128 * 1024 * 1024).unwrap(),
+        ] {
+            let high_last = MMIO_GAP_END + memory.size_bytes - memory.low_size_bytes - PAGE_SIZE;
+            let valid = [
+                0,
+                memory.low_size_bytes - PAGE_SIZE,
+                MMIO_GAP_END,
+                high_last,
+            ];
+            let dev = VirtioBalloonMmio::new(9, memory.clone(), 0).unwrap();
+            let submit = |gpas: &[u64]| {
+                let bytes = gpas
+                    .iter()
+                    .flat_map(|gpa| ((*gpa / PAGE_SIZE) as u32).to_le_bytes())
+                    .collect::<Vec<_>>();
+                memory.write_phys(0x10000, &bytes).unwrap();
+                dev.parse_pfns(&[(0x10000, bytes.len() as u32)], &[])
+            };
+            let parsed = submit(&valid).expect("low and high RAM PFNs");
+            memory.write_phys(MMIO_GAP_END, &[0x5a; 4096]).unwrap();
+            for bad in [
+                memory.low_size_bytes,
+                MMIO_GAP_END - PAGE_SIZE,
+                high_last + PAGE_SIZE,
+                u64::from(u32::MAX) * PAGE_SIZE,
+            ] {
+                assert!(submit(&[MMIO_GAP_END, bad]).is_none());
+                let mut page = [0; 4096];
+                memory.read_phys(MMIO_GAP_END, &mut page).unwrap();
+                assert_eq!(page, [0x5a; 4096], "no partial discard of rejected batch");
+            }
+            assert!(dev.inflate(parsed));
+            let mut page = [1; 4096];
+            memory.read_phys(MMIO_GAP_END, &mut page).unwrap();
+            assert_eq!(page, [0; 4096]);
+            assert_eq!(dev.inflate_pages.load(Ordering::Relaxed), 4);
+        }
     }
 
     #[test]
