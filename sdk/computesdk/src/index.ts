@@ -82,6 +82,17 @@ class TaritApiError extends Error {
   }
 }
 
+export class TaritDeadlineExceeded extends Error {
+  constructor(readonly executionId?: string) {
+    super(executionId === undefined
+      ? 'tarit command exceeded its deadline; execution ID unavailable; submission may have been accepted'
+      : `tarit command exceeded its deadline; execution ID ${executionId}`);
+    this.name = 'TaritDeadlineExceeded';
+  }
+}
+
+const RETRYABLE_POLL_STATUS = new Set([429, 502, 503, 504]);
+
 async function call<T>(
   config: TaritConfig,
   method: string,
@@ -188,37 +199,59 @@ export const tarit = defineProvider<TaritInstance, TaritConfig>({
       runCommand: async (vm, command, options) => {
         const started = Date.now();
         const timeoutMs = options?.timeout ?? vm.timeoutMs;
-        const request = {
-          vm_id: vm.id,
-          command: shellCommand(command, options?.env, options?.cwd, options?.background),
-          timeout_ms: timeoutMs,
-        };
-        let result: ExecutionRecord;
-        if (timeoutMs <= SYNC_EXECUTE_LIMIT_MS) {
-          result = await call<ExecutionRecord>(vm.config, 'POST', '/v1/execute', request);
-        } else {
-          // Past the synchronous deadline: start it, then poll until it ends.
-          result = await call<ExecutionRecord>(vm.config, 'POST', '/v1/execute_async', request);
-          let pollMs = EXECUTION_POLL_FIRST_MS;
-          while (result.status === 'pending' || result.status === 'running') {
-            await new Promise((resolve) => setTimeout(resolve, pollMs));
-            pollMs = Math.min(pollMs * 2, EXECUTION_POLL_MAX_MS);
-            result = await call<ExecutionRecord>(
-              vm.config,
-              'GET',
-              `/v1/executions/${encodeURIComponent(result.id)}`,
-            );
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2_147_478_647) {
+          throw new RangeError('command timeout must be positive and leave room for its 5000ms deadline margin');
+        }
+        const deadline = performance.now() + timeoutMs + 5_000;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), Math.ceil(timeoutMs + 5_000));
+        let executionId: string | undefined;
+        try {
+          const request = {
+            vm_id: vm.id,
+            command: shellCommand(command, options?.env, options?.cwd, options?.background),
+            timeout_ms: timeoutMs,
+          };
+          let result: ExecutionRecord;
+          if (timeoutMs <= SYNC_EXECUTE_LIMIT_MS) {
+            result = await call<ExecutionRecord>(vm.config, 'POST', '/v1/execute', request, controller.signal);
+          } else {
+            // Past the synchronous deadline: start it, then poll until it ends.
+            result = await call<ExecutionRecord>(vm.config, 'POST', '/v1/execute_async', request, controller.signal);
+            executionId = result.id;
+            let pollMs = EXECUTION_POLL_FIRST_MS;
+            while (result.status === 'pending' || result.status === 'running') {
+              const remaining = deadline - performance.now();
+              if (remaining <= 0 || controller.signal.aborted) throw new TaritDeadlineExceeded(executionId);
+              await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, remaining)));
+              if (performance.now() >= deadline || controller.signal.aborted) throw new TaritDeadlineExceeded(executionId);
+              pollMs = Math.min(pollMs * 2, EXECUTION_POLL_MAX_MS);
+              try {
+                result = await call<ExecutionRecord>(
+                  vm.config, 'GET', `/v1/executions/${encodeURIComponent(executionId)}`,
+                  undefined, controller.signal,
+                );
+              } catch (error) {
+                if (!(error instanceof TaritApiError && RETRYABLE_POLL_STATUS.has(error.status))) throw error;
+              }
+            }
           }
+          if (performance.now() >= deadline || controller.signal.aborted) throw new TaritDeadlineExceeded(executionId);
+          if (result.exit_code === null || result.exit_code === undefined) {
+            throw new Error(`tarit command did not complete: ${result.error ?? result.status}`);
+          }
+          return {
+            stdout: result.stdout ?? '',
+            stderr: result.stderr ?? '',
+            exitCode: result.exit_code,
+            durationMs: Date.now() - started,
+          };
+        } catch (error) {
+          if (controller.signal.aborted || error instanceof TaritDeadlineExceeded) throw new TaritDeadlineExceeded(executionId);
+          throw error;
+        } finally {
+          clearTimeout(timer);
         }
-        if (result.exit_code === null || result.exit_code === undefined) {
-          throw new Error(`tarit command did not complete: ${result.error ?? result.status}`);
-        }
-        return {
-          stdout: result.stdout ?? '',
-          stderr: result.stderr ?? '',
-          exitCode: result.exit_code,
-          durationMs: Date.now() - started,
-        };
       },
 
       getInfo: async (vm) => {

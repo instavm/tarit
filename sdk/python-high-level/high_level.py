@@ -500,9 +500,15 @@ class TaritClient:
 
     def _wait_execution(self, execution_id: UUID, deadline: float, poll_interval: float) -> ExecutionRecord:
         operation = f"execution {execution_id}"
+        attempt = 0
         try:
             while True:
                 response = self._request(deadline, operation, **get_execution_api._get_kwargs(execution_id))
+                if int(response.status_code) in RETRYABLE_STATUS:
+                    time.sleep(min(max(poll_interval, _retry_delay(attempt)), _remaining(deadline, operation)))
+                    attempt += 1
+                    continue
+                attempt = 0
                 record = _parsed(
                     get_execution_api._build_response(client=self.raw, response=response),
                     ExecutionRecord,
@@ -704,9 +710,15 @@ class AsyncTaritClient:
 
     async def _wait_execution(self, execution_id: UUID, deadline: float, poll_interval: float) -> ExecutionRecord:
         operation = f"execution {execution_id}"
+        attempt = 0
         try:
             while True:
                 response = await self._request(deadline, operation, **get_execution_api._get_kwargs(execution_id))
+                if int(response.status_code) in RETRYABLE_STATUS:
+                    await asyncio.sleep(min(max(poll_interval, _retry_delay(attempt)), _remaining(deadline, operation)))
+                    attempt += 1
+                    continue
+                attempt = 0
                 record = _parsed(
                     get_execution_api._build_response(client=self.raw, response=response),
                     ExecutionRecord,

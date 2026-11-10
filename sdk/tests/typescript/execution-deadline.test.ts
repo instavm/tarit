@@ -282,3 +282,57 @@ test("execution ID context preserves ordinary API failures", async () => {
     await assert.rejects(operation, (error) => error instanceof TaritApiError && error.status === 403);
   }
 });
+
+test("execution polling retries transient HTTP responses without resubmitting", async () => {
+  const statuses = [202, 429, 502, 503, 504, 200];
+  const methods: string[] = [];
+  const fetch: typeof globalThis.fetch = async (request, init) => {
+    const incoming = request instanceof Request ? request : new Request(request, init);
+    methods.push(incoming.method);
+    const status = statuses.shift()!;
+    return status === 202 ? executionResponse("pending", status)
+      : status === 200 ? executionResponse("completed")
+      : new Response(JSON.stringify({ error: "temporarily busy" }), { status });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
+  assert.equal((await client.execute(vmId, "once", { deadlineMs: 5000, pollIntervalMs: 0 })).status, "completed");
+  assert.deepEqual(methods, ["POST", "GET", "GET", "GET", "GET", "GET"]);
+});
+
+test("persistent polling overload reaches the original deadline with execution ID", async () => {
+  let calls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    calls++;
+    return new Response('{"error":"busy"}', { status: 503 });
+  };
+  const client = new TaritClient({ baseUrl: "https://tarit.test", apiKey: "key", fetch });
+  await assert.rejects(() => client.waitExecution(executionId, { deadlineMs: 20 }), deadlineWithId(executionId));
+  assert.equal(calls, 1);
+});
+
+test("PTY deletion aborts a real HTTP response stalled in its body", async () => {
+  const { createServer } = await import("node:http");
+  let received = false;
+  const server = createServer((_request, response) => {
+    received = true;
+    response.writeHead(500, { "Content-Type": "application/json", "Content-Length": 100 });
+    response.write('{"error":');
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    const client = new TaritClient({ baseUrl: `http://127.0.0.1:${address.port}`, apiKey: "key" });
+    await assert.rejects(() => client.deletePtySession(vmId, "pty", { deadlineMs: 200 }), (error) => {
+      assert.ok(error instanceof TaritDeadlineExceeded);
+      assert.equal(error.executionId, undefined);
+      assert.match(error.message, /delete PTY/);
+      assert.doesNotMatch(error.message, /execution ID unavailable/);
+      return true;
+    });
+    assert.ok(received);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  }
+});

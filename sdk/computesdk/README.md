@@ -51,3 +51,5 @@ On the reference host (6-core desktop, other load present), ComputeSDK's
 time-to-interactive benchmark measured a 66 ms median and a 99.1 score with
 10 sandboxes at once. Treat that as a lower bound for a remote host, which
 adds the network round trips.
+
+Command requests and polling share a total deadline of the guest command timeout plus 5 seconds. Command timeouts must be finite positive milliseconds at most 2,147,478,647. Transient polling responses (429/502/503/504) retry the same execution; submission is never replayed. `TaritDeadlineExceeded` retains `executionId` when submission returned it; an unavailable ID means submission may still have been accepted.
