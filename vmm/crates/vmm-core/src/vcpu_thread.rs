@@ -674,10 +674,12 @@ mod tests {
         let kvm = kvm_ioctls::Kvm::new().unwrap();
         assert!(kvm.check_extension(kvm_ioctls::Cap::ImmediateExit));
         for code in [
-            vec![0xe4, 0x80],                // in al, 0x80
-            vec![0xe6, 0x80],                // out 0x80, al
-            vec![0x67, 0xa0, 0, 0, 0, 0xf0], // mov al, byte [0xf0000000]
-            vec![0x67, 0xa2, 0, 0, 0, 0xf0], // mov byte [0xf0000000], al
+            vec![0xe4, 0x80], // in al, 0x80
+            vec![0xe6, 0x80], // out 0x80, al
+            // Real-mode DS has a 64 KiB limit. Use an unmapped hole above
+            // our 16 KiB RAM slot, but within that architectural limit.
+            vec![0xa0, 0x00, 0x80], // mov al, byte [0x8000]
+            vec![0xa2, 0x00, 0x80], // mov byte [0x8000], al
         ] {
             let vm = kvm.create_vm().unwrap();
             // Match production VM setup before entering real mode on VMX.
