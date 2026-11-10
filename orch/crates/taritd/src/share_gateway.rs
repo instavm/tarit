@@ -130,6 +130,38 @@ impl http_body::Body for AdmittedShareBody {
     }
 }
 
+// A request can disappear while restore's spawn_blocking worker continues.
+// Keep the complete activation future alive, charged to its original permit,
+// through restore publication and cleanup. Only admitted requests spawn this
+// task, so abandoned activations still occupy the finite node/tenant/share caps.
+async fn admitted_activation<T: Send + 'static>(
+    admission: Arc<ShareAdmissionPermit>,
+    work: impl Future<Output = Result<T, GatewayError>> + Send + 'static,
+) -> Result<T, GatewayError> {
+    tokio::spawn(async move {
+        let _admission = admission;
+        work.await
+    })
+    .await
+    .map_err(|_| GatewayError::Unavailable)?
+}
+
+async fn ensure_admitted_local_active(
+    state: &AppState,
+    share: &ShareRecord,
+    admission: Arc<ShareAdmissionPermit>,
+) -> Result<(), GatewayError> {
+    let state = state.clone();
+    let share = share.clone();
+    admitted_activation(admission, async move {
+        ops::ensure_active_local_for_owner(&state, share.vm_id, &share.owner_key)
+            .await
+            .map(|_| ())
+            .map_err(GatewayError::from)
+    })
+    .await
+}
+
 fn hold_share_response(response: Response, admission: Arc<ShareAdmissionPermit>) -> Response {
     let (parts, body) = response.into_parts();
     Response::from_parts(
@@ -831,14 +863,18 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
         };
         // Legacy shares may still reference a reused UUID. Check the durable
         // tenant before stale-host recovery can claim or wake that VM.
-        verify_share_vm_owner(&state, &share).await?;
-        let owner = ops::resolve_owner_for_activation(&state, share.vm_id, &activation_identity)
-            .await
-            .map_err(|error| {
-                tracing::warn!(share_id = %share.id, %error, "share owner resolution failed");
-                state.metrics.inc_share_owner_failures();
+        let activation_state = state.clone();
+        let activation_share = share.clone();
+        let owner = admitted_activation(Arc::clone(&permit), async move {
+            verify_share_vm_owner(&activation_state, &activation_share).await?;
+            ops::resolve_owner_for_activation(
+                &activation_state, activation_share.vm_id, &activation_identity,
+            ).await.map_err(|error| {
+                tracing::warn!(share_id = %activation_share.id, %error, "share owner resolution failed");
+                activation_state.metrics.inc_share_owner_failures();
                 GatewayError::Unavailable
-            })?;
+            })
+        }).await?;
 
         if is_websocket_request(&parts) {
             if state.share_runtime.is_shutting_down() {
@@ -887,7 +923,7 @@ async fn handle_request(State(state): State<AppState>, request: Request<Body>) -
             parts.extensions.insert(forwarding);
             let request = Request::from_parts(parts, body);
             match owner {
-                Owner::Local => proxy_local_http(&state, &share, request).await,
+                Owner::Local => proxy_local_http(&state, &share, request, Arc::clone(&permit)).await,
                 Owner::Remote(target) => proxy_remote_http(&state, &share, &target, request).await,
             }
         }
@@ -1132,7 +1168,13 @@ pub(crate) async fn proxy_authoritative_local_share(
         .await
     } else {
         parts.extensions.insert(forwarding);
-        proxy_local_http(state, share, Request::from_parts(parts, body)).await
+        proxy_local_http(
+            state,
+            share,
+            Request::from_parts(parts, body),
+            Arc::clone(&permit),
+        )
+        .await
     }?;
     Ok(hold_share_response(response, permit))
 }
@@ -1269,10 +1311,9 @@ async fn proxy_local_http(
     state: &AppState,
     share: &ShareRecord,
     request: Request<Body>,
+    admission: Arc<ShareAdmissionPermit>,
 ) -> Result<Response, GatewayError> {
-    crate::ops::ensure_active_local_for_owner(state, share.vm_id, &share.owner_key)
-        .await
-        .map_err(GatewayError::from)?;
+    ensure_admitted_local_active(state, share, admission).await?;
     let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
     })?;
@@ -1559,9 +1600,12 @@ async fn proxy_local_websocket(
     if state.share_runtime.is_shutting_down() {
         return Err(GatewayError::Unavailable);
     }
-    crate::ops::ensure_active_local_for_owner(state, share.vm_id, &share.owner_key)
-        .await
-        .map_err(GatewayError::from)?;
+    ensure_admitted_local_active(
+        state,
+        share,
+        request.admission.clone().ok_or(GatewayError::Unavailable)?,
+    )
+    .await?;
     let (target, lease) = local_target(state, share).inspect_err(|_| {
         state.metrics.inc_share_target_failures();
     })?;
@@ -2192,6 +2236,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admitted_activation_releases_budget_after_success_and_failure() {
+        for succeed in [false, true] {
+            let runtime = Arc::new(ShareRuntime::default());
+            let share = gateway_share(Uuid::new_v4(), 8080, ShareVisibility::Public);
+            let permit = runtime
+                .admit_share(runtime.admit_lookup().unwrap(), &share)
+                .unwrap();
+            let result = super::admitted_activation(permit, async move {
+                if succeed {
+                    Ok(())
+                } else {
+                    Err(super::GatewayError::Unavailable)
+                }
+            })
+            .await;
+            assert_eq!(result.is_ok(), succeed);
+            assert_eq!(
+                runtime.admission_global.available_permits(),
+                super::MAX_SHARE_REQUESTS
+            );
+            assert!(runtime.admission_counts.lock().unwrap().tenants.is_empty());
+            assert!(runtime.admission_counts.lock().unwrap().shares.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn streaming_body_drop_and_lookup_cancellation_retain_their_budgets() {
         let runtime = Arc::new(ShareRuntime::default());
         let share = gateway_share(Uuid::new_v4(), 8080, ShareVisibility::Public);
@@ -2278,6 +2348,222 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_activation_keeps_admission_until_restore_worker_and_cleanup_finish() {
+        use sha2::Digest as _;
+        let state = gateway_test_state();
+        let runtime = Arc::clone(&state.share_runtime);
+        let share = install_gateway_share(
+            &state,
+            "127.0.0.1:8080".parse().unwrap(),
+            ShareVisibility::Public,
+        )
+        .await;
+        let id = share.vm_id;
+        let record = {
+            let mut cache = state.vm_cache.write().unwrap();
+            let vm = cache.get_mut(&id).unwrap();
+            vm.status = VmStatus::Hibernated;
+            vm.rootfs_path = None;
+            vm.clone()
+        };
+        let root = std::env::temp_dir().join(format!("share-activation-cancel-{id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("vm.snap");
+        let header = [0u8; 32];
+        let memory = b"hibernated RAM image";
+        std::fs::write(&path, [&header[..], &memory[..]].concat()).unwrap();
+        let manifest = tarit_proto::IntegrityManifest {
+            chunk_size: tarit_proto::INTEGRITY_CHUNK_SIZE,
+            artifacts: vec![
+                tarit_proto::ArtifactIntegrity {
+                    kind: tarit_proto::ArtifactKind::SnapshotMetadata,
+                    len: header.len() as u64,
+                    chunk_hashes: vec![sha2::Sha256::digest(header).into()],
+                },
+                tarit_proto::ArtifactIntegrity {
+                    kind: tarit_proto::ArtifactKind::Ram,
+                    len: memory.len() as u64,
+                    chunk_hashes: vec![sha2::Sha256::digest(memory).into()],
+                },
+            ],
+            working_set: Vec::new(),
+        };
+        let manifest_path = PathBuf::from(format!("{}.integrity", path.display()));
+        std::fs::write(&manifest_path, manifest.encode().unwrap()).unwrap();
+        let now = Utc::now();
+        {
+            let store = state.store.lock().unwrap();
+            store.insert_vm(&record).unwrap();
+            store
+                .insert_snapshot(&tarit_store::SnapshotRecord {
+                    snapshot_id: Uuid::new_v4(),
+                    path: path.display().to_string(),
+                    overlay_path: None,
+                    host_id: state.config.host_id.clone(),
+                    owner_key: Some(share.owner_key.clone()),
+                    api_key_id: None,
+                    vm_id: id,
+                    ephemeral_owner_vm_id: None,
+                    memory_mib: Some(record.memory_mib),
+                    vcpus: Some(record.vcpus),
+                    kernel_path: Some(record.kernel_path.clone()),
+                    rootfs_path: None,
+                    rootfs_read_only: None,
+                    cmdline: Some(record.cmdline.clone()),
+                    content_digest: Some(
+                        crate::image::sha256_regular_file(&manifest_path).unwrap(),
+                    ),
+                    size_bytes: Some((header.len() + memory.len()) as u64),
+                    created_at: now,
+                })
+                .unwrap();
+            store
+                .upsert_hibernation(&tarit_store::HibernationRecord {
+                    vm_id: id,
+                    owner_key: share.owner_key.clone(),
+                    snapshot_path: path.display().to_string(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        *crate::ops::ACTIVATION_RESTORE_PAUSE.lock().unwrap() =
+            Some(crate::ops::ActivationRestorePause {
+                id,
+                entered: entered_tx,
+                release: release_rx,
+                done: done_tx,
+            });
+        let request = Request::builder()
+            .uri("/")
+            .header(HOST, "calm-red-fox.shares.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let task = tokio::spawn(gateway_router(state.clone()).oneshot(request));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("request must reach actual blocking restore")
+            .unwrap();
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS - 1
+        );
+        assert_eq!(
+            runtime
+                .admission_counts
+                .lock()
+                .unwrap()
+                .tenants
+                .get(&share.owner_key),
+            Some(&1)
+        );
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // Cancellation must not admit work in place of the still-live restore.
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS - 1
+        );
+        assert_eq!(
+            runtime
+                .admission_counts
+                .lock()
+                .unwrap()
+                .tenants
+                .get(&share.owner_key),
+            Some(&1)
+        );
+        assert_eq!(
+            runtime
+                .admission_counts
+                .lock()
+                .unwrap()
+                .shares
+                .get(&share.id),
+            Some(&1)
+        );
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        let same_share_holds = (1..super::MAX_SHARE_REQUESTS_PER_SHARE)
+            .map(|_| {
+                runtime
+                    .admit_share(runtime.admit_lookup().unwrap(), &share)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            runtime.admit_share(runtime.admit_lookup().unwrap(), &share),
+            Err(super::GatewayError::Overloaded)
+        ));
+        drop(same_share_holds);
+        let mut new_holds = Vec::new();
+        for _ in 0..super::MAX_SHARE_REQUESTS_PER_TENANT - 1 {
+            let mut next_share = share.clone();
+            next_share.id = Uuid::new_v4();
+            new_holds.push(
+                runtime
+                    .admit_share(runtime.admit_lookup().unwrap(), &next_share)
+                    .unwrap(),
+            );
+        }
+        let mut next_share = share.clone();
+        next_share.id = Uuid::new_v4();
+        assert!(matches!(
+            runtime.admit_share(runtime.admit_lookup().unwrap(), &next_share),
+            Err(super::GatewayError::Overloaded)
+        ));
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match done_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(e) => panic!("worker completion: {e}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // Worker exit is followed by reservation/publication failure cleanup.
+        // Keep charging admission until that owned async activation also ends.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime
+                .admission_counts
+                .lock()
+                .unwrap()
+                .shares
+                .contains_key(&share.id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!state.supervisor.has_retained_boot(id));
+        assert!(!state.scheduler.is_reserved(id));
+        drop(new_holds);
+        assert_eq!(
+            runtime.admission_global.available_permits(),
+            super::MAX_SHARE_REQUESTS
+        );
+        assert!(runtime.admission_counts.lock().unwrap().tenants.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

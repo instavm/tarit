@@ -12,6 +12,13 @@ actually finishes, including a blocked SQLite lookup. Unknown or unauthorized
 slugs never consume a tenant or share slot. A stuck database can exhaust the
 finite global capacity until its work completes.
 
+Admitted owner recovery and local activation retain all three budgets through
+actual restore, publication and cleanup, even when the HTTP or WebSocket
+request is cancelled. The owned activation task holds the original permit;
+only already-admitted work can create it. A stuck restore therefore consumes
+its finite slot until completion instead of freeing capacity for another wake.
+This applies to public and owner-side peer requests.
+
 HTTP response bodies retain admission until dropped. WebSocket bridges retain
 it through the actual bridge lifetime, including after upgrade headers are
 sent. Owner-side proxying independently applies the same node budgets before
