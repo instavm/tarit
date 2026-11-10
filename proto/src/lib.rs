@@ -17,6 +17,7 @@ pub use config::{
 pub use integrity::{ArtifactIntegrity, ArtifactKind, IntegrityManifest, INTEGRITY_CHUNK_SIZE};
 pub use pty::{
     read_frame, write_error_frame, write_frame, write_json_frame, PtyExit, PtyResize, PtyStart,
-    PtyStreamFrame, MAX_FRAME_LEN, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE, TYPE_START,
+    PtyStreamFrame, MAX_FRAME_LEN, TYPE_DATA, TYPE_ERROR, TYPE_EXEC_START, TYPE_EXIT, TYPE_RESIZE,
+    TYPE_START, TYPE_STDERR, TYPE_STDIN_EOF,
 };
 pub use state::{VmState, VmStatus};

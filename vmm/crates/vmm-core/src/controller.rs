@@ -2544,7 +2544,7 @@ impl VmmController {
         }
         .ok_or_else(|| VmmError::Device("vsock PTY channel unavailable".into()))?;
 
-        pty.attach(host_stream, cols, rows, shell)
+        pty.attach(host_stream, cols, rows, shell, false)
             .map_err(VmmError::Device)
     }
 
@@ -2557,6 +2557,33 @@ impl VmmController {
         _shell: Option<String>,
     ) -> Result<()> {
         Err(VmmError::Kvm("AttachPty needs Linux+KVM+boot".into()))
+    }
+
+    pub fn attach_exec(
+        &self,
+        host_stream: std::os::unix::net::UnixStream,
+        command: String,
+    ) -> Result<()> {
+        if !crate::pty_stream::valid_stream_exec_command(&command) {
+            return Err(VmmError::InvalidConfig("invalid streaming command".into()));
+        }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+        {
+            let pty = {
+                let slot = self.lock();
+                slot.as_ref()
+                    .and_then(|vm| vm.running.as_ref())
+                    .and_then(|r| r.vsock_pty.clone())
+            }
+            .ok_or_else(|| VmmError::Device("vsock command channel unavailable".into()))?;
+            pty.attach(host_stream, 0, 0, Some(command), true)
+                .map_err(VmmError::Device)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
+        {
+            let _ = (host_stream, command);
+            Err(VmmError::Kvm("AttachExec needs Linux+KVM+boot".into()))
+        }
     }
 
     /// Packet counters of each virtio-net device, in configuration order.

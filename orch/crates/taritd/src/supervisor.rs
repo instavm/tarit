@@ -8052,6 +8052,12 @@ impl VmmSupervisor {
             .map_err(|e| OrchError::Vmm(e.to_string()))
     }
 
+    pub fn attach_exec(&self, id: Uuid, command: String) -> Result<UnixStream, OrchError> {
+        self.client_for(id)?
+            .attach_exec(command)
+            .map_err(|e| OrchError::Vmm(e.to_string()))
+    }
+
     pub fn is_running(&self, id: Uuid) -> bool {
         self.running
             .lock()

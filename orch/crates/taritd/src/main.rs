@@ -19,6 +19,7 @@ mod scheduler;
 mod share_gateway;
 mod shares;
 mod ssh_keys;
+mod stream_frame;
 mod supervisor;
 mod usage;
 mod volume_provider;

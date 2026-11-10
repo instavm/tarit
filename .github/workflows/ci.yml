@@ -13,6 +13,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  guest-stream:
+    name: guest streaming exec protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build guest agent with warnings as errors
+        run: make -C vmm/guest/agent CFLAGS="-O2 -Wall -Wextra -Werror -pedantic"
+      - name: Test real guest pipe and PTY handlers without KVM
+        run: timeout 60s python3 vmm/guest/agent/test-stream-exec.py
+
   musl:
     name: build release targets (musl)
     runs-on: ubuntu-latest

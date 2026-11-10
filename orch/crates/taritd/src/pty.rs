@@ -21,7 +21,7 @@ use tarit_types::OrchError;
 use tarit_vmm_client::{
     PtyResize, PtyStreamFrame, MAX_FRAME_LEN, TYPE_DATA, TYPE_ERROR, TYPE_EXIT, TYPE_RESIZE,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 use crate::{
@@ -843,42 +843,26 @@ fn truncate_close_reason(reason: &str) -> String {
     reason.chars().take(120).collect()
 }
 
-async fn read_vmm_stream_frame<R>(reader: &mut R) -> Result<PtyStreamFrame, BridgeError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; 5];
-    reader.read_exact(&mut header).await?;
-    let frame_type = header[0];
-    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(BridgeError::Protocol("stream frame too large".into()));
-    }
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
-    Ok(PtyStreamFrame {
-        frame_type,
-        payload,
-    })
+async fn read_vmm_stream_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<PtyStreamFrame, BridgeError> {
+    crate::stream_frame::read(reader)
+        .await
+        .map_err(|error| match error {
+            crate::stream_frame::FrameError::Io(error) => BridgeError::Io(error),
+            crate::stream_frame::FrameError::Protocol(message) => BridgeError::Protocol(message),
+        })
 }
-
-async fn write_vmm_stream_frame<W>(
+async fn write_vmm_stream_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &PtyStreamFrame,
-) -> Result<(), BridgeError>
-where
-    W: AsyncWrite + Unpin,
-{
-    if frame.payload.len() > MAX_FRAME_LEN {
-        return Err(BridgeError::Protocol("stream frame too large".into()));
-    }
-    let mut header = [0u8; 5];
-    header[0] = frame.frame_type;
-    header[1..5].copy_from_slice(&(frame.payload.len() as u32).to_be_bytes());
-    writer.write_all(&header).await?;
-    writer.write_all(&frame.payload).await?;
-    writer.flush().await?;
-    Ok(())
+) -> Result<(), BridgeError> {
+    crate::stream_frame::write(writer, frame)
+        .await
+        .map_err(|error| match error {
+            crate::stream_frame::FrameError::Io(error) => BridgeError::Io(error),
+            crate::stream_frame::FrameError::Protocol(message) => BridgeError::Protocol(message),
+        })
 }
 
 fn data_frame(data: Vec<u8>) -> PtyStreamFrame {

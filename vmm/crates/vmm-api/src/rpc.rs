@@ -322,7 +322,7 @@ pub fn dispatch(req: ApiRequest, controller: &VmmController) -> ApiResponse {
             },
             Err(e) => error_response(e),
         },
-        ApiRequest::AttachPty { .. } => ApiResponse::Err {
+        ApiRequest::AttachPty { .. } | ApiRequest::AttachExec { .. } => ApiResponse::Err {
             msg: "AttachPty is a streaming request".into(),
         },
         ApiRequest::UpdateEgress {
@@ -471,6 +471,32 @@ pub fn serve_with_controller(socket_path: &str, controller: VmmController) -> st
                 continue;
             }
         };
+        if let ApiRequest::AttachExec { command } = req {
+            // Explicit JSON acknowledgement lets new clients distinguish an
+            // older VMM's unsupported-request response from stream framing.
+            if write_frame(&mut stream, &encode_response(&ApiResponse::Ok)).is_err() {
+                continue;
+            }
+            if let Err(e) = clear_control_timeouts(&stream) {
+                log::warn!("clear AttachExec control timeout: {e}");
+                continue;
+            }
+            let controller = controller.clone();
+            if let Err(e) = std::thread::Builder::new()
+                .name("api-attach-exec".into())
+                .spawn(move || {
+                    let mut error_stream = stream.try_clone().ok();
+                    if let Err(e) = controller.attach_exec(stream, command) {
+                        if let Some(stream) = error_stream.as_mut() {
+                            let _ = vmm_core::pty_stream::write_error_frame(stream, &e.to_string());
+                        }
+                    }
+                })
+            {
+                log::warn!("attach_exec thread spawn: {e}");
+            }
+            continue;
+        }
         if let ApiRequest::AttachPty { cols, rows, shell } = req {
             // PTY sessions are intentionally long-lived. The absolute framing
             // deadline protects only their initial authenticated request.

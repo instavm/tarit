@@ -697,6 +697,32 @@ impl VmmClient {
         Ok(stream)
     }
 
+    /// Open a pipe-backed command stream; older VMMs reject this request.
+    pub fn attach_exec(&self, command: String) -> Result<UnixStream, VmmError> {
+        if !tarit_proto::pty::valid_stream_exec_command(&command) {
+            return Err(VmmError::Api("invalid streaming command".into()));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = self.connect_for_request(Some(deadline))?;
+        let body = serde_json::to_vec(&ApiRequest::AttachExec { command })?;
+        write_api_frame_until(&mut stream, &body, deadline)?;
+        let response: ApiResponse =
+            serde_json::from_slice(&read_api_frame_until(&mut stream, deadline)?)?;
+        match response {
+            ApiResponse::Ok => {}
+            ApiResponse::Err { msg } => return Err(VmmError::Api(msg)),
+            other => {
+                return Err(VmmError::Api(format!(
+                    "unexpected stream acknowledgement: {other:?}"
+                )))
+            }
+        }
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        stream.set_nonblocking(false)?;
+        Ok(stream)
+    }
+
     /// Restore a VM from a snapshot file into this (freshly spawned) `vmm serve`
     /// process, resuming it to a running state.
     pub fn restore(&self, snapshot_path: &str, overlay: Option<String>) -> Result<(), VmmError> {
@@ -836,6 +862,50 @@ mod tests {
             ".tarit-vmm-client-{}-{id}.sock",
             std::process::id()
         )))
+    }
+
+    #[test]
+    fn attach_exec_requires_an_explicit_acknowledgement_before_streaming() {
+        let socket = socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request: ApiRequest =
+                serde_json::from_slice(&read_api_frame(&mut stream).unwrap()).unwrap();
+            assert!(matches!(request, ApiRequest::AttachExec { command } if command == "cat"));
+            write_api_frame(&mut stream, &serde_json::to_vec(&ApiResponse::Ok).unwrap()).unwrap();
+            tarit_proto::pty::write_frame(&mut stream, TYPE_STDERR, b"stderr\n").unwrap();
+            release_rx.recv().unwrap();
+        });
+        let mut stream = VmmClient::new(&socket.0).attach_exec("cat".into()).unwrap();
+        let frame = tarit_proto::pty::read_frame(&mut stream).unwrap();
+        assert_eq!(frame.frame_type, TYPE_STDERR);
+        assert_eq!(frame.payload, b"stderr\n");
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn attach_exec_rejects_an_older_vmm_json_error_without_stream_fallback() {
+        let socket = socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_api_frame(&mut stream).unwrap();
+            write_api_frame(
+                &mut stream,
+                &serde_json::to_vec(&ApiResponse::Err {
+                    msg: "unknown variant AttachExec".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        });
+        assert!(
+            matches!(VmmClient::new(&socket.0).attach_exec("cat".into()), Err(VmmError::Api(message)) if message.contains("unknown variant"))
+        );
+        server.join().unwrap();
     }
 
     #[test]
