@@ -47,7 +47,7 @@ const VIRTIO_NET_HDR_NUM_BUFFERS_OFF: usize = 10;
 pub const NET_QUEUE_SIZE_MAX: u16 = 1024;
 
 /// Max Ethernet frame we accept end-to-end (header + 1500 MTU + slack).
-const MAX_FRAME_BYTES: usize = 1600;
+pub(super) const MAX_FRAME_BYTES: usize = 1600;
 
 /// Max frame with offloads: the 65550-byte packet virtio-net allows with TSO,
 /// plus the header.
@@ -1468,9 +1468,9 @@ impl MmioDevice for VirtioNetMmio {
                 if val as usize == QUEUE_TX {
                     return self.process_tx_queue().map(|_| ());
                 }
-                // RX kicks: nothing for the device to do — the driver just
-                // refreshed avail; we'll see the new descriptors next time
-                // we inject a packet.
+                // KVM routes both RX and TX kicks to the I/O worker. An RX
+                // kick wakes a blocked receive after the driver posts buffers;
+                // direct MMIO callers have no worker to wake here.
             }
             reg::INTERRUPT_ACK => {
                 self.interrupt_status.fetch_and(!val, Ordering::SeqCst);
