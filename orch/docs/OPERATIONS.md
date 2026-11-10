@@ -285,6 +285,33 @@ When enabled, `taritd`:
    the allowlist; established and related return traffic remains allowed.
 10. Appends a Linux `ip=` kernel command-line fragment so the guest configures `eth0`.
 
+Network slot reuse requires `conntrack` from conntrack-tools (1.4.6 or later), with kernel ctnetlink and conntrack-zone support and
+`CAP_NET_ADMIN` in taritd's network namespace. On Debian/Ubuntu install the
+`conntrack` package alongside `iproute2` and `nftables`. Tarit owns its
+172.16.0.0/16 pool in that namespace and uses conntrack zone zero; deployments
+must not assign Tarit guest traffic to a different conntrack zone.
+
+After containing and deleting a TAP, teardown deletes entries matching that
+slot's exact guest IPv4 address in all four original/reply address positions,
+across transport protocols, in zone zero. Only then may the persisted slot be
+freed. Provisioning repeats this barrier before creating a fresh TAP, covering
+state left by older versions and orphaned allocations. No host-wide flush is
+used. Missing tools, permissions, unsupported filters, oversized diagnostics or
+a five-second per-command timeout fail closed: the TAP stays absent and the
+persisted allocation remains reserved. Fix the prerequisite/error and retry
+cleanup; do not manually remove its reservation while conntrack cleanup fails.
+Live recovered VM flows are preserved. IPv6 is disabled for Tarit TAPs; IPv6
+conntrack and other namespaces/zones/guest addresses are not deleted.
+
+To validate the kernel behavior without changing host firewall state, build the
+Linux taritd test binary with `cargo test --manifest-path orch/Cargo.toml -p
+taritd --no-run`, then run `sudo test/conntrack-reuse-isolated.sh
+/absolute/path/to/the/test-binary` from the repository root. The script creates
+a private network namespace and runs an ignored test of the production flush
+helper against TCP, UDP, ICMP and NAT reply tuples, including repeated cleanup
+and preservation of another guest, zone and IPv6 flow. It requires permission
+to create a network namespace; no KVM or VM guest is needed.
+
 Snapshot restore assigns a new host TAP allocation. Before publishing the VM,
 taritd sends a typed IPv4 repair request to the guest agent and verifies
 host-to-guest reachability. The agent applies and checks the configuration
