@@ -2730,14 +2730,14 @@ impl VmmController {
                 let remaining = timeout.saturating_sub(start.elapsed());
                 match vx.exec(command, remaining) {
                     Some(Ok(r)) => {
-                        log::info!("exec '{command}' via vsock → exit={}", r.0);
+                        log::info!("exec via vsock → exit={}", r.0);
                         return Ok(r);
                     }
                     Some(Err(crate::vsock_exec::VsockExecError::NotDelivered(e))) => {
                         log::warn!("vsock exec not delivered ({e}); falling back to serial");
                     }
                     Some(Err(e @ crate::vsock_exec::VsockExecError::Ambiguous(_))) => {
-                        log::warn!("vsock exec '{command}' failed: {e}");
+                        log::warn!("vsock exec failed: {e}");
                         return Err(VmmError::Device(format!("vsock exec failed: {e}")));
                     }
                     None => {} // no guest connection / disabled → serial
@@ -2895,7 +2895,7 @@ impl VmmController {
                         let exit_code: i32 = code.trim().parse().unwrap_or(0);
                         let duration_ms = start.elapsed().as_millis() as u64;
                         let output_str = finish_exec_output(output, truncated);
-                        log::info!("exec: '{command}' → exit={exit_code} {duration_ms}ms");
+                        log::info!("exec → exit={exit_code} {duration_ms}ms");
                         return Ok((exit_code, output_str, String::new(), duration_ms));
                     }
                     if confirmed {
@@ -2912,7 +2912,7 @@ impl VmmController {
                 log::warn!("exec: timed out after {duration_ms}ms");
                 return Ok((-1, output_str, String::new(), duration_ms));
             }
-            log::warn!("exec: '{command}' got no response from guest agent after {duration_ms}ms");
+            log::warn!("exec got no response from guest agent after {duration_ms}ms");
             return Err(VmmError::Kvm(format!(
                 "exec timed out after {timeout:?} — no response from guest agent"
             )));
@@ -2997,7 +2997,7 @@ impl VmmController {
         vm.run_vcpu(&mut vcpu)?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        log::info!("exec (fresh boot): '{command}' → {duration_ms}ms");
+        log::info!("exec (fresh boot) → {duration_ms}ms");
         Ok((0, String::new(), String::new(), duration_ms))
     }
 
