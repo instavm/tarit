@@ -806,20 +806,9 @@ async fn cleanup_hibernation_snapshots_for_vm(
             .store
             .lock()
             .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
-        let bindings = store.list_hibernations().map_err(crate::api::store_err)?;
         store
-            .list_ephemeral_snapshots_for_vm(vm_id)
+            .list_unbound_hibernation_snapshots_for_vm(vm_id)
             .map_err(crate::api::store_err)?
-            .into_iter()
-            .filter(|snapshot| snapshot.vm_id == vm_id)
-            // A failed publication may retain its wake image while the cache
-            // still says Running. Only retire snapshots no binding needs.
-            .filter(|snapshot| {
-                !bindings
-                    .iter()
-                    .any(|binding| binding.snapshot_path == snapshot.path)
-            })
-            .collect()
     };
     cleanup_ephemeral_snapshots(state, snapshots).await
 }
@@ -2907,16 +2896,61 @@ pub async fn resolve_owner_for_activation(
     }
 }
 
-fn activation_gate(state: &AppState, id: Uuid) -> Result<Arc<tokio::sync::Mutex<()>>, OrchError> {
+type ActivationGateMap =
+    std::sync::Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>;
+
+/// Owns one caller's place in activation serialization, including time spent
+/// waiting. The map entry survives until the final caller releases its lease.
+pub(crate) struct ActivationGate {
+    id: Uuid,
+    gates: Arc<ActivationGateMap>,
+    gate: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl ActivationGate {
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate
+            .as_ref()
+            .expect("live activation lease")
+            .lock()
+            .await
+    }
+}
+
+impl Drop for ActivationGate {
+    fn drop(&mut self) {
+        // Acquisition and eviction share this mutex. A new caller therefore
+        // cannot create a second gate while an existing waiter still uses it.
+        let mut gates = self.gates.lock().unwrap_or_else(|error| error.into_inner());
+        let gate = self.gate.take().expect("live activation lease");
+        if Arc::strong_count(&gate) == 2
+            && gates
+                .get(&self.id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &gate))
+        {
+            gates.remove(&self.id);
+        }
+        // Release this reference before unlocking: simultaneous final drops
+        // must observe one another's release, or the map could retain a gate.
+        drop(gate);
+    }
+}
+
+pub(crate) fn activation_gate(state: &AppState, id: Uuid) -> Result<ActivationGate, OrchError> {
     let mut gates = state
         .activation_gates
         .lock()
         .map_err(|_| OrchError::Internal("activation gate map poisoned".into()))?;
-    Ok(Arc::clone(
+    let gate = Arc::clone(
         gates
             .entry(id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-    ))
+    );
+    Ok(ActivationGate {
+        id,
+        gates: Arc::clone(&state.activation_gates),
+        gate: Some(gate),
+    })
 }
 
 /// Make a logical VM runnable, coalescing every concurrent wake source into
@@ -3775,7 +3809,7 @@ pub async fn localize_branch_artifact(
         });
     }
     let gate = activation_gate(state, artifact.artifact_id)?;
-    let _localization = gate.lock_owned().await;
+    let _localization = gate.lock().await;
     let existing_local = {
         let store = state
             .store
@@ -4874,6 +4908,104 @@ mod tests {
     use std::sync::{Mutex, RwLock};
     use std::time::Duration;
     use tarit_store::Store;
+
+    #[test]
+    fn activation_gates_retire_after_missing_vm_requests() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            for _ in 0..1000 {
+                assert!(matches!(
+                    ensure_active_local(&state, Uuid::new_v4()).await,
+                    Err(OrchError::NotFound(_))
+                ));
+                assert!(state.activation_gates.lock().unwrap().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn activation_gates_preserve_waiters_and_cross_vm_concurrency() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let waiter = activation_gate(&state, id).unwrap();
+            {
+                let mut waiting = std::pin::pin!(waiter.lock());
+                assert!(tokio::time::timeout(Duration::ZERO, &mut waiting)
+                    .await
+                    .is_err());
+                let other = activation_gate(&state, Uuid::new_v4()).unwrap();
+                let independent = other
+                    .gate
+                    .as_ref()
+                    .unwrap()
+                    .try_lock()
+                    .expect("different VMs do not serialize");
+                drop(independent);
+                drop(other);
+                drop(held);
+                drop(first);
+                let next = activation_gate(&state, id).unwrap();
+                assert!(Arc::ptr_eq(
+                    waiter.gate.as_ref().unwrap(),
+                    next.gate.as_ref().unwrap()
+                ));
+                let acquired = waiting.await;
+                assert!(next.gate.as_ref().unwrap().try_lock().is_err());
+                drop(acquired);
+                drop(next);
+            }
+            drop(waiter);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn simultaneous_final_activation_leases_do_not_leave_entries() {
+        let (state, _writes) = test_state_with_durable_writer();
+        for _ in 0..50 {
+            let id = Uuid::new_v4();
+            let leases: Vec<_> = (0..8)
+                .map(|_| activation_gate(&state, id).unwrap())
+                .collect();
+            let barrier = Arc::new(std::sync::Barrier::new(leases.len()));
+            std::thread::scope(|scope| {
+                for lease in leases {
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        drop(lease);
+                    });
+                }
+            });
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelled_activation_waiter_releases_its_lease() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let waiter = activation_gate(&state, id).unwrap();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                started.send(()).unwrap();
+                let _guard = waiter.lock().await;
+            });
+            ready.await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(state.activation_gates.lock().unwrap().len(), 1);
+            drop(held);
+            drop(first);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn live_transition_validation_is_idempotent_and_rejects_wrong_states() {
