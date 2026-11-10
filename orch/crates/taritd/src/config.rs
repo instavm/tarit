@@ -1669,6 +1669,9 @@ mod security_tests {
         assert!(validate_peer_listener_config(true, false, false, address, Some(&tls)).is_ok());
         assert!(validate_peer_listener_config(true, false, true, address, Some(&tls)).is_err());
         assert!(validate_peer_listener_config(false, false, true, address, None).is_ok());
+        assert!(validate_peer_listener_config(true, false, true, address, None).is_ok());
+        assert!(validate_peer_listener_config(true, true, true, address, None).is_err());
+        assert!(validate_peer_listener_config(true, true, false, address, None).is_err());
     }
 
     #[test]
