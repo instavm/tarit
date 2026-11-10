@@ -9350,6 +9350,15 @@ mod tests {
             )
         };
         assert_ne!(addr, libc::MAP_FAILED);
+        // This test needs page-granular faults: host THP (including mTHP)
+        // can populate a never-touched neighbour when another page is written.
+        // Disable it before the first touch; keep both residency assertions.
+        // SAFETY: addr is the fresh, page-aligned mapping owned by this test.
+        assert_eq!(
+            unsafe { libc::madvise(addr, pages * PAGE, libc::MADV_NOHUGEPAGE) },
+            0
+        );
+
         // SAFETY: the mapping above is pages * PAGE bytes and live until munmap.
         let mem = unsafe { std::slice::from_raw_parts_mut(addr.cast::<u8>(), pages * PAGE) };
         mem[3 * PAGE] = 1;
