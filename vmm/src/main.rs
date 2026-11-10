@@ -1891,6 +1891,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("vmm.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let body = vmm_api::rpc::read_frame(&mut stream).unwrap();
@@ -1906,6 +1907,10 @@ mod tests {
             ))
             .unwrap();
             vmm_api::rpc::write_frame(&mut stream, &response).unwrap();
+            // Keep the peer alive while the CLI clears the framed-write timeout.
+            // macOS may reject setsockopt after an already-closed peer; this test
+            // exercises request framing, not that separate close/reset race.
+            release_rx.recv().unwrap();
             request
         });
         api_request(
@@ -1916,6 +1921,7 @@ mod tests {
             },
         )
         .unwrap();
+        release_tx.send(()).unwrap();
         assert!(matches!(
             server.join().unwrap(),
             vmm_api::types::ApiRequest::SetMemoryHotplug {
