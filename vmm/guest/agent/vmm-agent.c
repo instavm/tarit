@@ -544,7 +544,8 @@ static void make_raw(int fd) {
 }
 
 static int open_serial(void) {
-    int fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
+    const char *path = getenv("VMM_AGENT_SERIAL");
+    int fd = open(path && path[0] ? path : "/dev/ttyS0", O_RDWR | O_NOCTTY);
     if (fd < 0) {
         fd = open("/dev/console", O_RDWR | O_NOCTTY);
     }
