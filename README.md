@@ -76,6 +76,12 @@ The quickstart is layered. Layer 1 gets your code running in a microVM. Layer 2
 adds snapshots, suspend, and restore. Layer 3 runs a managed fleet with the
 orchestrator. Take only the layer you need.
 
+Local builds and CI use Rust **1.99.0**, pinned in `rust-toolchain.toml` and
+the workflow toolchain steps. Run Cargo from this checkout to select it
+automatically. The manifests retain `rust-version = "1.95"` as the declared
+minimum supported Rust version; the compiler pin records the validated build
+environment, rather than raising that minimum.
+
 You need a Linux host with KVM (`/dev/kvm`) and a Rust toolchain. Running
 microVMs needs root (or membership in the `kvm` group), so the commands use
 `sudo`.
