@@ -482,6 +482,7 @@ impl VcpuThread {
         // Wake the vCPU out of any blocking KVM_RUN so it observes the flags.
         self.signal_vcpu();
         if let Some(handle) = self.handle.take() {
+            crate::vcpu::wait_for_vcpu_exit(&handle, || self.vcpu_alive(), || self.signal_vcpu());
             // A thread terminated by a signal (e.g. a seccomp SIGSYS) cannot be
             // joined cleanly — the std thread lifecycle panics on join. Isolate
             // the join with catch_unwind and treat an unwinding join as an
@@ -500,19 +501,10 @@ impl Drop for VcpuThread {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         self.control.store(true, Ordering::Relaxed);
-        // Best-effort signal so a Drop in error paths doesn't hang the
-        // process when the vCPU is mid-KVM_RUN.
-        let tid = self.tid.load(Ordering::SeqCst);
-        if tid != 0 {
-            // SAFETY: getpid has no preconditions and cannot invalidate memory.
-            let pid = unsafe { libc::getpid() };
-            // SAFETY: tgkill targets the published vCPU TID with SIGALRM to wake
-            // KVM_RUN during Drop; the result is intentionally ignored.
-            unsafe {
-                libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGALRM);
-            }
-        }
+        // Repeated kicks below cover both a missed signal and startup before
+        // the worker publishes its TID. Never detach while VM memory is live.
         if let Some(handle) = self.handle.take() {
+            crate::vcpu::wait_for_vcpu_exit(&handle, || self.vcpu_alive(), || self.signal_vcpu());
             // Never panic in Drop — a panic during an unwind aborts the whole
             // process. Joining a signal-killed thread panics, so isolate it.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

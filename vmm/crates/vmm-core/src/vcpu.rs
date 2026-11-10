@@ -30,6 +30,27 @@ impl VcpuId {
     }
 }
 
+/// Keep interrupting a stopping vCPU until it has actually exited. A single
+/// signal can be handled between the stop-flag check and KVM_RUN entry, or
+/// before the worker has published its TID. The caller must set stop first.
+/// Keep ownership and join afterwards: detaching could release live VM memory.
+#[cfg(any(
+    test,
+    all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
+))]
+pub(crate) fn wait_for_vcpu_exit<T>(
+    handle: &std::thread::JoinHandle<T>,
+    mut alive: impl FnMut() -> bool,
+    mut kick: impl FnMut(),
+) {
+    // A seccomp-killed worker cannot publish Rust's completion packet. The
+    // OS liveness check permits the caller's abnormal-exit join handling.
+    while !handle.is_finished() && alive() {
+        kick();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// A vCPU handle. On KVM this owns the `kvm_ioctls::Vcpu`; the run loop lives
 /// in `Vcpu::run`. Off-KVM the body is a no-op stub.
 pub struct Vcpu {
@@ -64,6 +85,30 @@ mod tests {
         for id in 0..=u8::MAX {
             // TASK_COMM_LEN is 16 including the terminating NUL.
             assert!(VcpuId(id).thread_name().len() <= 15);
+        }
+    }
+
+    #[test]
+    fn stopping_vcpu_retries_a_lost_kick_and_unpublished_tid() {
+        for missed_kicks in [1, 3] {
+            let (send, recv) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || recv.recv().unwrap());
+            let mut kicks = 0;
+            wait_for_vcpu_exit(
+                &worker,
+                || true,
+                || {
+                    kicks += 1;
+                    assert!(kicks < 1000, "worker did not stop within retry budget");
+                    // Model a signal handled before KVM_RUN, or a TID not yet
+                    // published: those attempts cannot wake the blocked worker.
+                    if kicks > missed_kicks {
+                        let _ = send.send(42);
+                    }
+                },
+            );
+            assert_eq!(worker.join().unwrap(), 42);
+            assert!(kicks > missed_kicks);
         }
     }
 
