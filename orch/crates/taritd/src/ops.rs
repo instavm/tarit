@@ -2246,15 +2246,10 @@ pub async fn exec_local(
     let current = ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
     ensure_execution_incarnation(expected_vm, &current)?;
     let sup = Arc::clone(&state.supervisor);
-    let execution = sup.begin_execution(vm_id)?;
-    tokio::task::spawn_blocking(move || {
-        let _operation = operation;
-        let result = sup.exec_vm(vm_id, &command, timeout_ms, &execution);
-        drop(execution); // Clear registration before releasing the operation gate.
-        result
-    })
-    .await
-    .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+    let execution = sup.begin_execution(vm_id, operation)?;
+    tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms, &execution))
+        .await
+        .map_err(|e| OrchError::Internal(format!("join: {e}")))?
 }
 
 fn ensure_execution_incarnation(expected: &VmRecord, current: &VmRecord) -> Result<(), OrchError> {

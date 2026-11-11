@@ -973,6 +973,9 @@ struct ExecutionControl {
 }
 
 pub(crate) struct ExecutionGuard {
+    // Drop clears the active registration before fields release this gate,
+    // including when the blocking worker unwinds.
+    _operation: tokio::sync::OwnedMutexGuard<()>,
     control: Arc<Mutex<ExecutionControl>>,
     cancellation: Arc<tarit_vmm_client::RequestCancellation>,
 }
@@ -7445,7 +7448,11 @@ impl VmmSupervisor {
     }
 
     /// Called with this runtime's operation gate held, before spawning exec.
-    pub(crate) fn begin_execution(&self, id: Uuid) -> Result<ExecutionGuard, OrchError> {
+    pub(crate) fn begin_execution(
+        &self,
+        id: Uuid,
+        operation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ExecutionGuard, OrchError> {
         let control = self
             .running
             .lock()
@@ -7463,6 +7470,7 @@ impl VmmSupervisor {
         execution.active = Some(Arc::clone(&cancellation));
         drop(execution);
         Ok(ExecutionGuard {
+            _operation: operation,
             control,
             cancellation,
         })
