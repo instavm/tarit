@@ -765,6 +765,7 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
                         .map_err(crate::api::store_err)?;
                 }
                 cleanup_ephemeral_snapshots_for_vm(state, id).await?;
+                state.supervisor.clear_runtime_stopped(id)?;
                 state
                     .lifecycle
                     .lock()
@@ -2702,6 +2703,7 @@ async fn finish_hibernation(state: &AppState, id: Uuid) -> Result<(), OrchError>
     persist_vm_record(state, record.clone()).await?;
     commit_vm_record(state, record.clone())?;
     state.supervisor.release_reservation_after_terminal(id)?;
+    state.supervisor.clear_runtime_stopped(id)?;
     mark_running(state, record)
 }
 

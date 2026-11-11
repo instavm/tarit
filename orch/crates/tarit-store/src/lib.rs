@@ -560,6 +560,9 @@ impl Store {
         // A watermark represents an open live-runtime interval, not VM age.
         // Triggers couple its creation to the durable status publication, across
         // all writers and retries. Paused/suspended VMMs retain their interval.
+        // Inactive transitions atomically settle any unconsumed interval before
+        // clearing it, including startup recovery and administrative writers.
+        // A previously frozen death boundary wins over the observation time.
         conn.execute_batch(
             "CREATE TRIGGER IF NOT EXISTS start_runtime_on_vm_insert
              AFTER INSERT ON vms WHEN NEW.status IN ('running','paused','suspended') BEGIN
@@ -575,17 +578,48 @@ impl Store {
              AFTER DELETE ON billing_watermark BEGIN
                DELETE FROM billing_runtime_end WHERE vm_id = OLD.vm_id;
              END;
-             CREATE TRIGGER IF NOT EXISTS clear_runtime_on_vm_inactive
+             DROP TRIGGER IF EXISTS clear_runtime_on_vm_inactive;
+             DROP TRIGGER IF EXISTS clear_runtime_on_vm_delete;
+             CREATE TRIGGER IF NOT EXISTS finalize_runtime_on_vm_inactive
              AFTER UPDATE OF status ON vms
              WHEN NEW.status NOT IN ('running','paused','suspended') BEGIN
+               INSERT INTO usage_outbox
+                 (id, api_key_id, owner_key, host_id, vm_id, kind, seconds,
+                  window_start, window_end, created_at)
+               SELECT lower(hex(randomblob(16))), OLD.api_key_id, OLD.owner_key,
+                      OLD.host_id, OLD.id, 'vm_runtime',
+                      round((julianday(COALESCE(e.ended_at, NEW.updated_at)) -
+                             julianday(w.last_billed_at)) * 86400000) / 1000.0,
+                      w.last_billed_at, COALESCE(e.ended_at, NEW.updated_at),
+                      NEW.updated_at
+                 FROM billing_watermark w
+                 LEFT JOIN billing_runtime_end e ON e.vm_id = w.vm_id
+                WHERE w.vm_id = OLD.id AND OLD.api_key_id IS NOT NULL
+                  AND OLD.owner_key IS NOT NULL
+                  AND julianday(COALESCE(e.ended_at, NEW.updated_at)) > julianday(w.last_billed_at);
                DELETE FROM billing_watermark WHERE vm_id = NEW.id;
              END;
-             CREATE TRIGGER IF NOT EXISTS clear_runtime_on_vm_delete
-             AFTER DELETE ON vms BEGIN
+             CREATE TRIGGER IF NOT EXISTS finalize_runtime_on_vm_delete
+             BEFORE DELETE ON vms BEGIN
+               INSERT INTO usage_outbox
+                 (id, api_key_id, owner_key, host_id, vm_id, kind, seconds,
+                  window_start, window_end, created_at)
+               SELECT lower(hex(randomblob(16))), OLD.api_key_id, OLD.owner_key,
+                      OLD.host_id, OLD.id, 'vm_runtime',
+                      round((julianday(COALESCE(e.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) -
+                             julianday(w.last_billed_at)) * 86400000) / 1000.0,
+                      w.last_billed_at, COALESCE(e.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 FROM billing_watermark w
+                 LEFT JOIN billing_runtime_end e ON e.vm_id = w.vm_id
+                WHERE w.vm_id = OLD.id AND OLD.api_key_id IS NOT NULL
+                  AND OLD.owner_key IS NOT NULL
+                  AND julianday(COALESCE(e.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) > julianday(w.last_billed_at);
                DELETE FROM billing_watermark WHERE vm_id = OLD.id;
              END;
-             DELETE FROM billing_watermark WHERE vm_id NOT IN
-               (SELECT id FROM vms WHERE status IN ('running','paused','suspended'));",
+             UPDATE vms SET status = status
+              WHERE status NOT IN ('running','paused','suspended')
+                AND id IN (SELECT vm_id FROM billing_watermark);",
         )?;
         // Upgrade/readoption of an existing live VM without a watermark starts
         // at observation time. Its historical runtime is unknown; never infer
@@ -5297,6 +5331,48 @@ mod tests {
             destination.get_billing_watermark(vm.id).unwrap(),
             Some(vm.updated_at)
         );
+    }
+
+    #[test]
+    fn inactive_transition_and_delete_finalize_frozen_usage_atomically() {
+        for delete in [false, true] {
+            let store = Store::open(":memory:").unwrap();
+            let mut vm = test_vm(Uuid::new_v4(), "owner");
+            vm.api_key_id = Some("key".into());
+            vm.status = VmStatus::Running;
+            vm.updated_at = Utc::now() - chrono::Duration::hours(2);
+            let start = vm.updated_at;
+            let end = start + chrono::Duration::seconds(10);
+            store.insert_vm(&vm).unwrap();
+            store.freeze_billing_end(vm.id, end).unwrap();
+            store.conn.execute_batch("CREATE TRIGGER reject_final_usage BEFORE INSERT ON usage_outbox BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+            let close = || {
+                if delete {
+                    store.delete_vm(vm.id)
+                } else {
+                    store.update_vm_status(vm.id, VmStatus::Hibernated)
+                }
+            };
+            assert!(close().is_err());
+            assert_eq!(store.get_vm(vm.id).unwrap().status, VmStatus::Running);
+            assert_eq!(store.get_billing_watermark(vm.id).unwrap(), Some(start));
+            assert_eq!(store.get_billing_end(vm.id).unwrap(), Some(end));
+            store
+                .conn
+                .execute_batch("DROP TRIGGER reject_final_usage")
+                .unwrap();
+            close().unwrap();
+            let events = store.list_unsent_usage(10).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].window_start, start);
+            assert_eq!(events[0].window_end, end);
+            assert_eq!(events[0].seconds, Some(10.0));
+            assert_eq!(store.get_billing_watermark(vm.id).unwrap(), None);
+            if !delete {
+                store.update_vm_status(vm.id, VmStatus::Error).unwrap();
+                assert_eq!(store.list_unsent_usage(10).unwrap().len(), 1);
+            }
+        }
     }
 
     #[test]

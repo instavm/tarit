@@ -80,6 +80,28 @@ fn meter_runtime_once(state: &AppState) {
         let (Some(api_key_id), Some(owner_key)) = (api_key_id, owner_key) else {
             continue;
         };
+        // Process death ends usage even if teardown retains runtime resources
+        // for retry (nftables, journal or conntrack failure). The supervisor
+        // records this boundary before beginning any resource cleanup.
+        match state.supervisor.runtime_stopped_at(vm_id) {
+            Ok(Some(end)) => {
+                let Ok(Some(start)) = store.get_billing_watermark(vm_id) else {
+                    continue;
+                };
+                let Ok(Some(end)) = store.freeze_billing_end(vm_id, end) else {
+                    continue;
+                };
+                if end > start {
+                    let event = runtime_event(state, vm_id, api_key_id, owner_key, start, end);
+                    let _ = store.commit_runtime_usage(&event, true);
+                } else {
+                    let _ = store.clear_billing_watermark(vm_id);
+                }
+                continue;
+            }
+            Err(_) => continue, // Unreadable boundary must never extend billing.
+            Ok(None) => {}
+        }
         // Check under the store mutex, immediately before metering, so a
         // stale cache scan cannot bill a stopped lifecycle if persisting its
         // frozen end failed. Lifecycle writers release their mutex before I/O.
@@ -127,6 +149,7 @@ pub(crate) fn meter_vm_final_at(
     now: DateTime<Utc>,
 ) -> Result<(), tarit_types::OrchError> {
     use tarit_types::OrchError;
+    let now = state.supervisor.runtime_stopped_at(vm_id)?.unwrap_or(now);
     let vm = state
         .vm_cache
         .read()
@@ -590,6 +613,34 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].window_start, start);
         assert!(events[0].seconds.unwrap() >= 10.0);
+    }
+
+    #[test]
+    fn confirmed_death_closes_usage_while_cleanup_leaves_status_running() {
+        let state = test_state();
+        let id = owned_vm(&state, VmStatus::Running);
+        let start = Utc::now() - chrono::Duration::hours(1);
+        state
+            .store
+            .lock()
+            .unwrap()
+            .set_billing_watermark(id, start)
+            .unwrap();
+        state.supervisor.record_runtime_stopped(id).unwrap();
+        let end = state.supervisor.runtime_stopped_at(id).unwrap().unwrap();
+        meter_runtime_once(&state);
+        meter_runtime_once(&state);
+        meter_vm_final_at(&state, id, end + chrono::Duration::hours(8)).unwrap();
+        let store = state.store.lock().unwrap();
+        let events = store.list_unsent_usage(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].window_start, start);
+        assert_eq!(events[0].window_end, end);
+        assert_eq!(store.get_billing_watermark(id).unwrap(), None);
+        assert_eq!(
+            state.vm_cache.read().unwrap()[&id].status,
+            VmStatus::Running
+        );
     }
 
     #[test]
