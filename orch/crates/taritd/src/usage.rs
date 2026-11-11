@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use tarit_fleet::PostgresFleet;
-use tarit_types::{UsageEvent, UsageKind, VmStatus};
+use tarit_types::{UsageEvent, UsageKind, VmRecord, VmStatus};
 
 use crate::api::{AppState, LifecycleState, StoreWrite};
 
@@ -29,9 +29,6 @@ const CACHE_EVICT_INTERVAL: Duration = Duration::from_secs(60);
 /// answers 404 for it; the grace only lets in-flight work that looked it up
 /// finish against the same record.
 pub(crate) const STOPPED_VM_CACHE_GRACE: Duration = Duration::from_secs(300);
-
-/// A local alive VM the meter needs: id, key id, and tenant.
-type AliveVm = (Uuid, Option<String>, Option<String>);
 
 /// Spawn the VM-runtime meter. Every `interval_secs` it bills each alive local
 /// VM for the wall-clock seconds since its last billed watermark.
@@ -55,7 +52,7 @@ pub fn spawn_usage_meter(
 
 /// Emit VM-runtime usage for every alive local VM in one pass.
 fn meter_runtime_once(state: &AppState) {
-    let alive: Vec<AliveVm> = match state.vm_cache.read() {
+    let alive: Vec<VmRecord> = match state.vm_cache.read() {
         Ok(cache) => cache
             .values()
             .filter(|v| {
@@ -65,19 +62,39 @@ fn meter_runtime_once(state: &AppState) {
                         VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
                     )
             })
-            .map(|v| (v.id, v.api_key_id.clone(), v.owner_key.clone()))
+            .cloned()
             .collect(),
         Err(_) => return,
     };
+    meter_runtime_snapshot(state, alive, Utc::now());
+}
+
+// A UUID can be reused once its old durable row is pruned. Revalidate the
+// captured incarnation and billing identity while holding the same store lock
+// as the watermark transaction, before consulting any UUID-keyed runtime data.
+fn same_billing_incarnation(captured: &VmRecord, current: &VmRecord) -> bool {
+    captured.created_at == current.created_at
+        && captured.host_id == current.host_id
+        && captured.owner_key == current.owner_key
+        && captured.api_key_id == current.api_key_id
+}
+
+fn meter_runtime_snapshot(state: &AppState, alive: Vec<VmRecord>, now: DateTime<Utc>) {
     if alive.is_empty() {
         return;
     }
-    let now = Utc::now();
     let Ok(store) = state.store.lock() else {
         return;
     };
-    for (vm_id, api_key_id, owner_key) in alive {
-        let (Some(api_key_id), Some(owner_key)) = (api_key_id, owner_key) else {
+    for vm in alive {
+        let Ok(current) = store.get_vm(vm.id) else {
+            continue;
+        };
+        if !same_billing_incarnation(&vm, &current) {
+            continue;
+        }
+        let vm_id = vm.id;
+        let (Some(api_key_id), Some(owner_key)) = (vm.api_key_id, vm.owner_key) else {
             continue;
         };
         // Process death ends usage even if teardown retains runtime resources
@@ -149,7 +166,6 @@ pub(crate) fn meter_vm_final_at(
     now: DateTime<Utc>,
 ) -> Result<(), tarit_types::OrchError> {
     use tarit_types::OrchError;
-    let now = state.supervisor.runtime_stopped_at(vm_id)?.unwrap_or(now);
     let vm = state
         .vm_cache
         .read()
@@ -169,6 +185,15 @@ pub(crate) fn meter_vm_final_at(
         .store
         .lock()
         .map_err(|_| OrchError::Internal("store lock poisoned".into()))?;
+    let current = match store.get_vm(vm_id) {
+        Ok(current) => current,
+        Err(tarit_store::StoreError::NotFound) => return Ok(()),
+        Err(error) => return Err(crate::api::store_err(error)),
+    };
+    if !same_billing_incarnation(&vm, &current) {
+        return Ok(());
+    }
+    let now = state.supervisor.runtime_stopped_at(vm_id)?.unwrap_or(now);
     // Missing means never published live, or already finalized. In particular,
     // deleting an Error VM must not reconstruct its entire lifetime.
     let Some(start) = store
@@ -558,7 +583,10 @@ mod tests {
         let id = Uuid::new_v4();
         insert_vm(state, id, "tenant", status);
         let mut cache = state.vm_cache.write().unwrap();
-        cache.get_mut(&id).unwrap().api_key_id = Some("key".into());
+        let vm = cache.get_mut(&id).unwrap();
+        vm.api_key_id = Some("key".into());
+        vm.revision += 1;
+        state.store.lock().unwrap().insert_vm(vm).unwrap();
         id
     }
 
@@ -613,6 +641,64 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].window_start, start);
         assert!(events[0].seconds.unwrap() >= 10.0);
+    }
+
+    #[test]
+    fn stale_runtime_snapshot_cannot_bill_reused_uuid() {
+        for same_tenant in [false, true] {
+            let state = test_state();
+            let id = owned_vm(&state, VmStatus::Running);
+            // Capture exactly what a tick obtains before it waits for the store.
+            let stale = state.vm_cache.read().unwrap()[&id].clone();
+            let mut replacement = stale.clone();
+            replacement.created_at += chrono::Duration::seconds(1);
+            replacement.updated_at = replacement.created_at;
+            replacement.revision = 1;
+            if !same_tenant {
+                replacement.owner_key = Some("replacement-tenant".into());
+                replacement.api_key_id = Some("replacement-key".into());
+            }
+            let start = replacement.created_at;
+            let end = start + chrono::Duration::seconds(10);
+            {
+                let store = state.store.lock().unwrap();
+                // The old interval has already been settled before retention
+                // removes the row and permits reuse of the client-chosen UUID.
+                store.clear_billing_watermark(id).unwrap();
+                store.delete_vm(id).unwrap();
+                store.insert_vm(&replacement).unwrap();
+            }
+            meter_runtime_snapshot(&state, vec![stale.clone()], end);
+            // The finalizer can also have captured the old cache record before
+            // replacement publication. It must not consume the new interval.
+            meter_vm_final_at(&state, id, end).unwrap();
+            {
+                let store = state.store.lock().unwrap();
+                assert_eq!(store.get_billing_watermark(id).unwrap(), Some(start));
+                assert_eq!(store.get_billing_end(id).unwrap(), None);
+                assert!(store.list_unsent_usage(10).unwrap().is_empty());
+            }
+            // Even a death marker for the replacement cannot make the stale
+            // tick charge that new incarnation to its captured billing identity.
+            state.supervisor.record_runtime_stopped(id).unwrap();
+            meter_runtime_snapshot(&state, vec![stale], end);
+            {
+                let store = state.store.lock().unwrap();
+                assert_eq!(store.get_billing_watermark(id).unwrap(), Some(start));
+                assert_eq!(store.get_billing_end(id).unwrap(), None);
+                assert!(store.list_unsent_usage(10).unwrap().is_empty());
+            }
+            state.supervisor.clear_runtime_stopped(id).unwrap();
+            meter_runtime_snapshot(&state, vec![replacement.clone()], end);
+            let store = state.store.lock().unwrap();
+            let events = store.list_unsent_usage(10).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].owner_key, replacement.owner_key.unwrap());
+            assert_eq!(events[0].api_key_id, replacement.api_key_id.unwrap());
+            assert_eq!(events[0].window_start, start);
+            assert_eq!(events[0].window_end, end);
+            assert_eq!(store.get_billing_watermark(id).unwrap(), Some(end));
+        }
     }
 
     #[test]
