@@ -17,7 +17,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Mutex,
 };
 use std::time::Duration;
@@ -44,8 +44,9 @@ const NFT_INGRESS_CHAIN: &str = "ingress";
 const LINK_LOCAL_CIDR: &str = "169.254.0.0/16";
 const TAP_PREFIX: &str = "insta";
 const NET_POOL_SLOTS: u32 = 1 << 14;
-const NET_STATE_VERSION: u32 = 2;
+const NET_STATE_VERSION: u32 = 3;
 const CONNTRACK_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNTRACK_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNTRACK_STDERR_LIMIT: usize = 8 * 1024;
 const STALE_TAP_MIN_AGE: Duration = Duration::from_secs(30);
 static STATE_WRITE_SEQUENCE: std::sync::atomic::AtomicUsize =
@@ -113,6 +114,7 @@ pub struct NetProvisioner {
     /// Keep all current reservations and refuse further provisioning in this
     /// process rather than risk reusing a slot after a failed free.
     fail_closed: AtomicBool,
+    retry_cursor: AtomicU32,
 }
 
 #[derive(Default)]
@@ -152,9 +154,10 @@ impl NetProvisioner {
         recovered_tap_owners: HashMap<Uuid, (u32, u32)>,
     ) -> Result<Self, OrchError> {
         let live_vm_ids = live_vm_ids.into_iter().collect::<HashSet<_>>();
-        // This is deliberately the first fallible startup action. A corrupt
-        // state file or failed uplink lookup must not leave an old Tarit TAP
-        // forwarding while recovery cannot establish its owner or policy.
+        // Verify the dependency before changing live networking. Once that
+        // succeeds, contain existing TAPs before reading ownership or policy;
+        // corrupt state must not leave them forwarding during failed recovery.
+        conntrack_preflight()?;
         let _ = startup_preflight()?;
         let uplink = default_uplink()?;
         let entries = load_state(&state_path, &live_vm_ids)?;
@@ -167,6 +170,7 @@ impl NetProvisioner {
             quota,
             recovered_tap_owners,
             fail_closed: AtomicBool::new(false),
+            retry_cursor: AtomicU32::new(0),
         };
         let all_allocations = provisioner.all_allocations()?;
         let recovered_allocations = provisioner.allocations_for_vms(&live_vm_ids)?;
@@ -177,11 +181,18 @@ impl NetProvisioner {
                 error,
             ));
         }
-        for alloc in all_allocations
-            .iter()
-            .filter(|alloc| !live_vm_ids.contains(&alloc.vm_id))
-        {
-            if let Err(error) = provisioner.teardown_locked(alloc) {
+        for alloc in all_allocations.iter().filter(|alloc| {
+            !live_vm_ids.contains(&alloc.vm_id)
+                || provisioner.is_cleanup_pending(alloc).unwrap_or(false)
+        }) {
+            let cleanup = if provisioner.is_quarantined(alloc)? {
+                // Reconfirm isolation on restart, but leave expensive retries
+                // to the bounded lifecycle worker instead of stalling startup.
+                provisioner.quarantine_allocation(alloc)
+            } else {
+                provisioner.teardown_or_defer_locked(alloc)
+            };
+            if let Err(error) = cleanup {
                 return Err(provisioner.recovery_failure_after_emergency_isolation(
                     &all_allocations,
                     "remove stale persisted network allocation before slot reuse",
@@ -287,8 +298,11 @@ impl NetProvisioner {
         };
 
         let policy = self.egress_policy_for(&alloc)?;
-        self.prepare_slot_for_provision(&alloc)?;
-        if let Err(e) = self.provision_host(&alloc, &policy, owner) {
+        if let Err(e) = self
+            .prepare_slot_for_provision(&alloc)
+            .and_then(|()| self.set_quarantined(&alloc, false))
+            .and_then(|()| self.provision_host(&alloc, &policy, owner))
+        {
             if let Err(cleanup_error) = self.contain_failed_provision(&alloc) {
                 tracing::warn!(
                     tap = %alloc.tap,
@@ -306,19 +320,36 @@ impl NetProvisioner {
     /// Remove a VM's tap and exact nft rule(s), then free and persist the slot.
     /// Idempotent and fail-closed: a slot remains owned until interface deletion
     /// and exact policy cleanup are both confirmed.
+    #[cfg(test)]
     pub fn teardown(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
         self.network_transactions
-            .run(|| self.teardown_locked(alloc))?
+            .run(|| self.teardown_with_retry_ownership(alloc, false, CONNTRACK_DELETE_TIMEOUT))?
     }
 
-    fn teardown_locked(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+    fn teardown_with_retry_ownership(
+        &self,
+        alloc: &NetAlloc,
+        defer: bool,
+        timeout: Duration,
+    ) -> Result<(), OrchError> {
         // A repeated cleanup must never flush state or remove a TAP that has
         // since been assigned to a new VM at the same address.
         if !self.is_current_allocation(alloc)? {
             return Ok(());
         }
+        self.mark_cleanup_pending(alloc)?;
         self.delete_tap_for_teardown(alloc)?;
-        flush_guest_conntrack(alloc)?;
+        if let Err(error) = flush_guest_conntrack_with_timeout(alloc, timeout) {
+            // No interface can produce new flows. Remove exact policy before
+            // excluding this reservation from complete active-policy checks.
+            self.quarantine_allocation(alloc)?;
+            if defer && !self.fail_closed.load(Ordering::SeqCst) {
+                tracing::warn!(vm = %alloc.vm_id, slot = alloc.idx, %error,
+                    "isolated network cleanup transferred to durable retry reservation");
+                return Ok(());
+            }
+            return Err(error);
+        }
         self.delete_nft_rules_for_alloc(alloc)?;
         self.require_no_tagged_policy_residual(alloc)?;
         self.free_allocation_locked(alloc)
@@ -396,9 +427,108 @@ impl NetProvisioner {
             .map(|slot| NetAlloc::for_slot(vm_id, slot))
             .transpose()?;
         if let Some(alloc) = alloc {
-            self.teardown_locked(&alloc)?;
+            self.teardown_or_defer_locked(&alloc)?;
         }
         Ok(())
+    }
+
+    /// Complete runtime teardown once the network has either been removed or
+    /// durably transferred to an isolated retry reservation. The caller may
+    /// finish terminal state and billing; this allocator still owns the IP.
+    pub fn teardown_or_defer(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.network_transactions
+            .run(|| self.teardown_or_defer_locked(alloc))?
+    }
+
+    fn teardown_or_defer_locked(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.teardown_with_retry_ownership(alloc, true, CONNTRACK_DELETE_TIMEOUT)
+    }
+
+    fn is_cleanup_pending(&self, alloc: &NetAlloc) -> Result<bool, OrchError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+        Ok(inner.by_slot.get(&alloc.idx) == Some(&alloc.vm_id)
+            && inner.cleanup_pending.contains(&alloc.vm_id))
+    }
+
+    fn is_quarantined(&self, alloc: &NetAlloc) -> Result<bool, OrchError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+        Ok(inner.by_slot.get(&alloc.idx) == Some(&alloc.vm_id)
+            && inner.quarantined.contains(&alloc.vm_id))
+    }
+
+    fn mark_cleanup_pending(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+        // Retain the in-memory retry even if persistence fails. The previous
+        // durable allocation still reserves this address across a crash.
+        inner.cleanup_pending.insert(alloc.vm_id);
+        persist_allocator(&self.state_path, &inner)
+            .map_err(|error| self.persistence_failure("persist pending network cleanup", error))
+    }
+
+    fn set_quarantined(&self, alloc: &NetAlloc, quarantined: bool) -> Result<(), OrchError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+        let original = inner.clone();
+        if quarantined {
+            inner.quarantined.insert(alloc.vm_id);
+            inner.cleanup_pending.insert(alloc.vm_id);
+        } else {
+            inner.quarantined.remove(&alloc.vm_id);
+            inner.cleanup_pending.remove(&alloc.vm_id);
+        }
+        if let Err(error) = persist_allocator(&self.state_path, &inner) {
+            *inner = original;
+            return Err(self.persistence_failure("persist isolated network retry ownership", error));
+        }
+        Ok(())
+    }
+
+    fn quarantine_allocation(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.delete_tap_for_teardown(alloc)?;
+        self.delete_nft_rules_for_alloc(alloc)?;
+        self.require_no_tagged_policy_residual(alloc)?;
+        self.set_quarantined(alloc, true)
+    }
+
+    /// Retry one owned cleanup per lifecycle tick, round-robin. A broken slot
+    /// cannot starve another. Four 250ms conntrack commands cap the reuse-barrier
+    /// work at one second instead of using the foreground five-second deadline.
+    pub(crate) fn retry_pending_cleanup(&self) {
+        let result = self.network_transactions.run(|| {
+            let allocations = self.all_allocations()?;
+            let cursor = self.retry_cursor.load(Ordering::Relaxed);
+            let pending_ids = self
+                .inner
+                .lock()
+                .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?
+                .cleanup_pending
+                .clone();
+            let mut pending = allocations
+                .into_iter()
+                .filter(|a| pending_ids.contains(&a.vm_id))
+                .collect::<Vec<_>>();
+            pending.sort_by_key(|a| (a.idx < cursor, a.idx));
+            if let Some(alloc) = pending.first() {
+                self.retry_cursor
+                    .store((alloc.idx + 1) % NET_POOL_SLOTS, Ordering::Relaxed);
+                self.teardown_with_retry_ownership(alloc, false, CONNTRACK_RETRY_TIMEOUT)?;
+            }
+            Ok::<(), OrchError>(())
+        });
+        if let Err(error) = result.and_then(|result| result) {
+            tracing::warn!(%error, "owned network cleanup will retry on a later lifecycle tick");
+        }
     }
 
     fn prepare_slot_for_provision(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
@@ -580,7 +710,9 @@ impl NetProvisioner {
         Ok(self
             .all_allocations()?
             .into_iter()
-            .filter(|alloc| vm_ids.contains(&alloc.vm_id))
+            .filter(|alloc| {
+                vm_ids.contains(&alloc.vm_id) && !self.is_cleanup_pending(alloc).unwrap_or(true)
+            })
             .collect())
     }
 
@@ -588,17 +720,19 @@ impl NetProvisioner {
     /// persisted. Used when re-adopting VMs after a taritd restart so the
     /// supervisor can attach the recovered TAP/IP to the running VM handle.
     pub fn allocation_for_vm(&self, vm_id: Uuid) -> Result<Option<NetAlloc>, OrchError> {
-        let slot = self
+        let inner = self
             .inner
             .lock()
-            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?
+            .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
+        if inner.cleanup_pending.contains(&vm_id) {
+            return Ok(None);
+        }
+        inner
             .by_vm
             .get(&vm_id)
-            .copied();
-        match slot {
-            Some(slot) => Ok(Some(NetAlloc::for_slot(vm_id, slot)?)),
-            None => Ok(None),
-        }
+            .copied()
+            .map(|slot| NetAlloc::for_slot(vm_id, slot))
+            .transpose()
     }
 
     fn ensure_provisioning_available(&self) -> Result<(), OrchError> {
@@ -624,10 +758,12 @@ impl NetProvisioner {
     }
 
     fn contain_failed_provision(&self, alloc: &NetAlloc) -> Result<(), OrchError> {
+        self.mark_cleanup_pending(alloc)?;
         self.delete_tap_for_teardown(alloc)?;
         delete_ingress_table_for_slot(alloc.idx)?;
         self.delete_nft_rules_for_slot(alloc.idx)?;
-        Ok(())
+        self.require_no_tagged_policy_residual(alloc)?;
+        self.set_quarantined(alloc, true)
     }
 
     fn reconcile_recovered_allocations(&self, allocations: &[NetAlloc]) -> Result<(), OrchError> {
@@ -820,6 +956,7 @@ impl NetProvisioner {
             inner
                 .active_allocations()
                 .into_iter()
+                .filter(|(_, vm_id)| !inner.quarantined.contains(vm_id))
                 .map(|(slot, vm_id)| {
                     let alloc = NetAlloc::for_slot(vm_id, slot)?;
                     let policy = inner.egress_policy_for(&alloc)?;
@@ -1106,6 +1243,7 @@ impl NetProvisioner {
             .map_err(|_| OrchError::Internal("net allocator lock poisoned".into()))?;
         if inner.by_vm.get(&alloc.vm_id) == Some(&alloc.idx)
             && inner.by_slot.get(&alloc.idx) == Some(&alloc.vm_id)
+            && !inner.cleanup_pending.contains(&alloc.vm_id)
         {
             Ok(())
         } else {
@@ -1283,6 +1421,8 @@ struct SlotAllocator {
     by_slot: BTreeMap<u32, Uuid>,
     by_vm: HashMap<Uuid, u32>,
     egress_by_vm: HashMap<Uuid, Option<EgressPolicy>>,
+    quarantined: HashSet<Uuid>,
+    cleanup_pending: HashSet<Uuid>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1298,6 +1438,8 @@ impl SlotAllocator {
             by_slot: BTreeMap::new(),
             by_vm: HashMap::new(),
             egress_by_vm: HashMap::new(),
+            quarantined: HashSet::new(),
+            cleanup_pending: HashSet::new(),
         }
     }
 
@@ -1309,12 +1451,20 @@ impl SlotAllocator {
             vm_id,
             tap: _,
             egress,
+            quarantined,
+            cleanup_pending,
         } in entries
         {
             allocator.free.remove(&slot);
             allocator.by_slot.insert(slot, vm_id);
             allocator.by_vm.insert(vm_id, slot);
             allocator.egress_by_vm.insert(vm_id, egress);
+            if quarantined {
+                allocator.quarantined.insert(vm_id);
+            }
+            if cleanup_pending || quarantined {
+                allocator.cleanup_pending.insert(vm_id);
+            }
         }
         Ok(allocator)
     }
@@ -1344,12 +1494,16 @@ impl SlotAllocator {
                 self.by_slot.remove(&slot);
                 self.free.insert(slot);
                 self.egress_by_vm.remove(&alloc.vm_id);
+                self.quarantined.remove(&alloc.vm_id);
+                self.cleanup_pending.remove(&alloc.vm_id);
             }
             None => match self.by_slot.get(&alloc.idx).copied() {
                 Some(owner) if owner == alloc.vm_id => {
                     self.by_slot.remove(&alloc.idx);
                     self.free.insert(alloc.idx);
                     self.egress_by_vm.remove(&alloc.vm_id);
+                    self.quarantined.remove(&alloc.vm_id);
+                    self.cleanup_pending.remove(&alloc.vm_id);
                 }
                 Some(owner) => tracing::warn!(
                     slot = alloc.idx,
@@ -1407,6 +1561,8 @@ impl SlotAllocator {
                 vm_id: *vm_id,
                 tap: tap_name(*slot),
                 egress: self.egress_by_vm.get(vm_id).cloned().flatten(),
+                quarantined: self.quarantined.contains(vm_id),
+                cleanup_pending: self.cleanup_pending.contains(vm_id),
             })
             .collect()
     }
@@ -1425,6 +1581,12 @@ struct NetStateEntry {
     tap: String,
     #[serde(default)]
     egress: Option<EgressPolicy>,
+    /// TAP and exact policy are absent; only the address reuse barrier remains.
+    #[serde(default)]
+    quarantined: bool,
+    /// Cleanup intent is owned even if isolation/policy cleanup has not finished.
+    #[serde(default)]
+    cleanup_pending: bool,
 }
 
 fn load_state(path: &Path, live_vm_ids: &HashSet<Uuid>) -> Result<Vec<NetStateEntry>, OrchError> {
@@ -1450,7 +1612,7 @@ fn decode_net_state(
         .map_err(|e| OrchError::Internal(format!("parse net state {}: {e}", path.display())))?;
     validate_state_entries(&state.allocations)?;
     match state.version {
-        NET_STATE_VERSION => Ok(state.allocations),
+        NET_STATE_VERSION | 2 => Ok(state.allocations),
         1 => {
             if state
                 .allocations
@@ -2208,8 +2370,15 @@ fn conntrack_delete_argv(alloc: &NetAlloc) -> Result<Vec<Vec<String>>, OrchError
 }
 
 fn flush_guest_conntrack(alloc: &NetAlloc) -> Result<(), OrchError> {
+    flush_guest_conntrack_with_timeout(alloc, CONNTRACK_DELETE_TIMEOUT)
+}
+
+fn flush_guest_conntrack_with_timeout(
+    alloc: &NetAlloc,
+    timeout: Duration,
+) -> Result<(), OrchError> {
     for args in conntrack_delete_argv(alloc)? {
-        run_conntrack_delete(&args, CONNTRACK_DELETE_TIMEOUT).map_err(|error| {
+        run_conntrack_delete(&args, timeout).map_err(|error| {
             OrchError::Internal(format!("net: cannot invalidate conntrack for {} (slot {}); retaining allocation with TAP absent: {error}", alloc.guest_ip, alloc.idx))
         })?;
     }
@@ -2218,6 +2387,16 @@ fn flush_guest_conntrack(alloc: &NetAlloc) -> Result<(), OrchError> {
 
 /// Exit 1 also means an empty deletion in conntrack-tools. Accept only its
 /// exact C-locale zero-match diagnostic, never generic errors with that status.
+fn conntrack_preflight() -> Result<(), OrchError> {
+    // A read-only netlink query verifies both the executable and permission in
+    // the actual host namespace before startup lowers or deletes any live TAP.
+    run_conntrack_command(
+        &command_argv(&["-L", "-f", "ipv4", "--zone", "0", "--orig-src", "0.0.0.0"]),
+        CONNTRACK_DELETE_TIMEOUT,
+        false,
+    )
+}
+
 fn conntrack_delete_succeeded(status: std::process::ExitStatus, stderr: &[u8]) -> bool {
     let stderr = String::from_utf8_lossy(stderr);
     let line = stderr.trim();
@@ -2231,6 +2410,14 @@ fn conntrack_delete_succeeded(status: std::process::ExitStatus, stderr: &[u8]) -
 /// Bound both process lifetime and captured diagnostics. stdout can contain
 /// arbitrarily many deleted flows, so discard it instead of buffering it.
 fn run_conntrack_delete(args: &[String], timeout: Duration) -> Result<(), OrchError> {
+    run_conntrack_command(args, timeout, true)
+}
+
+fn run_conntrack_command(
+    args: &[String],
+    timeout: Duration,
+    deletion: bool,
+) -> Result<(), OrchError> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     let mut child = Command::new("conntrack")
@@ -2291,7 +2478,9 @@ fn run_conntrack_delete(args: &[String], timeout: Duration) -> Result<(), OrchEr
                     }
                     stderr.extend_from_slice(&tail[..n]);
                 }
-                return if conntrack_delete_succeeded(status, &stderr) {
+                return if status.success()
+                    || (deletion && conntrack_delete_succeeded(status, &stderr))
+                {
                     Ok(())
                 } else {
                     Err(OrchError::Internal(format!(
@@ -2301,7 +2490,7 @@ fn run_conntrack_delete(args: &[String], timeout: Duration) -> Result<(), OrchEr
                 };
             }
             if std::time::Instant::now() >= deadline {
-                return Err(OrchError::Internal("conntrack deletion timed out".into()));
+                return Err(OrchError::Internal("conntrack command timed out".into()));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2450,6 +2639,9 @@ pub fn startup_preflight() -> Result<Vec<String>, OrchError> {
             ))
         }
     };
+    if !taps.is_empty() {
+        conntrack_preflight()?;
+    }
     let isolation = emergency_isolate_tap_names(&taps);
     if isolation.failures.is_empty() {
         Ok(taps)
@@ -5434,12 +5626,16 @@ esac
                 vm_id: live_vm,
                 tap: "insta7".into(),
                 egress: Some(EgressPolicy::default()),
+                quarantined: false,
+                cleanup_pending: false,
             },
             NetStateEntry {
                 slot: 8,
                 vm_id: stale_vm,
                 tap: "insta8".into(),
                 egress: Some(EgressPolicy::default()),
+                quarantined: false,
+                cleanup_pending: false,
             },
         ];
         let mut allocator = SlotAllocator::from_entries(entries).unwrap();
@@ -5494,12 +5690,16 @@ esac
                 vm_id: first_vm,
                 tap: "insta7".into(),
                 egress: Some(EgressPolicy::default()),
+                quarantined: false,
+                cleanup_pending: false,
             },
             NetStateEntry {
                 slot: 8,
                 vm_id: first_vm,
                 tap: "insta8".into(),
                 egress: Some(EgressPolicy::default()),
+                quarantined: false,
+                cleanup_pending: false,
             },
         ];
         assert!(
@@ -5516,6 +5716,8 @@ esac
             vm_id,
             tap: "insta7".into(),
             egress: None,
+            quarantined: false,
+            cleanup_pending: false,
         }])
         .unwrap();
         let alloc = NetAlloc::for_slot(vm_id, 7).unwrap();
@@ -5954,6 +6156,7 @@ esac
             quota: VmNetQuotaConfig::default(),
             recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
+            retry_cursor: AtomicU32::new(0),
         };
         let old_path = std::env::var_os("PATH");
         std::env::set_var(
@@ -6671,7 +6874,7 @@ esac
 
     #[test]
     fn network_state_v2_only_migrates_v1_without_live_allocations() {
-        assert_eq!(NET_STATE_VERSION, 2);
+        assert_eq!(NET_STATE_VERSION, 3);
         let live_vm = Uuid::new_v4();
         let live_v1 = format!(
             r#"{{"version":1,"allocations":[{{"slot":7,"vm_id":"{live_vm}","tap":"insta7"}}]}}"#
@@ -6723,6 +6926,7 @@ esac
             permissions.set_mode(0o755);
             std::fs::set_permissions(&path, permissions).unwrap();
         }
+        std::fs::copy(&path, bin.join("conntrack")).unwrap();
         let old_path = std::env::var_os("PATH");
         std::env::set_var(
             "PATH",
@@ -6924,6 +7128,7 @@ esac
             quota: VmNetQuotaConfig::default(),
             recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
+            retry_cursor: AtomicU32::new(0),
         };
         let old_path = std::env::var_os("PATH");
         std::env::set_var(
@@ -7103,7 +7308,7 @@ esac
         );
         assert!(std::fs::read_to_string(&state_path)
             .unwrap()
-            .contains("\"version\": 2"));
+            .contains("\"version\": 3"));
         assert!(!state_write_path(&state_path).exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -7363,10 +7568,23 @@ esac
             std::fs::create_dir_all(&bin).unwrap();
             let script = r#"#!/bin/sh
 printf '%s %s\n' "${0##*/}" "$*" >> "$TARIT_TEST_CT_ROOT/commands"
+if [ "${0##*/}" = nft ] && [ "$TARIT_TEST_CT_MODE" = nft-failure ]; then exit 1; fi
 case "${0##*/}:$*" in
   'ip:-j link show')
     if [ -e "$TARIT_TEST_CT_ROOT/tap" ]; then echo '[{"ifname":"insta0"}]'; else echo '[]'; fi ;;
-  'ip:link del insta0') rm -f "$TARIT_TEST_CT_ROOT/tap" ;;
+  'ip:link del insta0')
+    [ "$TARIT_TEST_CT_MODE" != 'delete-failure' ] || exit 1
+    rm -f "$TARIT_TEST_CT_ROOT/tap" ;;
+  'ip:route get 8.8.8.8') echo '8.8.8.8 via 192.0.2.1 dev eth0 src 192.0.2.2' ;;
+  'nft:-j list chain ip taritd_nat post') echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"post","type":"nat","hook":"postrouting","prio":100,"policy":"accept"}}]}' ;;
+  'nft:-j list chain ip taritd_nat vm_egress') echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_egress","type":"filter","hook":"forward","prio":0,"policy":"accept"}}]}' ;;
+  'nft:-j list chain ip taritd_nat vm_input') echo '{"nftables":[{"chain":{"family":"ip","table":"taritd_nat","name":"vm_input","type":"filter","hook":"input","prio":0,"policy":"accept"}}]}' ;;
+  'nft:add rule ip taritd_nat '*)
+    shift 4; chain=$1; shift
+    printf '%s\n' "$*" >> "$TARIT_TEST_CT_ROOT/$chain" ;;
+  'nft:-a list chain ip taritd_nat '*)
+    shift 5
+    if [ -f "$TARIT_TEST_CT_ROOT/$1" ]; then cat "$TARIT_TEST_CT_ROOT/$1"; fi ;;
   conntrack:*)
     case "$TARIT_TEST_CT_MODE" in
       timeout) exec /bin/sleep 10 ;;
@@ -7380,7 +7598,7 @@ case "${0##*/}:$*" in
     esac ;;
 esac
 "#;
-            for name in ["ip", "nft", "conntrack"] {
+            for name in ["ip", "nft", "conntrack", "sysctl", "tc"] {
                 let path = bin.join(name);
                 std::fs::write(&path, script).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -7409,6 +7627,7 @@ esac
                 quota: VmNetQuotaConfig::default(),
                 recovered_tap_owners: HashMap::new(),
                 fail_closed: AtomicBool::new(false),
+                retry_cursor: AtomicU32::new(0),
             }
         }
 
@@ -7692,9 +7911,14 @@ esac
                 .allocate(Uuid::new_v4())
                 .unwrap();
             assert_eq!(next.idx, 1, "failed slot cannot be reused");
+            assert!(fixture.persisted().allocations[0].quarantined);
+            assert!(provisioner
+                .allocation_for_vm(alloc.vm_id)
+                .unwrap()
+                .is_none());
             assert!(
-                !fixture.log().contains("nft -a list chain"),
-                "keep old policy on flush failure"
+                fixture.log().contains("nft -a list chain"),
+                "remove inert policy before transferring ownership"
             );
             // A later successful cleanup releases only the failed reservation.
             std::env::remove_var("TARIT_TEST_CT_FAIL_SELECTOR");
@@ -7739,6 +7963,169 @@ esac
         assert!(error.to_string().contains("conntrack"));
         assert_eq!(fixture.persisted().allocations.len(), 2);
         assert!(!fixture.log().contains("ip tuntap"));
+    }
+
+    #[test]
+    fn conntrack_failed_create_does_not_poison_another_tenants_create() {
+        let _guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = ConntrackFixture::new();
+        let provisioner = fixture.provisioner(SlotAllocator::empty());
+        let failed_vm = Uuid::new_v4();
+        std::env::set_var("TARIT_TEST_CT_MODE", "failure");
+        assert!(provisioner.provision(failed_vm).is_err());
+        assert!(fixture.persisted().allocations[0].quarantined);
+        // Failure may persist for this slot while new addresses still work.
+        std::env::remove_var("TARIT_TEST_CT_MODE");
+        std::env::set_var("TARIT_TEST_CT_FAIL_SELECTOR", "172.16.0.2");
+        let healthy = provisioner.provision(Uuid::new_v4()).unwrap();
+        assert_eq!(healthy.idx, 1);
+        assert!(fixture.log().contains("ip link set insta1 up"));
+        assert!(provisioner.allocation_for_vm(failed_vm).unwrap().is_none());
+        // Existing policy for the healthy tenant remains valid during retry.
+        provisioner.retry_pending_cleanup();
+        provisioner
+            .validate_complete_effective_policies(None)
+            .unwrap();
+        assert_eq!(provisioner.inner.lock().unwrap().by_vm[&failed_vm], 0);
+    }
+
+    #[test]
+    fn conntrack_quarantine_survives_restart_and_retry_releases_only_flushed_slots() {
+        let _guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = ConntrackFixture::new();
+        let provisioner = fixture.provisioner(SlotAllocator::empty());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        std::env::set_var("TARIT_TEST_CT_MODE", "failure");
+        assert!(provisioner.provision(first).is_err());
+        assert!(provisioner.provision(second).is_err());
+        drop(provisioner);
+        std::env::remove_var("TARIT_TEST_CT_MODE");
+        // A selective deletion fault does not fail the read-only startup probe.
+        std::env::set_var("TARIT_TEST_CT_FAIL_SELECTOR", "172.16.0.2");
+        let recovered = NetProvisioner::new(
+            fixture.root.join("state.json"),
+            [first, second],
+            VmNetQuotaConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(fixture.persisted().allocations.len(), 2);
+        assert!(recovered.allocation_for_vm(first).unwrap().is_none());
+        recovered.retry_pending_cleanup(); // first continues failing
+        recovered.retry_pending_cleanup(); // second succeeds despite first
+        let remaining = fixture.persisted();
+        assert_eq!(remaining.allocations.len(), 1);
+        assert_eq!(remaining.allocations[0].vm_id, first);
+        assert!(remaining.allocations[0].quarantined);
+        std::env::remove_var("TARIT_TEST_CT_FAIL_SELECTOR");
+        recovered.retry_pending_cleanup();
+        assert!(fixture.persisted().allocations.is_empty());
+        assert_eq!(
+            recovered
+                .inner
+                .lock()
+                .unwrap()
+                .allocate(Uuid::new_v4())
+                .unwrap()
+                .idx,
+            0
+        );
+    }
+
+    #[test]
+    fn conntrack_deferred_teardown_requires_confirmed_isolation_and_persistence() {
+        let _guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = ConntrackFixture::new();
+        let mut allocator = SlotAllocator::empty();
+        let alloc = allocator.allocate(Uuid::new_v4()).unwrap();
+        let provisioner = fixture.provisioner(allocator);
+        std::fs::write(fixture.root.join("tap"), "").unwrap();
+        std::env::set_var("TARIT_TEST_CT_MODE", "failure");
+        provisioner.teardown_or_defer(&alloc).unwrap();
+        assert!(!fixture.root.join("tap").exists());
+        assert!(fixture.persisted().allocations[0].quarantined);
+        // An earlier quarantine marker is not proof of current isolation.
+        std::fs::write(fixture.root.join("tap"), "").unwrap();
+        std::env::set_var("TARIT_TEST_CT_MODE", "delete-failure");
+        assert!(provisioner.teardown_or_defer(&alloc).is_err());
+        assert!(fixture.root.join("tap").exists());
+        std::env::set_var("TARIT_TEST_CT_MODE", "failure");
+        std::fs::remove_file(&provisioner.state_path).unwrap();
+        std::fs::create_dir(&provisioner.state_path).unwrap();
+        assert!(
+            provisioner.teardown_or_defer(&alloc).is_err(),
+            "a failed durable handoff cannot report terminal cleanup success"
+        );
+    }
+
+    #[test]
+    fn conntrack_cleanup_retry_owns_nft_failures_before_quarantine_completes() {
+        let _guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = ConntrackFixture::new();
+        let mut allocator = SlotAllocator::empty();
+        let alloc = allocator.allocate(Uuid::new_v4()).unwrap();
+        let provisioner = fixture.provisioner(allocator);
+        std::env::set_var("TARIT_TEST_CT_MODE", "nft-failure");
+        assert!(provisioner.teardown_or_defer(&alloc).is_err());
+        let entry = fixture.persisted().allocations.remove(0);
+        assert!(entry.cleanup_pending);
+        assert!(!entry.quarantined);
+        assert!(provisioner
+            .allocation_for_vm(alloc.vm_id)
+            .unwrap()
+            .is_none());
+        std::env::remove_var("TARIT_TEST_CT_MODE");
+        provisioner.retry_pending_cleanup();
+        assert!(fixture.persisted().allocations.is_empty());
+    }
+
+    #[test]
+    fn conntrack_background_retry_does_not_hold_host_lock_for_foreground_timeout() {
+        let _guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = ConntrackFixture::new();
+        let mut allocator = SlotAllocator::empty();
+        let alloc = allocator.allocate(Uuid::new_v4()).unwrap();
+        allocator.quarantined.insert(alloc.vm_id);
+        allocator.cleanup_pending.insert(alloc.vm_id);
+        let provisioner = fixture.provisioner(allocator);
+        std::env::set_var("TARIT_TEST_CT_MODE", "timeout");
+        let start = std::time::Instant::now();
+        provisioner.retry_pending_cleanup();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(fixture.persisted().allocations[0].quarantined);
+        assert!(!provisioner.inner.lock().unwrap().free.contains(&alloc.idx));
+    }
+
+    #[test]
+    fn conntrack_startup_failure_does_not_mutate_live_networking() {
+        let _guard = RECOVERY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let fixture = ConntrackFixture::new();
+        std::fs::write(fixture.root.join("tap"), "").unwrap();
+        std::env::set_var("TARIT_TEST_CT_MODE", "failure");
+        assert!(startup_preflight().is_err());
+        assert!(fixture.root.join("tap").exists());
+        assert!(!fixture.log().contains("ip link set"));
+        assert!(!fixture.log().contains("ip link del"));
+        assert!(!fixture.log().contains("nft "));
+        assert!(!fixture.log().contains("sysctl "));
+        std::fs::remove_file(fixture.root.join("bin/conntrack")).unwrap();
+        std::env::set_var("PATH", fixture.root.join("bin"));
+        assert!(startup_preflight().is_err());
+        assert!(fixture.root.join("tap").exists());
+        assert!(!fixture.log().contains("ip link set"));
+        assert!(!fixture.log().contains("ip link del"));
     }
 
     #[test]
@@ -7827,6 +8214,7 @@ esac
             quota: VmNetQuotaConfig::default(),
             recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
+            retry_cursor: AtomicU32::new(0),
         };
 
         let old_path = std::env::var_os("PATH");
@@ -7856,7 +8244,9 @@ esac
             error.to_string().contains("cannot delete contained TAP"),
             "{error}"
         );
-        assert!(provisioner.require_active_allocation(&alloc).is_ok());
+        assert!(provisioner.is_current_allocation(&alloc).unwrap());
+        assert!(provisioner.is_cleanup_pending(&alloc).unwrap());
+        assert!(provisioner.require_active_allocation(&alloc).is_err());
         assert!(std::fs::read_to_string(&state_path)
             .unwrap()
             .contains(&vm_id.to_string()));
@@ -7945,6 +8335,7 @@ esac
             quota: VmNetQuotaConfig::default(),
             recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
+            retry_cursor: AtomicU32::new(0),
         };
 
         let old_path = std::env::var_os("PATH");
@@ -7980,7 +8371,9 @@ esac
             error.to_string().contains("tagged policy remains"),
             "{error}"
         );
-        assert!(provisioner.require_active_allocation(&alloc).is_ok());
+        assert!(provisioner.is_current_allocation(&alloc).unwrap());
+        assert!(provisioner.is_cleanup_pending(&alloc).unwrap());
+        assert!(provisioner.require_active_allocation(&alloc).is_err());
         assert!(std::fs::read_to_string(&state_path)
             .unwrap()
             .contains(&vm_id.to_string()));
@@ -8040,6 +8433,7 @@ esac
             quota: VmNetQuotaConfig::default(),
             recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
+            retry_cursor: AtomicU32::new(0),
         };
         let alloc = NetAlloc::for_slot(Uuid::new_v4(), 7).unwrap();
         let old_path = std::env::var_os("PATH");
@@ -8155,6 +8549,7 @@ esac
             quota: VmNetQuotaConfig::default(),
             recovered_tap_owners: HashMap::new(),
             fail_closed: AtomicBool::new(false),
+            retry_cursor: AtomicU32::new(0),
         };
 
         FAIL_NEXT_STATE_DIRECTORY_SYNC.store(true, Ordering::SeqCst);
@@ -8204,7 +8599,7 @@ esac
         );
         assert!(std::fs::read_to_string(&state_path)
             .unwrap()
-            .contains("\"version\": 2"));
+            .contains("\"version\": 3"));
         assert!(
             std::fs::read_dir(&root).unwrap().all(|entry| !entry
                 .unwrap()
