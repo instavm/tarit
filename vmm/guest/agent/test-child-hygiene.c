@@ -42,6 +42,17 @@ static void expect_marker(int fd) {
 
 int main(int argc, char **argv) {
     if (argc > 1) return probe_child(strcmp(argv[1], "--pty-probe") == 0);
+    int probe[2];
+    assert(pipe(probe) == 0);
+    run_probe(probe[1], "0123456789abcdef");
+    close(probe[1]);
+    char replies[256] = {0};
+    ssize_t reply_len = read(probe[0], replies, sizeof(replies) - 1);
+    assert(reply_len > 0);
+    assert(strcmp(replies,
+        "VMM_PROBE_OK:0123456789abcdef:TRANSPORT=2\n"
+        "VMM_PROBE_OK:0123456789abcdef\n") == 0);
+    close(probe[0]);
     alarm(15);
     signal(SIGPIPE, SIG_IGN);
     sigset_t blocked;

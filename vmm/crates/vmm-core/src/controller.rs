@@ -21,6 +21,27 @@ const EXEC_OUTPUT_PAYLOAD_CAP: usize = EXEC_OUTPUT_CAP - EXEC_OUTPUT_TRUNCATED.l
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 const EXEC_ACC_TAIL_CAP: usize = 64 * 1024;
 
+/// A nonce binds transport compatibility to the currently executing agent,
+/// including after a RAM snapshot restore. Serial is a trusted control channel;
+/// this gate diagnoses version mismatches, not guest-root impersonation.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn privileged_agent_probe_reply(line: &[u8], token: &str) -> Result<bool> {
+    let legacy = format!("VMM_PROBE_OK:{token}");
+    let current = format!("{legacy}:TRANSPORT=2");
+    if line == current.as_bytes() {
+        return Ok(true);
+    }
+    if line == legacy.as_bytes() || line.starts_with(format!("{legacy}:TRANSPORT=").as_bytes()) {
+        return Err(VmmError::Device(
+            "AGENT_TRANSPORT_INCOMPATIBLE: privileged transport v2 required; rebuild the guest agent/rootfs and recapture golden, warm, and hibernation snapshots (updating the disk does not update an agent restored from RAM)".into(),
+        ));
+    }
+    Ok(false)
+}
+
 /// State backing a VM whose vCPU is actively executing in a background thread.
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 pub struct RunningVm {
@@ -2536,6 +2557,9 @@ impl VmmController {
         rows: u16,
         shell: Option<String>,
     ) -> Result<()> {
+        // Direct VMM users may bypass orchestrator boot readiness. Check the
+        // live agent before connecting to its privileged PTY listener too.
+        self.exec("", 5_000)?;
         let pty = {
             let slot = self.lock();
             slot.as_ref()
@@ -2710,7 +2734,7 @@ impl VmmController {
         // being re-sent on serial where it could run twice. Opt out with
         // VMM_VSOCK_EXEC=0. Clone the Arc and drop the controller lock before
         // the (blocking) exec so other API calls aren't stalled.
-        if std::env::var("VMM_VSOCK_EXEC").as_deref() != Ok("0") {
+        if !command.is_empty() && std::env::var("VMM_VSOCK_EXEC").as_deref() != Ok("0") {
             let vsock_channel = {
                 let slot = self.lock();
                 slot.as_ref()
@@ -2775,7 +2799,6 @@ impl VmmController {
                     std::process::id(),
                     PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32
                 );
-                let expected = format!("VMM_PROBE_OK:{token}");
                 let probe = format!("\n\n\n\nVMM_PROBE:{token}\n");
                 if !serial.send_within(probe.as_bytes(), start + timeout) {
                     return Err(VmmError::Kvm(
@@ -2792,7 +2815,7 @@ impl VmmController {
                         if line.last() == Some(&b'\r') {
                             line.pop();
                         }
-                        if line == expected.as_bytes() {
+                        if privileged_agent_probe_reply(&line, &token)? {
                             return Ok((
                                 0,
                                 String::new(),
@@ -8989,6 +9012,31 @@ fn serialize_state_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_requires_current_nonce_and_privileged_transport() {
+        let token = "0123456789abcdef";
+        assert!(
+            privileged_agent_probe_reply(b"VMM_PROBE_OK:0123456789abcdef:TRANSPORT=2", token)
+                .unwrap()
+        );
+        for reply in [
+            b"VMM_PROBE_OK:0123456789abcdef".as_slice(),
+            b"VMM_PROBE_OK:0123456789abcdef:TRANSPORT=1".as_slice(),
+        ] {
+            assert!(privileged_agent_probe_reply(reply, token)
+                .unwrap_err()
+                .to_string()
+                .contains("AGENT_TRANSPORT_INCOMPATIBLE"));
+        }
+        for reply in [
+            b"VMM_PROBE_OK:fedcba9876543210:TRANSPORT=2".as_slice(),
+            b"VMM_PROBE_OK:fedcba9876543210".as_slice(),
+            b"VMM_AGENT_READY".as_slice(),
+        ] {
+            assert!(!privileged_agent_probe_reply(reply, token).unwrap());
+        }
+    }
 
     #[test]
     fn free_huge_page_blocks_counts_order_nine_and_up() {

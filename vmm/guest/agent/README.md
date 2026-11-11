@@ -49,11 +49,47 @@ checks `capable(CAP_NET_BIND_SERVICE)` for reserved ports, and
 [`capable`](https://github.com/gregkh/linux/blob/v6.12.96/kernel/capability.c)
 checks the initial user namespace. User-namespace root alone is insufficient.
 
-**Deploy the rebuilt agent and VMM together.** An old agent's ephemeral exec
-source is rejected by the new VMM, and the old PTY port 1025 is no longer used.
-There is no insecure compatibility fallback for vsock. Serial exec remains
-available and has its existing trusted-console boundary. Exec v2 and PTY frame
+**Deploy the rebuilt agent and VMM as a paired rollout.** An old agent's
+ephemeral exec source is rejected by the new VMM, and the old PTY port 1025 is
+no longer used. There is no insecure compatibility fallback for vsock. Serial
+exec retains its existing trusted-console boundary. Exec v2 and PTY frame
 formats are unchanged; this is an intentional transport pairing change.
+
+The empty-command readiness probe now requires a nonce-bound
+`VMM_PROBE_OK:<nonce>:TRANSPORT=2` response from the running agent. A legacy or
+unsupported reply fails with `AGENT_TRANSPORT_INCOMPATIBLE`; the orchestrator
+aborts readiness immediately instead of publishing that guest as ready. Direct
+VMM PTY attachment performs the same check before connecting. The agent sends
+the v2 reply first and then the original nonce response so older VMM readiness
+probes still work; **this does not make the new agent's PTY listener compatible
+with an old VMM**. A stale reply with a different nonce cannot pass readiness.
+
+Rollout order:
+
+1. Build the new agent and VMM, bake the agent into every rootfs/OCI image
+   variant, and test a cold boot with that exact pair. Keep old production
+   images and VMM binaries available for the old pool during the drain.
+2. Stop admitting new VMs on old hosts and drain their running VMs, warm pools,
+   and golden templates. Do not restart the new agent in a live guest managed
+   by an old VMM: old-host PTY/SSH still targets port 1025.
+3. Replace the host VMM and configured images together on drained hosts. Cold
+   boot new golden sources and regenerate warm pools and snapshots from the
+   new pair before re-enabling admission. Exercise empty-command readiness,
+   framed exec, PTY/SSH, snapshot capture, and restored readiness/PTY.
+4. Existing hibernation, fork, golden, and warm snapshots contain the **old
+   running agent in RAM**. Updating their backing disk or installing a new
+   binary does not upgrade that process. Keep these snapshots on a compatible
+   old pool long enough to resume and migrate application data, then cold boot
+   a new-pair guest and capture a replacement. If no old pool remains, reject
+   those restores and rebuild from application data; do not relabel old
+   snapshots as compatible or bypass the gate. A new-host restore of an old
+   agent must fail readiness with `AGENT_TRANSPORT_INCOMPATIBLE`.
+
+For a machine-checkable preflight, call the VMM `Exec` API with an empty command
+(the normal orchestrator create/resume readiness path does this). Success means
+the currently running agent answered transport v2, including after restore;
+checking a binary version or disk marker alone cannot prove RAM compatibility.
+The gate diagnoses pairing and does not authenticate against guest root.
 
 Command children receive EOF on stdin for serial and framed exec, default and
 unblocked SIGPIPE, and no inherited descriptors above stderr. PTY children keep

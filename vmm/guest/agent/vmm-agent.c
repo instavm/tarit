@@ -932,6 +932,10 @@ static void run_probe(int serial_fd, const char *token) {
             return;
         }
     }
+    /* Current hosts consume the first response; old hosts ignore it and
+     * consume the second. Both are nonce-bound, so a leftover legacy reply
+     * cannot satisfy a subsequent probe. */
+    serial_printf(serial_fd, "VMM_PROBE_OK:%s:TRANSPORT=2\n", token);
     serial_printf(serial_fd, "VMM_PROBE_OK:%s\n", token);
 }
 
