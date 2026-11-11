@@ -2242,13 +2242,19 @@ pub async fn exec_local(
     let vm_id = expected_vm.id;
     ensure_active_local_owned(state, vm_id, None, Some(expected_vm)).await?;
     let gate = state.supervisor.operation_gate(vm_id)?;
-    let _operation = lock_operation_gate(gate, vm_id, gate_deadline).await?;
+    let operation = lock_operation_gate(gate, vm_id, gate_deadline).await?;
     let current = ensure_vm_status(state, vm_id, "exec", &[VmStatus::Running])?;
     ensure_execution_incarnation(expected_vm, &current)?;
     let sup = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || sup.exec_vm(vm_id, &command, timeout_ms))
-        .await
-        .map_err(|e| OrchError::Internal(format!("join: {e}")))?
+    let execution = sup.begin_execution(vm_id)?;
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        let result = sup.exec_vm(vm_id, &command, timeout_ms, &execution);
+        drop(execution); // Clear registration before releasing the operation gate.
+        result
+    })
+    .await
+    .map_err(|e| OrchError::Internal(format!("join: {e}")))?
 }
 
 fn ensure_execution_incarnation(expected: &VmRecord, current: &VmRecord) -> Result<(), OrchError> {
@@ -2318,7 +2324,25 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
         Err(error) => return Err(error),
     };
     let _operation = match operation_gate {
-        Some(gate) => Some(try_live_operation_gate(gate, id)?),
+        Some(gate) => Some(match Arc::clone(&gate).try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) if state.supervisor.cancel_execution_for_delete(id)? => {
+                // Shutdown wakes the active socket immediately. A connection
+                // not yet registered can spend at most the 5s connect budget;
+                // wait for the blocking worker itself before touching the VM.
+                lock_operation_gate(
+                    gate,
+                    id,
+                    Some(tokio::time::Instant::now() + std::time::Duration::from_secs(6)),
+                )
+                .await?
+            }
+            Err(_) => {
+                return Err(OrchError::Conflict(format!(
+                    "VM {id} is busy with another operation"
+                )))
+            }
+        }),
         None => None,
     };
     {
@@ -5701,6 +5725,107 @@ mod tests {
         );
         std::fs::remove_file(&durable).unwrap();
         std::fs::remove_file(format!("{durable}.integrity")).unwrap();
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn delete_cancels_active_exec_and_fences_queued_exec_before_teardown() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        use tower::ServiceExt;
+        let (mut state, writes) = test_state_with_durable_writer();
+        drop(writes); // Exercise direct durable fallback instead of an unconsumed queue.
+        state.config.api_keys = ApiKeyRegistry::from_plaintext_entries(vec![
+            ("test-key".into(), "test".into(), ApiRole::User, 0),
+            ("foreign-key".into(), "foreign".into(), ApiRole::User, 0),
+        ])
+        .unwrap();
+        let id = insert_running_vm(&state);
+        let initial = vm_get(&state, id).unwrap();
+        state.store.lock().unwrap().insert_vm(&initial).unwrap();
+        mark_running(&state, initial.clone()).unwrap();
+        state
+            .scheduler
+            .reserve_existing(id, crate::scheduler::ResourceShape::new(1, 256))
+            .unwrap();
+        let socket = PathBuf::from(format!("/tmp/tarit-exec-delete-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            let read_request = |stream: &mut std::os::unix::net::UnixStream| {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut length = [0; 4];
+                stream.read_exact(&mut length).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(length) as usize];
+                stream.read_exact(&mut body).unwrap();
+                serde_json::from_slice::<tarit_vmm_client::ApiRequest>(&body).unwrap()
+            };
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(matches!(
+                read_request(&mut stream),
+                tarit_vmm_client::ApiRequest::Exec {
+                    timeout_ms: 3_600_000,
+                    ..
+                }
+            ));
+            started_tx.send(()).unwrap();
+            // The cancelled blocking worker must close before DELETE tears down the VM.
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+            // Real VMM dispatch remains inside guest exec after transport
+            // shutdown; DELETE must not wait for another RPC response.
+            listener.set_nonblocking(true).unwrap();
+            assert!(listener.accept().is_err());
+        });
+        state
+            .supervisor
+            .install_test_control_runtime(id, socket.clone());
+        test_runtime().block_on(async {
+            let exec_state = state.clone();
+            let expected = initial.clone();
+            let active = tokio::spawn(async move {
+                exec_local(&exec_state, &expected, "sleep 3600".into(), 3_600_000, None).await
+            });
+            started_rx.await.unwrap();
+            let app = crate::api::router(state.clone());
+            let delete = |key| {
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/vms/{id}"))
+                    .header("X-API-Key", key)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            };
+            let denied = app.clone().oneshot(delete("foreign-key")).await.unwrap();
+            assert_eq!(denied.status(), axum::http::StatusCode::FORBIDDEN);
+            assert!(
+                !active.is_finished(),
+                "unauthorized DELETE must not cancel exec"
+            );
+            let queued = exec_local(&state, &initial, "must not execute".into(), 1000, None);
+            tokio::pin!(queued);
+            assert!(futures_util::poll!(&mut queued).is_pending());
+            let (deleted, queued) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    tokio::join!(app.oneshot(delete("test-key")), queued)
+                })
+                .await
+                .expect("DELETE must not wait for the hour-long guest timeout");
+            assert_eq!(
+                deleted.unwrap().status(),
+                axum::http::StatusCode::NO_CONTENT
+            );
+            assert!(queued.is_err());
+            assert!(active.await.unwrap().is_err());
+            assert_eq!(
+                state.store.lock().unwrap().get_vm(id).unwrap().status,
+                VmStatus::Stopped
+            );
+            assert_eq!(vm_get(&state, id).unwrap().status, VmStatus::Stopped);
+            assert!(state.supervisor.operation_gate(id).is_err());
+        });
+        server.join().unwrap();
         assert!(!socket.exists());
     }
 

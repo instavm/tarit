@@ -352,7 +352,10 @@ pub(crate) async fn enforce_api_traffic(
     next: middleware::Next,
 ) -> Response {
     let identity = if limits.tenant_isolation {
-        auth::resolve_identity_from_headers(&limits.config, request.headers()).ok()
+        match request.extensions().get::<crate::pty::ConnectIdentity>() {
+            Some(identity) => identity.0.clone(),
+            None => auth::resolve_identity_from_headers(&limits.config, request.headers()).ok(),
+        }
     } else {
         None
     };
@@ -366,8 +369,8 @@ pub(crate) async fn enforce_api_traffic(
     let Ok(tenant_permit) = Arc::clone(&budget.concurrency).try_acquire_owned() else {
         return overloaded_response("API concurrency limit exceeded");
     };
-    // Token-authenticated PTY connects and invalid credentials cannot drain
-    // authenticated capacity. Both admission domains retain fixed caps.
+    // Authenticated API keys and PTY tokens share their tenant budget.
+    // Invalid credentials have a separate bounded admission domain.
     let permit = if identity.is_some() {
         match Arc::clone(&limits.concurrency).try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -734,16 +737,24 @@ pub fn router(state: AppState) -> Router {
         .layer(Extension(async_executions))
         .layer(DefaultBodyLimit::max(max_body_bytes));
     let admitted = protected
-        .route(
-            "/v1/vms/{id}/pty/{pty_id}/connect",
-            get(crate::pty::connect_ws),
-        )
-        // Bound invalid credentials and PTY connect tokens separately from
-        // configured-tenant budgets, before dispatching expensive handlers.
         .layer(middleware::from_fn_with_state(
-            traffic_limits,
+            traffic_limits.clone(),
             enforce_api_traffic,
-        ));
+        ))
+        .merge(
+            Router::new().route(
+                "/v1/vms/{id}/pty/{pty_id}/connect",
+                get(crate::pty::connect_ws)
+                    .layer(middleware::from_fn_with_state(
+                        traffic_limits,
+                        enforce_api_traffic,
+                    ))
+                    .layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        crate::pty::identify_connect,
+                    )),
+            ),
+        );
 
     Router::new()
         .route("/health", get(health))
@@ -5983,7 +5994,8 @@ pub(crate) mod tests {
         let before = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
         let app = router(state.clone());
         test_runtime().block_on(async {
-            // Models an async exec holding the operation gate for an hour.
+            // Models committed lifecycle work holding the operation gate.
+            // DELETE may cancel registered exec, but must preserve this work.
             let held = state
                 .supervisor
                 .operation_gate(id)
