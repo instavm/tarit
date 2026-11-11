@@ -3850,6 +3850,9 @@ impl VmmSupervisor {
                 }
             }
         }
+        if let Some(net) = &self.net {
+            net.retry_pending_cleanup();
+        }
     }
 
     fn reconcile_process_exit(
@@ -8331,7 +8334,7 @@ impl VmmSupervisor {
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
             match self.defer_network_teardown(id, a.clone()) {
                 Ok(Some(allocation)) => {
-                    if let Err(error) = p.teardown(&allocation) {
+                    if let Err(error) = p.teardown_or_defer(&allocation) {
                         failures.push(format!("teardown network allocation: {error}"));
                     }
                 }
@@ -8383,7 +8386,7 @@ impl VmmSupervisor {
         };
         if let Some(allocation) = teardown {
             if let Some(provisioner) = &self.net {
-                if let Err(error) = provisioner.teardown(&allocation) {
+                if let Err(error) = provisioner.teardown_or_defer(&allocation) {
                     tracing::error!(%id, %error, "failed deferred network teardown");
                     return;
                 }
