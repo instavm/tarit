@@ -47,6 +47,9 @@ const VSOCK_FEATURES_HIGH: u32 = 1;
 const DEFAULT_BUF_ALLOC: u32 = 256 * 1024;
 const MAX_PACKET_BYTES: usize = 64 * 1024;
 const HOST_READ_CHUNK: usize = 4096;
+// Bound each nonblocking drain, including repeated EINTR/short-write retries,
+// while holding the connection lock. A later host pump continues the drain.
+const MAX_HOST_WRITE_ATTEMPTS: usize = 16;
 const HOST_EPHEMERAL_PORT_START: u32 = 49152;
 const HOST_EPHEMERAL_PORT_END: u32 = 65535;
 
@@ -276,7 +279,34 @@ struct Connection {
     peer_fwd_cnt: u32,
     fwd_cnt: u32,
     credit_update_pending: bool,
+    pending_host_write: VecDeque<u8>,
+    shutdown_pending: Option<u32>,
     established: bool,
+}
+
+impl Connection {
+    fn flush_host_writes(&mut self) -> io::Result<()> {
+        for _ in 0..MAX_HOST_WRITE_ATTEMPTS {
+            if self.pending_host_write.is_empty() {
+                break;
+            }
+            let (front, _) = self.pending_host_write.as_slices();
+            match self.stream.write(front) {
+                Ok(0) => return Err(io::Error::from(ErrorKind::WriteZero)),
+                Ok(n) => {
+                    self.pending_host_write.drain(..n);
+                    // Credit is freed only by bytes the host actually accepted,
+                    // never by bytes merely copied out of the guest TX queue.
+                    self.fwd_cnt = self.fwd_cnt.wrapping_add(n as u32);
+                    self.credit_update_pending = true;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct VirtioVsockMmio {
@@ -497,6 +527,8 @@ impl VirtioVsockMmio {
                     peer_fwd_cnt: 0,
                     fwd_cnt: 0,
                     credit_update_pending: false,
+                    pending_host_write: VecDeque::new(),
+                    shutdown_pending: None,
                     established: false,
                 },
             );
@@ -807,25 +839,47 @@ impl VirtioVsockMmio {
                 if !conn.established {
                     continue;
                 }
-                let mut buf = [0u8; HOST_READ_CHUNK];
-                match conn.stream.read(&mut buf) {
-                    Ok(0) => {
-                        // The host end closed: it will neither send nor
-                        // receive. SEND is what tells the guest no more data
-                        // is coming (POLLRDHUP); RCV alone left a guest
-                        // blocked on the stream unaware the host had gone.
+                if conn.flush_host_writes().is_err() {
+                    packets.push(host_packet(*key, op::RST, 0, Vec::new(), conn.fwd_cnt));
+                    closed.push(*key);
+                    continue;
+                }
+                if let Some(flags) = conn.shutdown_pending {
+                    if conn.pending_host_write.is_empty() {
                         packets.push(host_packet(
                             *key,
                             op::SHUTDOWN,
-                            shutdown_flags::RCV | shutdown_flags::SEND,
+                            flags,
                             Vec::new(),
                             conn.fwd_cnt,
                         ));
                         closed.push(*key);
                     }
+                    continue;
+                }
+                let mut buf = [0u8; HOST_READ_CHUNK];
+                match conn.stream.read(&mut buf) {
+                    Ok(0) => {
+                        // The host stopped producing data. Preserve accepted
+                        // guest output until it drains, then report closure.
+                        // SEND lets a guest blocked on read observe EOF.
+                        let flags = shutdown_flags::RCV | shutdown_flags::SEND;
+                        if conn.pending_host_write.is_empty() {
+                            packets.push(host_packet(
+                                *key,
+                                op::SHUTDOWN,
+                                flags,
+                                Vec::new(),
+                                conn.fwd_cnt,
+                            ));
+                            closed.push(*key);
+                        } else {
+                            conn.shutdown_pending = Some(flags);
+                        }
+                    }
                     Ok(n) => {
-                        // NB: fwd_cnt must be the count of bytes we've received
-                        // from the guest (updated in handle_rw), NOT host→guest
+                        // NB: fwd_cnt counts bytes actually forwarded from
+                        // the guest into the host stream, NOT host→guest
                         // bytes. Sending host→guest bytes here made fwd_cnt exceed
                         // the guest's tx_cnt, an impossible credit value that made
                         // the guest reject the packet. Leave fwd_cnt as-is.
@@ -968,6 +1022,8 @@ impl VirtioVsockMmio {
                         peer_fwd_cnt: header.fwd_cnt,
                         fwd_cnt: 0,
                         credit_update_pending: false,
+                        pending_host_write: VecDeque::new(),
+                        shutdown_pending: None,
                         established: true,
                     },
                 );
@@ -1003,20 +1059,25 @@ impl VirtioVsockMmio {
     fn handle_rw(&self, header: VsockPacketHeader, data: &[u8]) -> MmioWriteResult {
         let key = key_from_guest(&header);
         let mut reset = false;
+        let mut fwd_cnt = 0;
         {
             let mut connections = self.try_lock_state(&self.connections, "connections")?;
             if let Some(conn) = connections.get_mut(&key) {
-                log::debug!("vsock: guest→host {} bytes (RW)", data.len());
-                if let Err(err) = conn.stream.write_all(data) {
-                    log::debug!("vsock write to host stream failed: {err}");
+                // The peer can have at most our advertised credit outstanding.
+                // A compliant sender fills this buffer, then waits for actual
+                // host writes to return credit. Exceeding it is a protocol error.
+                if conn.shutdown_pending.is_some()
+                    || data.len() > DEFAULT_BUF_ALLOC as usize - conn.pending_host_write.len()
+                {
                     reset = true;
-                } else if !data.is_empty() {
-                    // Only bytes accepted by the host free guest send credit.
-                    // Linux can block without sending a CREDIT_REQUEST, so an
-                    // unsolicited update must follow successful forwarding.
-                    conn.fwd_cnt = conn.fwd_cnt.wrapping_add(data.len() as u32);
-                    conn.credit_update_pending = true;
+                } else {
+                    conn.pending_host_write.extend(data);
+                    if let Err(error) = conn.flush_host_writes() {
+                        log::debug!("vsock write to host stream failed: {error}");
+                        reset = true;
+                    }
                 }
+                fwd_cnt = conn.fwd_cnt;
                 conn.peer_buf_alloc = header.buf_alloc;
                 conn.peer_fwd_cnt = header.fwd_cnt;
             } else {
@@ -1027,7 +1088,7 @@ impl VirtioVsockMmio {
             }
         }
         if reset {
-            self.enqueue_rx(self.reply_packet(&header, op::RST, 0, Vec::new(), 0))?;
+            self.enqueue_rx(self.reply_packet(&header, op::RST, 0, Vec::new(), fwd_cnt))?;
         }
         Ok(())
     }
@@ -1055,9 +1116,22 @@ impl VirtioVsockMmio {
     }
 
     fn handle_shutdown(&self, header: VsockPacketHeader) -> MmioWriteResult {
-        self.try_lock_state(&self.connections, "connections")?
-            .remove(&key_from_guest(&header));
-        self.enqueue_rx(self.reply_packet(&header, op::SHUTDOWN, header.flags, Vec::new(), 0))
+        let key = key_from_guest(&header);
+        let mut connections = self.try_lock_state(&self.connections, "connections")?;
+        if let Some(conn) = connections.get_mut(&key) {
+            if !conn.pending_host_write.is_empty() {
+                // TX descriptors are already consumed. Drain accepted bytes
+                // before acknowledging closure and dropping their ownership.
+                conn.shutdown_pending = Some(header.flags);
+                return Ok(());
+            }
+        }
+        let fwd_cnt = connections
+            .remove(&key)
+            .map(|conn| conn.fwd_cnt)
+            .unwrap_or(0);
+        drop(connections);
+        self.enqueue_rx(self.reply_packet(&header, op::SHUTDOWN, header.flags, Vec::new(), fwd_cnt))
     }
 
     fn handle_rst(&self, header: VsockPacketHeader) -> MmioWriteResult {
@@ -1447,6 +1521,7 @@ mod tests {
         inbound: VecDeque<u8>,
         outbound: Vec<u8>,
         write_error: Option<ErrorKind>,
+        write_steps: VecDeque<io::Result<usize>>,
     }
 
     #[derive(Clone)]
@@ -1475,6 +1550,11 @@ mod tests {
     impl Write for FakeStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let mut state = self.state.lock().unwrap();
+            if let Some(step) = state.write_steps.pop_front() {
+                let n = step?.min(buf.len());
+                state.outbound.extend_from_slice(&buf[..n]);
+                return Ok(n);
+            }
             if let Some(kind) = state.write_error {
                 return Err(io::Error::from(kind));
             }
@@ -2253,9 +2333,213 @@ mod tests {
         assert!(dev.pending_rx.lock().unwrap().is_empty());
     }
 
+    fn connected_fake() -> (VirtioVsockMmio, Arc<Mutex<FakeStreamState>>, ConnectionKey) {
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        let state = Arc::new(Mutex::new(FakeStreamState::default()));
+        dev.set_host_listener(Arc::new(FakeListener {
+            state: state.clone(),
+            connects: AtomicUsize::new(0),
+        }));
+        let header = guest_packet(GUEST_PORT, op::REQUEST, &[]).header;
+        dev.handle_request(header).unwrap();
+        dev.pending_rx.lock().unwrap().clear();
+        (dev, state, key_from_guest(&header))
+    }
+
+    #[test]
+    fn short_writes_and_would_block_retain_order_and_only_credit_actual_writes() {
+        let (dev, state, key) = connected_fake();
+        state.lock().unwrap().write_steps = VecDeque::from([
+            Ok(3),
+            Err(io::Error::from(ErrorKind::Interrupted)),
+            Err(io::Error::from(ErrorKind::WouldBlock)),
+            Ok(2),
+            Err(io::Error::from(ErrorKind::WouldBlock)),
+        ]);
+        dev.handle_rw(
+            guest_packet(GUEST_PORT, op::RW, b"abcdefgh").header,
+            b"abcdefgh",
+        )
+        .unwrap();
+        assert_eq!(state.lock().unwrap().outbound, b"abc");
+        dev.handle_rw(guest_packet(GUEST_PORT, op::RW, b"ijkl").header, b"ijkl")
+            .unwrap();
+        assert_eq!(state.lock().unwrap().outbound, b"abcde");
+        // Credit generation must survive full RX while unwritten data remains.
+        while dev.pending_rx.lock().unwrap().len() < MAX_PENDING_RX {
+            dev.enqueue_rx(host_packet(key, op::RST, 0, Vec::new(), 0))
+                .unwrap();
+        }
+        for _ in 0..3 {
+            state.lock().unwrap().write_steps =
+                VecDeque::from([Ok(2), Err(io::Error::from(ErrorKind::WouldBlock))]);
+            dev.pump_host_streams().unwrap();
+            let forwarded = state.lock().unwrap().outbound.len();
+            let connections = dev.connections.lock().unwrap();
+            let conn = connections
+                .get(&key)
+                .expect("backpressure must preserve connection");
+            assert_eq!(conn.fwd_cnt as usize, forwarded);
+            assert_eq!(
+                conn.pending_host_write.iter().copied().collect::<Vec<_>>(),
+                b"abcdefghijkl"[forwarded..]
+            );
+            assert!(conn.credit_update_pending);
+        }
+        dev.pending_rx.lock().unwrap().clear();
+        dev.pump_host_streams().unwrap();
+        assert_eq!(state.lock().unwrap().outbound, b"abcdefghijkl");
+        let connections = dev.connections.lock().unwrap();
+        let conn = connections.get(&key).unwrap();
+        assert!(conn.pending_host_write.is_empty());
+        assert_eq!(conn.fwd_cnt, 12);
+        let pending = dev.pending_rx.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].header.op, op::CREDIT_UPDATE);
+        assert_eq!(pending[0].header.fwd_cnt, 12);
+    }
+
+    #[test]
+    fn full_advertised_credit_buffers_without_loss_and_interrupted_drains_are_bounded() {
+        let (dev, state, key) = connected_fake();
+        state.lock().unwrap().write_error = Some(ErrorKind::WouldBlock);
+        let chunk = vec![0x5a; MAX_PACKET_BYTES];
+        for _ in 0..DEFAULT_BUF_ALLOC as usize / chunk.len() {
+            dev.handle_rw(guest_packet(GUEST_PORT, op::RW, &chunk).header, &chunk)
+                .unwrap();
+        }
+        dev.pump_host_streams().unwrap();
+        {
+            let connections = dev.connections.lock().unwrap();
+            let conn = connections.get(&key).unwrap();
+            assert_eq!(conn.pending_host_write.len(), DEFAULT_BUF_ALLOC as usize);
+            assert_eq!(conn.fwd_cnt, 0);
+        }
+        assert!(
+            dev.pending_rx.lock().unwrap().is_empty(),
+            "queued bytes cannot grant credit"
+        );
+        {
+            let mut stream = state.lock().unwrap();
+            stream.write_error = None;
+            stream.write_steps = (0..2 * MAX_HOST_WRITE_ATTEMPTS)
+                .map(|_| Err(io::Error::from(ErrorKind::Interrupted)))
+                .collect();
+        }
+        dev.pump_host_streams().unwrap();
+        assert_eq!(
+            state.lock().unwrap().write_steps.len(),
+            MAX_HOST_WRITE_ATTEMPTS
+        );
+        dev.pump_host_streams().unwrap();
+        assert!(state.lock().unwrap().outbound.is_empty());
+        dev.pump_host_streams().unwrap();
+        assert_eq!(
+            state.lock().unwrap().outbound,
+            vec![0x5a; DEFAULT_BUF_ALLOC as usize]
+        );
+        assert_eq!(
+            dev.connections.lock().unwrap().get(&key).unwrap().fwd_cnt,
+            DEFAULT_BUF_ALLOC
+        );
+        assert!(dev
+            .pending_rx
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|packet| packet.header.op != op::RST));
+    }
+
+    #[test]
+    fn shutdown_drains_buffered_output_and_reset_discards_pending_ownership() {
+        let (dev, state, key) = connected_fake();
+        state.lock().unwrap().write_error = Some(ErrorKind::WouldBlock);
+        dev.handle_rw(guest_packet(GUEST_PORT, op::RW, b"tail").header, b"tail")
+            .unwrap();
+        let mut shutdown = guest_packet(GUEST_PORT, op::SHUTDOWN, &[]).header;
+        shutdown.flags = shutdown_flags::SEND | shutdown_flags::RCV;
+        dev.handle_shutdown(shutdown).unwrap();
+        dev.pump_host_streams().unwrap();
+        assert!(dev.connections.lock().unwrap().contains_key(&key));
+        assert!(dev.pending_rx.lock().unwrap().is_empty());
+        state.lock().unwrap().write_error = None;
+        dev.pump_host_streams().unwrap();
+        assert_eq!(state.lock().unwrap().outbound, b"tail");
+        assert!(!dev.connections.lock().unwrap().contains_key(&key));
+        let closed = dev.pending_rx.lock().unwrap().pop_back().unwrap();
+        assert_eq!(closed.header.op, op::SHUTDOWN);
+        assert_eq!(closed.header.fwd_cnt, 4);
+        let (dev, state, key) = connected_fake();
+        state.lock().unwrap().write_error = Some(ErrorKind::WouldBlock);
+        dev.handle_rw(
+            guest_packet(GUEST_PORT, op::RW, b"pending").header,
+            b"pending",
+        )
+        .unwrap();
+        dev.handle_rst(guest_packet(GUEST_PORT, op::RST, &[]).header)
+            .unwrap();
+        assert!(!dev.connections.lock().unwrap().contains_key(&key));
+        dev.pump_host_streams().unwrap();
+        assert!(state.lock().unwrap().outbound.is_empty());
+    }
+
+    #[test]
+    fn hard_write_error_after_partial_progress_resets_with_exact_forwarded_count() {
+        let (dev, state, key) = connected_fake();
+        state.lock().unwrap().write_steps =
+            VecDeque::from([Ok(3), Err(io::Error::from(ErrorKind::BrokenPipe))]);
+        dev.handle_rw(
+            guest_packet(GUEST_PORT, op::RW, b"abcdefgh").header,
+            b"abcdefgh",
+        )
+        .unwrap();
+        assert!(!dev.connections.lock().unwrap().contains_key(&key));
+        assert_eq!(state.lock().unwrap().outbound, b"abc");
+        let reset = dev.pending_rx.lock().unwrap().pop_front().unwrap();
+        assert_eq!(reset.header.op, op::RST);
+        assert_eq!(reset.header.fwd_cnt, 3);
+        assert!(dev.pending_rx.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pump_terminal_error_and_credit_violation_release_pending_buffers() {
+        let (dev, state, key) = connected_fake();
+        state.lock().unwrap().write_error = Some(ErrorKind::WouldBlock);
+        dev.handle_rw(
+            guest_packet(GUEST_PORT, op::RW, b"pending").header,
+            b"pending",
+        )
+        .unwrap();
+        state.lock().unwrap().write_error = Some(ErrorKind::BrokenPipe);
+        dev.pump_host_streams().unwrap();
+        assert!(!dev.connections.lock().unwrap().contains_key(&key));
+        let reset = dev.pending_rx.lock().unwrap().pop_front().unwrap();
+        assert_eq!(reset.header.op, op::RST);
+        assert_eq!(reset.header.fwd_cnt, 0);
+        let (dev, state, key) = connected_fake();
+        state.lock().unwrap().write_error = Some(ErrorKind::WouldBlock);
+        let chunk = vec![0; MAX_PACKET_BYTES];
+        for _ in 0..DEFAULT_BUF_ALLOC as usize / chunk.len() {
+            dev.handle_rw(guest_packet(GUEST_PORT, op::RW, &chunk).header, &chunk)
+                .unwrap();
+        }
+        // A valid peer stops at advertised credit; reject excess without
+        // growing the bounded buffer or pretending any bytes were forwarded.
+        dev.handle_rw(
+            guest_packet(GUEST_PORT, op::RW, b"excess").header,
+            b"excess",
+        )
+        .unwrap();
+        assert!(!dev.connections.lock().unwrap().contains_key(&key));
+        assert!(state.lock().unwrap().outbound.is_empty());
+        let reset = dev.pending_rx.lock().unwrap().pop_front().unwrap();
+        assert_eq!(reset.header.op, op::RST);
+        assert_eq!(reset.header.fwd_cnt, 0);
+    }
+
     #[test]
     fn failed_host_write_resets_without_replenishing_credit() {
-        for kind in [ErrorKind::WouldBlock, ErrorKind::BrokenPipe] {
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset] {
             let dev = VirtioVsockMmio::new(7, GUEST_CID);
             let state = Arc::new(Mutex::new(FakeStreamState {
                 write_error: Some(kind),
