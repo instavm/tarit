@@ -3714,6 +3714,31 @@ mod tests {
     use super::*;
     use tarit_types::{ShareRecord, ShareVisibility, VmRuntimeLayout};
 
+    #[test]
+    fn bundled_sqlite_and_unsigned_integer_compatibility() {
+        // Guard the bundled security floor and the fallible_uint feature:
+        // counters remain INTEGERs, with checked bounds rather than wrapping.
+        assert!(rusqlite::version_number() >= 3_054_000);
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE counters (value INTEGER NOT NULL)", [])
+            .unwrap();
+        for value in [0_u64, i64::MAX as u64] {
+            conn.execute("DELETE FROM counters", []).unwrap();
+            conn.execute("INSERT INTO counters VALUES (?1)", [value])
+                .unwrap();
+            let actual: u64 = conn
+                .query_row("SELECT value FROM counters", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(actual, value);
+        }
+        assert!(conn
+            .execute("INSERT INTO counters VALUES (?1)", [i64::MAX as u64 + 1])
+            .is_err());
+        assert!(conn
+            .query_row("SELECT -1", [], |row| row.get::<_, u64>(0))
+            .is_err());
+    }
+
     fn test_share(slug: &str, owner_key: &str) -> ShareRecord {
         let now = Utc::now();
         ShareRecord {
