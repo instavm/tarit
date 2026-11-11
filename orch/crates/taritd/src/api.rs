@@ -128,6 +128,7 @@ pub(crate) enum LifecycleState {
     /// release have all converged; retries must not resume the captured guest.
     Hibernating {
         record: VmRecord,
+        stopped_at: Option<chrono::DateTime<Utc>>,
     },
     /// A live VMM transition could not be rolled back or observed. The record
     /// stays registered so the lifecycle sweeper retries VMM observation and
@@ -180,7 +181,7 @@ impl LifecycleState {
             Self::Creating { record, .. }
             | Self::Publishing { record, .. }
             | Self::Running { record }
-            | Self::Hibernating { record }
+            | Self::Hibernating { record, .. }
             | Self::Reconciling { record }
             | Self::Abandoned { record }
             | Self::Terminal { record, .. } => record,
@@ -4627,11 +4628,13 @@ pub(crate) mod tests {
         insert_vm(&state, id, "tenant-a", VmStatus::Running);
         let mut record = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
         record.status = VmStatus::Hibernated;
-        state
-            .lifecycle
-            .lock()
-            .unwrap()
-            .insert(id, LifecycleState::Hibernating { record });
+        state.lifecycle.lock().unwrap().insert(
+            id,
+            LifecycleState::Hibernating {
+                record,
+                stopped_at: None,
+            },
+        );
         assert!(matches!(
             ops::get_local(&state, id),
             Err(OrchError::Unavailable(_))

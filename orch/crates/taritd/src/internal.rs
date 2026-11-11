@@ -1240,11 +1240,13 @@ mod tests {
         let mut record = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
         record.status = VmStatus::Hibernated;
         record.revision += 1;
-        state
-            .lifecycle
-            .lock()
-            .unwrap()
-            .insert(id, crate::api::LifecycleState::Hibernating { record });
+        state.lifecycle.lock().unwrap().insert(
+            id,
+            crate::api::LifecycleState::Hibernating {
+                record,
+                stopped_at: None,
+            },
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

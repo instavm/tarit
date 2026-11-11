@@ -320,6 +320,10 @@ impl Store {
                vm_id TEXT PRIMARY KEY,
                last_billed_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS billing_runtime_end (
+               vm_id TEXT PRIMARY KEY,
+               ended_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS snapshots (
                path TEXT PRIMARY KEY NOT NULL,
                snapshot_id TEXT UNIQUE,
@@ -552,6 +556,78 @@ impl Store {
                                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                 WHERE vm_id = NEW.id AND revoked_at IS NULL;
              END;",
+        )?;
+        // A watermark represents an open live-runtime interval, not VM age.
+        // Triggers couple its creation to the durable status publication, across
+        // all writers and retries. Paused/suspended VMMs retain their interval.
+        // Inactive transitions atomically settle any unconsumed interval before
+        // clearing it, including startup recovery and administrative writers.
+        // A previously frozen death boundary wins over the observation time.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS start_runtime_on_vm_insert
+             AFTER INSERT ON vms WHEN NEW.status IN ('running','paused','suspended') BEGIN
+               INSERT OR REPLACE INTO billing_watermark VALUES (NEW.id, NEW.updated_at);
+             END;
+             CREATE TRIGGER IF NOT EXISTS start_runtime_on_vm_activation
+             AFTER UPDATE OF status ON vms
+             WHEN NEW.status IN ('running','paused','suspended')
+              AND OLD.status NOT IN ('running','paused','suspended') BEGIN
+               INSERT OR REPLACE INTO billing_watermark VALUES (NEW.id, NEW.updated_at);
+             END;
+             CREATE TRIGGER IF NOT EXISTS clear_runtime_end_on_watermark_delete
+             AFTER DELETE ON billing_watermark BEGIN
+               DELETE FROM billing_runtime_end WHERE vm_id = OLD.vm_id;
+             END;
+             DROP TRIGGER IF EXISTS clear_runtime_on_vm_inactive;
+             DROP TRIGGER IF EXISTS clear_runtime_on_vm_delete;
+             CREATE TRIGGER IF NOT EXISTS finalize_runtime_on_vm_inactive
+             AFTER UPDATE OF status ON vms
+             WHEN NEW.status NOT IN ('running','paused','suspended') BEGIN
+               INSERT INTO usage_outbox
+                 (id, api_key_id, owner_key, host_id, vm_id, kind, seconds,
+                  window_start, window_end, created_at)
+               SELECT lower(hex(randomblob(16))), OLD.api_key_id, OLD.owner_key,
+                      OLD.host_id, OLD.id, 'vm_runtime',
+                      round((julianday(COALESCE(e.ended_at, NEW.updated_at)) -
+                             julianday(w.last_billed_at)) * 86400000) / 1000.0,
+                      w.last_billed_at, COALESCE(e.ended_at, NEW.updated_at),
+                      NEW.updated_at
+                 FROM billing_watermark w
+                 LEFT JOIN billing_runtime_end e ON e.vm_id = w.vm_id
+                WHERE w.vm_id = OLD.id AND OLD.api_key_id IS NOT NULL
+                  AND OLD.owner_key IS NOT NULL
+                  AND julianday(COALESCE(e.ended_at, NEW.updated_at)) > julianday(w.last_billed_at);
+               DELETE FROM billing_watermark WHERE vm_id = NEW.id;
+             END;
+             CREATE TRIGGER IF NOT EXISTS finalize_runtime_on_vm_delete
+             BEFORE DELETE ON vms BEGIN
+               INSERT INTO usage_outbox
+                 (id, api_key_id, owner_key, host_id, vm_id, kind, seconds,
+                  window_start, window_end, created_at)
+               SELECT lower(hex(randomblob(16))), OLD.api_key_id, OLD.owner_key,
+                      OLD.host_id, OLD.id, 'vm_runtime',
+                      round((julianday(COALESCE(e.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) -
+                             julianday(w.last_billed_at)) * 86400000) / 1000.0,
+                      w.last_billed_at, COALESCE(e.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 FROM billing_watermark w
+                 LEFT JOIN billing_runtime_end e ON e.vm_id = w.vm_id
+                WHERE w.vm_id = OLD.id AND OLD.api_key_id IS NOT NULL
+                  AND OLD.owner_key IS NOT NULL
+                  AND julianday(COALESCE(e.ended_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))) > julianday(w.last_billed_at);
+               DELETE FROM billing_watermark WHERE vm_id = OLD.id;
+             END;
+             UPDATE vms SET status = status
+              WHERE status NOT IN ('running','paused','suspended')
+                AND id IN (SELECT vm_id FROM billing_watermark);",
+        )?;
+        // Upgrade/readoption of an existing live VM without a watermark starts
+        // at observation time. Its historical runtime is unknown; never infer
+        // it from created_at (which may predate many hibernations).
+        conn.execute(
+            "INSERT OR IGNORE INTO billing_watermark (vm_id, last_billed_at)
+             SELECT id, ?1 FROM vms WHERE status IN ('running','paused','suspended')",
+            params![Utc::now().to_rfc3339()],
         )?;
         Ok(Self { conn })
     }
@@ -2892,6 +2968,53 @@ impl Store {
         mark_outbox_sent(&self.conn, "audit_outbox", ids)
     }
 
+    /// Freeze the first confirmed teardown boundary before attempting outbox
+    /// writes. A failed final transaction must never move this end on retry.
+    pub fn freeze_billing_end(
+        &self,
+        vm_id: Uuid,
+        end: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO billing_runtime_end (vm_id, ended_at)
+             SELECT vm_id, ?2 FROM billing_watermark WHERE vm_id = ?1",
+            params![vm_id.to_string(), end.to_rfc3339()],
+        )?;
+        self.get_billing_end(vm_id)
+    }
+
+    pub fn get_billing_end(&self, vm_id: Uuid) -> Result<Option<DateTime<Utc>>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT ended_at FROM billing_runtime_end WHERE vm_id = ?1",
+                params![vm_id.to_string()],
+                |row| {
+                    let ts: String = row.get(0)?;
+                    parse_ts(&ts)
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Commit the event and interval advancement/closure as one durable unit.
+    /// The caller holds the store mutex from watermark read through this write.
+    pub fn commit_runtime_usage(
+        &self,
+        event: &UsageEvent,
+        final_interval: bool,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.enqueue_usage(event)?;
+        if final_interval {
+            self.clear_billing_watermark(event.vm_id)?;
+        } else {
+            self.set_billing_watermark(event.vm_id, event.window_end)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_billing_watermark(&self, vm_id: Uuid, ts: DateTime<Utc>) -> Result<(), StoreError> {
         self.conn.execute(
             "INSERT INTO billing_watermark (vm_id, last_billed_at) VALUES (?1,?2)
@@ -5192,6 +5315,156 @@ mod tests {
             .local_usage_summary(Some("a"), old - chrono::Duration::days(1), to)
             .unwrap();
         assert_eq!(wide[0].vm_runtime_seconds, 12.5);
+    }
+
+    #[test]
+    fn billing_activation_is_durable_and_does_not_reset_on_live_updates() {
+        let store = Store::open(":memory:").unwrap();
+        let mut vm = test_vm(Uuid::new_v4(), "owner");
+        vm.created_at = Utc::now() - chrono::Duration::days(7);
+        store.insert_vm(&vm).unwrap();
+        assert_eq!(store.get_billing_watermark(vm.id).unwrap(), None);
+        vm.status = VmStatus::Running;
+        vm.revision += 1;
+        store.insert_vm(&vm).unwrap();
+        assert_eq!(
+            store.get_billing_watermark(vm.id).unwrap(),
+            Some(vm.updated_at)
+        );
+        let advanced = vm.updated_at + chrono::Duration::seconds(5);
+        store.set_billing_watermark(vm.id, advanced).unwrap();
+        vm.status = VmStatus::Paused;
+        vm.revision += 1;
+        store.insert_vm(&vm).unwrap();
+        store.insert_vm(&vm).unwrap();
+        assert_eq!(store.get_billing_watermark(vm.id).unwrap(), Some(advanced));
+        vm.status = VmStatus::Hibernated;
+        vm.revision += 1;
+        store.insert_vm(&vm).unwrap();
+        assert_eq!(store.get_billing_watermark(vm.id).unwrap(), None);
+        // A new node has no local runtime history. Importing the durable
+        // Hibernated record must wait for a successful Running publication.
+        let destination = Store::open(":memory:").unwrap();
+        vm.host_id = "host-b".into();
+        destination.insert_vm(&vm).unwrap();
+        assert_eq!(destination.get_billing_watermark(vm.id).unwrap(), None);
+        vm.status = VmStatus::Running;
+        vm.revision += 1;
+        vm.updated_at = advanced + chrono::Duration::hours(1);
+        destination.insert_vm(&vm).unwrap();
+        assert_eq!(
+            destination.get_billing_watermark(vm.id).unwrap(),
+            Some(vm.updated_at)
+        );
+    }
+
+    #[test]
+    fn inactive_transition_and_delete_finalize_frozen_usage_atomically() {
+        for delete in [false, true] {
+            let store = Store::open(":memory:").unwrap();
+            let mut vm = test_vm(Uuid::new_v4(), "owner");
+            vm.api_key_id = Some("key".into());
+            vm.status = VmStatus::Running;
+            vm.updated_at = Utc::now() - chrono::Duration::hours(2);
+            let start = vm.updated_at;
+            let end = start + chrono::Duration::seconds(10);
+            store.insert_vm(&vm).unwrap();
+            store.freeze_billing_end(vm.id, end).unwrap();
+            store.conn.execute_batch("CREATE TRIGGER reject_final_usage BEFORE INSERT ON usage_outbox BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+            let close = || {
+                if delete {
+                    store.delete_vm(vm.id)
+                } else {
+                    store.update_vm_status(vm.id, VmStatus::Hibernated)
+                }
+            };
+            assert!(close().is_err());
+            assert_eq!(store.get_vm(vm.id).unwrap().status, VmStatus::Running);
+            assert_eq!(store.get_billing_watermark(vm.id).unwrap(), Some(start));
+            assert_eq!(store.get_billing_end(vm.id).unwrap(), Some(end));
+            store
+                .conn
+                .execute_batch("DROP TRIGGER reject_final_usage")
+                .unwrap();
+            close().unwrap();
+            let events = store.list_unsent_usage(10).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].window_start, start);
+            assert_eq!(events[0].window_end, end);
+            assert_eq!(events[0].seconds, Some(10.0));
+            assert_eq!(store.get_billing_watermark(vm.id).unwrap(), None);
+            if !delete {
+                store.update_vm_status(vm.id, VmStatus::Error).unwrap();
+                assert_eq!(store.list_unsent_usage(10).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn billing_event_and_watermark_rollback_together() {
+        let store = Store::open(":memory:").unwrap();
+        let id = Uuid::new_v4();
+        let start = Utc::now() - chrono::Duration::seconds(5);
+        let end = Utc::now();
+        store.set_billing_watermark(id, start).unwrap();
+        let event = UsageEvent {
+            id: Uuid::new_v4(),
+            api_key_id: "key".into(),
+            owner_key: "owner".into(),
+            host_id: "host-a".into(),
+            vm_id: id,
+            kind: UsageKind::VmRuntime,
+            seconds: Some(5.0),
+            duration_ms: None,
+            window_start: start,
+            window_end: end,
+            created_at: end,
+        };
+        assert_eq!(store.freeze_billing_end(id, end).unwrap(), Some(end));
+        store.conn.execute_batch("CREATE TRIGGER reject_billing_close BEFORE DELETE ON billing_watermark BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(store.commit_runtime_usage(&event, true).is_err());
+        assert!(store.list_unsent_usage(100).unwrap().is_empty());
+        assert_eq!(store.get_billing_watermark(id).unwrap(), Some(start));
+        // Advancing retry time cannot bill the stopped gap, even though the
+        // final outbox transaction rolled back and its watermark remains open.
+        let retried_end = store
+            .freeze_billing_end(id, end + chrono::Duration::hours(8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried_end, end);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_billing_close")
+            .unwrap();
+        store.commit_runtime_usage(&event, true).unwrap();
+        let events = store.list_unsent_usage(100).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].window_end, end);
+        assert_eq!(store.get_billing_watermark(id).unwrap(), None);
+        assert_eq!(store.get_billing_end(id).unwrap(), None);
+    }
+
+    #[test]
+    fn billing_restart_preserves_live_progress_and_fences_unknown_history() {
+        let path = std::env::temp_dir().join(format!("tarit-billing-{}.sqlite", Uuid::new_v4()));
+        let id = Uuid::new_v4();
+        let store = Store::open(&path).unwrap();
+        let mut vm = test_vm(id, "owner");
+        vm.status = VmStatus::Running;
+        vm.created_at = Utc::now() - chrono::Duration::days(30);
+        store.insert_vm(&vm).unwrap();
+        let billed = Utc::now() - chrono::Duration::seconds(2);
+        store.set_billing_watermark(id, billed).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.get_billing_watermark(id).unwrap(), Some(billed));
+        store.clear_billing_watermark(id).unwrap();
+        drop(store);
+        let observation = Utc::now();
+        let store = Store::open(&path).unwrap();
+        assert!(store.get_billing_watermark(id).unwrap().unwrap() >= observation);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

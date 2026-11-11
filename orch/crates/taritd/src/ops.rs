@@ -687,6 +687,9 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
         };
         match phase {
             TerminalPhase::PersistRecordAndRelease | TerminalPhase::PersistRecordOnly => {
+                // The terminal lifecycle remains retryable if the outbox write
+                // fails; never publish inactive state before closing its usage.
+                crate::usage::meter_vm_final_at(state, id, record.updated_at)?;
                 persist_vm_record(state, record.clone()).await?;
                 set_lifecycle_state(
                     state,
@@ -762,6 +765,7 @@ async fn finish_terminal_transition(state: &AppState, id: Uuid) -> Result<(), Or
                         .map_err(crate::api::store_err)?;
                 }
                 cleanup_ephemeral_snapshots_for_vm(state, id).await?;
+                state.supervisor.clear_runtime_stopped(id)?;
                 state
                     .lifecycle
                     .lock()
@@ -2381,9 +2385,6 @@ pub async fn stop_local(state: &AppState, id: Uuid) -> Result<(), OrchError> {
     // withdraws the runtime before signalling the VMM, so its exit is not
     // reported as unexpected.
     //
-    // Bill the final runtime interval before teardown, while the VM record (and
-    // its owning key) is still in the cache, then drop its watermark.
-    crate::usage::meter_vm_final(state, id);
     let sup = Arc::clone(&state.supervisor);
     tokio::task::spawn_blocking(move || sup.stop_vm(id))
         .await
@@ -2440,7 +2441,6 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
             ) {
                 finish_publication(state, exit.id).await?;
             }
-            crate::usage::meter_vm_final(state, exit.id);
             start_terminal_transition(state, exit.id, VmStatus::Error, false)?;
             finish_terminal_transition(state, exit.id).await
         }
@@ -2602,6 +2602,7 @@ async fn hibernate_local_owned(
         id,
         LifecycleState::Hibernating {
             record: record.clone(),
+            stopped_at: None,
         },
     )?;
     finish_hibernation(state, id).await?;
@@ -2662,7 +2663,8 @@ async fn prepare_hibernation(
 /// Caller holds terminal_transition_gate (and the runtime gate if present).
 /// The durable hibernation row also lets startup recover after a daemon crash.
 async fn finish_hibernation(state: &AppState, id: Uuid) -> Result<(), OrchError> {
-    let Some(LifecycleState::Hibernating { record }) = lifecycle_state(state, id)? else {
+    let Some(LifecycleState::Hibernating { record, stopped_at }) = lifecycle_state(state, id)?
+    else {
         return Ok(());
     };
     if let Some(fleet) = state.fleet.as_ref() {
@@ -2702,15 +2704,36 @@ async fn finish_hibernation(state: &AppState, id: Uuid) -> Result<(), OrchError>
                 OrchError::Internal(format!("publish durable fleet hibernation: {error}"))
             })?;
     }
-    state.pty_registry.close_vm_sessions(id);
-    let supervisor = Arc::clone(&state.supervisor);
-    tokio::task::spawn_blocking(move || supervisor.stop_vm(id))
-        .await
-        .map_err(|join| OrchError::Internal(format!("hibernate teardown join: {join}")))??;
+    let stopped_at = match stopped_at {
+        Some(end) => end,
+        None => {
+            state.pty_registry.close_vm_sessions(id);
+            let supervisor = Arc::clone(&state.supervisor);
+            tokio::task::spawn_blocking(move || supervisor.stop_vm(id))
+                .await
+                .map_err(|join| {
+                    OrchError::Internal(format!("hibernate teardown join: {join}"))
+                })??;
+            let end = Utc::now();
+            // Keep the exact boundary even if persisting the freeze itself
+            // fails. Retries must not run teardown again and choose a later end.
+            set_lifecycle_state(
+                state,
+                id,
+                LifecycleState::Hibernating {
+                    record: record.clone(),
+                    stopped_at: Some(end),
+                },
+            )?;
+            end
+        }
+    };
+    crate::usage::meter_vm_final_at(state, id, stopped_at)?;
     claim_lifecycle_ownership(state, &record).await?;
     persist_vm_record(state, record.clone()).await?;
     commit_vm_record(state, record.clone())?;
     state.supervisor.release_reservation_after_terminal(id)?;
+    state.supervisor.clear_runtime_stopped(id)?;
     mark_running(state, record)
 }
 
@@ -6144,6 +6167,38 @@ mod tests {
         assert!(!is_shutdown_rejection(&OrchError::Internal(
             "store unavailable".into()
         )));
+    }
+
+    #[test]
+    fn terminal_usage_survives_publication_retry_and_later_delete() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        let mut record = vm_get(&state, id).unwrap();
+        record.api_key_id = Some("key".into());
+        state.vm_cache.write().unwrap().insert(id, record.clone());
+        state.store.lock().unwrap().insert_vm(&record).unwrap();
+        state
+            .store
+            .lock()
+            .unwrap()
+            .set_billing_watermark(id, Utc::now() - chrono::Duration::seconds(10))
+            .unwrap();
+        // Unexpected exit enters retryable terminal convergence. Fail durable
+        // status publication after the usage interval has already committed.
+        start_terminal_transition(&state, id, VmStatus::Error, false).unwrap();
+        inject_lifecycle_fault(&state, LifecycleFault::SQLite);
+        test_runtime().block_on(async {
+            assert!(finish_terminal_transition(&state, id).await.is_err());
+            finish_terminal_transition(&state, id).await.unwrap();
+            // DELETE of the Error VM must not reconstruct lifetime usage.
+            start_terminal_transition(&state, id, VmStatus::Stopped, false).unwrap();
+            finish_terminal_transition(&state, id).await.unwrap();
+        });
+        let store = state.store.lock().unwrap();
+        assert_eq!(store.list_unsent_usage(100).unwrap().len(), 1);
+        assert!(store.get_billing_watermark(id).unwrap().is_none());
+        assert_eq!(store.get_vm(id).unwrap().status, VmStatus::Stopped);
     }
 
     #[test]
