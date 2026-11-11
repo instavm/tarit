@@ -521,25 +521,38 @@ impl PostgresFleet {
             .owner_key
             .as_deref()
             .ok_or_else(|| FleetError::Conflict("fleet snapshot requires a tenant owner".into()))?;
-        let client = self.pool.get().await?;
-        client
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        // A durable locator owns its artifact independently of running restores.
+        // Serialize publication with automatic artifact GC when the artifact
+        // already exists (initial publication creates the locator first).
+        tx.query_opt(
+            "SELECT artifact_id FROM fleet_artifacts
+             WHERE artifact_id = $1 AND owner_key = $2 FOR UPDATE",
+            &[&snapshot.snapshot_id, &owner_key],
+        )
+        .await?;
+        tx
             .execute(
-                "INSERT INTO fleet_snapshots (snapshot_id, host_id, owner_key, snapshot_path, created_at)
-                 VALUES ($1,$2,$3,$4,$5)
+                "INSERT INTO fleet_snapshots (snapshot_id, host_id, owner_key, snapshot_path, created_at, retain_artifact)
+                 VALUES ($1,$2,$3,$4,$5,$6)
                  ON CONFLICT (snapshot_id) DO UPDATE SET
                    host_id = EXCLUDED.host_id,
                    owner_key = EXCLUDED.owner_key,
                    snapshot_path = EXCLUDED.snapshot_path,
-                   created_at = EXCLUDED.created_at",
+                   created_at = EXCLUDED.created_at,
+                   retain_artifact = EXCLUDED.retain_artifact",
                 &[
                     &snapshot.snapshot_id,
                     &snapshot.host_id,
                     &owner_key,
                     &snapshot.path,
                     &snapshot.created_at,
+                    &snapshot.ephemeral_owner_vm_id.is_none(),
                 ],
             )
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3027,6 +3040,9 @@ CREATE TABLE IF NOT EXISTS fleet_snapshots (
   snapshot_path TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL
 );
+-- Existing locators lack an ephemeral/durable discriminator. Preserve them
+-- conservatively; explicit snapshot deletion still retires their artifacts.
+ALTER TABLE fleet_snapshots ADD COLUMN IF NOT EXISTS retain_artifact BOOLEAN NOT NULL DEFAULT TRUE;
 CREATE INDEX IF NOT EXISTS fleet_snapshots_owner ON fleet_snapshots(owner_key, created_at DESC);
 CREATE TABLE IF NOT EXISTS fleet_artifacts (
   artifact_id UUID PRIMARY KEY,
@@ -3580,6 +3596,20 @@ async fn delete_unreferenced_artifact_chain_tx(
             break;
         };
         if row.get::<_, i64>(1) != 0 {
+            break;
+        }
+        // Runtime references reaching zero do not retire a user-owned snapshot.
+        // This separate retention hold leaves explicit snapshot deletion free to
+        // enforce its existing zero-runtime/branch-reference requirement.
+        if tx
+            .query_opt(
+                "SELECT 1 FROM fleet_snapshots
+                 WHERE snapshot_id = $1 AND owner_key = $2 AND retain_artifact",
+                &[&current_id, &owner_key],
+            )
+            .await?
+            .is_some()
+        {
             break;
         }
         let parent_id: Option<Uuid> = row.get(0);
@@ -5101,6 +5131,128 @@ mod tests {
             )
             .await?;
         result
+    }
+
+    #[tokio::test]
+    async fn durable_snapshot_retention_survives_restore_delete_and_parent_gc(
+    ) -> Result<(), FleetError> {
+        let Some(url) = postgres_test_database_url() else {
+            return Ok(());
+        };
+        let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+        let fleet = PostgresFleet::connect(&url).await?;
+        let suffix = Uuid::new_v4();
+        let owner = format!("retention-{suffix}");
+        for (durable, legacy) in [(true, false), (true, true), (false, false)] {
+            let artifact = test_artifact(&owner, "host-a", suffix);
+            let vm = test_vm(Uuid::new_v4(), "host-a", &owner);
+            let snapshot = SnapshotRecord {
+                snapshot_id: artifact.artifact_id,
+                path: artifact.storage_locator.clone(),
+                overlay_path: None,
+                host_id: artifact.host_id.clone(),
+                owner_key: Some(owner.clone()),
+                api_key_id: None,
+                vm_id: vm.id,
+                ephemeral_owner_vm_id: (!durable).then_some(vm.id),
+                memory_mib: Some(256),
+                vcpus: Some(1),
+                kernel_path: None,
+                rootfs_path: None,
+                rootfs_read_only: Some(true),
+                cmdline: None,
+                content_digest: Some(artifact.content_digest.clone()),
+                size_bytes: Some(artifact.size_bytes),
+                created_at: artifact.created_at,
+            };
+            // Match production's locator-before-artifact publication order.
+            if legacy {
+                // Old writers omit the new column; upgraded existing rows use
+                // the same conservative default and must keep their hold.
+                fleet.pool.get().await?.execute(
+                    "INSERT INTO fleet_snapshots (snapshot_id, host_id, owner_key, snapshot_path, created_at)
+                     VALUES ($1,$2,$3,$4,$5)",
+                    &[&snapshot.snapshot_id, &snapshot.host_id, &owner, &snapshot.path, &snapshot.created_at],
+                ).await?;
+            } else {
+                fleet.upsert_snapshot(&snapshot).await?;
+            }
+            fleet.insert_artifact(&artifact).await?;
+            fleet
+                .acquire_vm_artifact_ref(&vm, artifact.artifact_id)
+                .await?;
+            fleet
+                .acquire_vm_artifact_ref(&vm, artifact.artifact_id)
+                .await?;
+            fleet.upsert_vm(&vm).await?;
+            // Publication retries racing runtime release must preserve the hold.
+            if legacy {
+                fleet.delete_vm(&vm).await?;
+            } else {
+                let (published, deleted) =
+                    tokio::join!(fleet.upsert_snapshot(&snapshot), fleet.delete_vm(&vm));
+                published?;
+                deleted?;
+            }
+            fleet.delete_vm(&vm).await?;
+            if durable {
+                assert_eq!(
+                    fleet
+                        .get_artifact(&owner, artifact.artifact_id)
+                        .await?
+                        .reference_count,
+                    0
+                );
+                assert!(fleet
+                    .get_snapshot_location(snapshot.snapshot_id)
+                    .await?
+                    .is_some());
+                // A child owns one parent reference. Releasing the child must
+                // stop at the durable parent's independent retention hold.
+                let mut child = test_artifact(&owner, "host-a", suffix);
+                // Test-only readiness avoids depending on a shared host heartbeat.
+                fleet.pool.get().await?.execute(
+                    "UPDATE fleet_artifacts SET replication_state = 'ready' WHERE artifact_id = $1",
+                    &[&artifact.artifact_id],
+                ).await?;
+                child.parent_artifact_id = Some(artifact.artifact_id);
+                fleet.insert_artifact(&child).await?;
+                fleet
+                    .acquire_vm_artifact_ref(&vm, child.artifact_id)
+                    .await?;
+                fleet.release_vm_artifact_ref(&vm).await?;
+                assert!(matches!(
+                    fleet.get_artifact(&owner, child.artifact_id).await,
+                    Err(FleetError::NotFound)
+                ));
+                assert_eq!(
+                    fleet
+                        .get_artifact(&owner, artifact.artifact_id)
+                        .await?
+                        .reference_count,
+                    0
+                );
+                // Explicit snapshot deletion can retire a retained zero-ref artifact.
+                fleet
+                    .delete_artifact_if_unreferenced(&owner, artifact.artifact_id)
+                    .await?;
+            }
+            assert!(matches!(
+                fleet.get_artifact(&owner, artifact.artifact_id).await,
+                Err(FleetError::NotFound)
+            ));
+            fleet
+                .delete_snapshot_by_id(&owner, snapshot.snapshot_id)
+                .await?;
+            fleet
+                .delete_snapshot_by_id(&owner, snapshot.snapshot_id)
+                .await?;
+            assert!(fleet
+                .get_snapshot_location(snapshot.snapshot_id)
+                .await?
+                .is_none());
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
