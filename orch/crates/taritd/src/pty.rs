@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-        Extension, Path, Query, State,
+        Extension, Path, Query, Request, State,
     },
     http::StatusCode,
     response::Response,
@@ -420,6 +420,19 @@ impl PtyRegistry {
         })
     }
 
+    // Admission lookup is deliberately non-consuming. The upgrade still
+    // reserves the session atomically in admit_connect, including race checks.
+    fn connect_identity(&self, vm_id: Uuid, pty_id: Uuid, provided: &str) -> Option<ApiIdentity> {
+        let sessions = self.sessions.lock().ok()?;
+        let session = sessions.get(&pty_id)?;
+        (session.vm_id == vm_id
+            && !session.active_connection
+            && session.connect_token_expires_at >= Utc::now()
+            && !provided.is_empty()
+            && connect_token_matches(provided, &session.connect_token))
+        .then(|| session.owner.clone())
+    }
+
     pub(crate) fn admit_connect(
         &self,
         vm_id: Uuid,
@@ -549,6 +562,25 @@ pub(crate) async fn resize_session(
         cols: session.cols,
         rows: session.rows,
     }))
+}
+
+#[derive(Clone)]
+pub(crate) struct ConnectIdentity(pub(crate) Option<ApiIdentity>);
+
+/// Resolve only the credential accepted by this route. Even a valid API key
+/// cannot charge a victim tenant for an invalid PTY token.
+pub(crate) async fn identify_connect(
+    State(state): State<AppState>,
+    Path((vm_id, pty_id)): Path<(Uuid, Uuid)>,
+    mut request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let identity = Query::<WsQuery>::try_from_uri(request.uri())
+        .ok()
+        .and_then(|Query(query)| query.token)
+        .and_then(|token| state.pty_registry.connect_identity(vm_id, pty_id, &token));
+    request.extensions_mut().insert(ConnectIdentity(identity));
+    next.run(request).await
 }
 
 pub(crate) async fn connect_ws(
@@ -1079,6 +1111,124 @@ mod tests {
             write_vmm_stream_frame(&mut sink, &frame).await,
             Err(BridgeError::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn token_admission_isolated_from_invalid_keys_and_bound_to_session_owner() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let mut state = crate::api::tests::test_state();
+        state.config.api_requests_per_second = 1;
+        let vm_id = Uuid::new_v4();
+        let session = state
+            .pty_registry
+            .create(
+                vm_id,
+                80,
+                24,
+                None,
+                state.config.api_keys.resolve("tenant-a-key").unwrap(),
+            )
+            .unwrap();
+        let app = crate::api::router(state.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let request = |path: String, key| {
+                Request::builder()
+                    .uri(path)
+                    .header("X-API-Key", key)
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            assert_eq!(
+                app.clone()
+                    .oneshot(request("/v1/vms".into(), "junk"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            for (vm, token) in [
+                (vm_id, "invalid".to_owned()),
+                (Uuid::new_v4(), session.connect_token.clone()),
+            ] {
+                let path = format!("/v1/vms/{vm}/pty/{}/connect?token={token}", session.pty_id);
+                assert_eq!(
+                    app.clone()
+                        .oneshot(request(path, "tenant-a-key"))
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::TOO_MANY_REQUESTS
+                );
+            }
+            let path = format!(
+                "/v1/vms/{vm_id}/pty/{}/connect?token={}",
+                session.pty_id, session.connect_token
+            );
+            // No upgrade headers: reaching the WS extractor proves admission,
+            // while leaving the token available for a real upgrade.
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(path, "tenant-b-key"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                app.clone()
+                    .oneshot(request("/v1/vms".into(), "tenant-a-key"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(
+                app.oneshot(request("/v1/vms".into(), "tenant-b-key"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        });
+        assert!(state
+            .pty_registry
+            .connect_identity(vm_id, session.pty_id, &session.connect_token)
+            .is_some());
+        let (_, permit) = state
+            .pty_registry
+            .admit_connect(vm_id, session.pty_id, &session.connect_token)
+            .unwrap();
+        assert!(state
+            .pty_registry
+            .connect_identity(vm_id, session.pty_id, &session.connect_token)
+            .is_none());
+        assert!(state
+            .pty_registry
+            .admit_connect(vm_id, session.pty_id, &session.connect_token)
+            .is_err());
+        drop(permit);
+        state.pty_registry.finish_connection(vm_id, session.pty_id);
+        assert!(state
+            .pty_registry
+            .connect_identity(vm_id, session.pty_id, &session.connect_token)
+            .is_some());
+        state
+            .pty_registry
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&session.pty_id)
+            .unwrap()
+            .connect_token_expires_at = Utc::now() - ChronoDuration::seconds(1);
+        assert!(state
+            .pty_registry
+            .connect_identity(vm_id, session.pty_id, &session.connect_token)
+            .is_none());
     }
 
     #[test]

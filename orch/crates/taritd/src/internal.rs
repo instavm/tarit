@@ -131,7 +131,7 @@ struct InternalRestoreRequest {
 }
 
 pub fn internal_router(state: AppState) -> Router {
-    let traffic_limits = ApiTrafficLimits::new(&state.config);
+    let traffic_limits = ApiTrafficLimits::new_peer(&state.config);
     let max_body_bytes = state.config.api_max_body_bytes;
     Router::new()
         .route("/internal/v1/vms", post(internal_create))
@@ -1140,6 +1140,97 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tarit_types::VmStatus;
+
+    #[test]
+    fn signed_peer_requests_use_global_admission_and_reject_tampering() {
+        use tower::ServiceExt;
+        let mut state = crate::api::tests::test_state();
+        let id = Uuid::new_v4();
+        crate::api::tests::insert_vm(&state, id, "tenant-a", VmStatus::Running);
+        let path = format!("/internal/v1/vms/{id}");
+        let signed_request = |key: &str, tamper: bool| {
+            let source = Uuid::new_v4().to_string();
+            let timestamp = Utc::now().timestamp().to_string();
+            let identity_nonce = Uuid::new_v4().to_string();
+            let nonce = Uuid::new_v4().to_string();
+            let source_session = Uuid::new_v4().to_string();
+            let target_session = state.config.host_session_id.to_string();
+            let mut identity_mac =
+                Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
+            identity_mac.update(format!("{IDENTITY_SIGNATURE_VERSION}\n{source}\n{timestamp}\n{identity_nonce}\ntenant-a\nuser\ntest-key-id").as_bytes());
+            let identity_signature = URL_SAFE_NO_PAD.encode(identity_mac.finalize().into_bytes());
+            let payload = URL_SAFE_NO_PAD.encode(Sha256::digest(b""));
+            let mut request_mac =
+                Hmac::<Sha256>::new_from_slice(state.config.peer_secret.as_bytes()).unwrap();
+            for component in [
+                REQUEST_SIGNATURE_VERSION,
+                "GET",
+                &path,
+                &payload,
+                &timestamp,
+                &nonce,
+                &source,
+                &state.config.host_id,
+                &source_session,
+                &target_session,
+                &identity_signature,
+            ] {
+                request_mac.update(component.as_bytes());
+                request_mac.update(b"\n");
+            }
+            let signature = URL_SAFE_NO_PAD.encode(request_mac.finalize().into_bytes());
+            Request::builder()
+                .uri(&path)
+                .header("X-API-Key", key)
+                .header("X-Tarit-Peer-Version", REQUEST_SIGNATURE_VERSION)
+                .header("X-Tarit-Peer-Source", source)
+                .header("X-Tarit-Peer-Target", &state.config.host_id)
+                .header("X-Tarit-Peer-Source-Session", source_session)
+                .header("X-Tarit-Peer-Target-Session", target_session)
+                .header("X-Tarit-Peer-Timestamp", &timestamp)
+                .header("X-Tarit-Peer-Nonce", nonce)
+                .header("X-Tarit-Peer-Body-SHA256", payload)
+                .header(
+                    "X-Tarit-Peer-Signature",
+                    if tamper { "invalid" } else { &signature },
+                )
+                .header("X-Tarit-Tenant", "tenant-a")
+                .header("X-Tarit-Role", "user")
+                .header("X-Tarit-Api-Key-Id", "test-key-id")
+                .header("X-Tarit-Identity-Timestamp", timestamp)
+                .header("X-Tarit-Identity-Nonce", identity_nonce)
+                .header("X-Tarit-Identity-Signature", identity_signature)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let valid = signed_request("junk", false);
+        let exhausted = signed_request("tenant-b-key", false);
+        let tampered = signed_request("tenant-a-key", true);
+        state.config.api_requests_per_second = 1;
+        let app = internal_router(state.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                app.clone().oneshot(valid).await.unwrap().status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                app.oneshot(exhausted).await.unwrap().status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(
+                internal_router(state)
+                    .oneshot(tampered)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        });
+    }
 
     #[test]
     fn peer_delete_retries_pending_hibernation_without_bypassing_tenant_identity() {

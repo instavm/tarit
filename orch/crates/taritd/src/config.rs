@@ -362,6 +362,12 @@ impl ApiKeyRegistry {
         Ok(registry)
     }
 
+    pub(crate) fn tenants(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .map(|entry| entry.identity.tenant.as_str())
+    }
+
     pub fn resolve(&self, provided_key: &str) -> Option<ApiIdentity> {
         let provided_hash = hash_api_key(provided_key);
         let mut found = None;
@@ -752,6 +758,7 @@ pub struct Config {
     pub metrics_expose_tenant_labels: bool,
     /// Public API load-shedding and request envelope limits.
     pub api_max_in_flight: usize,
+    /// Per configured tenant, with a separate shared unauthenticated budget.
     pub api_requests_per_second: u64,
     pub api_request_timeout_ms: u64,
     pub api_max_body_bytes: usize,

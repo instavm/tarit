@@ -261,9 +261,18 @@ pub struct AppState {
 #[derive(Clone)]
 pub(crate) struct ApiTrafficLimits {
     concurrency: Arc<tokio::sync::Semaphore>,
+    unauthenticated: TrafficBudget,
+    tenants: Arc<HashMap<String, TrafficBudget>>,
+    config: Arc<Config>,
+    tenant_isolation: bool,
+    timeout: Duration,
+}
+
+#[derive(Clone)]
+struct TrafficBudget {
+    concurrency: Arc<tokio::sync::Semaphore>,
     rate: Arc<Mutex<TokenBucket>>,
     requests_per_second: u64,
-    timeout: Duration,
 }
 
 struct TokenBucket {
@@ -271,16 +280,15 @@ struct TokenBucket {
     updated_at: Instant,
 }
 
-impl ApiTrafficLimits {
-    pub(crate) fn new(config: &Config) -> Self {
+impl TrafficBudget {
+    fn new(rate: u64, concurrency: usize) -> Self {
         Self {
-            concurrency: Arc::new(tokio::sync::Semaphore::new(config.api_max_in_flight)),
+            concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency)),
             rate: Arc::new(Mutex::new(TokenBucket {
-                tokens: config.api_requests_per_second as f64,
+                tokens: rate as f64,
                 updated_at: Instant::now(),
             })),
-            requests_per_second: config.api_requests_per_second,
-            timeout: Duration::from_millis(config.api_request_timeout_ms),
+            requests_per_second: rate,
         }
     }
 
@@ -302,16 +310,74 @@ impl ApiTrafficLimits {
     }
 }
 
+impl ApiTrafficLimits {
+    /// Peer requests use signed identities, not API keys. Preserve their fixed
+    /// global admission budget; an X-API-Key header must not affect peer limits.
+    pub(crate) fn new_peer(config: &Config) -> Self {
+        let mut limits = Self::new(config);
+        limits.tenant_isolation = false;
+        limits.unauthenticated =
+            TrafficBudget::new(config.api_requests_per_second, config.api_max_in_flight);
+        limits
+    }
+
+    pub(crate) fn new(config: &Config) -> Self {
+        let tenant_concurrency = (config.api_max_in_flight / 2).max(1);
+        // Only configured tenants allocate state. Multiple keys for one tenant
+        // share a budget; arbitrary invalid credentials share one fixed budget.
+        let tenants = config
+            .api_keys
+            .tenants()
+            .map(|tenant| {
+                (
+                    tenant.to_owned(),
+                    TrafficBudget::new(config.api_requests_per_second, tenant_concurrency),
+                )
+            })
+            .collect();
+        Self {
+            concurrency: Arc::new(tokio::sync::Semaphore::new(config.api_max_in_flight)),
+            unauthenticated: TrafficBudget::new(config.api_requests_per_second, tenant_concurrency),
+            tenants: Arc::new(tenants),
+            config: Arc::new(config.clone()),
+            tenant_isolation: true,
+            timeout: Duration::from_millis(config.api_request_timeout_ms),
+        }
+    }
+}
+
 pub(crate) async fn enforce_api_traffic(
     State(limits): State<ApiTrafficLimits>,
     request: Request,
     next: middleware::Next,
 ) -> Response {
-    if !limits.take_rate_token() {
+    let identity = if limits.tenant_isolation {
+        match request.extensions().get::<crate::pty::ConnectIdentity>() {
+            Some(identity) => identity.0.clone(),
+            None => auth::resolve_identity_from_headers(&limits.config, request.headers()).ok(),
+        }
+    } else {
+        None
+    };
+    let budget = identity
+        .as_ref()
+        .and_then(|identity| limits.tenants.get(&identity.tenant))
+        .unwrap_or(&limits.unauthenticated);
+    if !budget.take_rate_token() {
         return overloaded_response("API rate limit exceeded");
     }
-    let Ok(permit) = Arc::clone(&limits.concurrency).try_acquire_owned() else {
+    let Ok(tenant_permit) = Arc::clone(&budget.concurrency).try_acquire_owned() else {
         return overloaded_response("API concurrency limit exceeded");
+    };
+    // Authenticated API keys and PTY tokens share their tenant budget.
+    // Invalid credentials have a separate bounded admission domain.
+    let permit = if identity.is_some() {
+        match Arc::clone(&limits.concurrency).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return overloaded_response("API concurrency limit exceeded"),
+        }
+    } else {
+        None
     };
     // Own the handler in a spawned task so the deadline cannot cancel a
     // mutating operation mid-flight: `spawn_blocking` VMM transitions would
@@ -320,6 +386,7 @@ pub(crate) async fn enforce_api_traffic(
     // concurrency permit) and only the response is abandoned.
     let mut handler = tokio::spawn(async move {
         let _permit = permit;
+        let _tenant_permit = tenant_permit;
         next.run(request).await
     });
     match tokio::time::timeout(limits.timeout, &mut handler).await {
@@ -670,18 +737,24 @@ pub fn router(state: AppState) -> Router {
         .layer(Extension(async_executions))
         .layer(DefaultBodyLimit::max(max_body_bytes));
     let admitted = protected
-        .route(
-            "/v1/vms/{id}/pty/{pty_id}/connect",
-            get(crate::pty::connect_ws),
-        )
-        // Keep the global admission guard outside authentication. Invalid
-        // API credentials and invalid PTY connect tokens still consume bounded
-        // concurrency and rate capacity, preventing authentication floods from
-        // bypassing backpressure.
         .layer(middleware::from_fn_with_state(
-            traffic_limits,
+            traffic_limits.clone(),
             enforce_api_traffic,
-        ));
+        ))
+        .merge(
+            Router::new().route(
+                "/v1/vms/{id}/pty/{pty_id}/connect",
+                get(crate::pty::connect_ws)
+                    .layer(middleware::from_fn_with_state(
+                        traffic_limits,
+                        enforce_api_traffic,
+                    ))
+                    .layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        crate::pty::identify_connect,
+                    )),
+            ),
+        );
 
     Router::new()
         .route("/health", get(health))
@@ -5864,7 +5937,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unauthorized_requests_are_subject_to_global_rate_limit() {
+    fn unauthorized_flood_is_bounded_without_draining_tenant_rate_limit() {
         let mut state = test_state();
         state.config.api_requests_per_second = 1;
         let app = router(state);
@@ -5884,7 +5957,7 @@ pub(crate) mod tests {
 
         let second = rt
             .block_on(
-                app.oneshot(
+                app.clone().oneshot(
                     Request::builder()
                         .uri("/v1/vms")
                         .body(Body::empty())
@@ -5893,7 +5966,298 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let authenticated = rt
+            .block_on(
+                app.oneshot(
+                    Request::builder()
+                        .uri("/v1/vms")
+                        .header("X-API-Key", "tenant-a-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::OK);
         drop(rt);
+    }
+
+    #[test]
+    fn busy_vm_controls_release_admission_without_mutating_the_vm() {
+        let (mut state, _writes) = test_state_with_audit();
+        state.config.api_max_in_flight = 4;
+        state.config.api_request_timeout_ms = 100;
+        let id = Uuid::new_v4();
+        insert_vm(&state, id, "tenant-a", VmStatus::Running);
+        state
+            .supervisor
+            .install_test_control_runtime(id, PathBuf::from("must-not-receive-controls.sock"));
+        let before = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
+        let app = router(state.clone());
+        test_runtime().block_on(async {
+            // Models committed lifecycle work holding the operation gate.
+            // DELETE may cancel registered exec, but must preserve this work.
+            let held = state
+                .supervisor
+                .operation_gate(id)
+                .unwrap()
+                .lock_owned()
+                .await;
+            for _ in 0..3 {
+                for (method, suffix, body) in [
+                    ("GET", "/status", serde_json::json!({})),
+                    ("GET", "/balloon", serde_json::json!({})),
+                    ("PUT", "/balloon", serde_json::json!({"target_mib": 0})),
+                    ("POST", "/snapshot", serde_json::json!({"diff": false})),
+                    ("POST", "/pause", serde_json::json!({})),
+                    ("POST", "/suspend", serde_json::json!({})),
+                    ("POST", "/hibernate", serde_json::json!({})),
+                    ("DELETE", "", serde_json::json!({})),
+                ] {
+                    let response = request_json(
+                        app.clone(),
+                        method,
+                        &format!("/v1/vms/{id}{suffix}"),
+                        "tenant-a-key",
+                        body,
+                    )
+                    .await;
+                    assert_eq!(response.status(), StatusCode::CONFLICT, "{method} {suffix}");
+                }
+            }
+            let other = request_json(
+                app.clone(),
+                "GET",
+                "/v1/vms",
+                "tenant-b-key",
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(other.status(), StatusCode::OK);
+            let after = state.vm_cache.read().unwrap().get(&id).unwrap().clone();
+            assert_eq!(before.status, after.status);
+            assert_eq!(before.revision, after.revision);
+            assert!(state
+                .supervisor
+                .operation_gate(id)
+                .unwrap()
+                .try_lock_owned()
+                .is_err());
+            drop(held);
+            // The gate and its existing owner survive every rejected request.
+            assert!(state
+                .supervisor
+                .operation_gate(id)
+                .unwrap()
+                .try_lock_owned()
+                .is_ok());
+        });
+    }
+
+    #[test]
+    fn tenant_rate_budgets_are_shared_by_keys_and_isolated_between_tenants() {
+        let mut state = test_state();
+        state.config.api_requests_per_second = 1;
+        state.config.api_keys = ApiKeyRegistry::from_plaintext_entries(vec![
+            ("a-one".into(), "tenant-a".into(), ApiRole::User, 1),
+            ("a-two".into(), "tenant-a".into(), ApiRole::User, 1),
+            ("b".into(), "tenant-b".into(), ApiRole::User, 1),
+        ])
+        .unwrap();
+        let limits = ApiTrafficLimits::new(&state.config);
+        assert_eq!(limits.tenants.len(), 2);
+        let app = router(state);
+        let rt = test_runtime();
+        rt.block_on(async {
+            for (key, expected) in [
+                ("a-one", StatusCode::OK),
+                ("a-two", StatusCode::TOO_MANY_REQUESTS),
+                ("b", StatusCode::OK),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/v1/vms")
+                            .header("X-API-Key", key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn tenant_concurrency_preserves_capacity_for_other_tenants() {
+        let mut state = test_state();
+        state.config.api_max_in_flight = 4;
+        let limits = ApiTrafficLimits::new(&state.config);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = Router::new()
+            .route(
+                "/slow",
+                get({
+                    let release = release.clone();
+                    let entered = entered.clone();
+                    move || {
+                        let release = release.clone();
+                        let entered = entered.clone();
+                        async move {
+                            entered.add_permits(1);
+                            release.notified().await;
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route("/fast", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                limits.clone(),
+                enforce_api_traffic,
+            ));
+        let rt = test_runtime();
+        rt.block_on(async {
+            let request = |path, key| {
+                Request::builder()
+                    .uri(path)
+                    .header("X-API-Key", key)
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                tasks.push(tokio::spawn(
+                    app.clone().oneshot(request("/slow", "tenant-a-key")),
+                ));
+            }
+            entered.acquire_many(2).await.unwrap().forget();
+            let rejected = app
+                .clone()
+                .oneshot(request("/fast", "tenant-a-key"))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+            // Invalid credentials use their own bounded pool, even while one
+            // tenant's entire budget is occupied by slow work.
+            for _ in 0..2 {
+                tasks.push(tokio::spawn(
+                    app.clone().oneshot(request("/slow", "invalid-key")),
+                ));
+            }
+            entered.acquire_many(2).await.unwrap().forget();
+            let invalid = app
+                .clone()
+                .oneshot(request("/fast", "another-invalid-key"))
+                .await
+                .unwrap();
+            assert_eq!(invalid.status(), StatusCode::TOO_MANY_REQUESTS);
+            let other = app.oneshot(request("/fast", "tenant-b-key")).await.unwrap();
+            assert_eq!(other.status(), StatusCode::OK);
+            assert_eq!(limits.concurrency.available_permits(), 2);
+            release.notify_waiters();
+            for task in tasks {
+                assert_eq!(task.await.unwrap().unwrap().status(), StatusCode::OK);
+            }
+            assert_eq!(limits.concurrency.available_permits(), 4);
+        });
+    }
+
+    #[test]
+    fn peer_admission_keeps_its_global_rate_budget_regardless_of_api_key() {
+        let mut state = test_state();
+        state.config.api_requests_per_second = 1;
+        let limits = ApiTrafficLimits::new_peer(&state.config);
+        assert_eq!(
+            limits.unauthenticated.concurrency.available_permits(),
+            state.config.api_max_in_flight
+        );
+        let app = Router::new()
+            .route("/peer", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(limits, enforce_api_traffic));
+        test_runtime().block_on(async {
+            for (key, expected) in [
+                ("tenant-a-key", StatusCode::OK),
+                ("tenant-b-key", StatusCode::TOO_MANY_REQUESTS),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/peer")
+                            .header("X-API-Key", key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn timed_out_mutation_retains_its_permits_until_completion() {
+        let mut state = test_state();
+        state.config.api_max_in_flight = 4;
+        state.config.api_request_timeout_ms = 10;
+        let limits = ApiTrafficLimits::new(&state.config);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = Router::new()
+            .route(
+                "/mutate",
+                get({
+                    let release = release.clone();
+                    let completed = completed.clone();
+                    move || {
+                        let release = release.clone();
+                        let completed = completed.clone();
+                        async move {
+                            release.notified().await;
+                            completed.add_permits(1);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                limits.clone(),
+                enforce_api_traffic,
+            ));
+        test_runtime().block_on(async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/mutate")
+                        .header("X-API-Key", "tenant-a-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(limits.concurrency.available_permits(), 3);
+            assert_eq!(
+                limits.tenants["tenant-a"].concurrency.available_permits(),
+                1
+            );
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                completed.acquire().await.unwrap().forget();
+                while limits.concurrency.available_permits() != 4 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("timed-out mutation must complete rather than be cancelled");
+            assert_eq!(
+                limits.tenants["tenant-a"].concurrency.available_permits(),
+                2
+            );
+        });
     }
 
     #[test]

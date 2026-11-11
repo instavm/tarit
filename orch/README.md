@@ -160,6 +160,24 @@ Public endpoints require `X-API-Key`. User keys are tenant-scoped; admin keys ca
 
 Full request and response schemas are in [docs/API.md](docs/API.md).
 
+API request admission is per API node. `TARIT_API_REQUESTS_PER_SECOND` (default
+5,000) is a token-bucket rate per configured tenant; all keys for a tenant share
+the bucket. Invalid credentials and PTY WebSocket connects without an API key
+share a separate fixed bucket and cannot spend authenticated tenants' capacity.
+`TARIT_API_MAX_IN_FLIGHT` (default 1,024) caps authenticated handlers globally;
+each tenant may hold at most half that budget (minimum one). The unauthenticated
+budget has its own half-sized concurrency cap. Total admitted handlers are thus
+bounded by the global authenticated cap plus the unauthenticated cap. A global
+cap of one cannot reserve simultaneous capacity for another tenant.
+
+Live controls (status, balloon, snapshot/fork, pause/suspend/resume, hibernate,
+egress-policy update and DELETE) return 409 when another operation holds the
+local VM's operation gate, including a long-running asynchronous exec. Retry
+once the current operation finishes. Operations already performing lifecycle
+publication or rollback continue after an HTTP timeout; only admission to a
+busy VM is rejected. Lifecycle recovery and shutdown keep waiting for their
+existing work to finish safely.
+
 Asynchronous execution admission lasts until the command reaches a terminal state.
 Each API node accepts at most `min(TARIT_API_MAX_IN_FLIGHT, 128)` unfinished
 asynchronous commands. Admission checks the tenant first (all its API keys share

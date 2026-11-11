@@ -931,6 +931,7 @@ struct RunningVm {
     /// must be observed as one transition. The gate is owned by the runtime
     /// entry, so deleting a VM also removes the only registry reference.
     operation_gate: Arc<AsyncMutex<()>>,
+    execution: Arc<Mutex<ExecutionControl>>,
     /// VMM-visible path of the full snapshot this runtime last wrote or was
     /// restored from. Passed as the next snapshot's base so the VMM pauses
     /// only for pages changed since; the VMM verifies it is exactly that
@@ -946,13 +947,43 @@ impl RunningVm {
             process,
             net,
             operation_gate: Arc::new(AsyncMutex::new(())),
+            execution: Arc::new(Mutex::new(ExecutionControl::default())),
             checkpoint_base: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn execution_cancelled_for_delete(&self) -> bool {
+        self.execution
+            .lock()
+            .map(|execution| execution.deleting)
+            .unwrap_or(false)
     }
 
     fn set_checkpoint_base(&self, path: Option<String>) {
         if let Ok(mut base) = self.checkpoint_base.lock() {
             *base = path;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExecutionControl {
+    deleting: bool,
+    active: Option<Arc<tarit_vmm_client::RequestCancellation>>,
+}
+
+pub(crate) struct ExecutionGuard {
+    // Drop clears the active registration before fields release this gate,
+    // including when the blocking worker unwinds.
+    _operation: tokio::sync::OwnedMutexGuard<()>,
+    control: Arc<Mutex<ExecutionControl>>,
+    cancellation: Arc<tarit_vmm_client::RequestCancellation>,
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut control) = self.control.lock() {
+            control.active = None;
         }
     }
 }
@@ -7416,6 +7447,57 @@ impl VmmSupervisor {
             .ok_or_else(|| OrchError::NotFound(format!("vm {id} not running")))
     }
 
+    /// Called with this runtime's operation gate held, before spawning exec.
+    pub(crate) fn begin_execution(
+        &self,
+        id: Uuid,
+        operation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ExecutionGuard, OrchError> {
+        let control = self
+            .running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
+            .get(&id)
+            .map(|vm| Arc::clone(&vm.execution))
+            .ok_or_else(|| OrchError::NotFound(format!("vm {id} not running")))?;
+        let mut execution = control
+            .lock()
+            .map_err(|_| OrchError::Internal("execution lock poisoned".into()))?;
+        if execution.deleting {
+            return Err(OrchError::Conflict(format!("VM {id} is being deleted")));
+        }
+        let cancellation = Arc::new(tarit_vmm_client::RequestCancellation::default());
+        execution.active = Some(Arc::clone(&cancellation));
+        drop(execution);
+        Ok(ExecutionGuard {
+            _operation: operation,
+            control,
+            cancellation,
+        })
+    }
+
+    /// Only exec may be interrupted. Lifecycle mutations retain their gate
+    /// through publication/rollback and must never be cancelled here.
+    pub(crate) fn cancel_execution_for_delete(&self, id: Uuid) -> Result<bool, OrchError> {
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
+        let Some(vm) = running.get(&id) else {
+            return Ok(false);
+        };
+        let mut execution = vm
+            .execution
+            .lock()
+            .map_err(|_| OrchError::Internal("execution lock poisoned".into()))?;
+        let Some(cancellation) = execution.active.clone() else {
+            return Ok(false);
+        };
+        execution.deleting = true;
+        cancellation.cancel();
+        Ok(true)
+    }
+
     pub fn stop_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let booting = {
             let _gate = self.boot_gate.blocking_write();
@@ -7470,8 +7552,10 @@ impl VmmSupervisor {
             return Ok(());
         };
 
-        let client = VmmClient::new(&running.socket_path);
-        let _ = client.stop();
+        if !running.execution_cancelled_for_delete() {
+            let client = VmmClient::new(&running.socket_path);
+            let _ = client.stop();
+        }
         if let Err(error) = self.teardown_vm(id, &running) {
             self.running
                 .lock()
@@ -7660,18 +7744,20 @@ impl VmmSupervisor {
             .map_err(|error| OrchError::Vmm(format!("get balloon: {error}")))
     }
 
-    pub fn exec_vm(
+    pub(crate) fn exec_vm(
         &self,
         id: Uuid,
         command: &str,
         timeout_ms: u64,
+        execution: &ExecutionGuard,
     ) -> Result<(i32, String, String, u64), OrchError> {
         // The guest is allowed to run for the full `timeout_ms`; the transport
         // deadline must outlive it or long commands fail with a spurious
         // socket timeout (EAGAIN) while the guest is still working.
         let client = self
             .client_for(id)?
-            .with_request_timeout(Duration::from_millis(timeout_ms) + EXEC_OP_MARGIN);
+            .with_request_timeout(Duration::from_millis(timeout_ms) + EXEC_OP_MARGIN)
+            .with_cancellation(Arc::clone(&execution.cancellation));
         // An exec request is not replay-safe: a lost response may mean the
         // guest accepted and ran the command. Send it exactly once and surface
         // an ambiguous transport failure to the caller. Readiness retries use
@@ -8197,7 +8283,12 @@ impl VmmSupervisor {
 
     fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
         let mut failures = Vec::new();
-        graceful_stop_vmm(&vm.socket_path);
+        // The VMM RPC loop is synchronous: while guest exec runs it cannot
+        // answer Stop, even after its client socket closes. DELETE has already
+        // fenced exec and awaited the host worker; kill/reap directly here.
+        if !vm.execution_cancelled_for_delete() {
+            graceful_stop_vmm(&vm.socket_path);
+        }
         let process_exited = match vm.process.kill_wait() {
             Ok(()) => true,
             Err(error) => {
