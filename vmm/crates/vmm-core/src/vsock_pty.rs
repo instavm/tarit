@@ -1,7 +1,7 @@
 //! Host side of the interactive PTY vsock channel.
 //!
 //! The host initiates one virtio-vsock stream per PTY session to the guest
-//! agent's PTY listener (port 1025). After sending the START stream frame this
+//! agent's PTY listener (port 1022). After sending the START stream frame this
 //! module becomes a byte relay between the API UDS connection and the vsock
 //! stream, waking the virtio-vsock pump after every host→guest write.
 
@@ -17,7 +17,7 @@ use vmm_devices::virtio::vsock::VirtioVsockMmio;
 use vmm_sys_util::eventfd::EventFd;
 
 /// Guest agent vsock port used for interactive PTY sessions.
-pub const VMM_PTY_VSOCK_PORT: u32 = 1025;
+pub const VMM_PTY_VSOCK_PORT: u32 = 1022;
 
 /// Host endpoint for interactive PTY sessions over virtio-vsock.
 pub struct VsockPtyChannel {

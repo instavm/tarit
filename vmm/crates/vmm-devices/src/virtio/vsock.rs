@@ -164,6 +164,10 @@ pub trait HostVsockStream: Read + Write + Send {}
 impl<T: Read + Write + Send> HostVsockStream for T {}
 
 pub trait HostVsockListener: Send + Sync {
+    fn allows_connection(&self, _source_port: u32, _destination_port: u32) -> bool {
+        true
+    }
+
     fn connect(&self, port: u32) -> io::Result<Box<dyn HostVsockStream>>;
 }
 
@@ -174,7 +178,20 @@ struct UdsHostListener {
 
 #[cfg(unix)]
 impl HostVsockListener for UdsHostListener {
-    fn connect(&self, _port: u32) -> io::Result<Box<dyn HostVsockStream>> {
+    fn allows_connection(&self, source_port: u32, destination_port: u32) -> bool {
+        // Linux requires initial-user-namespace CAP_NET_BIND_SERVICE to bind
+        // these source ports. Guest root/the kernel remain trusted; ordinary
+        // guest processes must not impersonate the privileged exec agent.
+        (1..=1023).contains(&source_port) && destination_port == 1024
+    }
+
+    fn connect(&self, port: u32) -> io::Result<Box<dyn HostVsockStream>> {
+        if port != 1024 {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "not the exec channel",
+            ));
+        }
         let stream = UnixStream::connect(&self.path)?;
         stream.set_nonblocking(true)?;
         Ok(Box::new(stream))
@@ -978,7 +995,7 @@ impl VirtioVsockMmio {
     }
 
     fn handle_request(&self, header: VsockPacketHeader) -> MmioWriteResult {
-        if header.dst_cid != VSOCK_HOST_CID {
+        if header.dst_cid != VSOCK_HOST_CID || header.src_cid != self.guest_cid {
             return self.enqueue_rx(self.reply_packet(&header, op::RST, 0, Vec::new(), 0));
         }
 
@@ -989,6 +1006,9 @@ impl VirtioVsockMmio {
             return self.enqueue_rx(self.reply_packet(&header, op::RST, 0, Vec::new(), 0));
         };
 
+        if !listener.allows_connection(header.src_port, header.dst_port) {
+            return self.enqueue_rx(self.reply_packet(&header, op::RST, 0, Vec::new(), 0));
+        }
         let key = key_from_guest(&header);
         {
             let connections = self.try_lock_state(&self.connections, "connections")?;
@@ -2212,6 +2232,59 @@ mod tests {
             dev.pending_rx.lock().unwrap().back().unwrap().header.op,
             op::RST
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_uds_bridge_requires_privileged_guest_source_and_exact_destination() {
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exec.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dev = VirtioVsockMmio::new(7, GUEST_CID);
+        dev.connect_uds(&path).unwrap();
+        for (source, destination, cid) in [
+            (49152, SERVICE_PORT, GUEST_CID),
+            (1024, SERVICE_PORT, GUEST_CID),
+            (0, SERVICE_PORT, GUEST_CID),
+            (1023, SERVICE_PORT + 1, GUEST_CID),
+            (1023, SERVICE_PORT, GUEST_CID + 1),
+        ] {
+            let mut packet = guest_packet(source, op::REQUEST, &[]);
+            packet.header.dst_port = destination;
+            packet.header.src_cid = cid;
+            dev.handle_request(packet.header).unwrap();
+            assert_eq!(
+                dev.pending_rx
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap()
+                    .header
+                    .op,
+                op::RST
+            );
+            assert!(dev.connections.lock().unwrap().is_empty());
+            assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        }
+        for source in [1023, 1] {
+            dev.handle_request(guest_packet(source, op::REQUEST, &[]).header)
+                .unwrap();
+            let (_accepted, _) = listener.accept().unwrap();
+            assert_eq!(
+                dev.pending_rx
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap()
+                    .header
+                    .op,
+                op::RESPONSE
+            );
+            dev.handle_rst(guest_packet(source, op::RST, &[]).header)
+                .unwrap();
+        }
     }
 
     #[test]

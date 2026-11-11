@@ -5902,6 +5902,7 @@ impl VmmSupervisor {
         )
         .map_err(|error| match error {
             ReadinessWaitError::Cancelled(error) => error,
+            ReadinessWaitError::Incompatible(error) => OrchError::Vmm(error),
             ReadinessWaitError::TimedOut(last) => OrchError::Vmm(format!(
                 "guest agent never became ready at {}: {last}",
                 socket.display()
@@ -7660,6 +7661,7 @@ impl VmmSupervisor {
         )
         .map_err(|error| match error {
             ReadinessWaitError::Cancelled(error) => error,
+            ReadinessWaitError::Incompatible(error) => OrchError::Vmm(error),
             ReadinessWaitError::TimedOut(last) => {
                 OrchError::Vmm(format!("guest did not become ready after resume: {last}"))
             }
@@ -8990,6 +8992,7 @@ fn readiness_poll_sleep(remaining: Duration) -> Duration {
 #[derive(Debug)]
 enum ReadinessWaitError {
     Cancelled(OrchError),
+    Incompatible(String),
     TimedOut(String),
 }
 
@@ -9015,6 +9018,9 @@ where
             Ok(true) => return Ok(()),
             Ok(false) => {
                 last = "guest agent readiness probe did not succeed".to_string();
+            }
+            Err(error) if error.contains("AGENT_TRANSPORT_INCOMPATIBLE:") => {
+                return Err(ReadinessWaitError::Incompatible(error));
             }
             Err(error) => last = error,
         }
@@ -9682,6 +9688,21 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use tarit_volume::BlockVolumeProvider;
+
+    #[test]
+    fn incompatible_guest_transport_is_not_retried_until_boot_timeout() {
+        let mut probes = 0;
+        let result = wait_for_guest_ready(
+            Duration::from_secs(60),
+            || Ok(()),
+            |_| {
+                probes += 1;
+                Err("AGENT_TRANSPORT_INCOMPATIBLE: rebuild guest agent".into())
+            },
+        );
+        assert!(matches!(result, Err(ReadinessWaitError::Incompatible(_))));
+        assert_eq!(probes, 1);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
