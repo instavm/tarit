@@ -2385,8 +2385,6 @@ fn flush_guest_conntrack_with_timeout(
     Ok(())
 }
 
-/// Exit 1 also means an empty deletion in conntrack-tools. Accept only its
-/// exact C-locale zero-match diagnostic, never generic errors with that status.
 fn conntrack_preflight() -> Result<(), OrchError> {
     // A read-only netlink query verifies both the executable and permission in
     // the actual host namespace before startup lowers or deletes any live TAP.
@@ -2397,6 +2395,8 @@ fn conntrack_preflight() -> Result<(), OrchError> {
     )
 }
 
+/// Exit 1 also means an empty deletion in conntrack-tools. Accept only its
+/// exact C-locale zero-match diagnostic, never generic errors with that status.
 fn conntrack_delete_succeeded(status: std::process::ExitStatus, stderr: &[u8]) -> bool {
     let stderr = String::from_utf8_lossy(stderr);
     let line = stderr.trim();

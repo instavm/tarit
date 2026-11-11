@@ -298,8 +298,20 @@ freed. Provisioning repeats this barrier before creating a fresh TAP, covering
 state left by older versions and orphaned allocations. No host-wide flush is
 used. Missing tools, permissions, unsupported filters, oversized diagnostics or
 a five-second per-command timeout fail closed: the TAP stays absent and the
-persisted allocation remains reserved. Fix the prerequisite/error and retry
-cleanup; do not manually remove its reservation while conntrack cleanup fails.
+persisted allocation remains reserved. Once the TAP and exact firewall policy
+are confirmed absent, the reservation is marked quarantined and runtime cleanup
+can complete. Quarantined reservations do not require active masquerade/egress
+policy, so a failed create cannot invalidate another tenant's network activation.
+
+A separate persisted cleanup intent owns unfinished TAP or firewall removal.
+The lifecycle worker retries one pending slot per scan, round-robin, including
+slots whose initial containment failed. Background conntrack commands each have
+a 250 ms timeout (at most one second per four-selector attempt). Fix the
+prerequisite/error and the worker releases the address after successful cleanup;
+do not manually remove its reservation while conntrack cleanup fails. Network
+state version 3 preserves this intent across restart and accepts version 2 input.
+Older binaries reject version 3; do not downgrade by deleting reservation data.
+
 Live recovered VM flows are preserved. IPv6 is disabled for Tarit TAPs; IPv6
 conntrack and other namespaces/zones/guest addresses are not deleted.
 
@@ -319,7 +331,11 @@ through the kernel, so minimal OCI images do not need `iproute2` for restore.
 
 Before loading configuration, opening a database, resolving images, or looking
 up VMs, `taritd` enumerates strict `insta<N>` names with structured `ip -j
-link` output and lowers them. A containment, VM-list, or recovery error is
+link` output. If any exist, it first issues a bounded, read-only conntrack query
+in the host namespace. Missing conntrack or denied netlink access aborts startup
+without changing their networking. Once that dependency check succeeds it lowers
+the TAPs. Network-enabled provisioning also requires the same dependency check,
+even on a host without existing TAPs. A containment, VM-list, or recovery error is
 fatal: no supervisor or HTTP listener is published. Network-disabled startup
 is allowed only when that preflight found no Tarit TAP. Networkless live VMs
 can still be adopted from local durable state. It then reconciles the persisted
