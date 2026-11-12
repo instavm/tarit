@@ -100,6 +100,7 @@ pub fn jail(cfg: &JailerConfig) -> Result<(), JailerError> {
     // SAFETY: umask takes and returns scalar mode values only.
     unsafe { libc::umask(0o077) };
 
+    crate::mark_entered_jail();
     log::info!("jail: all confinement applied successfully");
     Ok(())
 }
