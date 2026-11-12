@@ -2433,10 +2433,15 @@ pub(crate) async fn reconcile_unexpected_vmm_exits(state: &AppState) -> Vec<Stri
             // A retained delivery must not terminate a replacement runtime.
             // The watcher withdraws the exited runtime before enqueuing this
             // event, so any currently registered runtime is a later owner.
+            // That includes a create or restore of the same id whose boot is
+            // still registered: it has no pid yet and is not in `running`
+            // (publication moves a boot from `booting` to `running`
+            // atomically, so the exited runtime itself is never in `booting`).
             let current = lifecycle_state(state, exit.id)?
                 .map(|lifecycle| lifecycle.record().clone())
                 .or_else(|| vm_get(state, exit.id).ok());
             if state.supervisor.is_running(exit.id)
+                || state.supervisor.has_retained_boot(exit.id)
                 || current.as_ref().is_none_or(|record| {
                     record.pid.is_some_and(|pid| pid != exit.pid)
                         || matches!(record.status, VmStatus::Stopped | VmStatus::Error)
@@ -6596,6 +6601,58 @@ mod tests {
             assert!(reconcile_unexpected_vmm_exits(&state).await.is_empty());
             assert!(state.supervisor.pending_unexpected_exits().is_empty());
             assert_eq!(vm_get(&state, id).unwrap(), replacement);
+        });
+    }
+
+    #[test]
+    fn retained_exit_does_not_fail_a_replacement_that_is_still_booting() {
+        let (state, writes) = test_state_with_durable_writer();
+        drop(writes);
+        let id = insert_running_vm(&state);
+        enqueue_test_exit(&state, id, 42);
+        // While the delivery was pending, a create or restore of the same id
+        // registered its boot. It has no pid yet and is not in `running`.
+        let mut replacement = vm_get(&state, id).unwrap();
+        replacement.status = VmStatus::Creating;
+        replacement.pid = None;
+        replacement.created_at += chrono::Duration::seconds(1);
+        set_lifecycle_state(
+            &state,
+            id,
+            LifecycleState::Creating {
+                record: replacement.clone(),
+                phase: CreatingPhase::CacheVisible,
+            },
+        )
+        .unwrap();
+        state
+            .vm_cache
+            .write()
+            .unwrap()
+            .insert(id, replacement.clone());
+        test_runtime().block_on(async {
+            let ticket = state
+                .supervisor
+                .begin_boot_with_registration(
+                    id,
+                    SpawnPurpose::Live,
+                    crate::scheduler::ResourceShape::new(1, 256),
+                    || async { Ok(()) },
+                )
+                .await
+                .unwrap();
+            assert!(!state.supervisor.is_running(id));
+            assert!(state.supervisor.has_retained_boot(id));
+
+            assert!(reconcile_unexpected_vmm_exits(&state).await.is_empty());
+            assert!(state.supervisor.pending_unexpected_exits().is_empty());
+            assert_eq!(vm_get(&state, id).unwrap(), replacement);
+            assert!(matches!(
+                lifecycle_state(&state, id).unwrap(),
+                Some(LifecycleState::Creating { .. })
+            ));
+            assert!(state.supervisor.has_retained_boot(id));
+            state.supervisor.abort_unstarted_boot(&ticket).await;
         });
     }
 
