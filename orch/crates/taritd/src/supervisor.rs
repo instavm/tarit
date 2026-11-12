@@ -11900,7 +11900,7 @@ mod tests {
             assert_boot_failed_for_all_waiters(&control);
             assert!(!supervisor.has_retained_boot(id));
             assert!(!supervisor.scheduler.is_reserved(id));
-            assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+            assert!(!supervisor.artifact_owners.lock().unwrap().contains_key(&id));
             supervisor.stop_all().unwrap();
         }
     }
@@ -11930,7 +11930,7 @@ mod tests {
         let stopped = supervisor.stop_all().unwrap();
         assert_eq!(stopped.booting_ids, vec![id]);
         assert!(!supervisor.has_retained_boot(id));
-        assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+        assert!(!supervisor.artifact_owners.lock().unwrap().contains_key(&id));
         // Live capacity belongs to the durable terminal transition owner.
         supervisor.release_reservation_after_terminal(id).unwrap();
         assert!(!supervisor.scheduler.is_reserved(id));
@@ -11963,7 +11963,7 @@ mod tests {
             .cleanup_registered_boot_failure(id, OrchError::Internal("worker panicked".into()));
         assert!(!supervisor.has_retained_boot(id));
         assert!(!supervisor.scheduler.is_reserved(id));
-        assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+        assert!(!supervisor.artifact_owners.lock().unwrap().contains_key(&id));
         supervisor.stop_all().unwrap();
     }
 
