@@ -10704,7 +10704,11 @@ mod tests {
         reopened
             .freeze_billing_end(id, restarted.runtime_stopped_at(id).unwrap().unwrap())
             .unwrap();
-        reopened.update_vm_status(id, VmStatus::Hibernated).unwrap();
+        let mut hibernated = record.clone();
+        hibernated.status = VmStatus::Hibernated;
+        hibernated.revision += 1;
+        hibernated.updated_at = chrono::Utc::now();
+        reopened.update_vm(&hibernated).unwrap();
         let events = reopened.list_unsent_usage(10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].window_end, end);

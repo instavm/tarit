@@ -5403,7 +5403,11 @@ mod tests {
                 if delete {
                     store.delete_vm(vm.id)
                 } else {
-                    store.update_vm_status(vm.id, VmStatus::Hibernated)
+                    let mut hibernated = vm.clone();
+                    hibernated.status = VmStatus::Hibernated;
+                    hibernated.revision += 1;
+                    hibernated.updated_at = Utc::now();
+                    store.update_vm(&hibernated)
                 }
             };
             assert!(close().is_err());
@@ -5422,7 +5426,11 @@ mod tests {
             assert_eq!(events[0].seconds, Some(10.0));
             assert_eq!(store.get_billing_watermark(vm.id).unwrap(), None);
             if !delete {
-                store.update_vm_status(vm.id, VmStatus::Error).unwrap();
+                let mut errored = vm.clone();
+                errored.status = VmStatus::Error;
+                errored.revision += 2;
+                errored.updated_at = Utc::now();
+                store.update_vm(&errored).unwrap();
                 assert_eq!(store.list_unsent_usage(10).unwrap().len(), 1);
             }
         }
