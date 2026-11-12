@@ -2032,7 +2032,11 @@ impl OverlaySeeding {
                 )
             });
         let (thread, spawn_error) = match spawned {
-            Ok(thread) => (Some(thread), None),
+            Ok(thread) => {
+                #[cfg(test)]
+                note_overlay_writer(1);
+                (Some(thread), None)
+            }
             Err(error) => (
                 None,
                 Some(OrchError::Internal(format!(
@@ -2054,7 +2058,12 @@ impl OverlaySeeding {
         if let Some(error) = self.spawn_error.take() {
             return Err(error);
         }
-        let result = match self.thread.take().map(std::thread::JoinHandle::join) {
+        let joined = self.thread.take().map(std::thread::JoinHandle::join);
+        #[cfg(test)]
+        if joined.is_some() {
+            note_overlay_writer(-1);
+        }
+        let result = match joined {
             Some(Ok(result)) => result,
             Some(Err(_)) => Err(OrchError::Internal(
                 "seeding the restore disk upper panicked".into(),
@@ -2073,6 +2082,8 @@ impl Drop for OverlaySeeding {
         self.cancellation.requested.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+            #[cfg(test)]
+            note_overlay_writer(-1);
         }
         if !self.keep {
             if let Err(error) = remove_file_if_present(&self.destination) {
@@ -2545,6 +2556,23 @@ fn hash_artifact_range_checked(
 #[cfg(test)]
 thread_local! {
     static TEST_RAM_INTEGRITY_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Restore disk writers started on this thread and not yet joined.
+    static TEST_UNJOINED_OVERLAY_WRITERS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// Set when boot failure cleanup ran on this thread while one of its
+    /// restore disk writers was still running.
+    static TEST_CLEANUP_RACED_OVERLAY_WRITER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn note_overlay_writer(delta: isize) {
+    TEST_UNJOINED_OVERLAY_WRITERS.with(|writers| writers.set(writers.get() + delta));
+}
+
+#[cfg(test)]
+fn note_boot_failure_cleanup() {
+    if TEST_UNJOINED_OVERLAY_WRITERS.with(|writers| writers.get() > 0) {
+        TEST_CLEANUP_RACED_OVERLAY_WRITER.with(|raced| raced.set(true));
+    }
 }
 
 /// Authenticate the durable chunk manifest, validate artifact shapes, and
@@ -5344,6 +5372,8 @@ impl VmmSupervisor {
         vm: &RunningVm,
         cause: OrchError,
     ) -> OrchError {
+        #[cfg(test)]
+        note_boot_failure_cleanup();
         let mut cleanup_failures = self
             .teardown_vm(id, vm)
             .err()
@@ -5386,6 +5416,8 @@ impl VmmSupervisor {
         control: &Arc<BootControl>,
         cause: OrchError,
     ) -> OrchError {
+        #[cfg(test)]
+        note_boot_failure_cleanup();
         let mut cleanup_failures = Vec::new();
         if let Some(net) = &self.net {
             if let Err(error) = net.teardown_vm_id(id) {
@@ -5738,6 +5770,19 @@ impl VmmSupervisor {
         runtime: &PreparedRuntime,
         net_alloc: Option<NetAlloc>,
     ) -> Result<RunningVm, OrchError> {
+        self.spawn_server_for_boot_with_writer(ticket, runtime, net_alloc, &mut None)
+    }
+
+    /// `overlay_writer` is a restore's disk seeding, still running alongside
+    /// the spawn. Every failure cleanup below cancels and joins it first, so
+    /// jail/overlay removal never races a live writer.
+    fn spawn_server_for_boot_with_writer(
+        &self,
+        ticket: &BootTicket,
+        runtime: &PreparedRuntime,
+        net_alloc: Option<NetAlloc>,
+        overlay_writer: &mut Option<OverlaySeeding>,
+    ) -> Result<RunningVm, OrchError> {
         let id = ticket.id;
         let socket_path = runtime.host_socket.clone();
         let _ = std::fs::remove_file(&socket_path);
@@ -5746,6 +5791,7 @@ impl VmmSupervisor {
         let cgroup_args = match self.cgroup_args(id, ticket.shape, runtime) {
             Ok(args) => args,
             Err(error) => {
+                drop(overlay_writer.take());
                 return Err(self.cleanup_boot_failure_without_process(id, &ticket.control, error));
             }
         };
@@ -5780,6 +5826,7 @@ impl VmmSupervisor {
         }
         if self.is_shutting_down() || ticket.control.is_cancelled() {
             drop(boot_gate);
+            drop(overlay_writer.take());
             return Err(self.cleanup_boot_failure_without_process(
                 id,
                 &ticket.control,
@@ -5824,6 +5871,7 @@ impl VmmSupervisor {
             Ok(fd) => fd,
             Err(error) => {
                 drop(boot_gate);
+                drop(overlay_writer.take());
                 return Err(self.cleanup_boot_failure_without_process(id, &ticket.control, error));
             }
         };
@@ -5833,6 +5881,7 @@ impl VmmSupervisor {
                 Ok(file) => Some(file),
                 Err(error) => {
                     drop(boot_gate);
+                    drop(overlay_writer.take());
                     return Err(self.cleanup_boot_failure_without_process(
                         id,
                         &ticket.control,
@@ -5894,6 +5943,7 @@ impl VmmSupervisor {
             Ok(child) => child,
             Err(error) => {
                 drop(boot_gate);
+                drop(overlay_writer.take());
                 return Err(self.cleanup_boot_failure_without_process(
                     id,
                     &ticket.control,
@@ -5941,6 +5991,7 @@ impl VmmSupervisor {
         unregistered.0 = None;
         let vm = RunningVm::new(pid, socket_path, process, net_alloc);
         if let Err(error) = attached {
+            drop(overlay_writer.take());
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, error));
         }
         Ok(vm)
@@ -6164,32 +6215,11 @@ impl VmmSupervisor {
             }
             None => (None, None, 0),
         };
-        let net_alloc = match &self.net {
-            Some(provisioner) => {
-                match provisioner.provision_with_owner_and_policy(
-                    id,
-                    self.jail_identity(id).map_err(|error| {
-                        self.cleanup_boot_failure_without_process(id, &ticket.control, error)
-                    })?,
-                    &vm_config.egress_allowlist,
-                    vm_config.egress_allow_existing,
-                ) {
-                    Ok(allocation) => Some(allocation),
-                    Err(error) => {
-                        return Err(self.cleanup_boot_failure_without_process(
-                            id,
-                            &ticket.control,
-                            error,
-                        ));
-                    }
-                }
-            }
-            None => None,
-        };
-        let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
-        // Provision/spawn failures can clean the jail internally. Start the
-        // writer only after those steps succeed, then overlap it with socket
-        // readiness. Every early cleanup below first cancels and joins it.
+        // Seeding the private disk upper needs nothing from the VMM, so it
+        // overlaps network provisioning, the VMM spawn and socket readiness.
+        // It is cancelled with the boot, and every failure cleanup below (and
+        // inside spawn_server_for_boot_with_writer) cancels and joins it first,
+        // so jail/overlay removal never races a live writer.
         let mut seeding = match &overlay {
             RestoreOverlay::None => None,
             RestoreOverlay::Seeded(source) => {
@@ -6207,7 +6237,40 @@ impl VmmSupervisor {
                 ))
             }
         };
-
+        let net_alloc = match &self.net {
+            Some(provisioner) => {
+                let owner = match self.jail_identity(id) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        drop(seeding.take());
+                        return Err(self.cleanup_boot_failure_without_process(
+                            id,
+                            &ticket.control,
+                            error,
+                        ));
+                    }
+                };
+                match provisioner.provision_with_owner_and_policy(
+                    id,
+                    owner,
+                    &vm_config.egress_allowlist,
+                    vm_config.egress_allow_existing,
+                ) {
+                    Ok(allocation) => Some(allocation),
+                    Err(error) => {
+                        drop(seeding.take());
+                        return Err(self.cleanup_boot_failure_without_process(
+                            id,
+                            &ticket.control,
+                            error,
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
+        let base_vm =
+            self.spawn_server_for_boot_with_writer(&ticket, &runtime, net_alloc, &mut seeding)?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -12171,6 +12234,68 @@ mod tests {
             assert!(!supervisor.artifact_owners.lock().unwrap().contains_key(&id));
             supervisor.stop_all().unwrap();
         }
+    }
+
+    /// The restore disk writer overlaps network provisioning and the VMM
+    /// spawn. A failure inside the spawn step must cancel and join it before
+    /// any cleanup removes the jail/overlay it is writing into.
+    #[test]
+    fn restore_failure_inside_vmm_spawn_joins_overlay_writer_before_cleanup() {
+        let mut supervisor = test_supervisor();
+        Arc::get_mut(&mut supervisor)
+            .unwrap()
+            .config
+            .vm_cgroup_parent = Some("target/test-cgroup".into());
+        let dir = PathBuf::from(format!("target/overlay-spawn-fail-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        std::fs::write(&source, vec![7u8; 4 * 1024 * 1024]).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let id = Uuid::new_v4();
+        let mut ticket = test_runtime()
+            .block_on(supervisor.begin_boot_with_registration(
+                id,
+                SpawnPurpose::Refill,
+                ResourceShape::new(1, 256),
+                || async { Ok(()) },
+            ))
+            .unwrap();
+        // The checked-limit failure happens inside the VMM spawn step, after
+        // the writer has started.
+        ticket.shape.memory_mib = u64::MAX;
+        let shape = ticket.shape;
+        let mut cfg = spawn_config(false, Some(supervisor.config.rootfs.clone()));
+        cfg.memory_mib = u64::MAX;
+        TEST_UNJOINED_OVERLAY_WRITERS.with(|writers| writers.set(0));
+        TEST_CLEANUP_RACED_OVERLAY_WRITER.with(|raced| raced.set(false));
+        let error = supervisor
+            .spawn_and_restore(
+                ticket,
+                "unused-snapshot",
+                RestoreOverlay::Seeded(source.clone()),
+                &cfg,
+                shape,
+                None,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("memory cgroup limit overflow"),
+            "{error}"
+        );
+        assert!(
+            !TEST_CLEANUP_RACED_OVERLAY_WRITER.with(|raced| raced.get()),
+            "boot cleanup ran while the restore disk writer was still live"
+        );
+        assert_eq!(
+            TEST_UNJOINED_OVERLAY_WRITERS.with(|writers| writers.get()),
+            0
+        );
+        assert!(!PathBuf::from(supervisor.overlay_path_for(id)).exists());
+        assert!(!supervisor.has_retained_boot(id));
+        assert!(!supervisor.scheduler.is_reserved(id));
+        supervisor.stop_all().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
