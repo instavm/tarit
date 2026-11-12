@@ -111,8 +111,9 @@ install.
 
 Only want the hypervisor? Run `make vmm` as your regular user, then
 `sudo make install-vmm` to install just `vmm`. Install targets only copy prebuilt
-artifacts and fail with build guidance if an artifact is missing; they never run
-Cargo or the guest compiler under sudo.
+artifacts and fail with build guidance if an artifact is missing or older than
+the sources it was built from (for example after a `git pull` without `make
+build`); they never run Cargo or the guest compiler under sudo.
 
 ### Layer 2: snapshot, suspend, restore
 

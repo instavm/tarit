@@ -36,7 +36,7 @@ sha256_file() {
 }
 
 if [ ! -x "$VMM" ] && ! command -v "$VMM" >/dev/null 2>&1; then
-  echo "error: vmm binary not found. Build it first: sudo make install (or make vmm)." >&2
+  echo "error: vmm binary not found. Build it first as your regular user: make vmm (optionally followed by sudo make install-vmm)." >&2
   exit 1
 fi
 

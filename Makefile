@@ -40,9 +40,10 @@ guest:
 
 # Install host binaries plus the guest-only agent (use sudo for /usr/local).
 install:
-	@for binary in vmm/target/release/vmm orch/target/release/taritd vmm/guest/agent/vmm-agent; do \
-		test -x "$$binary" || { echo "missing $$binary; run make build as your regular user first" >&2; exit 1; }; \
-	done
+	@./scripts/check-install-artifact.sh vmm/target/release/vmm "make build" vmm/Cargo.lock
+	@./scripts/check-install-artifact.sh orch/target/release/taritd "make build" orch/Cargo.lock
+	@test -x vmm/guest/agent/vmm-agent && $(MAKE) --no-print-directory -q -C vmm/guest/agent vmm-agent || \
+		{ echo "error: vmm/guest/agent/vmm-agent is missing or older than its source; run 'make build' as your regular user first, then install again" >&2; exit 1; }
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -d "$(DESTDIR)$(LIBEXECDIR)"
 	install -m755 vmm/target/release/vmm     "$(DESTDIR)$(BINDIR)/vmm"
@@ -53,7 +54,7 @@ install:
 
 # Install only the VMM.
 install-vmm:
-	@test -x vmm/target/release/vmm || { echo "missing vmm/target/release/vmm; run make vmm as your regular user first" >&2; exit 1; }
+	@./scripts/check-install-artifact.sh vmm/target/release/vmm "make vmm" vmm/Cargo.lock
 	install -d "$(DESTDIR)$(BINDIR)"
 	install -m755 vmm/target/release/vmm "$(DESTDIR)$(BINDIR)/vmm"
 	@echo "installed vmm to $(DESTDIR)$(BINDIR)"
