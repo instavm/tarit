@@ -2108,23 +2108,17 @@ fn seed_restore_overlay(
         let artifact = OwnedArtifact::capture(destination).map_err(|error| {
             OrchError::Internal(format!("capture seeded restore disk upper: {error}"))
         })?;
-        let actual = hash_artifact_range_checked(
+        verify_file_artifact_integrity_checked(
             &artifact._file,
-            integrity.kind,
-            0,
-            integrity.len,
+            integrity,
             chunk_size,
+            "seeded restore disk",
             &|| {
                 cancellation
                     .check()
                     .map_err(|error| OrchError::Internal(error.to_string()))
             },
         )?;
-        if actual.chunk_hashes != integrity.chunk_hashes {
-            return Err(OrchError::BadRequest(
-                "seeded restore disk integrity verification failed".into(),
-            ));
-        }
     }
     cancellation
         .check()
@@ -2681,7 +2675,20 @@ fn verify_file_artifact_integrity(
     chunk_size: u64,
     what: &str,
 ) -> Result<(), OrchError> {
-    let actual = hash_artifact_range(file, integrity.kind, 0, integrity.len, chunk_size)?;
+    verify_file_artifact_integrity_checked(file, integrity, chunk_size, what, &|| Ok(()))
+}
+
+/// [`verify_file_artifact_integrity`] that stops at `check`'s first error,
+/// polled once per hash window.
+fn verify_file_artifact_integrity_checked(
+    file: &File,
+    integrity: &tarit_proto::ArtifactIntegrity,
+    chunk_size: u64,
+    what: &str,
+    check: &dyn Fn() -> Result<(), OrchError>,
+) -> Result<(), OrchError> {
+    let actual =
+        hash_artifact_range_checked(file, integrity.kind, 0, integrity.len, chunk_size, check)?;
     if actual.chunk_hashes != integrity.chunk_hashes {
         return Err(OrchError::BadRequest(format!(
             "{what} integrity verification failed"
