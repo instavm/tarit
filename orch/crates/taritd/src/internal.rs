@@ -48,11 +48,13 @@ use crate::{
 const IDENTITY_SIGNATURE_VERSION: &str = "tarit-peer-identity-v1";
 const REQUEST_SIGNATURE_VERSION: &str = "tarit-peer-request-v2";
 const STREAMING_PAYLOAD: &str = "STREAMING-UNSIGNED-PAYLOAD";
-// A 10-second acceptance window tolerates ordinary clock skew while keeping a
-// captured signature's replay lifetime short. At the default 5,000 request/s
-// limit, a single source can retain the full window without saturating its
-// 65,536-entry bucket.
+// Timestamps are accepted inclusively within +/-10 whole seconds. A request
+// first seen ten seconds in the future remains valid for almost 21 seconds
+// after receipt. Retain its nonce for that entire interval, including rounding.
 const MAX_PEER_IDENTITY_AGE_SECS: u64 = 10;
+const PEER_NONCE_RETENTION_SECS: u64 = 2 * MAX_PEER_IDENTITY_AGE_SECS + 1;
+// Keep the existing memory bounds. Saturation rejects new authentication;
+// it must never evict a still-valid nonce to make room.
 const MAX_PEER_SOURCE_LEN: usize = 128;
 const MAX_TRACKED_NONCES_PER_SOURCE: usize = 65_536;
 const MAX_TRACKED_NONCES_TOTAL: usize = 262_144;
@@ -773,7 +775,7 @@ fn consume_nonce(cache: &OnceLock<Mutex<ReplayCache>>, source: &str, nonce: Uuid
         source,
         nonce,
         now,
-        Duration::from_secs(MAX_PEER_IDENTITY_AGE_SECS),
+        Duration::from_secs(PEER_NONCE_RETENTION_SECS),
     )
 }
 
@@ -1445,6 +1447,38 @@ mod tests {
             .consume_at_with_limits("node-c", Uuid::new_v4(), now, ttl, limits)
             .is_none());
         assert_eq!(cache.tracked, 3);
+    }
+
+    #[test]
+    fn future_timestamp_nonce_survives_the_entire_inclusive_acceptance_window() {
+        let received = Instant::now();
+        let wall_received = 100_i64;
+        let issued_at = wall_received + MAX_PEER_IDENTITY_AGE_SECS as i64;
+        let ttl = Duration::from_secs(PEER_NONCE_RETENTION_SECS);
+        let nonce = Uuid::new_v4();
+        let mut cache = ReplayCache::default();
+        assert!(cache.consume_at("peer", nonce, received, ttl).is_some());
+        // Both HMAC envelope types use this cache policy. The old ten-second
+        // TTL forgot this nonce while its signed timestamp was still valid.
+        for elapsed_ms in [10_000, 10_001, 20_000, 20_999] {
+            let wall_now = wall_received + elapsed_ms / 1000;
+            assert!(wall_now.abs_diff(issued_at) <= MAX_PEER_IDENTITY_AGE_SECS);
+            assert!(cache
+                .consume_at(
+                    "peer",
+                    nonce,
+                    received + Duration::from_millis(elapsed_ms as u64),
+                    ttl
+                )
+                .is_none());
+        }
+        assert!(
+            (wall_received + PEER_NONCE_RETENTION_SECS as i64).abs_diff(issued_at)
+                > MAX_PEER_IDENTITY_AGE_SECS
+        );
+        assert!(cache
+            .consume_at("peer", nonce, received + ttl, ttl)
+            .is_some());
     }
 
     #[test]
