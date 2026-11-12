@@ -946,6 +946,7 @@ impl Config {
             allow_insecure_peer_http,
             production_mode,
         )?;
+        validate_insecure_peer_http_scope(allow_insecure_peer_http, peer_listen, &rpc_addr)?;
 
         let enable_net = env_bool_checked("TARIT_ENABLE_NET", false)?;
         let guest_dns = parse_guest_dns(std::env::var("TARIT_GUEST_DNS").ok().as_deref())?;
@@ -1428,6 +1429,68 @@ fn validate_rpc_addr(
     Ok(())
 }
 
+/// Plaintext peer RPC carries exec commands, output and forwarded identities.
+/// When `TARIT_ALLOW_INSECURE_PEER_HTTP=1` is set, both the address the peer
+/// listener binds and the advertised `TARIT_RPC_ADDR` must stay on a loopback
+/// or private network (IPv4 RFC 1918 or IPv6 unique-local), so a cluster
+/// started without `TARIT_PRODUCTION` cannot run its peer traffic in the clear
+/// over a public network. A wildcard bind (`0.0.0.0`, `::`) is refused because
+/// it listens on every interface, including public ones. A DNS name in
+/// `TARIT_RPC_ADDR` is not resolved here (other than `localhost`); the bound
+/// peer listener address is what limits where plaintext is accepted.
+fn validate_insecure_peer_http_scope(
+    allow_insecure_http: bool,
+    peer_listen: Option<SocketAddr>,
+    rpc_addr: &str,
+) -> Result<()> {
+    if !allow_insecure_http {
+        return Ok(());
+    }
+    if let Some(address) = peer_listen {
+        if !is_loopback_or_private_ip(address.ip()) {
+            bail!(
+                "TARIT_ALLOW_INSECURE_PEER_HTTP=1 requires TARIT_PEER_LISTEN to be a loopback or private (RFC 1918 / unique-local) address, got {address}; configure peer mutual TLS instead"
+            );
+        }
+    }
+    let url =
+        reqwest::Url::parse(rpc_addr).context("TARIT_RPC_ADDR must be an absolute HTTP URL")?;
+    let rpc_ip = url
+        .host_str()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok());
+    if let Some(ip) = rpc_ip {
+        if !is_loopback_or_private_ip(ip) {
+            bail!(
+                "TARIT_ALLOW_INSECURE_PEER_HTTP=1 requires TARIT_RPC_ADDR to name a loopback or private (RFC 1918 / unique-local) address, got {rpc_addr}; configure peer mutual TLS instead"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_loopback_or_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        // fc00::/7 is the IPv6 unique-local range (RFC 4193).
+        std::net::IpAddr::V6(ip) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// The startup warning logged whenever plaintext peer HTTP is permitted.
+pub(crate) fn insecure_peer_http_warning(config: &Config) -> Option<String> {
+    config.allow_insecure_peer_http.then(|| {
+        let listener = config
+            .peer_listen
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| "none".into());
+        format!(
+            "INSECURE: TARIT_ALLOW_INSECURE_PEER_HTTP=1 is set; peer RPC (exec commands, output and forwarded identities) travels as plaintext HTTP (peer listener {listener}, advertised {}). Use only on an isolated development network; configure peer mutual TLS for any real cluster",
+            config.rpc_addr
+        )
+    })
+}
+
 /// Comma-separated IPv4 or IPv6 resolver addresses, at most three (what a
 /// guest's resolv.conf uses).
 fn parse_guest_dns(value: Option<&str>) -> Result<Vec<String>> {
@@ -1672,6 +1735,69 @@ mod security_tests {
         assert!(validate_peer_listener_config(true, false, true, address, None).is_ok());
         assert!(validate_peer_listener_config(true, true, true, address, None).is_err());
         assert!(validate_peer_listener_config(true, true, false, address, None).is_err());
+    }
+
+    #[test]
+    fn insecure_peer_http_is_limited_to_loopback_and_private_addresses() {
+        let listen = |raw: &str| Some(raw.parse::<SocketAddr>().unwrap());
+        // Without the flag nothing is restricted here (TLS rules apply elsewhere).
+        assert!(validate_insecure_peer_http_scope(
+            false,
+            listen("203.0.113.7:9443"),
+            "https://203.0.113.7:9443"
+        )
+        .is_ok());
+        for (peer, rpc) in [
+            ("127.0.0.1:9443", "http://127.0.0.1:9443"),
+            ("10.1.2.3:9443", "http://10.1.2.3:9443"),
+            ("172.16.0.9:9443", "http://172.31.255.1:9443"),
+            ("192.168.1.5:9443", "http://192.168.1.5:9443"),
+            ("[::1]:9443", "http://[::1]:9443"),
+            ("[fd12:3456::1]:9443", "http://[fd12:3456::1]:9443"),
+            ("[::ffff:10.0.0.1]:9443", "http://localhost:9443"),
+            ("10.0.0.4:9443", "http://node-a:9443"),
+        ] {
+            assert!(
+                validate_insecure_peer_http_scope(true, listen(peer), rpc).is_ok(),
+                "{peer} / {rpc} is private"
+            );
+        }
+        for (peer, rpc) in [
+            ("203.0.113.7:9443", "http://10.0.0.1:9443"),
+            ("0.0.0.0:9443", "http://10.0.0.1:9443"),
+            ("[::]:9443", "http://10.0.0.1:9443"),
+            ("172.32.0.1:9443", "http://10.0.0.1:9443"),
+            ("169.254.1.1:9443", "http://10.0.0.1:9443"),
+            ("[2001:db8::1]:9443", "http://10.0.0.1:9443"),
+            ("10.0.0.1:9443", "http://198.51.100.4:9443"),
+            ("10.0.0.1:9443", "http://[2001:db8::2]:9443"),
+            ("10.0.0.1:9443", "http://0.0.0.0:9443"),
+        ] {
+            let error = validate_insecure_peer_http_scope(true, listen(peer), rpc)
+                .expect_err(&format!("{peer} / {rpc} must be refused"))
+                .to_string();
+            assert!(
+                error.contains("TARIT_ALLOW_INSECURE_PEER_HTTP=1 requires"),
+                "{error}"
+            );
+        }
+        // Single-node mode without a peer listener still checks the advertised address.
+        assert!(validate_insecure_peer_http_scope(true, None, "http://127.0.0.1:8080").is_ok());
+        assert!(validate_insecure_peer_http_scope(true, None, "http://8.8.8.8:8080").is_err());
+    }
+
+    #[test]
+    fn insecure_peer_http_logs_a_startup_warning() {
+        let mut config = crate::api::tests::test_state().config.clone();
+        config.allow_insecure_peer_http = true;
+        let warning = insecure_peer_http_warning(&config).expect("flag set must warn");
+        assert!(warning.contains("INSECURE"), "{warning}");
+        assert!(
+            warning.contains("TARIT_ALLOW_INSECURE_PEER_HTTP"),
+            "{warning}"
+        );
+        config.allow_insecure_peer_http = false;
+        assert!(insecure_peer_http_warning(&config).is_none());
     }
 
     #[test]
