@@ -44,10 +44,37 @@ static inline bool worker_reaped(struct agent_worker *workers, size_t count,
     return false;
 }
 
+/* The signals the supervisor blocks and waits for. */
+static inline void worker_wait_signals(sigset_t *set) {
+    sigemptyset(set);
+    sigaddset(set, SIGCHLD);
+    sigaddset(set, SIGTERM);
+    sigaddset(set, SIGINT);
+}
+
+/* Milliseconds until the earliest pending restart, or -1 when every worker is
+ * running: the supervisor then sleeps until a signal instead of polling. */
+static inline int64_t worker_next_wait_ms(const struct agent_worker *workers,
+                                          size_t count, uint64_t now) {
+    int64_t wait = -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (workers[i].pid > 0) {
+            continue;
+        }
+        uint64_t due = workers[i].retry_at_ms > now ? workers[i].retry_at_ms - now : 0;
+        if (wait < 0 || due < (uint64_t)wait) {
+            wait = (int64_t)due;
+        }
+    }
+    return wait;
+}
+
 /* fork_fn is injectable so a real fork failure can be tested without exhausting
- * the guest process limit. No threads are created before these forks. */
+ * the guest process limit. No threads are created before these forks. The
+ * child installs child_mask, the mask from before the supervisor blocked its
+ * wait signals, so workers and the commands they run never inherit them. */
 static inline int worker_start(struct agent_worker *worker, uint64_t now,
-                                pid_t (*fork_fn)(void)) {
+                                pid_t (*fork_fn)(void), const sigset_t *child_mask) {
     if (worker->pid > 0 || now < worker->retry_at_ms) {
         return 0;
     }
@@ -57,8 +84,9 @@ static inline int worker_start(struct agent_worker *worker, uint64_t now,
         return -1;
     }
     if (pid == 0) {
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGINT, SIG_DFL);
+        if (sigprocmask(SIG_SETMASK, child_mask, NULL) < 0) {
+            _exit(1);
+        }
         worker->serve();
         _exit(1); /* These workers must never return normally. */
     }

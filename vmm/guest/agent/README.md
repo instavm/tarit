@@ -137,8 +137,13 @@ Restarts and fork failures back off from 100 ms to 5 seconds; ten seconds of
 stable service resets the backoff. In-flight commands or PTY sessions are not
 replayed. A reconnect after a worker failure starts a new request/session.
 When running as PID 1, the supervisor also reaps adopted command orphans.
+Between events it sleeps in `sigtimedwait` until a child exits, a restart
+falls due or SIGTERM or SIGINT asks it to stop its workers, so an idle guest
+gets no wakeups from it. Workers and the commands they run start with the
+signal mask the agent started with.
 
 Run `make test` for process-level crash/restart, orphan isolation, fork failure,
-backoff, and cleanup regressions. The supervision tests use ordinary POSIX
-children and do not require KVM or vsock. A live guest test must install the
-rebuilt agent into a private rootfs fixture before exercising worker recovery.
+backoff, idle wakeup, signal mask and cleanup regressions. The supervision tests
+use ordinary POSIX children and do not require KVM or vsock. A live guest test
+must install the rebuilt agent into a private rootfs fixture before exercising
+worker recovery.

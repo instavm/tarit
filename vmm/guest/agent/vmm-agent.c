@@ -2240,13 +2240,6 @@ static void serve_serial_forever(void) {
 }
 
 #ifdef __linux__
-static volatile sig_atomic_t supervisor_stopping;
-
-static void stop_supervisor(int signum) {
-    (void)signum;
-    supervisor_stopping = 1;
-}
-
 static uint64_t monotonic_ms(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
@@ -2263,14 +2256,16 @@ static int supervise_workers(void) {
         {.name = "serial", .serve = serve_serial_forever},
     };
     const size_t count = sizeof(workers) / sizeof(workers[0]);
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    action.sa_handler = stop_supervisor;
-    sigemptyset(&action.sa_mask);
-    if (sigaction(SIGTERM, &action, NULL) < 0 || sigaction(SIGINT, &action, NULL) < 0) {
+    /* Sleep until a worker exits, an adopted orphan needs reaping, a restart
+     * falls due or we are told to stop. Blocking these signals first means
+     * none can arrive between the reap and the wait unseen. */
+    sigset_t wait_set;
+    sigset_t child_mask;
+    worker_wait_signals(&wait_set);
+    if (sigprocmask(SIG_BLOCK, &wait_set, &child_mask) < 0) {
         return 1;
     }
-    while (!supervisor_stopping) {
+    for (;;) {
         uint64_t now = monotonic_ms();
         int status;
         pid_t pid;
@@ -2280,13 +2275,25 @@ static int supervise_workers(void) {
                         (long)pid, status);
             }
         }
-        for (size_t i = 0; i < count && !supervisor_stopping; ++i) {
-            if (worker_start(&workers[i], now, fork) < 0) {
+        for (size_t i = 0; i < count; ++i) {
+            if (worker_start(&workers[i], now, fork, &child_mask) < 0) {
                 fprintf(stderr, "vmm-agent: fork %s: %s; retrying with backoff\n",
                         workers[i].name, strerror(errno));
             }
         }
-        sleep_us(100000U);
+        int64_t wait_ms = worker_next_wait_ms(workers, count, monotonic_ms());
+        int sig;
+        if (wait_ms < 0) {
+            sig = sigwaitinfo(&wait_set, NULL);
+        } else {
+            struct timespec timeout;
+            timeout.tv_sec = (time_t)(wait_ms / 1000);
+            timeout.tv_nsec = (long)(wait_ms % 1000) * 1000000L;
+            sig = sigtimedwait(&wait_set, NULL, &timeout);
+        }
+        if (sig == SIGTERM || sig == SIGINT) {
+            break;
+        }
     }
     /* Termination is bounded even if a worker is stuck serving a command.
      * PID 1 also keeps reaping adopted command/session orphans while running. */
