@@ -1048,18 +1048,24 @@ impl VmmController {
         };
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         let resume_result = match io_resume_result {
-            Ok(()) if paused_here && state_before == VmState::Running => resume_running_vcpus(vm),
+            Ok(()) if paused_here && state_before == VmState::Running => {
+                resume_running_vcpus_or_stop(vm)
+            }
             Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
         {
-            vm.state = if resume_result.is_ok() {
-                state_before
-            } else {
-                VmState::Paused
-            };
+            // An unconfirmed vCPU resume has already stopped the VM. An I/O
+            // release failure leaves every vCPU held at this snapshot's pause.
+            if vm.state != VmState::Stopped {
+                vm.state = if resume_result.is_ok() {
+                    state_before
+                } else {
+                    VmState::Paused
+                };
+            }
         }
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
         {
@@ -3383,12 +3389,9 @@ fn pause_vcpu_group<T: SnapshotPauseTarget>(
         Ok(())
     })();
     if let Err(primary) = result {
-        // Resume every target before waiting on any one: some requests may
-        // have succeeded even when another request/acknowledgement failed.
-        for target in targets {
-            target.resume_target();
-        }
-        return match targets.iter().try_for_each(|target| target.wait_resumed()) {
+        // Some requests may have succeeded even when another
+        // request/acknowledgement failed, so roll back every target.
+        return match resume_vcpu_group(targets) {
             Ok(()) => Err((primary, true)),
             Err(resume_error) => Err((
                 VmmError::Snapshot(format!(
@@ -3399,6 +3402,35 @@ fn pause_vcpu_group<T: SnapshotPauseTarget>(
         };
     }
     Ok(())
+}
+
+/// Release every target before waiting on any one, so one slow
+/// acknowledgement does not keep the others paused.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn resume_vcpu_group<T: SnapshotPauseTarget>(targets: &[&T]) -> Result<()> {
+    for target in targets {
+        target.resume_target();
+    }
+    targets.iter().try_for_each(|target| target.wait_resumed())
+}
+
+/// Once vCPU resume has been requested, an unconfirmed acknowledgement leaves
+/// no coherent state: some vCPUs may be running guest code while another is
+/// still parked or gone. Recording Paused would let a later pause() succeed
+/// without pausing and a later snapshot publish vCPU captures older than
+/// memory, so stop the VM, as for an unconfirmed pause rollback.
+#[cfg(any(
+    test,
+    all(target_arch = "x86_64", target_os = "linux", feature = "boot")
+))]
+fn resolve_vcpu_resume(vm: &mut VmInstance, result: Result<()>) -> Result<()> {
+    if result.is_err() {
+        stop_after_uncertain_pause(vm);
+    }
+    result
 }
 
 #[cfg(any(
@@ -3552,20 +3584,14 @@ fn resume_running_io(vm: &VmInstance) -> Result<()> {
     Ok(())
 }
 
-/// Resume a Paused or Suspended VM: I/O workers first, then vCPUs. On
-/// failure the I/O workers are parked again and the VM stays paused.
+/// Resume a Paused or Suspended VM: I/O workers first, then vCPUs. If the
+/// I/O workers cannot be released, the vCPUs stay paused and so does the VM.
+/// If the vCPUs were released but not all confirmed, the VM is stopped (see
+/// [`resolve_vcpu_resume`]).
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
 fn resume_paused_vm(vm: &mut VmInstance) -> Result<()> {
     resume_running_io(vm)?;
-    if let Err(error) = resume_running_vcpus(vm) {
-        let rollback = pause_running_io(vm).err();
-        return Err(match rollback {
-            Some(rollback) => VmmError::Device(format!(
-                "resume vCPUs: {error}; failed to re-quiesce I/O workers: {rollback}"
-            )),
-            None => error,
-        });
-    }
+    resume_running_vcpus_or_stop(vm)?;
     vm.state = VmState::Running;
     Ok(())
 }
@@ -3576,14 +3602,15 @@ fn resume_running_vcpus(vm: &VmInstance) -> Result<()> {
         let vcpu_threads = std::iter::once(&r.vcpu_thread)
             .chain(r.ap_threads.iter())
             .collect::<Vec<_>>();
-        for vcpu_thread in &vcpu_threads {
-            vcpu_thread.resume();
-        }
-        for vcpu_thread in &vcpu_threads {
-            vcpu_thread.wait_snapshot_resumed()?;
-        }
+        resume_vcpu_group(&vcpu_threads)?;
     }
     Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn resume_running_vcpus_or_stop(vm: &mut VmInstance) -> Result<()> {
+    let result = resume_running_vcpus(vm);
+    resolve_vcpu_resume(vm, result)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -3834,7 +3861,9 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
             Ok(())
         };
         let resume_result = match io_resume_result {
-            Ok(()) if paused_here && state_before == VmState::Running => resume_running_vcpus(vm),
+            Ok(()) if paused_here && state_before == VmState::Running => {
+                resume_running_vcpus_or_stop(vm)
+            }
             Ok(()) => Ok(()),
             Err(error) => Err(error),
         };
@@ -3844,7 +3873,11 @@ fn suspend_vm_in_place(vm: &mut VmInstance) -> Result<()> {
                 Err(error)
             }
             Err(resume) => {
-                vm.state = VmState::Paused;
+                // An unconfirmed vCPU resume has already stopped the VM. An
+                // I/O release failure leaves every vCPU held at this pause.
+                if vm.state != VmState::Stopped {
+                    vm.state = VmState::Paused;
+                }
                 Err(VmmError::Snapshot(format!(
                     "{error}; failed to restore running state after suspend failure: {resume}"
                 )))
@@ -9335,6 +9368,78 @@ mod tests {
                 if !request_failure {
                     assert_eq!(&log[..3], &[(0, "request"), (1, "request"), (2, "request")]);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn unconfirmed_vcpu_resume_stops_instead_of_recording_paused() {
+        struct Target {
+            id: usize,
+            fail_resume: bool,
+            log: Arc<Mutex<Vec<(usize, &'static str)>>>,
+        }
+        impl SnapshotPauseTarget for Target {
+            fn request_pause(&self) -> Result<()> {
+                unreachable!("resume only")
+            }
+            fn wait_paused(&self) -> Result<()> {
+                unreachable!("resume only")
+            }
+            fn resume_target(&self) {
+                self.log.lock().unwrap().push((self.id, "resume"));
+            }
+            fn wait_resumed(&self) -> Result<()> {
+                self.log.lock().unwrap().push((self.id, "confirm"));
+                if self.fail_resume {
+                    Err(VmmError::Snapshot("injected resume timeout".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for unconfirmed in [false, true] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let targets = (0..3)
+                .map(|id| Target {
+                    id,
+                    fail_resume: unconfirmed && id == 1,
+                    log: log.clone(),
+                })
+                .collect::<Vec<_>>();
+            let refs = targets.iter().collect::<Vec<_>>();
+            let controller = controller_in_state(VmState::Paused);
+            let mut slot = controller.lock();
+            let vm = slot.as_mut().unwrap();
+            let result = resolve_vcpu_resume(vm, resume_vcpu_group(&refs));
+            assert_eq!(result.is_err(), unconfirmed);
+            // Success leaves the state to the caller; failure is terminal.
+            assert_eq!(
+                vm.state,
+                if unconfirmed {
+                    VmState::Stopped
+                } else {
+                    VmState::Paused
+                }
+            );
+            drop(slot);
+            assert_eq!(
+                &log.lock().unwrap()[..3],
+                &[(0, "resume"), (1, "resume"), (2, "resume")],
+                "every vCPU is released before any acknowledgement is awaited"
+            );
+            if unconfirmed {
+                assert!(controller.pause().is_err());
+                assert!(controller
+                    .snapshot(false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stopped"));
+                assert!(controller
+                    .suspend()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stopped"));
             }
         }
     }
