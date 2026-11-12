@@ -5063,6 +5063,12 @@ pub(crate) mod tests {
                 .is_some());
             server.abort();
             let _ = server.await;
+            // This test's owner node has no fleet handle, so its deletes leave
+            // the fleet locators behind; drop them as a fleet-backed owner
+            // would. Only tenant-a's fork-managed locator stays on the node.
+            for snapshot in [&remote_a, &remote_b] {
+                fleet.delete_snapshot(snapshot).await.unwrap();
+            }
             let mut failed_host = fleet
                 .get_host(&remote.config.host_id)
                 .await
