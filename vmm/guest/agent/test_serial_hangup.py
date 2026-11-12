@@ -33,9 +33,21 @@ def read_until(fd, marker, timeout):
     raise AssertionError('no %r within %.0fs; got %r' % (marker, timeout, buf[-300:]))
 
 
-def cpu_seconds(pid):
-    fields = open('/proc/%d/stat' % pid).read().rsplit(')', 1)[1].split()
-    return (int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK')
+def cpu_seconds(sid):
+    """CPU of every agent process in session sid. The serial loop runs in a
+    worker the supervisor forks, so the agent's own pid alone would read idle
+    even while that worker spins."""
+    ticks = 0
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        try:
+            fields = open('/proc/%s/stat' % name).read().rsplit(')', 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[3]) == sid:
+            ticks += int(fields[11]) + int(fields[12])
+    return ticks / os.sysconf('SC_CLK_TCK')
 
 
 def main(agent):
