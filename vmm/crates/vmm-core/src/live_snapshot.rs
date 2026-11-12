@@ -15,7 +15,9 @@ use crate::vcpu_thread::VcpuThread;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::time::{Duration, Instant};
+use vmm_memory_backend::backend::PageMap;
 use vmm_memory_backend::dirty::DirtyBitmap;
+use vmm_memory_backend::uffd_restore::LazyPageDiscard;
 use vmm_memory_backend::GuestMemory;
 use vmm_snapshot::live::{decide, PrecopyParams, RoundDecision};
 
@@ -343,7 +345,13 @@ pub struct LiveSnapshotOutput {
 /// Copy one contiguous half-open PFN run. Dirty bitmaps are ordered, so a
 /// guest rewriting a large buffer should cost one positioned write per run,
 /// not one syscall and one filesystem extent update per 4 KiB page.
-fn copy_page_run(mem: &GuestMemory, dest: &File, start_pfn: u64, end_pfn: u64) -> Result<u64> {
+pub(crate) fn copy_page_run(
+    mem: &GuestMemory,
+    dest: &File,
+    start_pfn: u64,
+    end_pfn: u64,
+    pagemap: Option<&PageMap>,
+) -> Result<u64> {
     let pages = end_pfn
         .checked_sub(start_pfn)
         .ok_or_else(|| VmmError::Memory("dirty page run is reversed".into()))?;
@@ -365,11 +373,31 @@ fn copy_page_run(mem: &GuestMemory, dest: &File, start_pfn: u64, end_pfn: u64) -
         .map_err(|_| VmmError::Memory("guest page offset does not fit usize".into()))?;
     let len = usize::try_from(len)
         .map_err(|_| VmmError::Memory("dirty page run length does not fit usize".into()))?;
-    // SAFETY: GuestMemory guarantees this mapping for `size_bytes`; the range
-    // was checked above and the file write does not retain the pointer.
-    let src = unsafe { std::slice::from_raw_parts(mem.as_ptr().add(offset), len) };
-    dest.write_all_at(src, gpa)
-        .map_err(|error| VmmError::Snapshot(format!("write staged RAM at {gpa:#x}: {error}")))?;
+    let Some(lazy) = mem.lazy_page_discard() else {
+        // SAFETY: GuestMemory guarantees this mapping for `size_bytes`; the
+        // range was checked above and the file write does not retain it.
+        let src = unsafe { std::slice::from_raw_parts(mem.as_ptr().add(offset), len) };
+        dest.write_all_at(src, gpa).map_err(|error| {
+            VmmError::Snapshot(format!("write staged RAM at {gpa:#x}: {error}"))
+        })?;
+        return Ok(pages);
+    };
+    let pagemap = pagemap.ok_or_else(|| VmmError::Snapshot("read the guest page map".into()))?;
+    // Captures end on capture-chunk boundaries, so each one covers whole
+    // integrity chunks and finish() reads every source chunk once.
+    let chunk = crate::snapshot_memory::live_capture_chunk(&lazy);
+    let end = offset + len;
+    let mut start = offset;
+    while start < end {
+        let stop = ((start / chunk + 1) * chunk).min(end);
+        let bytes = crate::snapshot_memory::capture_live_range(mem, pagemap, start, stop)?
+            .finish()
+            .map_err(|error| VmmError::Snapshot(format!("finish lazy dirty capture: {error}")))?;
+        dest.write_all_at(&bytes, start as u64).map_err(|error| {
+            VmmError::Snapshot(format!("write staged RAM at {start:#x}: {error}"))
+        })?;
+        start = stop;
+    }
     Ok(pages)
 }
 
@@ -418,78 +446,116 @@ pub(crate) fn write_nonzero_pages(dest: &File, source: &[u8], at: u64) -> std::i
 /// holding all of its RAM. Populated pages are read from memory. A page
 /// populated after the page map is read holds the snapshot's bytes until the
 /// guest or a device writes it, and those writes are in the dirty log.
+///
+/// RAM is captured under the balloon fence one
+/// [`crate::snapshot_memory::live_capture_chunk`] at a time. On a filesystem
+/// that shares blocks, consecutive captures the guest never touched are then
+/// cloned from the restore snapshot (still verified) in runs of up to
+/// [`CLONE_RUN_BYTES`] instead of written: nothing to copy now or to sync
+/// later. A clone needs no fence: a page the guest writes after its capture
+/// is in the dirty log, and a page discarded after it either makes the clone
+/// refuse the run or is marked host-dirty, so a later round copies it.
 fn write_lazy_restored_pages(
     dest: &File,
     mem: &GuestMemory,
-    source: &[u8],
-    lazy: &vmm_memory_backend::uffd_restore::LazyPageDiscard,
+    len: usize,
+    lazy: &LazyPageDiscard,
+    pagemap: &PageMap,
     cloning_time: &mut Duration,
 ) -> Result<u64> {
-    let page = PAGE_SIZE as usize;
-    let populated = mem
-        .populated_pages()
-        .ok_or_else(|| VmmError::Snapshot("read the guest page map".into()))?;
-    let chunk = lazy.untouched_chunk();
-    let mut buffer = vec![0u8; chunk];
+    let chunk = crate::snapshot_memory::live_capture_chunk(lazy);
     let mut written = 0u64;
-    let mut start = 0usize;
-    // On a filesystem that shares blocks, runs of chunks the guest never
-    // touched are cloned from the restore snapshot (still verified) instead
-    // of written: nothing to copy now or to sync later.
     let mut cloning = true;
-    while start < source.len() {
-        if cloning {
-            let untouched = |at: usize| {
-                let end = (at + chunk).min(source.len());
-                populated[at / page..end / page]
-                    .iter()
-                    .all(|touched| !*touched)
-            };
-            let mut run_end = start;
-            while run_end < source.len() && run_end - start < CLONE_RUN_BYTES && untouched(run_end)
-            {
-                run_end = (run_end + chunk).min(source.len());
+    // Start of the untouched run not yet cloned, which ends at `start`.
+    let mut run: Option<usize> = None;
+    let mut start = 0usize;
+    while start < len {
+        let end = (start + chunk).min(len);
+        let capture = crate::snapshot_memory::capture_live_range(mem, pagemap, start, end)?;
+        if cloning && capture.all_source_pages() {
+            let run_start = *run.get_or_insert(start);
+            if end - run_start >= CLONE_RUN_BYTES || end == len {
+                run = None;
+                written += clone_or_write_run(
+                    dest,
+                    mem,
+                    lazy,
+                    pagemap,
+                    run_start..end,
+                    &mut cloning,
+                    cloning_time,
+                )?;
             }
-            if run_end > start {
-                use vmm_memory_backend::uffd_restore::CloneOutcome;
-                let clone_started = Instant::now();
-                let outcome = lazy
-                    .clone_untouched(start, run_end - start, dest, start as u64)
-                    .map_err(|error| VmmError::Snapshot(format!("clone restored RAM: {error}")))?;
-                *cloning_time += clone_started.elapsed();
-                match outcome {
-                    CloneOutcome::Cloned => {
-                        start = run_end;
-                        continue;
-                    }
-                    CloneOutcome::NotThisRange => {}
-                    CloneOutcome::Unsupported => cloning = false,
-                }
-            }
-        }
-        let end = (start + chunk).min(source.len());
-        let pages = &populated[start / page..end / page];
-        let write = if pages.iter().all(|touched| *touched) {
-            write_nonzero_pages(dest, &source[start..end], start as u64)
         } else {
-            let bytes = &mut buffer[..end - start];
-            lazy.read_untouched(start, bytes)
-                .map_err(|error| VmmError::Snapshot(format!("read restored RAM: {error}")))?;
-            for (index, _) in pages.iter().enumerate().filter(|(_, touched)| **touched) {
-                let at = index * page;
-                bytes[at..at + page].copy_from_slice(&source[start + at..start + at + page]);
+            if let Some(run_start) = run.take() {
+                written += clone_or_write_run(
+                    dest,
+                    mem,
+                    lazy,
+                    pagemap,
+                    run_start..start,
+                    &mut cloning,
+                    cloning_time,
+                )?;
             }
-            write_nonzero_pages(dest, bytes, start as u64)
-        };
-        written +=
-            write.map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?;
+            written += write_capture(dest, capture, start)?;
+        }
         start = end;
     }
     Ok(written)
 }
 
+/// Clone `run`, captured as untouched, from the restore snapshot. If it
+/// cannot be shared, capture it again and write it.
+fn clone_or_write_run(
+    dest: &File,
+    mem: &GuestMemory,
+    lazy: &LazyPageDiscard,
+    pagemap: &PageMap,
+    run: std::ops::Range<usize>,
+    cloning: &mut bool,
+    cloning_time: &mut Duration,
+) -> Result<u64> {
+    use vmm_memory_backend::uffd_restore::CloneOutcome;
+    let started = Instant::now();
+    let outcome = lazy
+        .clone_untouched(run.start, run.len(), dest, run.start as u64)
+        .map_err(|error| VmmError::Snapshot(format!("clone restored RAM: {error}")))?;
+    *cloning_time += started.elapsed();
+    match outcome {
+        CloneOutcome::Cloned => return Ok(0),
+        CloneOutcome::Unsupported => *cloning = false,
+        CloneOutcome::NotThisRange => {}
+    }
+    let chunk = crate::snapshot_memory::live_capture_chunk(lazy);
+    let mut written = 0u64;
+    for start in run.clone().step_by(chunk) {
+        let end = (start + chunk).min(run.end);
+        let capture = crate::snapshot_memory::capture_live_range(mem, pagemap, start, end)?;
+        written += write_capture(dest, capture, start)?;
+    }
+    Ok(written)
+}
+
+fn write_capture(
+    dest: &File,
+    capture: vmm_memory_backend::uffd_restore::CapturedSnapshotRange,
+    at: usize,
+) -> Result<u64> {
+    let bytes = capture
+        .finish()
+        .map_err(|error| VmmError::Snapshot(format!("finish lazy bulk capture: {error}")))?;
+    write_nonzero_pages(dest, &bytes, at as u64)
+        .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))
+}
+
 /// Copy every page named by `dirty` into the staged file.
-fn copy_dirty_pages(mem: &GuestMemory, dest: &File, dirty: &DirtyBitmap) -> Result<u64> {
+fn copy_dirty_pages(
+    mem: &GuestMemory,
+    dest: &File,
+    dirty: &DirtyBitmap,
+    pagemap: Option<&PageMap>,
+) -> Result<u64> {
     let mut copied = 0u64;
     let max_pfn = mem.size_bytes / PAGE_SIZE;
     let mut run_start = None;
@@ -505,7 +571,7 @@ fn copy_dirty_pages(mem: &GuestMemory, dest: &File, dirty: &DirtyBitmap) -> Resu
         match run_start {
             Some(_) if pfn == run_end => run_end += 1,
             Some(start) => {
-                copied += copy_page_run(mem, dest, start, run_end)?;
+                copied += copy_page_run(mem, dest, start, run_end, pagemap)?;
                 run_start = Some(pfn);
                 run_end = pfn + 1;
             }
@@ -516,7 +582,7 @@ fn copy_dirty_pages(mem: &GuestMemory, dest: &File, dirty: &DirtyBitmap) -> Resu
         }
     }
     if let Some(start) = run_start {
-        copied += copy_page_run(mem, dest, start, run_end)?;
+        copied += copy_page_run(mem, dest, start, run_end, pagemap)?;
     }
     Ok(copied)
 }
@@ -652,26 +718,33 @@ where
     // Step 2: bulk round — copy all of guest RAM while the guest runs. This is
     // also the bandwidth sample that drives the convergence decision.
     let bulk_start = Instant::now();
-    let lazy_fence = mem.lazy_snapshot_fence();
-    let _bulk_read_guard = lazy_fence.as_ref().map(|fence| {
-        fence
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    });
     // SAFETY: GuestMemory guarantees the mapping for `size_bytes`; the
     // positioned writes copy it immediately and retain no pointer.
     let source = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem_size) };
     // A page that is zero now and written later is in the dirty log, so a
     // later round or the final stop copies it.
     let mut cloning_time = Duration::ZERO;
-    let bulk_written = match mem.lazy_page_discard() {
-        Some(lazy) => {
-            write_lazy_restored_pages(memory_file, mem, source, &lazy, &mut cloning_time)?
-        }
-        None => write_nonzero_pages(memory_file, source, 0)
+    // Lazily restored RAM is read through the page map in every round; one
+    // handle serves the whole snapshot. Without it, fail as before.
+    let lazy = mem.lazy_page_discard();
+    let pagemap = match lazy {
+        Some(_) => Some(
+            PageMap::open().ok_or_else(|| VmmError::Snapshot("read the guest page map".into()))?,
+        ),
+        None => None,
+    };
+    let bulk_written = match (lazy, pagemap.as_ref()) {
+        (Some(lazy), Some(pagemap)) => write_lazy_restored_pages(
+            memory_file,
+            mem,
+            source.len(),
+            &lazy,
+            pagemap,
+            &mut cloning_time,
+        )?,
+        _ => write_nonzero_pages(memory_file, source, 0)
             .map_err(|error| VmmError::Snapshot(format!("write bulk staged RAM: {error}")))?,
     };
-    drop(_bulk_read_guard);
     // Bulk writeback and cache eviction happen while the guest is running.
     // This keeps the staging image reclaimable instead of pinning a second
     // anonymous copy of guest RAM until publication.
@@ -748,14 +821,7 @@ where
         // Always copy what we just read. KVM cleared these bits, so leaving
         // them uncopied would drop those pages from the image entirely.
         let copy_start = Instant::now();
-        let lazy_fence = mem.lazy_snapshot_fence();
-        let _dirty_read_guard = lazy_fence.as_ref().map(|fence| {
-            fence
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        });
-        let copied = copy_dirty_pages(mem, memory_file, &dirty)?;
-        drop(_dirty_read_guard);
+        let copied = copy_dirty_pages(mem, memory_file, &dirty, pagemap.as_ref())?;
         if copied > 0 {
             memory_file.sync_data().map_err(|error| {
                 VmmError::Snapshot(format!("sync pre-copy staged RAM: {error}"))
@@ -845,14 +911,7 @@ where
         final_dirty.merge(&pending_final_dirty);
         let final_dirty_pages = final_dirty.len() as u64;
         consumed_dirty.merge(&final_dirty);
-        let lazy_fence = mem.lazy_snapshot_fence();
-        let _final_read_guard = lazy_fence.as_ref().map(|fence| {
-            fence
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        });
-        total_pages_copied += copy_dirty_pages(mem, memory_file, &final_dirty)?;
-        drop(_final_read_guard);
+        total_pages_copied += copy_dirty_pages(mem, memory_file, &final_dirty, pagemap.as_ref())?;
         // Every vCPU is paused, so the registers and device state captured here
         // are coherent with the memory image assembled above.
         let state_blob = capture_state()?;
@@ -1039,7 +1098,7 @@ mod tests {
         dirty.mark(PAGE_SIZE);
         dirty.mark(9 * PAGE_SIZE);
 
-        assert_eq!(copy_dirty_pages(&mem, &file, &dirty).unwrap(), 2);
+        assert_eq!(copy_dirty_pages(&mem, &file, &dirty, None).unwrap(), 2);
         let mut copied = vec![0u8; (2 * PAGE_SIZE) as usize];
         file.read_exact_at(&mut copied, PAGE_SIZE).unwrap();
         assert!(copied[..PAGE_SIZE as usize]
@@ -1216,5 +1275,101 @@ mod tests {
             .to_string()
             .contains("failed to confirm vCPU rollback"));
         assert_eq!(&*actions.borrow(), &["vcpu-resume"]);
+    }
+
+    /// An integrity manifest may use chunks larger than 2 MiB (up to 4 MiB).
+    /// The restore snapshot can only share whole integrity chunks, so the bulk
+    /// copy must capture and clone in whole chunks; otherwise every untouched
+    /// page is read, verified and written instead of shared.
+    #[test]
+    #[ignore = "requires permitted userfaultfd; shares blocks only where \
+                VMM_TEST_OVERLAY_DIR is on btrfs or XFS"]
+    fn lazy_bulk_clones_untouched_ram_with_large_integrity_chunks() {
+        use sha2::{Digest as _, Sha256};
+        use std::io::Write as _;
+        use vmm_memory_backend::uffd_restore::CloneOutcome;
+        use vmm_memory_backend::{start_lazy_restore_with_integrity, ChunkIntegrity};
+        const PAGE: usize = PAGE_SIZE as usize;
+        const CHUNK: usize = 4 << 20;
+        const LEN: usize = 2 * CHUNK;
+        let dir = std::env::var_os("VMM_TEST_OVERLAY_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        // Every page non-zero, so a written page is never skipped as a hole.
+        let snapshot = (0..LEN)
+            .map(|at| (at / PAGE % 251 + 1) as u8)
+            .collect::<Vec<_>>();
+        let mut source = tempfile::tempfile_in(&dir).unwrap();
+        source.write_all(&snapshot).unwrap();
+        source.sync_all().unwrap();
+        let hashes = snapshot
+            .chunks(CHUNK)
+            .map(|chunk| Sha256::digest(chunk).into())
+            .collect();
+        let mem = GuestMemory::new(LEN as u64).unwrap();
+        let lazy = start_lazy_restore_with_integrity(
+            mem.as_ptr() as *mut u8,
+            LEN,
+            &source,
+            0,
+            LEN as u64,
+            None,
+            Some(ChunkIntegrity {
+                chunk_size: CHUNK,
+                chunk_hashes: hashes,
+                prefetch: Vec::new(),
+            }),
+        )
+        .expect("explicit UFFD test requires userfaultfd");
+        mem.set_lazy_page_discard(lazy.page_discard());
+        let discard = lazy.page_discard();
+        let pagemap = PageMap::open().unwrap();
+        let bulk = |mem: &GuestMemory| {
+            let dest = tempfile::tempfile_in(&dir).unwrap();
+            dest.set_len(LEN as u64).unwrap();
+            let mut cloning_time = Duration::ZERO;
+            let written =
+                write_lazy_restored_pages(&dest, mem, LEN, &discard, &pagemap, &mut cloning_time)
+                    .unwrap();
+            let mut bytes = vec![0; LEN];
+            dest.read_exact_at(&mut bytes, 0).unwrap();
+            (written, bytes)
+        };
+
+        let probe = tempfile::tempfile_in(&dir).unwrap();
+        probe.set_len(LEN as u64).unwrap();
+        if discard.clone_untouched(0, CHUNK, &probe, 0).unwrap() == CloneOutcome::Unsupported {
+            eprintln!(
+                "skipped: {} cannot share blocks; set VMM_TEST_OVERLAY_DIR to btrfs or XFS",
+                dir.display()
+            );
+            mem.clear_lazy_page_discard();
+            drop(lazy);
+            return;
+        }
+
+        let (written, bytes) = bulk(&mem);
+        assert_eq!(written, 0, "untouched RAM is shared, not written");
+        assert!(bytes == snapshot, "shared RAM holds the snapshot's bytes");
+        assert!(
+            mem.populated_pages()
+                .unwrap()
+                .iter()
+                .all(|present| !present),
+            "the bulk copy must not fault untouched RAM in"
+        );
+
+        // The guest writes one page of the second chunk: the first chunk is
+        // still shared and only the second is written.
+        mem.write_phys((CHUNK + PAGE) as u64, &[0xee; PAGE])
+            .unwrap();
+        let mut expected = snapshot.clone();
+        expected[CHUNK + PAGE..CHUNK + 2 * PAGE].fill(0xee);
+        let (written, bytes) = bulk(&mem);
+        assert_eq!(written, CHUNK as u64);
+        assert!(bytes == expected, "touched chunk holds the guest's bytes");
+
+        mem.clear_lazy_page_discard();
+        drop(lazy);
     }
 }

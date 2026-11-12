@@ -130,6 +130,66 @@ struct LazySource {
 /// Chunk size of [`LazyPageDiscard::read_untouched`] without a manifest.
 const UNTOUCHED_READ_CHUNK: usize = 2 * 1024 * 1024;
 
+/// Owned capture: no guest mapping access or exclusion fence is needed to finish it.
+pub struct CapturedSnapshotRange {
+    lazy: LazyPageDiscard,
+    offset: usize,
+    bytes: Vec<u8>,
+    populated: Vec<bool>,
+    discarded: Vec<bool>,
+}
+
+impl CapturedSnapshotRange {
+    pub fn all_source_pages(&self) -> bool {
+        self.populated
+            .iter()
+            .zip(&self.discarded)
+            .all(|(present, discarded)| !present && !discarded)
+    }
+
+    /// Source I/O and integrity verification run after releasing guest exclusion.
+    pub fn finish(self) -> Result<Vec<u8>, UffdRestoreError> {
+        const PAGE: usize = 4096;
+        let len = self.populated.len() * PAGE;
+        if self
+            .populated
+            .iter()
+            .zip(&self.discarded)
+            .all(|(present, discarded)| *present || *discarded)
+        {
+            // `bytes` is empty when no page was populated: all discarded.
+            return Ok(if self.bytes.is_empty() {
+                vec![0; len]
+            } else {
+                self.bytes
+            });
+        }
+        let mut out = vec![0; len];
+        let chunk = self.lazy.untouched_chunk();
+        let end = self.offset + len;
+        let mut buffer = vec![0; chunk.min(self.lazy.guest_len)];
+        let mut at = self.offset / chunk * chunk;
+        while at < end {
+            let chunk_end = (at + chunk).min(self.lazy.guest_len);
+            self.lazy
+                .read_untouched(at, &mut buffer[..chunk_end - at])?;
+            let from = at.max(self.offset);
+            let to = chunk_end.min(end);
+            out[from - self.offset..to - self.offset].copy_from_slice(&buffer[from - at..to - at]);
+            at = chunk_end;
+        }
+        for (page, (present, discarded)) in self.populated.iter().zip(&self.discarded).enumerate() {
+            let range = page * PAGE..(page + 1) * PAGE;
+            if *present {
+                out[range.clone()].copy_from_slice(&self.bytes[range]);
+            } else if *discarded {
+                out[range].fill(0);
+            }
+        }
+        Ok(out)
+    }
+}
+
 impl LazyPageDiscard {
     pub fn snapshot_fence(&self) -> std::sync::Arc<std::sync::RwLock<()>> {
         self.snapshot_fence.clone()
@@ -215,6 +275,128 @@ impl LazyPageDiscard {
                 .unwrap_or(false)
             {
                 page.fill(0);
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture one bounded page-aligned range while the caller holds snapshot_fence.
+    /// Only populated RAM is copied here; file I/O is deferred to finish().
+    pub fn capture_snapshot_range(
+        &self,
+        offset: usize,
+        len: usize,
+        populated: Vec<bool>,
+    ) -> Result<CapturedSnapshotRange, UffdRestoreError> {
+        const PAGE: usize = 4096;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.guest_len)
+            .ok_or_else(|| UffdRestoreError::Uffd("capture beyond guest RAM".into()))?;
+        if !offset.is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+            || populated.len() != len / PAGE
+        {
+            return Err(UffdRestoreError::Uffd(
+                "capture requires aligned pages and population map".into(),
+            ));
+        }
+        let discarded = self
+            .discarded_pages
+            .lock()
+            .map_err(|_| UffdRestoreError::Uffd("discard bitmap lock poisoned".into()))?
+            [offset / PAGE..end / PAGE]
+            .to_vec();
+        // Untouched RAM, the bulk of a lazily restored guest, has nothing to
+        // copy: skip the buffer instead of zeroing one per range.
+        let mut bytes = if populated.iter().any(|present| *present) {
+            vec![0; len]
+        } else {
+            Vec::new()
+        };
+        for (page, present) in populated.iter().enumerate() {
+            if *present {
+                // SAFETY: validated live mmap range; caller excludes concurrent discard.
+                let source = unsafe {
+                    std::slice::from_raw_parts(
+                        (self.guest_base + offset + page * PAGE) as *const u8,
+                        PAGE,
+                    )
+                };
+                bytes[page * PAGE..(page + 1) * PAGE].copy_from_slice(source);
+            }
+        }
+        Ok(CapturedSnapshotRange {
+            lazy: self.clone(),
+            offset,
+            bytes,
+            populated,
+            discarded,
+        })
+    }
+
+    /// Copy snapshot-visible bytes without faulting missing guest pages in.
+    /// `populated` must describe present OR swapped pages while discard is
+    /// excluded by snapshot_fence (or all guest/device workers are paused).
+    /// Resident/swapped pages contain current guest writes; missing discarded
+    /// pages are zero, and other missing pages come from the verified source.
+    pub fn read_snapshot_range(
+        &self,
+        offset: usize,
+        out: &mut [u8],
+        populated: &[bool],
+    ) -> Result<(), UffdRestoreError> {
+        const PAGE: usize = 4096;
+        let end = offset
+            .checked_add(out.len())
+            .filter(|end| *end <= self.guest_len)
+            .ok_or_else(|| UffdRestoreError::Uffd("snapshot read beyond guest RAM".into()))?;
+        if populated.len() != self.guest_len / PAGE {
+            return Err(UffdRestoreError::Uffd(
+                "snapshot population map length mismatch".into(),
+            ));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        let discarded = self
+            .discarded_pages
+            .lock()
+            .map_err(|_| UffdRestoreError::Uffd("discard bitmap lock poisoned".into()))?;
+        let needs_source =
+            (offset / PAGE..end.div_ceil(PAGE)).any(|page| !populated[page] && !discarded[page]);
+        drop(discarded);
+        out.fill(0);
+        if needs_source {
+            let chunk = self.untouched_chunk();
+            let mut bytes = vec![0; chunk.min(self.guest_len)];
+            let mut at = offset / chunk * chunk;
+            while at < end {
+                let chunk_end = (at + chunk).min(self.guest_len);
+                self.read_untouched(at, &mut bytes[..chunk_end - at])?;
+                let from = at.max(offset);
+                let to = chunk_end.min(end);
+                out[from - offset..to - offset].copy_from_slice(&bytes[from - at..to - at]);
+                at = chunk_end;
+            }
+        }
+        // Never dereference a missing page: doing so would allocate a zero
+        // page for a balloon discard and undo the host-memory reclaim.
+        for (page, present) in populated
+            .iter()
+            .enumerate()
+            .take(end.div_ceil(PAGE))
+            .skip(offset / PAGE)
+        {
+            if *present {
+                let from = (page * PAGE).max(offset);
+                let to = ((page + 1) * PAGE).min(end);
+                // SAFETY: the validated range is inside the live guest mmap;
+                // callers keep that mmap alive and exclude concurrent discard.
+                let source = unsafe {
+                    std::slice::from_raw_parts((self.guest_base + from) as *const u8, to - from)
+                };
+                out[from - offset..to - offset].copy_from_slice(source);
             }
         }
         Ok(())

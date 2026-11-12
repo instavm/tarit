@@ -43,7 +43,9 @@ fn e2e_boot_snapshot_restore() {
     let snap_size = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
     eprintln!("Snapshot: {snap_ms}ms, {snap_size} bytes");
 
-    // 3. Restore.
+    // 3. Restore. One process owns one VM: stop the source first, then
+    // restore into the same, now empty, controller.
+    controller.stop().expect("stop source before restore");
     let t2 = Instant::now();
     controller
         .restore(
@@ -62,6 +64,34 @@ fn e2e_boot_snapshot_restore() {
     );
     let restore_ms = t2.elapsed().as_millis();
     eprintln!("Restore: {restore_ms}ms");
+
+    // 3b. A second restore into the occupied controller is refused and leaves
+    // the running guest alone. The proof file is written after the snapshot,
+    // so it survives only if the snapshot was not restored over this guest.
+    assert_guest_exec(
+        &controller,
+        "bash -c 'echo slot-owner > /tmp/restore-slot-proof && sync && echo proof-written'",
+        "proof-written",
+    );
+    let occupied = controller
+        .restore(
+            &snap_path,
+            Some(
+                private_overlay_path("lifecycle-occupied")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .expect_err("restore into an occupied controller must be refused");
+    assert!(
+        occupied.to_string().contains("VM already exists"),
+        "unexpected occupied-restore error: {occupied}"
+    );
+    assert_guest_exec(
+        &controller,
+        "bash -c 'cat /tmp/restore-slot-proof'",
+        "slot-owner",
+    );
 
     // 4. Verify the snapshot file is valid (read header + check magic).
     let snap_bytes = std::fs::read(&snap_path).unwrap();
@@ -139,6 +169,7 @@ fn stability_soak_10_cycles() {
         );
         let snap_path = controller.snapshot(false).expect("snapshot");
         retain_snapshot(&controller, &snap_path);
+        controller.stop().expect("stop source before restore");
         controller
             .restore(
                 &snap_path,

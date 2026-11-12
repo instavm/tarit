@@ -93,7 +93,17 @@ fn comprehensive_all_features_and_edge_cases() {
     }
 
     // === 3. Restore ===
+    // One process owns one VM: a restore into the running controller is
+    // refused, so stop the source and restore into the emptied controller.
     eprintln!("=== 3. Restore ===");
+    let occupied = controller.restore(&snap_path, None);
+    check!(
+        "restore into occupied controller refused",
+        occupied
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("VM already exists"))
+    );
+    check!("stop source before restore", controller.stop().is_ok());
     let restore_result = controller.restore(
         &snap_path,
         Some(

@@ -16,7 +16,8 @@ KERNEL="${KERNEL:-/tmp/vmlinux.microvm}"
 ROOTFS="${ROOTFS:-/tmp/vsock-rootfs.ext4}"
 SOCK=/tmp/vmm-vsock-val.sock
 LOG=/tmp/vmm-vsock-val.log
-rm -f "$SOCK" "$LOG"
+SNAP_COPY=/tmp/vmm-vsock-val.snap
+rm -f "$SOCK" "$LOG" "$SNAP_COPY"
 
 req() { python3 -c 'import json,sys;print(json.dumps({"op":"exec","command":sys.argv[1],"timeout_ms":8000}))' "$1"; }
 api() {
@@ -52,13 +53,18 @@ echo "=== pre-snapshot vsock smoke ==="
 pre=$(gx "echo pre-snapshot-vsock")
 echo "  pre-snapshot exec: $pre"
 
-echo "=== snapshot + restore (guest must re-dial vsock) ==="
+echo "=== snapshot, stop, restore (guest must re-dial vsock) ==="
 RA=$(api '{"op":"snapshot","diff":false}')
 echo "  $RA"
 SNAP=$(echo "$RA" | python3 -c "import sys,json;print(json.loads(sys.stdin.read()).get('path',''))" 2>/dev/null)
 echo "  snap=$SNAP"
+# One vmm process owns one VM and refuses a restore while that VM exists.
+# Stop releases the vmm's scratch snapshot, so restore a private copy.
+cp --reflink=auto --sparse=always "$SNAP" "$SNAP_COPY"
+api '{"op":"stop"}' >/dev/null
 MARK=$(wc -l < "$LOG")
-api '{"op":"restore","snapshot_path":"'"$SNAP"'"}' >/dev/null
+RESTORED=$(api '{"op":"restore","snapshot_path":"'"$SNAP_COPY"'"}')
+echo "  $RESTORED"
 echo "  (running 5s post-restore)"
 sleep 5
 post=$(gx "echo post-restore-vsock")
@@ -67,10 +73,12 @@ post_vsock=$(tail -n +"$MARK" "$LOG" | grep -c "via vsock" || true)
 post_connects=$(tail -n +"$MARK" "$LOG" | grep -c "guest agent connected" || true)
 echo "  post-restore execs via vsock: $post_vsock"
 echo "  post-restore vsock connections: $post_connects"
-if [ "$pre" != "pre-snapshot-vsock" ] || [ "$post" != "post-restore-vsock" ] || [ "$post_vsock" -lt 1 ]; then
+if [ "$pre" != "pre-snapshot-vsock" ] || [ "$post" != "post-restore-vsock" ] || [ "$post_vsock" -lt 1 ] \
+  || ! echo "$RESTORED" | grep -q '"restored"'; then
   echo "  ERROR: restore did not re-establish exec over vsock"
   api "{\"op\":\"stop\"}" >/dev/null
   kill "$SP" 2>/dev/null || true
+  rm -f "$SNAP_COPY"
   exit 1
 fi
 
@@ -91,3 +99,4 @@ grep -c "guest agent connected" "$LOG" | sed 's/^/  vsock connections: /'
 
 api "{\"op\":\"stop\"}" >/dev/null
 kill "$SP" 2>/dev/null || true
+rm -f "$SNAP_COPY"

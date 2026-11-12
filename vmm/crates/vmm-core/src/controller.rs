@@ -555,6 +555,19 @@ impl VmmController {
         })
     }
 
+    fn begin_empty_restore(&self) -> Result<LifecycleGuard<'_>> {
+        // The lifecycle guard excludes create/stop/another restore until the
+        // replacement is installed. Check before opening snapshots or adopting
+        // descriptors so a rejected restore cannot disturb the existing VM.
+        let guard = self.begin_lifecycle(LifecycleOp::Restore)?;
+        if self.lock().is_some() {
+            return Err(VmmError::InvalidConfig(
+                "VM already exists (1:1 model — stop first)".into(),
+            ));
+        }
+        Ok(guard)
+    }
+
     /// Boot the single VM. Error if one already exists.
     pub fn create(&self, config: VmConfig) -> Result<()> {
         let _lifecycle = self.begin_lifecycle(LifecycleOp::Create)?;
@@ -854,6 +867,11 @@ impl VmmController {
                 // whole function; we only read it, and we mutate only other `vm` fields.
                 unsafe { std::slice::from_raw_parts(mem_ptr, mem_bytes) }
             };
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+            let lazy_reader = vm
+                .guest_mem
+                .as_ref()
+                .and_then(crate::snapshot_memory::LazySnapshotReader::new);
             let state_blob: Vec<u8> = vm.state_blob.clone().unwrap_or_default();
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
             let state_blob = if volume_rewrites.is_empty() {
@@ -916,6 +934,7 @@ impl VmmController {
                     base_file,
                     base_mem_offset,
                     base_mem_crc,
+                    lazy_reader.as_ref(),
                 )?);
                 return Ok(mem_slice.len());
             }
@@ -941,6 +960,7 @@ impl VmmController {
                         &state_blob,
                         mem_slice,
                         &dirty,
+                        lazy_reader.as_ref(),
                     )
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
@@ -968,31 +988,40 @@ impl VmmController {
                     .filter(|guest_mem| guest_mem.is_file_backed())
                     .map(|guest_mem| guest_mem.file_backed_ranges());
                 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
-                match (file_ranges, populated.as_deref()) {
-                    (Some(ranges), Some(populated)) => {
-                        deferred_full = Some(write_snapshot_memory_deferred(
-                            owned_snapshot.file(),
+                if let Some(reader) = lazy_reader.as_ref() {
+                    write_lazy_snapshot_to_file(
+                        owned_snapshot.file(),
+                        &state_blob,
+                        mem_slice,
+                        reader,
+                    )?;
+                } else {
+                    match (file_ranges, populated.as_deref()) {
+                        (Some(ranges), Some(populated)) => {
+                            deferred_full = Some(write_snapshot_memory_deferred(
+                                owned_snapshot.file(),
+                                &state_blob,
+                                mem_slice,
+                                populated,
+                                &ranges,
+                            )?);
+                        }
+                        // File-backed RAM without a pagemap must be read in full.
+                        (Some(_), None) => write_scratch_snapshot_file(
+                            &owned_snapshot,
+                            &state_blob,
+                            mem_slice,
+                            None,
+                            false,
+                        )?,
+                        (None, populated) => write_scratch_snapshot_file(
+                            &owned_snapshot,
                             &state_blob,
                             mem_slice,
                             populated,
-                            &ranges,
-                        )?);
+                            false,
+                        )?,
                     }
-                    // File-backed RAM without a pagemap must be read in full.
-                    (Some(_), None) => write_scratch_snapshot_file(
-                        &owned_snapshot,
-                        &state_blob,
-                        mem_slice,
-                        None,
-                        false,
-                    )?,
-                    (None, populated) => write_scratch_snapshot_file(
-                        &owned_snapshot,
-                        &state_blob,
-                        mem_slice,
-                        populated,
-                        false,
-                    )?,
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", feature = "boot")))]
                 write_scratch_snapshot_file(
@@ -2040,7 +2069,7 @@ impl VmmController {
     ) -> Result<()> {
         use std::time::Instant;
 
-        let _lifecycle = self.begin_lifecycle(LifecycleOp::Restore)?;
+        let _lifecycle = self.begin_empty_restore()?;
         let runtime_dir = RuntimeDirUse::acquire();
         let start = Instant::now();
         let restored =
@@ -2294,6 +2323,7 @@ impl VmmController {
         _memory_integrity: Option<tarit_proto::MemoryIntegrity>,
         _target_memory_mib: Option<u64>,
     ) -> Result<()> {
+        let _lifecycle = self.begin_empty_restore()?;
         Err(VmmError::Snapshot("restore needs Linux+KVM+boot".into()))
     }
 
@@ -5232,6 +5262,27 @@ impl SnapshotWriteLayout {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+fn write_lazy_snapshot_to_file(
+    file: &std::fs::File,
+    state: &[u8],
+    memory: &[u8],
+    reader: &crate::snapshot_memory::LazySnapshotReader,
+) -> Result<()> {
+    let layout = SnapshotWriteLayout::new(state, memory.len(), false)?;
+    file.set_len(0)
+        .map_err(|error| VmmError::Snapshot(error.to_string()))?;
+    let mut crc = crc32fast::Hasher::new();
+    for start in (0..memory.len()).step_by(2 * 1024 * 1024) {
+        let end = (start + 2 * 1024 * 1024).min(memory.len());
+        let bytes = crate::snapshot_memory::read_snapshot_bytes(memory, Some(reader), start, end)?;
+        crc.update(&bytes);
+        crate::live_snapshot::write_nonzero_pages(file, &bytes, layout.mem_offset + start as u64)
+            .map_err(|error| VmmError::Snapshot(error.to_string()))?;
+    }
+    layout.finish(file, state, crc.finalize())
+}
+
 fn write_snapshot_to_file(
     file: &std::fs::File,
     state_blob: &[u8],
@@ -5414,6 +5465,7 @@ fn check_snapshot_base(
 /// written from memory, every other page is queued to be copied from `base`
 /// after the guest resumes ([`finish_deferred_snapshot`]).
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+#[allow(clippy::too_many_arguments)] // Base identity and optional lazy reader describe one source.
 fn write_snapshot_memory_from_base(
     file: &std::fs::File,
     state_blob: &[u8],
@@ -5422,6 +5474,7 @@ fn write_snapshot_memory_from_base(
     base: Arc<std::fs::File>,
     base_mem_offset: u64,
     base_mem_crc: u32,
+    reader: Option<&crate::snapshot_memory::LazySnapshotReader>,
 ) -> Result<DeferredFullSnapshot> {
     use std::os::unix::fs::FileExt;
 
@@ -5444,9 +5497,14 @@ fn write_snapshot_memory_from_base(
         // Write the dirty run page by page, leaving zero pages as holes.
         let mut page = start;
         while page < end {
-            let bytes = &mem[page as usize..(page + PAGE).min(end) as usize];
-            if !is_zero(bytes) {
-                file.write_all_at(bytes, layout.mem_offset + page)
+            let bytes = crate::snapshot_memory::read_snapshot_bytes(
+                mem,
+                reader,
+                page as usize,
+                (page + PAGE).min(end) as usize,
+            )?;
+            if !is_zero(&bytes) {
+                file.write_all_at(&bytes, layout.mem_offset + page)
                     .map_err(|e| VmmError::Snapshot(e.to_string()))?;
             }
             page += PAGE;
@@ -5838,8 +5896,9 @@ fn write_scratch_diff_snapshot_file(
     state_blob: &[u8],
     mem: &[u8],
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+    reader: Option<&crate::snapshot_memory::LazySnapshotReader>,
 ) -> Result<usize> {
-    write_diff_snapshot_to_file(owned_file.file(), parent, state_blob, mem, dirty)
+    write_diff_snapshot_to_file(owned_file.file(), parent, state_blob, mem, dirty, reader)
 }
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5852,7 +5911,7 @@ fn write_diff_snapshot_file_with_mode(
     mode: SnapshotCreateMode,
 ) -> Result<usize> {
     let file = open_snapshot_output(path, mode)?;
-    write_diff_snapshot_to_file(&file, parent, state_blob, mem, dirty)
+    write_diff_snapshot_to_file(&file, parent, state_blob, mem, dirty, None)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
@@ -5862,6 +5921,7 @@ fn write_diff_snapshot_to_file(
     state_blob: &[u8],
     mem: &[u8],
     dirty: &vmm_memory_backend::dirty::DirtyBitmap,
+    reader: Option<&crate::snapshot_memory::LazySnapshotReader>,
 ) -> Result<usize> {
     use std::io::Write;
 
@@ -5877,7 +5937,15 @@ fn write_diff_snapshot_to_file(
         let start = offset as usize;
         let full_end = start + pages as usize * DIFF_PAGE_BYTES;
         let end = full_end.min(mem.len());
-        data_crc.update(&mem[start..end]);
+        for at in (start..end).step_by(2 * 1024 * 1024) {
+            let bytes = crate::snapshot_memory::read_snapshot_bytes(
+                mem,
+                reader,
+                at,
+                (at + 2 * 1024 * 1024).min(end),
+            )?;
+            data_crc.update(&bytes);
+        }
         // The reader checks the padded run, so pad the CRC the same way.
         data_crc.update(&vec![0u8; full_end - end]);
         data_len += end - start;
@@ -5913,14 +5981,18 @@ fn write_diff_snapshot_to_file(
     wr(&header)?;
     for &(offset, pages) in &runs {
         let start = offset as usize;
-        let end = start + pages as usize * DIFF_PAGE_BYTES;
-        if end <= mem.len() {
-            wr(&mem[start..end])?;
-        } else {
-            // A partial final page is zero-filled so the data stays aligned.
-            wr(&mem[start..])?;
-            wr(&vec![0u8; end - mem.len()])?;
+        let full_end = start + pages as usize * DIFF_PAGE_BYTES;
+        let end = full_end.min(mem.len());
+        for at in (start..end).step_by(2 * 1024 * 1024) {
+            let bytes = crate::snapshot_memory::read_snapshot_bytes(
+                mem,
+                reader,
+                at,
+                (at + 2 * 1024 * 1024).min(end),
+            )?;
+            wr(&bytes)?;
         }
+        wr(&vec![0u8; full_end - end])?;
     }
     file.flush()
         .map_err(|e| VmmError::Snapshot(e.to_string()))?;
@@ -9167,6 +9239,42 @@ mod tests {
         controller
     }
 
+    #[test]
+    fn occupied_restore_rejects_before_snapshot_io_and_preserves_the_instance() {
+        for state in [
+            VmState::Created,
+            VmState::Running,
+            VmState::Paused,
+            VmState::Suspended,
+            VmState::Stopped,
+        ] {
+            let controller = controller_in_state(state);
+            let generation = controller.lock().as_ref().unwrap().generation;
+            for _ in 0..2 {
+                let error = controller
+                    .restore_with_memory_target(
+                        "/nonexistent/restore-must-not-open-this",
+                        None,
+                        None,
+                        None,
+                        tarit_proto::RestoreMemoryPolicy::default(),
+                        None,
+                        None,
+                    )
+                    .unwrap_err();
+                assert!(error.to_string().contains("VM already exists"), "{error}");
+                let slot = controller.lock();
+                let vm = slot.as_ref().unwrap();
+                assert_eq!(vm.generation, generation);
+                assert_eq!(vm.state, state);
+                assert_eq!(vm.mem_dump.as_ref().unwrap(), &vec![0; 4096]);
+            }
+            // Failure released its lifecycle reservation, so teardown is usable.
+            controller.stop().unwrap();
+            assert!(controller.lock().is_none());
+        }
+    }
+
     fn net(tap: &str, mac: &str, ip: &str) -> NetConfig {
         NetConfig {
             tap: tap.into(),
@@ -9544,6 +9652,269 @@ mod tests {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
     #[test]
+    #[ignore = "requires permitted userfaultfd; run explicitly on Linux"]
+    fn lazy_snapshot_writers_preserve_balloon_reclaim_and_current_bytes() {
+        use std::io::Write as _;
+        use vmm_memory_backend::{
+            dirty::DirtyBitmap, uffd_restore::start_lazy_restore, GuestMemory,
+        };
+        const PAGE: usize = 4096;
+        const LEN: usize = 16 * PAGE;
+        let memory = GuestMemory::new(LEN as u64).unwrap();
+        // SAFETY: this is the live page-aligned mapping owned by memory.
+        assert_eq!(
+            unsafe {
+                libc::madvise(
+                    memory.as_ptr() as *mut libc::c_void,
+                    LEN,
+                    libc::MADV_NOHUGEPAGE,
+                )
+            },
+            0
+        );
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(&vec![0x5a; LEN]).unwrap();
+        let lazy = start_lazy_restore(
+            memory.as_ptr() as *mut u8,
+            LEN,
+            &source,
+            0,
+            LEN as u64,
+            None,
+        )
+        .expect("explicit UFFD regression requires permitted userfaultfd");
+        memory.set_lazy_page_discard(lazy.page_discard());
+        memory.read_phys(PAGE as u64, &mut [0; PAGE]).unwrap();
+        memory.write_phys((3 * PAGE) as u64, &[0xa5; PAGE]).unwrap();
+        memory
+            .discard_range(PAGE as u64, (2 * PAGE) as u64)
+            .unwrap();
+        // Reusing a discarded page must preserve its new guest bytes too.
+        memory
+            .discard_range((4 * PAGE) as u64, PAGE as u64)
+            .unwrap();
+        memory.write_phys((4 * PAGE) as u64, &[0xb6; PAGE]).unwrap();
+        let before = memory.populated_pages().unwrap();
+        assert!(!before[1] && !before[2] && before[3] && before[4]);
+        let reader = crate::snapshot_memory::LazySnapshotReader::new(&memory)
+            .expect("lazy RAM with a readable page map");
+        // SAFETY: the mapping stays live and no guest/device workers run here.
+        let raw = unsafe { std::slice::from_raw_parts(memory.as_ptr(), LEN) };
+        let mut expected = vec![0x5a; LEN];
+        expected[PAGE..3 * PAGE].fill(0);
+        expected[3 * PAGE..4 * PAGE].fill(0xa5);
+        expected[4 * PAGE..5 * PAGE].fill(0xb6);
+        let reference = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(reference.path(), b"state", &expected);
+        let full = tempfile::NamedTempFile::new().unwrap();
+        write_lazy_snapshot_to_file(full.as_file(), b"state", raw, &reader).unwrap();
+        assert_eq!(
+            std::fs::read(full.path()).unwrap(),
+            std::fs::read(reference.path()).unwrap()
+        );
+        assert_eq!(memory.populated_pages().unwrap(), before);
+
+        let mut dirty = DirtyBitmap::new();
+        for page in 1..=4 {
+            dirty.mark((page * PAGE) as u64);
+        }
+        let base = tempfile::NamedTempFile::new().unwrap();
+        write_full_snapshot_for_test(base.path(), b"state", &vec![0x5a; LEN]);
+        let identity = full_snapshot_identity(base.path()).unwrap();
+        let (base_file, offset, crc) =
+            open_snapshot_base(base.path().to_str().unwrap(), &identity, LEN).unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let pending = write_snapshot_memory_from_base(
+            output.as_file(),
+            b"state",
+            raw,
+            &dirty,
+            base_file,
+            offset,
+            crc,
+            Some(&reader),
+        )
+        .unwrap();
+        finish_deferred_snapshot(output.as_file(), pending).unwrap();
+        assert_eq!(
+            std::fs::read(output.path()).unwrap(),
+            std::fs::read(reference.path()).unwrap()
+        );
+        assert_eq!(memory.populated_pages().unwrap(), before);
+
+        let diff = tempfile::NamedTempFile::new().unwrap();
+        let diff_reference = tempfile::NamedTempFile::new().unwrap();
+        write_diff_snapshot_to_file(
+            diff.as_file(),
+            "parent",
+            b"state",
+            raw,
+            &dirty,
+            Some(&reader),
+        )
+        .unwrap();
+        write_diff_snapshot_to_file(
+            diff_reference.as_file(),
+            "parent",
+            b"state",
+            &expected,
+            &dirty,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(diff.path()).unwrap(),
+            std::fs::read(diff_reference.path()).unwrap()
+        );
+        assert_eq!(memory.populated_pages().unwrap(), before);
+        let live = tempfile::NamedTempFile::new().unwrap();
+        let pagemap = vmm_memory_backend::backend::PageMap::open().unwrap();
+        crate::live_snapshot::copy_page_run(&memory, live.as_file(), 0, 16, Some(&pagemap))
+            .unwrap();
+        assert_eq!(std::fs::read(live.path()).unwrap(), expected);
+        assert_eq!(memory.populated_pages().unwrap(), before);
+        memory.clear_lazy_page_discard();
+        drop(lazy);
+    }
+
+    /// InstaVM runs the vmm in a jail without /proc, so the page map of a
+    /// lazily restored guest cannot be read there. A paused snapshot must then
+    /// read RAM in full, as it did before the page map was consulted, and not
+    /// fail. The test reruns itself in a private mount namespace with /proc
+    /// unmounted and snapshots a paused lazily restored VM through the
+    /// controller.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
+    #[ignore = "requires root (a private mount namespace) and permitted userfaultfd"]
+    fn lazy_snapshot_without_proc_reads_ram_in_full() {
+        const CHILD: &str = "TARIT_TEST_LAZY_SNAPSHOT_WITHOUT_PROC";
+        if let Some(marker) = std::env::var_os(CHILD) {
+            lazy_snapshot_without_proc_child();
+            std::fs::write(marker, b"done").unwrap();
+            return;
+        }
+        use std::os::unix::process::CommandExt as _;
+        // The child writes this only after its assertions, so a filter that
+        // matched no test cannot pass.
+        let marker = tempfile::NamedTempFile::new().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "controller::tests::lazy_snapshot_without_proc_reads_ram_in_full",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, marker.path());
+        // SAFETY: the hook runs between fork and exec and only makes raw
+        // syscalls on static C strings; it neither allocates nor locks.
+        unsafe {
+            child.pre_exec(|| {
+                let fail = |rc: libc::c_int| {
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                };
+                fail(libc::unshare(libc::CLONE_NEWNS))?;
+                fail(libc::mount(
+                    c"none".as_ptr(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ))?;
+                fail(libc::umount2(c"/proc".as_ptr(), libc::MNT_DETACH))
+            });
+        }
+        let status = child.status().expect("rerun the test without /proc");
+        assert!(status.success(), "snapshot without /proc: {status}");
+        assert_eq!(std::fs::read(marker.path()).unwrap(), b"done");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    fn lazy_snapshot_without_proc_child() {
+        use std::io::Write as _;
+        use vmm_memory_backend::{uffd_restore::start_lazy_restore, GuestMemory};
+        const PAGE: usize = 4096;
+        const LEN: usize = 16 * PAGE;
+        assert!(
+            std::fs::File::open("/proc/self/pagemap").is_err(),
+            "the child must run without /proc"
+        );
+        let memory = GuestMemory::new(LEN as u64).unwrap();
+        // SAFETY: this is the live page-aligned mapping owned by memory.
+        assert_eq!(
+            unsafe {
+                libc::madvise(
+                    memory.as_ptr() as *mut libc::c_void,
+                    LEN,
+                    libc::MADV_NOHUGEPAGE,
+                )
+            },
+            0
+        );
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(&vec![0x5a; LEN]).unwrap();
+        let lazy = start_lazy_restore(
+            memory.as_ptr() as *mut u8,
+            LEN,
+            &source,
+            0,
+            LEN as u64,
+            None,
+        )
+        .expect("permitted userfaultfd");
+        memory.set_lazy_page_discard(lazy.page_discard());
+        assert!(
+            crate::snapshot_memory::LazySnapshotReader::new(&memory).is_none(),
+            "without a page map the snapshot reads RAM in full"
+        );
+        memory.write_phys((3 * PAGE) as u64, &[0xa5; PAGE]).unwrap();
+        memory
+            .discard_range(PAGE as u64, (2 * PAGE) as u64)
+            .unwrap();
+        let mut expected = vec![0x5a; LEN];
+        expected[PAGE..3 * PAGE].fill(0);
+        expected[3 * PAGE..4 * PAGE].fill(0xa5);
+
+        let controller = VmmController::new();
+        *controller.lock() = Some(VmInstance {
+            state: VmState::Paused,
+            generation: next_vm_generation(),
+            created_at: std::time::Instant::now(),
+            last_snapshot: None,
+            base_identity: None,
+            restore_base: None,
+            transient_files: VmTransientFiles::default(),
+            dirty_logging: false,
+            config: cfg(),
+            guest_mem: Some(memory),
+            state_blob: Some(b"state".to_vec()),
+            mem_dump: None,
+            lazy_restore: Some(lazy),
+            running: None,
+            runtime_dir: RuntimeDirUse::acquire(),
+        });
+        let path = controller
+            .snapshot(false)
+            .expect("a paused snapshot without a page map");
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], b"VMSN");
+        let state_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mem_len = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
+        assert_eq!(mem_len, LEN);
+        assert!(
+            bytes[32 + state_len..] == expected[..],
+            "the full read keeps the source, discarded and written pages"
+        );
+        controller.stop().unwrap();
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "boot"))]
+    #[test]
     fn snapshot_from_base_is_identical_to_a_full_snapshot() {
         use vmm_memory_backend::dirty::DirtyBitmap;
         const PAGE: usize = 4096;
@@ -9586,6 +9957,7 @@ mod tests {
             file,
             offset,
             crc,
+            None,
         )
         .unwrap();
         finish_deferred_snapshot(out.as_file(), pending).unwrap();
@@ -9626,6 +9998,7 @@ mod tests {
             file,
             offset,
             crc,
+            None,
         )
         .unwrap();
         let error = finish_deferred_snapshot(out.as_file(), pending).unwrap_err();

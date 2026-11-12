@@ -3,7 +3,9 @@
 #
 # Two modes:
 #   --mode=fast  Boots the candidate with the agent rootfs, executes in the
-#                guest, snapshots, restores, and executes again every cycle.
+#                guest, snapshots, stops the source, restores into the same
+#                process and executes again, then checks that a second restore
+#                into the occupied process is refused, every cycle.
 #                Default for leak hunting and steady-state regression.
 #   --mode=full  Runs the full workspace test suite (~minutes per cycle).
 #                Default for correctness coverage on long runs.
