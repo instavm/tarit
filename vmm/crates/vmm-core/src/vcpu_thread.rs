@@ -982,7 +982,14 @@ mod tests {
     /// A pause that lands inside a long MMIO string instruction and cannot
     /// finish it fails that pause only: no state is captured, the vCPU
     /// acknowledges and resumes, and its thread stays alive for the next
-    /// pause. With the production budget every such pause succeeds.
+    /// pause. With the production budget every such pause succeeds, and each
+    /// capture holds registers that match memory, never a half-done copy.
+    ///
+    /// The vCPU is prepared the way the controller prepares one before its
+    /// thread can capture: an in-kernel irqchip (the capture reads the LAPIC)
+    /// and `setup_cpuid`, which also caches the snapshot MSR list that the
+    /// seccomp-confined vCPU thread cannot read from /dev/kvm. Without them
+    /// every capture fails, so every pause is refused whatever the budget.
     #[test]
     #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
     fn kvm_pause_that_cannot_finish_io_fails_without_killing_the_vcpu() {
@@ -991,11 +998,18 @@ mod tests {
         let program: [u8; 13] = [
             0xb9, 0xa0, 0x0f, 0xbe, 0x00, 0x80, 0xbf, 0x00, 0x20, 0xf3, 0xa4, 0xeb, 0xf3,
         ];
+        const REP_RIP: u64 = 0x1009;
+        const COUNT: u64 = 4000;
         for budget in [4, PENDING_IO_REENTRY_BUDGET] {
             let (vm, _mem) = real_mode_vm(&kvm, &program);
+            vm.create_irq_chip().unwrap();
+            let vcpu = real_mode_vcpu(&vm);
+            crate::vcpu_setup::setup_cpuid(&vcpu).unwrap();
+            crate::vcpu_setup::capture_vcpu_full_state(&vcpu)
+                .expect("the test vCPU must allow a full capture");
             let thread = VcpuThread::spawn_with_start_gate(
                 VcpuId(0),
-                real_mode_vcpu(&vm),
+                vcpu,
                 Arc::new(MmioBus::new()),
                 test_serial(),
                 None,
@@ -1004,14 +1018,45 @@ mod tests {
             .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(5));
             let mut refused = 0;
+            let mut inside_rep = 0;
             for _ in 0..20 {
                 thread.request_snapshot_pause().unwrap();
-                if let Err(error) = thread.wait_snapshot_paused() {
-                    assert!(
-                        error.to_string().contains("did not capture state"),
-                        "budget {budget}: {error}"
-                    );
-                    refused += 1;
+                match thread.wait_snapshot_paused() {
+                    Ok(()) => {
+                        let bytes = thread
+                            .captured_state
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .expect("a confirmed pause holds a capture");
+                        let state: crate::vcpu_setup::VcpuFullState =
+                            postcard::from_bytes(&bytes).unwrap();
+                        let regs = state.regs;
+                        if regs.rip == REP_RIP {
+                            // KVM leaves an emulated `rep` only when cx is a
+                            // multiple of 1,024, including 0 (the guest then
+                            // runs the rep with nothing left). Any other count
+                            // is a mid-instruction capture. Real mode: 16-bit.
+                            let left = regs.rcx & 0xffff;
+                            assert!(
+                                left == COUNT || left.is_multiple_of(1024),
+                                "budget {budget}: captured inside rep movsb, cx={left}"
+                            );
+                            let done = COUNT - left;
+                            assert_eq!(regs.rsi & 0xffff, 0x8000 + done, "budget {budget}");
+                            assert_eq!(regs.rdi & 0xffff, 0x2000 + done, "budget {budget}");
+                            if left < COUNT {
+                                inside_rep += 1;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        assert!(
+                            error.to_string().contains("did not capture state"),
+                            "budget {budget}: {error}"
+                        );
+                        refused += 1;
+                    }
                 }
                 assert!(!thread.is_exited(), "budget {budget}: vCPU thread exited");
                 thread.resume();
@@ -1020,6 +1065,7 @@ mod tests {
             }
             if budget == PENDING_IO_REENTRY_BUDGET {
                 assert_eq!(refused, 0, "the production budget must finish rep I/O");
+                assert!(inside_rep > 0, "no pause landed inside the rep instruction");
             } else {
                 assert!(refused > 0, "no pause landed inside the rep instruction");
             }
