@@ -2482,13 +2482,8 @@ mod tests {
         }
         // A gate already held by another operation must not even be awaited by
         // an unauthorized old share. The public ingress rejects before wake.
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        state
-            .activation_gates
-            .lock()
-            .unwrap()
-            .insert(share.vm_id, gate.clone());
-        let held = gate.lock_owned().await;
+        let gate = crate::ops::activation_gate(&state, share.vm_id).unwrap();
+        let held = gate.lock().await;
         for websocket in [false, true] {
             let mut request = Request::builder().uri("/").header(HOST, SHARE_HOST);
             if websocket {
@@ -3317,86 +3312,97 @@ mod tests {
 
     #[tokio::test]
     async fn remote_owner_bridges_text_binary_ping_pong_and_graceful_close() {
-        let (upstream, observed) = spawn_cross_node_websocket_upstream().await;
-        let cluster =
-            TestShareCluster::start_with_upstream(upstream, ShareVisibility::Public).await;
-        let mut request = format!("ws://{}/socket?keep=this", cluster.client_addr)
-            .into_client_request()
-            .unwrap();
-        request
-            .headers_mut()
-            .insert(HOST, HeaderValue::from_static(SHARE_HOST));
-        request.headers_mut().insert(
-            SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("chat, alternate"),
-        );
-        request
-            .headers_mut()
-            .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
-        request
-            .headers_mut()
-            .insert(COOKIE, HeaderValue::from_static("session=guest"));
-        request
-            .headers_mut()
-            .insert(AUTHORIZATION, HeaderValue::from_static("******"));
-        request.headers_mut().insert(
-            "x-tarit-share-token",
-            HeaderValue::from_static("must-not-reach-guest"),
-        );
-
-        let (mut client, response) = connect_async(request).await.unwrap();
-        assert_eq!(
-            response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
-            "chat"
-        );
-        wait_for_websocket_gauge(&cluster.client_metrics, 1).await;
-        wait_for_websocket_gauge(&cluster.owner_metrics, 1).await;
-
-        client
-            .send(TungsteniteMessage::Text("through-owner".into()))
-            .await
-            .unwrap();
-        assert_eq!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Text("through-owner".into())
-        );
-        client
-            .send(TungsteniteMessage::Binary(Bytes::from_static(
-                b"through-owner",
-            )))
-            .await
-            .unwrap();
-        assert_eq!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Binary(Bytes::from_static(b"through-owner"))
-        );
-        client
-            .send(TungsteniteMessage::Ping(Bytes::from_static(b"ping")))
-            .await
-            .unwrap();
-        assert_eq!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Pong(Bytes::from_static(b"ping"))
-        );
-        client
-            .send(TungsteniteMessage::Pong(Bytes::from_static(b"pong")))
-            .await
-            .unwrap();
-        client.send(TungsteniteMessage::Close(None)).await.unwrap();
-        assert!(matches!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Close(_)
-        ));
-
-        wait_for_websocket_gauge(&cluster.client_metrics, 0).await;
-        wait_for_websocket_gauge(&cluster.owner_metrics, 0).await;
-        let observed = observed.await.unwrap();
-        for frame in ["text", "binary", "ping", "pong", "close"] {
-            assert!(
-                observed.contains(&frame),
-                "upstream did not receive {frame}"
+        // Protocol coverage must tolerate scheduler delays on loaded CI hosts.
+        // Dedicated idle-eviction tests retain their short idle deadlines.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (upstream, observed) = spawn_cross_node_websocket_upstream().await;
+            let cluster = TestShareCluster::start_with_idle_timeout(
+                upstream,
+                ShareVisibility::Public,
+                None,
+                30,
+            )
+            .await;
+            let mut request = format!("ws://{}/socket?keep=this", cluster.client_addr)
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert(HOST, HeaderValue::from_static(SHARE_HOST));
+            request.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static("chat, alternate"),
             );
-        }
+            request
+                .headers_mut()
+                .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+            request
+                .headers_mut()
+                .insert(COOKIE, HeaderValue::from_static("session=guest"));
+            request
+                .headers_mut()
+                .insert(AUTHORIZATION, HeaderValue::from_static("******"));
+            request.headers_mut().insert(
+                "x-tarit-share-token",
+                HeaderValue::from_static("must-not-reach-guest"),
+            );
+
+            let (mut client, response) = connect_async(request).await.unwrap();
+            assert_eq!(
+                response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
+                "chat"
+            );
+            wait_for_websocket_gauge(&cluster.client_metrics, 1).await;
+            wait_for_websocket_gauge(&cluster.owner_metrics, 1).await;
+
+            client
+                .send(TungsteniteMessage::Text("through-owner".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Text("through-owner".into())
+            );
+            client
+                .send(TungsteniteMessage::Binary(Bytes::from_static(
+                    b"through-owner",
+                )))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Binary(Bytes::from_static(b"through-owner"))
+            );
+            client
+                .send(TungsteniteMessage::Ping(Bytes::from_static(b"ping")))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Pong(Bytes::from_static(b"ping"))
+            );
+            client
+                .send(TungsteniteMessage::Pong(Bytes::from_static(b"pong")))
+                .await
+                .unwrap();
+            client.send(TungsteniteMessage::Close(None)).await.unwrap();
+            assert!(matches!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Close(_)
+            ));
+
+            wait_for_websocket_gauge(&cluster.client_metrics, 0).await;
+            wait_for_websocket_gauge(&cluster.owner_metrics, 0).await;
+            let observed = observed.await.unwrap();
+            for frame in ["text", "binary", "ping", "pong", "close"] {
+                assert!(
+                    observed.contains(&frame),
+                    "upstream did not receive {frame}"
+                );
+            }
+        })
+        .await
+        .expect("remote websocket protocol forwarding must complete within 15s");
     }
 
     #[tokio::test]
@@ -3516,7 +3522,17 @@ mod tests {
             visibility: ShareVisibility,
             release_second_chunk: Option<oneshot::Sender<()>>,
         ) -> Self {
-            let owner = gateway_test_state_for_host("owner");
+            Self::start_with_idle_timeout(upstream, visibility, release_second_chunk, 1).await
+        }
+
+        async fn start_with_idle_timeout(
+            upstream: SocketAddr,
+            visibility: ShareVisibility,
+            release_second_chunk: Option<oneshot::Sender<()>>,
+            idle_timeout_secs: u64,
+        ) -> Self {
+            let mut owner = gateway_test_state_for_host("owner");
+            owner.config.share_idle_timeout_secs = idle_timeout_secs;
             let owner_state = owner.clone();
             let owner_metrics = Arc::clone(&owner.metrics);
             let owner_shares = owner.shares.clone();
@@ -3541,7 +3557,8 @@ mod tests {
             ))
             .await;
 
-            let client = gateway_test_state_for_host("non-owner");
+            let mut client = gateway_test_state_for_host("non-owner");
+            client.config.share_idle_timeout_secs = idle_timeout_secs;
             let client_metrics = Arc::clone(&client.metrics);
             client.shares.insert(&share).await.unwrap();
             // The test's authoritative-host override substitutes for fleet
