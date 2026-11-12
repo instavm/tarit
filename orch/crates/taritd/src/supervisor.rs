@@ -1972,13 +1972,33 @@ enum RestoreOverlay {
 
 /// A restore's private disk upper being seeded from its snapshot (copied,
 /// handed to the jail's uid, and checked against the snapshot manifest) on
-/// a thread of its own. Dropping it unfinished waits for the thread and
-/// removes whatever it wrote.
+/// a thread of its own. Dropping it unfinished requests cancellation, joins
+/// the writer, and removes its output before runtime/jail cleanup proceeds.
 struct OverlaySeeding {
     destination: PathBuf,
     thread: Option<std::thread::JoinHandle<Result<(), OrchError>>>,
     spawn_error: Option<OrchError>,
     keep: bool,
+    cancellation: Arc<OverlaySeedCancellation>,
+}
+
+struct OverlaySeedCancellation {
+    requested: AtomicBool,
+    boot: Option<Arc<BootControl>>,
+}
+
+impl OverlaySeedCancellation {
+    fn check(&self) -> std::io::Result<()> {
+        if self.requested.load(Ordering::Acquire)
+            || self.boot.as_ref().is_some_and(|boot| boot.is_cancelled())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "restore disk seeding cancelled",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl OverlaySeeding {
@@ -1988,12 +2008,25 @@ impl OverlaySeeding {
         jail_owner: Option<(u32, u32)>,
         integrity: Option<tarit_proto::ArtifactIntegrity>,
         chunk_size: u64,
+        boot: Option<Arc<BootControl>>,
     ) -> Self {
+        let cancellation = Arc::new(OverlaySeedCancellation {
+            requested: AtomicBool::new(false),
+            boot,
+        });
+        let worker_cancellation = Arc::clone(&cancellation);
         let target = destination.clone();
         let spawned = std::thread::Builder::new()
             .name("seed-overlay".into())
             .spawn(move || {
-                seed_restore_overlay(&source, &target, jail_owner, integrity.as_ref(), chunk_size)
+                seed_restore_overlay(
+                    &source,
+                    &target,
+                    jail_owner,
+                    integrity.as_ref(),
+                    chunk_size,
+                    &worker_cancellation,
+                )
             });
         let (thread, spawn_error) = match spawned {
             Ok(thread) => (Some(thread), None),
@@ -2009,6 +2042,7 @@ impl OverlaySeeding {
             thread,
             spawn_error,
             keep: false,
+            cancellation,
         }
     }
 
@@ -2033,6 +2067,7 @@ impl OverlaySeeding {
 
 impl Drop for OverlaySeeding {
     fn drop(&mut self) {
+        self.cancellation.requested.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -2054,10 +2089,15 @@ fn seed_restore_overlay(
     jail_owner: Option<(u32, u32)>,
     integrity: Option<&tarit_proto::ArtifactIntegrity>,
     chunk_size: u64,
+    cancellation: &OverlaySeedCancellation,
 ) -> Result<(), OrchError> {
-    copy_private_artifact(source, destination).map_err(|error| {
-        OrchError::Internal(format!("seed private restore disk upper: {error}"))
-    })?;
+    copy_private_artifact_owned_checked(source, destination, unsafe { libc::geteuid() }, &|| {
+        cancellation.check()
+    })
+    .map_err(|error| OrchError::Internal(format!("seed private restore disk upper: {error}")))?;
+    cancellation
+        .check()
+        .map_err(|error| OrchError::Internal(error.to_string()))?;
     if let Some((uid, gid)) = jail_owner {
         set_jail_owner_mode(destination, uid, gid, 0o600)?;
     }
@@ -2065,14 +2105,27 @@ fn seed_restore_overlay(
         let artifact = OwnedArtifact::capture(destination).map_err(|error| {
             OrchError::Internal(format!("capture seeded restore disk upper: {error}"))
         })?;
-        verify_file_artifact_integrity(
+        let actual = hash_artifact_range_checked(
             &artifact._file,
-            integrity,
+            integrity.kind,
+            0,
+            integrity.len,
             chunk_size,
-            "seeded restore disk",
+            &|| {
+                cancellation
+                    .check()
+                    .map_err(|error| OrchError::Internal(error.to_string()))
+            },
         )?;
+        if actual.chunk_hashes != integrity.chunk_hashes {
+            return Err(OrchError::BadRequest(
+                "seeded restore disk integrity verification failed".into(),
+            ));
+        }
     }
-    Ok(())
+    cancellation
+        .check()
+        .map_err(|error| OrchError::Internal(error.to_string()))
 }
 
 impl SnapshotBundle {
@@ -2426,6 +2479,18 @@ fn hash_artifact_range(
     len: u64,
     chunk_size: u64,
 ) -> Result<tarit_proto::ArtifactIntegrity, OrchError> {
+    hash_artifact_range_checked(file, kind, start, len, chunk_size, &|| Ok(()))
+}
+
+fn hash_artifact_range_checked(
+    file: &File,
+    kind: tarit_proto::ArtifactKind,
+    start: u64,
+    len: u64,
+    chunk_size: u64,
+    check: &dyn Fn() -> Result<(), OrchError>,
+) -> Result<tarit_proto::ArtifactIntegrity, OrchError> {
+    check()?;
     #[cfg(test)]
     if kind == tarit_proto::ArtifactKind::Ram {
         TEST_RAM_INTEGRITY_HASH_PASSES.with(|passes| passes.set(passes.get() + 1));
@@ -2442,6 +2507,7 @@ fn hash_artifact_range(
     // is byte-for-byte what reading every chunk would produce.
     let zero_chunk: [u8; 32] = Sha256::digest(vec![0u8; chunk_size as usize]).into();
     while offset < len {
+        check()?;
         let hole_chunks = match next_data_offset(file, start + offset) {
             Some(data) => data.saturating_sub(start + offset) / chunk_size,
             // No data after this offset: the rest of the range is a hole.
@@ -5847,26 +5913,6 @@ impl VmmSupervisor {
             }
             None => (None, None, 0),
         };
-        // Seeding and verifying the private disk upper needs nothing from the
-        // VMM, so it runs while the network is provisioned and the VMM process
-        // starts. Its result is taken below, where the seeding used to run;
-        // every earlier return joins it and removes what it wrote.
-        let mut seeding = match &overlay {
-            RestoreOverlay::None => None,
-            RestoreOverlay::Seeded(source) => {
-                let destination = runtime
-                    .host_overlay
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(self.overlay_path_for(id)));
-                Some(OverlaySeeding::start(
-                    source.clone(),
-                    destination,
-                    runtime.jail.as_ref().map(|jail| (jail.uid, jail.gid)),
-                    overlay_integrity.clone(),
-                    integrity_chunk_size,
-                ))
-            }
-        };
         let net_alloc = match &self.net {
             Some(provisioner) => {
                 match provisioner.provision_with_owner_and_policy(
@@ -5888,19 +5934,43 @@ impl VmmSupervisor {
             None => None,
         };
         let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
+        // Provision/spawn failures can clean the jail internally. Start the
+        // writer only after those steps succeed, then overlap it with socket
+        // readiness. Every early cleanup below first cancels and joins it.
+        let mut seeding = match &overlay {
+            RestoreOverlay::None => None,
+            RestoreOverlay::Seeded(source) => {
+                let destination = runtime
+                    .host_overlay
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(self.overlay_path_for(id)));
+                Some(OverlaySeeding::start(
+                    source.clone(),
+                    destination,
+                    runtime.jail.as_ref().map(|jail| (jail.uid, jail.gid)),
+                    overlay_integrity.clone(),
+                    integrity_chunk_size,
+                    Some(Arc::clone(&ticket.control)),
+                ))
+            }
+        };
+
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
+            drop(seeding.take());
             return Err(self.cleanup_boot_failure(id, &ticket.control, &base_vm, error));
         }
         // Same readiness boundary as boot_vm: restore-based refills must run at
         // refill CPU weight or warm replenishment competes with leased VMs.
         if ticket.purpose == SpawnPurpose::Refill {
             if let Err(error) = self.configure_refill_cgroup(id, base_vm.pid) {
+                drop(seeding.take());
                 return Err(self.cleanup_boot_failure(id, &ticket.control, &base_vm, error));
             }
         }
         if !boot_can_publish(&ticket.control, self.is_shutting_down()) {
+            drop(seeding.take());
             return Err(self.cleanup_boot_failure(
                 id,
                 &ticket.control,
@@ -8731,6 +8801,7 @@ fn stage_jail_device(
 /// Copy an orchestrator-owned artifact without following either leaf path.
 /// The destination is created exclusively at mode 0600, then both it and its
 /// parent directory are synced before the path can be persisted.
+#[cfg(test)]
 fn copy_private_artifact(
     source_path: &Path,
     destination_path: &Path,
@@ -8761,6 +8832,16 @@ fn copy_private_artifact_owned(
     destination_path: &Path,
     expected_uid: u32,
 ) -> std::io::Result<OwnedArtifact> {
+    copy_private_artifact_owned_checked(source_path, destination_path, expected_uid, &|| Ok(()))
+}
+
+fn copy_private_artifact_owned_checked(
+    source_path: &Path,
+    destination_path: &Path,
+    expected_uid: u32,
+    check: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<OwnedArtifact> {
+    check()?;
     let mut source_options = OpenOptions::new();
     source_options
         .read(true)
@@ -8792,7 +8873,8 @@ fn copy_private_artifact_owned(
 
     let destination = OwnedArtifact::create_private(destination_path)?;
     let result = (|| {
-        copy_artifact_data(&source, &destination._file, before.len())?;
+        copy_artifact_data_checked(&source, &destination._file, before.len(), check)?;
+        check()?;
         destination._file.sync_all()?;
 
         let after = source.metadata()?;
@@ -8895,8 +8977,18 @@ pub(crate) fn directory_supports_reflink(_dir: &Path) -> Option<bool> {
     None
 }
 
-#[cfg(target_os = "linux")]
 fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std::io::Result<()> {
+    copy_artifact_data_checked(source, destination, source_len, &|| Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn copy_artifact_data_checked(
+    source: &File,
+    destination: &File,
+    source_len: u64,
+    check: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    check()?;
     use std::os::fd::AsRawFd;
 
     // FICLONE is the fastest safe path on XFS/btrfs and compatible filesystems:
@@ -8914,6 +9006,18 @@ fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std
         _ => return Err(clone_error),
     }
 
+    copy_artifact_data_fallback_checked(source, destination, source_len, check)
+}
+
+#[cfg(target_os = "linux")]
+fn copy_artifact_data_fallback_checked(
+    source: &File,
+    destination: &File,
+    source_len: u64,
+    check: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
     // Reflink is optional. The fallback copies only allocated extents, keeping
     // a large CoW file sparse instead of reading and allocating its virtual
     // data region. SEEK_DATA/SEEK_HOLE failure is fatal: silently using a dense
@@ -8922,6 +9026,7 @@ fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std
     let mut cursor = 0u64;
     let mut buffer = vec![0u8; COPY_CHUNK];
     while cursor < source_len {
+        check()?;
         let data = unsafe {
             libc::lseek(
                 source.as_raw_fd(),
@@ -8963,6 +9068,7 @@ fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std
         }
         let mut offset = data;
         while offset < extent_end {
+            check()?;
             let amount = usize::try_from((extent_end - offset).min(COPY_CHUNK as u64))
                 .expect("bounded copy length fits usize");
             source.read_exact_at(&mut buffer[..amount], offset)?;
@@ -8975,11 +9081,27 @@ fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std
 }
 
 #[cfg(not(target_os = "linux"))]
-fn copy_artifact_data(source: &File, destination: &File, source_len: u64) -> std::io::Result<()> {
+fn copy_artifact_data_checked(
+    source: &File,
+    destination: &File,
+    source_len: u64,
+    check: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    copy_artifact_data_fallback_checked(source, destination, source_len, check)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn copy_artifact_data_fallback_checked(
+    source: &File,
+    destination: &File,
+    source_len: u64,
+    check: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     const COPY_CHUNK: usize = 1024 * 1024;
     let mut buffer = vec![0u8; COPY_CHUNK];
     let mut offset = 0u64;
     while offset < source_len {
+        check()?;
         let amount = usize::try_from((source_len - offset).min(COPY_CHUNK as u64))
             .expect("bounded copy length fits usize");
         source.read_exact_at(&mut buffer[..amount], offset)?;
@@ -12519,6 +12641,142 @@ mod tests {
     }
 
     #[test]
+    fn overlay_copy_and_hash_stop_at_cancellation_checkpoints() {
+        let dir = PathBuf::from(format!("target/overlay-cancel-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("source");
+        let destination_path = dir.join("destination");
+        let bytes = vec![7u8; 4 * 1024 * 1024];
+        std::fs::write(&source_path, &bytes).unwrap();
+        std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let source = File::open(&source_path).unwrap();
+        let destination = File::create(&destination_path).unwrap();
+        // Force the real fallback, including on reflink-capable Linux filesystems.
+        let checks = std::cell::Cell::new(0);
+        let error =
+            copy_artifact_data_fallback_checked(&source, &destination, bytes.len() as u64, &|| {
+                checks.set(checks.get() + 1);
+                if destination.metadata()?.len() >= 1024 * 1024 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "injected cancellation",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(destination.metadata().unwrap().len(), 1024 * 1024);
+        assert!(checks.get() >= 2);
+        let hash_checks = std::cell::Cell::new(0);
+        let error = hash_artifact_range_checked(
+            &source,
+            tarit_proto::ArtifactKind::Overlay,
+            0,
+            bytes.len() as u64,
+            64 * 1024,
+            &|| {
+                hash_checks.set(hash_checks.get() + 1);
+                if hash_checks.get() == 3 {
+                    Err(OrchError::Internal("injected hash cancellation".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected hash cancellation"));
+        assert_eq!(hash_checks.get(), 3, "stopped after the first hash window");
+        // Actual private-copy ownership compensation also removes its new inode.
+        let staged = dir.join("staged");
+        let copy_checks = std::cell::Cell::new(0);
+        assert!(copy_private_artifact_owned_checked(
+            &source_path,
+            &staged,
+            unsafe { libc::geteuid() },
+            &|| {
+                copy_checks.set(copy_checks.get() + 1);
+                if copy_checks.get() >= 2 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancel",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        )
+        .is_err());
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dropping_overlay_writer_joins_before_jail_directory_cleanup() {
+        let dir = PathBuf::from(format!("target/overlay-join-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("disk.cow");
+        let cancellation = Arc::new(OverlaySeedCancellation {
+            requested: AtomicBool::new(false),
+            boot: None,
+        });
+        let worker_cancellation = Arc::clone(&cancellation);
+        let target = destination.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
+        let thread = thread::spawn(move || {
+            std::fs::write(target, b"partial disk").unwrap();
+            started_tx.send(()).unwrap();
+            while worker_cancellation.check().is_ok() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            worker_stopped.store(true, Ordering::Release);
+            Err(OrchError::Internal("cancelled".into()))
+        });
+        let seeding = OverlaySeeding {
+            destination: destination.clone(),
+            thread: Some(thread),
+            spawn_error: None,
+            keep: false,
+            cancellation,
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(seeding);
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(!destination.exists());
+        std::fs::remove_dir(dir).expect("joined writer removed before jail release");
+    }
+
+    #[test]
+    fn lifecycle_cancellation_interrupts_overlay_seeding_and_removes_destination() {
+        let dir = PathBuf::from(format!("target/overlay-boot-cancel-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let destination = dir.join("disk.cow");
+        std::fs::write(&source, b"private disk").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let boot = Arc::new(BootControl::new(SpawnPurpose::Refill));
+        boot.request_cancellation();
+        let error = OverlaySeeding::start(
+            source.clone(),
+            destination.clone(),
+            None,
+            None,
+            0,
+            Some(boot),
+        )
+        .finish()
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(source).unwrap(), b"private disk");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn overlay_seeding_keeps_a_verified_upper_and_cleans_up_otherwise() {
         let dir = std::env::current_dir()
             .unwrap()
@@ -12544,6 +12802,7 @@ mod tests {
             None,
             Some(manifest.clone()),
             chunk,
+            None,
         );
         seeding.finish().unwrap();
         assert_eq!(std::fs::read(&kept).unwrap(), vec![7u8; 128 * 1024]);
@@ -12556,6 +12815,7 @@ mod tests {
             None,
             None,
             chunk,
+            None,
         ));
         assert!(!dropped.exists());
 
@@ -12563,7 +12823,7 @@ mod tests {
         let mut wrong = manifest;
         wrong.chunk_hashes[1] = [0u8; 32];
         let damaged = dir.join("damaged.cow");
-        let error = OverlaySeeding::start(source, damaged.clone(), None, Some(wrong), chunk)
+        let error = OverlaySeeding::start(source, damaged.clone(), None, Some(wrong), chunk, None)
             .finish()
             .unwrap_err();
         assert!(error.to_string().contains("integrity"), "{error}");
