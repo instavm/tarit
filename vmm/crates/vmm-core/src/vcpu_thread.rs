@@ -792,6 +792,49 @@ mod tests {
         );
     }
 
+    /// #126: a vCPU thread started with `spawn_parked` runs no guest
+    /// instruction until the start gate is released. The controller releases
+    /// it only after every BSP/AP saved state is installed; the second gate
+    /// participant here stands in for an AP still being restored.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_parked_vcpu_runs_no_guest_code_before_release() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        // mov byte [0x3000], 1; jmp $
+        let (vm, mem) = real_mode_vm(&kvm, &[0xc6, 0x06, 0x00, 0x30, 0x01, 0xeb, 0xfe]);
+        let marker = || {
+            let mut byte = [0u8];
+            mem.read_phys(0x3000, &mut byte).unwrap();
+            byte[0]
+        };
+        let gate = crate::vcpu_start::VcpuStartGate::new(2);
+        let thread = VcpuThread::spawn_parked(
+            VcpuId(0),
+            real_mode_vcpu(&vm),
+            Arc::new(MmioBus::new()),
+            test_serial(),
+            gate.participant(),
+        )
+        .unwrap();
+        let ap = gate.participant();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(marker(), 0, "parked vCPU ran guest code before release");
+        assert!(!thread.is_exited());
+        let ap_ready = std::thread::spawn(move || ap.wait(&AtomicBool::new(false)));
+        gate.release_when_ready(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(ap_ready.join().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while marker() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "released vCPU did not run"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        thread.stop().unwrap();
+    }
+
     /// `rep movsb` from MMIO exits once per byte, and KVM reaches its
     /// immediate-exit check only at each 1,024-iteration boundary. Finishing
     /// it needs hundreds of re-entries: the production budget must cover
