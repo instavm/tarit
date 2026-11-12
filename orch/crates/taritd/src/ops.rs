@@ -2915,6 +2915,30 @@ impl ActivationGate {
             .lock()
             .await
     }
+
+    /// Like [`Self::lock`], but the guard owns this lease, so it can be held
+    /// across `spawn_blocking` or moved into a task. Both variants wait in the
+    /// same FIFO queue of this id's single gate; other ids are never involved.
+    pub(crate) async fn lock_owned(self) -> OwnedActivationGuard {
+        // The temporary holding the extra gate reference is dropped before
+        // `self` if this wait is cancelled, so the lease still retires the
+        // map entry when it is the last one.
+        let guard = Arc::clone(self.gate.as_ref().expect("live activation lease"))
+            .lock_owned()
+            .await;
+        OwnedActivationGuard {
+            _guard: guard,
+            _lease: self,
+        }
+    }
+}
+
+/// An activation guard that owns its lease. Fields drop in declaration order:
+/// the gate is unlocked first, then the lease is released (and the map entry
+/// retired if this was the final lease).
+pub(crate) struct OwnedActivationGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _lease: ActivationGate,
 }
 
 impl Drop for ActivationGate {
@@ -5003,6 +5027,133 @@ mod tests {
             assert_eq!(state.activation_gates.lock().unwrap().len(), 1);
             drop(held);
             drop(first);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn owned_activation_guard_crosses_tasks_and_keeps_per_vm_serialization() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let held = activation_gate(&state, id).unwrap().lock_owned().await;
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            // The owned guard is held on a blocking worker, not by this task.
+            let holder = tokio::task::spawn_blocking(move || {
+                let _held = held;
+                released.recv().unwrap();
+            });
+            let waiter = activation_gate(&state, id).unwrap();
+            {
+                let mut waiting = std::pin::pin!(waiter.lock());
+                assert!(futures_util::poll!(&mut waiting).is_pending());
+                let other = activation_gate(&state, Uuid::new_v4()).unwrap();
+                let _independent = tokio::time::timeout(Duration::ZERO, other.lock_owned())
+                    .await
+                    .expect("a held gate never blocks another VM's gate");
+                release.send(()).unwrap();
+                holder.await.unwrap();
+                drop(waiting.await);
+            }
+            drop(waiter);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn owned_and_borrowed_activation_waiters_share_one_fifo_queue() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let borrowed_lease = activation_gate(&state, id).unwrap();
+            {
+                let mut owned = Box::pin(activation_gate(&state, id).unwrap().lock_owned());
+                assert!(futures_util::poll!(&mut owned).is_pending());
+                let mut borrowed = std::pin::pin!(borrowed_lease.lock());
+                assert!(futures_util::poll!(&mut borrowed).is_pending());
+                drop(held);
+                drop(first);
+                // The earlier owned waiter is served first; the borrowed one waits.
+                assert!(futures_util::poll!(&mut borrowed).is_pending());
+                let owned_guard = match futures_util::poll!(&mut owned) {
+                    std::task::Poll::Ready(guard) => guard,
+                    std::task::Poll::Pending => panic!("first queued waiter must be served"),
+                };
+                drop(owned);
+                assert!(futures_util::poll!(&mut borrowed).is_pending());
+                drop(owned_guard);
+                drop(borrowed.await);
+            }
+            drop(borrowed_lease);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn cancelled_owned_activation_waiter_retires_the_final_lease() {
+        let (state, _writes) = test_state_with_durable_writer();
+        test_runtime().block_on(async {
+            let id = Uuid::new_v4();
+            let first = activation_gate(&state, id).unwrap();
+            let held = first.lock().await;
+            let mut waiting = Box::pin(activation_gate(&state, id).unwrap().lock_owned());
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            drop(held);
+            drop(first);
+            // The cancelled waiter is now the final lease; dropping it must
+            // not leave the entry behind because of its own extra reference.
+            drop(waiting);
+            assert!(state.activation_gates.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn held_activation_guard_never_blocks_another_tenants_vm() {
+        let (state, _writes) = test_state_with_durable_writer();
+        let tenant_a = insert_running_vm(&state);
+        let tenant_b = insert_running_vm(&state);
+        state
+            .vm_cache
+            .write()
+            .unwrap()
+            .get_mut(&tenant_b)
+            .unwrap()
+            .owner_key = Some("tenant-b".into());
+        test_runtime().block_on(async {
+            // Tenant A's activation and egress gates are held indefinitely.
+            let held = activation_gate(&state, tenant_a)
+                .unwrap()
+                .lock_owned()
+                .await;
+            let blocked = tokio::spawn(async move {
+                let _held = held;
+                std::future::pending::<()>().await;
+            });
+            let deadline = Duration::from_secs(5);
+            tokio::time::timeout(
+                deadline,
+                ensure_active_local_for_owner(&state, tenant_b, "tenant-b"),
+            )
+            .await
+            .expect("tenant B activation is not blocked by tenant A")
+            .unwrap();
+            let egress = tokio::time::timeout(
+                deadline,
+                put_egress_policy_local(&state, tenant_b, "tenant-b", 1, Vec::new(), true),
+            )
+            .await
+            .expect("tenant B egress update is not blocked by tenant A");
+            // Tests have no host networking, so the update itself is refused;
+            // only that it was never queued behind tenant A matters here.
+            assert!(egress.is_err());
+            let gates = state.activation_gates.lock().unwrap();
+            assert_eq!(gates.len(), 1);
+            assert!(gates.contains_key(&tenant_a));
+            drop(gates);
+            blocked.abort();
+            let _ = blocked.await;
             assert!(state.activation_gates.lock().unwrap().is_empty());
         });
     }
