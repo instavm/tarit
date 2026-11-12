@@ -3900,6 +3900,12 @@ fn private_runtime_dir_in(base: &Path, pid: u32) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// This process's private runtime directory,
+/// `<temp dir>/.vmm-runtime-<euid>/vmm-<pid>` (mode 0700).
+///
+/// The temp dir (`TMPDIR`, else `/tmp`, as seen after any chroot) must already
+/// exist: it is never created, and it and each of its ancestors must be owned
+/// by root or this user and not group/world writable unless root-owned sticky.
 pub(crate) fn private_runtime_dir() -> Result<PathBuf> {
     private_runtime_dir_in(&std::env::temp_dir(), std::process::id())
 }

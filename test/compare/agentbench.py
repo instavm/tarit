@@ -780,8 +780,9 @@ def scen_burst(kind, a, lab):
 
 def leak_probe(kind, a):
     procs = sh(["pgrep", "-c", "-x", "vmm" if kind == "tarit" else "firecracker-v1."], check=False)
-    # The VMM keeps its runtime files under $TMPDIR, like tempfile does.
-    root = os.path.join(tempfile.gettempdir(), ".vmm-runtime")
+    # The VMM keeps its runtime files under $TMPDIR, like tempfile does, in a
+    # per-user namespace named after its effective uid.
+    root = os.path.join(tempfile.gettempdir(), ".vmm-runtime-%d" % os.geteuid())
     runtime = os.listdir(root) if os.path.isdir(root) else []
     overlays = len(os.listdir(os.path.join(a.work, "overlays"))) \
         if os.path.isdir(os.path.join(a.work, "overlays")) else 0

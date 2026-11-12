@@ -224,9 +224,15 @@ if [[ -n "$FAIL_PHASE" ]]; then
   status_json=$("$VMM_BIN" --socket "$SOCKET" status)
   status_state=$(json_field state <<<"$status_json")
   [[ "${status_state,,}" == running ]]
-  runtime_dir="${SOCKET_ROOT%/}/.vmm-runtime/vmm-$SERVE_PID"
-  if [[ -d "$runtime_dir" ]] && \
-    find "$runtime_dir" -maxdepth 1 -type f -name '*live*' -print -quit | grep -q .; then
+  # The VMM keeps scratch under its own temp dir (inherited TMPDIR, else /tmp),
+  # not SOCKET_ROOT, in a namespace named after its effective uid.
+  runtime_base=${TMPDIR:-/tmp}
+  runtime_dir="${runtime_base%/}/.vmm-runtime-$(id -u)/vmm-$SERVE_PID"
+  if [[ ! -d "$runtime_dir" ]]; then
+    echo "runtime directory $runtime_dir is missing; leak check cannot run" >&2
+    exit 1
+  fi
+  if find "$runtime_dir" -maxdepth 1 -type f -name '*live*' -print -quit | grep -q .; then
     echo "failed live snapshot leaked a staged artifact" >&2
     exit 1
   fi
