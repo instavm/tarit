@@ -343,7 +343,12 @@ pub struct LiveSnapshotOutput {
 /// Copy one contiguous half-open PFN run. Dirty bitmaps are ordered, so a
 /// guest rewriting a large buffer should cost one positioned write per run,
 /// not one syscall and one filesystem extent update per 4 KiB page.
-fn copy_page_run(mem: &GuestMemory, dest: &File, start_pfn: u64, end_pfn: u64) -> Result<u64> {
+pub(crate) fn copy_page_run(
+    mem: &GuestMemory,
+    dest: &File,
+    start_pfn: u64,
+    end_pfn: u64,
+) -> Result<u64> {
     let pages = end_pfn
         .checked_sub(start_pfn)
         .ok_or_else(|| VmmError::Memory("dirty page run is reversed".into()))?;
@@ -365,11 +370,19 @@ fn copy_page_run(mem: &GuestMemory, dest: &File, start_pfn: u64, end_pfn: u64) -
         .map_err(|_| VmmError::Memory("guest page offset does not fit usize".into()))?;
     let len = usize::try_from(len)
         .map_err(|_| VmmError::Memory("dirty page run length does not fit usize".into()))?;
-    // SAFETY: GuestMemory guarantees this mapping for `size_bytes`; the range
-    // was checked above and the file write does not retain the pointer.
-    let src = unsafe { std::slice::from_raw_parts(mem.as_ptr().add(offset), len) };
-    dest.write_all_at(src, gpa)
-        .map_err(|error| VmmError::Snapshot(format!("write staged RAM at {gpa:#x}: {error}")))?;
+    let reader = crate::snapshot_memory::LazySnapshotReader::new(mem)?;
+    // SAFETY: the checked range lies inside GuestMemory's live mapping. The
+    // lazy reader below never dereferences its missing pages.
+    let source = unsafe { std::slice::from_raw_parts(mem.as_ptr(), mem.size_bytes as usize) };
+    const CHUNK: usize = 2 * 1024 * 1024;
+    for start in (offset..offset + len).step_by(CHUNK) {
+        let end = (start + CHUNK).min(offset + len);
+        let bytes =
+            crate::snapshot_memory::read_snapshot_bytes(source, reader.as_ref(), start, end)?;
+        dest.write_all_at(&bytes, start as u64).map_err(|error| {
+            VmmError::Snapshot(format!("write staged RAM at {start:#x}: {error}"))
+        })?;
+    }
     Ok(pages)
 }
 
