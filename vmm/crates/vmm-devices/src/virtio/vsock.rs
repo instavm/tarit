@@ -796,7 +796,7 @@ impl VirtioVsockMmio {
                         return None;
                     }
                 };
-                let packet = match packet {
+                let mut packet = match packet {
                     Some(packet) => packet,
                     None => return None,
                 };
@@ -817,10 +817,12 @@ impl VirtioVsockMmio {
                 } else {
                     packet.data.len()
                 };
-                let mut delivered = packet.clone();
-                delivered.data.truncate(payload_len);
-                delivered.header.len = payload_len as u32;
-                let bytes = delivered.to_bytes();
+                // `packet` is already this closure's own copy of the queue head,
+                // so truncate it in place rather than cloning it again.
+                let full_len = packet.data.len();
+                packet.data.truncate(payload_len);
+                packet.header.len = payload_len as u32;
+                let bytes = packet.to_bytes();
                 if cap < bytes.len() {
                     return Some(0);
                 }
@@ -829,7 +831,7 @@ impl VirtioVsockMmio {
                 }
                 match self.try_lock_state(&self.pending_rx, "pending_rx") {
                     Ok(mut pending) => {
-                        if payload_len < packet.data.len() {
+                        if payload_len < full_len {
                             if let Some(remainder) = pending.front_mut() {
                                 remainder.data.drain(..payload_len);
                                 remainder.header.len = remainder.data.len() as u32;
