@@ -36,3 +36,5 @@ have accepted the command; the SDK does not invent an ID or retry submission.
 
 `pollIntervalMs` is the minimum wait after a pending response before another
 poll. If the deadline expires before that interval ends, no further poll is sent.
+
+Execution polling retries HTTP 429, 502, 503, and 504 within the original deadline and retains the execution ID on timeout. Execution submission is never retried. `deletePtySession(vmId, ptyId, { deadlineMs })` defaults to a 5-second total deadline, including response-body reading; timeout raises `TaritDeadlineExceeded`. Deletion still accepts 204 and 404.

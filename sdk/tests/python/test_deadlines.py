@@ -33,6 +33,38 @@ class Clock:
 
 
 class SyncDeadlineTests(unittest.TestCase):
+    def test_transient_poll_responses_retry_without_submission_replay(self) -> None:
+        clock = Clock()
+        statuses = iter([202, 429, 502, 503, 504, 200])
+        methods: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            status = next(statuses)
+            return httpx.Response(status, json=execution("completed" if status == 200 else "pending")
+                                  if status in {200, 202} else {"error": "busy"})
+
+        with clock.patched(), TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+            self.assertEqual(client.execute(VM_ID, "once", deadline_seconds=5).status, "completed")
+        self.assertEqual(methods, ["POST", "GET", "GET", "GET", "GET", "GET"])
+
+    def test_persistent_poll_overload_preserves_execution_deadline(self) -> None:
+        clock = Clock()
+        methods: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            return httpx.Response(503, json={"error": "busy"})
+
+        with (
+            clock.patched(),
+            TaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client,
+            self.assertRaises(TaritDeadlineExceeded) as raised,
+        ):
+            client.wait_execution(EXECUTION_ID, deadline_seconds=.05)
+        self.assertEqual(raised.exception.execution_id, EXECUTION_ID)
+        self.assertEqual(methods, ["GET"])
+
     def test_execute_deadline_retains_id_from_submission_through_polling(self) -> None:
         for stage in (
             "submission",
@@ -335,6 +367,34 @@ class SyncDeadlineTests(unittest.TestCase):
 
 
 class AsyncDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_persistent_poll_overload_preserves_execution_deadline(self) -> None:
+        methods: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            return httpx.Response(503, json={"error": "busy"})
+
+        async with AsyncTaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(TaritDeadlineExceeded) as raised:
+                await client.wait_execution(EXECUTION_ID, deadline_seconds=.02)
+        self.assertEqual(raised.exception.execution_id, EXECUTION_ID)
+        self.assertEqual(methods, ["GET"])
+
+    async def test_transient_poll_responses_retry_without_submission_replay(self) -> None:
+        statuses = iter([202, 429, 503, 504, 200])
+        methods: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            methods.append(request.method)
+            status = next(statuses)
+            return httpx.Response(status, json=execution("completed" if status == 200 else "pending")
+                                  if status in {200, 202} else {"error": "busy"})
+
+        async with AsyncTaritClient("https://tarit.test", "key", transport=httpx.MockTransport(handler)) as client:
+            result = await client.execute(VM_ID, "once", deadline_seconds=3)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(methods, ["POST", "GET", "GET", "GET", "GET"])
+
     async def test_execute_deadline_retains_id_from_submission_through_polling(
         self,
     ) -> None:
