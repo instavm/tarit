@@ -101,22 +101,18 @@ its scope.
 
 ## Required gates
 
-Normal CI runs formatting, unit/integration tests, linting, dependency policy,
-and security analysis. The protected-main KVM workflow additionally:
+Normal GitHub-hosted CI runs formatting, unit/integration tests, linting,
+dependency policy, security analysis and KVM/Linux type checking for PRs.
+Privileged hardware validation is manual on a fresh disposable KVM VM. The
+`Prepare manual KVM validation` workflow validates a full main commit SHA and
+publishes instructions; a green preparation job does not mean hardware gates
+passed. No Actions self-hosted runner is registered or used.
 
-- builds release VMM and orchestrator binaries on a dedicated KVM runner;
-- verifies real suspend memory release, state preservation, and bounded
-  resume-to-exec latency;
-- runs the VMM workspace KVM integration suite;
-- takes 100 end-to-end cold and warm create-to-exec samples, requires 100%
-  success, and enforces p99 ceilings of 5,000 ms cold and 1,000 ms warm; and
-- runs strict VMM cold, snapshot-restore, and suspend/resume performance gates
-  and uploads the measurements.
-
-This workflow requires a registered runner labeled `self-hosted`, `linux`, `x64`, and `kvm`; until one is provisioned, the hardware gates remain pending. `scripts/setup-kvm-runner.sh` provisions one: it creates a dedicated `tarit-ci` user with passwordless sudo (the KVM steps need root), installs a pinned, checksum-verified Actions runner as a service, and stages the guest kernel and rootfs where the workflow reads them.
-
-Privileged KVM jobs run only from the protected `main` ref; pull-request code is
-not executed on the persistent privileged runner.
+The manual procedure retains release builds, the full E2E/KVM suites, 100 cold
+and warm create-to-exec samples (100% success, p99 at most 5,000/1,000 ms), and
+strict startup/restore/suspend performance gates. Follow
+[the trust boundary and evidence procedure](docs/KVM_VALIDATION.md). Hardware
+evidence remains required separately before production readiness is claimed.
 
 ## Evidence from a single development host (2026-11-07)
 

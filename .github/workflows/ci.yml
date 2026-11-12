@@ -13,6 +13,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  kvm-trust:
+    name: manual KVM trust boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Test SHA admission and registration refusal
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_kvm_trust.py -v
+          bash -n scripts/setup-kvm-runner.sh scripts/run-trusted-kvm.sh
+
   musl:
     name: build release targets (musl)
     runs-on: ubuntu-latest
