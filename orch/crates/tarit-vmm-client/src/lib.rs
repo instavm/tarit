@@ -1089,6 +1089,39 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_interrupts_a_request_under_the_default_deadline() {
+        // Requests without an explicit timeout now always take the deadline
+        // path; delete-time cancellation must still cut them short.
+        let socket = socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+        let (received_tx, received_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_api_frame(&mut stream).unwrap();
+            received_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let cancellation = Arc::new(RequestCancellation::default());
+        let client = VmmClient::new(&socket.0).with_cancellation(Arc::clone(&cancellation));
+        let started = Instant::now();
+        let request = std::thread::spawn(move || client.exec("sleep 60", 60_000));
+        received_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exec request reached the VMM");
+        cancellation.cancel();
+        let result = request.join().unwrap();
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cancelled exec waited {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn default_request_deadline_bounds_a_silent_peer() {
         let socket = socket_path();
         let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
