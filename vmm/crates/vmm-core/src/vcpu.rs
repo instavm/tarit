@@ -87,6 +87,12 @@ pub(crate) fn drain_pending_io(
 /// signal can be handled between the stop-flag check and KVM_RUN entry, or
 /// before the worker has published its TID. The caller must set stop first.
 /// Keep ownership and join afterwards: detaching could release live VM memory.
+///
+/// A healthy vCPU leaves within microseconds of a kick, so the first checks
+/// spin and then sleep 10 µs, re-kicking every 200 µs; only after 5 ms does
+/// the loop fall back to 1 ms steps. Returns `Err(waited)` if the worker is
+/// still alive at `deadline`: it is then blocked in the kernel, and the
+/// caller decides how to fail.
 #[cfg(any(
     test,
     all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
@@ -95,13 +101,40 @@ pub(crate) fn wait_for_vcpu_exit<T>(
     handle: &std::thread::JoinHandle<T>,
     mut alive: impl FnMut() -> bool,
     mut kick: impl FnMut(),
-) {
-    // A seccomp-killed worker cannot publish Rust's completion packet. The
-    // OS liveness check permits the caller's abnormal-exit join handling.
-    while !handle.is_finished() && alive() {
-        kick();
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    deadline: std::time::Duration,
+) -> std::result::Result<(), std::time::Duration> {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let mut next_kick = Duration::ZERO;
+    while !handle.is_finished() {
+        let elapsed = start.elapsed();
+        if elapsed >= next_kick {
+            // A seccomp-killed worker cannot publish Rust's completion
+            // packet. The OS liveness check permits the caller's
+            // abnormal-exit join handling.
+            if !alive() {
+                break;
+            }
+            if elapsed >= deadline {
+                return Err(elapsed);
+            }
+            kick();
+            next_kick = elapsed
+                + if elapsed < Duration::from_millis(5) {
+                    Duration::from_micros(200)
+                } else {
+                    Duration::from_millis(1)
+                };
+        }
+        if elapsed < Duration::from_micros(100) {
+            std::hint::spin_loop();
+        } else if elapsed < Duration::from_millis(5) {
+            std::thread::sleep(Duration::from_micros(10));
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
+    Ok(())
 }
 
 /// A vCPU handle. On KVM this owns the `kvm_ioctls::Vcpu`; the run loop lives
@@ -222,10 +255,86 @@ mod tests {
                         let _ = send.send(42);
                     }
                 },
-            );
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
             assert_eq!(worker.join().unwrap(), 42);
             assert!(kicks > missed_kicks);
         }
+    }
+
+    /// The first kick must be followed by a µs-granular wait, not a fixed
+    /// sleep: with one 1 ms sleep per vCPU, stopping a 4-vCPU VM took at
+    /// least 4 ms where joining after one kick took tens of microseconds.
+    #[test]
+    fn stopping_vcpu_is_observed_without_a_fixed_sleep() {
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..20 {
+            let (send, recv) = std::sync::mpsc::channel::<()>();
+            let worker = std::thread::spawn(move || {
+                let _ = recv.recv();
+            });
+            // Let the worker block, as a vCPU inside KVM_RUN would.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let start = std::time::Instant::now();
+            wait_for_vcpu_exit(
+                &worker,
+                || true,
+                || {
+                    let _ = send.send(());
+                },
+                std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+            fastest = fastest.min(start.elapsed());
+            worker.join().unwrap();
+        }
+        assert!(
+            fastest < std::time::Duration::from_millis(1),
+            "fastest observed stop took {fastest:?}"
+        );
+    }
+
+    /// A worker that never leaves must not hold the caller forever: keep
+    /// kicking until the deadline, then report how long it waited. A worker
+    /// the OS reports gone ends the wait at once.
+    #[test]
+    fn stopping_vcpu_gives_up_at_the_deadline() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = blocked.recv();
+        });
+        let (done, result) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut kicks = 0;
+            let outcome = wait_for_vcpu_exit(
+                &worker,
+                || true,
+                || kicks += 1,
+                std::time::Duration::from_millis(30),
+            );
+            done.send((outcome, kicks)).unwrap();
+            worker
+        });
+        let (outcome, kicks) = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stop wait did not honour its deadline");
+        let waited = outcome.unwrap_err();
+        assert!(waited >= std::time::Duration::from_millis(30));
+        assert!(kicks > 1, "a stuck worker must be kicked repeatedly");
+        drop(release);
+        waiter.join().unwrap().join().unwrap();
+
+        let (hold, never) = std::sync::mpsc::channel::<()>();
+        let gone = std::thread::spawn(move || {
+            let _ = never.recv();
+        });
+        assert_eq!(
+            wait_for_vcpu_exit(&gone, || false, || {}, std::time::Duration::from_secs(5)),
+            Ok(())
+        );
+        drop(hold);
+        gone.join().unwrap();
     }
 
     #[cfg(target_os = "linux")]

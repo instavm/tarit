@@ -13,6 +13,12 @@ use std::thread::{self, JoinHandle};
 use vmm_devices::bus::MmioBus;
 
 const SNAPSHOT_VCPU_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a stopping vCPU may keep ignoring stop and repeated kicks. A
+/// healthy one leaves within microseconds; past this it is blocked in the
+/// kernel or in a device handler that does not return.
+const VCPU_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Process exit status when a vCPU thread never leaves after stop.
+const STUCK_VCPU_EXIT_STATUS: i32 = 79;
 
 /// Commands the control thread sends to the vCPU thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,6 +531,29 @@ impl VcpuThread {
         Ok(())
     }
 
+    /// Wait for this stopping vCPU's thread to leave, failing closed if it
+    /// never does. Returning would let the caller free guest memory the stuck
+    /// thread can still reach (and a later VM in this process could be mapped
+    /// at the same address); waiting forever would hold the controller lock
+    /// and hang every later request to this VMM. The process owns one VM,
+    /// which is already being torn down, so exit and let the kernel destroy
+    /// it, as the userfaultfd handler does when it dies.
+    fn wait_for_exit_or_terminate(&self, handle: &JoinHandle<Result<()>>) {
+        if let Err(waited) = crate::vcpu::wait_for_vcpu_exit(
+            handle,
+            || self.vcpu_alive(),
+            || self.signal_vcpu(),
+            VCPU_EXIT_DEADLINE,
+        ) {
+            let name = handle.thread().name().unwrap_or("vcpu");
+            eprintln!("FATAL: {name} did not exit {waited:?} after stop; terminating VMM");
+            log::error!("{name} did not exit {waited:?} after stop; terminating VMM");
+            // SAFETY: `_exit` ends the process without running destructors
+            // that could unmap guest memory the stuck vCPU can still reach.
+            unsafe { libc::_exit(STUCK_VCPU_EXIT_STATUS) }
+        }
+    }
+
     /// Stop the vCPU permanently (joins the thread).
     pub fn stop(mut self) -> Result<()> {
         // Order matters: set stop *before* control so the pause spin-loop
@@ -534,7 +563,7 @@ impl VcpuThread {
         // Wake the vCPU out of any blocking KVM_RUN so it observes the flags.
         self.signal_vcpu();
         if let Some(handle) = self.handle.take() {
-            crate::vcpu::wait_for_vcpu_exit(&handle, || self.vcpu_alive(), || self.signal_vcpu());
+            self.wait_for_exit_or_terminate(&handle);
             // A thread terminated by a signal (e.g. a seccomp SIGSYS) cannot be
             // joined cleanly — the std thread lifecycle panics on join. Isolate
             // the join with catch_unwind and treat an unwinding join as an
@@ -556,7 +585,7 @@ impl Drop for VcpuThread {
         // Repeated kicks below cover both a missed signal and startup before
         // the worker publishes its TID. Never detach while VM memory is live.
         if let Some(handle) = self.handle.take() {
-            crate::vcpu::wait_for_vcpu_exit(&handle, || self.vcpu_alive(), || self.signal_vcpu());
+            self.wait_for_exit_or_terminate(&handle);
             // Never panic in Drop — a panic during an unwind aborts the whole
             // process. Joining a signal-killed thread panics, so isolate it.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -833,6 +862,67 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         thread.stop().unwrap();
+    }
+
+    /// Child half of `kvm_vcpu_that_never_leaves_terminates_the_vmm`: a vCPU
+    /// blocked in a device handler ignores stop and every kick, so `stop()`
+    /// must end the process rather than return or wait forever.
+    #[test]
+    #[ignore = "requires /dev/kvm; run by kvm_vcpu_that_never_leaves_terminates_the_vmm"]
+    fn kvm_stuck_vcpu_child() {
+        if std::env::var_os("TARIT_TEST_STUCK_VCPU_CHILD").is_none() {
+            return;
+        }
+        struct NeverReturns;
+        impl vmm_devices::bus::MmioDevice for NeverReturns {
+            fn mmio_read(&self, _: u64, _: u8) -> vmm_devices::bus::MmioReadResult {
+                loop {
+                    std::thread::park();
+                }
+            }
+            fn mmio_write(&self, _: u64, _: u64, _: u8) -> vmm_devices::bus::MmioWriteResult {
+                Ok(())
+            }
+        }
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        // mov al, byte [0x8000]; hlt
+        let (vm, _mem) = real_mode_vm(&kvm, &[0xa0, 0x00, 0x80, 0xf4]);
+        let mut bus = MmioBus::new();
+        bus.insert(
+            vmm_devices::bus::MmioRange::new(0x8000, 0x1000),
+            Box::new(NeverReturns),
+        )
+        .unwrap();
+        let thread =
+            VcpuThread::spawn(VcpuId(0), real_mode_vcpu(&vm), Arc::new(bus), test_serial())
+                .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = thread.stop();
+        // Reaching here means stop() gave up the stuck thread.
+        std::process::exit(0);
+    }
+
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_vcpu_that_never_leaves_terminates_the_vmm() {
+        let started = std::time::Instant::now();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vcpu_thread::tests::kvm_stuck_vcpu_child",
+                "--include-ignored",
+                "--nocapture",
+            ])
+            .env("TARIT_TEST_STUCK_VCPU_CHILD", "1")
+            .status()
+            .unwrap();
+        let took = started.elapsed();
+        assert_eq!(status.code(), Some(STUCK_VCPU_EXIT_STATUS), "{status:?}");
+        assert!(
+            took >= VCPU_EXIT_DEADLINE
+                && took < VCPU_EXIT_DEADLINE + std::time::Duration::from_secs(10),
+            "terminated after {took:?}"
+        );
     }
 
     /// `rep movsb` from MMIO exits once per byte, and KVM reaches its
