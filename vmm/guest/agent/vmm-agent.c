@@ -544,7 +544,9 @@ static void make_raw(int fd) {
 }
 
 static int open_serial(void) {
-    int fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    /* VMM_AGENT_SERIAL names another tty; the agent's tests use a pty. */
+    const char *path = getenv("VMM_AGENT_SERIAL");
+    int fd = open(path && path[0] ? path : "/dev/ttyS0", O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (fd < 0) {
         fd = open("/dev/console", O_RDWR | O_NOCTTY | O_CLOEXEC);
     }
@@ -554,7 +556,7 @@ static int open_serial(void) {
     return fd;
 }
 
-static int read_line(int fd, char *line, size_t cap, bool eof_disconnect) {
+static int read_line(int fd, char *line, size_t cap) {
     size_t len = 0;
     bool overflow = false;
 
@@ -568,13 +570,15 @@ static int read_line(int fd, char *line, size_t cap, bool eof_disconnect) {
             return -1;
         }
         if (n == 0) {
-            /* A stream (vsock) EOF means the peer closed → reconnect. A serial
-             * tty can momentarily return 0 without a real hangup, so there we
-             * keep waiting instead of tearing the channel down. */
-            if (eof_disconnect) {
-                return -1;
-            }
-            continue;
+            /* On the serial tty (raw, VMIN=1) a read returns 0 only once it has
+             * been hung up, and then every later read on this descriptor
+             * returns 0 at once: retrying it spins a vCPU forever and never
+             * reads another byte. That happens at boot when a unit with
+             * TTYVHangup= on /dev/console (systemd's console-getty, even one
+             * that its ExecCondition= then skips) runs after we opened the
+             * tty. Return -1: the caller reopens, and a fresh descriptor
+             * reads the tty again. */
+            return -1;
         }
         if (c == '\r') {
             continue;
@@ -2261,7 +2265,7 @@ int main(void) {
                 continue;
             }
         }
-        int rc = read_line(serial_fd, line, sizeof(line), false);
+        int rc = read_line(serial_fd, line, sizeof(line));
         if (rc < 0) {
             close(serial_fd);
             sleep(1);

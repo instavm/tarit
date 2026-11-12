@@ -13,9 +13,11 @@ vmm-agent: vmm-agent.c
 syntax-check: vmm-agent.c
 	$(CC) $(CFLAGS) -fsyntax-only $<
 
-test: test-child-hygiene.c vmm-agent.c
+# test_serial_hangup.py needs Linux and root (TIOCVHANGUP); it skips otherwise.
+test: test-child-hygiene.c vmm-agent.c vmm-agent
 	$(CC) $(CFLAGS) $(LDFLAGS) -o test-child-hygiene test-child-hygiene.c $(LDLIBS)
 	./test-child-hygiene
+	python3 test_serial_hangup.py ./vmm-agent
 
 clean:
 	rm -f vmm-agent test-child-hygiene
