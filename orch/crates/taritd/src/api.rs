@@ -1927,18 +1927,7 @@ async fn inherit_source_egress(
     source_id: Uuid,
     child_id: Uuid,
 ) -> Result<(), OrchError> {
-    let policy = match cluster::resolve_owner(state, source_id).await? {
-        Owner::Local => ops::get_egress_policy_local(state, source_id, &identity.tenant)?,
-        Owner::Remote(rpc) => {
-            let peer = Arc::clone(&state.peer);
-            let identity = identity.clone();
-            tokio::task::spawn_blocking(move || {
-                peer.get_egress_policy_remote(&rpc, source_id, &identity)
-            })
-            .await
-            .map_err(|e| OrchError::Internal(format!("join: {e}")))??
-        }
-    };
+    let policy = read_egress_policy(state, identity, source_id).await?;
     if policy.allowlist.is_empty() && !policy.allow_existing {
         return Ok(());
     }
@@ -3808,14 +3797,24 @@ async fn get_egress_policy(
     Extension(identity): Extension<ApiIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<EgressPolicyRecord>, ApiError> {
-    let policy = match cluster::resolve_owner(&state, id).await? {
+    Ok(Json(read_egress_policy(&state, &identity, id).await?))
+}
+
+/// Read using the source VM's durable owner after authorizing the caller.
+/// Admin identities may differ from the source tenant; ordinary tenants may not.
+async fn read_egress_policy(
+    state: &AppState,
+    identity: &ApiIdentity,
+    id: Uuid,
+) -> Result<EgressPolicyRecord, OrchError> {
+    Ok(match cluster::resolve_owner(state, id).await? {
         Owner::Local => {
-            let vm = ops::get_local(&state, id)?;
-            ensure_vm_access(&identity, &vm)?;
+            let vm = ops::get_local(state, id)?;
+            ensure_vm_access(identity, &vm)?;
             let owner = vm.owner_key.ok_or_else(|| {
                 OrchError::BadRequest("admin-owned VM has no durable tenant policy".into())
             })?;
-            ops::get_egress_policy_local(&state, id, &owner)?
+            ops::get_egress_policy_local(state, id, &owner)?
         }
         Owner::Remote(rpc) => {
             let peer = Arc::clone(&state.peer);
@@ -3824,8 +3823,7 @@ async fn get_egress_policy(
                 .await
                 .map_err(|e| OrchError::Internal(format!("join: {e}")))??
         }
-    };
-    Ok(Json(policy))
+    })
 }
 
 async fn put_egress_policy(
@@ -4620,6 +4618,46 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tarit_store::Store;
     use tower::ServiceExt;
+
+    #[test]
+    fn admin_fork_reads_source_tenant_egress_without_granting_cross_tenant_access() {
+        let state = test_state();
+        let source = Uuid::new_v4();
+        insert_vm(&state, source, "tenant-b", VmStatus::Running);
+        let admin = state.config.api_keys.resolve("admin-key").unwrap();
+        let other = state.config.api_keys.resolve("tenant-a-key").unwrap();
+        test_runtime().block_on(async {
+            // The empty default policy requires no child update. This exact
+            // inheritance path used to fail after creating an admin's child.
+            inherit_source_egress(&state, &admin, source, Uuid::new_v4())
+                .await
+                .unwrap();
+            assert!(matches!(
+                inherit_source_egress(&state, &other, source, Uuid::new_v4()).await,
+                Err(OrchError::Forbidden(_))
+            ));
+            let expected = state
+                .store
+                .lock()
+                .unwrap()
+                .update_egress_policy(
+                    "tenant-b",
+                    source,
+                    1,
+                    &["example.com".into()],
+                    true,
+                    Utc::now(),
+                )
+                .unwrap();
+            let actual = read_egress_policy(&state, &admin, source).await.unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.owner_key, "tenant-b");
+            assert!(matches!(
+                read_egress_policy(&state, &other, source).await,
+                Err(OrchError::Forbidden(_))
+            ));
+        });
+    }
 
     #[test]
     fn pending_hibernation_delete_still_checks_tenant_ownership() {
