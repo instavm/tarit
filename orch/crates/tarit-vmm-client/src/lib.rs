@@ -28,6 +28,7 @@ pub enum VmmError {
     Busy(String),
 }
 
+#[cfg(test)]
 fn read_api_frame(stream: &mut UnixStream) -> Result<Vec<u8>, VmmError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
@@ -43,8 +44,27 @@ fn read_api_frame(stream: &mut UnixStream) -> Result<Vec<u8>, VmmError> {
     Ok(body)
 }
 
+fn checked_api_frame_len(len: usize) -> Result<u32, VmmError> {
+    if len > MAX_API_FRAME_LEN {
+        return Err(VmmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "request frame too large",
+        )));
+    }
+    u32::try_from(len).map_err(|_| {
+        VmmError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "request frame length exceeds wire format",
+        ))
+    })
+}
+
+/// Default total request budget. Explicit request timeouts take precedence;
+/// exec requests receive at least their guest execution budget plus five seconds.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn write_api_frame(stream: &mut UnixStream, body: &[u8]) -> Result<(), VmmError> {
-    let len = body.len() as u32;
+    let len = checked_api_frame_len(body.len())?;
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(body)?;
     stream.flush()?;
@@ -192,7 +212,7 @@ fn write_api_frame_until(
     body: &[u8],
     deadline: Instant,
 ) -> Result<(), VmmError> {
-    let len = body.len() as u32;
+    let len = checked_api_frame_len(body.len())?;
     write_all_until(stream, &len.to_be_bytes(), deadline)?;
     write_all_until(stream, body, deadline)?;
     stream
@@ -386,7 +406,9 @@ impl VmmClient {
         self
     }
 
-    /// Limit a request's total connect, write, and response-read time.
+    /// Override the default total connect, write, and response-read deadline.
+    /// A timeout does not establish whether a mutating request was applied;
+    /// callers must not blindly replay non-idempotent operations.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
         self
@@ -431,7 +453,9 @@ impl VmmClient {
         };
         let path = Path::new(&self.socket_path);
         let started = Instant::now();
-        let connect_deadline = deadline.min(started + self.connect_timeout);
+        let connect_deadline = started
+            .checked_add(self.connect_timeout)
+            .map_or(deadline, |connect| deadline.min(connect));
 
         loop {
             request_phase_timeout(Some(connect_deadline), Instant::now(), Duration::MAX)?;
@@ -450,20 +474,32 @@ impl VmmClient {
         }
     }
 
+    fn request_budget(&self, req: &ApiRequest) -> Duration {
+        self.request_timeout.unwrap_or_else(|| match req {
+            ApiRequest::Exec { timeout_ms, .. } => Duration::from_millis(*timeout_ms)
+                .saturating_add(Duration::from_secs(5))
+                .max(DEFAULT_REQUEST_TIMEOUT),
+            _ => DEFAULT_REQUEST_TIMEOUT,
+        })
+    }
+
     pub fn request(&self, req: &ApiRequest) -> Result<ApiResponse, VmmError> {
         let body = serde_json::to_vec(req)?;
-        let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
-        let mut stream = self.connect_for_request(deadline)?;
+        checked_api_frame_len(body.len())?;
+        let deadline = Instant::now()
+            .checked_add(self.request_budget(req))
+            .ok_or_else(|| {
+                VmmError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "request deadline exceeds monotonic clock range",
+                ))
+            })?;
+        let mut stream = self.connect_for_request(Some(deadline))?;
         if let Some(cancellation) = &self.cancellation {
             cancellation.register(&stream)?;
         }
-        let resp_body = if let Some(deadline) = deadline {
-            write_api_frame_until(&mut stream, &body, deadline)?;
-            read_api_frame_until(&mut stream, deadline)?
-        } else {
-            write_api_frame(&mut stream, &body)?;
-            read_api_frame(&mut stream)?
-        };
+        write_api_frame_until(&mut stream, &body, deadline)?;
+        let resp_body = read_api_frame_until(&mut stream, deadline)?;
         let resp: ApiResponse = serde_json::from_slice(&resp_body)?;
         Ok(resp)
     }
@@ -897,8 +933,23 @@ mod tests {
     }
 
     #[test]
-    fn request_timeout_is_opt_in() {
-        assert_eq!(VmmClient::new("/vmm.sock").request_timeout, None);
+    fn request_timeout_defaults_and_explicit_exec_budgets() {
+        let client = VmmClient::new("/vmm.sock");
+        assert_eq!(
+            client.request_budget(&ApiRequest::Status),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        let exec = ApiRequest::Exec {
+            command: "sleep 60".into(),
+            timeout_ms: 60000,
+        };
+        assert_eq!(client.request_budget(&exec), Duration::from_secs(65));
+        assert_eq!(
+            client
+                .with_request_timeout(Duration::from_secs(1))
+                .request_budget(&exec),
+            Duration::from_secs(1)
+        );
         assert_eq!(
             VmmClient::new("/vmm.sock")
                 .with_request_timeout(Duration::from_millis(200))
@@ -979,6 +1030,26 @@ mod tests {
     }
 
     #[test]
+    fn extreme_timeouts_do_not_overflow_monotonic_deadlines() {
+        let socket = socket_path();
+        let error = VmmClient::new(&socket.0)
+            .with_connect_timeout(Duration::MAX)
+            .with_request_timeout(Duration::from_millis(10))
+            .status()
+            .unwrap_err();
+        assert!(
+            matches!(error, VmmError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        let error = VmmClient::new(&socket.0)
+            .with_request_timeout(Duration::MAX)
+            .status()
+            .unwrap_err();
+        assert!(
+            matches!(error, VmmError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput)
+        );
+    }
+
+    #[test]
     fn request_timeout_covers_connect_retry() {
         let socket = socket_path();
 
@@ -991,6 +1062,105 @@ mod tests {
             error,
             VmmError::Io(ref error) if error.kind() == std::io::ErrorKind::TimedOut
         ));
+    }
+
+    #[test]
+    fn request_deadline_covers_partial_response_header_and_body() {
+        for partial in [&[0_u8, 0][..], &[0, 0, 0, 4, b'{'][..]] {
+            let socket = socket_path();
+            let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+            let (release_tx, release_rx) = mpsc::channel();
+            let partial = partial.to_vec();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_api_frame(&mut stream).unwrap();
+                stream.write_all(&partial).unwrap();
+                release_rx.recv().unwrap();
+            });
+            let result = VmmClient::new(&socket.0)
+                .with_request_timeout(Duration::from_millis(100))
+                .status();
+            release_tx.send(()).unwrap();
+            server.join().unwrap();
+            assert!(
+                matches!(result, Err(VmmError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_request_under_the_default_deadline() {
+        // Requests without an explicit timeout now always take the deadline
+        // path; delete-time cancellation must still cut them short.
+        let socket = socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+        let (received_tx, received_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_api_frame(&mut stream).unwrap();
+            received_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let cancellation = Arc::new(RequestCancellation::default());
+        let client = VmmClient::new(&socket.0).with_cancellation(Arc::clone(&cancellation));
+        let started = Instant::now();
+        let request = std::thread::spawn(move || client.exec("sleep 60", 60_000));
+        received_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exec request reached the VMM");
+        cancellation.cancel();
+        let result = request.join().unwrap();
+        let elapsed = started.elapsed();
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cancelled exec waited {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn default_request_deadline_bounds_a_silent_peer() {
+        let socket = socket_path();
+        let listener = std::os::unix::net::UnixListener::bind(&socket.0).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_api_frame(&mut stream).unwrap();
+            release_rx.recv().unwrap();
+        });
+        let started = Instant::now();
+        let result = VmmClient::new(&socket.0).status();
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(VmmError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(started.elapsed() < DEFAULT_REQUEST_TIMEOUT + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn oversized_request_frames_are_rejected_before_writing() {
+        assert!(checked_api_frame_len(usize::MAX).is_err());
+        let body = vec![0; MAX_API_FRAME_LEN + 1];
+        for bounded in [false, true] {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            let result = if bounded {
+                write_api_frame_until(&mut writer, &body, Instant::now() + Duration::from_secs(1))
+            } else {
+                write_api_frame(&mut writer, &body)
+            };
+            assert!(
+                matches!(result, Err(VmmError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput)
+            );
+            reader.set_nonblocking(true).unwrap();
+            assert_eq!(
+                reader.read(&mut [0; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
     }
 
     #[test]
