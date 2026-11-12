@@ -10895,30 +10895,37 @@ mod tests {
         ));
     }
 
-    /// The real InstaVM sequence on a real filesystem: a jail whose `/` is
-    /// root-owned 0755 and whose `/tmp` is owned by the jail uid with mode
-    /// 0700, then chroot, drop to the jail uid, and resolve the runtime
-    /// directory as `vmm serve` does. Needs root (chroot, chown, setuid).
+    /// The real InstaVM sequence on a real filesystem. InstaVM's
+    /// `prepare_jail` (sandbox `app/domain/firecracker/tarit_driver.py`)
+    /// chmods the jail's `/` to 0755 but does not chown it: on a worker it is
+    /// owned by InstaVM's service user (uid 800), neither root nor the jail
+    /// uid, with group = the jail gid. `/tmp` is the jail uid's, 0700. The
+    /// child enters it through `vmm_jailer::jail`, as `vmm serve --jail` does
+    /// (chroot, then drop to the jail uid), and resolves the runtime
+    /// directory. Needs root (chroot, chown, setuid).
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs root: chroot + setuid into an InstaVM-shaped jail"]
     fn instavm_jail_layout_is_accepted_after_chroot_and_uid_drop() {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         const CHILD_ENV: &str = "VMM_RUNTIME_JAIL_CHILD";
         const JAIL_UID: u32 = 10_123;
         const JAIL_GID: u32 = 10_123;
+        // The service user that prepares the jail: neither root nor the jail uid.
+        const LAUNCHER_UID: u32 = 10_800;
         if let Some(jail) = std::env::var_os(CHILD_ENV) {
-            let jail = std::ffi::CString::new(jail.as_bytes()).unwrap();
-            // SAFETY: plain syscalls on a valid C string; this child process
-            // runs only this test.
-            unsafe {
-                assert_eq!(libc::chroot(jail.as_ptr()), 0, "chroot");
-                assert_eq!(libc::chdir(c"/".as_ptr()), 0, "chdir");
-                assert_eq!(libc::setgroups(0, std::ptr::null()), 0, "setgroups");
-                assert_eq!(libc::setgid(JAIL_GID), 0, "setgid");
-                assert_eq!(libc::setuid(JAIL_UID), 0, "setuid");
-            }
+            vmm_jailer::jail(&vmm_jailer::jailer::JailerConfig {
+                chroot_dir: jail.into_string().unwrap(),
+                uid: JAIL_UID,
+                gid: JAIL_GID,
+                cgroup: String::new(),
+                cgroup_limits: None,
+                rlimit_nofile: 4096,
+                rlimit_as: 0,
+                netns: String::new(),
+                isolate_network: true,
+            })
+            .expect("enter the jail as vmm serve --jail does");
             std::env::remove_var("TMPDIR");
             let dir = private_runtime_dir().expect("InstaVM jail layout refused");
             assert_eq!(
@@ -10926,6 +10933,11 @@ mod tests {
                 PathBuf::from(format!("/tmp/.vmm-runtime-{JAIL_UID}"))
                     .join(format!("vmm-{}", std::process::id()))
             );
+            for path in [dir.parent().unwrap(), dir.as_path()] {
+                let meta = std::fs::symlink_metadata(path).unwrap();
+                assert_eq!(meta.uid(), JAIL_UID, "{}", path.display());
+                assert_eq!(meta.mode() & 0o777, 0o700, "{}", path.display());
+            }
             return;
         }
         // SAFETY: geteuid has no preconditions.
@@ -10933,6 +10945,7 @@ mod tests {
         let jail = tempfile::tempdir().unwrap();
         let tmp = jail.path().join("tmp");
         std::fs::create_dir(&tmp).unwrap();
+        std::os::unix::fs::chown(jail.path(), Some(LAUNCHER_UID), Some(JAIL_GID)).unwrap();
         std::fs::set_permissions(jail.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::os::unix::fs::chown(&tmp, Some(JAIL_UID), Some(JAIL_GID)).unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
