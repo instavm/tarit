@@ -3101,6 +3101,8 @@ async fn resume_hibernated_local_locked(
     let shape = restore_config.resource_shape();
     let supervisor = Arc::clone(&state.supervisor);
     let booted = match tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _activation_pause = pause_activation_restore(id);
         supervisor.restore_vm(
             ticket,
             path,
@@ -7542,4 +7544,41 @@ fn legacy_snapshot_null_rootfs_mode_restores_read_only() {
     assert!(restored_rootfs_read_only(None));
     assert!(restored_rootfs_read_only(Some(true)));
     assert!(!restored_rootfs_read_only(Some(false)));
+}
+
+// Deterministic in-process regression hook: pause only the actual restore worker.
+#[cfg(test)]
+pub(crate) struct ActivationRestorePause {
+    pub id: Uuid,
+    pub entered: tokio::sync::oneshot::Sender<()>,
+    pub release: std::sync::mpsc::Receiver<()>,
+    pub done: std::sync::mpsc::Sender<()>,
+}
+#[cfg(test)]
+pub(crate) static ACTIVATION_RESTORE_PAUSE: std::sync::Mutex<Option<ActivationRestorePause>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+struct ActivationRestoreDone(std::sync::mpsc::Sender<()>);
+#[cfg(test)]
+impl Drop for ActivationRestoreDone {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+#[cfg(test)]
+fn pause_activation_restore(id: Uuid) -> Option<ActivationRestoreDone> {
+    let probe = {
+        let mut slot = ACTIVATION_RESTORE_PAUSE.lock().unwrap();
+        if slot.as_ref().is_some_and(|p| p.id == id) {
+            slot.take()
+        } else {
+            None
+        }
+    }?;
+    let _ = probe.entered.send(());
+    probe
+        .release
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    Some(ActivationRestoreDone(probe.done))
 }

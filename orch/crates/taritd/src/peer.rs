@@ -589,7 +589,17 @@ impl PeerClient {
             .map(|config| Connector::Rustls(std::sync::Arc::clone(config)));
         let (socket, response) = connect_async_tls_with_config(request, None, false, connector)
             .await
-            .map_err(|error| OrchError::Internal(format!("peer WebSocket connect: {error}")))?;
+            .map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response)
+                    if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS =>
+                {
+                    OrchError::Overloaded {
+                        message: "owner share admission full".into(),
+                        retry_after_secs: 1,
+                    }
+                }
+                error => OrchError::Internal(format!("peer WebSocket connect: {error}")),
+            })?;
         let protocol = response
             .headers()
             .get(SEC_WEBSOCKET_PROTOCOL)
