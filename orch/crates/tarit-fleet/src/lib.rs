@@ -658,6 +658,27 @@ impl PostgresFleet {
         Ok(())
     }
 
+    /// Drop the snapshot locators of retired nodes. A node is retired when its
+    /// `fleet_hosts` row has been removed; its node-local snapshot files left
+    /// with it, so those locators can no longer be listed, restored or
+    /// deleted, and would otherwise mark every listing of their tenants as
+    /// partial forever. Only rows whose own `host_id` has no registration are
+    /// removed. A registered node's locators stay untouched, whether it is
+    /// healthy, unhealthy or stale, because a node that is merely down comes
+    /// back with its snapshots. Returns the number of locators removed.
+    pub async fn purge_retired_host_snapshots(&self) -> Result<u64, FleetError> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .execute(
+                "DELETE FROM fleet_snapshots snapshot
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM fleet_hosts host WHERE host.host_id = snapshot.host_id
+                  )",
+                &[],
+            )
+            .await?)
+    }
+
     /// Bind a hibernated logical VM to the immutable artifact that can recover
     /// it. The artifact reference and binding move in one transaction so GC
     /// can never remove the only recovery image between those writes.
@@ -5123,6 +5144,136 @@ mod tests {
             .await?;
         fleet.delete_snapshot(&unrelated).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn retired_host_snapshot_locators_are_purged_without_touching_registered_hosts(
+    ) -> Result<(), FleetError> {
+        let Some(database_url) = postgres_test_database_url() else {
+            return Ok(());
+        };
+        let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+        let fleet = PostgresFleet::connect(&database_url).await?;
+        let run = Uuid::new_v4();
+        let live_host = format!("purge-live-{run}");
+        let stale_host = format!("purge-stale-{run}");
+        let retired_host = format!("purge-retired-{run}");
+        let tenant_a = format!("purge-tenant-a-{run}");
+        let tenant_b = format!("purge-tenant-b-{run}");
+        let locator = |host: &str, owner: &str| SnapshotRecord {
+            snapshot_id: Uuid::new_v4(),
+            path: format!("/private/{}.ram", Uuid::new_v4()),
+            overlay_path: None,
+            host_id: host.into(),
+            owner_key: Some(owner.into()),
+            api_key_id: None,
+            vm_id: Uuid::new_v4(),
+            ephemeral_owner_vm_id: None,
+            memory_mib: Some(256),
+            vcpus: Some(1),
+            kernel_path: None,
+            rootfs_path: None,
+            rootfs_read_only: None,
+            cmdline: None,
+            content_digest: None,
+            size_bytes: Some(4096),
+            created_at: Utc::now(),
+        };
+        let kept = [
+            locator(&live_host, &tenant_a),
+            locator(&live_host, &tenant_b),
+            locator(&stale_host, &tenant_a),
+        ];
+        let retired = [
+            locator(&retired_host, &tenant_a),
+            locator(&retired_host, &tenant_b),
+        ];
+        let result = async {
+            for host in [&live_host, &stale_host, &retired_host] {
+                fleet
+                    .upsert_host(&host_record_from_capacity(
+                        host,
+                        Uuid::new_v4(),
+                        None,
+                        Some("http://127.0.0.1:9".into()),
+                        0,
+                        1,
+                        256,
+                    ))
+                    .await?;
+            }
+            for snapshot in kept.iter().chain(retired.iter()) {
+                fleet.upsert_snapshot(snapshot).await?;
+            }
+            let client = fleet.pool.get().await?;
+            // A node that is down (stale heartbeat, unhealthy) is not retired:
+            // it can come back with its snapshots.
+            client
+                .execute(
+                    "UPDATE fleet_hosts SET healthy = FALSE, last_heartbeat = NOW() - INTERVAL '1 day'
+                      WHERE host_id = $1",
+                    &[&stale_host],
+                )
+                .await?;
+            fleet.purge_retired_host_snapshots().await?;
+            for snapshot in kept.iter().chain(retired.iter()) {
+                assert!(
+                    fleet
+                        .get_snapshot_location(snapshot.snapshot_id)
+                        .await?
+                        .is_some(),
+                    "registered hosts keep every locator"
+                );
+            }
+            // Retire one node by removing its registration.
+            client
+                .execute("DELETE FROM fleet_hosts WHERE host_id = $1", &[&retired_host])
+                .await?;
+            assert!(fleet.purge_retired_host_snapshots().await? >= retired.len() as u64);
+            for snapshot in &retired {
+                assert!(fleet
+                    .get_snapshot_location(snapshot.snapshot_id)
+                    .await?
+                    .is_none());
+            }
+            for snapshot in &kept {
+                assert!(
+                    fleet
+                        .get_snapshot_location(snapshot.snapshot_id)
+                        .await?
+                        .is_some(),
+                    "only the retired node's locators are removed"
+                );
+            }
+            assert_eq!(fleet.snapshot_hosts(&tenant_a).await?, {
+                let mut hosts = vec![live_host.clone(), stale_host.clone()];
+                hosts.sort();
+                hosts
+            });
+            assert_eq!(fleet.snapshot_hosts(&tenant_b).await?, vec![live_host.clone()]);
+            Ok::<(), FleetError>(())
+        }
+        .await;
+        let client = fleet.pool.get().await?;
+        for snapshot in kept.iter().chain(retired.iter()) {
+            client
+                .execute(
+                    "DELETE FROM fleet_snapshots WHERE snapshot_id = $1",
+                    &[&snapshot.snapshot_id],
+                )
+                .await?;
+        }
+        client
+            .execute(
+                "DELETE FROM fleet_hosts WHERE host_id = ANY($1)",
+                &[&vec![
+                    live_host.clone(),
+                    stale_host.clone(),
+                    retired_host.clone(),
+                ]],
+            )
+            .await?;
+        result
     }
 
     #[tokio::test]
