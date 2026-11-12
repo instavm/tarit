@@ -625,7 +625,10 @@ fn handle_io_exit(
                 data[0] = serial.read((port - 0x3f8) as u8);
             }
         }
-        other => return Err(VmmError::Kvm(format!("unhandled exit: {other:?}"))),
+        other => {
+            log::warn!("vCPU exit {other:?} — stopping");
+            return Err(VmmError::Kvm(format!("unhandled exit: {other:?}")));
+        }
     }
     Ok(())
 }
@@ -735,6 +738,58 @@ mod tests {
         Arc::new(vmm_devices::serial::Serial::new(
             vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
         ))
+    }
+
+    /// Records warnings logged on the calling thread while `f` runs. Records
+    /// from other threads are dropped, so parallel tests do not interfere.
+    fn capture_warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        struct ThreadWarnings;
+        std::thread_local! {
+            static WARNINGS: std::cell::RefCell<Option<Vec<String>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        impl log::Log for ThreadWarnings {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    WARNINGS.with(|warnings| {
+                        if let Some(lines) = warnings.borrow_mut().as_mut() {
+                            lines.push(record.args().to_string());
+                        }
+                    });
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: ThreadWarnings = ThreadWarnings;
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).expect("no other logger in the vmm-core tests");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        WARNINGS.with(|warnings| *warnings.borrow_mut() = Some(Vec::new()));
+        let value = f();
+        let lines = WARNINGS.with(|warnings| warnings.borrow_mut().take().unwrap_or_default());
+        (value, lines)
+    }
+
+    /// Main logged every exit the run loop cannot handle before the vCPU
+    /// stopped; #124's shared handler had dropped that line. Needs the `kvm`
+    /// feature on Linux, not /dev/kvm.
+    #[test]
+    fn unhandled_exit_is_logged_before_the_vcpu_stops() {
+        let serial = test_serial();
+        let (result, warnings) =
+            capture_warnings(|| handle_io_exit(VcpuExit::Shutdown, &MmioBus::new(), &serial));
+        assert!(result.is_err());
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("Shutdown") && line.contains("stopping")),
+            "{warnings:?}"
+        );
     }
 
     /// `rep movsb` from MMIO exits once per byte, and KVM reaches its
