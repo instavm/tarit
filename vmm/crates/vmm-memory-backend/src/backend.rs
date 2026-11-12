@@ -104,6 +104,20 @@ pub enum MemoryError {
     OutOfBounds(u64, u64),
 }
 
+/// An open `/proc/self/pagemap`, so a snapshot that reads the page map many
+/// times opens it once. The handle is bound to this process's address space
+/// and every read is positioned, so it can serve any number of reads.
+#[cfg(target_os = "linux")]
+pub struct PageMap(std::fs::File);
+
+#[cfg(target_os = "linux")]
+impl PageMap {
+    /// `None` where it cannot be opened, such as a jail without /proc.
+    pub fn open() -> Option<Self> {
+        std::fs::File::open("/proc/self/pagemap").ok().map(Self)
+    }
+}
+
 /// Guest physical memory backed by one contiguous host mapping.
 ///
 /// Up to 3.25 GiB, the host mapping is registered as one KVM slot at GPA zero.
@@ -473,12 +487,18 @@ impl GuestMemory {
     /// snapshot. `None` when the map cannot be read.
     #[cfg(target_os = "linux")]
     pub fn populated_pages(&self) -> Option<Vec<bool>> {
-        self.populated_pages_range(0, usize::try_from(self.size_bytes).ok()?)
+        self.populated_pages_range(&PageMap::open()?, 0, usize::try_from(self.size_bytes).ok()?)
     }
 
-    /// Population map for one page-aligned packed-RAM range.
+    /// Population map for one page-aligned packed-RAM range, read through a
+    /// page map the caller opened once for many such reads.
     #[cfg(target_os = "linux")]
-    pub fn populated_pages_range(&self, offset: usize, len: usize) -> Option<Vec<bool>> {
+    pub fn populated_pages_range(
+        &self,
+        pagemap: &PageMap,
+        offset: usize,
+        len: usize,
+    ) -> Option<Vec<bool>> {
         use std::os::unix::fs::FileExt;
         const PAGE: usize = 4096;
         const PRESENT: u64 = 1 << 63;
@@ -493,9 +513,9 @@ impl GuestMemory {
         if !addr.is_multiple_of(PAGE) {
             return None;
         }
-        let pagemap = std::fs::File::open("/proc/self/pagemap").ok()?;
         let mut raw = vec![0u8; len / PAGE * 8];
         pagemap
+            .0
             .read_exact_at(&mut raw, (addr / PAGE * 8) as u64)
             .ok()?;
         Some(

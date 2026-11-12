@@ -2,6 +2,7 @@
 use crate::error::{Result, VmmError};
 #[cfg(feature = "boot")]
 use std::borrow::Cow;
+use vmm_memory_backend::backend::PageMap;
 #[cfg(feature = "boot")]
 use vmm_memory_backend::uffd_restore::LazyPageDiscard;
 use vmm_memory_backend::GuestMemory;
@@ -60,26 +61,41 @@ pub(crate) fn read_snapshot_bytes<'a>(
     }
 }
 
+/// The most RAM [`capture_live_range`] copies under the balloon fence: 2 MiB,
+/// or one integrity chunk where that is larger (a manifest allows at most
+/// 4 MiB). Holding the fence blocks balloon discards on vCPU threads, so it
+/// covers one page-map read and the copy of at most this much RAM. Both sizes
+/// are powers of two, so a capture is a whole number of integrity chunks:
+/// finish() then reads and verifies each source chunk once, and a run of
+/// untouched captures can be shared with the restore snapshot, which only
+/// clones whole integrity chunks.
+pub(crate) fn live_capture_chunk(
+    lazy: &vmm_memory_backend::uffd_restore::LazyPageDiscard,
+) -> usize {
+    lazy.untouched_chunk().max(2 * 1024 * 1024)
+}
+
 /// Capture at most one bounded live chunk under exclusion. The returned value
 /// performs all restore-source I/O after this function releases the fence.
 pub(crate) fn capture_live_range(
     memory: &GuestMemory,
+    pagemap: &PageMap,
     start: usize,
     end: usize,
 ) -> Result<vmm_memory_backend::uffd_restore::CapturedSnapshotRange> {
-    let len = end
-        .checked_sub(start)
-        .filter(|len| *len <= 2 * 1024 * 1024)
-        .ok_or_else(|| VmmError::Snapshot("live capture exceeds bounded chunk".into()))?;
     let lazy = memory
         .lazy_page_discard()
         .ok_or_else(|| VmmError::Snapshot("lazy capture without restore source".into()))?;
+    let len = end
+        .checked_sub(start)
+        .filter(|len| *len <= live_capture_chunk(&lazy))
+        .ok_or_else(|| VmmError::Snapshot("live capture exceeds bounded chunk".into()))?;
     let fence = lazy.snapshot_fence();
     let _guard = fence
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let populated = memory
-        .populated_pages_range(start, len)
+        .populated_pages_range(pagemap, start, len)
         .ok_or_else(|| VmmError::Snapshot("read bounded lazy population map".into()))?;
     lazy.capture_snapshot_range(start, len, populated)
         .map_err(|error| VmmError::Snapshot(format!("capture lazy snapshot range: {error}")))
@@ -124,7 +140,8 @@ mod tests {
         memory
             .discard_range((2 * PAGE) as u64, PAGE as u64)
             .unwrap();
-        let capture = capture_live_range(&memory, 0, LEN).unwrap();
+        let pagemap = PageMap::open().unwrap();
+        let capture = capture_live_range(&memory, &pagemap, 0, LEN).unwrap();
         // Keep the owned capture alive, as with blocked restore-source/output I/O.
         // Discard must finish before that downstream work is allowed to proceed.
         let (sent, received) = mpsc::channel();
@@ -147,7 +164,7 @@ mod tests {
             "finishing output must not undo discard"
         );
         // The discard is replayed by the next dirty round, yielding zero.
-        let after = capture_live_range(&memory, PAGE, 2 * PAGE)
+        let after = capture_live_range(&memory, &pagemap, PAGE, 2 * PAGE)
             .unwrap()
             .finish()
             .unwrap();

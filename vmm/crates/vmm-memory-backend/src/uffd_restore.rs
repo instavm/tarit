@@ -150,17 +150,23 @@ impl CapturedSnapshotRange {
     /// Source I/O and integrity verification run after releasing guest exclusion.
     pub fn finish(self) -> Result<Vec<u8>, UffdRestoreError> {
         const PAGE: usize = 4096;
+        let len = self.populated.len() * PAGE;
         if self
             .populated
             .iter()
             .zip(&self.discarded)
             .all(|(present, discarded)| *present || *discarded)
         {
-            return Ok(self.bytes);
+            // `bytes` is empty when no page was populated: all discarded.
+            return Ok(if self.bytes.is_empty() {
+                vec![0; len]
+            } else {
+                self.bytes
+            });
         }
-        let mut out = vec![0; self.bytes.len()];
+        let mut out = vec![0; len];
         let chunk = self.lazy.untouched_chunk();
-        let end = self.offset + out.len();
+        let end = self.offset + len;
         let mut buffer = vec![0; chunk.min(self.lazy.guest_len)];
         let mut at = self.offset / chunk * chunk;
         while at < end {
@@ -301,7 +307,13 @@ impl LazyPageDiscard {
             .map_err(|_| UffdRestoreError::Uffd("discard bitmap lock poisoned".into()))?
             [offset / PAGE..end / PAGE]
             .to_vec();
-        let mut bytes = vec![0; len];
+        // Untouched RAM, the bulk of a lazily restored guest, has nothing to
+        // copy: skip the buffer instead of zeroing one per range.
+        let mut bytes = if populated.iter().any(|present| *present) {
+            vec![0; len]
+        } else {
+            Vec::new()
+        };
         for (page, present) in populated.iter().enumerate() {
             if *present {
                 // SAFETY: validated live mmap range; caller excludes concurrent discard.

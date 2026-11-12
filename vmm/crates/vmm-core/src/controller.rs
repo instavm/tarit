@@ -9768,7 +9768,9 @@ mod tests {
         );
         assert_eq!(memory.populated_pages().unwrap(), before);
         let live = tempfile::NamedTempFile::new().unwrap();
-        crate::live_snapshot::copy_page_run(&memory, live.as_file(), 0, 16).unwrap();
+        let pagemap = vmm_memory_backend::backend::PageMap::open().unwrap();
+        crate::live_snapshot::copy_page_run(&memory, live.as_file(), 0, 16, Some(&pagemap))
+            .unwrap();
         assert_eq!(std::fs::read(live.path()).unwrap(), expected);
         assert_eq!(memory.populated_pages().unwrap(), before);
         memory.clear_lazy_page_discard();
