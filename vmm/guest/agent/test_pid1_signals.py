@@ -65,16 +65,21 @@ def main(agent):
     workdir = tempfile.mkdtemp(prefix='vmm-agent-pid1-', dir='/var/tmp')
     serial = os.path.join(workdir, 'serial')
     open(serial, 'w').close()
+    errors = tempfile.TemporaryFile(dir=workdir)
     env = dict(os.environ, VMM_AGENT_SERIAL=serial)
     proc = subprocess.Popen(
         ['unshare', '--user', '--map-root-user', '--pid', '--fork', '--kill-child',
-         '--mount', '--mount-proc', '--net',
-         'sh', '-c', SETUP, 'sh', os.ttyname(slave), serial, agent],
-        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL, start_new_session=True)
+         '--mount', '--net', 'sh', '-xc', SETUP, 'sh', os.ttyname(slave), serial, agent],
+        env=env, stdin=subprocess.DEVNULL, stdout=errors, stderr=errors,
+        start_new_session=True)
     init = None
     try:
-        read_until(master, b'VMM_AGENT_READY', 10)
+        try:
+            read_until(master, b'VMM_AGENT_READY', 10)
+        except AssertionError as error:
+            errors.seek(0)
+            raise AssertionError('%s; unshare exit %r; output %r'
+                                 % (error, proc.poll(), errors.read()[-2000:])) from None
         init = namespace_init(proc.pid)
         assert namespace_pid(init) == 1, 'agent is not PID 1 in its namespace'
         assert open('/proc/%d/comm' % init).read().strip() == 'vmm-agent'
@@ -102,6 +107,7 @@ def main(agent):
         proc.wait()
         os.close(master)
         os.close(slave)
+        errors.close()
         os.unlink(serial)
         os.rmdir(workdir)
 
