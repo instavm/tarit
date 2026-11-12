@@ -2804,90 +2804,97 @@ mod tests {
 
     #[tokio::test]
     async fn bridges_websocket_frames_and_negotiates_the_upstream_protocol() {
-        let (upstream, observed) = spawn_websocket_echo_upstream_with_expected_authorization(Some(
-            b"Bearer app-authorization-token-7",
-        ))
-        .await;
-        let (gateway, metrics) = start_gateway_router(upstream, Duration::from_secs(1)).await;
-        let mut request = format!("ws://{gateway}/socket?keep=this")
-            .into_client_request()
-            .unwrap();
-        request.headers_mut().insert(
-            SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("chat, alternate"),
-        );
-        request
-            .headers_mut()
-            .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
-        request
-            .headers_mut()
-            .insert(COOKIE, HeaderValue::from_static("session=guest"));
-        request
-            .headers_mut()
-            .insert(FORWARDED, HeaderValue::from_static("for=untrusted"));
-        request
-            .headers_mut()
-            .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
-        request.headers_mut().insert(
-            AUTHORIZATION,
-            HeaderValue::from_static("Bearer app-authorization-token-7"),
-        );
-        request.headers_mut().insert(
-            "x-tarit-share-token",
-            HeaderValue::from_static("share-token-that-must-be-stripped"),
-        );
+        // This verifies protocol forwarding, not idle eviction. Keep the
+        // bridge alive under a loaded CI runner; the outer deadline still
+        // bounds a broken handshake or missing frame.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (upstream, observed) = spawn_websocket_echo_upstream_with_expected_authorization(
+                Some(b"Bearer app-authorization-token-7"),
+            )
+            .await;
+            let (gateway, metrics) = start_gateway_router(upstream, Duration::from_secs(30)).await;
+            let mut request = format!("ws://{gateway}/socket?keep=this")
+                .into_client_request()
+                .unwrap();
+            request.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static("chat, alternate"),
+            );
+            request
+                .headers_mut()
+                .insert(ORIGIN, HeaderValue::from_static("https://client.example"));
+            request
+                .headers_mut()
+                .insert(COOKIE, HeaderValue::from_static("session=guest"));
+            request
+                .headers_mut()
+                .insert(FORWARDED, HeaderValue::from_static("for=untrusted"));
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                HeaderValue::from_static("Bearer app-authorization-token-7"),
+            );
+            request.headers_mut().insert(
+                "x-tarit-share-token",
+                HeaderValue::from_static("share-token-that-must-be-stripped"),
+            );
 
-        let (mut client, response) = connect_async(request).await.unwrap();
-        wait_for_websocket_gauge(&metrics, 1).await;
-        assert_eq!(
-            response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
-            "chat"
-        );
+            let (mut client, response) = connect_async(request).await.unwrap();
+            wait_for_websocket_gauge(&metrics, 1).await;
+            assert_eq!(
+                response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
+                "chat"
+            );
 
-        client
-            .send(TungsteniteMessage::Text("hello".into()))
-            .await
-            .unwrap();
-        assert_eq!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Text("hello".into())
-        );
+            client
+                .send(TungsteniteMessage::Text("hello".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Text("hello".into())
+            );
 
-        client
-            .send(TungsteniteMessage::Binary(Bytes::from_static(b"bin")))
-            .await
-            .unwrap();
-        assert_eq!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Binary(Bytes::from_static(b"bin"))
-        );
+            client
+                .send(TungsteniteMessage::Binary(Bytes::from_static(b"bin")))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Binary(Bytes::from_static(b"bin"))
+            );
 
-        client
-            .send(TungsteniteMessage::Ping(Bytes::from_static(b"ping")))
-            .await
-            .unwrap();
-        assert_eq!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Pong(Bytes::from_static(b"ping"))
-        );
-        client
-            .send(TungsteniteMessage::Pong(Bytes::from_static(b"pong")))
-            .await
-            .unwrap();
+            client
+                .send(TungsteniteMessage::Ping(Bytes::from_static(b"ping")))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Pong(Bytes::from_static(b"ping"))
+            );
+            client
+                .send(TungsteniteMessage::Pong(Bytes::from_static(b"pong")))
+                .await
+                .unwrap();
 
-        client.send(TungsteniteMessage::Close(None)).await.unwrap();
-        assert!(matches!(
-            client.next().await.unwrap().unwrap(),
-            TungsteniteMessage::Close(_)
-        ));
+            client.send(TungsteniteMessage::Close(None)).await.unwrap();
+            assert!(matches!(
+                client.next().await.unwrap().unwrap(),
+                TungsteniteMessage::Close(_)
+            ));
 
-        let observed = observed.await.unwrap();
-        assert!(observed.contains(&"text"));
-        assert!(observed.contains(&"binary"));
-        assert!(observed.contains(&"ping"));
-        assert!(observed.contains(&"pong"));
-        assert!(observed.contains(&"close"));
-        wait_for_websocket_gauge(&metrics, 0).await;
+            let observed = observed.await.unwrap();
+            assert!(observed.contains(&"text"));
+            assert!(observed.contains(&"binary"));
+            assert!(observed.contains(&"ping"));
+            assert!(observed.contains(&"pong"));
+            assert!(observed.contains(&"close"));
+            wait_for_websocket_gauge(&metrics, 0).await;
+        })
+        .await
+        .expect("websocket protocol forwarding must complete within15s");
     }
 
     #[tokio::test]

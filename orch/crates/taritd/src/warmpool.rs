@@ -431,7 +431,6 @@ pub(crate) fn spawn_replenisher(
                             continue;
                         }
                         let to_spawn = need.min(conc);
-                        let mut spawned = 0usize;
                         let mut set = Vec::with_capacity(to_spawn);
                         for _ in 0..to_spawn {
                             if worker_cancelled.load(Ordering::Acquire)
@@ -440,7 +439,6 @@ pub(crate) fn spawn_replenisher(
                                 worker_cancelled.store(true, Ordering::Release);
                                 break;
                             }
-                            spawned += 1;
                             let sup = Arc::clone(&sup);
                             let class = class.clone();
                             let golden_bundle = golden_bundle.clone();
@@ -449,19 +447,26 @@ pub(crate) fn spawn_replenisher(
                                 worker_children
                                     .spawn(move || {
                                         if cancelled.load(Ordering::Acquire) {
-                                        } else if let Err(e) = tokio::runtime::Handle::current()
+                                            return false;
+                                        }
+                                        match tokio::runtime::Handle::current()
                                             .block_on(sup.spawn_warm_restore(class, golden_bundle))
                                         {
-                                            tracing::warn!("warm restore spawn failed: {e}");
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                tracing::warn!("warm restore spawn failed: {e}");
+                                                false
+                                            }
                                         }
                                     })
                                     .await,
                             );
                         }
-                        if !await_blocking_set(&mut set, &worker_cancelled, &mut shutdown_rx).await
-                        {
+                        let Some(spawned) =
+                            await_blocking_set(&mut set, &worker_cancelled, &mut shutdown_rx).await
+                        else {
                             break 'replenish;
-                        }
+                        };
                         did_work |= spawned > 0;
                         continue;
                     }
@@ -478,7 +483,6 @@ pub(crate) fn spawn_replenisher(
                                 break;
                             }
                             remaining -= 1;
-                            did_work = true;
                             let sup = Arc::clone(&sup);
                             let class = class.clone();
                             let cancelled = Arc::clone(&worker_cancelled);
@@ -486,22 +490,33 @@ pub(crate) fn spawn_replenisher(
                                 worker_children
                                     .spawn(move || {
                                         if cancelled.load(Ordering::Acquire) {
-                                        } else if let Err(e) = tokio::runtime::Handle::current()
+                                            return false;
+                                        }
+                                        match tokio::runtime::Handle::current()
                                             .block_on(sup.spawn_warm(class))
                                         {
-                                            tracing::warn!("warm spawn failed: {e}");
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                tracing::warn!("warm spawn failed: {e}");
+                                                false
+                                            }
                                         }
                                     })
                                     .await,
                             );
                         }
-                        if !await_blocking_set(&mut set, &worker_cancelled, &mut shutdown_rx).await
-                        {
+                        let Some(spawned) =
+                            await_blocking_set(&mut set, &worker_cancelled, &mut shutdown_rx).await
+                        else {
                             break 'replenish;
+                        };
+                        did_work |= spawned > 0;
+                        if spawned == 0 {
+                            break;
                         }
                     }
                 }
-                // Idle only when the pool is full; under drain, loop immediately so
+                // Idle when full or a round made no progress; under drain, loop immediately so
                 // refill tracks the take rate instead of pausing 150ms every cycle.
                 if !did_work {
                     tokio::select! {
@@ -567,28 +582,29 @@ where
 }
 
 async fn await_blocking_set(
-    set: &mut Vec<oneshot::Receiver<()>>,
+    set: &mut Vec<oneshot::Receiver<bool>>,
     cancelled: &AtomicBool,
     shutdown_rx: &mut watch::Receiver<Option<&'static str>>,
-) -> bool {
+) -> Option<usize> {
+    let mut spawned = 0;
     while let Some(mut result) = set.pop() {
         if cancelled.load(Ordering::Acquire) {
             let _ = result.await;
             continue;
         }
         tokio::select! {
-            _ = &mut result => {}
+            result = &mut result => { spawned += usize::from(result.unwrap_or(false)); }
             _ = wait_for_shutdown(shutdown_rx) => {
                 cancelled.store(true, Ordering::Release);
                 let _ = result.await;
                 while let Some(result) = set.pop() {
                     let _ = result.await;
                 }
-                return false;
+                return None;
             }
         }
     }
-    true
+    Some(spawned)
 }
 
 fn shutdown_pending(shutdown_rx: &watch::Receiver<Option<&'static str>>) -> bool {
