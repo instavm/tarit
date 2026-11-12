@@ -261,6 +261,15 @@ Recommended safe scale-in sequence:
 6. Stop remaining VMs or restore them elsewhere according to workload policy.
 7. Terminate the underlying instance only after VM ownership is cleared or safely recreated.
 8. Verify the node disappears from `healthy_nodes` after heartbeat freshness expires.
+9. Retire the node permanently by deleting its row from `fleet_hosts`
+   (`DELETE FROM fleet_hosts WHERE host_id = '<victim>'`). Within about a
+   minute the remaining nodes drop the snapshot locators that point at it
+   (`fleet_snapshots` rows with that `host_id`, of every tenant), so
+   `GET /v1/snapshots` stops reporting it as unavailable. Only delete the row
+   once the node and its node-local snapshot files are gone for good: a node
+   that is merely stopped keeps its registration and its snapshots, and a
+   still-running node whose row is deleted re-registers on its next
+   heartbeat but loses those locators.
 
 If node-local snapshots are required for recovery, do not terminate a victim until snapshots are copied to durable storage.
 

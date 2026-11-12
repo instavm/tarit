@@ -533,6 +533,9 @@ when the list is complete, so a client that needs the full list should retry
 while it is present. It counts only nodes that hold the caller's own snapshots,
 and node ids are not exposed (the server log names them). The body stays a
 plain array so existing clients keep working.
+A node that is retired for good (its `fleet_hosts` row removed) is not
+counted: its snapshot locators are dropped within about a minute, see
+[AUTOSCALING.md](AUTOSCALING.md#drain-and-scale-in-safety).
 
 Status codes: `200` (complete, or partial with `X-Tarit-Unavailable-Hosts`),
 `401`, `503` (fleet store unavailable).

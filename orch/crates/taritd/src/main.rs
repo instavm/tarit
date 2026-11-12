@@ -48,6 +48,9 @@ const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const PEER_ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 const STORE_QUEUE_CAPACITY: usize = 8_192;
+/// Heartbeat ticks (5 s each) between sweeps that drop the snapshot locators
+/// of retired nodes, about once a minute.
+const RETIRED_HOST_SNAPSHOT_PURGE_TICKS: u32 = 12;
 
 #[derive(Clone)]
 struct ShutdownCoordinator {
@@ -1771,6 +1774,7 @@ fn spawn_fleet_sync(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut ticks_since_purge = 0_u32;
         loop {
             tokio::select! {
                 biased;
@@ -1793,6 +1797,20 @@ fn spawn_fleet_sync(
             }
             if let Err(error) = fleet.refresh_artifact_replication_health().await {
                 tracing::warn!(%error, "fleet artifact health reconciliation failed");
+            }
+            ticks_since_purge += 1;
+            if ticks_since_purge >= RETIRED_HOST_SNAPSHOT_PURGE_TICKS {
+                ticks_since_purge = 0;
+                match fleet.purge_retired_host_snapshots().await {
+                    Ok(0) => {}
+                    Ok(removed) => tracing::info!(
+                        removed,
+                        "dropped snapshot locators of retired (deregistered) nodes"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "retired node snapshot locator cleanup failed")
+                    }
+                }
             }
             match fleet.list_hosts().await {
                 Ok(hosts) => {
