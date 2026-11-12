@@ -227,6 +227,52 @@ fn backfill_legacy_runtime_layouts(
     Ok(())
 }
 
+// Startup reads the locally persisted attachment cache used to launch these VMMs.
+// Invalid metadata aborts startup rather than adopting a VM with incomplete limits.
+fn readopt_volume_configs(
+    config: &Config,
+    store: &Store,
+    records: &[tarit_types::VmRecord],
+) -> anyhow::Result<HashMap<Uuid, Vec<supervisor::VmDataVolumeConfig>>> {
+    let mut result = HashMap::new();
+    if !config.vm_io_quota.is_configured() || config.vm_cgroup_parent.is_none() {
+        return Ok(result);
+    }
+    for record in records.iter().filter(|record| {
+        record.host_id == config.host_id
+            && matches!(
+                record.status,
+                VmStatus::Running | VmStatus::Paused | VmStatus::Suspended
+            )
+    }) {
+        let Some(owner) = record.owner_key.as_deref() else {
+            continue;
+        };
+        let attachments = store.list_vm_volume_attachments(owner, record.id)?;
+        let mut volumes = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let volume = store.get_volume(owner, attachment.volume_id)?;
+            let target = volume_provider::placement_target(config, &volume)?;
+            anyhow::ensure!(
+                volume.generation == attachment.volume_generation
+                    && target.as_deref().is_none_or(|host| host == config.host_id),
+                "VM {} attachment {} cannot be recovered on this host",
+                record.id,
+                volume.id
+            );
+            volumes.push(supervisor::VmDataVolumeConfig {
+                id: volume.id,
+                provider: volume.provider,
+                size_bytes: volume.size_bytes,
+                read_only: attachment.mode == tarit_types::VolumeAttachmentMode::ReadOnly,
+                generation: volume.generation,
+            });
+        }
+        result.insert(record.id, volumes);
+    }
+    Ok(result)
+}
+
 async fn run_server(
     mut config: Config,
     preflight_taps: Vec<String>,
@@ -315,8 +361,10 @@ async fn run_server(
     // mandatory: if it fails, startup aborts rather than serve stale durable
     // Running/Paused/Suspended records for VMs that no longer exist.
     {
+        let volumes = readopt_volume_configs(&config, &store, &persisted_vms)
+            .context("load persisted volumes for cgroup readoption")?;
         let failures = supervisor
-            .readopt_running_vms(&mut persisted_vms)
+            .readopt_running_vms(&mut persisted_vms, &volumes)
             .await
             .context("re-adopt locally owned VMMs")?;
         let failed_ids = failures
@@ -1962,6 +2010,73 @@ mod tests {
     }
 
     #[test]
+    fn readoption_loads_tenant_scoped_persisted_volume_attachments() {
+        use tarit_types::{
+            VmVolumeAttachmentRecord, VolumeAttachmentMode, VolumeCapabilities, VolumeRecord,
+            VolumeStatus, VolumeStorageClass,
+        };
+        let mut config = test_config();
+        config.vm_cgroup_parent = Some("/unused/test-cgroups".into());
+        config.vm_io_quota.read_bps_max = Some(1048576);
+        let store = Store::open(":memory:").unwrap();
+        let id = Uuid::new_v4();
+        let record = legacy_active_record(&config, id, PathBuf::from("socket"), Some(42));
+        let now = chrono::Utc::now();
+        let volume = VolumeRecord {
+            id: Uuid::new_v4(),
+            owner_key: "tenant-a".into(),
+            name: "disk".into(),
+            provider: "local_block".into(),
+            storage_class: VolumeStorageClass::Block,
+            size_bytes: 4194304,
+            status: VolumeStatus::Available,
+            capabilities: VolumeCapabilities {
+                read_only_many: true,
+                read_write_once: true,
+                read_write_many: false,
+                snapshots: false,
+                clones: false,
+            },
+            host_id: Some(config.host_id.clone()),
+            region: None,
+            zone: None,
+            generation: 1,
+            revision: 1,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_volume(&volume).unwrap();
+        store.insert_vm(&record).unwrap();
+        store
+            .bind_vm_volumes(&[VmVolumeAttachmentRecord {
+                vm_id: id,
+                volume_id: volume.id,
+                device_index: 0,
+                owner_key: "tenant-a".into(),
+                mode: VolumeAttachmentMode::ReadOnly,
+                volume_generation: 1,
+                created_at: now,
+            }])
+            .unwrap();
+        let configs =
+            readopt_volume_configs(&config, &store, std::slice::from_ref(&record)).unwrap();
+        let recovered = &configs[&id];
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, volume.id);
+        assert_eq!(recovered[0].generation, 1);
+        assert!(recovered[0].read_only);
+        let mut other_tenant = record.clone();
+        other_tenant.owner_key = Some("tenant-b".into());
+        assert!(readopt_volume_configs(&config, &store, &[other_tenant]).unwrap()[&id].is_empty());
+        let mut wrong_host = config.clone();
+        wrong_host.host_id = "other-host".into();
+        let mut moved = record;
+        moved.host_id = wrong_host.host_id.clone();
+        assert!(readopt_volume_configs(&wrong_host, &store, &[moved]).is_err());
+    }
+
+    #[test]
     fn ambiguous_legacy_runtime_layout_requires_drain() {
         let config = test_config();
         let id = Uuid::new_v4();
@@ -2194,7 +2309,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(supervisor.readopt_running_vms(&mut records))
+            .block_on(supervisor.readopt_running_vms(&mut records, &HashMap::new()))
             .unwrap();
         server.join().unwrap();
         assert!(warnings.is_empty());

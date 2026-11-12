@@ -3791,7 +3791,7 @@ impl VmmSupervisor {
         vm_config: &VmSpawnConfig,
         snapshot_path: Option<&Path>,
     ) -> Result<PreparedRuntime, OrchError> {
-        let data_volumes = self.prepare_data_volumes(vm_config)?;
+        let data_volumes = self.prepare_data_volumes(&vm_config.data_volumes)?;
         let Some(jails) = &self.jails else {
             let host_overlay = vm_config.rootfs_path.as_ref().map(|_| {
                 snapshot_path.map_or_else(
@@ -3879,13 +3879,12 @@ impl VmmSupervisor {
 
     fn prepare_data_volumes(
         &self,
-        vm_config: &VmSpawnConfig,
+        volumes: &[VmDataVolumeConfig],
     ) -> Result<Vec<PreparedBlockAttachment>, OrchError> {
-        if vm_config.data_volumes.is_empty() {
+        if volumes.is_empty() {
             return Ok(Vec::new());
         }
-        vm_config
-            .data_volumes
+        volumes
             .iter()
             .map(|volume| {
                 let provider = crate::volume_provider::open(&self.config, &volume.provider)?;
@@ -4105,15 +4104,6 @@ impl VmmSupervisor {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    fn cgroup_io_max_for_paths(
-        &self,
-        rootfs: Option<&Path>,
-        overlay: Option<&Path>,
-    ) -> Result<Option<String>, OrchError> {
-        self.cgroup_io_max_for_paths_and_files(rootfs, overlay, &[])
-    }
-
-    #[cfg(any(target_os = "linux", test))]
     fn cgroup_io_max_for_paths_and_files(
         &self,
         rootfs: Option<&Path>,
@@ -4193,7 +4183,11 @@ impl VmmSupervisor {
         Ok(None)
     }
 
-    fn readopted_cgroup_limit_plan(&self, record: &VmRecord) -> Result<CgroupLimitPlan, OrchError> {
+    fn readopted_cgroup_limit_plan(
+        &self,
+        record: &VmRecord,
+        volumes: &[VmDataVolumeConfig],
+    ) -> Result<CgroupLimitPlan, OrchError> {
         let cpu_quota = u64::from(record.vcpus)
             .checked_mul(100_000)
             .ok_or_else(|| OrchError::BadRequest("vCPU cgroup limit overflow".into()))?;
@@ -4205,7 +4199,7 @@ impl VmmSupervisor {
         let memory_max = max_mib
             .checked_mul(1024 * 1024)
             .ok_or_else(|| OrchError::BadRequest("memory cgroup byte limit overflow".into()))?;
-        let io_max = self.readopted_cgroup_io_max(record)?;
+        let io_max = self.readopted_cgroup_io_max(record, volumes)?;
         Ok(CgroupLimitPlan {
             cpu_max: Some(format!("{cpu_quota} 100000")),
             cpu_weight: Some(NORMAL_CGROUP_CPU_WEIGHT),
@@ -4218,7 +4212,11 @@ impl VmmSupervisor {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    fn readopted_cgroup_io_max(&self, record: &VmRecord) -> Result<Option<String>, OrchError> {
+    fn readopted_cgroup_io_max(
+        &self,
+        record: &VmRecord,
+        volumes: &[VmDataVolumeConfig],
+    ) -> Result<Option<String>, OrchError> {
         let layout = record.runtime_layout.as_ref().ok_or_else(|| {
             OrchError::Internal(format!(
                 "VM {} has no runtime layout for cgroup recovery",
@@ -4233,15 +4231,36 @@ impl VmmSupervisor {
                 .unwrap_or_else(|| PathBuf::from(rootfs))
         });
         let overlay = layout.overlay_path.as_deref().map(PathBuf::from);
-        self.cgroup_io_max_for_paths(rootfs.as_deref(), overlay.as_deref())
+        let prepared = if self.config.vm_io_quota.is_configured() {
+            self.prepare_data_volumes(volumes)?
+        } else {
+            Vec::new()
+        };
+        self.cgroup_io_max_for_paths_and_files(
+            rootfs.as_deref(),
+            overlay.as_deref(),
+            &prepared
+                .iter()
+                .map(|volume| &volume.file)
+                .collect::<Vec<_>>(),
+        )
     }
 
     #[cfg(all(not(target_os = "linux"), not(test)))]
-    fn readopted_cgroup_io_max(&self, _record: &VmRecord) -> Result<Option<String>, OrchError> {
+    fn readopted_cgroup_io_max(
+        &self,
+        _record: &VmRecord,
+        _volumes: &[VmDataVolumeConfig],
+    ) -> Result<Option<String>, OrchError> {
         Ok(None)
     }
 
-    fn reconcile_readopted_cgroup(&self, record: &VmRecord, pid: u32) -> Result<(), OrchError> {
+    fn reconcile_readopted_cgroup(
+        &self,
+        record: &VmRecord,
+        pid: u32,
+        volumes: &[VmDataVolumeConfig],
+    ) -> Result<(), OrchError> {
         let Some(path) = self.exact_vm_cgroup_path(record.id) else {
             return Ok(());
         };
@@ -4257,7 +4276,7 @@ impl VmmSupervisor {
                 record.id
             ))
         })?;
-        let plan = self.readopted_cgroup_limit_plan(record)?;
+        let plan = self.readopted_cgroup_limit_plan(record, volumes)?;
         apply_and_verify_cgroup_limits(&path, &plan).map_err(|error| {
             OrchError::Internal(format!(
                 "reapply cgroup limits for adopted VM {} in {}: {error}",
@@ -7116,6 +7135,7 @@ impl VmmSupervisor {
     pub async fn readopt_running_vms(
         self: &Arc<Self>,
         records: &mut [VmRecord],
+        volumes: &HashMap<Uuid, Vec<VmDataVolumeConfig>>,
     ) -> Result<Vec<ReadoptWarning>, OrchError> {
         let durable_active_ids = records
             .iter()
@@ -7133,7 +7153,16 @@ impl VmmSupervisor {
             .collect::<HashSet<_>>();
         let mut failed = Vec::new();
         for record in records.iter_mut() {
-            match self.readopt_one(record).await {
+            match self
+                .readopt_one(
+                    record,
+                    volumes
+                        .get(&record.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+                .await
+            {
                 Ok(true) => {
                     tracing::info!(vm = %record.id, pid = record.pid.unwrap_or(0),
                         "re-adopted running VM after restart");
@@ -7164,7 +7193,11 @@ impl VmmSupervisor {
     /// and `Err` when the VM existed here but can no longer be controlled. When a
     /// VMM is positively identified as ours but cannot be managed, it is
     /// terminated through its pinned pidfd so no unmanaged VMM is left running.
-    async fn readopt_one(self: &Arc<Self>, record: &mut VmRecord) -> Result<bool, ReadoptFailure> {
+    async fn readopt_one(
+        self: &Arc<Self>,
+        record: &mut VmRecord,
+        volumes: &[VmDataVolumeConfig],
+    ) -> Result<bool, ReadoptFailure> {
         if record.host_id != self.config.host_id {
             return Ok(false);
         }
@@ -7306,7 +7339,7 @@ impl VmmSupervisor {
         // VMM that the control plane cannot manage, so terminate it through the
         // pinned pidfd before marking the VM terminal.
         let recovered: Result<Option<NetAlloc>, String> = 'recover: {
-            if let Err(error) = self.reconcile_readopted_cgroup(record, pid) {
+            if let Err(error) = self.reconcile_readopted_cgroup(record, pid, volumes) {
                 break 'recover Err(error.to_string());
             }
             if !socket_path.exists() {
@@ -10407,7 +10440,7 @@ mod tests {
         let mut child = spawn_jailed_vmm_standin(&lease.root);
 
         let warnings = test_runtime()
-            .block_on(supervisor.readopt_running_vms(&mut []))
+            .block_on(supervisor.readopt_running_vms(&mut [], &HashMap::new()))
             .unwrap();
         assert!(warnings.is_empty());
         child.wait().expect("reap terminated stand-in");
@@ -10444,7 +10477,9 @@ mod tests {
         record.socket_path = None;
 
         let warnings = test_runtime()
-            .block_on(supervisor.readopt_running_vms(std::slice::from_mut(&mut record)))
+            .block_on(
+                supervisor.readopt_running_vms(std::slice::from_mut(&mut record), &HashMap::new()),
+            )
             .unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].id, id);
@@ -10502,7 +10537,9 @@ mod tests {
         });
 
         let warnings = test_runtime()
-            .block_on(supervisor.readopt_running_vms(std::slice::from_mut(&mut record)))
+            .block_on(
+                supervisor.readopt_running_vms(std::slice::from_mut(&mut record), &HashMap::new()),
+            )
             .unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].reason.contains("runtime layout conflicts"));
@@ -10519,7 +10556,9 @@ mod tests {
         let mut record = restart_record(&supervisor, id, &socket);
         record.runtime_layout = None;
         let error = test_runtime()
-            .block_on(supervisor.readopt_running_vms(std::slice::from_mut(&mut record)))
+            .block_on(
+                supervisor.readopt_running_vms(std::slice::from_mut(&mut record), &HashMap::new()),
+            )
             .expect_err("missing active runtime layout must block startup");
         assert!(error.to_string().contains("drain required"));
         std::fs::remove_dir_all(root).unwrap();
@@ -10960,7 +10999,7 @@ mod tests {
 
         let mut records = vec![good_record, bad_record];
         let failures = test_runtime()
-            .block_on(supervisor.readopt_running_vms(&mut records))
+            .block_on(supervisor.readopt_running_vms(&mut records, &HashMap::new()))
             .unwrap();
 
         server.join().unwrap();
@@ -11417,6 +11456,55 @@ mod tests {
     }
 
     #[test]
+    fn readoption_limits_data_only_volume_devices_and_rejects_missing_backing() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/readopt-volume-{}", Uuid::new_v4()));
+        let mut config = supervisor_config(&root);
+        config.vm_io_quota.read_bps_max = Some(1048576);
+        let provider = tarit_volume::LocalBlockProvider::open(
+            config.images_dir.join("volumes"),
+            config.host_id.clone(),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        let volume_id = Uuid::new_v4();
+        provider.create(volume_id, 4 * 1024 * 1024).unwrap();
+        let supervisor = VmmSupervisor::new(config);
+        let id = Uuid::new_v4();
+        let mut record = restart_record(&supervisor, id, &supervisor.socket_path_for(id));
+        record.rootfs_path = None;
+        record.runtime_layout =
+            Some(supervisor.runtime_layout_for_config(id, &spawn_config(false, None)));
+        let volume = VmDataVolumeConfig {
+            id: volume_id,
+            provider: "local_block".into(),
+            size_bytes: 4 * 1024 * 1024,
+            read_only: false,
+            generation: 1,
+        };
+        assert_eq!(
+            supervisor.readopted_cgroup_io_max(&record, &[]).unwrap(),
+            None
+        );
+        let prepared = supervisor
+            .prepare_data_volumes(std::slice::from_ref(&volume))
+            .unwrap();
+        let device = cgroup_device_number(&prepared[0].file.metadata().unwrap()).unwrap();
+        let limits = supervisor
+            .readopted_cgroup_io_max(&record, std::slice::from_ref(&volume))
+            .unwrap()
+            .unwrap();
+        assert_eq!(limits, format!("{device} rbps=1048576"));
+        let mut missing = volume;
+        missing.id = Uuid::new_v4();
+        assert!(supervisor
+            .readopted_cgroup_io_max(&record, &[missing])
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn restart_reapplies_new_and_reduced_cgroup_quotas() {
         let root = PathBuf::from(format!("target/cgroup-readopt-limits-{}", Uuid::new_v4()));
         let cgroup_parent = root.join("cgroups");
@@ -11459,7 +11547,7 @@ mod tests {
         );
 
         supervisor
-            .reconcile_readopted_cgroup(&record, 4242)
+            .reconcile_readopted_cgroup(&record, 4242, &[])
             .unwrap();
 
         assert_eq!(
@@ -11511,7 +11599,7 @@ mod tests {
         std::fs::write(child.join("cgroup.procs"), "4242").unwrap();
         let record = restart_record(&supervisor, id, &supervisor.socket_path_for(id));
         let missing_error = supervisor
-            .reconcile_readopted_cgroup(&record, 4242)
+            .reconcile_readopted_cgroup(&record, 4242, &[])
             .unwrap_err();
         assert!(missing_error.to_string().contains("cpu.max"));
         std::fs::remove_dir_all(root).unwrap();
