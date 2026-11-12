@@ -5,7 +5,7 @@
 #![cfg(all(feature = "kvm", target_arch = "x86_64", target_os = "linux"))]
 
 use crate::error::{Result, VmmError};
-use crate::vcpu::VcpuId;
+use crate::vcpu::{drain_pending_io, PendingIo, VcpuId, PENDING_IO_REENTRY_BUDGET};
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,7 +66,7 @@ impl VcpuThread {
         mmio_bus: Arc<MmioBus>,
         serial: Arc<vmm_devices::serial::Serial>,
     ) -> Result<Self> {
-        Self::spawn_with_start_gate(id, vcpu, mmio_bus, serial, None)
+        Self::spawn_with_start_gate(id, vcpu, mmio_bus, serial, None, PENDING_IO_REENTRY_BUDGET)
     }
 
     pub(crate) fn spawn_parked(
@@ -76,7 +76,14 @@ impl VcpuThread {
         serial: Arc<vmm_devices::serial::Serial>,
         start: crate::vcpu_start::VcpuStartToken,
     ) -> Result<Self> {
-        Self::spawn_with_start_gate(id, vcpu, mmio_bus, serial, Some(start))
+        Self::spawn_with_start_gate(
+            id,
+            vcpu,
+            mmio_bus,
+            serial,
+            Some(start),
+            PENDING_IO_REENTRY_BUDGET,
+        )
     }
 
     fn spawn_with_start_gate(
@@ -85,6 +92,7 @@ impl VcpuThread {
         mmio_bus: Arc<MmioBus>,
         serial: Arc<vmm_devices::serial::Serial>,
         start: Option<crate::vcpu_start::VcpuStartToken>,
+        pending_io_budget: usize,
     ) -> Result<Self> {
         let control = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -168,16 +176,19 @@ impl VcpuThread {
                     }
                     // Check control channel.
                     if ctrl.load(Ordering::Relaxed) {
+                        let mut io_complete = true;
                         if pending_io {
-                            if !complete_pending_io(
+                            match complete_pending_io(
                                 &mut vcpu,
                                 &mmio_bus,
                                 &serial_for_thread,
                                 &stop_for_thread,
+                                pending_io_budget,
                             )? {
-                                return Ok(());
+                                PendingIo::Completed => pending_io = false,
+                                PendingIo::Stopped => return Ok(()),
+                                PendingIo::Incomplete => io_complete = false,
                             }
-                            pending_io = false;
                         }
                         // Cancellation/stop can race completion. Never publish a
                         // capture after stop, or park after pause was withdrawn.
@@ -200,16 +211,31 @@ impl VcpuThread {
                         // the futex (Mutex), and the allocation (mmap/brk) used
                         // below are in the vCPU seccomp allow-list, so this is
                         // safe under the installed filter.
-                        match crate::vcpu_setup::capture_vcpu_full_state(&vcpu) {
-                            Ok(st) => match postcard::to_allocvec(&st) {
-                                Ok(bytes) => {
-                                    *captured_for_thread
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner()) = Some(bytes);
-                                }
-                                Err(e) => log::warn!("serialize vCPU state: {e}"),
-                            },
-                            Err(e) => log::warn!("capture vCPU state: {e}"),
+                        if io_complete {
+                            match crate::vcpu_setup::capture_vcpu_full_state(&vcpu) {
+                                Ok(st) => match postcard::to_allocvec(&st) {
+                                    Ok(bytes) => {
+                                        *captured_for_thread
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner()) = Some(bytes);
+                                    }
+                                    Err(e) => log::warn!("serialize vCPU state: {e}"),
+                                },
+                                Err(e) => log::warn!("capture vCPU state: {e}"),
+                            }
+                        } else {
+                            // The instruction is still in flight, so registers
+                            // would not match memory. Publish no capture: the
+                            // waiting pause fails and its rollback resumes this
+                            // thread, which stays alive; KVM finishes the
+                            // instruction on the next ordinary entry.
+                            *captured_for_thread
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            log::warn!(
+                                "vCPU pause: in-flight I/O did not complete within \
+                                 {pending_io_budget} re-entries; this pause captures no state"
+                            );
                         }
                         paus.store(true, Ordering::Release);
                         log::info!("vCPU thread pausing");
@@ -549,9 +575,10 @@ fn complete_pending_io(
     bus: &MmioBus,
     serial: &vmm_devices::serial::Serial,
     stop: &AtomicBool,
-) -> Result<bool> {
+    budget: usize,
+) -> Result<PendingIo> {
     vcpu.set_kvm_immediate_exit(1);
-    let result = drain_pending_io(stop, || match vcpu.run() {
+    let result = drain_pending_io(stop, budget, || match vcpu.run() {
         Err(error) if error.errno() == libc::EINTR => Ok(true),
         Err(error) if error.errno() == libc::EAGAIN => Ok(false),
         Err(error) => Err(VmmError::Snapshot(format!(
@@ -566,23 +593,6 @@ fn complete_pending_io(
     });
     vcpu.set_kvm_immediate_exit(0);
     result
-}
-
-fn drain_pending_io(stop: &AtomicBool, mut step: impl FnMut() -> Result<bool>) -> Result<bool> {
-    // A broken backend must fail the snapshot rather than spin forever while
-    // the controller holds a lifecycle lock. Each run has immediate_exit set.
-    for _ in 0..64 {
-        if stop.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        if step()? {
-            return Ok(true);
-        }
-        std::thread::yield_now();
-    }
-    Err(VmmError::Snapshot(
-        "pending vCPU I/O did not complete in 64 reentries".into(),
-    ))
 }
 
 fn handle_io_exit(
@@ -623,40 +633,6 @@ fn handle_io_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn completion_retries_abort_on_fault_and_observe_stop_before_reentry() {
-        let stop = AtomicBool::new(false);
-        let mut attempts = 0;
-        assert!(drain_pending_io(&stop, || {
-            attempts += 1;
-            Ok(attempts == 3)
-        })
-        .unwrap());
-        assert_eq!(attempts, 3);
-        assert!(drain_pending_io(&stop, || Err(VmmError::Snapshot(
-            "injected completion fault".into()
-        )))
-        .is_err());
-        assert!(!drain_pending_io(&stop, || {
-            stop.store(true, Ordering::Release);
-            Ok(false)
-        })
-        .unwrap());
-        assert!(!drain_pending_io(&stop, || panic!("stop must precede reentry")).unwrap());
-    }
-
-    #[test]
-    fn completion_retry_budget_is_bounded() {
-        let stop = AtomicBool::new(false);
-        let mut attempts = 0;
-        assert!(drain_pending_io(&stop, || {
-            attempts += 1;
-            Ok(false)
-        })
-        .is_err());
-        assert_eq!(attempts, 64);
-    }
 
     // Requires real KVM: explicitly ignored by ordinary unit runs rather than
     // silently counting an unavailable /dev/kvm as passing execution evidence.
@@ -707,8 +683,16 @@ mod tests {
             let serial = vmm_devices::serial::Serial::new(
                 vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
             );
-            assert!(
-                complete_pending_io(&mut vcpu, &bus, &serial, &AtomicBool::new(false)).unwrap()
+            assert_eq!(
+                complete_pending_io(
+                    &mut vcpu,
+                    &bus,
+                    &serial,
+                    &AtomicBool::new(false),
+                    PENDING_IO_REENTRY_BUDGET
+                )
+                .unwrap(),
+                PendingIo::Completed
             );
             let regs = vcpu.get_regs().unwrap();
             assert_eq!(regs.rip, 0x1000 + code.len() as u64);
@@ -716,6 +700,143 @@ mod tests {
             assert_eq!(vcpu.get_kvm_run().immediate_exit, 0);
             assert!(matches!(vcpu.run().unwrap(), VcpuExit::Hlt));
             assert_eq!(vcpu.get_regs().unwrap().rax & 0xff, 0xcc);
+        }
+    }
+
+    /// 16 KiB of real-mode RAM at 0 holding `program` at 0x1000. Addresses
+    /// from 0x4000 up to the 64 KiB segment limit are an MMIO hole.
+    fn real_mode_vm(
+        kvm: &kvm_ioctls::Kvm,
+        program: &[u8],
+    ) -> (kvm_ioctls::VmFd, vmm_memory_backend::GuestMemory) {
+        let vm = kvm.create_vm().unwrap();
+        // Match production VM setup before entering real mode on VMX.
+        vm.set_tss_address(0xfffbd000).unwrap();
+        let mem = vmm_memory_backend::GuestMemory::new(0x4000).unwrap();
+        mem.register(&vm, 0).unwrap();
+        mem.write_phys(0x1000, program).unwrap();
+        (vm, mem)
+    }
+
+    fn real_mode_vcpu(vm: &kvm_ioctls::VmFd) -> VcpuFd {
+        let vcpu = vm.create_vcpu(0).unwrap();
+        let mut sregs = vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        vcpu.set_sregs(&sregs).unwrap();
+        let mut regs = vcpu.get_regs().unwrap();
+        regs.rip = 0x1000;
+        regs.rflags = 2;
+        vcpu.set_regs(&regs).unwrap();
+        vcpu
+    }
+
+    fn test_serial() -> Arc<vmm_devices::serial::Serial> {
+        Arc::new(vmm_devices::serial::Serial::new(
+            vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+        ))
+    }
+
+    /// `rep movsb` from MMIO exits once per byte, and KVM reaches its
+    /// immediate-exit check only at each 1,024-iteration boundary. Finishing
+    /// it needs hundreds of re-entries: the production budget must cover
+    /// that, and a budget that runs out must leave the vCPU consistent and
+    /// runnable rather than failed.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_rep_mmio_string_completes_within_budget_and_exhaustion_is_not_fatal() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        for budget in [PENDING_IO_REENTRY_BUDGET, 64] {
+            // rep movsb (DS:SI in the MMIO hole, ES:DI in RAM); mov al,0xcc; hlt
+            let (vm, _mem) = real_mode_vm(&kvm, &[0xf3, 0xa4, 0xb0, 0xcc, 0xf4]);
+            let mut vcpu = real_mode_vcpu(&vm);
+            let mut regs = vcpu.get_regs().unwrap();
+            regs.rsi = 0x8000;
+            regs.rdi = 0x2000;
+            regs.rcx = 3000;
+            regs.rax = 0x5a;
+            vcpu.set_regs(&regs).unwrap();
+            assert!(matches!(vcpu.run().unwrap(), VcpuExit::MmioRead(..)));
+            let bus = MmioBus::new();
+            let serial = test_serial();
+            let outcome =
+                complete_pending_io(&mut vcpu, &bus, &serial, &AtomicBool::new(false), budget)
+                    .unwrap();
+            assert_eq!(vcpu.get_kvm_run().immediate_exit, 0);
+            if budget == PENDING_IO_REENTRY_BUDGET {
+                assert_eq!(outcome, PendingIo::Completed);
+                let regs = vcpu.get_regs().unwrap();
+                assert!(
+                    regs.rcx < 3000 && regs.rcx.is_multiple_of(1024),
+                    "completion should stop at a 1,024-iteration boundary: rcx={}",
+                    regs.rcx
+                );
+                assert_eq!(regs.rax & 0xff, 0x5a, "next mov must not execute");
+            } else {
+                // Registers are not consistent mid-instruction; only the
+                // outcome and the run below are checked.
+                assert_eq!(outcome, PendingIo::Incomplete);
+            }
+            loop {
+                match vcpu.run() {
+                    Ok(VcpuExit::Hlt) => break,
+                    Ok(exit) => handle_io_exit(exit, &bus, &serial).unwrap(),
+                    Err(error) if error.errno() == libc::EINTR => {}
+                    Err(error) => panic!("KVM_RUN after completion: {error}"),
+                }
+            }
+            let regs = vcpu.get_regs().unwrap();
+            assert_eq!(regs.rcx, 0, "the copy must finish");
+            assert_eq!(regs.rax & 0xff, 0xcc);
+        }
+    }
+
+    /// A pause that lands inside a long MMIO string instruction and cannot
+    /// finish it fails that pause only: no state is captured, the vCPU
+    /// acknowledges and resumes, and its thread stays alive for the next
+    /// pause. With the production budget every such pause succeeds.
+    #[test]
+    #[ignore = "requires /dev/kvm; run explicitly on the KVM fixture host"]
+    fn kvm_pause_that_cannot_finish_io_fails_without_killing_the_vcpu() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        // l: mov cx,4000; mov si,0x8000; mov di,0x2000; rep movsb; jmp l
+        let program: [u8; 13] = [
+            0xb9, 0xa0, 0x0f, 0xbe, 0x00, 0x80, 0xbf, 0x00, 0x20, 0xf3, 0xa4, 0xeb, 0xf3,
+        ];
+        for budget in [4, PENDING_IO_REENTRY_BUDGET] {
+            let (vm, _mem) = real_mode_vm(&kvm, &program);
+            let thread = VcpuThread::spawn_with_start_gate(
+                VcpuId(0),
+                real_mode_vcpu(&vm),
+                Arc::new(MmioBus::new()),
+                test_serial(),
+                None,
+                budget,
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut refused = 0;
+            for _ in 0..20 {
+                thread.request_snapshot_pause().unwrap();
+                if let Err(error) = thread.wait_snapshot_paused() {
+                    assert!(
+                        error.to_string().contains("did not capture state"),
+                        "budget {budget}: {error}"
+                    );
+                    refused += 1;
+                }
+                assert!(!thread.is_exited(), "budget {budget}: vCPU thread exited");
+                thread.resume();
+                thread.wait_snapshot_resumed().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if budget == PENDING_IO_REENTRY_BUDGET {
+                assert_eq!(refused, 0, "the production budget must finish rep I/O");
+            } else {
+                assert!(refused > 0, "no pause landed inside the rep instruction");
+            }
+            assert!(!thread.is_exited());
+            thread.stop().unwrap();
         }
     }
 }

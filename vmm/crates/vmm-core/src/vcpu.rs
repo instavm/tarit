@@ -30,6 +30,59 @@ impl VcpuId {
     }
 }
 
+/// Most KVM_RUN re-entries a pause spends finishing one in-flight I/O
+/// instruction. A `rep` string instruction on MMIO exits once per iteration
+/// (more for MMIO-to-MMIO copies and accesses split across pages), and KVM
+/// reaches its immediate-exit check only every 1,024 iterations, so about
+/// 4,096 re-entries can be needed. Each one is a KVM_RUN plus the device
+/// access, which keeps even an exhausted budget to tens of milliseconds.
+#[cfg(any(
+    test,
+    all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
+))]
+pub(crate) const PENDING_IO_REENTRY_BUDGET: usize = 16_384;
+
+/// Outcome of finishing a vCPU's in-flight I/O instruction before a pause.
+#[cfg(any(
+    test,
+    all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingIo {
+    /// KVM reported the instruction complete: registers match memory.
+    Completed,
+    /// Stop was requested before the next re-entry.
+    Stopped,
+    /// The budget ran out with the instruction still in flight. This is not a
+    /// vCPU fault: KVM finishes the instruction on the next ordinary entry.
+    /// Only the pause that asked for it fails.
+    Incomplete,
+}
+
+/// Re-enter KVM (`step`, with immediate_exit set; true once KVM reports the
+/// pending operation complete) until the in-flight instruction finishes, stop
+/// is requested, or `budget` re-entries are spent. A fault from `step` is a
+/// real vCPU error and is returned as one.
+#[cfg(any(
+    test,
+    all(feature = "kvm", target_arch = "x86_64", target_os = "linux")
+))]
+pub(crate) fn drain_pending_io(
+    stop: &std::sync::atomic::AtomicBool,
+    budget: usize,
+    mut step: impl FnMut() -> Result<bool>,
+) -> Result<PendingIo> {
+    for _ in 0..budget {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(PendingIo::Stopped);
+        }
+        if step()? {
+            return Ok(PendingIo::Completed);
+        }
+    }
+    Ok(PendingIo::Incomplete)
+}
+
 /// Keep interrupting a stopping vCPU until it has actually exited. A single
 /// signal can be handled between the stop-flag check and KVM_RUN entry, or
 /// before the worker has published its TID. The caller must set stop first.
@@ -86,6 +139,69 @@ mod tests {
             // TASK_COMM_LEN is 16 including the terminating NUL.
             assert!(VcpuId(id).thread_name().len() <= 15);
         }
+    }
+
+    #[test]
+    fn completion_retries_abort_on_fault_and_observe_stop_before_reentry() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut attempts = 0;
+        assert_eq!(
+            drain_pending_io(&stop, PENDING_IO_REENTRY_BUDGET, || {
+                attempts += 1;
+                Ok(attempts == 3)
+            })
+            .unwrap(),
+            PendingIo::Completed
+        );
+        assert_eq!(attempts, 3);
+        assert!(drain_pending_io(&stop, PENDING_IO_REENTRY_BUDGET, || Err(
+            crate::error::VmmError::Snapshot("injected completion fault".into())
+        ))
+        .is_err());
+        assert_eq!(
+            drain_pending_io(&stop, PENDING_IO_REENTRY_BUDGET, || {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                Ok(false)
+            })
+            .unwrap(),
+            PendingIo::Stopped
+        );
+        assert_eq!(
+            drain_pending_io(&stop, PENDING_IO_REENTRY_BUDGET, || panic!(
+                "stop must precede reentry"
+            ))
+            .unwrap(),
+            PendingIo::Stopped
+        );
+    }
+
+    /// A `rep` MMIO string instruction can need about 1,024 re-entries per
+    /// KVM immediate-exit check, several times that when each iteration exits
+    /// more than once. The budget must cover it, and running out must not be
+    /// an error: an error ends the vCPU thread, and with it the VM.
+    #[test]
+    fn completion_budget_covers_rep_string_io_and_exhaustion_is_not_fatal() {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut attempts = 0;
+        assert_eq!(
+            drain_pending_io(&stop, PENDING_IO_REENTRY_BUDGET, || {
+                attempts += 1;
+                Ok(attempts == 4 * 1024)
+            })
+            .unwrap(),
+            PendingIo::Completed
+        );
+
+        let mut attempts = 0;
+        assert_eq!(
+            drain_pending_io(&stop, PENDING_IO_REENTRY_BUDGET, || {
+                attempts += 1;
+                Ok(false)
+            })
+            .unwrap(),
+            PendingIo::Incomplete
+        );
+        assert_eq!(attempts, PENDING_IO_REENTRY_BUDGET);
     }
 
     #[test]
