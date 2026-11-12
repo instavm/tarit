@@ -3031,6 +3031,53 @@ impl BootControl {
     }
 }
 
+/// Own a just-spawned child until the registry can find it during unwind.
+struct UnregisteredBootProcess(Option<ManagedProcess>);
+
+impl Drop for UnregisteredBootProcess {
+    fn drop(&mut self) {
+        if let Some(process) = self.0.take() {
+            if let Err(error) = process.kill_wait() {
+                tracing::error!(pid = process.pid, %error, "cleanup unregistered boot process");
+            }
+        }
+    }
+}
+
+/// The sole completion owner travels with the ticket/runtime through every
+/// synchronous and async handoff. An early `?`, panic, or dropped future cannot
+/// strand DELETE/shutdown waiters. Cleanup remains with the registered boot and
+/// existing join/terminal retry paths; a drop never claims runtime publication.
+struct BootCompletionGuard {
+    control: Arc<BootControl>,
+}
+
+impl BootCompletionGuard {
+    fn new(control: &Arc<BootControl>) -> Self {
+        Self {
+            control: Arc::clone(control),
+        }
+    }
+}
+
+impl Drop for BootCompletionGuard {
+    fn drop(&mut self) {
+        let mut completed = self
+            .control
+            .completion
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if completed.is_none() {
+            self.control.request_cancellation();
+            *completed = Some(Err(
+                "boot owner exited before runtime publication or cleanup completed".into(),
+            ));
+            self.control.completion.1.notify_all();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BootingVm {
     socket_path: PathBuf,
@@ -3098,12 +3145,14 @@ pub(crate) struct BootTicket {
     control: Arc<BootControl>,
     purpose: SpawnPurpose,
     shape: ResourceShape,
+    completion: BootCompletionGuard,
 }
 
 pub(crate) struct BootedVm {
     id: Uuid,
     vm: RunningVm,
     control: Arc<BootControl>,
+    completion: BootCompletionGuard,
 }
 
 /// A lifecycle publisher may retain a fully booted VM when an external
@@ -4591,14 +4640,13 @@ impl VmmSupervisor {
             let _ = self.release_artifact_owner(id);
             return Err(error);
         }
+        let completion = BootCompletionGuard::new(&control);
         // Reserve capacity before the durable registration so capacity
         // rejections leave no durable trace: the admission loop retries the
         // same id, and a leftover Error tombstone from a rejected attempt
         // would make the re-registration fail with an incarnation conflict.
         if let Err(error) = self.scheduler.try_reserve(id, shape) {
-            self.complete_booting(id, &control, Ok(()));
-            self.release_artifact_owner(id)?;
-            return Err(match error {
+            let cause = match error {
                 ReservationError::AlreadyReserved => {
                     OrchError::Conflict(format!("VM {id} already has a boot reservation"))
                 }
@@ -4611,11 +4659,14 @@ impl VmmSupervisor {
                     message: format!("{HOST_CAPACITY_EXHAUSTED}: {error:?}"),
                     retry_after_secs: 1,
                 },
-            });
+            };
+            self.complete_cleaned_boot_failure(id, &control, &cause);
+            self.release_artifact_owner(id)?;
+            return Err(cause);
         }
         if let Err(error) = on_registered().await {
             self.scheduler.release(id);
-            self.complete_booting(id, &control, Ok(()));
+            self.complete_cleaned_boot_failure(id, &control, &error);
             self.release_artifact_owner(id)?;
             return Err(error);
         }
@@ -4624,6 +4675,7 @@ impl VmmSupervisor {
             control,
             purpose,
             shape,
+            completion,
         })
     }
 
@@ -4980,7 +5032,11 @@ impl VmmSupervisor {
             .and_then(|booting| booting.get(&ticket.id).cloned())
             .is_some_and(|booting_vm| Arc::ptr_eq(&booting_vm.control, &ticket.control));
         if is_current {
-            self.complete_booting(ticket.id, &ticket.control, Ok(()));
+            self.complete_cleaned_boot_failure(
+                ticket.id,
+                &ticket.control,
+                &OrchError::Internal("boot aborted before VMM startup".into()),
+            );
             let _ = self.release_artifact_owner(ticket.id);
             if ticket.purpose == SpawnPurpose::Refill {
                 self.release_reservation_after_cleanup(ticket.id);
@@ -5045,6 +5101,25 @@ impl VmmSupervisor {
         control.complete(result);
     }
 
+    /// Cleanup success is not boot success: joiners must still observe the
+    /// original failure, while teardown waiters may retry idempotent cleanup.
+    fn complete_cleaned_boot_failure(
+        &self,
+        id: Uuid,
+        control: &Arc<BootControl>,
+        cause: &OrchError,
+    ) {
+        if let Ok(mut booting) = self.booting.lock() {
+            if booting
+                .get(&id)
+                .is_some_and(|vm| Arc::ptr_eq(&vm.control, control))
+            {
+                booting.remove(&id);
+            }
+        }
+        control.complete(Err(OrchError::Internal(cause.to_string())));
+    }
+
     fn cleanup_boot_failure(
         &self,
         id: Uuid,
@@ -5067,7 +5142,7 @@ impl VmmSupervisor {
             }
         }
         if cleanup_failures.is_empty() {
-            self.complete_booting(id, control, Ok(()));
+            self.complete_cleaned_boot_failure(id, control, &cause);
             if control.purpose == SpawnPurpose::Refill {
                 self.release_reservation_after_cleanup(id);
             }
@@ -5104,7 +5179,7 @@ impl VmmSupervisor {
             cleanup_failures.push(format!("release staged jail: {error}"));
         }
         if cleanup_failures.is_empty() {
-            self.complete_booting(id, control, Ok(()));
+            self.complete_cleaned_boot_failure(id, control, &cause);
             let _ = self.release_artifact_owner(id);
             if control.purpose == SpawnPurpose::Refill {
                 self.release_reservation_after_cleanup(id);
@@ -5150,7 +5225,7 @@ impl VmmSupervisor {
         booting.control.request_cancellation();
         match self.retry_booting_cleanup(id, &booting) {
             Ok(()) => {
-                self.complete_booting(id, &booting.control, Ok(()));
+                self.complete_cleaned_boot_failure(id, &booting.control, &cause);
                 if booting.purpose == SpawnPurpose::Refill {
                     self.release_reservation_after_cleanup(id);
                 }
@@ -5193,7 +5268,12 @@ impl VmmSupervisor {
         F: FnOnce(u32, PathBuf) -> Fut + Send,
         Fut: std::future::Future<Output = Result<T, PublicationFailure>> + Send,
     {
-        let BootedVm { id, vm, control } = booted;
+        let BootedVm {
+            id,
+            vm,
+            control,
+            completion: _completion,
+        } = booted;
         let pid = vm.pid;
         let socket_path = vm.socket_path.clone();
         let gate = self.boot_gate.read().await;
@@ -5272,7 +5352,12 @@ impl VmmSupervisor {
         booted: BootedVm,
         spec: VmSpawnConfig,
     ) -> Result<(), OrchError> {
-        let BootedVm { id, vm, control } = booted;
+        let BootedVm {
+            id,
+            vm,
+            control,
+            completion: _completion,
+        } = booted;
         let gate = self.boot_gate.read().await;
         let mut warm = match self.warm.lock() {
             Ok(warm) => warm,
@@ -5437,6 +5522,16 @@ impl VmmSupervisor {
                 failures.push(format!("teardown retained network allocation: {error}"));
             }
         }
+        if booting_vm.process.is_none() {
+            if let Err(error) = self.release_jail(id) {
+                failures.push(format!("release staged jail: {error}"));
+            }
+            if failures.is_empty() {
+                if let Err(error) = self.release_artifact_owner(id) {
+                    failures.push(format!("release boot artifact ownership: {error}"));
+                }
+            }
+        }
         if failures.is_empty() {
             Ok(())
         } else {
@@ -5588,6 +5683,7 @@ impl VmmSupervisor {
         };
 
         let process = ManagedProcess::new(child);
+        let mut unregistered = UnregisteredBootProcess(Some(process.clone()));
         let pid = process.pid;
         // Attach cleanup ownership before observing cancellation. A cancelled
         // boot must remain retryable if its first teardown attempt fails.
@@ -5615,6 +5711,8 @@ impl VmmSupervisor {
                 }
             });
         drop(boot_gate);
+        // From here either the registry or the explicit failure cleanup owns it.
+        unregistered.0 = None;
         let vm = RunningVm::new(pid, socket_path, process, net_alloc);
         if let Err(error) = attached {
             return Err(self.cleanup_boot_failure(id, &ticket.control, &vm, error));
@@ -5633,19 +5731,16 @@ impl VmmSupervisor {
         let runtime = match self.prepare_runtime(id, vm_config, None) {
             Ok(runtime) => runtime,
             Err(error) => {
-                self.complete_booting(id, &ticket.control, Ok(()));
-                let _ = self.release_artifact_owner(id);
-                if ticket.purpose == SpawnPurpose::Refill {
-                    self.release_reservation_after_cleanup(id);
-                }
-                return Err(error);
+                return Err(self.cleanup_boot_failure_without_process(id, &ticket.control, error));
             }
         };
         let net_alloc = match &self.net {
             Some(provisioner) => {
                 match provisioner.provision_with_owner_and_policy(
                     id,
-                    self.jail_identity(id)?,
+                    self.jail_identity(id).map_err(|error| {
+                        self.cleanup_boot_failure_without_process(id, &ticket.control, error)
+                    })?,
                     &vm_config.egress_allowlist,
                     vm_config.egress_allow_existing,
                 ) {
@@ -5665,7 +5760,9 @@ impl VmmSupervisor {
             }
             None => None,
         };
-        let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
+        let base_vm = self
+            .spawn_server_for_boot(&ticket, &runtime, net_alloc)
+            .map_err(|error| self.cleanup_registered_boot_failure(id, error))?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -5717,6 +5814,7 @@ impl VmmSupervisor {
             id,
             vm,
             control: ticket.control,
+            completion: ticket.completion,
         })
     }
 
@@ -5806,12 +5904,7 @@ impl VmmSupervisor {
         let runtime = match self.prepare_runtime(id, vm_config, Some(Path::new(snapshot_path))) {
             Ok(runtime) => runtime,
             Err(error) => {
-                self.complete_booting(id, &ticket.control, Ok(()));
-                let _ = self.release_artifact_owner(id);
-                if ticket.purpose == SpawnPurpose::Refill {
-                    self.release_reservation_after_cleanup(id);
-                }
-                return Err(error);
+                return Err(self.cleanup_boot_failure_without_process(id, &ticket.control, error));
             }
         };
         let (memory_integrity, overlay_integrity, integrity_chunk_size) = match integrity {
@@ -5871,7 +5964,9 @@ impl VmmSupervisor {
             Some(provisioner) => {
                 match provisioner.provision_with_owner_and_policy(
                     id,
-                    self.jail_identity(id)?,
+                    self.jail_identity(id).map_err(|error| {
+                        self.cleanup_boot_failure_without_process(id, &ticket.control, error)
+                    })?,
                     &vm_config.egress_allowlist,
                     vm_config.egress_allow_existing,
                 ) {
@@ -5887,7 +5982,9 @@ impl VmmSupervisor {
             }
             None => None,
         };
-        let base_vm = self.spawn_server_for_boot(&ticket, &runtime, net_alloc)?;
+        let base_vm = self
+            .spawn_server_for_boot(&ticket, &runtime, net_alloc)
+            .map_err(|error| self.cleanup_registered_boot_failure(id, error))?;
         if let Err(error) =
             self.wait_for_socket_or_cancellation(&base_vm.socket_path, &ticket.control)
         {
@@ -5968,6 +6065,7 @@ impl VmmSupervisor {
             id,
             vm,
             control: ticket.control,
+            completion: ticket.completion,
         })
     }
 
@@ -11744,6 +11842,173 @@ mod tests {
         task.join().unwrap();
     }
 
+    fn assert_boot_failed_for_all_waiters(control: &Arc<BootControl>) {
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..3 {
+            let control = Arc::clone(control);
+            let tx = tx.clone();
+            thread::spawn(move || tx.send(control.wait_for_completion()).unwrap());
+        }
+        for _ in 0..3 {
+            assert!(rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("boot waiter hung")
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn early_cgroup_failure_completes_cold_and_restore_boots_and_releases_refills() {
+        for restore in [false, true] {
+            let mut supervisor = test_supervisor();
+            Arc::get_mut(&mut supervisor)
+                .unwrap()
+                .config
+                .vm_cgroup_parent = Some("target/test-cgroup".into());
+            let id = Uuid::new_v4();
+            let mut ticket = test_runtime()
+                .block_on(supervisor.begin_boot_with_registration(
+                    id,
+                    SpawnPurpose::Refill,
+                    ResourceShape::new(1, 256),
+                    || async { Ok(()) },
+                ))
+                .unwrap();
+            let control = Arc::clone(&ticket.control);
+            // Exercise the real checked-limit early return before child spawn.
+            ticket.shape.memory_mib = u64::MAX;
+            let shape = ticket.shape;
+            let mut cfg = spawn_config(false, Some(supervisor.config.rootfs.clone()));
+            cfg.memory_mib = u64::MAX;
+            let result = if restore {
+                supervisor.spawn_and_restore(
+                    ticket,
+                    "unused-snapshot",
+                    RestoreOverlay::None,
+                    &cfg,
+                    shape,
+                    None,
+                )
+            } else {
+                supervisor.boot_vm(ticket, &cfg)
+            };
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("memory cgroup limit overflow"));
+            assert_boot_failed_for_all_waiters(&control);
+            assert!(!supervisor.has_retained_boot(id));
+            assert!(!supervisor.scheduler.is_reserved(id));
+            assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+            supervisor.stop_all().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelled_registration_unblocks_stop_all_and_retains_no_artifacts() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let runtime = test_runtime();
+        let mut registration = Box::pin(supervisor.begin_boot_with_registration(
+            id,
+            SpawnPurpose::Live,
+            ResourceShape::new(1, 1),
+            std::future::pending::<Result<(), OrchError>>,
+        ));
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = &mut registration => panic!("registration unexpectedly finished"),
+                _ = std::future::ready(()) => {}
+            }
+        });
+        let control = Arc::clone(&supervisor.booting.lock().unwrap().get(&id).unwrap().control);
+        assert!(control.completion.0.lock().unwrap().is_none());
+        drop(registration);
+        assert_boot_failed_for_all_waiters(&control);
+        let stopped = supervisor.stop_all().unwrap();
+        assert_eq!(stopped.booting_ids, vec![id]);
+        assert!(!supervisor.has_retained_boot(id));
+        assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+        // Live capacity belongs to the durable terminal transition owner.
+        supervisor.release_reservation_after_terminal(id).unwrap();
+        assert!(!supervisor.scheduler.is_reserved(id));
+    }
+
+    #[test]
+    fn panicked_boot_owner_and_unregistered_child_unblock_cleanup() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        let ticket = test_runtime()
+            .block_on(supervisor.begin_boot_with_registration(
+                id,
+                SpawnPurpose::Refill,
+                ResourceShape::new(1, 1),
+                || async { Ok(()) },
+            ))
+            .unwrap();
+        let control = Arc::clone(&ticket.control);
+        let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        let pid = process.pid;
+        let worker = thread::spawn(move || {
+            let _ticket = ticket;
+            let _unregistered = UnregisteredBootProcess(Some(process));
+            panic!("injected pre-attachment panic");
+        });
+        assert!(worker.join().is_err());
+        assert_boot_failed_for_all_waiters(&control);
+        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+        supervisor
+            .cleanup_registered_boot_failure(id, OrchError::Internal("worker panicked".into()));
+        assert!(!supervisor.has_retained_boot(id));
+        assert!(!supervisor.scheduler.is_reserved(id));
+        assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+        supervisor.stop_all().unwrap();
+    }
+
+    #[test]
+    fn dropped_publication_errors_waiters_and_stop_all_reaps_attached_child() {
+        let supervisor = test_supervisor();
+        let id = Uuid::new_v4();
+        supervisor.reserve_existing_for_test(id);
+        let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        let pid = process.pid;
+        let socket = supervisor.socket_path_for(id);
+        let control = supervisor
+            .track_booting(id, socket.clone(), process.clone(), SpawnPurpose::Live)
+            .unwrap();
+        let booted = BootedVm {
+            id,
+            vm: RunningVm::new(pid, socket, process, None),
+            completion: BootCompletionGuard::new(&control),
+            control: Arc::clone(&control),
+        };
+        let runtime = test_runtime();
+        let mut publication = Box::pin(supervisor.publish_running_with(booted, |_, _| {
+            std::future::pending::<Result<(), PublicationFailure>>()
+        }));
+        runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = &mut publication => panic!("publication unexpectedly finished"),
+                _ = std::future::ready(()) => {}
+            }
+        });
+        assert!(
+            control.completion.0.lock().unwrap().is_none(),
+            "success must wait for registration"
+        );
+        assert!(!supervisor.is_running(id));
+        drop(publication);
+        assert_boot_failed_for_all_waiters(&control);
+        supervisor.stop_all().unwrap();
+        assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
+        assert!(!supervisor.has_retained_boot(id));
+        supervisor.release_reservation_after_terminal(id).unwrap();
+        assert!(!supervisor.scheduler.is_reserved(id));
+    }
+
     #[test]
     fn cancellation_between_spawn_and_registry_attachment_waits_for_cleanup() {
         let supervisor = test_supervisor();
@@ -11782,7 +12047,7 @@ mod tests {
             done_rx.recv().unwrap().is_err(),
             "the attached cancelled process must be cleaned before completion"
         );
-        assert!(control.wait_for_completion().is_ok());
+        assert!(control.wait_for_completion().is_err());
         assert!(!supervisor.has_retained_boot(id));
         worker.join().unwrap();
     }
@@ -12772,6 +13037,7 @@ mod tests {
                 BootedVm {
                     id,
                     vm,
+                    completion: BootCompletionGuard::new(&worker_control),
                     control: worker_control,
                 },
                 move |_, _| async move {
@@ -12818,6 +13084,7 @@ mod tests {
                         process,
                         None,
                     ),
+                    completion: BootCompletionGuard::new(&worker_control),
                     control: worker_control,
                 },
                 |_, _| async { Ok(()) },
