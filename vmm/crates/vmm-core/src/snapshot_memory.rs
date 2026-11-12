@@ -25,9 +25,7 @@ impl LazySnapshotReader {
     pub(crate) fn new(memory: &GuestMemory) -> Option<Self> {
         let lazy = memory.lazy_page_discard()?;
         let Some(populated) = memory.populated_pages() else {
-            log::warn!(
-                "snapshot: guest page map unreadable; reading lazily restored RAM in full"
-            );
+            log::warn!("snapshot: guest page map unreadable; reading lazily restored RAM in full");
             return None;
         };
         Some(Self { lazy, populated })
