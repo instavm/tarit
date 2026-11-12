@@ -366,6 +366,22 @@ async fn run_server(
                 tracing::warn!(vm = %failure.id, reason = %failure.reason,
                     "startup reconciliation fenced an unrecoverable VM record");
             }
+            let confirmed_end = supervisor
+                .runtime_stopped_at(vm.id)
+                .context("recover confirmed runtime death boundary")?;
+            // An unadoptable runtime without a death journal has an unknown
+            // crash tail. Do not charge downtime up to startup observation.
+            let end = match confirmed_end {
+                Some(end) => Some(end),
+                None => store
+                    .get_billing_watermark(vm.id)
+                    .context("read unconfirmed runtime usage tail")?,
+            };
+            if let Some(end) = end {
+                store
+                    .freeze_billing_end(vm.id, end)
+                    .context("freeze recovered runtime usage before terminal publication")?;
+            }
             persist_startup_vm_observation(
                 &store,
                 vm,
@@ -375,6 +391,9 @@ async fn run_server(
                     "persist terminal status for startup-reconciled VM"
                 },
             )?;
+            supervisor
+                .clear_runtime_stopped(vm.id)
+                .context("retire finalized runtime death boundary")?;
         }
         for vm in &persisted_vms {
             if vm.host_id == config.host_id

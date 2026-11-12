@@ -7,6 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -333,11 +334,41 @@ fn connect_nonblocking(path: &Path, deadline: Instant) -> Result<UnixStream, Vmm
     Ok(stream)
 }
 
+/// Cancellation of one request's transport, used only when its VM is being
+/// deleted. This does not promise to cancel guest side effects by itself.
+#[derive(Debug, Default)]
+pub struct RequestCancellation {
+    state: Mutex<(bool, Option<UnixStream>)>,
+}
+
+impl RequestCancellation {
+    pub fn cancel(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.0 = true;
+        if let Some(stream) = &state.1 {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    fn register(&self, stream: &UnixStream) -> Result<(), VmmError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.0 {
+            return Err(VmmError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "VM execution cancelled for deletion",
+            )));
+        }
+        state.1 = Some(stream.try_clone()?);
+        Ok(())
+    }
+}
+
 /// Client for a single VMM instance (one UDS, one VM).
 pub struct VmmClient {
     socket_path: String,
     connect_timeout: Duration,
     request_timeout: Option<Duration>,
+    cancellation: Option<Arc<RequestCancellation>>,
 }
 
 impl VmmClient {
@@ -346,6 +377,7 @@ impl VmmClient {
             socket_path: socket_path.as_ref().display().to_string(),
             connect_timeout: Duration::from_secs(5),
             request_timeout: None,
+            cancellation: None,
         }
     }
 
@@ -357,6 +389,11 @@ impl VmmClient {
     /// Limit a request's total connect, write, and response-read time.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: Arc<RequestCancellation>) -> Self {
+        self.cancellation = Some(cancellation);
         self
     }
 
@@ -417,6 +454,9 @@ impl VmmClient {
         let body = serde_json::to_vec(req)?;
         let deadline = self.request_timeout.map(|timeout| Instant::now() + timeout);
         let mut stream = self.connect_for_request(deadline)?;
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.register(&stream)?;
+        }
         let resp_body = if let Some(deadline) = deadline {
             write_api_frame_until(&mut stream, &body, deadline)?;
             read_api_frame_until(&mut stream, deadline)?
@@ -836,6 +876,24 @@ mod tests {
             ".tarit-vmm-client-{}-{id}.sock",
             std::process::id()
         )))
+    }
+
+    #[test]
+    fn cancellation_before_connect_sends_no_exec_request() {
+        let socket =
+            std::env::temp_dir().join(format!("tarit-cancel-before-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let cancellation = Arc::new(RequestCancellation::default());
+        cancellation.cancel();
+        let result = VmmClient::new(&socket)
+            .with_request_timeout(Duration::from_secs(1))
+            .with_cancellation(cancellation)
+            .exec("must not run", 3_600_000);
+        assert!(result.is_err());
+        let (mut stream, _) = listener.accept().unwrap();
+        assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        std::fs::remove_file(socket).unwrap();
     }
 
     #[test]

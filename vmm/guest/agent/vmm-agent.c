@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -24,7 +25,6 @@
 #include <net/route.h>
 #include <linux/random.h>
 #include <linux/vm_sockets.h>
-#include <poll.h>
 #include <pty.h>
 #include <sys/mount.h>
 #include <sys/random.h>
@@ -47,7 +47,7 @@
  * a dead connection after restore is cleanly re-dialed. Serial stays as a
  * fallback for kernels/hosts without a virtio-vsock device. */
 #define VMM_EXEC_VSOCK_PORT 1024
-#define VMM_PTY_VSOCK_PORT 1025
+#define VMM_PTY_VSOCK_PORT 1022
 #define LINE_MAX_LEN 4096
 #define VSOCK_RECONNECT_BACKOFF_INITIAL_US 10000U
 #define VSOCK_RECONNECT_BACKOFF_MAX_US 1000000U
@@ -546,9 +546,9 @@ static void make_raw(int fd) {
 static int open_serial(void) {
     /* VMM_AGENT_SERIAL names another tty; the agent's tests use a pty. */
     const char *path = getenv("VMM_AGENT_SERIAL");
-    int fd = open(path && path[0] ? path : "/dev/ttyS0", O_RDWR | O_NOCTTY);
+    int fd = open(path && path[0] ? path : "/dev/ttyS0", O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (fd < 0) {
-        fd = open("/dev/console", O_RDWR | O_NOCTTY);
+        fd = open("/dev/console", O_RDWR | O_NOCTTY | O_CLOEXEC);
     }
     if (fd >= 0) {
         make_raw(fd);
@@ -760,6 +760,47 @@ static int wait_for_child_or_host(pid_t pid, int host_fd, bool *host_gone) {
 }
 #endif
 
+/* Called only in a freshly forked command child, after stdio is installed. */
+static void prepare_command_child(bool terminal_stdin) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGPIPE, &action, NULL) < 0) _exit(127);
+    sigset_t unblock;
+    sigemptyset(&unblock);
+    sigaddset(&unblock, SIGPIPE);
+    if (sigprocmask(SIG_UNBLOCK, &unblock, NULL) < 0) _exit(127);
+    if (!terminal_stdin) {
+        int null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0) _exit(127);
+        if (null_fd > STDERR_FILENO) close(null_fd);
+    }
+#ifdef __linux__
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0) return;
+#endif
+#endif
+    /* Support older guest kernels without close_range. Fail closed if the
+     * descriptor inventory is unavailable rather than leak a control socket. */
+#ifdef __linux__
+    DIR *fds = opendir("/proc/self/fd");
+#else
+    DIR *fds = opendir("/dev/fd");
+#endif
+    if (fds == NULL) _exit(127);
+    int inventory_fd = dirfd(fds);
+    struct dirent *entry;
+    while ((entry = readdir(fds)) != NULL) {
+        char *end = NULL;
+        long fd = strtol(entry->d_name, &end, 10);
+        if (end != entry->d_name && *end == '\0' && fd > STDERR_FILENO && fd != inventory_fd) {
+            close((int)fd);
+        }
+    }
+    closedir(fds);
+}
+
 /* Run a command in the exec child. Commands go through /bin/sh so pipes,
  * redirects and quoting work. Images without a shell (distroless, scratch)
  * still run plain commands: the line is split on spaces and tabs and
@@ -851,6 +892,7 @@ static void run_command(int serial_fd, const char *command) {
             _exit(127);
         }
         close(pipefd[1]);
+        prepare_command_child(false);
         exec_command(command);
         _exit(127);
     }
@@ -894,6 +936,10 @@ static void run_probe(int serial_fd, const char *token) {
             return;
         }
     }
+    /* Current hosts consume the first response; old hosts ignore it and
+     * consume the second. Both are nonce-bound, so a leftover legacy reply
+     * cannot satisfy a subsequent probe. */
+    serial_printf(serial_fd, "VMM_PROBE_OK:%s:TRANSPORT=2\n", token);
     serial_printf(serial_fd, "VMM_PROBE_OK:%s\n", token);
 }
 
@@ -1088,6 +1134,7 @@ static void run_command_chunked(int fd, uint64_t request_id, const char *command
         }
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
+        prepare_command_child(false);
         exec_command(command);
         _exit(127);
     }
@@ -1574,8 +1621,30 @@ static void run_guest_network_repair(int serial_fd, const char *json) {
 /* Dial the host exec channel over vsock (guest -> host CID 2, fixed port). The
  * VMM bridges this to a per-VM host Unix socket the controller accepts on. */
 static int vsock_connect_host(void) {
-    int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
+        return -1;
+    }
+    struct sockaddr_vm local;
+    memset(&local, 0, sizeof(local));
+    local.svm_family = AF_VSOCK;
+    local.svm_cid = VMADDR_CID_ANY;
+    bool bound = false;
+    /* Never fall back to an ephemeral port: the host admits only privileged
+     * source ports. Scan on reconnect to avoid a still-closing old binding. */
+    for (unsigned int port = 1023; port > 0; port--) {
+        if (port == VMM_PTY_VSOCK_PORT) continue;
+        local.svm_port = port;
+        if (bind(fd, (struct sockaddr *)&local, sizeof(local)) == 0) {
+            bound = true;
+            break;
+        }
+        if (errno != EADDRINUSE) break;
+    }
+    if (!bound) {
+        int error = errno;
+        close(fd);
+        errno = error;
         return -1;
     }
     struct sockaddr_vm addr;
@@ -1958,6 +2027,7 @@ static void handle_pty_client(int fd) {
         if (slave_fd > STDERR_FILENO) {
             close(slave_fd);
         }
+        prepare_command_child(true);
         if (getenv("PATH") == NULL) {
             setenv("PATH", DEFAULT_PATH, 1);
         }
@@ -1985,7 +2055,7 @@ static void handle_pty_client(int fd) {
 }
 
 static int listen_pty_vsock(void) {
-    int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
         return -1;
     }
@@ -2008,6 +2078,11 @@ static int listen_pty_vsock(void) {
 static void reap_pty_clients(void) {
     while (waitpid(-1, NULL, WNOHANG) > 0) {
     }
+}
+
+static bool pty_peer_is_host(const struct sockaddr_vm *peer, socklen_t peer_len) {
+    return peer_len == sizeof(*peer) && peer->svm_family == AF_VSOCK &&
+           peer->svm_cid == VMADDR_CID_HOST;
 }
 
 static void serve_pty_forever(void) {
@@ -2035,7 +2110,10 @@ static void serve_pty_forever(void) {
                 continue;
             }
 
-            int fd = accept(listen_fd, NULL, NULL);
+            struct sockaddr_vm peer;
+            socklen_t peer_len = sizeof(peer);
+            memset(&peer, 0, sizeof(peer));
+            int fd = accept4(listen_fd, (struct sockaddr *)&peer, &peer_len, SOCK_CLOEXEC);
             if (fd < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                     continue;
@@ -2043,6 +2121,12 @@ static void serve_pty_forever(void) {
                 break;
             }
 
+            /* Only the host may request a privileged shell. Guest-local vsock
+             * clients must not turn this listener into a privilege escalation. */
+            if (!pty_peer_is_host(&peer, peer_len)) {
+                close(fd);
+                continue;
+            }
             pid_t pid = fork();
             if (pid == 0) {
                 close(listen_fd);
@@ -2143,7 +2227,7 @@ int main(void) {
     /* Fork a dedicated vsock exec server; the parent keeps serving serial as a
      * fallback. The host uses whichever channel it opened, so only one runs a
      * given command. Fork a second vsock server for host-initiated PTY sessions
-     * on port 1025, so interactive shells never affect exec/serial fallback. */
+     * on privileged port 1022, so interactive shells never affect exec/serial fallback. */
     pid_t vsock_pid = fork();
     if (vsock_pid == 0) {
         serve_vsock_forever();

@@ -931,6 +931,7 @@ struct RunningVm {
     /// must be observed as one transition. The gate is owned by the runtime
     /// entry, so deleting a VM also removes the only registry reference.
     operation_gate: Arc<AsyncMutex<()>>,
+    execution: Arc<Mutex<ExecutionControl>>,
     /// VMM-visible path of the full snapshot this runtime last wrote or was
     /// restored from. Passed as the next snapshot's base so the VMM pauses
     /// only for pages changed since; the VMM verifies it is exactly that
@@ -946,13 +947,43 @@ impl RunningVm {
             process,
             net,
             operation_gate: Arc::new(AsyncMutex::new(())),
+            execution: Arc::new(Mutex::new(ExecutionControl::default())),
             checkpoint_base: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn execution_cancelled_for_delete(&self) -> bool {
+        self.execution
+            .lock()
+            .map(|execution| execution.deleting)
+            .unwrap_or(false)
     }
 
     fn set_checkpoint_base(&self, path: Option<String>) {
         if let Ok(mut base) = self.checkpoint_base.lock() {
             *base = path;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExecutionControl {
+    deleting: bool,
+    active: Option<Arc<tarit_vmm_client::RequestCancellation>>,
+}
+
+pub(crate) struct ExecutionGuard {
+    // Drop clears the active registration before fields release this gate,
+    // including when the blocking worker unwinds.
+    _operation: tokio::sync::OwnedMutexGuard<()>,
+    control: Arc<Mutex<ExecutionControl>>,
+    cancellation: Arc<tarit_vmm_client::RequestCancellation>,
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut control) = self.control.lock() {
+            control.active = None;
         }
     }
 }
@@ -1015,10 +1046,13 @@ impl Drop for NetworkLease {
     }
 }
 
+type RuntimeDeathObservation = (chrono::DateTime<chrono::Utc>, Instant);
+
 #[derive(Debug, Clone)]
 struct ManagedProcess {
     pid: u32,
     handle: ProcessHandle,
+    stopped_at: Arc<Mutex<Option<RuntimeDeathObservation>>>,
 }
 
 /// How the supervisor can terminate a VMM. A freshly spawned VMM is a child of
@@ -2622,6 +2656,7 @@ impl ManagedProcess {
         Self {
             pid,
             handle: ProcessHandle::Owned(Arc::new(Mutex::new(child))),
+            stopped_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2632,6 +2667,7 @@ impl ManagedProcess {
         Self {
             pid,
             handle: ProcessHandle::Adopted(Arc::new(pidfd)),
+            stopped_at: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2647,7 +2683,12 @@ impl ManagedProcess {
         match &self.handle {
             ProcessHandle::Owned(child) => Self::kill_wait_owned(child),
             ProcessHandle::Adopted(pidfd) => self.kill_wait_adopted(pidfd),
-        }
+        }?;
+        self.stopped_at
+            .lock()
+            .map_err(|_| OrchError::Internal("process death boundary poisoned".into()))?
+            .get_or_insert_with(|| (chrono::Utc::now(), Instant::now()));
+        Ok(())
     }
 
     fn try_exit(&self) -> Result<Option<String>, OrchError> {
@@ -3135,11 +3176,12 @@ fn shutdown_error() -> OrchError {
 pub struct VmmSupervisor {
     config: Config,
     running: Mutex<HashMap<Uuid, RunningVm>>,
+    runtime_deaths: Mutex<HashMap<Uuid, chrono::DateTime<chrono::Utc>>>,
     /// Authoritative ownership for UUID-scoped runtime artifacts. An id enters
     /// before any jail/overlay can be created and leaves only after teardown
     /// succeeds, so registry-to-registry lifecycle handoffs cannot expose a GC
     /// deletion gap.
-    artifact_owners: Mutex<HashSet<Uuid>>,
+    artifact_owners: Mutex<HashMap<Uuid, Instant>>,
     network_leases: Mutex<HashMap<Uuid, NetworkLeaseState>>,
     booting: Mutex<HashMap<Uuid, BootingVm>>,
     /// Orders VMM spawn registration and lifecycle publication against
@@ -3320,6 +3362,14 @@ impl VmmSupervisor {
     ) -> Result<Self, OrchError> {
         std::fs::create_dir_all(&config.socket_dir)
             .map_err(|error| OrchError::Internal(format!("create runtime directory: {error}")))?;
+        let death_dir = config.socket_dir.join("runtime-deaths");
+        std::fs::create_dir_all(&death_dir)
+            .and_then(|()| {
+                std::fs::set_permissions(&death_dir, std::fs::Permissions::from_mode(0o700))
+            })
+            .map_err(|error| {
+                OrchError::Internal(format!("create runtime death journal: {error}"))
+            })?;
         let overlay_dir = config.socket_dir.join("overlays");
         std::fs::create_dir_all(&overlay_dir)
             .map_err(|error| OrchError::Internal(format!("create overlay directory: {error}")))?;
@@ -3333,7 +3383,7 @@ impl VmmSupervisor {
             |error| OrchError::Internal(format!("protect snapshot artifact directory: {error}")),
         )?;
         let live_vm_ids = live_vm_ids.into_iter().collect::<Vec<_>>();
-        let artifact_owners = live_vm_ids.iter().copied().collect();
+        let artifact_owners = live_vm_ids.iter().map(|id| (*id, Instant::now())).collect();
         let jails = config.vm_jail.clone().map(JailManager::new).transpose()?;
         let mut pressure_roots = vec![config.socket_dir.clone()];
         if let Some(jail) = &config.vm_jail {
@@ -3372,6 +3422,7 @@ impl VmmSupervisor {
         Ok(Self {
             config,
             running: Mutex::new(HashMap::new()),
+            runtime_deaths: Mutex::new(HashMap::new()),
             artifact_owners: Mutex::new(artifact_owners),
             network_leases: Mutex::new(HashMap::new()),
             booting: Mutex::new(HashMap::new()),
@@ -3397,6 +3448,104 @@ impl VmmSupervisor {
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(VmAdmissionGate::default()),
         })
+    }
+
+    /// The first confirmed process-death boundary survives cleanup failures
+    /// and daemon restart. It is independent of runtime/artifact ownership.
+    pub(crate) fn runtime_stopped_at(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, OrchError> {
+        if let Some(end) = self
+            .runtime_deaths
+            .lock()
+            .map_err(|_| OrchError::Internal("runtime death registry poisoned".into()))?
+            .get(&id)
+        {
+            return Ok(Some(*end));
+        }
+        let path = self
+            .config
+            .socket_dir
+            .join("runtime-deaths")
+            .join(id.to_string());
+        match std::fs::read_to_string(path) {
+            Ok(value) => chrono::DateTime::parse_from_rfc3339(value.trim())
+                .map(|end| Some(end.with_timezone(&chrono::Utc)))
+                .map_err(|error| {
+                    OrchError::Internal(format!("read runtime death boundary for {id}: {error}"))
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(OrchError::Internal(format!(
+                "read runtime death journal for {id}: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_runtime_stopped(&self, id: Uuid) -> Result<(), OrchError> {
+        self.record_runtime_stopped_at(id, (chrono::Utc::now(), Instant::now()))
+    }
+
+    fn record_runtime_stopped_at(
+        &self,
+        id: Uuid,
+        observation: RuntimeDeathObservation,
+    ) -> Result<(), OrchError> {
+        use std::io::Write;
+        // Serialize against UUID reuse. A delayed cleanup retains its original
+        // monotonic death observation and cannot freeze a newer runtime.
+        let owners = self
+            .artifact_owners
+            .lock()
+            .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?;
+        if owners
+            .get(&id)
+            .is_some_and(|started| observation.1 < *started)
+        {
+            return Ok(());
+        }
+        let observed = self.runtime_stopped_at(id)?.unwrap_or(observation.0);
+        // Retain the first boundary even when the disk is unavailable: the
+        // periodic meter must stop immediately, and a retry persists this value.
+        let mut deaths = self
+            .runtime_deaths
+            .lock()
+            .map_err(|_| OrchError::Internal("runtime death registry poisoned".into()))?;
+        let end = *deaths.entry(id).or_insert(observed);
+        let dir = self.config.socket_dir.join("runtime-deaths");
+        let path = dir.join(id.to_string());
+        let temporary = dir.join(format!(".{id}-{}", Uuid::new_v4()));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)?;
+            file.write_all(end.to_rfc3339().as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)?;
+            File::open(&dir)?.sync_all()
+        })();
+        let _ = std::fs::remove_file(temporary);
+        result.map_err(|error| {
+            OrchError::Internal(format!("persist runtime death boundary for {id}: {error}"))
+        })
+    }
+
+    pub(crate) fn clear_runtime_stopped(&self, id: Uuid) -> Result<(), OrchError> {
+        let dir = self.config.socket_dir.join("runtime-deaths");
+        remove_file_if_present(&dir.join(id.to_string()))
+            .and_then(|()| File::open(dir)?.sync_all())
+            .map_err(|error| {
+                OrchError::Internal(format!("clear runtime death boundary for {id}: {error}"))
+            })?;
+        self.runtime_deaths
+            .lock()
+            .map_err(|_| OrchError::Internal("runtime death registry poisoned".into()))?
+            .remove(&id);
+        Ok(())
     }
 
     fn socket_path_for(&self, id: Uuid) -> PathBuf {
@@ -3580,11 +3729,14 @@ impl VmmSupervisor {
             .artifact_owners
             .lock()
             .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?;
-        if !owners.insert(id) {
+        if owners.contains_key(&id) {
             return Err(OrchError::Conflict(format!(
                 "VM {id} already owns runtime artifacts"
             )));
         }
+        // Reset only after exclusivity is proven, before a new runtime starts.
+        self.clear_runtime_stopped(id)?;
+        owners.insert(id, Instant::now());
         Ok(())
     }
 
@@ -3592,7 +3744,8 @@ impl VmmSupervisor {
         self.artifact_owners
             .lock()
             .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?
-            .insert(id);
+            .entry(id)
+            .or_insert_with(Instant::now);
         Ok(())
     }
 
@@ -3818,6 +3971,9 @@ impl VmmSupervisor {
                     tracing::error!(vm = %id, pid = process.pid, %error, "VMM exit scan failed");
                 }
             }
+        }
+        if let Some(net) = &self.net {
+            net.retry_pending_cleanup();
         }
     }
 
@@ -4249,10 +4405,10 @@ impl VmmSupervisor {
             .artifact_owners
             .lock()
             .map_err(|_| OrchError::Internal("artifact ownership registry poisoned".into()))?;
-        references.active_vm_ids.extend(owners.iter().copied());
+        references.active_vm_ids.extend(owners.keys().copied());
         references.runtime_paths.extend(
             owners
-                .iter()
+                .keys()
                 .map(|id| PathBuf::from(self.overlay_path_for(*id))),
         );
         // Publication holds this registry while staging names are atomically
@@ -5871,6 +6027,7 @@ impl VmmSupervisor {
         )
         .map_err(|error| match error {
             ReadinessWaitError::Cancelled(error) => error,
+            ReadinessWaitError::Incompatible(error) => OrchError::Vmm(error),
             ReadinessWaitError::TimedOut(last) => OrchError::Vmm(format!(
                 "guest agent never became ready at {}: {last}",
                 socket.display()
@@ -7416,6 +7573,57 @@ impl VmmSupervisor {
             .ok_or_else(|| OrchError::NotFound(format!("vm {id} not running")))
     }
 
+    /// Called with this runtime's operation gate held, before spawning exec.
+    pub(crate) fn begin_execution(
+        &self,
+        id: Uuid,
+        operation: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ExecutionGuard, OrchError> {
+        let control = self
+            .running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?
+            .get(&id)
+            .map(|vm| Arc::clone(&vm.execution))
+            .ok_or_else(|| OrchError::NotFound(format!("vm {id} not running")))?;
+        let mut execution = control
+            .lock()
+            .map_err(|_| OrchError::Internal("execution lock poisoned".into()))?;
+        if execution.deleting {
+            return Err(OrchError::Conflict(format!("VM {id} is being deleted")));
+        }
+        let cancellation = Arc::new(tarit_vmm_client::RequestCancellation::default());
+        execution.active = Some(Arc::clone(&cancellation));
+        drop(execution);
+        Ok(ExecutionGuard {
+            _operation: operation,
+            control,
+            cancellation,
+        })
+    }
+
+    /// Only exec may be interrupted. Lifecycle mutations retain their gate
+    /// through publication/rollback and must never be cancelled here.
+    pub(crate) fn cancel_execution_for_delete(&self, id: Uuid) -> Result<bool, OrchError> {
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| OrchError::Internal("supervisor lock poisoned".into()))?;
+        let Some(vm) = running.get(&id) else {
+            return Ok(false);
+        };
+        let mut execution = vm
+            .execution
+            .lock()
+            .map_err(|_| OrchError::Internal("execution lock poisoned".into()))?;
+        let Some(cancellation) = execution.active.clone() else {
+            return Ok(false);
+        };
+        execution.deleting = true;
+        cancellation.cancel();
+        Ok(true)
+    }
+
     pub fn stop_vm(&self, id: Uuid) -> Result<(), OrchError> {
         let booting = {
             let _gate = self.boot_gate.blocking_write();
@@ -7470,8 +7678,10 @@ impl VmmSupervisor {
             return Ok(());
         };
 
-        let client = VmmClient::new(&running.socket_path);
-        let _ = client.stop();
+        if !running.execution_cancelled_for_delete() {
+            let client = VmmClient::new(&running.socket_path);
+            let _ = client.stop();
+        }
         if let Err(error) = self.teardown_vm(id, &running) {
             self.running
                 .lock()
@@ -7576,6 +7786,7 @@ impl VmmSupervisor {
         )
         .map_err(|error| match error {
             ReadinessWaitError::Cancelled(error) => error,
+            ReadinessWaitError::Incompatible(error) => OrchError::Vmm(error),
             ReadinessWaitError::TimedOut(last) => {
                 OrchError::Vmm(format!("guest did not become ready after resume: {last}"))
             }
@@ -7660,18 +7871,20 @@ impl VmmSupervisor {
             .map_err(|error| OrchError::Vmm(format!("get balloon: {error}")))
     }
 
-    pub fn exec_vm(
+    pub(crate) fn exec_vm(
         &self,
         id: Uuid,
         command: &str,
         timeout_ms: u64,
+        execution: &ExecutionGuard,
     ) -> Result<(i32, String, String, u64), OrchError> {
         // The guest is allowed to run for the full `timeout_ms`; the transport
         // deadline must outlive it or long commands fail with a spurious
         // socket timeout (EAGAIN) while the guest is still working.
         let client = self
             .client_for(id)?
-            .with_request_timeout(Duration::from_millis(timeout_ms) + EXEC_OP_MARGIN);
+            .with_request_timeout(Duration::from_millis(timeout_ms) + EXEC_OP_MARGIN)
+            .with_cancellation(Arc::clone(&execution.cancellation));
         // An exec request is not replay-safe: a lost response may mean the
         // guest accepted and ran the command. Send it exactly once and surface
         // an ambiguous transport failure to the caller. Readiness retries use
@@ -8197,7 +8410,12 @@ impl VmmSupervisor {
 
     fn teardown_vm(&self, id: Uuid, vm: &RunningVm) -> Result<(), OrchError> {
         let mut failures = Vec::new();
-        graceful_stop_vmm(&vm.socket_path);
+        // The VMM RPC loop is synchronous: while guest exec runs it cannot
+        // answer Stop, even after its client socket closes. DELETE has already
+        // fenced exec and awaited the host worker; kill/reap directly here.
+        if !vm.execution_cancelled_for_delete() {
+            graceful_stop_vmm(&vm.socket_path);
+        }
         let process_exited = match vm.process.kill_wait() {
             Ok(()) => true,
             Err(error) => {
@@ -8205,6 +8423,17 @@ impl VmmSupervisor {
                 false
             }
         };
+        if process_exited {
+            let observation = vm
+                .process
+                .stopped_at
+                .lock()
+                .map_err(|_| OrchError::Internal("process death boundary poisoned".into()))?
+                .expect("successful kill_wait records process death");
+            if let Err(error) = self.record_runtime_stopped_at(id, observation) {
+                failures.push(error.to_string());
+            }
+        }
         if let Err(error) = remove_file_if_present(&vm.socket_path) {
             failures.push(format!("remove VMM socket: {error}"));
         }
@@ -8238,7 +8467,7 @@ impl VmmSupervisor {
         if let (Some(p), Some(a)) = (&self.net, &vm.net) {
             match self.defer_network_teardown(id, a.clone()) {
                 Ok(Some(allocation)) => {
-                    if let Err(error) = p.teardown(&allocation) {
+                    if let Err(error) = p.teardown_or_defer(&allocation) {
                         failures.push(format!("teardown network allocation: {error}"));
                     }
                 }
@@ -8290,7 +8519,7 @@ impl VmmSupervisor {
         };
         if let Some(allocation) = teardown {
             if let Some(provisioner) = &self.net {
-                if let Err(error) = provisioner.teardown(&allocation) {
+                if let Err(error) = provisioner.teardown_or_defer(&allocation) {
                     tracing::error!(%id, %error, "failed deferred network teardown");
                     return;
                 }
@@ -8899,6 +9128,7 @@ fn readiness_poll_sleep(remaining: Duration) -> Duration {
 #[derive(Debug)]
 enum ReadinessWaitError {
     Cancelled(OrchError),
+    Incompatible(String),
     TimedOut(String),
 }
 
@@ -8924,6 +9154,9 @@ where
             Ok(true) => return Ok(()),
             Ok(false) => {
                 last = "guest agent readiness probe did not succeed".to_string();
+            }
+            Err(error) if error.contains("AGENT_TRANSPORT_INCOMPATIBLE:") => {
+                return Err(ReadinessWaitError::Incompatible(error));
             }
             Err(error) => last = error,
         }
@@ -9591,6 +9824,21 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use tarit_volume::BlockVolumeProvider;
+
+    #[test]
+    fn incompatible_guest_transport_is_not_retried_until_boot_timeout() {
+        let mut probes = 0;
+        let result = wait_for_guest_ready(
+            Duration::from_secs(60),
+            || Ok(()),
+            |_| {
+                probes += 1;
+                Err("AGENT_TRANSPORT_INCOMPATIBLE: rebuild guest agent".into())
+            },
+        );
+        assert!(matches!(result, Err(ReadinessWaitError::Incompatible(_))));
+        assert_eq!(probes, 1);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -10410,6 +10658,75 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn failed_cleanup_preserves_confirmed_death_across_restart_and_retry() {
+        let root = PathBuf::from(format!("target/death-journal-{}", Uuid::new_v4()));
+        let config = supervisor_config(&root);
+        let supervisor = VmmSupervisor::new(config.clone());
+        let id = Uuid::new_v4();
+        supervisor.register_artifact_owner(id).unwrap();
+        let socket = root.join("not-a-socket");
+        std::fs::create_dir_all(&socket).unwrap(); // Inject cleanup failure after kill.
+        let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        supervisor.running.lock().unwrap().insert(
+            id,
+            RunningVm::new(process.pid, socket.clone(), process.clone(), None),
+        );
+        let db_path = root.join("billing.sqlite");
+        let store = tarit_store::Store::open(&db_path).unwrap();
+        let mut record = restart_record(&supervisor, id, &socket);
+        record.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        store.insert_vm(&record).unwrap();
+        drop(store);
+        assert!(supervisor.stop_vm(id).is_err());
+        assert!(process.try_exit().unwrap().is_some());
+        assert!(supervisor.is_running(id)); // Retained strictly for cleanup retry.
+        let end = supervisor.runtime_stopped_at(id).unwrap().unwrap();
+        let restarted = VmmSupervisor::new(config);
+        assert_eq!(restarted.runtime_stopped_at(id).unwrap(), Some(end));
+        // Startup imports the journal before changing the durable live status.
+        // The store's inactive transition settles the tail at death, not restart.
+        let reopened = tarit_store::Store::open(&db_path).unwrap();
+        reopened
+            .freeze_billing_end(id, restarted.runtime_stopped_at(id).unwrap().unwrap())
+            .unwrap();
+        reopened.update_vm_status(id, VmStatus::Hibernated).unwrap();
+        let events = reopened.list_unsent_usage(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].window_end, end);
+        assert_eq!(reopened.get_billing_watermark(id).unwrap(), None);
+        drop(reopened);
+        std::fs::remove_dir(socket).unwrap();
+        supervisor.stop_vm(id).unwrap();
+        assert_eq!(supervisor.runtime_stopped_at(id).unwrap(), Some(end));
+        let old_observation = process.stopped_at.lock().unwrap().unwrap();
+        supervisor.register_artifact_owner(id).unwrap();
+        supervisor
+            .record_runtime_stopped_at(id, old_observation)
+            .unwrap();
+        assert_eq!(supervisor.runtime_stopped_at(id).unwrap(), None);
+        assert_eq!(restarted.runtime_stopped_at(id).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn death_journal_write_failure_keeps_first_boundary_in_memory_for_retry() {
+        let root = PathBuf::from(format!("target/death-journal-failure-{}", Uuid::new_v4()));
+        let supervisor = VmmSupervisor::new(supervisor_config(&root));
+        let id = Uuid::new_v4();
+        let dir = supervisor.config.socket_dir.join("runtime-deaths");
+        std::fs::remove_dir(&dir).unwrap();
+        // ENOENT on the atomic temp write simulates an unavailable journal.
+        assert!(supervisor.record_runtime_stopped(id).is_err());
+        let end = supervisor.runtime_stopped_at(id).unwrap().unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        supervisor.record_runtime_stopped(id).unwrap();
+        assert_eq!(supervisor.runtime_stopped_at(id).unwrap(), Some(end));
+        let restarted = VmmSupervisor::new(supervisor.config.clone());
+        assert_eq!(restarted.runtime_stopped_at(id).unwrap(), Some(end));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11290,7 +11607,7 @@ mod tests {
 
         assert!(matches!(failure, ReadoptFailure::Unadoptable(_)));
         assert_ne!(unsafe { libc::kill(pid as libc::pid_t, 0) }, 0);
-        assert!(!supervisor.artifact_owners.lock().unwrap().contains(&id));
+        assert!(!supervisor.artifact_owners.lock().unwrap().contains_key(&id));
         std::fs::remove_dir_all(root).unwrap();
     }
 

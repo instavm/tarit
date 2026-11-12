@@ -7,7 +7,7 @@ sshd: a WebSocket PTY and an SSH gateway. Both terminate at the same guest agent
 ## Pieces
 
 - **Guest agent** (`guest/agent/vmm-agent.c`): forks a dedicated PTY server that
-  listens on **vsock port 1025** (host-initiated connect, one connection per PTY
+  listens on **vsock port 1022** (host-initiated connect, one connection per PTY
   session). On a new connection it reads a `START` frame, `openpty()`s, forks a
   login shell (`setsid` + `TIOCSCTTY` + `dup2`), and relays. Resize is
   `ioctl(TIOCSWINSZ)`. This is separate from the exec server (vsock port 1024)
