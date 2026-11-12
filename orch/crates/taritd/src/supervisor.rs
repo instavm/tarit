@@ -45,6 +45,14 @@ const GUEST_READY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const SOCKET_WAIT_INITIAL: Duration = Duration::from_millis(1);
 const SOCKET_WAIT_MAX: Duration = Duration::from_millis(4);
 const TEARDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Backoff between cleanup retries of a retiring warm VM whose teardown
+/// failed: doubles from the initial delay up to the cap.
+const WARM_CLEANUP_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const WARM_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(300);
+/// Failed teardowns after which a retiring warm VM gives back its capacity
+/// even though its VMM could not be confirmed dead (an operator is alerted).
+/// A VMM confirmed dead gives it back at its first failed teardown.
+const WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY: u32 = 5;
 /// Upper bound for VMM ops that copy guest RAM (suspend, snapshot) or fault it
 /// back in (a suspend right after resume). These are silent on the socket for
 /// the whole copy, so they get a generous request deadline instead of the
@@ -2556,6 +2564,9 @@ fn hash_artifact_range_checked(
 #[cfg(test)]
 thread_local! {
     static TEST_RAM_INTEGRITY_HASH_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many unexpected VMM exits were queued when this thread last ran
+    /// a retiring warm cleanup.
+    static TEST_WARM_CLEANUP_SAW_UNEXPECTED_EXITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Restore disk writers started on this thread and not yet joined.
     static TEST_UNJOINED_OVERLAY_WRITERS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
     /// Set when boot failure cleanup ran on this thread while one of its
@@ -2781,6 +2792,14 @@ impl ManagedProcess {
             ProcessHandle::Owned(child) => child,
             ProcessHandle::Adopted(_) => panic!("adopted process has no owned child handle"),
         }
+    }
+
+    /// Whether a successful `kill_wait` has confirmed this process dead.
+    fn death_confirmed(&self) -> bool {
+        self.stopped_at
+            .lock()
+            .map(|stopped| stopped.is_some())
+            .unwrap_or(false)
     }
 
     fn kill_wait(&self) -> Result<(), OrchError> {
@@ -3278,9 +3297,37 @@ struct BootingVm {
 struct WarmVm {
     // Retain cleanup ownership without offering this runtime to new creates.
     retiring: bool,
+    retirement: WarmRetirement,
     id: Uuid,
     vm: RunningVm,
     spec: VmSpawnConfig,
+}
+
+/// Cleanup state of a retiring warm VM whose teardown failed.
+#[derive(Debug, Default, Clone, Copy)]
+struct WarmRetirement {
+    failed_attempts: u32,
+    /// When the exit scan may retry; `None` means now.
+    next_attempt_at: Option<Instant>,
+    /// Its scheduler reservation was already given back, so a later
+    /// successful cleanup must not release it again.
+    capacity_released: bool,
+}
+
+impl WarmRetirement {
+    fn due(&self, now: Instant) -> bool {
+        match self.next_attempt_at {
+            Some(at) => now >= at,
+            None => true,
+        }
+    }
+}
+
+fn warm_cleanup_retry_delay(failed_attempts: u32) -> Duration {
+    let doublings = failed_attempts.saturating_sub(1).min(16);
+    WARM_CLEANUP_RETRY_INITIAL
+        .saturating_mul(1u32 << doublings)
+        .min(WARM_CLEANUP_RETRY_MAX)
 }
 
 /// A warm class added for a shape creates asked for (see
@@ -4197,18 +4244,43 @@ impl VmmSupervisor {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // User VMs first: their exits are what users and the lifecycle
+        // reconciler wait on, and warm cleanup retries can be slow.
+        for (id, process, operation_gate) in processes {
+            match process.try_exit() {
+                Ok(Some(status)) => {
+                    self.reconcile_process_exit(id, process.pid, &status, operation_gate);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(vm = %id, pid = process.pid, %error, "VMM exit scan failed");
+                }
+            }
+        }
+        let now = Instant::now();
         let warm_processes = self
             .warm
             .lock()
             .map(|warm| {
                 warm.iter()
-                    .map(|entry| (entry.id, entry.vm.clone(), entry.retiring))
+                    .map(|entry| {
+                        (
+                            entry.id,
+                            entry.vm.clone(),
+                            entry.retiring,
+                            entry.retirement.due(now),
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for (id, vm, retiring) in warm_processes {
+        for (id, vm, retiring, due) in warm_processes {
             if retiring {
-                let _ = self.cleanup_retiring_warm(id, &vm);
+                // A failed warm cleanup is retried with backoff, never once
+                // per scan.
+                if due {
+                    let _ = self.cleanup_retiring_warm(id, &vm, true);
+                }
             } else {
                 match vm.process.try_exit() {
                     Ok(Some(status)) => self.reconcile_process_exit(
@@ -4221,17 +4293,6 @@ impl VmmSupervisor {
                     Err(error) => {
                         tracing::error!(vm = %id, pid = vm.pid, %error, "warm VMM exit scan failed")
                     }
-                }
-            }
-        }
-        for (id, process, operation_gate) in processes {
-            match process.try_exit() {
-                Ok(Some(status)) => {
-                    self.reconcile_process_exit(id, process.pid, &status, operation_gate);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(vm = %id, pid = process.pid, %error, "VMM exit scan failed");
                 }
             }
         }
@@ -4289,7 +4350,8 @@ impl VmmSupervisor {
             Location::Running(vm) => vm,
             Location::Warm(vm) => {
                 drop(_operation);
-                let _ = self.cleanup_retiring_warm(id, &vm);
+                tracing::warn!(vm = %id, pid, %status, "warm VMM exited; capacity will be replenished");
+                let _ = self.cleanup_retiring_warm(id, &vm, false);
                 return;
             }
         };
@@ -5220,40 +5282,107 @@ impl VmmSupervisor {
         let Some((id, vm)) = taken else {
             return false;
         };
-        self.cleanup_retiring_warm(id, &vm).unwrap_or(false)
+        self.cleanup_retiring_warm(id, &vm, false).unwrap_or(false)
     }
 
     /// Retry failed warm teardown even while its process is still alive. The
-    /// entry and reservation remain owned until every cleanup step succeeds.
-    fn cleanup_retiring_warm(&self, id: Uuid, vm: &RunningVm) -> Result<bool, OrchError> {
+    /// entry stays owned (unclaimable) until every cleanup step succeeds; its
+    /// capacity is given back exactly once, at the latest by that success
+    /// (see [`Self::record_failed_warm_cleanup`] for the earlier cases).
+    /// `backed_off` (the exit scan's retry) skips an entry whose next retry
+    /// is not due yet, checked after the operation gate so a retry queued
+    /// behind a failing attempt does not run straight after it.
+    fn cleanup_retiring_warm(
+        &self,
+        id: Uuid,
+        vm: &RunningVm,
+        backed_off: bool,
+    ) -> Result<bool, OrchError> {
         let _operation = vm.operation_gate.blocking_lock();
+        #[cfg(test)]
+        TEST_WARM_CLEANUP_SAW_UNEXPECTED_EXITS
+            .with(|seen| seen.set(self.unexpected_exits.lock().map(|exits| exits.len()).ok()));
+        let now = Instant::now();
         if !self.warm.lock().is_ok_and(|warm| {
-            warm.iter()
-                .any(|entry| entry.id == id && entry.vm.pid == vm.pid && entry.retiring)
+            warm.iter().any(|entry| {
+                entry.id == id
+                    && entry.vm.pid == vm.pid
+                    && entry.retiring
+                    && (!backed_off || entry.retirement.due(now))
+            })
         }) {
             return Ok(false);
         }
-        let _ = VmmClient::new(&vm.socket_path).stop();
+        if !vm.process.death_confirmed() {
+            let _ = VmmClient::new(&vm.socket_path).stop();
+        }
         if let Err(error) = self.teardown_vm(id, vm) {
-            tracing::error!(vm = %id, %error, "idle warm VM teardown incomplete; retaining for retry");
+            self.record_failed_warm_cleanup(id, vm, &error);
             return Err(error);
         }
         let _gate = self.boot_gate.blocking_write();
-        let removed = self.warm.lock().is_ok_and(|mut warm| {
-            let Some(index) = warm
+        let removed = self.warm.lock().ok().and_then(|mut warm| {
+            let index = warm
                 .iter()
-                .position(|entry| entry.id == id && entry.vm.pid == vm.pid && entry.retiring)
-            else {
-                return false;
-            };
-            warm.remove(index);
-            true
+                .position(|entry| entry.id == id && entry.vm.pid == vm.pid && entry.retiring)?;
+            warm.remove(index)
         });
-        if removed {
+        let Some(removed) = removed else {
+            return Ok(false);
+        };
+        if !removed.retirement.capacity_released {
             self.release_reservation_after_cleanup(id);
-            tracing::info!(vm = %id, "stopped an idle warm VM");
         }
-        Ok(removed)
+        tracing::info!(vm = %id, "retired warm VM cleaned up");
+        Ok(true)
+    }
+
+    /// Keep a warm VM whose teardown failed for a backed-off retry, without
+    /// holding its capacity forever: the reservation is given back as soon as
+    /// the VMM is confirmed dead, and after a bounded number of failures even
+    /// when it is not (with an operator alert for the leftover). The flag set
+    /// under the warm lock makes the release happen at most once.
+    fn record_failed_warm_cleanup(&self, id: Uuid, vm: &RunningVm, error: &OrchError) {
+        let dead = vm.process.death_confirmed();
+        let now = Instant::now();
+        let mut release = false;
+        let mut attempts = 0;
+        if let Ok(mut warm) = self.warm.lock() {
+            if let Some(entry) = warm
+                .iter_mut()
+                .find(|entry| entry.id == id && entry.vm.pid == vm.pid && entry.retiring)
+            {
+                let retirement = &mut entry.retirement;
+                retirement.failed_attempts = retirement.failed_attempts.saturating_add(1);
+                attempts = retirement.failed_attempts;
+                retirement.next_attempt_at = Some(now + warm_cleanup_retry_delay(attempts));
+                if !retirement.capacity_released
+                    && (dead || attempts >= WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY)
+                {
+                    retirement.capacity_released = true;
+                    release = true;
+                }
+            }
+        }
+        if !release {
+            tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VM teardown incomplete; retaining it for retry");
+            return;
+        }
+        self.release_reservation_after_cleanup(id);
+        if dead {
+            tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VMM is dead but its cleanup failed; capacity released, cleanup retained for retry");
+        } else {
+            tracing::error!(vm = %id, pid = vm.pid, attempts, %error, "warm VMM could not be confirmed dead after repeated cleanup failures; capacity released, operator must remove the leftover VMM");
+        }
+    }
+
+    #[cfg(test)]
+    fn make_warm_cleanup_due_for_test(&self, id: Uuid) {
+        for entry in self.warm.lock().unwrap().iter_mut() {
+            if entry.id == id {
+                entry.retirement.next_attempt_at = None;
+            }
+        }
     }
 
     fn release_reservation_after_cleanup(&self, id: Uuid) {
@@ -5316,6 +5445,7 @@ impl VmmSupervisor {
             .map_err(|_| OrchError::Internal("warm lock poisoned".into()))?
             .push_back(WarmVm {
                 retiring: false,
+                retirement: WarmRetirement::default(),
                 id,
                 vm: RunningVm::new(
                     process.pid,
@@ -5688,6 +5818,7 @@ impl VmmSupervisor {
         booting.remove(&id);
         warm.push_back(WarmVm {
             retiring: false,
+            retirement: WarmRetirement::default(),
             id,
             vm,
             spec,
@@ -8117,7 +8248,7 @@ impl VmmSupervisor {
                     })
             };
             if let Some(warm) = warm {
-                return self.cleanup_retiring_warm(id, &warm).map(|_| ());
+                return self.cleanup_retiring_warm(id, &warm, false).map(|_| ());
             }
             if let Some(net) = &self.net {
                 net.teardown_vm_id(id)?;
@@ -13016,6 +13147,7 @@ mod tests {
         supervisor.complete_booting(id, &ticket.control, Ok(()));
         supervisor.warm.lock().unwrap().push_back(WarmVm {
             retiring: false,
+            retirement: WarmRetirement::default(),
             id,
             vm: RunningVm::new(
                 process.pid,
@@ -13196,6 +13328,7 @@ mod tests {
         supervisor.complete_booting(id, &ticket.control, Ok(()));
         supervisor.warm.lock().unwrap().push_back(WarmVm {
             retiring: false,
+            retirement: WarmRetirement::default(),
             id,
             vm: RunningVm::new(
                 process.pid,
@@ -13254,6 +13387,7 @@ mod tests {
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         supervisor.warm.lock().unwrap().push_back(WarmVm {
             retiring: false,
+            retirement: WarmRetirement::default(),
             id,
             vm: RunningVm::new(process.pid, PathBuf::from("exact-warm.sock"), process, None),
             spec: first.clone(),
@@ -13288,6 +13422,7 @@ mod tests {
             let process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
             supervisor.warm.lock().unwrap().push_back(WarmVm {
                 retiring: false,
+                retirement: WarmRetirement::default(),
                 id,
                 vm: RunningVm::new(
                     process.pid,
@@ -13338,6 +13473,7 @@ mod tests {
             }
             supervisor.warm.lock().unwrap().push_back(WarmVm {
                 retiring: false,
+                retirement: WarmRetirement::default(),
                 id,
                 vm: RunningVm::new(process.pid, socket.clone(), process, None),
                 spec: spec.clone(),
@@ -13348,7 +13484,12 @@ mod tests {
                 "exit" => supervisor.scan_for_exited_processes(),
                 _ => unreachable!(),
             }
-            assert!(supervisor.scheduler.is_reserved(id));
+            // Teardown confirmed the VMM dead before a later step failed, so
+            // its capacity is back at once; only the entry is retained.
+            assert!(
+                !supervisor.scheduler.is_reserved(id),
+                "{mode}: a dead warm VMM kept its capacity"
+            );
             assert_eq!(supervisor.warm_count(&spec), 0);
             assert!(!supervisor.has_warm_outside(|_| false));
             assert!(supervisor.warm.lock().unwrap()[0].retiring);
@@ -13362,16 +13503,137 @@ mod tests {
                 ))
                 .unwrap();
             assert!(matches!(outcome, WarmClaimOutcome::NoMatch));
+            // Backed off: the next scan does not retry yet.
+            supervisor.scan_for_exited_processes();
+            assert_eq!(
+                supervisor.warm.lock().unwrap()[0]
+                    .retirement
+                    .failed_attempts,
+                1,
+                "{mode}: retried without backoff"
+            );
+            supervisor.make_warm_cleanup_due_for_test(id);
             supervisor.scan_for_exited_processes();
             assert_eq!(supervisor.warm.lock().unwrap().len(), 1);
-            assert!(supervisor.scheduler.is_reserved(id));
+            assert_eq!(
+                supervisor.warm.lock().unwrap()[0]
+                    .retirement
+                    .failed_attempts,
+                2
+            );
+            assert!(!supervisor.scheduler.is_reserved(id));
             std::fs::remove_dir(&socket).unwrap();
+            supervisor.make_warm_cleanup_due_for_test(id);
             supervisor.scan_for_exited_processes();
             assert!(supervisor.warm.lock().unwrap().is_empty());
             assert!(!supervisor.scheduler.is_reserved(id));
             supervisor.scan_for_exited_processes(); // Idempotent after successful retry.
             assert!(supervisor.take_unexpected_exits().is_empty());
         }
+    }
+
+    /// A warm VMM that cannot be confirmed dead keeps its capacity while its
+    /// cleanup is retried, but only for a bounded number of failures; then the
+    /// capacity is given back exactly once and the entry stays for retry.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unconfirmed_warm_vmm_gives_back_capacity_after_bounded_cleanup_failures() {
+        let supervisor = test_supervisor();
+        let spec = spawn_config(false, Some(PathBuf::from("/images/a.ext4")));
+        let id = Uuid::new_v4();
+        supervisor
+            .scheduler
+            .try_reserve(id, ResourceShape::new(1, 1))
+            .unwrap();
+        // Not a pidfd: SIGKILL through it fails, so teardown can never
+        // confirm this "VMM" dead. No real process is signalled.
+        let not_a_pidfd: OwnedFd = File::open("/dev/null").unwrap().into();
+        let process = ManagedProcess::adopted(u32::MAX - 7, not_a_pidfd);
+        supervisor.warm.lock().unwrap().push_back(WarmVm {
+            retiring: false,
+            retirement: WarmRetirement::default(),
+            id,
+            vm: RunningVm::new(
+                process.pid,
+                PathBuf::from(format!(
+                    "target/taritd-supervisor-test/unconfirmed-{id}.sock"
+                )),
+                process,
+                None,
+            ),
+            spec,
+        });
+        assert!(!supervisor.reclaim_idle_warm());
+        for attempt in 1..=WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY + 1 {
+            if attempt > 1 {
+                supervisor.make_warm_cleanup_due_for_test(id);
+                supervisor.scan_for_exited_processes();
+            }
+            let retirement = supervisor.warm.lock().unwrap()[0].retirement;
+            assert_eq!(retirement.failed_attempts, attempt);
+            let released = attempt >= WARM_CLEANUP_ATTEMPTS_HOLDING_CAPACITY;
+            assert_eq!(retirement.capacity_released, released, "attempt {attempt}");
+            assert_eq!(
+                supervisor.scheduler.is_reserved(id),
+                !released,
+                "attempt {attempt}"
+            );
+            // The capacity, once given back, is never given back twice.
+            if released {
+                supervisor.reserve_existing_for_test(Uuid::new_v4());
+            }
+        }
+        // Both new reservations above are still counted.
+        assert_eq!(supervisor.scheduler.usage().vm_count, 2);
+        supervisor.warm.lock().unwrap().clear();
+    }
+
+    /// One exit scan reconciles user VM exits before it spends time on
+    /// retrying failed warm cleanup.
+    #[test]
+    fn exit_scan_detects_user_vm_exits_before_retrying_warm_cleanup() {
+        let supervisor = test_supervisor();
+        let warm_id = Uuid::new_v4();
+        supervisor
+            .scheduler
+            .try_reserve(warm_id, ResourceShape::new(1, 1))
+            .unwrap();
+        let socket = PathBuf::from(format!(
+            "target/taritd-supervisor-test/scan-order-{warm_id}"
+        ));
+        // A directory at the socket path keeps the warm cleanup failing.
+        std::fs::create_dir_all(&socket).unwrap();
+        let warm_process = ManagedProcess::new(Command::new("sleep").arg("30").spawn().unwrap());
+        supervisor.warm.lock().unwrap().push_back(WarmVm {
+            retiring: true,
+            retirement: WarmRetirement::default(),
+            id: warm_id,
+            vm: RunningVm::new(warm_process.pid, socket.clone(), warm_process, None),
+            spec: spawn_config(false, Some(PathBuf::from("/images/a.ext4"))),
+        });
+        let user_id = Uuid::new_v4();
+        supervisor.reserve_existing_for_test(user_id);
+        let user_process = ManagedProcess::new(Command::new("true").spawn().unwrap());
+        user_process.owned_child().lock().unwrap().wait().unwrap();
+        supervisor.running.lock().unwrap().insert(
+            user_id,
+            RunningVm::new(user_process.pid, PathBuf::new(), user_process.clone(), None),
+        );
+        TEST_WARM_CLEANUP_SAW_UNEXPECTED_EXITS.with(|seen| seen.set(None));
+        supervisor.scan_for_exited_processes();
+        assert_eq!(
+            TEST_WARM_CLEANUP_SAW_UNEXPECTED_EXITS.with(|seen| seen.get()),
+            Some(1),
+            "warm cleanup retry ran before the user VM exit was reconciled"
+        );
+        let exits = supervisor.take_unexpected_exits();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].id, user_id);
+        std::fs::remove_dir(&socket).unwrap();
+        supervisor.make_warm_cleanup_due_for_test(warm_id);
+        supervisor.scan_for_exited_processes();
+        assert!(supervisor.warm.lock().unwrap().is_empty());
+        assert!(!supervisor.scheduler.is_reserved(warm_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13413,9 +13675,15 @@ mod tests {
         })
         .await
         .unwrap();
-        // Sample early in the idle interval, relative to the first completed batch.
+        // Sample early in the idle interval, relative to the first completed
+        // batch. A loaded runner may oversleep past the idle interval, so the
+        // count is only checked when the sample really was early.
+        let batch_done = std::time::Instant::now();
         tokio::time::sleep(Duration::from_millis(30)).await;
-        assert_eq!(supervisor.warm_spawn_attempts.load(Ordering::Relaxed), 2);
+        let attempts = supervisor.warm_spawn_attempts.load(Ordering::Relaxed);
+        if batch_done.elapsed() < Duration::from_millis(120) {
+            assert_eq!(attempts, 2);
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             while supervisor.warm_spawn_attempts.load(Ordering::Relaxed) < 4 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -13742,6 +14010,7 @@ mod tests {
         let process = ManagedProcess::new(Command::new("true").spawn().unwrap());
         supervisor.warm.lock().unwrap().push_back(WarmVm {
             retiring: false,
+            retirement: WarmRetirement::default(),
             id,
             vm: RunningVm::new(
                 process.pid,
